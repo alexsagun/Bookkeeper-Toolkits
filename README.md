@@ -44,9 +44,20 @@ So the key lives only in your `.env` and the dev proxy — never in the bundle.
 
 ---
 
-## Production note
+## Deploying to Vercel
 
-`npm run build` produces a **static** bundle in `dist/`. The dev proxy only exists during `npm run dev`, so a production deployment needs its **own backend/serverless endpoint** at `/api/anthropic` that injects the API key. Without it, the non-AI tools work but AI calls will 401.
+This repo is Vercel-ready:
+
+- The front end builds with Vite (Vercel auto-detects it).
+- `api/anthropic/[...path].js` is a Vercel **serverless function** that plays the same role as the dev proxy in production — it forwards `/api/anthropic/*` to the Anthropic API and injects the key server-side.
+
+Steps:
+
+1. Push this repo to GitHub, then **Import Project** in Vercel and select it.
+2. In **Settings → Environment Variables**, add `ANTHROPIC_API_KEY` = your key (Production + Preview).
+3. Deploy. The static UI and the `/api/anthropic` function are served from the same domain, so the fetch shim in `src/main.jsx` works unchanged.
+
+> Local dev uses the Vite proxy in `vite.config.js`; production uses the serverless function in `api/`. Both respond at `/api/anthropic`, so no app code changes between environments. Without `ANTHROPIC_API_KEY`, the non-AI tools work but AI calls return an error.
 
 ---
 
@@ -55,6 +66,8 @@ So the key lives only in your `.env` and the dev proxy — never in the bundle.
 ```
 index.html            Vite entry (loads Tailwind CDN + src/main.jsx)
 vite.config.js        React plugin + Anthropic dev proxy
+api/
+  anthropic/[...path].js  Vercel serverless proxy (production key injection)
 src/
   main.jsx            Mounts the app; window.storage + Anthropic fetch shims
   BookkeeperPro.jsx   The full application component (unmodified source)
