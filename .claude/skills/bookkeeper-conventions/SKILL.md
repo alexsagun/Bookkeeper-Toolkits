@@ -12,29 +12,40 @@ in [src/main.jsx](../../../src/main.jsx). Make edits blend in with what's alread
 
 Defined near the top of the file:
 
-- `C` (~L576) — color palette: `C.primary` `#0A84FF`, `C.text`, `C.textSoft`, `C.textMute`,
+- `C` (~L624) — color palette: `C.primary` `#0A84FF`, `C.text`, `C.textSoft`, `C.textMute`,
   `C.green`, `C.amber`, `C.red`, `C.bg`, etc.
-- `GLASS` (~L609) — glass-card rgba surfaces (`GLASS.card`, `GLASS.cardElev`, `GLASS.border`…).
-- `SHEEN` (~L606) — the standard top-light gradient for headers/buttons.
-- Fonts (~L623): `fontDisplay` / `fontBody` (Inter), `fontMono` (JetBrains Mono).
+- `GLASS` (~L657) — glass-card rgba surfaces (`GLASS.card`, `GLASS.cardElev`, `GLASS.border`…).
+- `SHEEN` (~L654) — the standard top-light gradient for headers/buttons.
+- Fonts (~L671): `fontDisplay` / `fontBody` (Inter), `fontMono` (JetBrains Mono, ~L673).
 
 **Do:** `style={{ color: C.text, fontFamily: fontDisplay }}` and the `glass-card` class for panels.
 **Don't:** hardcode hex colors or invent new fonts — reuse the tokens so the glass-morphism look stays
 consistent. Use Tailwind utilities for layout (`flex`, `grid`, `gap-*`, `rounded-*`, spacing).
 
-## AI calls (proxy + shim contract)
+## AI calls (use the shared `callClaude()` helper)
 
-- Call the **real** URL: `fetch('https://api.anthropic.com/v1/messages', …)`. The fetch shim in
-  `main.jsx` rewrites it to `/api/anthropic`, and the proxy injects the key.
-- Headers are just `{ 'Content-Type': 'application/json' }`. **Never** add `x-api-key` or
-  `anthropic-version` in client code, and never reference `ANTHROPIC_API_KEY` from a component.
+- **Always** route AI calls through `callClaude()` ([src/BookkeeperPro.jsx:27](../../../src/BookkeeperPro.jsx#L27)) —
+  do **not** hand-roll `fetch`/`res.json()`. Signature:
+
+  ```js
+  const text = await callClaude({ model, max_tokens, system, messages });
+  // defaults: model 'claude-sonnet-4-20250514', max_tokens 1024
+  const { text, data } = await callClaude({ system, messages }, { returnData: true }); // need stop_reason etc.
+  ```
+
+- Under the hood it calls the **real** URL `https://api.anthropic.com/v1/messages`; the fetch shim in
+  `main.jsx` rewrites it to `/api/anthropic`, and the proxy injects the key. **Never** add `x-api-key`
+  or `anthropic-version` in client code, and never reference `ANTHROPIC_API_KEY` from a component.
 - Model is `claude-sonnet-4-20250514` everywhere; pick `max_tokens` to fit the task (800–4000).
-- Extract text via `(data.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('')`.
+- `callClaude` reads the body as text first, checks `res.ok`, and **throws a descriptive `Error`**
+  (already `console.error`-logged) on HTTP or non-JSON failures — so `try/catch` every call and set an
+  `err` state. It returns the joined text content for you (no manual `.filter(...).map(...)` needed).
 - If you prompt for JSON, strip ```` ``` ````/```` ```json ```` fences before `JSON.parse`.
+- Vision/PDF: pass base64 `image`/`document` content blocks inside `messages[].content`.
 - Always track `busy` and `err` state so the UI degrades gracefully without a key.
 
-See the **add-bookkeeper-tool** skill for the full copy-paste snippet, and `BankFeed` (~L2233) /
-`CoachAlexChat` (~L9114) as references.
+See the **add-bookkeeper-tool** skill for the full copy-paste snippet, and `BankFeed` (~L2214) /
+`CoachAlexChat` (~L9025) / `StatementConverter` (~L2411, vision) as references.
 
 ## State & persistence
 
@@ -48,27 +59,30 @@ See the **add-bookkeeper-tool** skill for the full copy-paste snippet, and `Bank
   const { value } = await window.storage.get('mykey');
   ```
 
-  Guard with `if (typeof window !== 'undefined' && window.storage)` as existing code does (~L891).
+  Guard with `if (typeof window !== 'undefined' && window.storage)` as existing code does (~L940).
+  Sidebar layout persists under `sidebar:*` keys (`sidebar:stages` / `sidebar:collapsed` /
+  `sidebar:expandedGroups`, ~L940–988).
 
 ## File import / export
 
-- **Download/export:** use the `downloadFile(content, filename, mimeType)` helper (~L631) — e.g.
+- **Download/export:** use the `downloadFile(content, filename, mimeType)` helper (~L679) — e.g.
   `downloadFile(csv, 'chart-of-accounts.csv', 'text/csv')`.
 - **Spreadsheets:** the `xlsx` library (`XLSX`) parses/builds Excel; see `StatementConverter` /
   `CoaGenerator`.
 - **Word docs:** `mammoth` extracts text from `.docx`.
-- **Images/PDF for Claude vision:** read the file to base64 and send as an image content block (see
-  `StatementConverter`, ~L2483).
+- **Images/PDF for Claude vision:** read the file to base64 and send as an `image`/`document` content
+  block in `messages[].content` (see `StatementConverter`, ~L2411).
 
 ## Currency
 
-For money-handling tools, reuse `useCurrency()` (~L664) and render `<CurrencyToggle />` (~L700) rather
+For money-handling tools, reuse `useCurrency()` (~L712) and render `<CurrencyToggle />` (~L748) rather
 than rolling your own USD↔PHP conversion.
 
 ## Navigation
 
-A tool is reachable only when its `id` appears in all three: the sidebar `stages` config (~L737–813),
-the render switch (~L1656–1690), and optionally the Dashboard tiles (~L1710+). Keep the `id` identical.
+A tool is reachable only when its `id` appears in all three: the sidebar `DEFAULT_STAGES` config
+(~L779–864), the render switch (~L1704–1738), and optionally the Dashboard tiles (~L1756–1829). Keep
+the `id` identical across all three.
 
 ## Don'ts
 

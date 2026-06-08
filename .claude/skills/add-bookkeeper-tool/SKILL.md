@@ -10,9 +10,9 @@ nav in **three** synchronized places. Do all three or the tool won't appear / wo
 
 ## Step 1 — Write the component
 
-Add a functional component near similar tools (calculators ~L9500–10300, AI chats ~L9100–9300,
-generators ~L5400–6700). Use the design tokens (`C`, `GLASS`, `SHEEN`, `fontDisplay`) and a
-[Lucide](https://lucide.dev) icon already imported at the top of the file.
+Add a functional component near similar tools (calculators ~L9400–10200, AI chats ~L9025–9400,
+generators ~L5379–6700). Use the design tokens (`C` ~L624, `GLASS` ~L657, `SHEEN` ~L654,
+`fontDisplay` ~L671) and a [Lucide](https://lucide.dev) icon already imported at the top of the file.
 
 Non-AI tool skeleton:
 
@@ -33,11 +33,14 @@ function MyNewTool() {
 ```
 
 If it deals with money, reuse the currency helpers: `const { currency, fxRate, ... } = useCurrency()`
-and render `<CurrencyToggle ... />` (see existing calculators, ~L10295+).
+(~L712) and render `<CurrencyToggle ... />` (~L748; see existing calculators).
 
-## Step 2 — For an AI-powered tool, use the standard fetch pattern
+## Step 2 — For an AI-powered tool, use the shared `callClaude()` helper
 
-Call the **real** Anthropic URL — the proxy injects the key. Do **not** add `x-api-key`.
+Every AI feature goes through the **`callClaude()`** helper at the top of the file
+([src/BookkeeperPro.jsx:27](../../../src/BookkeeperPro.jsx#L27)). It calls the **real** Anthropic URL —
+the `main.jsx` fetch shim rewrites it to `/api/anthropic` and the proxy injects the key. Do **not** add
+`x-api-key` and do **not** hand-roll `fetch`/`res.json()` for AI calls.
 
 ```jsx
 const [busy, setBusy] = useState(false);
@@ -46,22 +49,17 @@ const [err, setErr] = useState('');
 async function run() {
   setBusy(true); setErr('');
   try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1500,
-        system: 'You are a 15-year US QuickBooks ProAdvisor...', // role-specific system prompt
-        messages: [{ role: 'user', content: userInput }],
-      }),
+    // Defaults: model 'claude-sonnet-4-20250514', max_tokens 1024. Override as needed.
+    const text = await callClaude({
+      max_tokens: 1500,
+      system: 'You are a 15-year US QuickBooks ProAdvisor...', // role-specific system prompt
+      messages: [{ role: 'user', content: userInput }],
     });
-    const data = await res.json();
-    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
     // If you asked for JSON, strip code fences first:
     // const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
     setResult(text);
   } catch (e) {
+    console.error(e);                 // callClaude throws a descriptive, already-logged error
     setErr('AI request failed. Check your ANTHROPIC_API_KEY or try again.');
   } finally {
     setBusy(false);
@@ -69,18 +67,24 @@ async function run() {
 }
 ```
 
-Reference implementations to copy from: `BankFeed` (~L2233, JSON output + fence stripping),
-`CoachAlexChat` (~L9114, multi-turn chat), `StatementConverter` (~L2483, vision/base64 input).
+`callClaude` returns the joined text by default. If you need the raw response (e.g. to check
+`stop_reason` for `max_tokens` truncation), pass `{ returnData: true }` as the second arg and read
+`{ text, data }`. On any HTTP/non-JSON error it **throws** a descriptive `Error` (already
+`console.error`-logged) — so wrap calls in `try/catch` and set `err`; never assume success.
+
+Reference implementations to copy from: `BankFeed` (~L2214, JSON output + fence stripping),
+`CoachAlexChat` (~L9025, multi-turn chat), `StatementConverter` (~L2411, vision: base64 `image`/
+`document` blocks in `messages[].content`).
 
 Always handle `busy` (disable the button / show a spinner) and `err` (the app must degrade
 gracefully when no key is set).
 
 ## Step 3 — Wire it into navigation (three edits)
 
-1. **Sidebar config** (`stages` array, ~L737–813): add `{ id: 'mytool', label: 'My New Tool', icon: SomeIcon }`
+1. **Sidebar config** (`DEFAULT_STAGES` array, ~L779–864): add `{ id: 'mytool', label: 'My New Tool', icon: SomeIcon }`
    to the right stage's `tabs`, and add `'mytool'` to a group's `tabIds`.
-2. **Render switch** (~L1656–1690): add `{tab === 'mytool' && <MyNewTool />}`.
-3. **(Optional) Dashboard tile** (~L1710+): add `{ id: 'mytool', label, desc, icon, color }` if it
+2. **Render switch** (~L1704–1738): add `{tab === 'mytool' && <MyNewTool />}`.
+3. **(Optional) Dashboard tile** (~L1756–1829): add `{ id: 'mytool', label, desc, icon, color }` if it
    should appear on the Home roadmap.
 
 The `id` must be identical in all three places.
