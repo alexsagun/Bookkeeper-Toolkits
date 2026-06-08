@@ -29,14 +29,14 @@ consistent. Use Tailwind utilities for layout (`flex`, `grid`, `gap-*`, `rounded
 
   ```js
   const text = await callClaude({ model, max_tokens, system, messages });
-  // defaults: model 'claude-sonnet-4-20250514', max_tokens 1024
+  // defaults: model 'claude-sonnet-4-6', max_tokens 1024
   const { text, data } = await callClaude({ system, messages }, { returnData: true }); // need stop_reason etc.
   ```
 
 - Under the hood it calls the **real** URL `https://api.anthropic.com/v1/messages`; the fetch shim in
   `main.jsx` rewrites it to `/api/anthropic`, and the proxy injects the key. **Never** add `x-api-key`
   or `anthropic-version` in client code, and never reference `ANTHROPIC_API_KEY` from a component.
-- Model is `claude-sonnet-4-20250514` everywhere; pick `max_tokens` to fit the task (800–4000).
+- Model is `claude-sonnet-4-6` everywhere; pick `max_tokens` to fit the task (800–4000).
 - `callClaude` reads the body as text first, checks `res.ok`, and **throws a descriptive `Error`**
   (already `console.error`-logged) on HTTP or non-JSON failures — so `try/catch` every call and set an
   `err` state. It returns the joined text content for you (no manual `.filter(...).map(...)` needed).

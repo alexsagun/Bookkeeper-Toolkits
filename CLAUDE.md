@@ -92,7 +92,7 @@ Every AI tool goes through the shared **`callClaude()`** helper at the top of `B
 injects the key.
 
 ```js
-// defaults: model 'claude-sonnet-4-20250514', max_tokens 1024
+// defaults: model 'claude-sonnet-4-6', max_tokens 1024
 const text = await callClaude({
   max_tokens: 1500,
   system: sys,                                       // optional system prompt
@@ -103,7 +103,7 @@ const text = await callClaude({
 const { text, data } = await callClaude({ system, messages }, { returnData: true });
 ```
 
-- **Model:** `claude-sonnet-4-20250514` across all AI tools. `max_tokens` varies 800–4000 by task.
+- **Model:** `claude-sonnet-4-6` across all AI tools. `max_tokens` varies 800–4000 by task.
 - **Error handling:** `callClaude` reads the body as text first, checks `res.ok`, and **throws a
   descriptive `Error`** (already `console.error('[Claude] …')`-logged) on HTTP or non-JSON failures —
   instead of silently collapsing into a generic fallback. Wrap calls in `try/catch` and set an `err`

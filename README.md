@@ -76,7 +76,7 @@ standalone/
 .env.example          Template for your Anthropic API key
 ```
 
-The model IDs referenced in the source (e.g. `claude-sonnet-4-20250514`) are kept as authored.
+The model IDs referenced in the source (e.g. `claude-sonnet-4-6`) are kept as authored.
 
 ---
 

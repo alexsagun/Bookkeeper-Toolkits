@@ -24,7 +24,7 @@ import {
 // reads the body as text FIRST, so an HTTP error or a non-JSON response (e.g.
 // an HTML error page from a misrouted request) throws a *descriptive* error
 // that gets logged — instead of silently collapsing into a generic fallback.
-async function callClaude({ model = 'claude-sonnet-4-20250514', max_tokens = 1024, system, messages }, opts = {}) {
+async function callClaude({ model = 'claude-sonnet-4-6', max_tokens = 1024, system, messages }, opts = {}) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

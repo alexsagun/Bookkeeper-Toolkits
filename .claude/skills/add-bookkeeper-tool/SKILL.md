@@ -49,7 +49,7 @@ const [err, setErr] = useState('');
 async function run() {
   setBusy(true); setErr('');
   try {
-    // Defaults: model 'claude-sonnet-4-20250514', max_tokens 1024. Override as needed.
+    // Defaults: model 'claude-sonnet-4-6', max_tokens 1024. Override as needed.
     const text = await callClaude({
       max_tokens: 1500,
       system: 'You are a 15-year US QuickBooks ProAdvisor...', // role-specific system prompt
