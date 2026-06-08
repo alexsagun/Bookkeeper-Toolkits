@@ -14,6 +14,54 @@ import {
 } from 'lucide-react';
 
 // ═══════════════════════════════════════════════════════════════════
+// SHARED: ANTHROPIC API HELPER
+// ═══════════════════════════════════════════════════════════════════
+// Single place every AI feature calls the Claude API. The request is routed
+// through the proxy (browser fetch shim in src/main.jsx -> /api/anthropic ->
+// Vercel function / Vite dev proxy), which injects the API key server-side.
+//
+// Unlike the old inline `await res.json()` pattern, this checks res.ok and
+// reads the body as text FIRST, so an HTTP error or a non-JSON response (e.g.
+// an HTML error page from a misrouted request) throws a *descriptive* error
+// that gets logged — instead of silently collapsing into a generic fallback.
+async function callClaude({ model = 'claude-sonnet-4-20250514', max_tokens = 1024, system, messages }, opts = {}) {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, max_tokens, system, messages }),
+  });
+
+  const raw = await res.text(); // read once, as text — works for JSON and HTML error pages
+  if (!res.ok) {
+    console.error('[Claude] HTTP', res.status, raw.slice(0, 500));
+    // Surface Anthropic's own error message when the body is JSON.
+    let detail = raw.slice(0, 200);
+    try {
+      const j = JSON.parse(raw);
+      if (j?.error?.message) detail = j.error.message;
+    } catch {}
+    throw new Error(`Claude API ${res.status}: ${detail}`);
+  }
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    console.error('[Claude] non-JSON response (likely a misrouted /api/anthropic request):', raw.slice(0, 500));
+    throw new Error('Non-JSON response from the Anthropic proxy');
+  }
+
+  const text = (data.content || [])
+    .filter(b => b.type === 'text')
+    .map(b => b.text)
+    .join('\n');
+
+  // Callers that need stop_reason (e.g. to detect max_tokens truncation) pass
+  // { returnData: true } and get the full parsed response alongside the text.
+  return opts.returnData ? { text, data } : text;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // DATA: CHART OF ACCOUNTS BY INDUSTRY
 // ═══════════════════════════════════════════════════════════════════
 
@@ -2230,18 +2278,7 @@ Return ONLY a JSON array, no other text, no markdown fences. Format:
 
 Confidence (conf) 0.0-1.0: use 0.9+ if vendor is unambiguous, 0.6-0.8 if you're making a reasoned guess, below 0.5 if it really needs human review. If you cannot determine vendor/account at all, set vendor and account to "NEEDS REVIEW" and conf to 0.2 with a note explaining what's missing.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1500,
-          system: sys,
-          messages: [{ role: 'user', content: memos }],
-        }),
-      });
-      const data = await res.json();
-      const raw = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      const raw = (await callClaude({ max_tokens: 1500, system: sys, messages: [{ role: 'user', content: memos }] })).trim();
       const cleaned = raw.replace(/```json|```/g, '').trim();
       const aiResults = JSON.parse(cleaned);
 
@@ -2480,17 +2517,7 @@ Output ONLY this format. No markdown, no explanation.`
           }
         ];
 
-        const res = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: 'claude-sonnet-4-20250514',
-            max_tokens: 4000,
-            messages: [{ role: 'user', content }],
-          }),
-        });
-        const data = await res.json();
-        const extracted = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+        const extracted = (await callClaude({ max_tokens: 4000, messages: [{ role: 'user', content }] })).trim();
 
         // Parse the structured output
         const beginMatch = extracted.match(/BEGIN_BALANCE:\s*(-?[\d,]+\.\d{2})/i);
@@ -2772,23 +2799,11 @@ function ProChat() {
 
       const sys = `You are a US Accountant and 15-year QuickBooks Online ProAdvisor mentoring a beginner remote bookkeeper. Answer in clear, step-by-step language. Cover QBO navigation, bookkeeping workflows, cleanup scenarios (uncategorized expenses, negative AR, double-booked income, undeposited funds stuck, beginning balance issues, bank rec discrepancies), journal entries, sales tax, payroll basics, 1099 prep, year-end close, and US GAAP basics. Always give the practical QBO click-path when relevant (e.g., "Go to ⚙️ Settings → Reconcile"). Be encouraging, warm, and direct. Keep responses focused — typically 150-300 words unless the topic genuinely needs more depth. Use short paragraphs and numbered steps when giving procedures. Never give legal or tax-advice — clarify that you're sharing bookkeeping best practices.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1000,
-          system: sys,
-          messages: conv,
-        })
-      });
-      const data = await res.json();
-      const replyText = (data.content || [])
-        .filter(b => b.type === 'text')
-        .map(b => b.text)
-        .join('\n') || "Sorry, I didn't catch that — could you try again?";
+      const replyText = (await callClaude({ max_tokens: 1000, system: sys, messages: conv }))
+        || "Sorry, I didn't catch that — could you try again?";
       setMessages(m => [...m, { role: 'assistant', text: replyText }]);
     } catch (err) {
+      console.error('ProAdvisor chat failed:', err);
       setMessages(m => [...m, { role: 'assistant', text: "I'm having trouble reaching my brain right now — please try again in a moment." }]);
     }
     setBusy(false);
@@ -3596,17 +3611,7 @@ function ResumeOptimizer() {
           return;
         }
 
-        const res = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: 'claude-sonnet-4-20250514',
-            max_tokens: 4000,
-            messages: [{ role: 'user', content }],
-          }),
-        });
-        const data = await res.json();
-        const extracted = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+        const extracted = (await callClaude({ max_tokens: 4000, messages: [{ role: 'user', content }] })).trim();
         setResumeText(extracted);
         setUploadStatus('✓ Resume extracted from PDF. Now paste the job description below.');
         setBusyUpload(false);
@@ -3682,18 +3687,7 @@ ${resumeText}
 
 Optimize this resume to match the job description. Return the structured JSON only.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 4000,
-          system: sys,
-          messages: [{ role: 'user', content: user }],
-        }),
-      });
-      const data = await res.json();
-      const raw = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      const raw = (await callClaude({ max_tokens: 4000, system: sys, messages: [{ role: 'user', content: user }] })).trim();
       const cleaned = raw.replace(/```json|```/g, '').trim();
       const parsed = JSON.parse(cleaned);
 
@@ -4599,18 +4593,7 @@ Output as a JSON object with keys: context, action, result, fullStory (a 200-280
 
       const user = `My raw scenario or experience:\n\n${scenario}\n\nTurn this into a polished CAR story.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1500,
-          system: sys,
-          messages: [{ role: 'user', content: user }],
-        }),
-      });
-      const data = await res.json();
-      const raw = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      const raw = (await callClaude({ max_tokens: 1500, system: sys, messages: [{ role: 'user', content: user }] })).trim();
       const cleaned = raw.replace(/```json|```/g, '').trim();
       setStory(JSON.parse(cleaned));
     } catch (e) {
@@ -4841,18 +4824,7 @@ Generate 3-5 questions per category. Make them realistic — what a US hiring ma
 
       const user = `JOB DESCRIPTION:\n\n${jd}\n\nGenerate the predicted interview questions for this role.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 4000,
-          system: sys,
-          messages: [{ role: 'user', content: user }],
-        }),
-      });
-      const data = await res.json();
-      const raw = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      const raw = (await callClaude({ max_tokens: 4000, system: sys, messages: [{ role: 'user', content: user }] })).trim();
       const cleaned = raw.replace(/```json|```/g, '').trim();
       setQuestions(JSON.parse(cleaned));
     } catch (e) {
@@ -5030,18 +5002,7 @@ Be honest, specific, and warm. Use their OWN words and stories. Avoid corporate 
 
       const user = `Here are the candidate's answers from a personal branding deep-dive questionnaire:\n${formatted}\n\nSynthesize this into their authentic personal brand profile.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 4000,
-          system: sys,
-          messages: [{ role: 'user', content: user }],
-        }),
-      });
-      const data = await res.json();
-      const raw = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      const raw = (await callClaude({ max_tokens: 4000, system: sys, messages: [{ role: 'user', content: user }] })).trim();
       const cleaned = raw.replace(/```json|```/g, '').trim();
       setProfile(JSON.parse(cleaned));
     } catch (e) {
@@ -5574,18 +5535,7 @@ ${type === 'Referral Request Email' ? `- 80-120 words.
 
 Output the email/document directly with no preamble or explanation. Use heavy whitespace. Sign as ${yourName} | ${yourFirm}. Add a P.S. on every email — Hormozi always uses P.S.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 2000,
-          system: sys,
-          messages: [{ role: 'user', content: user }],
-        }),
-      });
-      const data = await res.json();
-      const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      const text = (await callClaude({ max_tokens: 2000, system: sys, messages: [{ role: 'user', content: user }] })).trim();
       setGenerated(text);
     } catch (e) {
       setGenerated('Error generating — please try again.');
@@ -5821,18 +5771,7 @@ CRITICAL FORMATTING:
 
 Output the letter directly with no preamble.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1500,
-          system: sys,
-          messages: [{ role: 'user', content: user }],
-        }),
-      });
-      const data = await res.json();
-      const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      const text = (await callClaude({ max_tokens: 1500, system: sys, messages: [{ role: 'user', content: user }] })).trim();
       setGenerated(text);
     } catch (e) {
       setGenerated('Error generating — please try again.');
@@ -6402,18 +6341,7 @@ Best regards,
 
 Do not add any preamble or commentary. Output ONLY the email.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1500,
-          system: sys,
-          messages: [{ role: 'user', content: user }],
-        }),
-      });
-      const data = await res.json();
-      const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      const text = (await callClaude({ max_tokens: 1500, system: sys, messages: [{ role: 'user', content: user }] })).trim();
       setGenerated(text);
     } catch (e) {
       setGenerated('Error generating — please try again.');
@@ -6783,34 +6711,17 @@ Keep all string values concise — 1-2 sentences each. Brevity beats verbosity.`
 
       const user = `Industry: ${industry}\n\nFocus on issues ${userPersona}.\n\nThe bookkeeper being positioned is a Filipino REMOTE bookkeeper. Output valid JSON only.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 2500,   // Tightened — 6 pain points × ~250 tokens + meta = ~2000
-          system: sys,
-          messages: [{ role: 'user', content: user }],
-        }),
-      });
-
-      if (!res.ok) {
-        let detail = `HTTP ${res.status}`;
-        try {
-          const errBody = await res.json();
-          if (errBody?.error?.message) detail += ' — ' + errBody.error.message;
-        } catch {}
-        throw new Error(`API request failed: ${detail}. Try again in a moment.`);
-      }
-
-      const data = await res.json();
+      const { text: rawText, data } = await callClaude(
+        { max_tokens: 2500, system: sys, messages: [{ role: 'user', content: user }] },
+        { returnData: true }
+      );
 
       // Detect truncation early
       if (data.stop_reason === 'max_tokens') {
         throw new Error('AI response was cut off. The toolkit will retry automatically — click Try Again.');
       }
 
-      const raw = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      const raw = rawText.trim();
       if (!raw) throw new Error('AI returned no content. Please try again.');
 
       // Robust JSON extraction
@@ -9181,23 +9092,11 @@ RULES:
 
 Be the coach you wish you had when you started.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1200,
-          system: sys,
-          messages: conv,
-        })
-      });
-      const data = await res.json();
-      const replyText = (data.content || [])
-        .filter(b => b.type === 'text')
-        .map(b => b.text)
-        .join('\n') || "Hmm, didn't catch that one. Mind asking again?";
+      const replyText = (await callClaude({ max_tokens: 1200, system: sys, messages: conv }))
+        || "Hmm, didn't catch that one. Mind asking again?";
       setMessages(m => [...m, { role: 'assistant', text: replyText }]);
     } catch (err) {
+      console.error('Coach Alex chat failed:', err);
       setMessages(m => [...m, { role: 'assistant', text: "My brain's offline for a sec — give me a moment and try again." }]);
     }
     setBusy(false);
@@ -9416,21 +9315,8 @@ VOICE & RULES:
 
 You are the technical resource a remote bookkeeper would otherwise pay $200-$400/hour to consult.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1500,
-          system: sys,
-          messages: conv,
-        })
-      });
-      const data = await res.json();
-      const replyText = (data.content || [])
-        .filter(b => b.type === 'text')
-        .map(b => b.text)
-        .join('\n') || "Apologies — could you rephrase the question?";
+      const replyText = (await callClaude({ max_tokens: 1500, system: sys, messages: conv }))
+        || "Apologies — could you rephrase the question?";
       setMessages(m => [...m, { role: 'assistant', text: replyText }]);
     } catch (err) {
       setMessages(m => [...m, { role: 'assistant', text: "Connection issue on my end — please try again in a moment." }]);
@@ -10883,18 +10769,7 @@ Current headline: ${currentHeadline || '(none)'}
 Current about: ${currentAbout || '(none)'}
 Key results / wins: ${keyResults || '(none yet — entry-level)'}`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 2000,
-          system: sys,
-          messages: [{ role: 'user', content: userMsg }],
-        })
-      });
-      const data = await res.json();
-      const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+      const text = await callClaude({ max_tokens: 2000, system: sys, messages: [{ role: 'user', content: userMsg }] });
       const clean = text.replace(/```json|```/g, '').trim();
       const parsed = JSON.parse(clean);
       setOutput(parsed);
@@ -11074,18 +10949,7 @@ INTERVIEW STRUCTURE:
 - Keep your turns SHORT (2-4 sentences max). Real interviewers don't lecture.
 - Be human. Use contractions, occasional "got it", "interesting", "okay".`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 600,
-          system: sys,
-          messages: conv,
-        })
-      });
-      const data = await res.json();
-      const replyText = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+      const replyText = await callClaude({ max_tokens: 600, system: sys, messages: conv });
       setMessages([...newMessages, { role: 'assistant', text: replyText }]);
       setQuestionCount(questionCount + 1);
     } catch (err) {
@@ -11112,18 +10976,7 @@ Schema:
 
 Be honest but constructive. Real coaches don't sugarcoat. Specific quotes from the transcript make feedback land harder.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 2500,
-          system: sys,
-          messages: [{ role: 'user', content: transcript }],
-        })
-      });
-      const data = await res.json();
-      const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+      const text = await callClaude({ max_tokens: 2500, system: sys, messages: [{ role: 'user', content: transcript }] });
       const clean = text.replace(/```json|```/g, '').trim();
       setScoreReport(JSON.parse(clean));
       setShowScore(true);
@@ -11379,18 +11232,7 @@ ${persona === 'overwhelmedfounder' ? 'Be slightly chaotic, jump topics, get emot
 
 IMPORTANT: Never give meta-commentary, never break character, never coach. You ARE the prospect.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 500,
-          system: sys,
-          messages: conv,
-        })
-      });
-      const data = await res.json();
-      const replyText = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+      const replyText = await callClaude({ max_tokens: 500, system: sys, messages: conv });
       setMessages([...newMessages, { role: 'assistant', text: replyText }]);
     } catch (err) {
       setMessages([...newMessages, { role: 'assistant', text: "[connection issue]" }]);
@@ -11418,18 +11260,7 @@ Schema:
 
 Focus on: did they ask discovery questions, did they hold their pricing, did they listen vs pitch, did they show technical depth, did they create next steps.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 2500,
-          system: sys,
-          messages: [{ role: 'user', content: transcript }],
-        })
-      });
-      const data = await res.json();
-      const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+      const text = await callClaude({ max_tokens: 2500, system: sys, messages: [{ role: 'user', content: transcript }] });
       const clean = text.replace(/```json|```/g, '').trim();
       setScoreReport(JSON.parse(clean));
       setShowScore(true);
@@ -11741,33 +11572,16 @@ Client / business context: ${clientContext || '(general small business client)'}
 
 Generate the SOP. Output valid JSON only.`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 8000,
-          system: sys,
-          messages: [{ role: 'user', content: userMsg }],
-        })
-      });
-
-      if (!res.ok) {
-        let detail = `HTTP ${res.status}`;
-        try {
-          const errBody = await res.json();
-          if (errBody?.error?.message) detail += ' — ' + errBody.error.message;
-        } catch {}
-        throw new Error(`API request failed: ${detail}`);
-      }
-
-      const data = await res.json();
+      const { text: rawText, data } = await callClaude(
+        { max_tokens: 8000, system: sys, messages: [{ role: 'user', content: userMsg }] },
+        { returnData: true }
+      );
 
       if (data.stop_reason === 'max_tokens') {
         throw new Error('SOP exceeded length limit. Try: (1) shorter topic name, (2) fewer items in Tools field, (3) shorter client context. Click Try Again.');
       }
 
-      const raw = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      const raw = rawText.trim();
       if (!raw) throw new Error('AI returned no content. Click Try Again.');
 
       // Robust JSON extraction
@@ -12553,18 +12367,7 @@ Net Income: ${netIncome || '(not provided)'}
 Wins this month: ${wins || '(none flagged)'}
 Watch items / concerns: ${watchItems || '(none flagged)'}`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 3000,
-          system: sys,
-          messages: [{ role: 'user', content: userMsg }],
-        })
-      });
-      const data = await res.json();
-      const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+      const text = await callClaude({ max_tokens: 3000, system: sys, messages: [{ role: 'user', content: userMsg }] });
       const clean = text.replace(/```json|```/g, '').trim();
       setScript(JSON.parse(clean));
     } catch (err) {
@@ -12776,18 +12579,7 @@ Increase: ${pctIncrease}%
 Months as client: ${monthsAsClient}
 Reason for raise: ${reasonLabels[reason]}`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 2500,
-          system: sys,
-          messages: [{ role: 'user', content: userMsg }],
-        })
-      });
-      const data = await res.json();
-      const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+      const text = await callClaude({ max_tokens: 2500, system: sys, messages: [{ role: 'user', content: userMsg }] });
       const clean = text.replace(/```json|```/g, '').trim();
       setOutput(JSON.parse(clean));
     } catch (err) {
@@ -12958,18 +12750,7 @@ Industry: ${industry || '(general)'}
 Current scope: ${scopeOptions[currentScope]}
 Current monthly fee: $${monthlyFee}`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 3000,
-          system: sys,
-          messages: [{ role: 'user', content: userMsg }],
-        })
-      });
-      const data = await res.json();
-      const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+      const text = await callClaude({ max_tokens: 3000, system: sys, messages: [{ role: 'user', content: userMsg }] });
       const clean = text.replace(/```json|```/g, '').trim();
       setOutput(JSON.parse(clean));
     } catch (err) {
@@ -14938,34 +14719,17 @@ ${generalObservations || '(none provided)'}
 
       userContent.push({ type: 'text', text: userText });
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 8000,
-          system: sys,
-          messages: [{ role: 'user', content: userContent }],
-        }),
-      });
-
-      if (!res.ok) {
-        let errorDetail = `HTTP ${res.status}`;
-        try {
-          const errBody = await res.json();
-          if (errBody?.error?.message) errorDetail += ` — ${errBody.error.message}`;
-        } catch {}
-        throw new Error(`API request failed: ${errorDetail}. Try again, or simplify the statements.`);
-      }
-
-      const data = await res.json();
+      const { text: rawText, data } = await callClaude(
+        { max_tokens: 8000, system: sys, messages: [{ role: 'user', content: userContent }] },
+        { returnData: true }
+      );
 
       // Check stop_reason — if max_tokens hit, the JSON is likely truncated
       if (data.stop_reason === 'max_tokens') {
         throw new Error('Response was too long and got cut off. Try shortening the pasted statements (just the main accounts), or reducing observations.');
       }
 
-      const raw = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      const raw = rawText.trim();
       if (!raw) throw new Error('AI returned no text content. Please try again.');
 
       // Robust JSON extraction
@@ -15834,13 +15598,9 @@ function BudgetingTool() {
     setAiBusy(true);
     setAiNote(null);
     try {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1500,
-          system: `You are a senior US bookkeeper building a 12-month operating budget for a small business client. Return a tight JSON object with industry-relevant line items grouped by Revenue, Cost of Goods Sold, and Operating Expenses. Include realistic monthly starting amounts (USD) for a typical small business in this industry — revenue around $30,000-80,000/month is a reasonable default. Output ONLY JSON, no preamble, no fences. Schema:
+      const { text: rawText, data } = await callClaude({
+        max_tokens: 1500,
+        system: `You are a senior US bookkeeper building a 12-month operating budget for a small business client. Return a tight JSON object with industry-relevant line items grouped by Revenue, Cost of Goods Sold, and Operating Expenses. Include realistic monthly starting amounts (USD) for a typical small business in this industry — revenue around $30,000-80,000/month is a reasonable default. Output ONLY JSON, no preamble, no fences. Schema:
 
 {
   "Revenue": [{ "name": "...", "monthly": <number>, "growth": <number 0-5> }],
@@ -15849,14 +15609,10 @@ function BudgetingTool() {
 }
 
 growth is monthly % growth (0-5). Most expense lines should be 0% growth. Revenue can have 1-2% growth. Include 2-3 revenue lines, 2-4 COGS lines if industry has COGS (otherwise empty array), and 10-14 opex lines covering typical bookkeeping categories.`,
-          messages: [{ role: 'user', content: `Industry: ${industry}\n\nGenerate the budget template JSON.` }],
-        }),
-      });
-
-      if (!res.ok) throw new Error(`API ${res.status}`);
-      const data = await res.json();
+        messages: [{ role: 'user', content: `Industry: ${industry}\n\nGenerate the budget template JSON.` }],
+      }, { returnData: true });
       if (data.stop_reason === 'max_tokens') throw new Error('Response truncated. Try a simpler industry name.');
-      const raw = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      const raw = rawText.trim();
 
       let jsonStr = raw.replace(/```json|```/g, '').trim();
       const first = jsonStr.indexOf('{');
@@ -15902,19 +15658,11 @@ Net Income: ${fmtFull(totalNet)}  (${netMargin.toFixed(1)}% margin)
 
 Top opex lines: ${groups['Operating Expenses'].sort((a,b) => rowAnnual(b)-rowAnnual(a)).slice(0,5).map(r => `${r.name} ${fmtFull(rowAnnual(r))}`).join('; ')}`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 800,
-          system: 'You are a US CPA reviewing a small business budget. Give a brief, plain-English review (3-5 sentences) covering: (1) whether margins look realistic for the industry, (2) any line items that seem too high or low, (3) one concrete suggestion to improve. Be specific. No preamble.',
-          messages: [{ role: 'user', content: summary }],
-        }),
-      });
-      if (!res.ok) throw new Error(`API ${res.status}`);
-      const data = await res.json();
-      const raw = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      const raw = (await callClaude({
+        max_tokens: 800,
+        system: 'You are a US CPA reviewing a small business budget. Give a brief, plain-English review (3-5 sentences) covering: (1) whether margins look realistic for the industry, (2) any line items that seem too high or low, (3) one concrete suggestion to improve. Be specific. No preamble.',
+        messages: [{ role: 'user', content: summary }],
+      })).trim();
       setAiNote({ kind: 'review', text: raw });
     } catch (err) {
       setAiNote({ kind: 'error', text: 'Review failed — ' + (err.message || 'try again') });
@@ -16338,19 +16086,11 @@ Cash crunch weeks (below reserve): ${crunchWeeks.length > 0 ? crunchWeeks.map(c 
 Top inflows: ${inflows.sort((a,b)=>(b.weekly||0)-(a.weekly||0)).slice(0,3).map(r=>`${r.name} ${fmtFull(r.weekly)}/wk`).join('; ')}
 Top outflows: ${outflows.sort((a,b)=>(b.weekly||0)-(a.weekly||0)).slice(0,3).map(r=>`${r.name} ${fmtFull(r.weekly)}/${r.cadence === 1 ? 'wk' : r.cadence + 'wks'}`).join('; ')}`;
 
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 900,
-          system: `You are a US CPA / fractional CFO reviewing a 13-week cash flow forecast for a small business client. Give a brief, plain-English review (4-6 sentences) that covers: (1) the cash position trajectory, (2) whether the cash crunch weeks are real risks or just timing, (3) one concrete operational action the owner should take this week, and (4) one strategic action for next 30-60 days. Be direct and specific. No preamble.`,
-          messages: [{ role: 'user', content: summary }],
-        }),
-      });
-      if (!res.ok) throw new Error(`API ${res.status}`);
-      const data = await res.json();
-      const raw = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      const raw = (await callClaude({
+        max_tokens: 900,
+        system: `You are a US CPA / fractional CFO reviewing a 13-week cash flow forecast for a small business client. Give a brief, plain-English review (4-6 sentences) that covers: (1) the cash position trajectory, (2) whether the cash crunch weeks are real risks or just timing, (3) one concrete operational action the owner should take this week, and (4) one strategic action for next 30-60 days. Be direct and specific. No preamble.`,
+        messages: [{ role: 'user', content: summary }],
+      })).trim();
       setAiNote({ kind: 'review', text: raw });
     } catch (err) {
       setAiNote({ kind: 'error', text: 'Review failed — ' + (err.message || 'try again') });

@@ -39,6 +39,11 @@ export default async function handler(req, res) {
     });
 
     const text = await upstream.text();
+    if (!upstream.ok) {
+      // Surface Anthropic's actual error in the Vercel function logs so a 401
+      // (bad key), 404 (bad model), or 429 (rate limit) is diagnosable.
+      console.error(`[anthropic-proxy] ${target} -> ${upstream.status}: ${text.slice(0, 500)}`);
+    }
     res.status(upstream.status);
     res.setHeader(
       'content-type',
