@@ -35,6 +35,13 @@ function MyNewTool() {
 If it deals with money, reuse the currency helpers: `const { currency, fxRate, ... } = useCurrency()`
 (~L712) and render `<CurrencyToggle ... />` (~L748; see existing calculators).
 
+**Auth & persistence:** the app is already behind a Supabase login gate, so a tool only ever renders
+for a signed-in user — no auth checks needed inside it. If the tool saves data, just use
+`window.storage` with plain keys (it auto-namespaces per user — see bookkeeper-conventions) and add any
+**new** key to `LEGACY_KEYS` in [src/auth/AuthProvider.jsx](../../../src/auth/AuthProvider.jsx).
+Read auth state when you need it via `const { user, profile } = useAuth()`. Whether a tool is free vs
+paid is a future Phase-2 concern (a `FREE_TABS` allowlist) — don't gate tools yourself now.
+
 ## Step 2 — For an AI-powered tool, use the shared `callClaude()` helper
 
 Every AI feature goes through the **`callClaude()`** helper at the top of the file

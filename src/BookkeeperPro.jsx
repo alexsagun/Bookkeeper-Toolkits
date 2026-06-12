@@ -10,8 +10,10 @@ import {
   Building2, Landmark, CalendarClock, ExternalLink,
   Heart, DollarSign, Phone, AlertCircle, Activity, Clock, Wallet,
   PieChart, Linkedin, ArrowUp, ArrowDown, X, Copy, Check,
-  TrendingUp as Growth, BookMarked, Globe, Coins, GraduationCap
+  TrendingUp as Growth, BookMarked, Globe, Coins, GraduationCap,
+  LogOut, Lock, Mail, KeyRound
 } from 'lucide-react';
+import { useAuth } from './auth/AuthProvider.jsx';
 
 // ═══════════════════════════════════════════════════════════════════
 // SHARED: ANTHROPIC API HELPER
@@ -771,8 +773,465 @@ function CurrencyToggle({ currency, setCurrency, fxRate, setFxRate, compact }) {
   );
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// AUTHENTICATION  (Phase 1 — Supabase email/password)
+// ───────────────────────────────────────────────────────────────────
+// Phase 2 (paywall) seam — when restricting the toolkit to paid students,
+// uncomment a FREE_TABS allowlist here and gate the render switch (see the
+// "Phase 2 paywall hooks" comment near the <main> render switch). The paid
+// flag already rides along on the profile: useAuth().profile?.is_paid.
+//   const FREE_TABS = new Set(['dashboard', 'course', 'calculators']);
+// ───────────────────────────────────────────────────────────────────
+
+// Brief branded splash shown while the initial Supabase session resolves.
+function AuthSplash() {
+  return (
+    <div className="h-screen w-full flex flex-col items-center justify-center gh-app-bg" style={{ fontFamily: fontBody }}>
+      <img src={LOGO_DATA_URI} alt="" style={{ width: 64, height: 64, objectFit: 'contain', filter: 'drop-shadow(0 6px 18px rgba(10,132,255,0.22))' }} />
+      <Loader2 size={22} className="animate-spin mt-6" style={{ color: C.primary }} />
+    </div>
+  );
+}
+
+// Google "G" glyph (lucide has no brand icons) for the one-click sign-in button.
+function GoogleGlyph({ size = 16 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 48 48" aria-hidden="true">
+      <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
+      <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
+      <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
+      <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
+    </svg>
+  );
+}
+
+// "Check your email" panel shown after signup (or an unconfirmed sign-in attempt)
+// when email confirmation is ON. Renders inside the AuthScreen glass card, with a
+// resend button (cooldown-guarded) and a way back to sign in.
+function PendingConfirm({ email, busy, cooldown, err, notice, onResend, onBack }) {
+  return (
+    <>
+      <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+        <div className="flex items-center justify-center mx-auto rounded-2xl" style={{ width: 56, height: 56, background: 'rgba(10,132,255,0.10)' }}>
+          <Mail size={26} style={{ color: C.primary }} />
+        </div>
+        <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>Check your email</div>
+        <div className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>
+          We sent a confirmation link to<br />
+          <span style={{ fontWeight: 700, color: C.text }}>{email}</span>
+        </div>
+      </div>
+      <div className="px-8 py-7 space-y-3.5">
+        <div className="text-center" style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+          Click the link in that email to activate your account — it opens right back here and signs you in.
+        </div>
+        {err && (
+          <div className="flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs" style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: `1px solid rgba(208,35,35,0.18)` }}>
+            <AlertTriangle size={14} className="flex-shrink-0 mt-px" /> <span>{err}</span>
+          </div>
+        )}
+        {notice && (
+          <div className="flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs" style={{ background: 'rgba(40,166,71,0.08)', color: C.green, border: `1px solid rgba(40,166,71,0.18)` }}>
+            <CheckCircle2 size={14} className="flex-shrink-0 mt-px" /> <span>{notice}</span>
+          </div>
+        )}
+        <button onClick={onResend} disabled={busy || cooldown > 0}
+          className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+          style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+          {busy && <Loader2 size={15} className="animate-spin" />}
+          {cooldown > 0 ? `Resend in ${cooldown}s` : 'Resend confirmation email'}
+        </button>
+        <button onClick={onBack} className="w-full text-center font-semibold" style={{ fontSize: 12.5, color: C.primary }}>
+          Back to sign in
+        </button>
+      </div>
+    </>
+  );
+}
+
+// Full-screen login / signup / password-reset gate. Renders instead of the app
+// shell when no user is signed in. Reuses the app's design tokens + glass look.
+function AuthScreen() {
+  const { signIn, signUp, resetPassword, signInWithGoogle, resendConfirmation, configured } = useAuth();
+  const [mode, setMode] = useState('signin'); // 'signin' | 'signup' | 'reset'
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [showPw, setShowPw] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
+  // When set, an account is awaiting email confirmation — show the "check your
+  // email" screen (with resend) instead of the sign-in form.
+  const [pendingEmail, setPendingEmail] = useState('');
+  const [cooldown, setCooldown] = useState(0); // seconds until resend re-enabled
+
+  // Tick down the resend cooldown.
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    const t = setTimeout(() => setCooldown(c => c - 1), 1000);
+    return () => clearTimeout(t);
+  }, [cooldown]);
+
+  const reset = () => { setErr(''); setNotice(''); };
+  const switchMode = (m) => { reset(); setMode(m); };
+  const backToSignIn = () => { setPendingEmail(''); reset(); setMode('signin'); };
+
+  const resend = async () => {
+    if (cooldown > 0 || busy) return;
+    reset();
+    setBusy(true);
+    try {
+      const { error } = await resendConfirmation(pendingEmail);
+      if (error) throw error;
+      setNotice('Confirmation email sent again — check your inbox (and spam).');
+      setCooldown(30);
+    } catch (e2) {
+      setErr(e2?.message || 'Could not resend right now. Please try again shortly.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    reset();
+    if (!configured) { setErr('Sign-in is not configured yet. Add your Supabase keys to .env (see .env.example).'); return; }
+    setBusy(true);
+    try {
+      if (mode === 'reset') {
+        const { error } = await resetPassword(email.trim());
+        if (error) throw error;
+        setNotice('Password reset link sent. Check your email.');
+      } else if (mode === 'signup') {
+        const { data, error } = await signUp(email.trim(), password, fullName.trim());
+        if (error) throw error;
+        // With "Confirm email" ON there is no session yet — show the check-your-email
+        // screen. With confirm OFF, onAuthStateChange fires and the app mounts itself.
+        if (!data.session) setPendingEmail(email.trim());
+      } else {
+        const { error } = await signIn(email.trim(), password);
+        if (error) {
+          // An unconfirmed account can't sign in — route to the check-your-email
+          // screen (with resend) instead of showing a dead-end error.
+          if (error.code === 'email_not_confirmed' || /not\s*confirmed/i.test(error.message || '')) {
+            setPendingEmail(email.trim());
+            return;
+          }
+          throw error;
+        }
+        // success → AuthProvider's onAuthStateChange swaps in the app shell
+      }
+    } catch (e2) {
+      setErr(e2?.message || 'Something went wrong. Please try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const googleSignIn = async () => {
+    reset();
+    if (!configured) { setErr('Sign-in is not configured yet. Add your Supabase keys to .env (see .env.example).'); return; }
+    setBusy(true);
+    try {
+      const { error } = await signInWithGoogle();
+      if (error) throw error;
+      // Success navigates away to Google; on return, AuthProvider mounts the app.
+    } catch (e2) {
+      setErr(e2?.message || 'Could not start Google sign-in.');
+      setBusy(false); // only reached on failure (success leaves the page)
+    }
+  };
+
+  const title = mode === 'signup' ? 'Create your account' : mode === 'reset' ? 'Reset your password' : 'Welcome back';
+  const sub = mode === 'signup'
+    ? 'Start your remote bookkeeping journey.'
+    : mode === 'reset'
+      ? "Enter your email and we'll send a reset link."
+      : 'Sign in to your toolkit.';
+
+  const inputCls = 'w-full pl-10 pr-3 py-2.5 rounded-xl text-sm outline-none transition';
+  const inputStyle = { background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody };
+
+  return (
+    <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+        .gh-app-bg { background:
+          radial-gradient(1200px 600px at 70% -10%, rgba(90,200,250,0.12), transparent 60%),
+          radial-gradient(900px 500px at -10% 110%, rgba(10,132,255,0.10), transparent 55%),
+          ${C.bg}; }
+        .auth-in { animation: authIn .5s cubic-bezier(.16,1,.3,1) both; }
+        @keyframes authIn { from { opacity:0; transform: translateY(10px) scale(.985); } to { opacity:1; transform:none; } }
+      `}</style>
+
+      <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
+        background: GLASS.cardDeep,
+        backdropFilter: 'blur(30px) saturate(180%)',
+        WebkitBackdropFilter: 'blur(30px) saturate(180%)',
+        border: `1px solid ${GLASS.border}`,
+        boxShadow: '0 24px 60px -12px rgba(10,30,80,0.22), inset 0 1px 0 rgba(255,255,255,0.6)',
+      }}>
+        {pendingEmail ? (
+          <PendingConfirm email={pendingEmail} busy={busy} cooldown={cooldown} err={err} notice={notice} onResend={resend} onBack={backToSignIn} />
+        ) : (
+        <>
+        {/* Header */}
+        <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+          <img src={LOGO_DATA_URI} alt="Get Hired With Alex" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
+          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>{title}</div>
+          <div className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>{sub}</div>
+        </div>
+
+        <form onSubmit={submit} className="px-8 py-7 space-y-3.5">
+          {mode !== 'reset' && (
+            <>
+              <button type="button" onClick={googleSignIn} disabled={busy}
+                className="w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2.5 transition hover:opacity-90 disabled:opacity-60"
+                style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text }}>
+                <GoogleGlyph size={16} /> Continue with Google
+              </button>
+              <div className="flex items-center gap-3 py-0.5">
+                <div className="flex-1 h-px" style={{ background: GLASS.borderSoft }} />
+                <span style={{ fontSize: 11, color: C.textMute }}>or</span>
+                <div className="flex-1 h-px" style={{ background: GLASS.borderSoft }} />
+              </div>
+            </>
+          )}
+
+          {mode === 'signup' && (
+            <div className="relative">
+              <User size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+              <input className={inputCls} style={inputStyle} type="text" autoComplete="name" placeholder="Full name"
+                value={fullName} onChange={e => setFullName(e.target.value)} required />
+            </div>
+          )}
+
+          <div className="relative">
+            <Mail size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+            <input className={inputCls} style={inputStyle} type="email" autoComplete="email" placeholder="Email address"
+              value={email} onChange={e => setEmail(e.target.value)} required />
+          </div>
+
+          {mode !== 'reset' && (
+            <div className="relative">
+              <Lock size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+              <input className={inputCls + ' pr-10'} style={inputStyle} type={showPw ? 'text' : 'password'}
+                autoComplete={mode === 'signup' ? 'new-password' : 'current-password'} placeholder="Password"
+                value={password} onChange={e => setPassword(e.target.value)} required minLength={6} />
+              <button type="button" onClick={() => setShowPw(s => !s)} tabIndex={-1}
+                className="absolute right-3 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} aria-label="Toggle password visibility">
+                <Eye size={15} />
+              </button>
+            </div>
+          )}
+
+          {mode === 'signin' && (
+            <div className="text-right">
+              <button type="button" onClick={() => switchMode('reset')} className="text-xs font-medium" style={{ color: C.primary }}>
+                Forgot password?
+              </button>
+            </div>
+          )}
+
+          {err && (
+            <div className="flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs" style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: `1px solid rgba(208,35,35,0.18)` }}>
+              <AlertTriangle size={14} className="flex-shrink-0 mt-px" /> <span>{err}</span>
+            </div>
+          )}
+          {notice && (
+            <div className="flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs" style={{ background: 'rgba(40,166,71,0.08)', color: C.green, border: `1px solid rgba(40,166,71,0.18)` }}>
+              <CheckCircle2 size={14} className="flex-shrink-0 mt-px" /> <span>{notice}</span>
+            </div>
+          )}
+
+          <button type="submit" disabled={busy}
+            className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+            {busy && <Loader2 size={15} className="animate-spin" />}
+            {mode === 'signup' ? 'Create account' : mode === 'reset' ? 'Send reset link' : 'Sign in'}
+          </button>
+        </form>
+
+        {/* Footer mode switch */}
+        <div className="px-8 pb-7 -mt-2 text-center" style={{ fontSize: 12.5, color: C.textSoft }}>
+          {mode === 'signin' && (<>New here? <button onClick={() => switchMode('signup')} className="font-semibold" style={{ color: C.primary }}>Create an account</button></>)}
+          {mode === 'signup' && (<>Already have an account? <button onClick={() => switchMode('signin')} className="font-semibold" style={{ color: C.primary }}>Sign in</button></>)}
+          {mode === 'reset'  && (<>Remembered it? <button onClick={() => switchMode('signin')} className="font-semibold" style={{ color: C.primary }}>Back to sign in</button></>)}
+        </div>
+        </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Shown when a user returns from a password-reset email link (recovery session).
+// Lets them set a new password — then clearRecovery() drops them into the toolkit
+// (they're already signed in via the recovery session).
+function UpdatePasswordScreen() {
+  const { updatePassword, clearRecovery } = useAuth();
+  const [password, setPassword] = useState('');
+  const [showPw, setShowPw] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [done, setDone] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setErr('');
+    setBusy(true);
+    try {
+      const { error } = await updatePassword(password);
+      if (error) throw error;
+      setDone(true);
+    } catch (e2) {
+      setErr(e2?.message || 'Could not update your password. Please try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const inputStyle = { background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody };
+
+  return (
+    <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+        .gh-app-bg { background:
+          radial-gradient(1200px 600px at 70% -10%, rgba(90,200,250,0.12), transparent 60%),
+          radial-gradient(900px 500px at -10% 110%, rgba(10,132,255,0.10), transparent 55%),
+          ${C.bg}; }
+        .auth-in { animation: authIn .5s cubic-bezier(.16,1,.3,1) both; }
+        @keyframes authIn { from { opacity:0; transform: translateY(10px) scale(.985); } to { opacity:1; transform:none; } }
+      `}</style>
+
+      <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
+        background: GLASS.cardDeep,
+        backdropFilter: 'blur(30px) saturate(180%)',
+        WebkitBackdropFilter: 'blur(30px) saturate(180%)',
+        border: `1px solid ${GLASS.border}`,
+        boxShadow: '0 24px 60px -12px rgba(10,30,80,0.22), inset 0 1px 0 rgba(255,255,255,0.6)',
+      }}>
+        <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+          <img src={LOGO_DATA_URI} alt="Get Hired With Alex" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
+          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>Set a new password</div>
+          <div className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>Choose a new password for your account.</div>
+        </div>
+
+        {done ? (
+          <div className="px-8 py-8 space-y-4 text-center">
+            <div className="flex items-center justify-center gap-2 text-sm font-semibold" style={{ color: C.green }}>
+              <CheckCircle2 size={16} /> Password updated.
+            </div>
+            <button onClick={() => clearRecovery()}
+              className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition"
+              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+              Continue to your toolkit
+            </button>
+          </div>
+        ) : (
+          <form onSubmit={submit} className="px-8 py-7 space-y-3.5">
+            <div className="relative">
+              <Lock size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+              <input className="w-full pl-10 pr-10 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
+                type={showPw ? 'text' : 'password'} autoComplete="new-password" placeholder="New password"
+                value={password} onChange={e => setPassword(e.target.value)} required minLength={6} />
+              <button type="button" onClick={() => setShowPw(s => !s)} tabIndex={-1}
+                className="absolute right-3 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} aria-label="Toggle password visibility">
+                <Eye size={15} />
+              </button>
+            </div>
+
+            {err && (
+              <div className="flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs" style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: `1px solid rgba(208,35,35,0.18)` }}>
+                <AlertTriangle size={14} className="flex-shrink-0 mt-px" /> <span>{err}</span>
+              </div>
+            )}
+
+            <button type="submit" disabled={busy}
+              className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+              {busy && <Loader2 size={15} className="animate-spin" />} Update password
+            </button>
+          </form>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// First-login welcome. Shown once per user (gated on the namespaced
+// `onboarding:welcomed` storage flag) so a brand-new account is greeted and
+// oriented to the three career stages instead of landing on a blank dashboard.
+function WelcomeOverlay({ name, onClose }) {
+  const first = (name || '').trim().split(/\s+/)[0] || 'there';
+  const stages = [
+    { n: '01', label: 'Training & Skills', desc: 'Master the accounting foundations and the tools US clients expect.' },
+    { n: '02', label: 'Job Application', desc: 'Build authentic branding and ace interviews & discovery calls.' },
+    { n: '03', label: 'Client Management', desc: 'Run engagements, deliver the books, and grow your practice.' },
+  ];
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-6"
+      style={{ background: 'rgba(10,20,40,0.45)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)', fontFamily: fontBody, color: C.text }}>
+      <style>{`.welcome-in{animation:welcomeIn .5s cubic-bezier(.16,1,.3,1) both}@keyframes welcomeIn{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:none}}`}</style>
+      <div className="welcome-in w-full max-w-lg rounded-3xl overflow-hidden" style={{
+        background: GLASS.cardDeep,
+        backdropFilter: 'blur(30px) saturate(180%)',
+        WebkitBackdropFilter: 'blur(30px) saturate(180%)',
+        border: `1px solid ${GLASS.border}`,
+        boxShadow: '0 24px 60px -12px rgba(10,30,80,0.28), inset 0 1px 0 rgba(255,255,255,0.6)',
+      }}>
+        <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+          <img src={LOGO_DATA_URI} alt="" style={{ width: 52, height: 52, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
+          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 20, letterSpacing: '-0.02em' }}>Welcome, {first}! 👋</div>
+          <div className="mt-1.5" style={{ fontSize: 13, color: C.textSoft, maxWidth: 400, margin: '6px auto 0', lineHeight: 1.5 }}>
+            Your complete toolkit to launch and grow a remote bookkeeping career serving US clients. Here's the journey ahead:
+          </div>
+        </div>
+        <div className="px-8 py-6 space-y-3">
+          {stages.map(s => (
+            <div key={s.n} className="flex items-start gap-3 p-3 rounded-2xl" style={{ background: GLASS.card, border: `1px solid ${GLASS.borderSoft}` }}>
+              <div className="flex items-center justify-center flex-shrink-0 rounded-xl text-white text-xs font-bold"
+                style={{ width: 34, height: 34, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>{s.n}</div>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 13.5 }}>{s.label}</div>
+                <div style={{ fontSize: 12, color: C.textSoft, lineHeight: 1.45 }}>{s.desc}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="px-8 pb-7">
+          <button onClick={onClose}
+            className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+            Start exploring <Sparkles size={15} />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function BookkeeperProToolkit() {
+  const { user, profile, loading, recovery, signOut } = useAuth();
   const [tab, setTab] = useState('dashboard');
+
+  // First-login welcome — shown once per user. The flag lives in the per-user
+  // namespaced storage, so each new account sees it exactly once.
+  const [showWelcome, setShowWelcome] = useState(false);
+  useEffect(() => {
+    if (!user) return;
+    let active = true;
+    window.storage.get('onboarding:welcomed')
+      .then(r => { if (active && !r?.value) setShowWelcome(true); })
+      .catch(() => {});
+    return () => { active = false; };
+  }, [user?.id]);
+  const dismissWelcome = () => {
+    setShowWelcome(false);
+    window.storage.set('onboarding:welcomed', '1').catch(() => {});
+  };
 
   // Career journey stages — DEFAULTS. Users can rename, reorder, and collapse them.
   // All customization is persisted to window.storage so it survives page reloads.
@@ -1118,8 +1577,14 @@ export default function BookkeeperProToolkit() {
     dragRef.current = { kind: null, stageId: null, tabId: null };
   };
 
+  // ── Auth gate ── unauthenticated users never see the app shell below.
+  if (loading)  return <AuthSplash />;
+  if (recovery) return <UpdatePasswordScreen />;  // returned from a reset-link
+  if (!user)    return <AuthScreen />;
+
   return (
     <div data-theme="light" style={{ fontFamily: fontBody, color: C.text }} className="h-screen w-full flex overflow-hidden gh-app-bg">
+      {showWelcome && <WelcomeOverlay name={profile?.full_name || user?.email} onClose={dismissWelcome} />}
       {/* Font import + global styles */}
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
@@ -1480,6 +1945,26 @@ export default function BookkeeperProToolkit() {
             </div>
           </div>
 
+          {/* Signed-in identity + sign out */}
+          {user && (
+            <div className="mt-4 flex items-center gap-2.5 px-2.5 py-2 rounded-xl" style={{ background: 'rgba(15,18,23,0.035)', border: `1px solid ${GLASS.borderSoft}` }}>
+              <div className="flex items-center justify-center flex-shrink-0 rounded-full text-white text-[11px] font-bold"
+                style={{ width: 30, height: 30, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+                {(((profile?.full_name || user.email || '?').trim()[0]) || '?').toUpperCase()}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="truncate" style={{ fontSize: 12, fontWeight: 600, color: C.text, lineHeight: 1.2 }}>
+                  {profile?.full_name || user.email?.split('@')[0]}
+                </div>
+                <div className="truncate" style={{ fontSize: 10, color: C.textMute, lineHeight: 1.3 }}>{user.email}</div>
+              </div>
+              <button onClick={() => signOut()} title="Sign out"
+                className="flex-shrink-0 p-1.5 rounded-lg transition hover:opacity-80" style={{ color: C.textMute }}>
+                <LogOut size={15} />
+              </button>
+            </div>
+          )}
+
           {/* Edit-mode toggle */}
           <div className="mt-4 flex items-center gap-2">
             <button onClick={() => { setEditMode(!editMode); setEditingTabId(null); setEditingStageId(null); }}
@@ -1700,6 +2185,9 @@ export default function BookkeeperProToolkit() {
 
       {/* MAIN */}
       <main className="flex-1 overflow-y-auto">
+        {/* Phase 2 paywall hooks here — to restrict to paid students, wrap this
+            <div> so that `!profile?.is_paid && !FREE_TABS.has(tab)` renders a
+            <PaywallOverlay/> instead of the tool. profile.is_paid comes from useAuth(). */}
         <div key={tab} className="fade-in p-10 max-w-7xl mx-auto">
           {tab === 'dashboard'   && <Dashboard goto={setTab} />}
           {tab === 'coa'         && <CoaGenerator />}

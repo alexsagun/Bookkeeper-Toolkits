@@ -22,6 +22,8 @@ templates) run fully offline with no API key.
 - **Tailwind CSS via CDN** (loaded in [index.html](index.html)) — utility classes work, but there is no `tailwind.config.js` and no JIT/build step for styles.
 - **Lucide React** for icons, **XLSX** (spreadsheet parse/generate), **Mammoth** (.docx parse).
 - **Anthropic Claude API** for AI features, via a key-hiding proxy (see below).
+- **Supabase** (`@supabase/supabase-js`) for **user authentication** (email/password signup & login).
+  See the "Authentication" section below. This is Phase 1; a paid-subscriber gate is the planned Phase 2.
 
 ## Commands
 
@@ -44,13 +46,26 @@ explicitly requested (see Roadmap, Phase 3).
 
 ### [src/main.jsx](src/main.jsx) — entry + two critical shims (do not remove)
 
-Mounts `<BookkeeperProToolkit />` and installs two shims that the tool code depends on:
+Mounts `<BookkeeperProToolkit />` (wrapped in `<AuthProvider>` — see Authentication) and installs
+two shims that the tool code depends on:
 
 1. **`window.storage`** → wraps `localStorage` with an async `get`/`set` API. The app was authored
-   in Claude artifacts and calls `window.storage` directly for all persistence.
+   in Claude artifacts and calls `window.storage` directly for all persistence. **Now per-user
+   namespaced:** [AuthProvider](src/auth/AuthProvider.jsx) calls `window.__setStorageUser(uid)` on
+   every session change, so each get/set transparently reads/writes `u:<uid>:<key>` — isolating each
+   account's data with **zero changes to the ~60 tools** (they still pass plain keys). Supabase's own
+   `sb-*` session key is written directly by supabase-js and is **not** namespaced.
 2. **fetch shim** → rewrites any request to `https://api.anthropic.com` → `/api/anthropic`. Tool
    code calls the *real* Anthropic URL; this shim redirects it to the proxy so the API key stays
-   server-side. **Removing either shim breaks persistence or AI calls.**
+   server-side. (It only matches `api.anthropic.com`, so Supabase calls to `*.supabase.co` pass
+   through untouched.) **Removing either shim breaks persistence or AI calls.**
+
+### [src/lib/supabase.js](src/lib/supabase.js) + [src/auth/AuthProvider.jsx](src/auth/AuthProvider.jsx) — auth infra
+
+The **two sanctioned exceptions** to the single-file rule (same spirit as the `main.jsx` shims):
+- `lib/supabase.js` — the single Supabase client, built from `VITE_SUPABASE_URL` /
+  `VITE_SUPABASE_ANON_KEY` (public anon key; safe in the bundle — RLS is the real boundary).
+- `auth/AuthProvider.jsx` — the `AuthProvider` + `useAuth()` hook (see Authentication).
 
 ### [src/BookkeeperPro.jsx](src/BookkeeperPro.jsx) — the entire app (~15.1k lines)
 
@@ -84,6 +99,32 @@ A single `tab` string in the root selects which tool renders. Three pieces must 
 3. **Dashboard roadmap tiles** (~L1756–1829): optional `{ id, label, desc, icon, color }` entries.
 
 Sidebar customizations (rename, reorder, collapse) persist to `window.storage` under `sidebar:*` keys.
+
+## Authentication (Supabase — Phase 1)
+
+The whole app sits behind a **Supabase email/password auth gate**. Anonymous visitors see a
+full-screen login/signup screen; only signed-in users reach the toolkit.
+
+- **Provider/hook:** [src/auth/AuthProvider.jsx](src/auth/AuthProvider.jsx) wraps the app in
+  [main.jsx](src/main.jsx). Any component reads auth via `const { session, user, profile, loading,
+  configured, signUp, signIn, signOut, resetPassword } = useAuth()`. `profile` is the row from the
+  Supabase `profiles` table and carries `is_paid` / `plan` (used by the planned Phase-2 paywall).
+- **The gate** lives in `BookkeeperProToolkit` just before its root `return` (~L1121): `if (loading)
+  return <AuthSplash/>; if (!user) return <AuthScreen/>;`. `AuthScreen` (defined just above the root
+  component) is the login/signup/reset UI, built from the design tokens (`C`, `SHEEN`, `GLASS`,
+  `fontDisplay`, `LOGO_DATA_URI`).
+- **Sign-out + identity** render in the sidebar header (just below the "built by Alex Sagun" line).
+- **Per-user data:** all `window.storage` keys are auto-namespaced per user (see the main.jsx shim
+  note). Tools need no changes. A one-time migration in `AuthProvider` adopts any pre-auth global
+  keys into the first signed-in account (guarded by `auth:legacyMigratedTo`). The canonical legacy-key
+  list lives in `AuthProvider.jsx` (`LEGACY_KEYS`) — **add to it whenever a tool introduces a new
+  persisted key.**
+- **Backend setup:** a `profiles` table + RLS + a signup trigger must exist in Supabase. Email
+  confirmation and Site/Redirect URLs are configured in the Supabase dashboard. See README / the
+  setup steps for the exact SQL.
+- **Phase 2 (not built):** restrict tools to paid students via a `FREE_TABS` allowlist + a paywall
+  overlay at the render switch (`// Phase 2 paywall hooks here` comment), with `is_paid` flipped
+  **server-side** by a Stripe/Gumroad webhook (never client-side — tighten the RLS update policy then).
 
 ## AI / proxy pattern
 
@@ -131,6 +172,11 @@ const { text, data } = await callClaude({ system, messages }, { returnData: true
 - Get a key at https://console.anthropic.com/, then `npm run dev`.
 - Without a key: AI tools fail gracefully; everything non-AI still works.
 - The key is **only** ever read server-side (Vite proxy in dev, Vercel function in prod).
+- `VITE_SUPABASE_URL` + `VITE_SUPABASE_ANON_KEY` (auth) also live in `.env`. Unlike the Anthropic key,
+  these are **`VITE_`-prefixed and public** — Vite inlines them into the browser bundle at **build**
+  time, so they must be set in Vercel (Prod + Preview) *before* building. The anon key is safe to
+  expose; Supabase **Row Level Security** is the real boundary. Without them, the app loads but the
+  auth screen shows a "not configured" notice.
 
 ## Deployment
 
@@ -167,6 +213,9 @@ docs **in the same change**:
   **bookkeeper-conventions**.
 - **The tool set** (added/removed/renamed tools, or large line drift) → refresh the architecture-map
   table and notable-tools anchors here.
+- **Auth** (the `useAuth()` shape, the gate, the storage-namespacing, the `profiles` schema, or the
+  `LEGACY_KEYS` inventory) → update the "Authentication" section here **and** the persistence notes in
+  **bookkeeper-conventions**.
 
 Line anchors are approximate and drift as the file grows — confirm with `Grep` before relying on them,
 and re-baseline the table when they've moved substantially.
@@ -185,3 +234,13 @@ A living plan — each phase is independent and can be approved/started on its o
 - **Phase 3 — Incremental code quality:** extract shared helpers opportunistically; only when a tool is
   already being edited, optionally split the largest components into their own files — no big-bang
   rewrite; single-file remains the default.
+
+### Authentication track (separate from the phases above)
+
+- **Auth Phase 1 — Signup/login (done):** Supabase email/password gate, `AuthProvider`/`useAuth()`,
+  per-user storage namespacing + legacy migration, sidebar identity/sign-out. See the Authentication
+  section. Requires the Supabase `profiles` table/RLS/trigger + the two `VITE_SUPABASE_*` env vars.
+- **Auth Phase 2 — Restrict to paid students (planned):** free-preview gating via a `FREE_TABS`
+  allowlist + a paywall overlay at the render switch; `is_paid` flipped server-side by a Stripe/Gumroad
+  checkout webhook (provider choice TBD); tighten the `profiles` RLS so users can't self-grant. Optional
+  later: full cloud data sync (move tool data from namespaced localStorage into Supabase for cross-device).

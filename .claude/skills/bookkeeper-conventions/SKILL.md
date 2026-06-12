@@ -63,6 +63,20 @@ See the **add-bookkeeper-tool** skill for the full copy-paste snippet, and `Bank
   Sidebar layout persists under `sidebar:*` keys (`sidebar:stages` / `sidebar:collapsed` /
   `sidebar:expandedGroups`, ~L940–988).
 
+- **Per-user namespacing is automatic.** `window.storage` keys are transparently scoped to the
+  signed-in user (`u:<uid>:<key>`) by the shim in `main.jsx`. Keep calling `window.storage` with
+  **plain keys** — do **not** add a uid prefix yourself. When you add a **new persisted key**, also add
+  it to the `LEGACY_KEYS` list in [src/auth/AuthProvider.jsx](../../../src/auth/AuthProvider.jsx) so a
+  pre-auth value gets migrated into the first account.
+
+## Auth context (`useAuth()`)
+
+Auth is available app-wide via `import { useAuth } from './auth/AuthProvider.jsx'`:
+`const { user, profile, loading, signOut } = useAuth()`. `user` is the Supabase user (`user.email`),
+`profile` is the `profiles` row (`profile.full_name`, and `profile.is_paid`/`plan` reserved for the
+Phase-2 paid gate). The app is already gated — every tool renders only for a signed-in user, so you
+don't need to add auth checks inside a tool. See the "Authentication" section in CLAUDE.md.
+
 ## File import / export
 
 - **Download/export:** use the `downloadFile(content, filename, mimeType)` helper (~L679) — e.g.
