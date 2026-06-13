@@ -143,7 +143,9 @@ domain you control DNS for — a `*.vercel.app` subdomain will **not** work.)
 3. **API Keys → Create API Key** → copy it (starts `re_…`).
 4. In **Supabase → Project Settings → Authentication → SMTP Settings** → enable **Custom SMTP**:
    - **Host** `smtp.resend.com` · **Port** `465` · **Username** `resend` · **Password** = the `re_…` key
-   - **Sender email** `noreply@yourdomain.com` · **Sender name** `Get Hired With Alex`
+   - **Sender email** `noreply@yourdomain.com` (warmer alternative: `alex@yourdomain.com` or
+     `hello@yourdomain.com` — pairs well with the "from Alex" sender name)
+   - **Sender name** `Sign in to toolkits from Alex`
    - **Save.** This also lifts the built-in rate limit.
 
 ## 4d. Brand the email templates
