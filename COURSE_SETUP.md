@@ -30,10 +30,30 @@ by Row Level Security, not just the UI).
 > schema change). The Resume and Interview courses use other slug prefixes, so they stay on their own
 > tabs and do **not** appear in this catalog.
 >
+> **Per-card ⋮ action menu (admin only).** Each course card has a 3-dot menu with **Edit course**,
+> **Duplicate course**, **Set cover image**, **Move up/down**, and **Delete course**. Students never
+> see it.
+>
+> **Duplicate course (monthly re-runs).** **⋮ → Duplicate course** clones a course's structure +
+> lessons into a **new independent DRAFT** ("Copy of …"), reusing the original's video links/uploads
+> and cover **by reference** (no files are copied — copy-on-write), and stamping `source_course_id`
+> for lineage. Per-user data (progress, completions, certificates) is **not** copied. The copy opens
+> straight in the builder so you can rename it, set the **Month** field (e.g. May → June), tweak
+> lessons, and publish. Because videos are shared until you change them, **storage deletes are
+> reference-aware**: replacing/deleting a lesson video or deleting a whole course only removes a file
+> when **no other course still references it**, so deleting one monthly edition never breaks another.
+>
 > **Removing test/dummy content:** sign in as an admin and delete it **in-app** — the catalog's
-> **Delete course** button purges the course's uploaded videos + cover from storage and cascades the
-> row deletion (modules, lessons, progress, completions); deleting a single lesson also removes its
-> uploaded file. No manual SQL or Storage cleanup required.
+> **Delete course** (⋮ menu) cascades the row deletion (modules, lessons, progress, completions) and
+> purges the course's uploaded videos + cover from storage **unless a duplicated course still uses
+> them**; deleting a single lesson behaves the same way. No manual SQL or Storage cleanup required.
+>
+> **Troubleshooting — Duplicate fails with a red banner / `400` in the console.** If **⋮ → Duplicate
+> course** errors and DevTools shows `POST …/rest/v1/courses → 400` (expand the logged error: `code`
+> is `PGRST204` or `42703`, "Could not find the 'source_course_id' column …"), the duplicate-course
+> migration hasn't been applied to this project. Run the two `alter table public.courses …` statements
+> above (the `month` + `source_course_id` columns) **plus** `notify pgrst, 'reload schema';` in the SQL
+> Editor, then retry. The in-app banner now spells out the exact Postgres error and this fix.
 
 ---
 
@@ -80,11 +100,18 @@ create table if not exists public.courses (
   subtitle    text,
   description text,
   cover_path  text,
+  month       text,                                                  -- optional label for monthly re-runs (e.g. "June 2026")
+  source_course_id uuid references public.courses(id) on delete set null, -- set when a course was duplicated from another (lineage)
   published   boolean not null default false,
   position    integer not null default 0,
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
+-- For projects created before the duplicate-course feature: add the two columns if missing (idempotent).
+alter table public.courses add column if not exists month text;
+alter table public.courses add column if not exists source_course_id uuid
+  references public.courses(id) on delete set null;
+notify pgrst, 'reload schema';  -- make PostgREST pick up the new columns immediately (avoids the 400 below)
 
 create table if not exists public.course_modules (
   id         uuid primary key default gen_random_uuid(),

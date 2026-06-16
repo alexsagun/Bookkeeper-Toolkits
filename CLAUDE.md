@@ -80,16 +80,17 @@ progress live in Supabase so they reach **all** students across devices. Two pie
   `embedded`. `load()` looks up by `courseId` when given, else by `slug`. The header is rendered when
   `showHead = !embedded && !onBack`.
 - **`CourseCatalog`** — a Thinkific-style **multi-course catalog**, **prefix-parameterized** so the
-  same component powers more than one catalog. Admins create/manage many courses from one dashboard
-  (cover image, reorder, publish, **delete**); students browse published course cards and open one to
-  learn (it hands off to `<CourseProgram courseId … onBack …/>`, keyed so each course gets clean
-  state). Props (all default to the QBO catalog, so `<CourseCatalog />` is unchanged): **`prefix`**
-  (the `courses.slug` namespace, e.g. `'qbo-'` or `'interview-'`; drives the `ilike '<prefix>%'`
-  filter, the auto-slug, and isolation between catalogs), **`embedded`** (drop the page `SectionHead`
-  when nested in a subtab), and copy props `eyebrow` / `title` / `adminDesc` / `studentDesc` /
-  `newCourseTitle` / `comingSoonDesc`. Each prefix is its own namespace, so catalogs never see each
-  other's courses. **Zero schema change** (reuses the `courses.slug` prefix + the `cover_path` /
-  `position` columns).
+  same component powers more than one catalog. Admins manage each course from a per-card **3-dot (⋮)
+  action menu** (Edit / **Duplicate** / Set cover / Move up·down / Delete; admin-only, closes on
+  outside-click or Escape); students browse published course cards and open one to learn (it hands off
+  to `<CourseProgram courseId … onBack … initialNotice? …/>`, keyed so each course gets clean state).
+  Props (all default to the QBO catalog, so `<CourseCatalog />` is unchanged): **`prefix`** (the
+  `courses.slug` namespace, e.g. `'qbo-'` or `'interview-'`; drives the `ilike '<prefix>%'` filter, the
+  auto-slug, and isolation between catalogs), **`embedded`** (drop the page `SectionHead` when nested
+  in a subtab), and copy props `eyebrow` / `title` / `adminDesc` / `studentDesc` / `newCourseTitle` /
+  `comingSoonDesc`. Each prefix is its own namespace, so catalogs never see each other's courses.
+  Catalogs reuse the `courses.slug` prefix + the `cover_path` / `position` / **`month`** /
+  **`source_course_id`** columns (the last two were added for duplication — see COURSE_SETUP.md).
 
 Wrappers:
 - `QBOMastery()` — the `qbomastery` tab (Training & Skills) → **`<CourseCatalog />`** (defaults →
@@ -107,19 +108,29 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
 `<CourseCatalog prefix="…" …/>` with its own prefix + copy and wire the nav sync points. To add a
 *single-course* tab, write a `CourseProgram` wrapper with its own `slug` + labels.
 
-- **Tables:** `courses` → `course_modules` → `course_lessons` (`type` video/text, link or uploaded
-  video), `lesson_progress` (per-user completion), `course_completions` (stamps the certificate date).
-  All keyed by `course_id`, so one schema serves every course.
+- **Tables:** `courses` (incl. `month` label + `source_course_id` lineage for duplicates) →
+  `course_modules` → `course_lessons` (`type` video/text, link or uploaded video), `lesson_progress`
+  (per-user completion), `course_completions` (stamps the certificate date). All keyed by `course_id`,
+  so one schema serves every course.
 - **Admin gate:** `profiles.is_admin` + a `public.is_admin()` SQL helper. RLS lets any signed-in user
   read **published** content but only admins write course content (UI also hides the builder/catalog
   controls). Progress rows are row-locked to the owning user.
 - **In-app course creation:** `CourseCatalog.createCourse()` (admin) inserts a `<prefix>-*` row and
   drops into its builder — no SQL seed. (The single-course wrappers also keep a
   `CourseProgram.createCourse()` empty-state button for their fixed slug.)
-- **In-app delete = data cleanup:** `CourseCatalog.deleteCourse()` purges the course's storage files
-  (`lessons/{id}/*` + `covers/{id}/*`) then deletes the row (FK cascade clears modules/lessons/
-  progress/completions); `CourseProgram.deleteLesson()` removes an uploaded lesson's storage object too
-  (no orphans). This is how dummy/test content is removed — admins delete it in-app.
+- **In-app duplication:** `CourseCatalog.duplicateCourse()` (⋮ → Duplicate) clones a course's row +
+  modules + lessons into a new **draft** "Copy of …" (3 inserts via client-generated module UUIDs;
+  rollback-deletes the new course if any child insert fails), **reusing** the original's
+  `video_url`/`storage_path`/`cover_path` by reference (copy-on-write — no files copied) and setting
+  `source_course_id`. Per-user `lesson_progress`/`course_completions` are **not** copied. It then opens
+  the copy in the builder with a one-time success banner (`CourseProgram`'s `initialNotice` prop).
+- **In-app delete = data cleanup (reference-aware):** `CourseCatalog.deleteCourse()` deletes the row
+  (FK cascade clears modules/lessons/progress/completions) then calls the module-level
+  `removeMediaIfUnreferenced()` to purge the course's storage files **only when no other course still
+  references them** (so deleting one monthly edition never breaks a duplicate that reused its videos).
+  The same helper guards `uploadCover()` and `CourseProgram`'s `saveLesson()`/`deleteLesson()` (always
+  called *after* the row update/delete). This is how dummy/test content is removed — admins delete it
+  in-app.
 - **Storage:** a public `course-media` bucket streams uploaded videos (`lessons/{course.id}/…`) and
   course covers (`covers/{course.id}/…`); write/delete restricted to admins. Videos can also be
   YouTube/Vimeo/MP4 **links**. Uploads are guarded client-side (video ≤ 50 MB; cover image ≤ 5 MB).

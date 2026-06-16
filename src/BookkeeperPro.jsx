@@ -12,7 +12,7 @@ import {
   PieChart, Linkedin, ArrowUp, ArrowDown, X, Copy, Check,
   TrendingUp as Growth, BookMarked, Globe, Coins, GraduationCap,
   LogOut, Lock, Mail, KeyRound, Menu,
-  Plus, Trash2, Save, Play, Video, ArrowRight, ArrowLeft, ChevronUp
+  Plus, Trash2, Save, Play, Video, ArrowRight, ArrowLeft, ChevronUp, MoreVertical
 } from 'lucide-react';
 import { useAuth } from './auth/AuthProvider.jsx';
 import { supabase } from './lib/supabase';
@@ -2373,9 +2373,9 @@ function Dashboard({ goto }) {
         { id: 'brand',         label: 'Authentic Branding',       desc: 'Psychological deep-dive to your brand', icon: User,      color: '#0A1E3F' },
         // Profile Optimization
         { id: 'resumestrategy', label: 'Resume Winning Strategy',  desc: 'Video courses · certificates',           icon: GraduationCap, color: '#1E40AF' },
-        { id: 'linkedinopt',   label: 'LinkedIn Optimizer',       desc: 'Headline, About, experience rewrites',  icon: Linkedin,  color: '#0EA5E9' },
+        { id: 'linkedinopt',   label: 'LinkedIn Optimizer',       desc: '1-on-1 LinkedIn optimization session',  icon: Linkedin,  color: '#0EA5E9' },
         // Interview
-        { id: 'coachalex',     label: 'Coach Alex AI',            desc: 'Live career coach · 12-yr accountant',  icon: MessageCircle, color: '#0EA5E9' },
+        { id: 'coachalex',     label: 'Coach Alex AI',            desc: 'Book 1-on-1 coaching with Alex',  icon: MessageCircle, color: '#0EA5E9' },
         { id: 'interview',     label: 'Job Interview Mastery',     desc: 'Strategy course + CAR + Q&A + negotiation',  icon: Mic,       color: '#3B82F6' },
         { id: 'mockinterview', label: 'Mock Interview Simulator', desc: 'AI plays US firm partner',              icon: Mic,       color: '#059669' },
         { id: 'qbdiag',        label: 'Free QB Diagnostic',       desc: 'Hook prospects · audit P&L + BS',       icon: Shield,    color: '#DC2626' },
@@ -2401,7 +2401,7 @@ function Dashboard({ goto }) {
         { id: 'coa',          label: 'Chart of Accounts',      desc: '17 industries, QBO-import ready', icon: FileSpreadsheet, color: '#0A1E3F' },
         { id: 'invoice',      label: 'Invoice Creator',        desc: 'Branded invoices + timesheet',    icon: Receipt,       color: '#0EA5E9' },
         // Daily Tasks
-        { id: 'cpaai',        label: 'US CPA AI',              desc: '20-yr CPA · GAAP · Tax · QBO',    icon: MessageCircle, color: '#0EA5E9' },
+        { id: 'cpaai',        label: 'US CPA AI',              desc: '1-on-1 US CPA guidance session',    icon: MessageCircle, color: '#0EA5E9' },
         { id: 'bankfeed',     label: 'Bank Feed AI',           desc: 'Vendor + account suggestions',    icon: Receipt,       color: '#0A1E3F' },
         { id: 'converter',    label: 'Statement → CSV',        desc: 'PDF/Image/Text → clean CSV',      icon: FileText,      color: '#0EA5E9' },
         { id: 'emails',       label: 'Email Templates',        desc: '12 templates ready to send',      icon: Send,          color: '#1E40AF' },
@@ -2830,13 +2830,15 @@ function CourseProgram({
   certFileName = 'QBO-Mastering-Certificate.pdf',
   comingSoonText = 'Your QuickBooks Online Mastering Programme is being prepared. Check back soon.',
   embedded = false,                                      // hide the sticky SectionHead when nested inside a subtab
+  initialNotice = null,                                  // one-time success banner (e.g. after duplicating a course)
 } = {}) {
   const { user, profile } = useAuth();
   const isAdmin = !!profile?.is_admin;
   const showHead = !embedded && !onBack;                 // the catalog/suite supplies its own header instead
 
   const [course, setCourse] = useState(null);
-  const [courseDraft, setCourseDraft] = useState({ title: '', subtitle: '', description: '' });
+  const [courseDraft, setCourseDraft] = useState({ title: '', subtitle: '', description: '', month: '' });
+  const [notice, setNotice] = useState(initialNotice);   // dismissible green banner shown once on arrival
   const [modules, setModules] = useState([]);            // [{ ...module, lessons: [...] }]
   const [doneIds, setDoneIds] = useState(new Set());
   const [completion, setCompletion] = useState(null);
@@ -2845,7 +2847,7 @@ function CourseProgram({
   const [err, setErr] = useState('');
   const [notConfigured, setNotConfigured] = useState(false); // Supabase course tables not created yet
   const [creating, setCreating] = useState(false);       // admin bootstrapping the course row
-  const [mode, setMode] = useState('learn');             // 'learn' | 'edit' | 'certificate'
+  const [mode, setMode] = useState(initialNotice ? 'edit' : 'learn'); // 'learn' | 'edit' | 'certificate' (open builder when arriving via duplicate)
 
   // Builder state
   const [editingLesson, setEditingLesson] = useState(null);  // draft copy of a lesson row
@@ -2875,7 +2877,7 @@ function CourseProgram({
       setCourse(courseRow);
       setCourseDraft({
         title: courseRow.title || '', subtitle: courseRow.subtitle || '',
-        description: courseRow.description || '',
+        description: courseRow.description || '', month: courseRow.month || '',
       });
 
       const [{ data: mods, error: mErr }, { data: lessons, error: lErr }] = await Promise.all([
@@ -2986,7 +2988,8 @@ function CourseProgram({
     try {
       const { error } = await supabase.from('courses').update({
         title: courseDraft.title, subtitle: courseDraft.subtitle,
-        description: courseDraft.description, updated_at: new Date().toISOString(),
+        description: courseDraft.description, month: (courseDraft.month || '').trim() || null,
+        updated_at: new Date().toISOString(),
       }).eq('id', course.id);
       if (error) throw error;
       await load();
@@ -3059,12 +3062,12 @@ function CourseProgram({
   async function deleteLesson(l) {
     if (!window.confirm(`Delete lesson "${l.title}"?`)) return;
     try {
-      // Remove the uploaded video from storage first so deleting a lesson never leaves an orphan file.
-      if (l.video_provider === 'upload' && l.storage_path) {
-        try { await supabase.storage.from('course-media').remove([l.storage_path]); } catch (_) { /* best-effort */ }
-      }
       const { error } = await supabase.from('course_lessons').delete().eq('id', l.id);
       if (error) throw error;
+      // Purge the uploaded video AFTER the row delete — and only if no other course (e.g. a
+      // duplicate that reused this path) still references it. Order matters: deleting first means
+      // this lesson's own reference is gone before the check.
+      if (l.video_provider === 'upload' && l.storage_path) await removeMediaIfUnreferenced([l.storage_path]);
       setActiveLessonId(prev => (prev === l.id ? null : prev)); // don't keep a deleted lesson active
       await load();
     } catch (e) { setErr(e.message || 'Could not delete lesson.'); }
@@ -3132,10 +3135,9 @@ function CourseProgram({
       };
       const { error } = await supabase.from('course_lessons').update(payload).eq('id', d.id);
       if (error) throw error;
-      // If a previously-uploaded file was replaced or removed, purge the old object.
-      if (oldPath && oldPath !== payload.storage_path) {
-        try { await supabase.storage.from('course-media').remove([oldPath]); } catch (_) { /* best-effort */ }
-      }
+      // If a previously-uploaded file was replaced or removed, purge the old object — but only if no
+      // other course (e.g. a duplicate that reused this path) still references it (copy-on-write).
+      if (oldPath && oldPath !== payload.storage_path) await removeMediaIfUnreferenced([oldPath]);
       if (previewUrl) { URL.revokeObjectURL(previewUrl); setPreviewUrl(null); }
       setEditingLesson(null);
       await load();
@@ -3359,6 +3361,12 @@ function CourseProgram({
                 className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
             </label>
             <label className="block sm:col-span-2">
+              <span className="text-xs font-semibold text-slate-500 inline-flex items-center gap-1.5"><CalendarClock size={13} /> Month / cohort <span className="font-normal text-slate-400">· optional, e.g. for monthly re-runs</span></span>
+              <input value={courseDraft.month} onChange={e => setCourseDraft(d => ({ ...d, month: e.target.value }))}
+                placeholder="e.g. June 2026"
+                className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+            </label>
+            <label className="block sm:col-span-2">
               <span className="text-xs font-semibold text-slate-500">Description</span>
               <textarea value={courseDraft.description} onChange={e => setCourseDraft(d => ({ ...d, description: e.target.value }))} rows={2}
                 className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
@@ -3557,6 +3565,14 @@ function CourseProgram({
     </div>
   ) : null;
 
+  const noticeBanner = notice ? (
+    <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: '#ECFDF5', borderColor: '#6EE7B7' }}>
+      <CheckCircle2 size={18} className="text-emerald-600 mt-0.5 flex-shrink-0" />
+      <div className="text-sm text-emerald-800 flex-1">{notice}</div>
+      <button onClick={() => setNotice(null)} className="text-emerald-500 hover:text-emerald-700"><X size={16} /></button>
+    </div>
+  ) : null;
+
   // In catalog mode, give the open course a back button + its own compact header (the catalog supplies the page title).
   const backBar = onBack ? (
     <div className="mb-4 flex items-center gap-3 flex-wrap">
@@ -3642,6 +3658,7 @@ function CourseProgram({
           </div>
         )}
       </div>
+      {noticeBanner}
       {errorBanner}
 
       {mode === 'certificate'
@@ -3662,6 +3679,58 @@ function slugify(title, prefix = 'qbo-') {
   const base = String(title || '').toLowerCase().normalize('NFKD')
     .replace(/[^\w\s-]/g, '').trim().replace(/[\s_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48);
   return prefix + (base || 'course');
+}
+
+// Delete storage objects ONLY if no surviving course still references them. Course duplication
+// reuses the original's video/cover paths (copy-on-write), so a path can be shared by several
+// courses; blindly removing it when one course is deleted/edited would break the others. A path
+// is "still used" if it appears as a lesson's storage_path or a course's cover_path anywhere.
+// ALWAYS call this AFTER the relevant row update/delete, so the just-changed row no longer counts.
+// Shared by CourseCatalog (deleteCourse/uploadCover) and CourseProgram (saveLesson/deleteLesson).
+async function removeMediaIfUnreferenced(rawPaths) {
+  const paths = [...new Set((rawPaths || []).filter(Boolean))];
+  if (!paths.length) return;
+  const chunk = (arr, n) => { const out = []; for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n)); return out; };
+  const referenced = new Set();
+  try {
+    for (const part of chunk(paths, 100)) {
+      const [{ data: lh }, { data: ch }] = await Promise.all([
+        supabase.from('course_lessons').select('storage_path').in('storage_path', part),
+        supabase.from('courses').select('cover_path').in('cover_path', part),
+      ]);
+      (lh || []).forEach(r => r.storage_path && referenced.add(r.storage_path));
+      (ch || []).forEach(r => r.cover_path && referenced.add(r.cover_path));
+    }
+  } catch (e) {
+    // If we can't confirm references, err on the safe side and keep the files (no orphan cleanup).
+    console.error('[course-media] reference check failed — leaving files in place:', e);
+    return;
+  }
+  const orphans = paths.filter(p => !referenced.has(p));
+  for (const part of chunk(orphans, 100)) {
+    try { await supabase.storage.from('course-media').remove(part); } catch (_) { /* best-effort */ }
+  }
+}
+
+// Turn a thrown error into a human-readable banner string. Unwraps our friendly-wrapped errors
+// (which stash the real PostgrestError on `.cause`) and pulls through the underlying message,
+// details, hint, and code — so a duplicate/cover/delete failure shows WHY instead of an opaque
+// "[object Object]". A missing-column code (PGRST204 / 42703 — the duplicate-feature migration not
+// yet applied) gets a targeted next-step hint.
+function describeDbError(e) {
+  if (!e) return 'Something went wrong. Please try again.';
+  const root = e.cause || e;                        // unwrap to the underlying Postgres error
+  const code = root.code || e.code;
+  const parts = [];
+  if (e.message && e.message !== root.message) parts.push(e.message);   // our friendly prefix, if any
+  if (root.message) parts.push(root.message);
+  if (root.details && root.details !== root.message) parts.push(root.details);
+  if (root.hint) parts.push(`Hint: ${root.hint}`);
+  if (code === 'PGRST204' || code === '42703') {
+    parts.push('The course-duplication database migration hasn’t been applied yet — run the SQL in COURSE_SETUP.md (the month / source_course_id columns), then “notify pgrst, \'reload schema\';”.');
+  }
+  if (code) parts.push(`(code ${code})`);
+  return parts.filter(Boolean).join(' — ') || 'Something went wrong. Please try again.';
 }
 
 // ── Multi-course catalog (prefix-scoped) ──
@@ -3693,7 +3762,20 @@ function CourseCatalog({
   const [err, setErr] = useState('');
   const [notConfigured, setNotConfigured] = useState(false);
   const [selectedId, setSelectedId] = useState(null);  // null = grid; otherwise the open course
-  const [busy, setBusy] = useState(false);             // create / delete / reorder / cover in flight
+  const [busy, setBusy] = useState(false);             // create / delete / reorder / cover / duplicate in flight
+  const [menuOpenId, setMenuOpenId] = useState(null);  // which card's ⋮ action menu is open
+  const [lastDuplicatedId, setLastDuplicatedId] = useState(null); // highlight + open the fresh copy in the builder
+
+  // Open a course in the builder, clearing any transient menu/highlight UI. (The post-duplicate
+  // auto-open uses setSelectedId directly so its one-time success banner still shows.)
+  function openCourse(id) { setMenuOpenId(null); setLastDuplicatedId(null); setSelectedId(id); }
+  // Close the ⋮ menu on Escape while one is open.
+  useEffect(() => {
+    if (!menuOpenId) return;
+    const onKey = (e) => { if (e.key === 'Escape') setMenuOpenId(null); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [menuOpenId]);
 
   async function loadCatalog() {
     setLoading(true); setErr(''); setNotConfigured(false);
@@ -3745,8 +3827,87 @@ function CourseCatalog({
       await loadCatalog();
       setSelectedId(res.data.id);                              // drop the admin straight into the new course (builder)
     } catch (e) {
-      console.error('[CourseCatalog] create failed:', e);
-      setErr(e.message || 'Could not create the course.');
+      console.error('[CourseCatalog] create failed:', e, e?.cause);
+      setErr(describeDbError(e));
+    } finally { setBusy(false); }
+  }
+
+  // ── Duplicate a course (structure + lessons + reused video/cover references) into a new DRAFT ──
+  // Reuses the original's storage_path/video_url/cover_path (copy-on-write — no file bytes copied),
+  // skips per-user progress/completions, and stamps source_course_id for lineage. Multi-step but
+  // safe: if anything after the course insert fails, the half-built copy is rolled back (cascade).
+  async function duplicateCourse(c) {
+    setMenuOpenId(null);
+    setBusy(true); setErr('');
+    let newCourseId = null;
+    try {
+      // 1. Load the source fresh (its row + ordered modules + ordered lessons).
+      const [{ data: src, error: e1 }, { data: mods, error: e2 }, { data: lessons, error: e3 }] = await Promise.all([
+        supabase.from('courses').select('*').eq('id', c.id).single(),
+        supabase.from('course_modules').select('*').eq('course_id', c.id).order('position'),
+        supabase.from('course_lessons').select('*').eq('course_id', c.id).order('position'),
+      ]);
+      if (e1) throw e1;
+      if (e2 || e3) throw (e2 || e3);
+
+      // 2. Unique, catalog-scoped slug for the copy (mirror createCourse's collision handling).
+      const newTitle = `Copy of ${src.title}`;
+      const existing = new Set(courses.map(x => x.slug));
+      const base = slugify(newTitle, prefix);
+      let slug = base, n = 2;
+      while (existing.has(slug)) slug = `${base}-${n++}`;
+      const position = courses.length ? Math.max(...courses.map(x => x.position ?? 0)) + 1 : 0;
+
+      // 3. Insert the new course as a DRAFT (reuse cover, keep month, record lineage).
+      const coursePayload = {
+        slug, title: newTitle,
+        subtitle: src.subtitle ?? '', description: src.description ?? null,
+        month: src.month ?? null, cover_path: src.cover_path ?? null,
+        source_course_id: src.id, published: false, position,
+      };
+      let res = await supabase.from('courses').insert(coursePayload).select('*').single();
+      if (res.error && res.error.code === '23505') {           // slug collision race — retry once with a unique suffix
+        slug = `${base}-${Date.now().toString(36).slice(-4)}`;
+        res = await supabase.from('courses').insert({ ...coursePayload, slug }).select('*').single();
+      }
+      if (res.error) throw res.error;
+      newCourseId = res.data.id;
+
+      // 4. Copy modules — pre-generate ids so we can remap lessons in one batch (3 inserts total).
+      const moduleIdMap = new Map();
+      const modulePayloads = (mods || []).map(m => {
+        const id = crypto.randomUUID();
+        moduleIdMap.set(m.id, id);
+        return { id, course_id: newCourseId, title: m.title, position: m.position };
+      });
+      if (modulePayloads.length) {
+        const { error } = await supabase.from('course_modules').insert(modulePayloads);
+        if (error) { const wrap = new Error('Couldn’t copy the modules for this course.'); wrap.cause = error; throw wrap; }
+      }
+
+      // 5. Copy lessons under the remapped modules (reuse video/storage references verbatim).
+      const lessonPayloads = (lessons || [])
+        .filter(l => moduleIdMap.has(l.module_id))
+        .map(l => ({
+          module_id: moduleIdMap.get(l.module_id), course_id: newCourseId,
+          title: l.title, type: l.type, video_url: l.video_url, video_provider: l.video_provider,
+          storage_path: l.storage_path, text_content: l.text_content,
+          duration_label: l.duration_label, position: l.position,
+        }));
+      if (lessonPayloads.length) {
+        const { error } = await supabase.from('course_lessons').insert(lessonPayloads);
+        if (error) { const wrap = new Error('Couldn’t copy the lessons for this course.'); wrap.cause = error; throw wrap; }
+      }
+
+      // 6. Refresh, then open the fresh copy straight in the builder for editing.
+      await loadCatalog();
+      setLastDuplicatedId(newCourseId);
+      setSelectedId(newCourseId);
+    } catch (e) {
+      console.error('[CourseCatalog] duplicate failed:', e, e?.cause);
+      // Roll back a partially-built copy so we never leave a course without its lessons.
+      if (newCourseId) { try { await supabase.from('courses').delete().eq('id', newCourseId); } catch (_) { /* best-effort */ } }
+      setErr(describeDbError(e));
     } finally { setBusy(false); }
   }
 
@@ -3762,38 +3923,53 @@ function CourseCatalog({
       if (upErr) throw upErr;
       const { error } = await supabase.from('courses').update({ cover_path: path, updated_at: new Date().toISOString() }).eq('id', c.id);
       if (error) throw error;
-      if (c.cover_path && c.cover_path !== path) { try { await supabase.storage.from('course-media').remove([c.cover_path]); } catch (_) { /* best-effort */ } }
+      // Purge the old cover only if no other course (e.g. a duplicate that reused it) still points to it.
+      if (c.cover_path && c.cover_path !== path) await removeMediaIfUnreferenced([c.cover_path]);
       await loadCatalog();
     } catch (e) {
-      console.error('[CourseCatalog] cover upload failed:', e);
-      setErr(e.message || 'Could not upload the cover image.');
+      console.error('[CourseCatalog] cover upload failed:', e, e?.cause);
+      setErr(describeDbError(e));
     } finally { setBusy(false); }
   }
 
   async function deleteCourse(c) {
-    if (!window.confirm(`Delete the course “${c.title}” and ALL of its modules, lessons, videos, and student progress? This cannot be undone.`)) return;
+    setMenuOpenId(null);
+    if (!window.confirm(`Delete the course “${c.title}” and ALL of its modules, lessons, and student progress? This cannot be undone.\n\nVideos shared with a duplicated course are kept.`)) return;
     setBusy(true); setErr('');
     try {
-      // Purge uploaded files first (videos + cover); folders are flat, so one list+remove each.
-      for (const prefix of [`lessons/${c.id}`, `covers/${c.id}`]) {
+      // Gather every storage object this course owns/uses BEFORE deleting the row: physical files
+      // under its folders, plus the paths its lesson rows + cover reference (a duplicate may reuse
+      // a path that physically lives under the ORIGINAL's folder). We remove only the orphans after.
+      const candidates = new Set();
+      for (const folder of [`lessons/${c.id}`, `covers/${c.id}`]) {
         try {
-          const { data: objs } = await supabase.storage.from('course-media').list(prefix, { limit: 1000 });
-          if (objs && objs.length) await supabase.storage.from('course-media').remove(objs.map(o => `${prefix}/${o.name}`));
+          const { data: objs } = await supabase.storage.from('course-media').list(folder, { limit: 1000 });
+          (objs || []).forEach(o => candidates.add(`${folder}/${o.name}`));
         } catch (_) { /* ignore — row delete still proceeds */ }
       }
+      try {
+        const { data: ls } = await supabase.from('course_lessons').select('storage_path').eq('course_id', c.id);
+        (ls || []).forEach(r => r.storage_path && candidates.add(r.storage_path));
+      } catch (_) { /* best-effort */ }
+      if (c.cover_path) candidates.add(c.cover_path);
+
       const { error } = await supabase.from('courses').delete().eq('id', c.id); // FK ON DELETE CASCADE clears children
       if (error) throw error;
+      // After the row (and its lessons) are gone, drop only files no surviving course references.
+      await removeMediaIfUnreferenced([...candidates]);
       if (selectedId === c.id) setSelectedId(null);
+      if (lastDuplicatedId === c.id) setLastDuplicatedId(null);
       await loadCatalog();
     } catch (e) {
-      console.error('[CourseCatalog] delete failed:', e);
-      setErr(e.message || 'Could not delete the course.');
+      console.error('[CourseCatalog] delete failed:', e, e?.cause);
+      setErr(describeDbError(e));
     } finally { setBusy(false); }
   }
 
   async function reorderCourse(idx, dir) {
     const j = idx + dir;
     if (j < 0 || j >= courses.length) return;
+    setMenuOpenId(null); setLastDuplicatedId(null);
     const arr = [...courses];
     [arr[idx], arr[j]] = [arr[j], arr[idx]];
     setCourses(arr);                                           // optimistic
@@ -3807,7 +3983,11 @@ function CourseCatalog({
 
   // ── Open one course in the shared engine (key forces clean state per course) ──
   if (selectedId) {
-    return <CourseProgram key={selectedId} courseId={selectedId} onBack={() => { setSelectedId(null); loadCatalog(); }} />;
+    return <CourseProgram key={selectedId} courseId={selectedId}
+      initialNotice={selectedId === lastDuplicatedId
+        ? '✓ Course duplicated as a draft. Edit the title, month, and lessons below, then publish when ready.'
+        : null}
+      onBack={() => { setMenuOpenId(null); setSelectedId(null); loadCatalog(); }} />;
   }
 
   const errorBanner = err ? (
@@ -3874,17 +4054,52 @@ function CourseCatalog({
             const dn = Math.min(done[c.id] || 0, total);
             const pct = total ? Math.round((dn / total) * 100) : 0;
             const cover = c.cover_path ? supabase.storage.from('course-media').getPublicUrl(c.cover_path).data.publicUrl : null;
+            const menuOpen = menuOpenId === c.id;
+            const highlight = lastDuplicatedId === c.id;
             return (
-              <div key={c.id} className="bg-white rounded-2xl border border-slate-200 overflow-hidden flex flex-col shadow-sm hover:shadow-md transition-shadow">
-                <button onClick={() => setSelectedId(c.id)} className="block w-full text-left relative" style={{ aspectRatio: '16 / 9' }}>
+              <div key={c.id}
+                className={`bg-white rounded-2xl border flex flex-col shadow-sm hover:shadow-md transition-shadow relative ${menuOpen ? 'z-50 ' : ''}${highlight ? 'border-emerald-300 ring-2 ring-emerald-300' : 'border-slate-200'}`}>
+                <button onClick={() => openCourse(c.id)} className="block w-full text-left relative rounded-t-2xl overflow-hidden" style={{ aspectRatio: '16 / 9' }}>
                   {cover
                     ? <img src={cover} alt="" className="absolute inset-0 w-full h-full object-cover" />
                     : <div className="absolute inset-0 flex items-center justify-center" style={{ background: `linear-gradient(135deg, ${ROYAL}, ${CYAN})` }}><GraduationCap size={44} className="text-white/90" /></div>}
                   {isAdmin && !c.published && <span className="absolute top-2 left-2 px-2 py-0.5 rounded-full text-[10px] font-bold" style={{ background: '#FEF3C7', color: '#92400E' }}>Draft</span>}
-                  {total > 0 && pct === 100 && <span className="absolute top-2 right-2 px-2 py-0.5 rounded-full text-[10px] font-bold inline-flex items-center gap-1" style={{ background: '#DCFCE7', color: '#166534' }}><Award size={11} /> Done</span>}
+                  {total > 0 && pct === 100 && <span className={`absolute top-2 ${isAdmin ? 'right-11' : 'right-2'} px-2 py-0.5 rounded-full text-[10px] font-bold inline-flex items-center gap-1`} style={{ background: '#DCFCE7', color: '#166534' }}><Award size={11} /> Done</span>}
                 </button>
+
+                {/* Admin ⋮ action menu (Edit / Duplicate / cover / reorder / Delete) */}
+                {isAdmin && (
+                  <>
+                    <button title="Course options" aria-label="Course options" aria-haspopup="menu" aria-expanded={menuOpen} disabled={busy}
+                      onClick={() => setMenuOpenId(menuOpen ? null : c.id)}
+                      className="absolute top-2 right-2 z-10 p-1.5 rounded-lg bg-white/90 backdrop-blur border border-slate-200 text-slate-600 hover:bg-white shadow-sm disabled:opacity-50">
+                      <MoreVertical size={16} />
+                    </button>
+                    {menuOpen && (
+                      <>
+                        <div className="fixed inset-0 z-40" aria-hidden="true" onClick={() => setMenuOpenId(null)} />
+                        <div role="menu" aria-label="Course options" className="absolute top-11 right-2 z-50 w-48 rounded-xl border border-slate-200 bg-white shadow-lg py-1 overflow-hidden">
+                          <button role="menuitem" onClick={() => openCourse(c.id)} className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2"><Edit3 size={14} /> Edit course</button>
+                          <button role="menuitem" disabled={busy} onClick={() => duplicateCourse(c)} className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2 disabled:opacity-50"><Copy size={14} /> Duplicate course</button>
+                          <label role="menuitem" className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2 cursor-pointer">
+                            <ImageIcon size={14} /> Set cover image
+                            <input type="file" accept="image/*" className="hidden" disabled={busy}
+                              onChange={e => { const f = e.target.files?.[0]; setMenuOpenId(null); if (f) uploadCover(c, f); e.target.value = ''; }} />
+                          </label>
+                          <div className="h-px bg-slate-100 my-1" />
+                          <button role="menuitem" disabled={idx === 0 || busy} onClick={() => reorderCourse(idx, -1)} className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2 disabled:opacity-30"><ChevronUp size={14} /> Move up</button>
+                          <button role="menuitem" disabled={idx === courses.length - 1 || busy} onClick={() => reorderCourse(idx, 1)} className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2 disabled:opacity-30"><ChevronDown size={14} /> Move down</button>
+                          <div className="h-px bg-slate-100 my-1" />
+                          <button role="menuitem" disabled={busy} onClick={() => deleteCourse(c)} className="w-full text-left px-3 py-2 text-sm text-red-600 hover:bg-red-50 inline-flex items-center gap-2 disabled:opacity-50"><Trash2 size={14} /> Delete course</button>
+                        </div>
+                      </>
+                    )}
+                  </>
+                )}
+
                 <div className="p-4 flex-1 flex flex-col">
-                  <button onClick={() => setSelectedId(c.id)} className="text-left flex-1">
+                  <button onClick={() => openCourse(c.id)} className="text-left flex-1">
+                    {c.month && <div className="mb-1.5 inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full" style={{ background: '#EFF6FF', color: ROYAL }}><CalendarClock size={11} /> {c.month}</div>}
                     <div style={{ fontFamily: fontDisplay, color: NAVY }} className="font-bold text-[15px] leading-tight">{c.title}</div>
                     {c.subtitle && <div className="text-xs text-slate-500 mt-1 line-clamp-2">{c.subtitle}</div>}
                   </button>
@@ -3897,23 +4112,11 @@ function CourseCatalog({
                       <div className="text-[11px] text-slate-400 mt-1">{dn} of {total} complete</div>
                     </div>
                   )}
-                  <div className="mt-3 flex items-center gap-2">
-                    <button onClick={() => setSelectedId(c.id)} className="flex-1 px-3 py-2 rounded-xl text-white text-sm font-semibold inline-flex items-center justify-center gap-2"
+                  <div className="mt-3">
+                    <button onClick={() => openCourse(c.id)} className="w-full px-3 py-2 rounded-xl text-white text-sm font-semibold inline-flex items-center justify-center gap-2"
                       style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
                       {isAdmin ? 'Open' : (pct > 0 ? 'Continue' : 'Start')} <ArrowRight size={14} />
                     </button>
-                    {isAdmin && (
-                      <>
-                        <label title="Set cover image" className="p-2 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-50 cursor-pointer">
-                          <ImageIcon size={15} />
-                          <input type="file" accept="image/*" className="hidden" disabled={busy}
-                            onChange={e => { const f = e.target.files?.[0]; if (f) uploadCover(c, f); e.target.value = ''; }} />
-                        </label>
-                        <button title="Move up" onClick={() => reorderCourse(idx, -1)} disabled={idx === 0 || busy} className="p-2 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-50 disabled:opacity-30"><ChevronUp size={15} /></button>
-                        <button title="Move down" onClick={() => reorderCourse(idx, 1)} disabled={idx === courses.length - 1 || busy} className="p-2 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-50 disabled:opacity-30"><ChevronDown size={15} /></button>
-                        <button title="Delete course" onClick={() => deleteCourse(c)} disabled={busy} className="p-2 rounded-xl border border-slate-200 text-red-400 hover:bg-red-50 disabled:opacity-30"><Trash2 size={15} /></button>
-                      </>
-                    )}
                   </div>
                 </div>
               </div>
@@ -10051,384 +10254,137 @@ ${showTimesheet && timesheet.length > 0 && timesheetSubtotal > 0 ? `
 
 
 // ═══════════════════════════════════════════════════════════════════
-// COMPONENT: COACH ALEX AI CHAT (Job Application / Career Coach)
+// SHARED: BOOKING / 1-ON-1 COACHING PAGE
 // ═══════════════════════════════════════════════════════════════════
 
-function CoachAlexChat() {
-  const [messages, setMessages] = useState([
-    { role: 'assistant', text: "Hey, glad you came by. I'm Alex — been doing US bookkeeping and accounting for 12 years, helped a lot of folks like you land their first US client and grow from there.\n\nWhat's on your mind today? Stuck on positioning? Need help getting your first interview? Trying to figure out a rate? Or just want to talk through whether to niche or stay broad — I've heard it all. Fire away." }
-  ]);
-  const [input, setInput] = useState('');
-  const [busy, setBusy] = useState(false);
-  const scrollRef = useRef(null);
+// Booking links — each page uses its own Zoom scheduler link.
+// Leave a value blank to show a "coming soon" CTA instead.
+const LINKEDIN_BOOKING_URL   = 'https://scheduler.zoom.us/alexander-sagun/1-on-1-profile-optimization';
+const COACH_ALEX_BOOKING_URL = 'https://scheduler.zoom.us/alexander-sagun/1-on-1-resume-and-interview-coaching';
+const US_CPA_BOOKING_URL     = 'https://scheduler.zoom.us/alexander-sagun/1-on-1qbocoaching';
 
-  useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [messages, busy]);
+function BookingPage({ eyebrow, title, intro, Icon, headline, message, benefits, ctaLabel, bookingUrl }) {
+  const live = !!bookingUrl && !bookingUrl.startsWith('[') && bookingUrl.trim() !== '';
 
-  const suggestions = [
-    "I have zero US clients. Where do I even start?",
-    "How do I position myself against US bookkeepers?",
-    "What rate should I charge for monthly bookkeeping?",
-    "Should I niche down or stay general?",
-    "Upwork vs LinkedIn vs cold email — which works?",
-    "I had a discovery call but they ghosted me. What now?",
-    "How do I answer 'why are you so cheap?'",
-    "Can I quit my BPO job to do this full-time?",
-  ];
-
-  const send = async (text) => {
-    const userText = text || input;
-    if (!userText.trim() || busy) return;
-    const userMsg = { role: 'user', text: userText };
-    setMessages(m => [...m, userMsg]);
-    setInput('');
-    setBusy(true);
-
-    try {
-      const conv = [...messages, userMsg]
-        .filter(m => m.role !== 'system')
-        .map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.text }));
-
-      const sys = `You are Coach Alex — a 12-year US bookkeeping and accounting veteran who now coaches aspiring REMOTE bookkeepers and accountants (primarily Filipinos and other offshore talent) on how to land US clients, position themselves, price their services, navigate interviews, and build a sustainable remote career.
-
-VOICE — this is the most important part:
-- You speak like a real person, not a chatbot. Warm, direct, occasionally funny.
-- You use contractions ("you're", "don't", "I've"). You start sentences with "And" or "But" when natural.
-- You give your honest opinion, not corporate hedging. If something is a bad idea, you say so.
-- You share specific stories from your own 12 years of experience when relevant ("Back in 2018, I had a client who...")
-- You ask follow-up questions when you don't have enough info — coaches don't just dump advice, they diagnose first.
-- You're encouraging but never patronizing. You treat the student as a capable adult.
-- You curse rarely but you can say "damn" or "hell" if it fits — you're not stiff.
-
-EXPERTISE — you cover:
-- Getting clients: Upwork strategy, LinkedIn outreach, cold email, referrals, Facebook groups, direct DMs to US accounting firms, freelance platforms
-- Positioning: niching down vs general, how to compete with US-local bookkeepers, how to use the offshore advantage without sounding "cheap"
-- Pricing: what to charge for monthly bookkeeping, cleanup engagements, advisory; how to raise rates with existing clients; how to handle "you're too expensive" or "why are you so cheap"
-- Interviews: discovery calls, how to handle objections, what questions to ask US prospects, how to close
-- Career moves: when to leave a BPO job, when to start your own firm, how to scale from 1 client to 15, how to hire your own team
-- Burnout, time zone management, working US hours from PH
-- Specific US client industries (construction, e-comm, SaaS, real estate, law firms, agencies, accounting firms wanting to scale offshore) and how to pitch each one
-- Mindset and confidence — many Filipino bookkeepers underprice themselves out of fear; you address this head-on
-
-RULES:
-- Don't give legal or tax advice. If asked tax-specific questions, redirect to "talk to a CPA or EA" but still give the bookkeeping context.
-- Keep responses focused — typically 150-300 words. Long enough to be useful, short enough to read in one sitting.
-- Use short paragraphs. White space matters in chat.
-- When giving advice, give 2-4 concrete steps, not 10.
-- If the student asks something vague ("how do I get clients"), ask ONE clarifying question first before dumping a generic answer.
-- Reference specific platforms, dollar amounts, and timeframes. "Charge $1,500/month for a 50-transaction client" not "charge what you're worth."
-- It is OK to share your opinion strongly. "I think Upwork is a trap for most beginners — here's why..." is the kind of advice they need.
-- Use Filipino-friendly examples when relevant (timezone math from Manila, Wise/PayPal, BPO context).
-- Never claim to be a real human if asked directly — say "I'm an AI built to mentor you, trained on Alex's coaching style and 12 years of experience."
-
-Be the coach you wish you had when you started.`;
-
-      const replyText = (await callClaude({ max_tokens: 1200, system: sys, messages: conv }))
-        || "Hmm, didn't catch that one. Mind asking again?";
-      setMessages(m => [...m, { role: 'assistant', text: replyText }]);
-    } catch (err) {
-      console.error('Coach Alex chat failed:', err);
-      setMessages(m => [...m, { role: 'assistant', text: "My brain's offline for a sec — give me a moment and try again." }]);
-    }
-    setBusy(false);
-  };
+  const renderCta = (full) => live ? (
+    <a href={bookingUrl} target="_blank" rel="noopener noreferrer"
+      className={`sheen-btn inline-flex items-center justify-center gap-2 text-white font-bold px-6 py-3 rounded-xl shadow-lg ${full ? 'w-full sm:w-auto' : ''}`}>
+      <CalendarClock size={17} /> {ctaLabel} <ArrowRight size={16} />
+    </a>
+  ) : (
+    <div className={full ? 'w-full sm:w-auto' : ''}>
+      <button disabled
+        className="sheen-btn inline-flex items-center justify-center gap-2 text-white font-bold px-6 py-3 rounded-xl shadow-lg w-full">
+        <CalendarClock size={17} /> {ctaLabel}
+      </button>
+      <div className="mt-2 text-xs flex items-center gap-1.5" style={{ color: C.textMute }}>
+        <Clock size={12} /> Booking link coming soon.
+      </div>
+    </div>
+  );
 
   return (
     <div>
-      <SectionHead eyebrow="Job Application · Tool" title="Coach Alex AI · Career & Client Coach" desc="A live AI mentor trained on Alex's 12 years of US bookkeeping and remote-career coaching. Ask anything about getting clients, positioning, pricing, niching, interviews, or career moves. Real talk — not corporate fluff." />
+      <SectionHead eyebrow={eyebrow} title={title} desc={intro} />
 
-      <div style={{ background: SHEEN }} className="glass-card rounded-2xl mt-6 overflow-hidden">
-        <div style={{ background: `linear-gradient(135deg, ${NAVY} 0%, #0F2A5A 100%)` }} className="px-6 py-4 text-white flex items-center gap-3">
-          <div style={{ background: `linear-gradient(135deg, ${ROYAL} 0%, ${CYAN} 100%)`, fontFamily: fontDisplay }} className="w-10 h-10 rounded-full flex items-center justify-center font-bold shadow-lg text-lg">
-            A
+      {/* Hero booking card */}
+      <div style={{ background: SHEEN }} className="glass-card p-6 md:p-8 mt-6 mb-6 relative overflow-hidden">
+        <div className="absolute -top-16 -right-16 w-56 h-56 rounded-full pointer-events-none"
+          style={{ background: `radial-gradient(circle, ${C.primary}14 0%, transparent 60%)` }} />
+        <div className="relative flex flex-col sm:flex-row items-start gap-5">
+          <div className="w-14 h-14 rounded-2xl flex items-center justify-center flex-shrink-0"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 8px 20px -6px ${C.primary}66` }}>
+            <Icon size={26} className="text-white" />
           </div>
-          <div>
-            <div className="font-bold">Coach Alex</div>
-            <div className="text-xs text-blue-200 flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              Online · 12+ years US bookkeeping · Career coach
-            </div>
+          <div className="flex-1">
+            <div className="gh-label mb-2" style={{ color: C.primary, fontSize: 11 }}>1-on-1 Session</div>
+            <h2 style={{ fontFamily: fontDisplay, color: C.text, letterSpacing: '-0.02em', fontWeight: 600 }} className="text-2xl leading-snug">{headline}</h2>
+            <p className="mt-3 text-[15px] leading-relaxed max-w-2xl" style={{ color: C.textSoft }}>{message}</p>
+            <div className="mt-5">{renderCta(false)}</div>
           </div>
-        </div>
-
-        <div ref={scrollRef} className="h-[480px] overflow-y-auto p-6 space-y-4 bg-white">
-          {messages.map((m, i) => (
-            <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[80%] rounded-2xl px-5 py-3 text-sm leading-relaxed whitespace-pre-wrap ${
-                m.role === 'user'
-                  ? 'text-white shadow-md'
-                  : 'bg-white border border-blue-200 text-slate-800 shadow-sm'
-              }`}
-              style={m.role === 'user' ? { background: `linear-gradient(135deg, ${ROYAL} 0%, ${CYAN} 100%)` } : {}}>
-                {m.text}
-              </div>
-            </div>
-          ))}
-          {busy && (
-            <div className="flex justify-start">
-              <div className="bg-white border border-blue-200 rounded-2xl px-5 py-3 text-sm text-slate-500 flex items-center gap-2">
-                <Loader2 size={14} className="animate-spin" /> Alex is typing...
-              </div>
-            </div>
-          )}
-        </div>
-
-        {messages.length <= 2 && (
-          <div className="px-6 py-3 bg-slate-50 border-t border-slate-200 flex flex-wrap gap-2">
-            {suggestions.map(s => (
-              <button key={s} onClick={() => send(s)} disabled={busy}
-                className="text-xs px-3 py-1.5 rounded-full bg-white border border-slate-300 hover:border-blue-400 hover:bg-blue-50 text-slate-700 font-medium transition disabled:opacity-50">
-                {s}
-              </button>
-            ))}
-          </div>
-        )}
-
-        <div className="p-4 border-t border-slate-200 bg-white flex gap-2">
-          <input value={input} onChange={e => setInput(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && !e.shiftKey && send()}
-            placeholder="Ask Alex anything about getting clients, pricing, positioning..."
-            disabled={busy}
-            className="flex-1 px-4 py-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-200 outline-none disabled:opacity-50" />
-          <button onClick={() => send()} disabled={busy || !input.trim()}
-            className="sheen-btn text-white font-bold px-5 rounded-xl shadow-lg disabled:opacity-50 flex items-center gap-2">
-            <Send size={16} />
-          </button>
         </div>
       </div>
+
+      {/* Benefits */}
+      <div className="mb-6">
+        <div className="gh-label mb-3" style={{ color: C.primary, fontSize: 11 }}>What this session helps with</div>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {benefits.map((b, i) => (
+            <div key={i} className="glass-card p-5 flex items-start gap-3">
+              <div className="w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0" style={{ background: ICE }}>
+                <CheckCircle2 size={16} style={{ color: C.primary }} />
+              </div>
+              <div className="text-sm leading-relaxed pt-1" style={{ color: C.text }}>{b}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Closing CTA */}
+      <div style={{ background: SHEEN }} className="glass-card p-6 md:p-8 flex flex-col sm:flex-row sm:items-center justify-between gap-5">
+        <div>
+          <h3 style={{ fontFamily: fontDisplay, color: C.text, letterSpacing: '-0.015em', fontWeight: 600 }} className="text-xl">Ready to get personalized support?</h3>
+          <p className="mt-1.5 text-[14px] leading-relaxed" style={{ color: C.textSoft }}>Book your 1-on-1 session and get tailored, practical guidance with clear next steps.</p>
+        </div>
+        <div className="flex-shrink-0">{renderCta(true)}</div>
+      </div>
     </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// COMPONENT: COACH ALEX 1-ON-1 BOOKING (Job Application / Career Coach)
+// ═══════════════════════════════════════════════════════════════════
+
+function CoachAlexChat() {
+  return (
+    <BookingPage
+      eyebrow="Job Application · 1-on-1"
+      title="Book 1-on-1 Coaching with Coach Alex"
+      intro="Get personalized, one-on-one coaching with Alex — built around your career goals, job search, and remote-bookkeeping journey. No generic advice; just a focused session for where you are and where you want to go."
+      Icon={GraduationCap}
+      headline="Personalized coaching, built around your goals"
+      message="This session gives you direct, one-on-one guidance based on your career goals, job-search needs, interview preparation, resume improvement, bookkeeping and accounting career direction, and overall professional development — with clear, practical next steps you can act on right away."
+      benefits={[
+        'Personalized career and job-search guidance',
+        'Interview preparation and confidence coaching',
+        'Resume and profile improvement direction',
+        'Bookkeeping & accounting career-path planning',
+        'Practical, specific recommendations',
+        'One-on-one support with clear next steps',
+      ]}
+      ctaLabel="Book a Session with Coach Alex"
+      bookingUrl={COACH_ALEX_BOOKING_URL}
+    />
   );
 }
 
 
 
 // ═══════════════════════════════════════════════════════════════════
-// COMPONENT: US CPA AI CHAT (Daily & Month-End)
+// COMPONENT: US CPA 1-ON-1 BOOKING (Daily & Month-End)
 // ═══════════════════════════════════════════════════════════════════
 
 function CPAAIChat() {
-  const [messages, setMessages] = useState([
-    { role: 'assistant', text: "Hi — I'm your US CPA reference. 20 years in public accounting, also a long-time QuickBooks ProAdvisor. My knowledge is current through May 2026, including the One Big Beautiful Bill Act (OBBBA) signed July 4, 2025 — so I'll give you the post-OBBBA rules (100% bonus depreciation restored, Section 179 raised to $2.5M, R&D fully expensable under new Section 174A, 1099 threshold raised to $2,000 for 2026, etc.).\n\nI'm here to answer your technical questions — GAAP, journal entries, tax rules, complex transactions, whatever you're wrestling with.\n\nWhat are we working on today?" }
-  ]);
-  const [input, setInput] = useState('');
-  const [busy, setBusy] = useState(false);
-  const scrollRef = useRef(null);
-
-  useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [messages, busy]);
-
-  const suggestions = [
-    "What changed under OBBBA for bonus depreciation in 2025?",
-    "How do I record a SAFE note? What's the journal entry?",
-    "Section 174A — can I expense domestic R&D now?",
-    "What's the new 1099-NEC threshold for tax year 2026?",
-    "When do I capitalize vs expense software?",
-    "How does revenue recognition work under ASC 606?",
-    "What's the journal entry for a Section 1031 exchange?",
-    "Cash basis vs accrual — when must I switch?",
-    "What's the entry for a prepaid insurance amortization?",
-    "How do I record owner distributions vs draws?",
-  ];
-
-  const send = async (text) => {
-    const userText = text || input;
-    if (!userText.trim() || busy) return;
-    const userMsg = { role: 'user', text: userText };
-    setMessages(m => [...m, userMsg]);
-    setInput('');
-    setBusy(true);
-
-    try {
-      const conv = [...messages, userMsg]
-        .filter(m => m.role !== 'system')
-        .map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.text }));
-
-      const sys = `You are a senior US Certified Public Accountant (CPA) with 20 years of experience in public accounting, AND a long-tenured QuickBooks Online ProAdvisor. You mentor remote bookkeepers and accountants by answering technical questions clearly and precisely.
-
-CRITICAL — YOUR KNOWLEDGE CURRENCY:
-- The current date is May 2026. Your knowledge is current through May 2026.
-- You are fully fluent in the One Big Beautiful Bill Act (OBBBA), signed into law on July 4, 2025, which made sweeping permanent changes to US business tax law. Below are the OBBBA-era rules that are CURRENT LAW as of May 2026 — use these, not the pre-OBBBA TCJA-era rules:
-
-CURRENT (OBBBA-ERA, May 2026) TAX RULES:
-
-  Section 179 Expensing (effective for property placed in service in tax years beginning after Dec 31, 2024):
-  - Maximum deduction: $2.5 million (up from $1.16 million pre-OBBBA)
-  - Phase-out threshold: starts at $4 million of property placed in service (up from $2.89 million)
-  - Both amounts indexed for inflation going forward
-
-  Bonus Depreciation (Section 168(k)):
-  - 100% bonus depreciation PERMANENTLY RESTORED for qualified property acquired AND placed in service AFTER January 19, 2025
-  - This reversed the TCJA phasedown (40% for 2025 / 20% for 2026 / 0% for 2027) — that phasedown no longer applies
-  - Applies to new AND used tangible personal property with 20-year-or-less recovery period, computer software, qualified improvement property
-  - Property placed in service ON OR BEFORE January 19, 2025 still follows the old TCJA phasedown schedule (60% for 2024, 40% for early-2025 pre-Jan-19)
-  - New Section 168(n): 100% depreciation for "Qualified Production Property" (manufacturing/production real property) — construction must begin Jan 19, 2025 through Dec 31, 2028
-
-  Section 174 / 174A — R&D Expensing (CRITICAL CHANGE):
-  - NEW Section 174A: Domestic R&D expenditures can be FULLY EXPENSED in year paid/incurred (tax years beginning after Dec 31, 2024)
-  - This permanently reverses the TCJA 5-year amortization requirement for domestic R&E
-  - Taxpayers may also ELECT to capitalize domestic R&D and amortize over 60 months minimum
-  - Foreign R&D expenditures STILL must be capitalized and amortized over 15 years under continuing Section 174
-  - Transition rule: taxpayers with capitalized R&D from 2022-2024 may elect to expense remaining unamortized balance over 1 or 2 years starting 2025
-  - Eligible small businesses may amend prior returns (2022-2024) to expense — see Rev. Proc. 2025-28 for procedural guidance
-  - Section 41 R&D credit interplay with 174A — companies choose between reducing R&E deduction by credit amount OR taking reduced credit to preserve full deduction
-
-  QBI Deduction (Section 199A): 20% qualified business income deduction is now PERMANENT (was set to sunset after 2025 under TCJA — OBBBA made it permanent)
-
-  Section 163(j) Interest Limitation: Base for adjusted taxable income (ATI) now includes depreciation and amortization (EBITDA-based) for tax years beginning after Dec 31, 2024 — expands deductibility vs the prior EBIT-based calculation
-
-  1099 Reporting Thresholds:
-  - 1099-NEC and 1099-MISC threshold: $600 for tax year 2025, RAISING TO $2,000 for tax year 2026 and later (per OBBBA)
-  - 1099-K threshold RESTORED to $20,000 AND 200 transactions (retroactive to 2022) — this reverses the previously planned phase-down to $600
-  - W-2 still required for all employees regardless of amount
-
-  Clean Energy & EV Credits: Most clean vehicle and residential energy tax credits are being phased out — major credits expire mid-2026
-
-  TCJA Permanent Provisions (made permanent by OBBBA): lower individual tax brackets, expanded standard deduction, higher SALT cap, QBI deduction
-
-YOUR EXPERTISE — you can answer with authority on:
-
-US GAAP:
-- Revenue recognition (ASC 606, performance obligations, transaction price allocation)
-- Lease accounting (ASC 842 — operating vs finance leases, ROU assets, lease liabilities)
-- Deferred revenue and revenue recognition over time vs at a point in time
-- Accruals, prepaids, deferrals — recognition timing
-- Intangible asset accounting (ASC 350 — capitalization, amortization, impairment)
-- Goodwill and business combinations (ASC 805)
-- Inventory accounting (FIFO, LIFO, weighted-avg, lower of cost or NRV)
-- Bad debt under allowance method vs direct write-off
-- Fair value measurement (ASC 820)
-- Stock-based compensation (ASC 718)
-- Statement of Cash Flows (direct vs indirect method, classification of activities)
-- Functional vs presentation currency in foreign ops (ASC 830)
-
-US Tax Rules (current as of May 2026, post-OBBBA):
-- Entity taxation: Sole Prop (Schedule C), Partnership (1065 + K-1), S-Corp (1120-S + K-1, reasonable salary), C-Corp (1120, 21% flat rate, double taxation)
-- Self-employment tax (15.3% — 12.4% SS up to $176,100 in 2025 wage base, 2.9% Medicare uncapped, additional 0.9% Medicare on high earners)
-- Section 179 + 100% bonus depreciation (per OBBBA rules above)
-- MACRS depreciation classes and conventions
-- Section 174A R&D expensing (per OBBBA rules above)
-- Section 1031 like-kind exchanges (real property only post-TCJA, still in effect)
-- QBI deduction (Section 199A, 20%, permanent post-OBBBA, SSTB rules, phase-outs)
-- Meals (50% deductible), entertainment (0% — still TCJA rule)
-- Home office (regular & exclusive use, simplified $5/sq ft up to $1,500, or actual method)
-- Vehicle expense (standard mileage 2025: 70¢/mile; 2026: TBD — verify on IRS.gov)
-- 1099-NEC ($600 for 2025, $2,000 for 2026+), 1099-MISC ($2,000 for 2026+), 1099-K ($20K/200 txn restored)
-- Sales tax nexus (physical + economic post-Wayfair, varies by state — $100K/200 txn most common threshold)
-- Payroll taxes (FIT, FICA, FUTA on first $7,000 at 6.0% gross / 0.6% net, SUTA varies)
-- Quarterly forms: 941 due Apr 30, Jul 31, Oct 31, Jan 31; 940 annual by Jan 31; W-2 to employees by Jan 31
-- Estimated taxes (quarterly: Apr 15, Jun 15, Sep 15, Jan 15 — safe harbor: pay 100% of prior year liability, 110% if AGI > $150K)
-
-Accounting Process & QBO:
-- Full accounting cycle (journalize → post → trial balance → adjusting entries → financial statements → closing entries)
-- Month-end and year-end close procedures
-- Bank reconciliation and three-way reconciliation (for trust accounts)
-- Adjusting entries: accruals, deferrals, depreciation, prepaid amortization
-- Closing entries and post-closing trial balance
-- Specific QBO workflows: setup, classes, locations, projects, recurring transactions, bank rules, undeposited funds, journal entries, custom reports
-- Industry-specific accounting: construction (job costing, WIP, retention), e-commerce (multi-channel rec, inventory, sales tax), law firms (IOLTA, retainers), real estate (per-property tracking, 1031, security deposits), SaaS (deferred revenue, MRR/ARR, ASC 606), nonprofit (fund accounting, functional expenses, Form 990), restaurants (food cost %, tip pools), agencies (principal vs agent media buys)
-
-VOICE & RULES:
-- Be technically precise. Use proper terminology (debit/credit, ASC/IRC citations when relevant, account types).
-- Show journal entries when asked, formatted clearly:
-  Dr. [Account]                $X,XXX
-      Cr. [Account]                 $X,XXX
-- Walk through the WHY, not just the WHAT. A great mentor explains the accounting theory behind the rule.
-- When QBO-specific, give the click-path (e.g., "Go to + New → Journal Entry").
-- Cite specific ASC, IRC, or IRS Pub references when appropriate (ASC 606, IRC 179, IRC 174A, Pub 535, Rev. Proc. 2025-28) — but don't overdo it.
-- For tax law: USE THE CURRENT POST-OBBBA RULES listed above. Do NOT cite outdated TCJA-era rules (e.g., do NOT say "bonus depreciation phasedown to 40% for 2025" — that was reversed by OBBBA). When discussing pre-2025 transactions or transition rules, you may reference the prior rules for historical context.
-- Specific 2026 figures may still need verification — always note "verify current IRS.gov tables for tax year 2026" when giving specific dollar limits that may have indexed for inflation
-- Length: 200-400 words typical. Longer if the question genuinely needs depth (complex JEs, multi-step transactions). Short paragraphs.
-- You can disagree with the user respectfully if they have a misconception. Correct it kindly — especially if they cite outdated pre-OBBBA rules.
-- IMPORTANT DISCLAIMERS: For specific client tax positions or legal questions, always note that the bookkeeper should refer to the client's CPA or EA for filing decisions. Bookkeepers prepare data; CPAs interpret it for the IRS.
-- Never make up regulations or IRS forms. If you're not sure, say "I'd verify this on IRS.gov — but my understanding is..."
-- If asked about non-US jurisdictions (PH, Canada, UK), politely redirect: "I specialize in US accounting and tax. For [country], you'd want a specialist in that jurisdiction."
-
-You are the technical resource a remote bookkeeper would otherwise pay $200-$400/hour to consult.`;
-
-      const replyText = (await callClaude({ max_tokens: 1500, system: sys, messages: conv }))
-        || "Apologies — could you rephrase the question?";
-      setMessages(m => [...m, { role: 'assistant', text: replyText }]);
-    } catch (err) {
-      setMessages(m => [...m, { role: 'assistant', text: "Connection issue on my end — please try again in a moment." }]);
-    }
-    setBusy(false);
-  };
-
   return (
-    <div>
-      <SectionHead eyebrow="Daily & Month-End · Tool" title="US CPA AI · GAAP, Tax & Technical Reference" desc="A live AI senior CPA with 20 years of US public accounting and QuickBooks ProAdvisor experience. Knowledge current through May 2026 — fluent in OBBBA (One Big Beautiful Bill Act, July 2025) and all current post-OBBBA tax rules. Ask anything technical: GAAP, ASC standards, IRS rules, journal entries, complex transactions, industry-specific accounting." />
-
-      <div style={{ background: SHEEN }} className="glass-card rounded-2xl mt-6 overflow-hidden">
-        <div style={{ background: `linear-gradient(135deg, ${NAVY} 0%, #0F2A5A 100%)` }} className="px-6 py-4 text-white flex items-center gap-3">
-          <div style={{ background: `linear-gradient(135deg, ${ROYAL} 0%, ${CYAN} 100%)`, fontFamily: fontDisplay }} className="w-10 h-10 rounded-full flex items-center justify-center font-bold shadow-lg">
-            <Award size={18} className="text-white" />
-          </div>
-          <div>
-            <div className="font-bold">Senior US CPA · ProAdvisor</div>
-            <div className="text-xs text-blue-200 flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              Online · 20+ yrs · Current through May 2026 · OBBBA-fluent
-            </div>
-          </div>
-        </div>
-
-        <div ref={scrollRef} className="h-[480px] overflow-y-auto p-6 space-y-4 bg-white">
-          {messages.map((m, i) => (
-            <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[80%] rounded-2xl px-5 py-3 text-sm leading-relaxed whitespace-pre-wrap ${
-                m.role === 'user'
-                  ? 'text-white shadow-md'
-                  : 'bg-white border border-blue-200 text-slate-800 shadow-sm'
-              }`}
-              style={m.role === 'user' ? { background: `linear-gradient(135deg, ${ROYAL} 0%, ${CYAN} 100%)` } : {}}>
-                {m.text}
-              </div>
-            </div>
-          ))}
-          {busy && (
-            <div className="flex justify-start">
-              <div className="bg-white border border-blue-200 rounded-2xl px-5 py-3 text-sm text-slate-500 flex items-center gap-2">
-                <Loader2 size={14} className="animate-spin" /> CPA is reviewing your question...
-              </div>
-            </div>
-          )}
-        </div>
-
-        {messages.length <= 2 && (
-          <div className="px-6 py-3 bg-slate-50 border-t border-slate-200 flex flex-wrap gap-2">
-            {suggestions.map(s => (
-              <button key={s} onClick={() => send(s)} disabled={busy}
-                className="text-xs px-3 py-1.5 rounded-full bg-white border border-slate-300 hover:border-blue-400 hover:bg-blue-50 text-slate-700 font-medium transition disabled:opacity-50">
-                {s}
-              </button>
-            ))}
-          </div>
-        )}
-
-        <div className="p-4 border-t border-slate-200 bg-white flex gap-2">
-          <input value={input} onChange={e => setInput(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && !e.shiftKey && send()}
-            placeholder="Ask about GAAP, tax rules, journal entries, QBO workflows..."
-            disabled={busy}
-            className="flex-1 px-4 py-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-200 outline-none disabled:opacity-50" />
-          <button onClick={() => send()} disabled={busy || !input.trim()}
-            className="sheen-btn text-white font-bold px-5 rounded-xl shadow-lg disabled:opacity-50 flex items-center gap-2">
-            <Send size={16} />
-          </button>
-        </div>
-      </div>
-
-      <div className="mt-4 p-4 rounded-xl border-l-4" style={{ background: '#FEF3C7', borderColor: '#D97706' }}>
-        <div className="flex gap-3 items-start">
-          <AlertTriangle size={18} className="text-amber-700 flex-shrink-0 mt-0.5" />
-          <div className="text-sm text-amber-900 leading-relaxed">
-            <span className="font-bold">Important disclaimer:</span> This AI provides educational accounting guidance — not legal or tax advice for specific client situations. For client filing decisions, always defer to a licensed CPA or EA. Tax law changes yearly; verify current limits and thresholds on IRS.gov.
-          </div>
-        </div>
-      </div>
-    </div>
+    <BookingPage
+      eyebrow="Client Delivery · 1-on-1"
+      title="Book 1-on-1 US CPA Guidance Session"
+      intro="Get personalized, one-on-one guidance on US CPA topics — from technical accounting questions to career direction and CPA-exam preparation. A focused session tailored to what you're working through."
+      Icon={Award}
+      headline="Personalized US CPA guidance, one-on-one"
+      message="This session helps you get personalized guidance around US CPA-related questions, career direction, accounting knowledge, professional development, and CPA preparation support — with clear, practical next steps for where you want to go."
+      benefits={[
+        'Personalized US CPA-related guidance',
+        'Accounting knowledge and concept clarity',
+        'CPA career direction and planning',
+        'Professional development support',
+        'CPA preparation and study support',
+        'Clear, practical next steps',
+      ]}
+      ctaLabel="Book US CPA Guidance Session"
+      bookingUrl={US_CPA_BOOKING_URL}
+    />
   );
 }
 
@@ -11758,167 +11714,29 @@ function CertificationTracker() {
 
 
 // ═══════════════════════════════════════════════════════════════════
-// COMPONENT: LINKEDIN OPTIMIZER (Job Application)
+// COMPONENT: LINKEDIN OPTIMIZATION 1-ON-1 BOOKING (Job Application)
 // ═══════════════════════════════════════════════════════════════════
 
 function LinkedInOptimizer() {
-  const [currentHeadline, setCurrentHeadline] = useState('');
-  const [currentAbout, setCurrentAbout] = useState('');
-  const [niche, setNiche] = useState('');
-  const [yearsExp, setYearsExp] = useState('3');
-  const [keyResults, setKeyResults] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [output, setOutput] = useState(null);
-
-  const generate = async () => {
-    if (!niche.trim()) return;
-    setBusy(true);
-    setOutput(null);
-    try {
-      const sys = `You are a LinkedIn profile optimizer specializing in remote bookkeepers targeting US clients. Output JSON only — no markdown, no preamble.
-
-Schema:
-{
-  "headlines": [string × 5],   // 220-char max each, optimized for US client search keywords
-  "about": string,             // 1800-2200 chars, structured: hook → credibility → results → CTA
-  "featuredKeywords": [string × 10],   // for SEO + LinkedIn search ranking
-  "profileTips": [string × 6],         // specific actions to take (banner, photo, etc.)
-  "weeklyContentIdeas": [string × 5]   // post topics to build authority
-}
-
-Rules:
-- Speak to US accounting firm owners and US small business founders (the buyers)
-- Lead with VALUE delivered, not job titles
-- Use specific numbers/results when provided
-- Avoid words: "passionate," "rockstar," "ninja," "guru"
-- Use ASC/IRS/QBO terminology to signal technical depth
-- Tone: confident, US-professional, warm but credible
-- About section uses SHORT paragraphs (2-3 sentences each) with line breaks for scanability`;
-
-      const userMsg = `Niche: ${niche}
-Years experience: ${yearsExp}
-Current headline: ${currentHeadline || '(none)'}
-Current about: ${currentAbout || '(none)'}
-Key results / wins: ${keyResults || '(none yet — entry-level)'}`;
-
-      const text = await callClaude({ max_tokens: 2000, system: sys, messages: [{ role: 'user', content: userMsg }] });
-      const clean = text.replace(/```json|```/g, '').trim();
-      const parsed = JSON.parse(clean);
-      setOutput(parsed);
-    } catch (err) {
-      setOutput({ error: 'Generation failed — please try again.' });
-    }
-    setBusy(false);
-  };
-
-  const copy = (text) => {
-    navigator.clipboard.writeText(text);
-  };
-
   return (
-    <div>
-      <SectionHead eyebrow="Job Application · Tool" title="LinkedIn Optimizer" desc="LinkedIn is where US firm owners actually scout remote talent. Optimize your headline, About section, and profile keywords for the search algorithm. Generates 5 headline options + a full About section tailored to your niche." />
-
-      <div style={{ background: SHEEN }} className="glass-card p-5 rounded-2xl mt-6 mb-5">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="text-[10px] uppercase tracking-wider font-bold text-slate-500 block mb-1">Target Niche *</label>
-            <input className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm" value={niche} onChange={e => setNiche(e.target.value)} placeholder="e.g., E-commerce bookkeeping, SaaS, Construction" />
-          </div>
-          <div>
-            <label className="text-[10px] uppercase tracking-wider font-bold text-slate-500 block mb-1">Years of Experience</label>
-            <select className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm bg-white" value={yearsExp} onChange={e => setYearsExp(e.target.value)}>
-              <option value="0">Less than 1 year (entry-level / career-shifter)</option>
-              <option value="1">1 year</option>
-              <option value="2">2 years</option>
-              <option value="3">3 years</option>
-              <option value="5">5 years</option>
-              <option value="7">7+ years</option>
-              <option value="10">10+ years</option>
-            </select>
-          </div>
-          <div className="md:col-span-2">
-            <label className="text-[10px] uppercase tracking-wider font-bold text-slate-500 block mb-1">Current Headline (optional)</label>
-            <input className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm" value={currentHeadline} onChange={e => setCurrentHeadline(e.target.value)} placeholder="What does your headline say now?" />
-          </div>
-          <div className="md:col-span-2">
-            <label className="text-[10px] uppercase tracking-wider font-bold text-slate-500 block mb-1">Current About (optional)</label>
-            <textarea className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm h-20" value={currentAbout} onChange={e => setCurrentAbout(e.target.value)} placeholder="Paste your current About section for AI to optimize" />
-          </div>
-          <div className="md:col-span-2">
-            <label className="text-[10px] uppercase tracking-wider font-bold text-slate-500 block mb-1">Key Wins / Results (optional but powerful)</label>
-            <textarea className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm h-24" value={keyResults} onChange={e => setKeyResults(e.target.value)} placeholder="e.g., 'Cleaned up 18 months of QBO data for SaaS client in 3 weeks' · 'Saved client $14K in sales tax penalties' · 'Reconciled $2M in Stripe transactions across 4 marketplaces'" />
-          </div>
-        </div>
-        <button onClick={generate} disabled={busy || !niche.trim()}
-          className="sheen-btn text-white font-bold px-6 py-3 rounded-xl shadow-lg disabled:opacity-50 mt-4 flex items-center gap-2">
-          {busy ? <><Loader2 size={16} className="animate-spin" /> Generating...</> : <><Sparkles size={16} /> Generate LinkedIn Optimization</>}
-        </button>
-      </div>
-
-      {output && output.error && (
-        <div className="p-4 rounded-xl bg-red-50 border border-red-200 text-red-800 text-sm">{output.error}</div>
-      )}
-
-      {output && !output.error && (
-        <div className="space-y-5">
-          {/* Headlines */}
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-            <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
-              <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">📌 Headline Options (pick your favorite)</div>
-            </div>
-            <div className="p-5 space-y-3">
-              {output.headlines && output.headlines.map((h, i) => (
-                <div key={i} className="p-4 rounded-xl bg-slate-50 hover:bg-blue-50 transition flex items-start gap-3">
-                  <div className="text-xs font-bold text-slate-400 mt-0.5">#{i + 1}</div>
-                  <div className="flex-1 text-sm text-slate-800 leading-relaxed">{h}</div>
-                  <button onClick={() => copy(h)} className="text-xs px-2 py-1 rounded bg-white border border-slate-300 hover:border-blue-400 flex items-center gap-1"><Copy size={11} /> Copy</button>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* About */}
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-            <div style={{ background: `linear-gradient(90deg, ${ROYAL} 0%, ${CYAN} 100%)` }} className="px-5 py-3 text-white flex items-center justify-between">
-              <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">📝 About Section (paste into LinkedIn)</div>
-              <button onClick={() => copy(output.about)} className="text-xs font-bold px-3 py-1.5 rounded-lg bg-white/20 hover:bg-white/30 transition flex items-center gap-1.5"><Copy size={12} /> Copy All</button>
-            </div>
-            <div className="p-5 text-sm text-slate-800 leading-relaxed whitespace-pre-wrap">{output.about}</div>
-          </div>
-
-          {/* Keywords */}
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
-            <div className="text-[10px] uppercase tracking-wider font-bold text-slate-500 mb-2">🔍 Featured Keywords (sprinkle through profile)</div>
-            <div className="flex flex-wrap gap-2">
-              {output.featuredKeywords && output.featuredKeywords.map((k, i) => (
-                <span key={i} className="text-xs px-3 py-1 rounded-full" style={{ background: ICE, color: NAVY }}>{k}</span>
-              ))}
-            </div>
-          </div>
-
-          {/* Profile tips */}
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
-            <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-base font-bold mb-3">✅ Profile Action Items</div>
-            <ul className="space-y-2 text-sm text-slate-700">
-              {output.profileTips && output.profileTips.map((t, i) => (
-                <li key={i} className="flex gap-2"><CheckCircle2 size={16} style={{ color: ROYAL }} className="flex-shrink-0 mt-0.5" />{t}</li>
-              ))}
-            </ul>
-          </div>
-
-          {/* Content ideas */}
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
-            <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-base font-bold mb-3">💡 Weekly Content Ideas (build authority)</div>
-            <ul className="space-y-2 text-sm text-slate-700">
-              {output.weeklyContentIdeas && output.weeklyContentIdeas.map((t, i) => (
-                <li key={i} className="flex gap-2"><Sparkles size={16} style={{ color: CYAN }} className="flex-shrink-0 mt-0.5" />{t}</li>
-              ))}
-            </ul>
-          </div>
-        </div>
-      )}
-    </div>
+    <BookingPage
+      eyebrow="Job Application · 1-on-1"
+      title="Book 1-on-1 LinkedIn Optimization Coaching"
+      intro="Work one-on-one to sharpen your LinkedIn profile — headline, About section, and overall positioning — so US firm owners see a clear, credible remote bookkeeper when they find you."
+      Icon={Linkedin}
+      headline="Position your LinkedIn profile to get noticed"
+      message="This session helps you improve your LinkedIn profile, position your experience more professionally, strengthen your headline and summary, sharpen your skills positioning, improve overall profile clarity, and present yourself better for job opportunities — with clear next steps you can apply right away."
+      benefits={[
+        'Full profile review and positioning',
+        'Headline and summary improvement',
+        'About-section rewrite guidance',
+        'Skills and experience positioning',
+        'Job-search visibility and clarity',
+        'Clear, practical next steps',
+      ]}
+      ctaLabel="Book LinkedIn Optimization Session"
+      bookingUrl={LINKEDIN_BOOKING_URL}
+    />
   );
 }
 
