@@ -29,7 +29,7 @@ export const useAuth = () => useContext(AuthContext);
 // when a tool introduces a new persisted key (see bookkeeper-conventions skill).
 const LEGACY_KEYS = [
   'currency:pref', 'currency:rate',
-  'sidebar:stages', 'sidebar:collapsed', 'sidebar:expandedGroups',
+  'sidebar:stages', 'sidebar:collapsed', 'sidebar:expandedGroups', 'sidebar:version',
   'certs:completed', 'certs:inProgress',
   'health:clients',
   'timetrack:entries', 'timetrack:clients', 'timetrack:rates',

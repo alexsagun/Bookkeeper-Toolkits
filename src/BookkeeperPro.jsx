@@ -11,9 +11,11 @@ import {
   Heart, DollarSign, Phone, AlertCircle, Activity, Clock, Wallet,
   PieChart, Linkedin, ArrowUp, ArrowDown, X, Copy, Check,
   TrendingUp as Growth, BookMarked, Globe, Coins, GraduationCap,
-  LogOut, Lock, Mail, KeyRound
+  LogOut, Lock, Mail, KeyRound, Menu,
+  Plus, Trash2, Save, Play, Video, ArrowRight, ArrowLeft, ChevronUp
 } from 'lucide-react';
 import { useAuth } from './auth/AuthProvider.jsx';
+import { supabase } from './lib/supabase';
 
 // ═══════════════════════════════════════════════════════════════════
 // SHARED: ANTHROPIC API HELPER
@@ -1216,6 +1218,10 @@ function WelcomeOverlay({ name, onClose }) {
 export default function BookkeeperProToolkit() {
   const { user, profile, loading, recovery, signOut } = useAuth();
   const [tab, setTab] = useState('dashboard');
+  // Mobile nav drawer (the sidebar is a static column on lg+, an off-canvas
+  // drawer below it). Auto-closes whenever the active tab changes.
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  useEffect(() => { setSidebarOpen(false); }, [tab]);
 
   // First-login welcome — shown once per user. The flag lives in the per-user
   // namespaced storage, so each new account sees it exactly once.
@@ -1252,10 +1258,12 @@ export default function BookkeeperProToolkit() {
       desc: 'Build your foundation',
       tabs: [
         { id: 'course',     label: 'Accounting 101',         icon: BookOpen },
+        { id: 'qbomastery', label: 'QuickBooks Online Mastering', icon: GraduationCap },
         { id: 'industryacc',label: 'Industry Accounting',    icon: Building2 },
         { id: 'ustax',      label: 'US Tax 101',             icon: Landmark },
         { id: 'chat',       label: 'ProAdvisor Chat',        icon: MessageCircle },
-        { id: 'portal',     label: 'Client Portal Demo',     icon: LayoutDashboard },
+        // hidden: Client Portal Demo (removed from toolkit) — uncomment to restore
+        // { id: 'portal',     label: 'Client Portal Demo',     icon: LayoutDashboard },
       ],
     },
     {
@@ -1265,7 +1273,7 @@ export default function BookkeeperProToolkit() {
       desc: 'Land US clients',
       groups: [
         { label: 'Self Discovery',          tabIds: ['brand'] },
-        { label: 'Profile Optimization',    tabIds: ['resume', 'linkedinopt'] },
+        { label: 'Profile Optimization',    tabIds: ['resumestrategy', 'linkedinopt'] },
         { label: 'Interview',               tabIds: ['coachalex', 'interview', 'mockinterview', 'qbdiag'] },
         { label: 'Proposal / Cover Letters', tabIds: ['painpoints', 'proposal'] },
       ],
@@ -1273,11 +1281,11 @@ export default function BookkeeperProToolkit() {
         // Self Discovery
         { id: 'brand',         label: 'Authentic Branding',       icon: User },
         // Profile Optimization
-        { id: 'resume',        label: 'Resume Optimizer',         icon: Briefcase },
+        { id: 'resumestrategy', label: 'Resume Winning Strategy',  icon: GraduationCap },
         { id: 'linkedinopt',   label: 'LinkedIn Optimizer',       icon: Linkedin },
         // Interview
         { id: 'coachalex',     label: 'Coach Alex AI',            icon: MessageCircle },
-        { id: 'interview',     label: 'Interview Prep',           icon: Mic },
+        { id: 'interview',     label: 'Job Interview Mastery',     icon: Mic },
         { id: 'mockinterview', label: 'Mock Interview Simulator', icon: Mic },
         { id: 'qbdiag',        label: 'Free QB Diagnostic',       icon: Shield },
         // Proposal / Cover Letters
@@ -1373,16 +1381,23 @@ export default function BookkeeperProToolkit() {
       };
     }).filter(s => defaultStageById[s.id]); // drop unknown stage ids
 
-    // Append any default stages/tabs missing from stored (e.g. new tabs added in updates)
+    // Add any default stages/tabs missing from stored (e.g. new tabs added in updates).
+    // Insert a missing tab at its DEFAULT_STAGES-relative position — just after the nearest
+    // preceding default sibling the user already has (else at the front) — instead of dumping
+    // it at the end. Keeps newly-shipped tabs where they belong in the navigation order.
     DEFAULT_STAGES.forEach(defStage => {
       const existing = merged.find(s => s.id === defStage.id);
       if (!existing) {
         merged.push(defStage);
       } else {
-        defStage.tabs.forEach(defTab => {
-          if (!existing.tabs.find(t => t.id === defTab.id)) {
-            existing.tabs.push(defTab);
+        defStage.tabs.forEach((defTab, defIdx) => {
+          if (existing.tabs.some(t => t.id === defTab.id)) return;
+          let insertAt = 0;
+          for (let k = defIdx - 1; k >= 0; k--) {
+            const pos = existing.tabs.findIndex(t => t.id === defStage.tabs[k].id);
+            if (pos !== -1) { insertAt = pos + 1; break; }
           }
+          existing.tabs.splice(insertAt, 0, defTab);
         });
       }
     });
@@ -1390,17 +1405,56 @@ export default function BookkeeperProToolkit() {
     return merged;
   };
 
+  // Bump when a code change should re-reconcile every user's saved sidebar layout (e.g. a new
+  // default tab that must land in a specific spot). On load, a stored version below this triggers
+  // a one-time normalizeTabOrder() pass so already-saved layouts adopt the new default ordering.
+  const SIDEBAR_VERSION = 3;
+
+  // Re-sort each stage's tabs to follow DEFAULT_STAGES order (preserving user renames). Safe:
+  // grouped stages render by explicit tabIds, so only flat stages (e.g. Training) are affected.
+  const normalizeTabOrder = (stgs) => stgs.map(s => {
+    const def = DEFAULT_STAGES.find(d => d.id === s.id);
+    if (!def) return s;
+    const order = def.tabs.map(t => t.id);
+    const rank = (id) => { const i = order.indexOf(id); return i === -1 ? 999 : i; };
+    return { ...s, tabs: [...s.tabs].sort((a, b) => rank(a.id) - rank(b.id)) };
+  });
+
+  // Tabs renamed in code after users may have persisted the old label. The sidebar merges
+  // labels stored-wins (so user renames survive), which would otherwise mask a code rename.
+  // This one-time, version-gated pass overwrites a saved label ONLY when it still equals the
+  // tab's PRIOR default — preserving any genuine user rename of the same tab.
+  const RENAMED_TAB_LABELS = {
+    interview: { from: 'Interview Prep', to: 'Job Interview Mastery' },
+  };
+  const reconcileRenamedLabels = (stgs) => stgs.map(s => ({
+    ...s,
+    tabs: s.tabs.map(t => {
+      const r = RENAMED_TAB_LABELS[t.id];
+      return r && t.label === r.from ? { ...t, label: r.to } : t;
+    }),
+  }));
+
   // Load persisted state on mount
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
         if (typeof window !== 'undefined' && window.storage) {
+          const versionRes = await window.storage.get('sidebar:version').catch(() => null);
+          const storedVersion = versionRes && versionRes.value ? (parseInt(versionRes.value, 10) || 1) : 1;
           const stagesRes = await window.storage.get('sidebar:stages').catch(() => null);
           if (!cancelled && stagesRes && stagesRes.value) {
             try {
               const parsed = JSON.parse(stagesRes.value);
-              setStages(mergeStoredWithDefaults(parsed));
+              let mergedStages = mergeStoredWithDefaults(parsed);
+              // One-time reconciliation: adopt the new default tab order for layouts saved before
+              // this SIDEBAR_VERSION (e.g. a newly-added tab that was previously appended at the end).
+              if (storedVersion < SIDEBAR_VERSION) {
+                mergedStages = normalizeTabOrder(mergedStages);
+                mergedStages = reconcileRenamedLabels(mergedStages);
+              }
+              setStages(mergedStages);
             } catch (e) {/* ignore */}
           }
           const collapsedRes = await window.storage.get('sidebar:collapsed').catch(() => null);
@@ -1431,6 +1485,15 @@ export default function BookkeeperProToolkit() {
       window.storage.set('sidebar:stages', JSON.stringify(stagesToStorable(stages))).catch(() => {});
     }
   }, [stages, storageReady]);
+
+  // Stamp the current sidebar layout version once after load, so the one-time reconciliation above
+  // runs at most once per user (the read in the load effect happens before this write).
+  useEffect(() => {
+    if (!storageReady) return;
+    if (typeof window !== 'undefined' && window.storage) {
+      window.storage.set('sidebar:version', String(SIDEBAR_VERSION)).catch(() => {});
+    }
+  }, [storageReady]);
 
   // Persist collapsed on change
   useEffect(() => {
@@ -1899,15 +1962,34 @@ export default function BookkeeperProToolkit() {
         ::selection { background: ${C.primary}33; color: var(--c-text); }
       `}</style>
 
-      {/* SIDEBAR */}
+      {/* Mobile drawer backdrop — click to dismiss (hidden on lg+) */}
+      {sidebarOpen && (
+        <div
+          className="fixed inset-0 z-40 bg-black/40 lg:hidden"
+          onClick={() => setSidebarOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+
+      {/* SIDEBAR — static column on lg+, off-canvas drawer below it */}
       <aside style={{
         background: 'linear-gradient(180deg, rgba(255,255,255,0.78) 0%, rgba(247,250,255,0.72) 100%)',
         backdropFilter: 'blur(40px) saturate(180%)',
         WebkitBackdropFilter: 'blur(40px) saturate(180%)',
         borderRight: `1px solid ${GLASS.borderSoft}`,
-      }} className="w-72 flex-shrink-0 flex flex-col h-screen relative">
+      }} className={`w-72 flex-shrink-0 flex flex-col h-screen z-50 fixed inset-y-0 left-0 transform transition-transform duration-300 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:relative lg:inset-auto lg:translate-x-0 lg:transition-none`}>
         {/* Subtle right-edge highlight */}
         <div className="absolute top-0 right-0 bottom-0 w-px" style={{ background: 'linear-gradient(180deg, transparent 0%, rgba(10,132,255,0.08) 50%, transparent 100%)' }} />
+
+        {/* Close control — drawer only (hidden on lg+) */}
+        <button
+          onClick={() => setSidebarOpen(false)}
+          aria-label="Close menu"
+          className="lg:hidden absolute top-4 right-4 z-10 flex items-center justify-center rounded-lg"
+          style={{ width: 32, height: 32, background: 'rgba(15,18,23,0.05)', border: `1px solid ${GLASS.borderSoft}` }}
+        >
+          <X size={18} style={{ color: C.textMute }} />
+        </button>
 
         <div className="px-5 py-5" style={{ borderBottom: `1px solid ${GLASS.borderSoft}` }}>
           <div className="flex items-center gap-3">
@@ -2185,13 +2267,32 @@ export default function BookkeeperProToolkit() {
 
       {/* MAIN */}
       <main className="flex-1 overflow-y-auto">
+        {/* Mobile top bar — hamburger opens the drawer (hidden on lg+) */}
+        <div
+          className="lg:hidden sticky top-0 z-30 flex items-center gap-3 px-4 py-3"
+          style={{ background: 'rgba(255,255,255,0.85)', backdropFilter: 'blur(20px) saturate(180%)', WebkitBackdropFilter: 'blur(20px) saturate(180%)', borderBottom: `1px solid ${GLASS.borderSoft}` }}
+        >
+          <button
+            onClick={() => setSidebarOpen(true)}
+            aria-label="Open menu"
+            className="flex items-center justify-center rounded-xl"
+            style={{ width: 40, height: 40, background: 'rgba(15,18,23,0.04)', border: `1px solid ${GLASS.borderSoft}` }}
+          >
+            <Menu size={20} style={{ color: C.text }} />
+          </button>
+          <img src={LOGO_DATA_URI} alt="" style={{ width: 30, height: 30, objectFit: 'contain' }} />
+          <div style={{ fontFamily: fontDisplay, fontSize: 13, fontWeight: 700, color: C.text, lineHeight: 1.1, letterSpacing: '-0.01em' }}>
+            Bookkeeper Toolkits
+          </div>
+        </div>
         {/* Phase 2 paywall hooks here — to restrict to paid students, wrap this
             <div> so that `!profile?.is_paid && !FREE_TABS.has(tab)` renders a
             <PaywallOverlay/> instead of the tool. profile.is_paid comes from useAuth(). */}
-        <div key={tab} className="fade-in p-10 max-w-7xl mx-auto">
+        <div key={tab} className="fade-in p-4 sm:p-6 lg:p-10 max-w-7xl mx-auto">
           {tab === 'dashboard'   && <Dashboard goto={setTab} />}
           {tab === 'coa'         && <CoaGenerator />}
           {tab === 'course'      && <Course />}
+          {tab === 'qbomastery'  && <QBOMastery />}
           {tab === 'industryacc' && <IndustryAccounting />}
           {tab === 'ustax'       && <USTax101 />}
           {tab === 'bankfeed'    && <BankFeed />}
@@ -2199,11 +2300,12 @@ export default function BookkeeperProToolkit() {
           {tab === 'chat'        && <ProChat />}
           {tab === 'coachalex'   && <CoachAlexChat />}
           {tab === 'cpaai'       && <CPAAIChat />}
-          {tab === 'resume'      && <ResumeOptimizer />}
+          {tab === 'resumestrategy' && <ResumeStrategy />}
           {tab === 'interview'   && <InterviewPrep />}
           {tab === 'brand'       && <AuthenticBranding standalone />}
           {tab === 'painpoints'  && <PainPointsGenerator />}
-          {tab === 'portal'      && <ClientPortalDemo />}
+          {/* hidden: Client Portal Demo (removed from toolkit) — uncomment to restore */}
+          {/* {tab === 'portal'      && <ClientPortalDemo />} */}
           {tab === 'proposal'    && <ProposalGenerator />}
           {tab === 'engagement'  && <EngagementLetter />}
           {tab === 'invoice'     && <InvoiceCreator />}
@@ -2248,10 +2350,12 @@ function Dashboard({ goto }) {
       desc: 'Build your foundation as a US bookkeeper',
       tiles: [
         { id: 'course',      label: 'Accounting 101',      desc: '8 modules · self-paced',          icon: BookOpen,        color: '#1E40AF' },
+        { id: 'qbomastery',  label: 'QBO Mastering Programme', desc: 'Video course · certificate',  icon: GraduationCap,   color: '#2563EB' },
         { id: 'industryacc', label: 'Industry Accounting', desc: '12 industries · QBO workflows',   icon: Building2,       color: '#3B82F6' },
         { id: 'ustax',       label: 'US Tax 101',          desc: 'Forms, deadlines, IRS links',     icon: Landmark,        color: '#0A1E3F' },
         { id: 'chat',        label: 'ProAdvisor Chat',     desc: 'Live mentor for clean-ups',       icon: MessageCircle,   color: '#0EA5E9' },
-        { id: 'portal',      label: 'Client Portal Demo',  desc: 'See what you deliver to clients', icon: LayoutDashboard, color: '#1E40AF' },
+        // hidden: Client Portal Demo (removed from toolkit) — uncomment to restore
+        // { id: 'portal',      label: 'Client Portal Demo',  desc: 'See what you deliver to clients', icon: LayoutDashboard, color: '#1E40AF' },
       ],
     },
     {
@@ -2260,7 +2364,7 @@ function Dashboard({ goto }) {
       desc: 'Land US remote clients',
       groups: [
         { label: 'Self Discovery',          tabIds: ['brand'] },
-        { label: 'Profile Optimization',    tabIds: ['resume', 'linkedinopt'] },
+        { label: 'Profile Optimization',    tabIds: ['resumestrategy', 'linkedinopt'] },
         { label: 'Interview',               tabIds: ['coachalex', 'interview', 'mockinterview', 'qbdiag'] },
         { label: 'Proposal / Cover Letters', tabIds: ['painpoints', 'proposal'] },
       ],
@@ -2268,11 +2372,11 @@ function Dashboard({ goto }) {
         // Self Discovery
         { id: 'brand',         label: 'Authentic Branding',       desc: 'Psychological deep-dive to your brand', icon: User,      color: '#0A1E3F' },
         // Profile Optimization
-        { id: 'resume',        label: 'Resume Optimizer',         desc: 'JD-matched, ATS-ready, editable',       icon: Briefcase, color: '#1E40AF' },
+        { id: 'resumestrategy', label: 'Resume Winning Strategy',  desc: 'Video courses · certificates',           icon: GraduationCap, color: '#1E40AF' },
         { id: 'linkedinopt',   label: 'LinkedIn Optimizer',       desc: 'Headline, About, experience rewrites',  icon: Linkedin,  color: '#0EA5E9' },
         // Interview
         { id: 'coachalex',     label: 'Coach Alex AI',            desc: 'Live career coach · 12-yr accountant',  icon: MessageCircle, color: '#0EA5E9' },
-        { id: 'interview',     label: 'Interview Prep',           desc: 'CAR storytelling + Q&A + negotiation',  icon: Mic,       color: '#3B82F6' },
+        { id: 'interview',     label: 'Job Interview Mastery',     desc: 'Strategy course + CAR + Q&A + negotiation',  icon: Mic,       color: '#3B82F6' },
         { id: 'mockinterview', label: 'Mock Interview Simulator', desc: 'AI plays US firm partner',              icon: Mic,       color: '#059669' },
         { id: 'qbdiag',        label: 'Free QB Diagnostic',       desc: 'Hook prospects · audit P&L + BS',       icon: Shield,    color: '#DC2626' },
         // Proposal / Cover Letters
@@ -2321,7 +2425,7 @@ function Dashboard({ goto }) {
       {/* Hero */}
       <div className="mb-10 gh-halo">
         <div className="gh-label mb-2" style={{ color: C.primary }}>Welcome back</div>
-        <h1 style={{ fontFamily: fontDisplay, color: C.text, letterSpacing: '-0.03em', fontWeight: 600, fontSize: 44, lineHeight: 1.02 }}>
+        <h1 style={{ fontFamily: fontDisplay, color: C.text, letterSpacing: '-0.03em', fontWeight: 600, fontSize: 'clamp(28px, 6vw, 44px)', lineHeight: 1.02 }}>
           Get Hired With Alex
         </h1>
         <div className="gh-label mt-2" style={{ fontSize: 12, color: C.textSoft, letterSpacing: '0.1em' }}>
@@ -2490,7 +2594,7 @@ function StatCard({ label, value, sub, icon: Icon }) {
         <Icon size={20} className="text-white" />
       </div>
       <div className="min-w-0">
-        <div className="gh-bignum leading-none" style={{ color: C.text, fontSize: 34 }}>{value}</div>
+        <div className="gh-bignum leading-none" style={{ color: C.text, fontSize: 'clamp(26px, 5vw, 34px)' }}>{value}</div>
         <div className="gh-label mt-1.5" style={{ fontSize: 10, color: C.textSoft }}>{label}</div>
         <div className="text-[11px]" style={{ color: C.textMute }}>{sub}</div>
       </div>
@@ -2692,6 +2796,1176 @@ function Course() {
         })}
       </div>
     </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// COMPONENT: QUICKBOOKS ONLINE MASTERING PROGRAMME (cloud video course)
+// ═══════════════════════════════════════════════════════════════════
+// A Thinkific-style course backed by Supabase (see COURSE_SETUP.md):
+//   courses → course_modules → course_lessons, per-user lesson_progress,
+//   and a course_completions stamp that fixes the certificate's issue date.
+// Students watch lessons + earn a downloadable PDF certificate; admins
+// (profiles.is_admin) get an in-app builder to author modules/lessons and
+// link or upload videos. All writes are also enforced server-side by RLS.
+
+// Parse a pasted URL into a known provider + an embeddable URL.
+function parseVideoUrl(url) {
+  if (!url) return { provider: null, embedUrl: null };
+  const u = String(url).trim();
+  const yt = u.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/|v\/)|youtu\.be\/)([\w-]{11})/);
+  if (yt) return { provider: 'youtube', embedUrl: `https://www.youtube.com/embed/${yt[1]}` };
+  const vm = u.match(/vimeo\.com\/(?:video\/)?(\d+)/);
+  if (vm) return { provider: 'vimeo', embedUrl: `https://player.vimeo.com/video/${vm[1]}` };
+  return { provider: 'mp4', embedUrl: u };
+}
+
+function CourseProgram({
+  slug = 'qbo-mastery',
+  courseId = null,                                       // catalog mode: load by id instead of slug
+  onBack = null,                                         // catalog mode: show "← All courses" + its own course header
+  eyebrow = 'Video Course',
+  courseTitle = 'QuickBooks Online Mastering Programme',
+  defaultSubtitle = 'From setup to month-end — the complete QBO workflow for remote bookkeepers.',
+  certFileName = 'QBO-Mastering-Certificate.pdf',
+  comingSoonText = 'Your QuickBooks Online Mastering Programme is being prepared. Check back soon.',
+  embedded = false,                                      // hide the sticky SectionHead when nested inside a subtab
+} = {}) {
+  const { user, profile } = useAuth();
+  const isAdmin = !!profile?.is_admin;
+  const showHead = !embedded && !onBack;                 // the catalog/suite supplies its own header instead
+
+  const [course, setCourse] = useState(null);
+  const [courseDraft, setCourseDraft] = useState({ title: '', subtitle: '', description: '' });
+  const [modules, setModules] = useState([]);            // [{ ...module, lessons: [...] }]
+  const [doneIds, setDoneIds] = useState(new Set());
+  const [completion, setCompletion] = useState(null);
+  const [activeLessonId, setActiveLessonId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+  const [notConfigured, setNotConfigured] = useState(false); // Supabase course tables not created yet
+  const [creating, setCreating] = useState(false);       // admin bootstrapping the course row
+  const [mode, setMode] = useState('learn');             // 'learn' | 'edit' | 'certificate'
+
+  // Builder state
+  const [editingLesson, setEditingLesson] = useState(null);  // draft copy of a lesson row
+  const [savingLesson, setSavingLesson] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState(null);        // local object URL while authoring
+  const [metaBusy, setMetaBusy] = useState(false);           // saving course details / toggling publish
+  const [structBusy, setStructBusy] = useState(false);       // adding a module or lesson
+
+  // Certificate state
+  const [studentName, setStudentName] = useState(
+    user?.user_metadata?.full_name || user?.user_metadata?.name ||
+    (user?.email ? user.email.split('@')[0] : '')
+  );
+  const [certBusy, setCertBusy] = useState(false);
+  const certRef = useRef(null);
+
+  // ── Load course + curriculum + this user's progress ──
+  async function load() {
+    setLoading(true); setErr(''); setNotConfigured(false);
+    try {
+      let cq = supabase.from('courses').select('*');
+      cq = courseId ? cq.eq('id', courseId) : cq.eq('slug', slug);
+      const { data: courseRow, error: cErr } = await cq.maybeSingle();
+      if (cErr) throw cErr;
+      if (!courseRow) { setCourse(null); setModules([]); setLoading(false); return; }
+      setCourse(courseRow);
+      setCourseDraft({
+        title: courseRow.title || '', subtitle: courseRow.subtitle || '',
+        description: courseRow.description || '',
+      });
+
+      const [{ data: mods, error: mErr }, { data: lessons, error: lErr }] = await Promise.all([
+        supabase.from('course_modules').select('*').eq('course_id', courseRow.id).order('position'),
+        supabase.from('course_lessons').select('*').eq('course_id', courseRow.id).order('position'),
+      ]);
+      if (mErr) throw mErr;
+      if (lErr) throw lErr;
+      const nested = (mods || []).map(m => ({
+        ...m, lessons: (lessons || []).filter(l => l.module_id === m.id),
+      }));
+      setModules(nested);
+
+      const [{ data: prog }, { data: comp }] = await Promise.all([
+        supabase.from('lesson_progress').select('lesson_id')
+          .eq('course_id', courseRow.id).eq('user_id', user.id),
+        supabase.from('course_completions').select('*')
+          .eq('course_id', courseRow.id).eq('user_id', user.id).maybeSingle(),
+      ]);
+      const done = new Set((prog || []).map(p => p.lesson_id));
+      setDoneIds(done);
+      setCompletion(comp || null);
+
+      const all = nested.flatMap(m => m.lessons);
+      setActiveLessonId(prev => prev || (all.find(l => !done.has(l.id)) || all[0])?.id || null);
+    } catch (e) {
+      console.error('[CourseProgram] load failed:', e);
+      const msg = e?.message || '';
+      // The course tables don't exist yet (COURSE_SETUP.md not run) — treat as "not configured"
+      // and show a friendly setup/coming-soon state instead of a raw red Postgres error.
+      if (e?.code === 'PGRST205' || /schema cache|could not find the table|does not exist/i.test(msg)) {
+        setNotConfigured(true);
+        setCourse(null);
+      } else {
+        setErr(msg || 'Failed to load the course.');
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { if (user?.id) load(); /* eslint-disable-next-line */ }, [user?.id, courseId]);
+  // Revoke the local preview object URL when it changes / on unmount.
+  useEffect(() => () => { if (previewUrl) URL.revokeObjectURL(previewUrl); }, [previewUrl]);
+
+  // ── Derived ──
+  const allLessons = modules.flatMap(m => m.lessons || []);
+  const totalLessons = allLessons.length;
+  const completedCount = allLessons.filter(l => doneIds.has(l.id)).length;
+  const progressPct = totalLessons ? Math.round((completedCount / totalLessons) * 100) : 0;
+  const isComplete = totalLessons > 0 && completedCount === totalLessons;
+  const activeLesson = allLessons.find(l => l.id === activeLessonId) || null;
+
+  // ── Learner actions ──
+  function goAdjacent(lesson, delta) {
+    const idx = allLessons.findIndex(l => l.id === lesson.id);
+    const next = allLessons[idx + delta];
+    if (next) setActiveLessonId(next.id);
+  }
+
+  async function markComplete(lesson) {
+    if (!lesson) return;
+    if (doneIds.has(lesson.id)) { goAdjacent(lesson, 1); return; }
+    try {
+      const { error } = await supabase.from('lesson_progress').upsert(
+        { user_id: user.id, lesson_id: lesson.id, course_id: course.id },
+        { onConflict: 'user_id,lesson_id', ignoreDuplicates: true }
+      );
+      if (error) throw error;
+      const next = new Set(doneIds); next.add(lesson.id); setDoneIds(next);
+      const newCount = allLessons.filter(l => next.has(l.id)).length;
+      if (totalLessons > 0 && newCount === totalLessons && !completion) {
+        const { error: cErr } = await supabase.from('course_completions').upsert(
+          { user_id: user.id, course_id: course.id },
+          { onConflict: 'user_id,course_id', ignoreDuplicates: true }
+        );
+        if (cErr) throw cErr;
+        const { data: c2 } = await supabase.from('course_completions').select('*')
+          .eq('user_id', user.id).eq('course_id', course.id).maybeSingle();
+        setCompletion(c2 || { completed_at: new Date().toISOString() });
+      }
+      goAdjacent(lesson, 1);
+    } catch (e) {
+      console.error('[CourseProgram] progress failed:', e);
+      setErr(e.message || 'Could not save your progress.');
+    }
+  }
+
+  // ── Builder: bootstrap the course row (admin-only; RLS restricts inserts to is_admin()) ──
+  async function createCourse() {
+    setCreating(true); setErr('');
+    try {
+      const { error } = await supabase.from('courses').insert({
+        slug, title: courseTitle, subtitle: defaultSubtitle, published: false,
+      });
+      if (error) throw error;
+      await load();
+      setMode('edit');
+    } catch (e) {
+      console.error('[CourseProgram] create failed:', e);
+      setErr(e.message || 'Could not create the course.');
+    } finally { setCreating(false); }
+  }
+
+  // ── Builder: course meta ──
+  async function saveCourseMeta() {
+    setMetaBusy(true); setErr('');
+    try {
+      const { error } = await supabase.from('courses').update({
+        title: courseDraft.title, subtitle: courseDraft.subtitle,
+        description: courseDraft.description, updated_at: new Date().toISOString(),
+      }).eq('id', course.id);
+      if (error) throw error;
+      await load();
+    } catch (e) { setErr(e.message || 'Could not save course details.'); }
+    finally { setMetaBusy(false); }
+  }
+  async function togglePublished() {
+    setMetaBusy(true); setErr('');
+    try {
+      const { error } = await supabase.from('courses')
+        .update({ published: !course.published }).eq('id', course.id);
+      if (error) throw error;
+      await load();
+    } catch (e) { setErr(e.message || 'Could not change publish state.'); }
+    finally { setMetaBusy(false); }
+  }
+
+  // ── Builder: modules ──
+  async function addModule() {
+    setStructBusy(true); setErr('');
+    try {
+      const { error } = await supabase.from('course_modules')
+        .insert({ course_id: course.id, title: 'New module', position: modules.length });
+      if (error) throw error;
+      await load();
+    } catch (e) { setErr(e.message || 'Could not add module.'); }
+    finally { setStructBusy(false); }
+  }
+  async function renameModule(m, title) {
+    if (title === m.title) return;
+    try {
+      const { error } = await supabase.from('course_modules').update({ title }).eq('id', m.id);
+      if (error) throw error;
+      setModules(ms => ms.map(x => x.id === m.id ? { ...x, title } : x));
+    } catch (e) { setErr(e.message || 'Could not rename module.'); }
+  }
+  async function deleteModule(m) {
+    if (!window.confirm(`Delete "${m.title}" and all its lessons? This cannot be undone.`)) return;
+    try {
+      const { error } = await supabase.from('course_modules').delete().eq('id', m.id);
+      if (error) throw error;
+      await load();
+    } catch (e) { setErr(e.message || 'Could not delete module.'); }
+  }
+  async function moveModule(idx, dir) {
+    const j = idx + dir;
+    if (j < 0 || j >= modules.length) return;
+    const arr = [...modules];
+    [arr[idx], arr[j]] = [arr[j], arr[idx]];
+    try {
+      await Promise.all(arr.map((m, i) => supabase.from('course_modules').update({ position: i }).eq('id', m.id)));
+      await load();
+    } catch (e) { setErr(e.message || 'Could not reorder modules.'); }
+  }
+
+  // ── Builder: lessons ──
+  async function addLesson(m) {
+    setStructBusy(true); setErr('');
+    try {
+      const { data, error } = await supabase.from('course_lessons').insert({
+        module_id: m.id, course_id: course.id, title: 'New lesson',
+        type: 'video', position: (m.lessons?.length || 0),
+      }).select('*').single();
+      if (error) throw error;
+      await load();
+      setEditingLesson({ ...data });
+    } catch (e) { setErr(e.message || 'Could not add lesson.'); }
+    finally { setStructBusy(false); }
+  }
+  async function deleteLesson(l) {
+    if (!window.confirm(`Delete lesson "${l.title}"?`)) return;
+    try {
+      // Remove the uploaded video from storage first so deleting a lesson never leaves an orphan file.
+      if (l.video_provider === 'upload' && l.storage_path) {
+        try { await supabase.storage.from('course-media').remove([l.storage_path]); } catch (_) { /* best-effort */ }
+      }
+      const { error } = await supabase.from('course_lessons').delete().eq('id', l.id);
+      if (error) throw error;
+      setActiveLessonId(prev => (prev === l.id ? null : prev)); // don't keep a deleted lesson active
+      await load();
+    } catch (e) { setErr(e.message || 'Could not delete lesson.'); }
+  }
+  async function moveLesson(m, idx, dir) {
+    const j = idx + dir;
+    if (j < 0 || j >= m.lessons.length) return;
+    const arr = [...m.lessons];
+    [arr[idx], arr[j]] = [arr[j], arr[idx]];
+    try {
+      await Promise.all(arr.map((l, i) => supabase.from('course_lessons').update({ position: i }).eq('id', l.id)));
+      await load();
+    } catch (e) { setErr(e.message || 'Could not reorder lessons.'); }
+  }
+
+  async function uploadVideo(file) {
+    if (!file || !course) return;
+    const MAX_MB = 50;
+    if (!/^video\//i.test(file.type)) { setErr('Please choose a video file (MP4, MOV, WebM…), or paste a YouTube/Vimeo link instead.'); return; }
+    if (file.size > MAX_MB * 1024 * 1024) {
+      setErr(`That video is ${(file.size / 1024 / 1024).toFixed(0)} MB — the upload limit is ${MAX_MB} MB. Compress it, or host it on YouTube/Vimeo and paste the link.`);
+      return;
+    }
+    setUploading(true); setErr('');
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    setPreviewUrl(URL.createObjectURL(file));
+    try {
+      const safe = file.name.replace(/[^\w.\-]+/g, '_');
+      const path = `lessons/${course.id}/${crypto.randomUUID()}-${safe}`;
+      const { error } = await supabase.storage.from('course-media')
+        .upload(path, file, { upsert: false, contentType: file.type || 'video/mp4' });
+      if (error) throw error;
+      setEditingLesson(d => ({ ...d, storage_path: path, video_provider: 'upload', video_url: '' }));
+    } catch (e) {
+      console.error('[CourseProgram] upload failed:', e);
+      setErr(e.message || 'Video upload failed — check the file size and that you have admin access.');
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function saveLesson() {
+    if (!editingLesson) return;
+    const d = editingLesson;
+    const isVideo = d.type === 'video';
+    const isUpload = isVideo && d.video_provider === 'upload' && !!d.storage_path;
+    const hasLink = isVideo && !isUpload && !!(d.video_url || '').trim();
+    const hasText = !!(d.text_content || '').trim();
+    // Don't let an empty lesson be saved (it would show "No video added yet" to students).
+    if (isVideo && !isUpload && !hasLink && !hasText) {
+      setErr('Add a video link, upload a file, or write some lesson notes before saving.'); return;
+    }
+    if (!isVideo && !hasText) { setErr('Add some lesson content before saving.'); return; }
+    setSavingLesson(true); setErr('');
+    try {
+      const oldPath = allLessons.find(x => x.id === d.id)?.storage_path; // for cleanup if the video changed
+      const payload = {
+        title: (d.title || '').trim() || 'Untitled lesson',
+        type: d.type || 'video',
+        video_url: isVideo && !isUpload ? (d.video_url || null) : null,
+        video_provider: isVideo ? (isUpload ? 'upload' : parseVideoUrl(d.video_url).provider) : null,
+        storage_path: isUpload ? d.storage_path : null,
+        text_content: d.text_content || null,
+        duration_label: (d.duration_label || '').trim() || null,
+      };
+      const { error } = await supabase.from('course_lessons').update(payload).eq('id', d.id);
+      if (error) throw error;
+      // If a previously-uploaded file was replaced or removed, purge the old object.
+      if (oldPath && oldPath !== payload.storage_path) {
+        try { await supabase.storage.from('course-media').remove([oldPath]); } catch (_) { /* best-effort */ }
+      }
+      if (previewUrl) { URL.revokeObjectURL(previewUrl); setPreviewUrl(null); }
+      setEditingLesson(null);
+      await load();
+    } catch (e) { setErr(e.message || 'Could not save lesson.'); }
+    finally { setSavingLesson(false); }
+  }
+
+  // ── Certificate ──
+  async function downloadCertificate() {
+    if (!certRef.current) return;
+    setCertBusy(true); setErr('');
+    try {
+      const [{ jsPDF }, h2c] = await Promise.all([import('jspdf'), import('html2canvas')]);
+      const html2canvas = h2c.default;
+      const canvas = await html2canvas(certRef.current, { scale: 2, backgroundColor: '#ffffff', useCORS: true });
+      const img = canvas.toDataURL('image/png');
+      const pdf = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+      const pw = pdf.internal.pageSize.getWidth();
+      const ph = pdf.internal.pageSize.getHeight();
+      const ratio = Math.min(pw / canvas.width, ph / canvas.height);
+      const w = canvas.width * ratio, h = canvas.height * ratio;
+      pdf.addImage(img, 'PNG', (pw - w) / 2, (ph - h) / 2, w, h);
+      downloadFile(pdf.output('blob'), certFileName, 'application/pdf');
+    } catch (e) {
+      console.error('[CourseProgram] certificate failed:', e);
+      setErr('Certificate download failed: ' + (e.message || 'unknown error'));
+    } finally { setCertBusy(false); }
+  }
+  function printCertificate() {
+    if (!certRef.current) return;
+    const w = window.open('', '_blank');
+    if (!w) { setErr('Pop-up blocked — allow pop-ups for this site to print.'); return; }
+    w.document.write(
+      '<!doctype html><html><head><title>Certificate</title>' +
+      '<style>@page{size:A4 landscape;margin:0}html,body{margin:0;padding:0;display:flex;justify-content:center;align-items:center;min-height:100vh;background:#fff}</style>' +
+      '</head><body>' + certRef.current.outerHTML + '</body></html>'
+    );
+    w.document.close();
+    setTimeout(() => { try { w.focus(); w.print(); } catch (_) { /* ignore */ } }, 350);
+  }
+
+  // ── Video / content renderer ──
+  function renderVideo(lesson) {
+    if (!lesson) return null;
+    if (lesson.type === 'text') {
+      return lesson.text_content
+        ? <div className="text-slate-700 whitespace-pre-line leading-relaxed text-[15px]">{lesson.text_content}</div>
+        : <div className="rounded-xl border-2 border-dashed border-slate-200 p-10 text-center text-slate-400">No content yet.</div>;
+    }
+    if (lesson.video_provider === 'upload' && lesson.storage_path) {
+      const { data } = supabase.storage.from('course-media').getPublicUrl(lesson.storage_path);
+      return <video key={lesson.id} controls className="w-full rounded-xl bg-black" style={{ maxHeight: 460 }} src={data.publicUrl} />;
+    }
+    if (lesson.video_provider === 'mp4' && lesson.video_url) {
+      return <video key={lesson.id} controls className="w-full rounded-xl bg-black" style={{ maxHeight: 460 }} src={lesson.video_url} />;
+    }
+    if ((lesson.video_provider === 'youtube' || lesson.video_provider === 'vimeo') && lesson.video_url) {
+      const { embedUrl } = parseVideoUrl(lesson.video_url);
+      if (embedUrl) return (
+        <div style={{ position: 'relative', paddingBottom: '56.25%', height: 0 }} className="rounded-xl overflow-hidden bg-black">
+          <iframe src={embedUrl} title={lesson.title} loading="lazy"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen
+            style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', border: 0 }} />
+        </div>
+      );
+    }
+    return (
+      <div className="rounded-xl border-2 border-dashed border-slate-200 p-10 text-center text-slate-400">
+        <Video size={28} className="mx-auto mb-2 opacity-60" />
+        No video added yet.
+      </div>
+    );
+  }
+
+  // ── Sub-views ──
+  function renderLearner() {
+    if (totalLessons === 0) {
+      return (
+        <div className="mt-6 glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
+          <GraduationCap size={36} className="mx-auto mb-3" style={{ color: ROYAL }} />
+          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg font-bold">
+            {isAdmin ? 'Your course is empty' : 'Curriculum coming soon'}
+          </div>
+          <div className="text-slate-500 mt-1 text-sm">
+            {isAdmin ? 'Open the builder to add your first module and lessons.' : 'Lessons are being added. Check back shortly.'}
+          </div>
+          {isAdmin && (
+            <button onClick={() => setMode('edit')} className="mt-4 px-5 py-2.5 rounded-xl text-white font-semibold inline-flex items-center gap-2"
+              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+              <Edit3 size={16} /> Open the builder
+            </button>
+          )}
+        </div>
+      );
+    }
+    const activeIdx = activeLesson ? allLessons.findIndex(l => l.id === activeLesson.id) : -1;
+    return (
+      <div className="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Curriculum — below the player on mobile, sticky sidebar on desktop */}
+        <div className="order-2 lg:order-1 lg:col-span-1 space-y-4 lg:sticky lg:top-24 lg:self-start lg:max-h-[calc(100vh-7rem)] lg:overflow-y-auto">
+          <div style={{ background: SHEEN }} className="glass-card p-5 rounded-2xl">
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-xs uppercase tracking-[0.2em] font-bold text-slate-600">Your Progress</div>
+              <div style={{ color: ROYAL, fontFamily: fontDisplay }} className="text-2xl font-bold">{progressPct}%</div>
+            </div>
+            <div className="w-full h-3 bg-slate-200 rounded-full overflow-hidden">
+              <div className="h-full transition-all duration-700 relative"
+                style={{ width: `${progressPct}%`, background: `linear-gradient(90deg, ${ROYAL} 0%, ${CYAN} 50%, ${GOLD} 100%)` }}>
+                <div className="absolute inset-0 shimmer" />
+              </div>
+            </div>
+            <div className="text-xs text-slate-500 mt-2">{completedCount} of {totalLessons} lessons complete</div>
+            {isComplete && (
+              <button onClick={() => setMode('certificate')} className="mt-3 w-full px-4 py-2.5 rounded-xl text-white font-semibold inline-flex items-center justify-center gap-2"
+                style={{ background: `linear-gradient(135deg, ${C.primary}, ${C.accent})` }}>
+                <Award size={16} /> Get your certificate
+              </button>
+            )}
+          </div>
+          {modules.map((m, mi) => (
+            <div key={m.id} className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
+              <div className="px-4 py-3 border-b border-slate-100">
+                <div className="text-[11px] font-bold tracking-wider uppercase text-blue-700">Module {mi + 1}</div>
+                <div style={{ fontFamily: fontDisplay, color: NAVY }} className="font-bold leading-tight text-[15px]">{m.title}</div>
+              </div>
+              <div className="p-2">
+                {(m.lessons || []).length === 0 && <div className="px-3 py-2 text-xs text-slate-400 italic">No lessons yet</div>}
+                {(m.lessons || []).map((l) => {
+                  const done = doneIds.has(l.id);
+                  const active = l.id === activeLessonId;
+                  return (
+                    <button key={l.id} onClick={() => setActiveLessonId(l.id)}
+                      className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left transition-colors hover:bg-slate-50"
+                      style={active ? { background: ICE } : undefined}>
+                      {done ? <CheckCircle2 size={18} style={{ color: ROYAL }} className="flex-shrink-0" />
+                            : <Circle size={18} className="text-slate-300 flex-shrink-0" />}
+                      <span className="flex-1 text-sm truncate" style={{ color: active ? NAVY : C.text, fontWeight: active ? 700 : 500 }}>{l.title}</span>
+                      {l.type === 'video' ? <Play size={13} className="text-slate-400 flex-shrink-0" /> : <FileText size={13} className="text-slate-400 flex-shrink-0" />}
+                      {l.duration_label && <span className="text-[11px] text-slate-400 flex-shrink-0">{l.duration_label}</span>}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Player */}
+        <div className="order-1 lg:order-2 lg:col-span-2">
+          {activeLesson ? (
+            <div className="glass-card rounded-2xl p-5 sm:p-6" style={{ background: '#fff' }}>
+              {renderVideo(activeLesson)}
+              <div className="mt-5">
+                <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">{activeLesson.title}</div>
+                {activeLesson.duration_label && <div className="text-xs text-slate-400 mt-0.5">{activeLesson.duration_label}</div>}
+                {activeLesson.type === 'video' && activeLesson.text_content && (
+                  <div className="mt-4 text-slate-700 whitespace-pre-line leading-relaxed text-[15px]">{activeLesson.text_content}</div>
+                )}
+              </div>
+              <div className="mt-5 pt-4 border-t border-slate-100">
+                <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-3">Lesson {activeIdx + 1} of {totalLessons}</div>
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <button onClick={() => goAdjacent(activeLesson, -1)} disabled={activeIdx <= 0}
+                    className="px-4 py-2.5 rounded-xl text-sm font-semibold text-slate-600 border border-slate-200 disabled:opacity-40 inline-flex items-center gap-1.5">
+                    <ArrowLeft size={15} /> Previous
+                  </button>
+                  <div className="flex items-center gap-2">
+                    {doneIds.has(activeLesson.id) ? (
+                      <span className="px-4 py-2.5 rounded-xl text-sm font-semibold inline-flex items-center gap-2" style={{ background: '#DCFCE7', color: '#166534' }}>
+                        <Check size={16} /> Completed
+                      </span>
+                    ) : (
+                      <button onClick={() => markComplete(activeLesson)}
+                        className="px-5 py-2.5 rounded-xl text-white text-sm font-semibold inline-flex items-center gap-2"
+                        style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+                        <CheckCircle2 size={16} /> Mark complete
+                      </button>
+                    )}
+                    <button onClick={() => goAdjacent(activeLesson, 1)} disabled={activeIdx >= totalLessons - 1}
+                      className="px-5 py-2.5 rounded-xl text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-40"
+                      style={doneIds.has(activeLesson.id)
+                        ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff' }
+                        : { background: '#F1F5F9', color: C.textSoft }}>
+                      Next <ArrowRight size={15} />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="glass-card rounded-2xl p-10 text-center text-slate-400">Select a lesson to begin.</div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  function renderBuilder() {
+    return (
+      <div className="mt-6 space-y-5">
+        {/* Course settings */}
+        <div className="glass-card rounded-2xl p-5" style={{ background: SHEEN }}>
+          <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+            <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg font-bold flex items-center gap-2"><Edit3 size={18} /> Course settings</div>
+            <button onClick={togglePublished} disabled={metaBusy} className="px-4 py-2 rounded-xl text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-60"
+              style={course.published ? { background: '#DCFCE7', color: '#166534' } : { background: '#FEF3C7', color: '#92400E' }}>
+              {metaBusy ? <Loader2 size={15} className="animate-spin" /> : course.published ? <Eye size={15} /> : <Lock size={15} />}
+              {course.published ? 'Published' : 'Draft'}
+              <span className="opacity-60 font-normal">· click to {course.published ? 'unpublish' : 'publish'}</span>
+            </button>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <label className="block">
+              <span className="text-xs font-semibold text-slate-500">Title</span>
+              <input value={courseDraft.title} onChange={e => setCourseDraft(d => ({ ...d, title: e.target.value }))}
+                className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+            </label>
+            <label className="block">
+              <span className="text-xs font-semibold text-slate-500">Subtitle</span>
+              <input value={courseDraft.subtitle} onChange={e => setCourseDraft(d => ({ ...d, subtitle: e.target.value }))}
+                className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+            </label>
+            <label className="block sm:col-span-2">
+              <span className="text-xs font-semibold text-slate-500">Description</span>
+              <textarea value={courseDraft.description} onChange={e => setCourseDraft(d => ({ ...d, description: e.target.value }))} rows={2}
+                className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+            </label>
+          </div>
+          <button onClick={saveCourseMeta} disabled={metaBusy} className="mt-3 px-4 py-2 rounded-xl text-white text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-60"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>{metaBusy ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />} Save details</button>
+        </div>
+
+        {/* Modules */}
+        {modules.map((m, mi) => (
+          <div key={m.id} className="bg-white rounded-2xl border border-slate-200 p-4">
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] font-bold tracking-wider uppercase text-blue-700 flex-shrink-0">Module {mi + 1}</span>
+              <input defaultValue={m.title} onBlur={e => renameModule(m, e.target.value)}
+                className="flex-1 min-w-0 px-2 py-1.5 rounded-lg border border-transparent hover:border-slate-200 focus:border-slate-300 focus:outline-none font-bold text-[15px]"
+                style={{ fontFamily: fontDisplay, color: NAVY }} />
+              <button onClick={() => moveModule(mi, -1)} disabled={mi === 0} className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 disabled:opacity-30"><ChevronUp size={16} /></button>
+              <button onClick={() => moveModule(mi, 1)} disabled={mi === modules.length - 1} className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 disabled:opacity-30"><ChevronDown size={16} /></button>
+              <button onClick={() => deleteModule(m)} className="p-1.5 rounded-lg text-red-400 hover:bg-red-50"><Trash2 size={16} /></button>
+            </div>
+            <div className="mt-2 space-y-1.5">
+              {(m.lessons || []).map((l, li) => (
+                <div key={l.id} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-50 border border-slate-100">
+                  {l.type === 'video' ? <Play size={14} className="text-slate-400 flex-shrink-0" /> : <FileText size={14} className="text-slate-400 flex-shrink-0" />}
+                  <span className="flex-1 min-w-0 text-sm font-medium text-slate-700 truncate">{l.title}</span>
+                  {l.video_provider && <span className="text-[10px] uppercase font-bold text-slate-400 flex-shrink-0">{l.video_provider}</span>}
+                  <button onClick={() => moveLesson(m, li, -1)} disabled={li === 0} className="p-1 rounded text-slate-400 hover:bg-slate-200 disabled:opacity-30"><ChevronUp size={14} /></button>
+                  <button onClick={() => moveLesson(m, li, 1)} disabled={li === (m.lessons.length - 1)} className="p-1 rounded text-slate-400 hover:bg-slate-200 disabled:opacity-30"><ChevronDown size={14} /></button>
+                  <button onClick={() => setEditingLesson({ ...l })} className="p-1 rounded text-blue-500 hover:bg-blue-50"><Edit3 size={14} /></button>
+                  <button onClick={() => deleteLesson(l)} className="p-1 rounded text-red-400 hover:bg-red-50"><Trash2 size={14} /></button>
+                </div>
+              ))}
+              <button onClick={() => addLesson(m)} disabled={structBusy} className="mt-1 text-sm font-semibold text-blue-600 inline-flex items-center gap-1.5 px-3 py-1.5 hover:bg-blue-50 rounded-lg disabled:opacity-50"><Plus size={15} /> Add lesson</button>
+            </div>
+          </div>
+        ))}
+
+        <button onClick={addModule} disabled={structBusy} className="w-full py-3 rounded-2xl border-2 border-dashed border-slate-300 text-slate-500 font-semibold inline-flex items-center justify-center gap-2 hover:border-blue-300 hover:text-blue-600 disabled:opacity-50">
+          {structBusy ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} />} Add module
+        </button>
+      </div>
+    );
+  }
+
+  function renderLessonEditor() {
+    const d = editingLesson;
+    const detected = d.type === 'video' && d.video_provider !== 'upload' ? parseVideoUrl(d.video_url).provider : null;
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(15,18,23,0.45)' }} onClick={() => !savingLesson && setEditingLesson(null)}>
+        <div className="bg-white rounded-2xl w-full max-w-xl max-h-[88vh] overflow-y-auto shadow-2xl" onClick={e => e.stopPropagation()}>
+          <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between sticky top-0 bg-white">
+            <div style={{ fontFamily: fontDisplay, color: NAVY }} className="font-bold">Edit lesson</div>
+            <button onClick={() => !savingLesson && setEditingLesson(null)} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
+          </div>
+          <div className="p-5 space-y-4">
+            <label className="block">
+              <span className="text-xs font-semibold text-slate-500">Lesson title</span>
+              <input value={d.title || ''} onChange={e => setEditingLesson(s => ({ ...s, title: e.target.value }))}
+                className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+            </label>
+            <div className="flex gap-2">
+              {['video', 'text'].map(t => (
+                <button key={t} onClick={() => setEditingLesson(s => ({ ...s, type: t }))}
+                  className="px-4 py-2 rounded-xl text-sm font-semibold capitalize inline-flex items-center gap-2"
+                  style={d.type === t ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff' } : { background: '#F1F5F9', color: C.textSoft }}>
+                  {t === 'video' ? <Play size={14} /> : <FileText size={14} />} {t}
+                </button>
+              ))}
+            </div>
+
+            {d.type === 'video' && (
+              <>
+                <label className="block">
+                  <span className="text-xs font-semibold text-slate-500">Video link (YouTube, Vimeo, or MP4 URL)</span>
+                  <input value={d.video_provider === 'upload' ? '' : (d.video_url || '')} placeholder="https://youtube.com/watch?v=…"
+                    onChange={e => setEditingLesson(s => ({ ...s, video_url: e.target.value, video_provider: parseVideoUrl(e.target.value).provider, storage_path: null }))}
+                    className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+                  {detected && d.video_url && <span className="text-[11px] text-slate-400 mt-1 inline-block">Detected: {detected}</span>}
+                </label>
+                <div className="flex items-center gap-2 text-xs text-slate-400"><div className="flex-1 h-px bg-slate-200" /> or upload a file <div className="flex-1 h-px bg-slate-200" /></div>
+                <div className="flex items-center">
+                  <label className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border border-slate-200 text-sm font-semibold text-slate-600 cursor-pointer hover:bg-slate-50">
+                    <Upload size={15} /> {uploading ? 'Uploading…' : 'Choose video file'}
+                    <input type="file" accept="video/*" className="hidden" disabled={uploading}
+                      onChange={e => { const f = e.target.files?.[0]; if (f) uploadVideo(f); e.target.value = ''; }} />
+                  </label>
+                  {uploading && <Loader2 size={16} className="animate-spin ml-2 text-blue-500" />}
+                  {d.video_provider === 'upload' && d.storage_path && !uploading && <span className="text-[11px] text-green-600 ml-2 inline-flex items-center gap-1"><Check size={12} /> Uploaded</span>}
+                </div>
+                {(previewUrl || (d.video_provider && (d.video_url || d.storage_path))) && (
+                  <div className="rounded-xl overflow-hidden">
+                    {previewUrl
+                      ? <video controls src={previewUrl} className="w-full rounded-xl bg-black" style={{ maxHeight: 220 }} />
+                      : renderVideo(d)}
+                  </div>
+                )}
+              </>
+            )}
+
+            <label className="block">
+              <span className="text-xs font-semibold text-slate-500">{d.type === 'video' ? 'Lesson notes (optional)' : 'Lesson content'}</span>
+              <textarea value={d.text_content || ''} onChange={e => setEditingLesson(s => ({ ...s, text_content: e.target.value }))} rows={d.type === 'text' ? 6 : 3}
+                className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+            </label>
+            <label className="block">
+              <span className="text-xs font-semibold text-slate-500">Duration label (optional, e.g. 8:32)</span>
+              <input value={d.duration_label || ''} onChange={e => setEditingLesson(s => ({ ...s, duration_label: e.target.value }))}
+                className="mt-1 w-40 px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+            </label>
+          </div>
+          <div className="px-5 py-4 border-t border-slate-100 flex justify-end gap-2 sticky bottom-0 bg-white">
+            <button onClick={() => setEditingLesson(null)} disabled={savingLesson} className="px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 border border-slate-200">Cancel</button>
+            <button onClick={saveLesson} disabled={savingLesson} className="px-5 py-2 rounded-xl text-white text-sm font-semibold inline-flex items-center gap-2"
+              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+              {savingLesson ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />} Save lesson
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function renderCertificate() {
+    const unlocked = isComplete || !!completion || isAdmin;
+    if (!unlocked) {
+      return (
+        <div className="mt-6 glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
+          <Lock size={32} className="mx-auto mb-3 text-slate-400" />
+          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg font-bold">Certificate locked</div>
+          <div className="text-slate-500 text-sm mt-1">Complete all {totalLessons} lessons to unlock your certificate.</div>
+          <button onClick={() => setMode('learn')} className="mt-4 px-5 py-2.5 rounded-xl text-white font-semibold" style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>Back to course</button>
+        </div>
+      );
+    }
+    const dateStr = new Date(completion?.completed_at || Date.now()).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+    return (
+      <div className="mt-6">
+        <div className="flex flex-wrap items-center gap-3 mb-5">
+          <label className="text-sm text-slate-600 flex items-center gap-2">
+            Name on certificate:
+            <input value={studentName} onChange={e => setStudentName(e.target.value)} className="px-3 py-1.5 rounded-lg border border-slate-200 text-sm w-64" />
+          </label>
+          {isAdmin && !isComplete && <span className="text-[11px] px-2 py-1 rounded-full bg-slate-100 text-slate-500">admin preview</span>}
+          <div className="flex-1" />
+          <button onClick={() => setMode('learn')} className="px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 border border-slate-200">Back to course</button>
+          <button onClick={printCertificate} className="px-4 py-2 rounded-xl text-sm font-semibold text-slate-700 border border-slate-200 inline-flex items-center gap-2"><Printer size={15} /> Print</button>
+          <button onClick={downloadCertificate} disabled={certBusy} className="px-5 py-2 rounded-xl text-white text-sm font-semibold inline-flex items-center gap-2" style={{ background: `linear-gradient(135deg, ${C.primary}, ${C.accent})` }}>
+            {certBusy ? <Loader2 size={15} className="animate-spin" /> : <Download size={15} />} Download PDF
+          </button>
+        </div>
+
+        <div className="overflow-x-auto pb-2">
+          <div ref={certRef} style={{
+            width: 900, margin: '0 auto', background: '#ffffff', position: 'relative',
+            padding: 24, boxSizing: 'border-box', fontFamily: fontBody,
+            border: `2px solid ${C.primary}`, borderRadius: 18,
+            boxShadow: '0 10px 40px rgba(10,132,255,0.12)',
+          }}>
+            <div style={{ border: `1px solid ${C.accent}`, borderRadius: 12, padding: '40px 48px', textAlign: 'center', background: 'linear-gradient(180deg,#ffffff,#F7FAFF)' }}>
+              <img src={LOGO_DATA_URI} alt="" style={{ width: 68, height: 68, objectFit: 'contain', margin: '0 auto 8px' }} />
+              <div style={{ fontFamily: fontDisplay, fontSize: 13, letterSpacing: '0.32em', textTransform: 'uppercase', color: C.primary, fontWeight: 700 }}>Certificate of Completion</div>
+              <div style={{ height: 2, width: 64, background: `linear-gradient(90deg, ${C.primary}, ${C.accent})`, margin: '14px auto 22px', borderRadius: 2 }} />
+              <div style={{ fontSize: 14, color: C.textSoft }}>This certifies that</div>
+              <div style={{ fontFamily: fontDisplay, fontSize: 38, fontWeight: 800, color: NAVY, margin: '6px 0 4px' }}>{studentName || 'Your Name'}</div>
+              <div style={{ width: 380, height: 1, background: C.border, margin: '8px auto 22px' }} />
+              <div style={{ fontSize: 14, color: C.textSoft }}>has successfully completed the</div>
+              <div style={{ fontFamily: fontDisplay, fontSize: 24, fontWeight: 700, color: C.primary, margin: '6px 0 2px' }}>{course.title}</div>
+              {course.subtitle && <div style={{ fontSize: 13, color: C.textMute, maxWidth: 520, margin: '6px auto 0' }}>{course.subtitle}</div>}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginTop: 44, padding: '0 12px' }}>
+                <div style={{ textAlign: 'center' }}>
+                  <div style={{ fontFamily: fontDisplay, fontSize: 20, color: NAVY, fontWeight: 700 }}>Alex Sagun</div>
+                  <div style={{ width: 160, height: 1, background: C.border, margin: '4px auto' }} />
+                  <div style={{ fontSize: 11, color: C.textMute, letterSpacing: '0.08em', textTransform: 'uppercase' }}>Instructor · Get Hired With Alex</div>
+                </div>
+                <Award size={40} style={{ color: C.accent, flexShrink: 0 }} />
+                <div style={{ textAlign: 'center' }}>
+                  <div style={{ fontFamily: fontDisplay, fontSize: 16, color: NAVY, fontWeight: 700 }}>{dateStr}</div>
+                  <div style={{ width: 160, height: 1, background: C.border, margin: '4px auto' }} />
+                  <div style={{ fontSize: 11, color: C.textMute, letterSpacing: '0.08em', textTransform: 'uppercase' }}>Date Completed</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Shell ──
+  const errorBanner = err ? (
+    <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: '#FEF2F2', borderColor: '#FCA5A5' }}>
+      <AlertTriangle size={18} className="text-red-500 mt-0.5 flex-shrink-0" />
+      <div className="text-sm text-red-700 flex-1">{err}</div>
+      <button onClick={() => setErr('')} className="text-red-400 hover:text-red-600"><X size={16} /></button>
+    </div>
+  ) : null;
+
+  // In catalog mode, give the open course a back button + its own compact header (the catalog supplies the page title).
+  const backBar = onBack ? (
+    <div className="mb-4 flex items-center gap-3 flex-wrap">
+      <button onClick={onBack} className="inline-flex items-center gap-2 text-sm font-semibold text-slate-600 hover:text-slate-900 px-3 py-1.5 rounded-lg border border-slate-200 bg-white shadow-sm">
+        <ArrowLeft size={16} /> All courses
+      </button>
+      {course && (
+        <div className="min-w-0">
+          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg sm:text-xl font-bold leading-tight truncate">{course.title}</div>
+          {(course.subtitle || defaultSubtitle) && <div className="text-xs text-slate-500 truncate">{course.subtitle || defaultSubtitle}</div>}
+        </div>
+      )}
+    </div>
+  ) : null;
+
+  if (loading) {
+    return (
+      <div>
+        {showHead && <SectionHead eyebrow={eyebrow} title={courseTitle} desc="Loading…" gold />}
+        {backBar}
+        <div className="flex items-center justify-center py-24 text-slate-400"><Loader2 className="animate-spin" size={28} /></div>
+      </div>
+    );
+  }
+
+  if (!course) {
+    return (
+      <div>
+        {showHead && <SectionHead eyebrow={eyebrow} title={courseTitle} desc="" gold />}
+        {backBar}
+        {errorBanner}
+        <div className="mt-6 glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
+          <GraduationCap size={40} className="mx-auto mb-3" style={{ color: ROYAL }} />
+          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">
+            {!isAdmin ? 'Course coming soon' : notConfigured ? 'Finish backend setup' : 'No course yet'}
+          </div>
+          <div className="text-slate-500 mt-2 text-sm max-w-md mx-auto">
+            {!isAdmin
+              ? comingSoonText
+              : notConfigured
+                ? 'The course tables aren’t in Supabase yet. Open COURSE_SETUP.md and run the SQL, create the public course-media bucket, then refresh this page.'
+                : 'No course exists yet. Click “Create course” to set it up, then add your modules and lessons in the builder.'}
+          </div>
+          {isAdmin && notConfigured && (
+            <div className="mt-4 inline-flex items-center gap-2 text-xs font-semibold px-3 py-1.5 rounded-full" style={{ background: '#FEF3C7', color: '#92400E' }}>
+              <AlertTriangle size={13} /> See COURSE_SETUP.md
+            </div>
+          )}
+          {isAdmin && !notConfigured && (
+            <button onClick={createCourse} disabled={creating}
+              className="mt-5 inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold text-white shadow-sm disabled:opacity-60"
+              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+              {creating ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />}
+              {creating ? 'Creating…' : 'Create course'}
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {showHead && <SectionHead eyebrow={eyebrow} title={courseTitle}
+        desc={course.subtitle || defaultSubtitle} gold />}
+      {backBar}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-2 text-sm text-slate-500">
+          <BookMarked size={15} /> {modules.length} modules · {totalLessons} lessons
+          {!course.published && isAdmin && (
+            <span className="ml-1 px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: '#FEF3C7', color: '#92400E' }}>Draft — not published</span>
+          )}
+        </div>
+        {isAdmin && (
+          <div className="inline-flex p-1 rounded-xl border border-slate-200 bg-white shadow-sm">
+            {[['learn', 'Learn', Play], ['edit', 'Edit course', Edit3]].map(([key, lbl, Icon]) => (
+              <button key={key} onClick={() => setMode(key)}
+                className="px-4 py-2 rounded-lg text-sm font-semibold inline-flex items-center gap-2 transition-all"
+                style={mode === key ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff' } : { color: C.textSoft }}>
+                <Icon size={15} /> {lbl}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      {errorBanner}
+
+      {mode === 'certificate'
+        ? renderCertificate()
+        : (mode === 'edit' && isAdmin)
+          ? renderBuilder()
+          : renderLearner()}
+
+      {editingLesson && isAdmin && renderLessonEditor()}
+    </div>
+  );
+}
+
+// Turn a human title into a unique-ish, catalog-scoped slug. The `prefix` groups the course
+// into one catalog without any schema change ("qbo-" → QuickBooks Online Mastery,
+// "interview-" → Interview Winning Strategy, etc.).
+function slugify(title, prefix = 'qbo-') {
+  const base = String(title || '').toLowerCase().normalize('NFKD')
+    .replace(/[^\w\s-]/g, '').trim().replace(/[\s_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48);
+  return prefix + (base || 'course');
+}
+
+// ── Multi-course catalog (prefix-scoped) ──
+// A Thinkific-style library: admins create/manage many courses from one dashboard
+// (cover, reorder, publish, delete); students browse published courses and open one to
+// learn. Courses are grouped by a `prefix` on `courses.slug`, so each catalog is its own
+// namespace with zero schema change ("qbo-" → QuickBooks Online Mastery, "interview-" →
+// Interview Winning Strategy). All copy is prop-driven and defaults to the QBO catalog, so
+// `<CourseCatalog />` with no props behaves exactly as before. Pass `embedded` to drop the
+// big SectionHead when the catalog is nested inside a subtab that already shows a header.
+// Opening a course hands off to the shared CourseProgram engine via courseId + onBack.
+function CourseCatalog({
+  prefix = 'qbo-',
+  embedded = false,
+  eyebrow = 'Video Courses',
+  title = 'QuickBooks Online Mastery',
+  adminDesc = 'Create and manage your QuickBooks Online video courses — add modules, upload or embed lessons, set covers, and publish.',
+  studentDesc = 'Master QuickBooks Online with structured, on-demand video courses. Choose a course to start learning.',
+  newCourseTitle = 'New QuickBooks Course',
+  comingSoonDesc = 'Your QuickBooks Online training is being prepared. Check back soon.',
+} = {}) {
+  const { user, profile } = useAuth();
+  const isAdmin = !!profile?.is_admin;
+
+  const [courses, setCourses] = useState([]);
+  const [counts, setCounts] = useState({});            // course_id -> total lessons
+  const [done, setDone] = useState({});                // course_id -> lessons this user completed
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+  const [notConfigured, setNotConfigured] = useState(false);
+  const [selectedId, setSelectedId] = useState(null);  // null = grid; otherwise the open course
+  const [busy, setBusy] = useState(false);             // create / delete / reorder / cover in flight
+
+  async function loadCatalog() {
+    setLoading(true); setErr(''); setNotConfigured(false);
+    try {
+      const { data: rows, error: cErr } = await supabase
+        .from('courses').select('*').ilike('slug', `${prefix}%`).order('position').order('created_at');
+      if (cErr) throw cErr;
+      const list = rows || [];
+      setCourses(list);
+      const ids = list.map(c => c.id);
+      if (ids.length) {
+        const [{ data: lessons }, { data: prog }] = await Promise.all([
+          supabase.from('course_lessons').select('id,course_id').in('course_id', ids),
+          supabase.from('lesson_progress').select('lesson_id,course_id').in('course_id', ids).eq('user_id', user.id),
+        ]);
+        const cnt = {}, dn = {};
+        (lessons || []).forEach(l => { cnt[l.course_id] = (cnt[l.course_id] || 0) + 1; });
+        (prog || []).forEach(p => { dn[p.course_id] = (dn[p.course_id] || 0) + 1; });
+        setCounts(cnt); setDone(dn);
+      } else { setCounts({}); setDone({}); }
+    } catch (e) {
+      console.error('[CourseCatalog] load failed:', e);
+      const msg = e?.message || '';
+      if (e?.code === 'PGRST205' || /schema cache|could not find the table|does not exist/i.test(msg)) {
+        setNotConfigured(true); setCourses([]);
+      } else { setErr(msg || 'Failed to load courses.'); }
+    } finally { setLoading(false); }
+  }
+
+  useEffect(() => { if (user?.id) loadCatalog(); /* eslint-disable-next-line */ }, [user?.id]);
+
+  // ── Admin actions (RLS also enforces is_admin server-side) ──
+  async function createCourse() {
+    const title = (window.prompt('New course title:', newCourseTitle) || '').trim();
+    if (!title) return;
+    setBusy(true); setErr('');
+    try {
+      const existing = new Set(courses.map(c => c.slug));
+      const base = slugify(title, prefix);
+      let slug = base, n = 2;
+      while (existing.has(slug)) slug = `${base}-${n++}`;
+      const position = courses.length ? Math.max(...courses.map(c => c.position ?? 0)) + 1 : 0;
+      let res = await supabase.from('courses').insert({ slug, title, subtitle: '', published: false, position }).select('*').single();
+      if (res.error && res.error.code === '23505') {           // slug collision race — retry once with a unique suffix
+        slug = `${base}-${Date.now().toString(36).slice(-4)}`;
+        res = await supabase.from('courses').insert({ slug, title, subtitle: '', published: false, position }).select('*').single();
+      }
+      if (res.error) throw res.error;
+      await loadCatalog();
+      setSelectedId(res.data.id);                              // drop the admin straight into the new course (builder)
+    } catch (e) {
+      console.error('[CourseCatalog] create failed:', e);
+      setErr(e.message || 'Could not create the course.');
+    } finally { setBusy(false); }
+  }
+
+  async function uploadCover(c, file) {
+    if (!file) return;
+    if (!/^image\//i.test(file.type)) { setErr('Please choose an image file for the cover.'); return; }
+    if (file.size > 5 * 1024 * 1024) { setErr('Cover image is too large (max 5 MB).'); return; }
+    setBusy(true); setErr('');
+    try {
+      const safe = file.name.replace(/[^\w.\-]+/g, '_');
+      const path = `covers/${c.id}/${crypto.randomUUID()}-${safe}`;
+      const { error: upErr } = await supabase.storage.from('course-media').upload(path, file, { upsert: false, contentType: file.type });
+      if (upErr) throw upErr;
+      const { error } = await supabase.from('courses').update({ cover_path: path, updated_at: new Date().toISOString() }).eq('id', c.id);
+      if (error) throw error;
+      if (c.cover_path && c.cover_path !== path) { try { await supabase.storage.from('course-media').remove([c.cover_path]); } catch (_) { /* best-effort */ } }
+      await loadCatalog();
+    } catch (e) {
+      console.error('[CourseCatalog] cover upload failed:', e);
+      setErr(e.message || 'Could not upload the cover image.');
+    } finally { setBusy(false); }
+  }
+
+  async function deleteCourse(c) {
+    if (!window.confirm(`Delete the course “${c.title}” and ALL of its modules, lessons, videos, and student progress? This cannot be undone.`)) return;
+    setBusy(true); setErr('');
+    try {
+      // Purge uploaded files first (videos + cover); folders are flat, so one list+remove each.
+      for (const prefix of [`lessons/${c.id}`, `covers/${c.id}`]) {
+        try {
+          const { data: objs } = await supabase.storage.from('course-media').list(prefix, { limit: 1000 });
+          if (objs && objs.length) await supabase.storage.from('course-media').remove(objs.map(o => `${prefix}/${o.name}`));
+        } catch (_) { /* ignore — row delete still proceeds */ }
+      }
+      const { error } = await supabase.from('courses').delete().eq('id', c.id); // FK ON DELETE CASCADE clears children
+      if (error) throw error;
+      if (selectedId === c.id) setSelectedId(null);
+      await loadCatalog();
+    } catch (e) {
+      console.error('[CourseCatalog] delete failed:', e);
+      setErr(e.message || 'Could not delete the course.');
+    } finally { setBusy(false); }
+  }
+
+  async function reorderCourse(idx, dir) {
+    const j = idx + dir;
+    if (j < 0 || j >= courses.length) return;
+    const arr = [...courses];
+    [arr[idx], arr[j]] = [arr[j], arr[idx]];
+    setCourses(arr);                                           // optimistic
+    setBusy(true); setErr('');
+    try {
+      await Promise.all(arr.map((c, i) => supabase.from('courses').update({ position: i }).eq('id', c.id)));
+      await loadCatalog();
+    } catch (e) { setErr(e.message || 'Could not reorder courses.'); await loadCatalog(); }
+    finally { setBusy(false); }
+  }
+
+  // ── Open one course in the shared engine (key forces clean state per course) ──
+  if (selectedId) {
+    return <CourseProgram key={selectedId} courseId={selectedId} onBack={() => { setSelectedId(null); loadCatalog(); }} />;
+  }
+
+  const errorBanner = err ? (
+    <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: '#FEF2F2', borderColor: '#FCA5A5' }}>
+      <AlertTriangle size={18} className="text-red-500 mt-0.5 flex-shrink-0" />
+      <div className="text-sm text-red-700 flex-1">{err}</div>
+      <button onClick={() => setErr('')} className="text-red-400 hover:text-red-600"><X size={16} /></button>
+    </div>
+  ) : null;
+
+  return (
+    <div>
+      {!embedded && <SectionHead eyebrow={eyebrow} title={title}
+        desc={isAdmin ? adminDesc : studentDesc} gold />}
+      {errorBanner}
+
+      {isAdmin && !notConfigured && !loading && courses.length > 0 && (
+        <div className="flex items-center justify-between gap-3 flex-wrap mb-4">
+          <div className="text-sm text-slate-500 inline-flex items-center gap-2"><BookMarked size={15} /> {courses.length} course{courses.length === 1 ? '' : 's'}</div>
+          <button onClick={createCourse} disabled={busy}
+            className="px-4 py-2.5 rounded-xl text-white text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-60"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+            {busy ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />} New course
+          </button>
+        </div>
+      )}
+
+      {loading ? (
+        <div className="flex items-center justify-center py-24 text-slate-400"><Loader2 className="animate-spin" size={28} /></div>
+      ) : notConfigured ? (
+        <div className="mt-6 glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
+          <GraduationCap size={40} className="mx-auto mb-3" style={{ color: ROYAL }} />
+          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">{isAdmin ? 'Finish backend setup' : 'Courses coming soon'}</div>
+          <div className="text-slate-500 mt-2 text-sm max-w-md mx-auto">
+            {isAdmin
+              ? 'The course tables aren’t in Supabase yet. Open COURSE_SETUP.md, run the SQL, create the public course-media bucket, then refresh this page.'
+              : comingSoonDesc}
+          </div>
+          {isAdmin && (
+            <div className="mt-4 inline-flex items-center gap-2 text-xs font-semibold px-3 py-1.5 rounded-full" style={{ background: '#FEF3C7', color: '#92400E' }}>
+              <AlertTriangle size={13} /> See COURSE_SETUP.md
+            </div>
+          )}
+        </div>
+      ) : courses.length === 0 ? (
+        <div className="mt-6 glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
+          <GraduationCap size={40} className="mx-auto mb-3" style={{ color: ROYAL }} />
+          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">{isAdmin ? 'No courses yet' : 'Courses coming soon'}</div>
+          <div className="text-slate-500 mt-2 text-sm max-w-md mx-auto">
+            {isAdmin ? 'Create your first course, then add modules and video lessons in the builder.' : comingSoonDesc}
+          </div>
+          {isAdmin && (
+            <button onClick={createCourse} disabled={busy}
+              className="mt-5 inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold text-white shadow-sm disabled:opacity-60"
+              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+              {busy ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />} Create your first course
+            </button>
+          )}
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+          {courses.map((c, idx) => {
+            const total = counts[c.id] || 0;
+            const dn = Math.min(done[c.id] || 0, total);
+            const pct = total ? Math.round((dn / total) * 100) : 0;
+            const cover = c.cover_path ? supabase.storage.from('course-media').getPublicUrl(c.cover_path).data.publicUrl : null;
+            return (
+              <div key={c.id} className="bg-white rounded-2xl border border-slate-200 overflow-hidden flex flex-col shadow-sm hover:shadow-md transition-shadow">
+                <button onClick={() => setSelectedId(c.id)} className="block w-full text-left relative" style={{ aspectRatio: '16 / 9' }}>
+                  {cover
+                    ? <img src={cover} alt="" className="absolute inset-0 w-full h-full object-cover" />
+                    : <div className="absolute inset-0 flex items-center justify-center" style={{ background: `linear-gradient(135deg, ${ROYAL}, ${CYAN})` }}><GraduationCap size={44} className="text-white/90" /></div>}
+                  {isAdmin && !c.published && <span className="absolute top-2 left-2 px-2 py-0.5 rounded-full text-[10px] font-bold" style={{ background: '#FEF3C7', color: '#92400E' }}>Draft</span>}
+                  {total > 0 && pct === 100 && <span className="absolute top-2 right-2 px-2 py-0.5 rounded-full text-[10px] font-bold inline-flex items-center gap-1" style={{ background: '#DCFCE7', color: '#166534' }}><Award size={11} /> Done</span>}
+                </button>
+                <div className="p-4 flex-1 flex flex-col">
+                  <button onClick={() => setSelectedId(c.id)} className="text-left flex-1">
+                    <div style={{ fontFamily: fontDisplay, color: NAVY }} className="font-bold text-[15px] leading-tight">{c.title}</div>
+                    {c.subtitle && <div className="text-xs text-slate-500 mt-1 line-clamp-2">{c.subtitle}</div>}
+                  </button>
+                  <div className="mt-3 text-[11px] text-slate-400 inline-flex items-center gap-1"><Play size={11} /> {total} lesson{total === 1 ? '' : 's'}</div>
+                  {total > 0 && (
+                    <div className="mt-2">
+                      <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                        <div className="h-full transition-all duration-500" style={{ width: `${pct}%`, background: `linear-gradient(90deg, ${ROYAL}, ${CYAN})` }} />
+                      </div>
+                      <div className="text-[11px] text-slate-400 mt-1">{dn} of {total} complete</div>
+                    </div>
+                  )}
+                  <div className="mt-3 flex items-center gap-2">
+                    <button onClick={() => setSelectedId(c.id)} className="flex-1 px-3 py-2 rounded-xl text-white text-sm font-semibold inline-flex items-center justify-center gap-2"
+                      style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+                      {isAdmin ? 'Open' : (pct > 0 ? 'Continue' : 'Start')} <ArrowRight size={14} />
+                    </button>
+                    {isAdmin && (
+                      <>
+                        <label title="Set cover image" className="p-2 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-50 cursor-pointer">
+                          <ImageIcon size={15} />
+                          <input type="file" accept="image/*" className="hidden" disabled={busy}
+                            onChange={e => { const f = e.target.files?.[0]; if (f) uploadCover(c, f); e.target.value = ''; }} />
+                        </label>
+                        <button title="Move up" onClick={() => reorderCourse(idx, -1)} disabled={idx === 0 || busy} className="p-2 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-50 disabled:opacity-30"><ChevronUp size={15} /></button>
+                        <button title="Move down" onClick={() => reorderCourse(idx, 1)} disabled={idx === courses.length - 1 || busy} className="p-2 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-50 disabled:opacity-30"><ChevronDown size={15} /></button>
+                        <button title="Delete course" onClick={() => deleteCourse(c)} disabled={busy} className="p-2 rounded-xl border border-slate-200 text-red-400 hover:bg-red-50 disabled:opacity-30"><Trash2 size={15} /></button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Thin wrappers. QBO Mastery, Resume Winning Strategy, and Interview Winning Strategy are all
+// multi-course catalogs (CourseCatalog, each scoped to its own slug prefix). QBO and Resume are
+// top-level tabs (their own SectionHead); Interview is embedded as a subtab. Any pre-existing
+// `resume-strategy` course matches `resume-%`, so it shows in the Resume catalog automatically —
+// nothing is orphaned.
+function QBOMastery() { return <CourseCatalog />; }
+
+// Resume Winning Strategy — the `resumestrategy` tab in Profile Optimization. A multi-course
+// catalog scoped to the `resume-` slug prefix, so tutors can add many resume-strategy courses
+// over time (structure, summaries, achievement bullets, ATS, positioning, etc.).
+function ResumeStrategy() {
+  return (
+    <CourseCatalog
+      prefix="resume-"
+      eyebrow="Resume Training"
+      title="Resume Winning Strategy"
+      adminDesc="Create and manage resume strategy video courses — add modules, upload or embed lessons, set covers, and publish."
+      studentDesc="Build a stronger resume — structure, professional summary, achievement-driven bullets, ATS optimization, and positioning that wins interviews. Pick a course to start."
+      newCourseTitle="New Resume Strategy Course"
+      comingSoonDesc="Your Resume Winning Strategy training is being prepared. Check back soon."
+    />
+  );
+}
+
+// Rendered as the 7th subtab inside InterviewPrep — a multi-course catalog scoped to the
+// `interview-` slug prefix (so tutors can add many interview-strategy courses over time).
+// Forwards `embedded` so the catalog drops its own SectionHead (the suite header above it
+// already covers the title). The pre-existing `interview-winning-strategy` course, if any,
+// matches `interview-%` and shows here automatically — nothing is orphaned.
+function InterviewStrategyCatalog({ embedded = false }) {
+  return (
+    <CourseCatalog
+      prefix="interview-"
+      embedded={embedded}
+      eyebrow="Strategy Courses"
+      title="Interview Winning Strategy"
+      adminDesc="Create and manage interview strategy video courses — add modules, upload or embed lessons, set covers, and publish."
+      studentDesc="Practical strategies to win the offer — confidence, storytelling, tough questions, presence, and real-interview prep. Pick a course to start."
+      newCourseTitle="New Interview Strategy Course"
+      comingSoonDesc="Your Interview Winning Strategy training is being prepared. Check back soon."
+    />
   );
 }
 
@@ -3993,761 +5267,7 @@ function LoanAmortization() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// COMPONENT: RESUME OPTIMIZER
-// ═══════════════════════════════════════════════════════════════════
-
-function ResumeOptimizer() {
-  // Step 1: Upload
-  const [resumeText, setResumeText] = useState('');
-  const [uploadedName, setUploadedName] = useState('');
-  const [uploadStatus, setUploadStatus] = useState('');
-  const [busyUpload, setBusyUpload] = useState(false);
-  const [uploadErr, setUploadErr] = useState('');
-  const fileInputRef = useRef(null);
-
-  // Step 2: Job description
-  const [jobDesc, setJobDesc] = useState('');
-
-  // Step 3: Optimization
-  const [busyOptimize, setBusyOptimize] = useState(false);
-  const [keywords, setKeywords] = useState([]);
-  const [matchScore, setMatchScore] = useState(null);
-  const [optimized, setOptimized] = useState(null);  // structured object
-
-  // Step 4: Final editable resume (this is the live state used for the printable view)
-  const [resume, setResume] = useState(null);
-
-  // ─── File reading helpers ───
-  const fileToBase64 = (file) => new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result.split(',')[1]);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-
-  const fileToText = (file) => new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = reject;
-    reader.readAsText(file);
-  });
-
-  // Extract text from .docx using mammoth (already available in Claude artifact env)
-  const docxToText = async (file) => {
-    const mammoth = await import('mammoth');
-    const arrayBuffer = await file.arrayBuffer();
-    const result = await mammoth.extractRawText({ arrayBuffer });
-    return result.value;
-  };
-
-  const handleFile = async (file) => {
-    if (!file) return;
-    setUploadErr('');
-    setUploadedName(file.name);
-    setBusyUpload(true);
-    setUploadStatus(`Reading ${file.name}...`);
-
-    const ext = file.name.toLowerCase().split('.').pop();
-    const mime = file.type;
-
-    try {
-      // Plain text
-      if (ext === 'txt' || mime === 'text/plain') {
-        const text = await fileToText(file);
-        setResumeText(text);
-        setUploadStatus('✓ Text loaded. Now paste the job description below.');
-        setBusyUpload(false);
-        return;
-      }
-
-      // Word document
-      if (ext === 'docx' || mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
-        setUploadStatus('Extracting text from Word document...');
-        const text = await docxToText(file);
-        setResumeText(text);
-        setUploadStatus('✓ Resume extracted from Word doc. Now paste the job description below.');
-        setBusyUpload(false);
-        return;
-      }
-
-      // .doc (older Word) — fallback to Claude
-      // PDF — use Claude document support
-      if (ext === 'pdf' || ext === 'doc' || mime === 'application/pdf' || mime === 'application/msword') {
-        setUploadStatus(`Extracting text from ${ext.toUpperCase()} via AI...`);
-        const b64 = await fileToBase64(file);
-
-        const isPdf = ext === 'pdf' || mime === 'application/pdf';
-        const content = [
-          {
-            type: isPdf ? 'document' : 'document',  // Claude supports PDF as document type
-            source: {
-              type: 'base64',
-              media_type: isPdf ? 'application/pdf' : 'application/pdf',
-              data: b64
-            }
-          },
-          {
-            type: 'text',
-            text: `Extract the COMPLETE text content of this resume. Preserve all sections, bullet points, dates, company names, and job titles. Output only the resume text — no commentary, no markdown formatting, no preamble. Use blank lines between sections.`
-          }
-        ];
-
-        if (!isPdf) {
-          // For .doc fallback, just ask user to convert
-          setUploadErr('Old .doc format detected. Please save as .docx or .pdf and re-upload.');
-          setBusyUpload(false);
-          return;
-        }
-
-        const extracted = (await callClaude({ max_tokens: 4000, messages: [{ role: 'user', content }] })).trim();
-        setResumeText(extracted);
-        setUploadStatus('✓ Resume extracted from PDF. Now paste the job description below.');
-        setBusyUpload(false);
-        return;
-      }
-
-      setUploadErr('Unsupported file type. Please upload PDF or DOCX.');
-      setBusyUpload(false);
-    } catch (e) {
-      setUploadErr('Failed to read file: ' + (e.message || 'unknown error'));
-      setBusyUpload(false);
-    }
-  };
-
-  // ─── Optimize ───
-  const optimize = async () => {
-    if (!resumeText.trim() || !jobDesc.trim()) return;
-    setBusyOptimize(true);
-    setOptimized(null);
-    setKeywords([]);
-    setMatchScore(null);
-
-    try {
-      const sys = `You are a senior US accounting recruiter and resume strategist with 15 years of experience placing remote bookkeepers, accountants, and accounting professionals with US clients. You specialize in optimizing resumes from Filipino, Indian, and other international candidates targeting US remote roles.
-
-Your goals:
-1. EXTRACT keywords from the job description (technical skills, software, certifications, soft skills, industry terms, action verbs the hiring manager used). Prioritize keywords that ATS systems scan for.
-2. REWRITE the candidate's duties to be ACHIEVEMENT-ORIENTED using the X-Y-Z formula (Accomplished X, as measured by Y, by doing Z). Include specific metrics where possible — invent reasonable ones if the candidate didn't provide them, but mark them clearly with [verify] tags so the candidate can confirm.
-3. ORGANIZE the resume with these specific sections on page 1, in this order:
-   - HEADER (name, location/timezone, email, phone, LinkedIn)
-   - PROFESSIONAL SUMMARY (3-4 sentences, keyword-rich, value-prop focused)
-   - PROFESSIONAL SKILLS (8-12 bullets, matched to JD keywords)
-   - SOFTWARE PROFICIENCY (bulleted list of software with brief expertise levels)
-   - CLIENT INDUSTRIES (list of industries served — leverage variety as a strength)
-   - PROFESSIONAL EXPERIENCE (each role: company, title, dates, then 3-5 X-Y-Z achievement bullets)
-
-OUTPUT FORMAT — return ONLY a valid JSON object, no markdown fences, no preamble. Structure:
-{
-  "matchScore": <number 0-100, estimated ATS match score>,
-  "keywords": [{"term":"...","priority":"high|medium|low","inResume":true|false}],
-  "header": {
-    "name": "...",
-    "title": "Remote Bookkeeper | QuickBooks ProAdvisor | US Tax Knowledge",
-    "location": "Manila, Philippines (PST/EST overlap)",
-    "email": "...",
-    "phone": "...",
-    "linkedin": "linkedin.com/in/..."
-  },
-  "summary": "3-4 sentence professional summary, keyword-loaded",
-  "skills": ["skill 1", "skill 2", ...],
-  "software": [{"name":"QuickBooks Online","level":"Expert (5+ years)"},...],
-  "industries": ["E-commerce", "Real Estate", ...],
-  "experience": [
-    {
-      "company": "...",
-      "title": "...",
-      "location": "...",
-      "dates": "Jan 2022 - Present",
-      "bullets": ["Achieved X by doing Y, resulting in Z (specific metric)", ...]
-    }
-  ],
-  "education": [{"degree":"...","school":"...","year":"...","details":"..."}],
-  "certifications": ["QuickBooks Online ProAdvisor", "Xero Certified", ...]
-}
-
-CRITICAL: Pull the candidate's actual name, contact info, education, and certifications from their resume. If anything is missing from their original resume, leave that field as an empty string or empty array — do NOT invent contact info, education, or company names. DO invent reasonable metrics for bullet achievements (always tag invented metrics with [verify]).`;
-
-      const user = `JOB DESCRIPTION:
-${jobDesc}
-
-CANDIDATE'S CURRENT RESUME:
-${resumeText}
-
-Optimize this resume to match the job description. Return the structured JSON only.`;
-
-      const raw = (await callClaude({ max_tokens: 4000, system: sys, messages: [{ role: 'user', content: user }] })).trim();
-      const cleaned = raw.replace(/```json|```/g, '').trim();
-      const parsed = JSON.parse(cleaned);
-
-      setMatchScore(parsed.matchScore || 0);
-      setKeywords(parsed.keywords || []);
-      setOptimized(parsed);
-      setResume(parsed); // sync editable state
-    } catch (e) {
-      console.error(e);
-      alert('Optimization failed: ' + (e.message || 'unknown error'));
-    }
-    setBusyOptimize(false);
-  };
-
-  // ─── Editable resume mutators ───
-  const updateField = (path, value) => {
-    setResume(r => {
-      if (!r) return r;
-      const next = JSON.parse(JSON.stringify(r));
-      const keys = path.split('.');
-      let cur = next;
-      for (let i = 0; i < keys.length - 1; i++) {
-        const k = keys[i];
-        if (k.match(/\d+/)) cur = cur[parseInt(k)]; else cur = cur[k];
-      }
-      const lastKey = keys[keys.length - 1];
-      if (lastKey.match(/^\d+$/)) cur[parseInt(lastKey)] = value;
-      else cur[lastKey] = value;
-      return next;
-    });
-  };
-
-  const addExpBullet = (expIdx) => {
-    setResume(r => {
-      const next = JSON.parse(JSON.stringify(r));
-      next.experience[expIdx].bullets.push('New achievement — describe what you did and the result.');
-      return next;
-    });
-  };
-  const removeExpBullet = (expIdx, bulletIdx) => {
-    setResume(r => {
-      const next = JSON.parse(JSON.stringify(r));
-      next.experience[expIdx].bullets.splice(bulletIdx, 1);
-      return next;
-    });
-  };
-  const addSkill = () => setResume(r => ({ ...r, skills: [...r.skills, 'New skill'] }));
-  const removeSkill = (i) => setResume(r => ({ ...r, skills: r.skills.filter((_, idx) => idx !== i) }));
-  const addSoftware = () => setResume(r => ({ ...r, software: [...r.software, { name: 'New software', level: 'Proficient' }] }));
-  const removeSoftware = (i) => setResume(r => ({ ...r, software: r.software.filter((_, idx) => idx !== i) }));
-  const addIndustry = () => setResume(r => ({ ...r, industries: [...r.industries, 'New industry'] }));
-  const removeIndustry = (i) => setResume(r => ({ ...r, industries: r.industries.filter((_, idx) => idx !== i) }));
-  const addCertification = () => setResume(r => ({ ...r, certifications: [...(r.certifications || []), 'New certification'] }));
-  const removeCertification = (i) => setResume(r => ({ ...r, certifications: (r.certifications || []).filter((_, idx) => idx !== i) }));
-
-  // ─── Export to PDF — opens a new window with standalone HTML and triggers print ───
-  // This works around artifact iframe limitations that break window.print() from the iframe context.
-  const exportPDF = () => {
-    const sheet = document.getElementById('resume-sheet');
-    if (!sheet) { alert('Resume not ready yet.'); return; }
-
-    // Clone the sheet so we can strip out edit-only UI (✕ delete buttons, + Add buttons)
-    const clone = sheet.cloneNode(true);
-    // Remove anything marked .no-print
-    clone.querySelectorAll('.no-print').forEach(el => el.remove());
-    // Make contentEditable spans non-editable in the export
-    clone.querySelectorAll('[contenteditable]').forEach(el => el.removeAttribute('contenteditable'));
-
-    const name = (resume?.header?.name || 'Resume').replace(/[^a-zA-Z0-9]/g, '_');
-    const html = `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>${name} — Resume</title>
-<style>
-  @page { size: letter; margin: 0; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    padding: 0;
-    background: #f5f5f5;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
-    color: #1f2937;
-    -webkit-print-color-adjust: exact !important;
-    print-color-adjust: exact !important;
-  }
-  .sheet {
-    width: 8.5in;
-    min-height: 11in;
-    padding: 0.5in;
-    margin: 20px auto;
-    background: white;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.1);
-  }
-  @media print {
-    body { background: white; }
-    .sheet { margin: 0; box-shadow: none; width: 100%; min-height: auto; }
-    .print-bar { display: none !important; }
-  }
-  .print-bar {
-    position: fixed; top: 0; left: 0; right: 0;
-    background: linear-gradient(135deg, #0A1E3F 0%, #1E40AF 100%);
-    color: white; padding: 12px 20px;
-    display: flex; justify-content: space-between; align-items: center;
-    z-index: 9999;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
-  }
-  .print-bar button {
-    background: white; color: #1E40AF; border: none;
-    padding: 8px 20px; border-radius: 8px; font-weight: 700;
-    cursor: pointer; font-size: 14px;
-  }
-  .print-bar button:hover { background: #DBEAFE; }
-  /* Reset Tailwind classes used inside the sheet — inline minimal equivalents */
-  .sheet h1, .sheet h2, .sheet h3, .sheet p, .sheet span, .sheet div, .sheet ul, .sheet li {
-    margin: 0; padding: 0;
-  }
-  .sheet ul { list-style: none; }
-  .sheet section { margin-bottom: 16px; }
-  body .sheet { padding-top: 0.5in; } /* allow header */
-  body { padding-top: 60px; } /* room for the print bar */
-  @media print { body { padding-top: 0; } }
-</style>
-</head>
-<body>
-  <div class="print-bar">
-    <div style="font-weight:700">${name.replace(/_/g, ' ')} — Resume Export</div>
-    <div>
-      <button onclick="window.print()">📄 Save as PDF / Print</button>
-    </div>
-  </div>
-  <div class="sheet">${clone.innerHTML}</div>
-  <script>
-    // Auto-open print dialog after a brief delay so user sees the preview
-    window.addEventListener('load', function() {
-      setTimeout(function() { window.print(); }, 400);
-    });
-  </script>
-</body>
-</html>`;
-
-    const w = window.open('', '_blank');
-    if (!w) {
-      alert('Please allow pop-ups for this site, then click Export to PDF again.');
-      return;
-    }
-    w.document.open();
-    w.document.write(html);
-    w.document.close();
-  };
-
-  // ─── Step 1: Upload ───
-  if (!resumeText) {
-    return (
-      <div>
-        <SectionHead eyebrow="Tool 06" title="Resume Optimizer" desc="Upload your resume, paste a job description, and get an ATS-optimized resume with achievement-driven bullets. Edit freely. Export to PDF." />
-
-        <div style={{ background: SHEEN }} className="glass-card p-8 rounded-2xl mt-6">
-          <div className="text-center mb-6">
-            <div style={{ background: `linear-gradient(135deg, ${ROYAL} 0%, ${CYAN} 100%)` }} className="w-16 h-16 rounded-2xl flex items-center justify-center shadow-lg mx-auto mb-4">
-              <Briefcase size={28} className="text-white" />
-            </div>
-            <div style={{ color: NAVY, fontFamily: fontDisplay, letterSpacing: '-0.02em' }} className="text-2xl font-bold">Step 1 · Upload Your Current Resume</div>
-            <div className="text-sm text-slate-500 mt-1">Accepts PDF, DOCX, or TXT. We'll extract the text and use it as the base.</div>
-          </div>
-
-          <div
-            onClick={() => fileInputRef.current?.click()}
-            onDragOver={(e) => { e.preventDefault(); }}
-            onDrop={(e) => { e.preventDefault(); const f = e.dataTransfer.files?.[0]; if (f) handleFile(f); }}
-            className="border-2 border-dashed border-blue-300 rounded-2xl p-10 text-center cursor-pointer hover:border-blue-500 hover:bg-blue-50/30 transition-all max-w-lg mx-auto"
-            style={{ background: 'rgba(255,255,255,0.5)' }}>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".pdf,.docx,.doc,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
-              onChange={(e) => handleFile(e.target.files?.[0])}
-              className="hidden"
-            />
-            <Upload size={32} className="mx-auto mb-3" style={{ color: ROYAL }} />
-            <div className="text-base font-bold text-slate-800 mb-1">
-              {uploadedName ? `📄 ${uploadedName}` : 'Drop your resume here or click to upload'}
-            </div>
-            <div className="text-xs text-slate-500 mt-2 flex items-center justify-center gap-2 flex-wrap">
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-red-50 text-red-700 font-semibold"><FileText size={12} /> PDF</span>
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-blue-50 text-blue-700 font-semibold"><FileText size={12} /> DOCX</span>
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-100 text-slate-700 font-semibold"><FileType2 size={12} /> TXT</span>
-            </div>
-            {uploadStatus && (
-              <div className="mt-4 text-sm font-semibold" style={{ color: ROYAL }}>
-                {busyUpload && <Loader2 size={14} className="inline animate-spin mr-1" />}
-                {uploadStatus}
-              </div>
-            )}
-            {uploadErr && <div className="mt-3 text-xs text-red-600 font-semibold">{uploadErr}</div>}
-          </div>
-
-          <div className="mt-6 text-center">
-            <div className="text-xs text-slate-500">Don't have a resume yet? Paste your work history below to skip the upload.</div>
-            <button onClick={() => { setResumeText('Paste your resume content here, then add the job description below.'); setUploadedName('manual-entry.txt'); }}
-              className="mt-2 text-sm font-semibold underline" style={{ color: ROYAL }}>
-              Start with blank resume
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // ─── Step 2/3: Edit text + JD + Optimize ───
-  if (!optimized) {
-    return (
-      <div>
-        <SectionHead eyebrow="Tool 06" title="Resume Optimizer" desc="Upload your resume, paste a job description, and get an ATS-optimized resume with achievement-driven bullets. Edit freely. Export to PDF." />
-
-        <div className="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-5">
-          {/* Resume text */}
-          <div style={{ background: SHEEN }} className="glass-card p-6 rounded-2xl">
-            <div className="flex items-center justify-between mb-3">
-              <div>
-                <div className="text-xs uppercase tracking-[0.2em] font-bold" style={{ color: ROYAL }}>Step 1 ✓</div>
-                <div style={{ color: NAVY, fontFamily: fontDisplay }} className="text-lg font-bold">Your Resume Text</div>
-              </div>
-              <button onClick={() => { setResumeText(''); setUploadedName(''); setUploadStatus(''); }}
-                className="text-xs px-3 py-1.5 rounded-lg bg-white border border-slate-300 hover:border-blue-400 text-slate-700 font-semibold">
-                Upload different file
-              </button>
-            </div>
-            <textarea value={resumeText} onChange={e => setResumeText(e.target.value)}
-              className="w-full h-80 p-4 rounded-xl border border-slate-200 bg-white text-xs font-mono focus:border-blue-500 focus:ring-2 focus:ring-blue-200 outline-none resize-none" />
-            <div className="text-[10px] text-slate-400 mt-2">Source: {uploadedName} · You can edit before optimizing.</div>
-          </div>
-
-          {/* JD */}
-          <div style={{ background: SHEEN }} className="glass-card p-6 rounded-2xl">
-            <div className="mb-3">
-              <div className="text-xs uppercase tracking-[0.2em] font-bold" style={{ color: ROYAL }}>Step 2</div>
-              <div style={{ color: NAVY, fontFamily: fontDisplay }} className="text-lg font-bold">Paste the Job Description</div>
-              <div className="text-xs text-slate-500 mt-1">Copy the full job posting — title, requirements, responsibilities, qualifications.</div>
-            </div>
-            <textarea value={jobDesc} onChange={e => setJobDesc(e.target.value)}
-              placeholder="Paste the full job description here. Include the job title, responsibilities, required skills, software, and qualifications. The more complete, the better the optimization."
-              className="w-full h-80 p-4 rounded-xl border border-slate-200 bg-white text-xs font-mono focus:border-blue-500 focus:ring-2 focus:ring-blue-200 outline-none resize-none" />
-          </div>
-        </div>
-
-        <div className="mt-6 flex justify-center">
-          <button onClick={optimize} disabled={busyOptimize || !resumeText.trim() || !jobDesc.trim()}
-            className="sheen-btn text-white font-bold py-4 px-12 rounded-xl shadow-lg text-base tracking-wide flex items-center gap-3 disabled:opacity-50">
-            {busyOptimize
-              ? <><Loader2 size={20} className="animate-spin" /> Optimizing your resume with AI...</>
-              : <><Sparkles size={20} /> Optimize My Resume</>}
-          </button>
-        </div>
-        {(!resumeText.trim() || !jobDesc.trim()) && (
-          <div className="mt-3 text-center text-xs text-slate-500">
-            {!resumeText.trim() && '• Resume text required'} {!jobDesc.trim() && '• Job description required'}
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  // ─── Step 4: Final editable resume + preview + export ───
-  return (
-    <div>
-      {/* Print-specific styles: hide everything except the resume sheet */}
-      <style>{`
-        @media print {
-          @page { size: letter; margin: 0.5in; }
-          body * { visibility: hidden; }
-          #resume-sheet, #resume-sheet * { visibility: visible; }
-          #resume-sheet { position: absolute; left: 0; top: 0; width: 100%; box-shadow: none !important; border: none !important; }
-          .no-print { display: none !important; }
-        }
-      `}</style>
-
-      <div className="no-print">
-        <SectionHead eyebrow="Tool 06" title="Resume Optimizer" desc="Step 3 · Review, edit, and export. Every field is editable — click and type. Use Export PDF when finished." />
-
-        {/* Score + Keywords + Actions */}
-        <div className="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <div className="lg:col-span-1">
-            <div style={{ background: `linear-gradient(135deg, ${ROYAL} 0%, ${CYAN} 100%)` }} className="rounded-2xl p-6 text-white shadow-lg">
-              <div className="text-[10px] uppercase tracking-[0.2em] font-bold text-blue-100 mb-1">ATS Match Score</div>
-              <div style={{ fontFamily: fontDisplay }} className="text-6xl font-bold leading-none">{matchScore}<span className="text-2xl text-blue-200">/100</span></div>
-              <div className="text-xs text-blue-100 mt-2">
-                {matchScore >= 85 ? '🚀 Excellent — submit with confidence' :
-                 matchScore >= 70 ? '✓ Strong match — minor edits recommended' :
-                 matchScore >= 50 ? '⚠ Decent — consider adding more keywords' :
-                 '⚠ Low match — significant tailoring needed'}
-              </div>
-            </div>
-          </div>
-
-          <div className="lg:col-span-2">
-            <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-sm h-full">
-              <div className="text-xs uppercase tracking-[0.2em] font-bold text-slate-600 mb-2">Job Description Keywords</div>
-              <div className="flex flex-wrap gap-1.5 max-h-32 overflow-y-auto">
-                {keywords.map((k, i) => (
-                  <span key={i} className={`text-xs px-2.5 py-1 rounded-md font-semibold ${
-                    k.inResume
-                      ? 'bg-blue-100 text-blue-800 border border-blue-200'
-                      : k.priority === 'high'
-                        ? 'bg-red-50 text-red-700 border border-red-200'
-                        : 'bg-slate-100 text-slate-600 border border-slate-200'
-                  }`}>
-                    {k.inResume ? '✓ ' : '+ '}{k.term}
-                  </span>
-                ))}
-              </div>
-              <div className="text-[10px] text-slate-400 mt-3">
-                <span className="font-bold text-blue-700">✓ blue</span> = already in your resume · <span className="font-bold text-red-700">+ red</span> = high priority missing · gray = nice-to-have
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Action bar */}
-        <div className="mt-5 flex flex-wrap gap-2 justify-center">
-          <button onClick={() => setOptimized(null)}
-            className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-white border border-slate-300 hover:border-blue-400 text-sm font-semibold text-slate-700">
-            <Edit3 size={14} /> Back to Step 2
-          </button>
-          <button onClick={optimize} disabled={busyOptimize}
-            className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-white border border-slate-300 hover:border-blue-400 text-sm font-semibold text-slate-700">
-            {busyOptimize ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />} Re-optimize
-          </button>
-          <button onClick={exportPDF}
-            className="sheen-btn text-white font-bold py-2.5 px-6 rounded-xl shadow-lg text-sm tracking-wide flex items-center gap-2">
-            <Printer size={16} /> Export to PDF
-          </button>
-        </div>
-
-        <div className="mt-3 text-center text-xs text-slate-500">
-          💡 Tip: Click any text below to edit. When you click <strong>Export to PDF</strong>, a new window will open with your resume — choose <strong>Save as PDF</strong> in the print dialog. Make sure pop-ups are allowed for this site.
-        </div>
-      </div>
-
-      {/* THE ACTUAL EDITABLE RESUME SHEET */}
-      <div className="mt-6 flex justify-center">
-        <div
-          id="resume-sheet"
-          className="bg-white border border-slate-200 rounded-lg"
-          style={{
-            width: '8.5in',
-            minHeight: '11in',
-            padding: '0.5in',
-            boxShadow: '0 24px 70px -20px rgba(10,30,63,0.30), 0 8px 20px -8px rgba(10,30,63,0.10)',
-            fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif',
-            color: '#1f2937',
-          }}>
-
-          {/* HEADER */}
-          <div className="border-b-2 pb-3 mb-4" style={{ borderColor: NAVY }}>
-            <EditableText
-              value={resume.header.name}
-              onChange={v => updateField('header.name', v)}
-              className="text-3xl font-bold leading-tight block"
-              style={{ color: NAVY, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif', letterSpacing: '-0.02em' }}
-              placeholder="Your Full Name"
-            />
-            <EditableText
-              value={resume.header.title}
-              onChange={v => updateField('header.title', v)}
-              className="text-sm font-semibold block mt-1"
-              style={{ color: ROYAL }}
-              placeholder="Your professional title"
-            />
-            <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2 text-xs text-slate-600">
-              <EditableText value={resume.header.location} onChange={v => updateField('header.location', v)} placeholder="Location" />
-              <EditableText value={resume.header.email} onChange={v => updateField('header.email', v)} placeholder="email@example.com" />
-              <EditableText value={resume.header.phone} onChange={v => updateField('header.phone', v)} placeholder="Phone" />
-              <EditableText value={resume.header.linkedin} onChange={v => updateField('header.linkedin', v)} placeholder="LinkedIn URL" />
-            </div>
-          </div>
-
-          {/* PROFESSIONAL SUMMARY */}
-          <ResumeSection title="PROFESSIONAL SUMMARY">
-            <EditableText
-              value={resume.summary}
-              onChange={v => updateField('summary', v)}
-              multiline
-              className="text-[13px] leading-relaxed block"
-              placeholder="Write a 3-4 sentence summary highlighting your value..."
-            />
-          </ResumeSection>
-
-          {/* PROFESSIONAL SKILLS */}
-          <ResumeSection title="PROFESSIONAL SKILLS" onAdd={addSkill}>
-            <div className="grid grid-cols-2 gap-x-6 gap-y-1">
-              {resume.skills.map((s, i) => (
-                <div key={i} className="flex items-start gap-2 text-[12px] group">
-                  <span className="font-bold mt-0.5" style={{ color: ROYAL }}>•</span>
-                  <EditableText value={s} onChange={v => {
-                    setResume(r => { const next = { ...r }; next.skills = [...r.skills]; next.skills[i] = v; return next; });
-                  }} className="flex-1" placeholder="Skill" />
-                  <button onClick={() => removeSkill(i)} className="no-print opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-600 text-xs">✕</button>
-                </div>
-              ))}
-            </div>
-          </ResumeSection>
-
-          {/* SOFTWARE PROFICIENCY */}
-          <ResumeSection title="SOFTWARE PROFICIENCY" onAdd={addSoftware}>
-            <div className="grid grid-cols-2 gap-x-6 gap-y-1">
-              {resume.software.map((s, i) => (
-                <div key={i} className="flex items-start gap-2 text-[12px] group">
-                  <span className="font-bold mt-0.5" style={{ color: ROYAL }}>•</span>
-                  <EditableText value={s.name} onChange={v => {
-                    setResume(r => { const next = { ...r }; next.software = [...r.software]; next.software[i] = { ...next.software[i], name: v }; return next; });
-                  }} className="font-semibold" placeholder="Software" />
-                  <span className="text-slate-500">—</span>
-                  <EditableText value={s.level} onChange={v => {
-                    setResume(r => { const next = { ...r }; next.software = [...r.software]; next.software[i] = { ...next.software[i], level: v }; return next; });
-                  }} className="flex-1 text-slate-600" placeholder="Level" />
-                  <button onClick={() => removeSoftware(i)} className="no-print opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-600 text-xs">✕</button>
-                </div>
-              ))}
-            </div>
-          </ResumeSection>
-
-          {/* CLIENT INDUSTRIES */}
-          <ResumeSection title="CLIENT INDUSTRIES" onAdd={addIndustry}>
-            <div className="flex flex-wrap gap-1.5">
-              {resume.industries.map((ind, i) => (
-                <div key={i} className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-semibold group" style={{ background: ICE, color: NAVY, border: `1px solid ${CYAN}40` }}>
-                  <EditableText value={ind} onChange={v => {
-                    setResume(r => { const next = { ...r }; next.industries = [...r.industries]; next.industries[i] = v; return next; });
-                  }} placeholder="Industry" />
-                  <button onClick={() => removeIndustry(i)} className="no-print opacity-0 group-hover:opacity-100 text-red-500 ml-1">✕</button>
-                </div>
-              ))}
-            </div>
-          </ResumeSection>
-
-          {/* PROFESSIONAL EXPERIENCE */}
-          <ResumeSection title="PROFESSIONAL EXPERIENCE">
-            {resume.experience.map((exp, i) => (
-              <div key={i} className="mb-4 last:mb-0">
-                <div className="flex flex-wrap items-baseline justify-between gap-2 mb-1">
-                  <div className="flex items-baseline gap-2 flex-wrap">
-                    <EditableText value={exp.title} onChange={v => {
-                      setResume(r => { const next = { ...r }; next.experience = [...r.experience]; next.experience[i] = { ...next.experience[i], title: v }; return next; });
-                    }} className="text-[13px] font-bold" style={{ color: NAVY }} placeholder="Job Title" />
-                    <span className="text-slate-400">·</span>
-                    <EditableText value={exp.company} onChange={v => {
-                      setResume(r => { const next = { ...r }; next.experience = [...r.experience]; next.experience[i] = { ...next.experience[i], company: v }; return next; });
-                    }} className="text-[13px] font-semibold" style={{ color: ROYAL }} placeholder="Company" />
-                    {exp.location && <>
-                      <span className="text-slate-400">·</span>
-                      <EditableText value={exp.location} onChange={v => {
-                        setResume(r => { const next = { ...r }; next.experience = [...r.experience]; next.experience[i] = { ...next.experience[i], location: v }; return next; });
-                      }} className="text-[11px] text-slate-500 italic" placeholder="Location" />
-                    </>}
-                  </div>
-                  <EditableText value={exp.dates} onChange={v => {
-                    setResume(r => { const next = { ...r }; next.experience = [...r.experience]; next.experience[i] = { ...next.experience[i], dates: v }; return next; });
-                  }} className="text-[11px] font-semibold text-slate-600" placeholder="Dates" />
-                </div>
-                <ul className="space-y-1 mt-1">
-                  {exp.bullets.map((b, bi) => (
-                    <li key={bi} className="flex items-start gap-2 text-[12px] leading-relaxed group">
-                      <span className="font-bold mt-0.5 flex-shrink-0" style={{ color: ROYAL }}>▸</span>
-                      <EditableText value={b} onChange={v => {
-                        setResume(r => {
-                          const next = JSON.parse(JSON.stringify(r));
-                          next.experience[i].bullets[bi] = v;
-                          return next;
-                        });
-                      }} multiline className="flex-1" placeholder="Achievement bullet" />
-                      <button onClick={() => removeExpBullet(i, bi)} className="no-print opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-600 text-xs flex-shrink-0">✕</button>
-                    </li>
-                  ))}
-                </ul>
-                <button onClick={() => addExpBullet(i)} className="no-print text-[10px] mt-1 ml-5 px-2 py-0.5 rounded bg-blue-50 text-blue-700 hover:bg-blue-100 font-semibold">+ Add bullet</button>
-              </div>
-            ))}
-          </ResumeSection>
-
-          {/* CERTIFICATIONS */}
-          {(resume.certifications && resume.certifications.length > 0) && (
-            <ResumeSection title="CERTIFICATIONS" onAdd={addCertification}>
-              <div className="grid grid-cols-2 gap-x-6 gap-y-1">
-                {resume.certifications.map((c, i) => (
-                  <div key={i} className="flex items-start gap-2 text-[12px] group">
-                    <span className="font-bold mt-0.5" style={{ color: ROYAL }}>•</span>
-                    <EditableText value={c} onChange={v => {
-                      setResume(r => { const next = { ...r }; next.certifications = [...r.certifications]; next.certifications[i] = v; return next; });
-                    }} className="flex-1" placeholder="Certification" />
-                    <button onClick={() => removeCertification(i)} className="no-print opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-600 text-xs">✕</button>
-                  </div>
-                ))}
-              </div>
-            </ResumeSection>
-          )}
-
-          {/* EDUCATION */}
-          {(resume.education && resume.education.length > 0) && (
-            <ResumeSection title="EDUCATION">
-              {resume.education.map((ed, i) => (
-                <div key={i} className="flex flex-wrap items-baseline justify-between gap-2 text-[12px] mb-1">
-                  <div className="flex items-baseline gap-2 flex-wrap">
-                    <EditableText value={ed.degree} onChange={v => {
-                      setResume(r => { const next = { ...r }; next.education = [...r.education]; next.education[i] = { ...next.education[i], degree: v }; return next; });
-                    }} className="font-bold" style={{ color: NAVY }} placeholder="Degree" />
-                    <span className="text-slate-400">·</span>
-                    <EditableText value={ed.school} onChange={v => {
-                      setResume(r => { const next = { ...r }; next.education = [...r.education]; next.education[i] = { ...next.education[i], school: v }; return next; });
-                    }} className="font-semibold" style={{ color: ROYAL }} placeholder="School" />
-                    {ed.details && <>
-                      <span className="text-slate-400">·</span>
-                      <EditableText value={ed.details} onChange={v => {
-                        setResume(r => { const next = { ...r }; next.education = [...r.education]; next.education[i] = { ...next.education[i], details: v }; return next; });
-                      }} className="text-slate-500 italic" placeholder="Details" />
-                    </>}
-                  </div>
-                  <EditableText value={ed.year} onChange={v => {
-                    setResume(r => { const next = { ...r }; next.education = [...r.education]; next.education[i] = { ...next.education[i], year: v }; return next; });
-                  }} className="font-semibold text-slate-600" placeholder="Year" />
-                </div>
-              ))}
-            </ResumeSection>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// Small helpers used by ResumeOptimizer
-function ResumeSection({ title, onAdd, children }) {
-  return (
-    <section className="mb-4">
-      <div className="flex items-center justify-between mb-1.5 pb-1 border-b" style={{ borderColor: '#CBD5E1' }}>
-        <h2 className="text-[11px] font-bold tracking-[0.2em] uppercase" style={{ color: NAVY }}>{title}</h2>
-        {onAdd && (
-          <button onClick={onAdd} className="no-print text-[10px] px-2 py-0.5 rounded bg-blue-50 text-blue-700 hover:bg-blue-100 font-semibold">+ Add</button>
-        )}
-      </div>
-      {children}
-    </section>
-  );
-}
-
-function EditableText({ value, onChange, multiline, className = '', style = {}, placeholder = '' }) {
-  if (multiline) {
-    return (
-      <span
-        contentEditable
-        suppressContentEditableWarning
-        onBlur={(e) => onChange(e.currentTarget.innerText)}
-        className={className + ' outline-none focus:bg-blue-50 hover:bg-blue-50/50 rounded px-0.5 transition'}
-        style={style}
-        data-placeholder={placeholder}
-      >{value}</span>
-    );
-  }
-  return (
-    <span
-      contentEditable
-      suppressContentEditableWarning
-      onBlur={(e) => onChange(e.currentTarget.innerText)}
-      className={className + ' outline-none focus:bg-blue-50 hover:bg-blue-50/50 rounded px-0.5 transition'}
-      style={style}
-      data-placeholder={placeholder}
-    >{value}</span>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// COMPONENT: INTERVIEW PREP (with 6 subtabs)
+// COMPONENT: INTERVIEW PREP (Job Interview Mastery — 7 subtabs)
 // ═══════════════════════════════════════════════════════════════════
 
 const INTERVIEW_SUBTABS = [
@@ -4757,17 +5277,18 @@ const INTERVIEW_SUBTABS = [
   { id: 'body',       label: 'Body Language',        icon: Eye, desc: 'On-camera presence, eye contact, posture, energy' },
   { id: 'jdgen',      label: 'JD Question Generator', icon: HelpCircle, desc: 'Paste any job description, get the exact questions they will ask' },
   { id: 'salary',     label: 'Salary Negotiation',   icon: TrendingUp, desc: 'Anchor high, defend with value, lock in 20-40% above their first offer' },
+  { id: 'winstrat',   label: 'Interview Winning Strategy', icon: Crown, desc: 'A video course library: the mindset, scripts, and tactics that win the offer' },
 ];
 
 function InterviewPrep() {
   const [sub, setSub] = useState('common');
   return (
     <div>
-      <SectionHead eyebrow="Tool 07" title="Interview Preparation Suite" desc="Six tools to turn a nervous candidate into a confident hire. Body language, CAR storytelling, common questions (weak vs strong), JD-generated questions, accounting Q&A, and salary negotiation." />
+      <SectionHead eyebrow="Tool 07" title="Job Interview Mastery" desc="Seven tools to turn a nervous candidate into a confident hire. Body language, CAR storytelling, common questions (weak vs strong), JD-generated questions, accounting Q&A, salary negotiation, and a full Interview Winning Strategy video course library." />
 
       {/* Subtab nav */}
       <div className="mt-6 mb-6">
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-2">
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-7 gap-2">
           {INTERVIEW_SUBTABS.map(t => {
             const Icon = t.icon;
             const active = sub === t.id;
@@ -4790,6 +5311,7 @@ function InterviewPrep() {
       {sub === 'body' && <BodyLanguage />}
       {sub === 'jdgen' && <JDQuestionGenerator />}
       {sub === 'salary' && <SalaryNegotiation />}
+      {sub === 'winstrat' && <InterviewStrategyCatalog embedded />}
     </div>
   );
 }
@@ -5055,16 +5577,31 @@ function AccountingInterviewQA() {
   );
 }
 
+// Shared inline error banner (matches the CourseProgram error style) so AI
+// tools surface failures in the glass UI instead of a jarring window.alert().
+function ErrorNote({ msg, onClose, className = 'mt-4' }) {
+  if (!msg) return null;
+  return (
+    <div className={`${className} flex items-start gap-3 p-4 rounded-xl border`} style={{ background: '#FEF2F2', borderColor: '#FCA5A5' }}>
+      <AlertTriangle size={18} className="text-red-500 mt-0.5 flex-shrink-0" />
+      <div className="text-sm text-red-700 flex-1">{msg}</div>
+      {onClose && <button onClick={onClose} className="text-red-400 hover:text-red-600"><X size={16} /></button>}
+    </div>
+  );
+}
+
 // ─── SUBTAB 3: CAR Storytelling ──────────────────────────────────────
 function CARStorytelling() {
   const [scenario, setScenario] = useState('');
   const [busy, setBusy] = useState(false);
   const [story, setStory] = useState(null);
+  const [err, setErr] = useState('');
 
   const generate = async () => {
     if (!scenario.trim()) return;
     setBusy(true);
     setStory(null);
+    setErr('');
     try {
       const sys = `You are an executive interview coach who specializes in the CAR storytelling method (Context, Action, Result). You help international remote bookkeepers craft compelling answers to behavioral interview questions for US clients.
 
@@ -5085,7 +5622,7 @@ Output as a JSON object with keys: context, action, result, fullStory (a 200-280
       const cleaned = raw.replace(/```json|```/g, '').trim();
       setStory(JSON.parse(cleaned));
     } catch (e) {
-      alert('Failed to generate story: ' + (e.message || 'unknown error'));
+      setErr('Failed to generate story: ' + (e.message || 'unknown error'));
     }
     setBusy(false);
   };
@@ -5122,6 +5659,7 @@ Output as a JSON object with keys: context, action, result, fullStory (a 200-280
           className="sheen-btn mt-4 text-white font-bold py-3 px-8 rounded-xl shadow-lg text-sm tracking-wide flex items-center gap-2 disabled:opacity-50">
           {busy ? <><Loader2 size={16} className="animate-spin" /> Crafting your story...</> : <><Target size={16} /> Generate CAR Story</>}
         </button>
+        <ErrorNote msg={err} onClose={() => setErr('')} />
       </div>
 
       {story && (
@@ -5272,11 +5810,13 @@ function JDQuestionGenerator() {
   const [jd, setJd] = useState('');
   const [busy, setBusy] = useState(false);
   const [questions, setQuestions] = useState(null);
+  const [err, setErr] = useState('');
 
   const generate = async () => {
     if (!jd.trim()) return;
     setBusy(true);
     setQuestions(null);
+    setErr('');
     try {
       const sys = `You are a senior US hiring manager and interview coach. Given a job description, you predict the EXACT interview questions the hiring manager will ask, organized by category.
 
@@ -5316,7 +5856,7 @@ Generate 3-5 questions per category. Make them realistic — what a US hiring ma
       const cleaned = raw.replace(/```json|```/g, '').trim();
       setQuestions(JSON.parse(cleaned));
     } catch (e) {
-      alert('Failed to generate questions: ' + (e.message || 'unknown error'));
+      setErr('Failed to generate questions: ' + (e.message || 'unknown error'));
     }
     setBusy(false);
   };
@@ -5335,6 +5875,7 @@ Generate 3-5 questions per category. Make them realistic — what a US hiring ma
           className="sheen-btn mt-4 text-white font-bold py-3 px-8 rounded-xl shadow-lg text-sm tracking-wide flex items-center gap-2 disabled:opacity-50">
           {busy ? <><Loader2 size={16} className="animate-spin" /> Predicting questions...</> : <><HelpCircle size={16} /> Generate Predicted Questions</>}
         </button>
+        <ErrorNote msg={err} onClose={() => setErr('')} />
       </div>
 
       {questions && (
@@ -5433,6 +5974,7 @@ function AuthenticBranding() {
   const [answers, setAnswers] = useState({});
   const [busy, setBusy] = useState(false);
   const [profile, setProfile] = useState(null);
+  const [err, setErr] = useState('');
 
   const totalQuestions = BRANDING_QUESTIONS.reduce((sum, sec) => sum + sec.items.length, 0);
   const answeredCount = Object.values(answers).filter(v => v && v.trim().length > 10).length;
@@ -5442,11 +5984,12 @@ function AuthenticBranding() {
 
   const generate = async () => {
     if (answeredCount < 8) {
-      alert('Please answer at least 8 questions for a meaningful brand profile.');
+      setErr('Please answer at least 8 questions for a meaningful brand profile.');
       return;
     }
     setBusy(true);
     setProfile(null);
+    setErr('');
     try {
       const formatted = BRANDING_QUESTIONS.map(sec => {
         const filled = sec.items.filter(i => answers[i.id] && answers[i.id].trim().length > 10);
@@ -5494,7 +6037,7 @@ Be honest, specific, and warm. Use their OWN words and stories. Avoid corporate 
       const cleaned = raw.replace(/```json|```/g, '').trim();
       setProfile(JSON.parse(cleaned));
     } catch (e) {
-      alert('Failed to generate brand profile: ' + (e.message || 'unknown error'));
+      setErr('Failed to generate brand profile: ' + (e.message || 'unknown error'));
     }
     setBusy(false);
   };
@@ -5856,6 +6399,7 @@ ${(profile.authenticWeaknesses || []).map(w => `
             : <><Sparkles size={20} /> {answeredCount < 8 ? `Answer ${8 - answeredCount} more to unlock` : 'Reveal My Authentic Brand'}</>}
         </button>
       </div>
+      <ErrorNote msg={err} onClose={() => setErr('')} className="mt-4 max-w-xl mx-auto" />
     </div>
   );
 }
@@ -16959,7 +17503,7 @@ function SectionHead({ eyebrow, title, desc, gold }) {
           </span>
         )}
       </div>
-      <h1 style={{ fontFamily: fontDisplay, color: C.text, letterSpacing: '-0.025em', fontWeight: 600, fontSize: 32, lineHeight: 1.05 }}>{title}</h1>
+      <h1 style={{ fontFamily: fontDisplay, color: C.text, letterSpacing: '-0.025em', fontWeight: 600, fontSize: 'clamp(24px, 5vw, 32px)', lineHeight: 1.05 }}>{title}</h1>
       {desc && (
         <p className="mt-2.5 text-[15px] max-w-3xl leading-relaxed" style={{ color: C.textSoft }}>{desc}</p>
       )}

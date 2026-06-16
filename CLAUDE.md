@@ -67,6 +67,69 @@ The **two sanctioned exceptions** to the single-file rule (same spirit as the `m
   `VITE_SUPABASE_ANON_KEY` (public anon key; safe in the bundle — RLS is the real boundary).
 - `auth/AuthProvider.jsx` — the `AuthProvider` + `useAuth()` hook (see Authentication).
 
+### Course platform (Supabase-backed) — `CourseProgram` engine + `CourseCatalog`
+
+The course platform is the **first in-app tool to read/write Supabase directly**
+(`import { supabase } from './lib/supabase'`) instead of `window.storage`. Course content + per-user
+progress live in Supabase so they reach **all** students across devices. Two pieces:
+
+- **`CourseProgram`** — the generic **single-course engine** (learner player, admin builder, lesson
+  editor, completion + branded PDF certificate). Props: `slug`, **`courseId`** (load by id — catalog
+  mode), **`onBack`** (show a "← All courses" bar + compact in-body header instead of the page
+  `SectionHead`), `eyebrow`, `courseTitle`, `defaultSubtitle`, `certFileName`, `comingSoonText`,
+  `embedded`. `load()` looks up by `courseId` when given, else by `slug`. The header is rendered when
+  `showHead = !embedded && !onBack`.
+- **`CourseCatalog`** — a Thinkific-style **multi-course catalog**, **prefix-parameterized** so the
+  same component powers more than one catalog. Admins create/manage many courses from one dashboard
+  (cover image, reorder, publish, **delete**); students browse published course cards and open one to
+  learn (it hands off to `<CourseProgram courseId … onBack …/>`, keyed so each course gets clean
+  state). Props (all default to the QBO catalog, so `<CourseCatalog />` is unchanged): **`prefix`**
+  (the `courses.slug` namespace, e.g. `'qbo-'` or `'interview-'`; drives the `ilike '<prefix>%'`
+  filter, the auto-slug, and isolation between catalogs), **`embedded`** (drop the page `SectionHead`
+  when nested in a subtab), and copy props `eyebrow` / `title` / `adminDesc` / `studentDesc` /
+  `newCourseTitle` / `comingSoonDesc`. Each prefix is its own namespace, so catalogs never see each
+  other's courses. **Zero schema change** (reuses the `courses.slug` prefix + the `cover_path` /
+  `position` columns).
+
+Wrappers:
+- `QBOMastery()` — the `qbomastery` tab (Training & Skills) → **`<CourseCatalog />`** (defaults →
+  `qbo-*` QuickBooks course library).
+- `InterviewStrategyCatalog({ embedded })` — the `winstrat` **subtab** inside `InterviewPrep` →
+  **`<CourseCatalog prefix="interview-" embedded …/>`** (the Interview Winning Strategy course
+  library; cards are `interview-*` courses, e.g. the legacy `interview-winning-strategy`).
+- `ResumeStrategy()` — the `resumestrategy` tab (Job Application → Profile Optimization) →
+  **`<CourseCatalog prefix="resume-" …/>`** (a top-level multi-course catalog, like `QBOMastery`; the
+  Resume Winning Strategy course library — cards are `resume-*` courses, e.g. the legacy
+  `resume-strategy`, which matches `resume-%` and migrates in automatically).
+
+To add a course to either catalog: an admin clicks **"New course"** (auto-generates a unique
+`<prefix>…` slug, no SQL). To add a *new catalog* (a new course category), render another
+`<CourseCatalog prefix="…" …/>` with its own prefix + copy and wire the nav sync points. To add a
+*single-course* tab, write a `CourseProgram` wrapper with its own `slug` + labels.
+
+- **Tables:** `courses` → `course_modules` → `course_lessons` (`type` video/text, link or uploaded
+  video), `lesson_progress` (per-user completion), `course_completions` (stamps the certificate date).
+  All keyed by `course_id`, so one schema serves every course.
+- **Admin gate:** `profiles.is_admin` + a `public.is_admin()` SQL helper. RLS lets any signed-in user
+  read **published** content but only admins write course content (UI also hides the builder/catalog
+  controls). Progress rows are row-locked to the owning user.
+- **In-app course creation:** `CourseCatalog.createCourse()` (admin) inserts a `<prefix>-*` row and
+  drops into its builder — no SQL seed. (The single-course wrappers also keep a
+  `CourseProgram.createCourse()` empty-state button for their fixed slug.)
+- **In-app delete = data cleanup:** `CourseCatalog.deleteCourse()` purges the course's storage files
+  (`lessons/{id}/*` + `covers/{id}/*`) then deletes the row (FK cascade clears modules/lessons/
+  progress/completions); `CourseProgram.deleteLesson()` removes an uploaded lesson's storage object too
+  (no orphans). This is how dummy/test content is removed — admins delete it in-app.
+- **Storage:** a public `course-media` bucket streams uploaded videos (`lessons/{course.id}/…`) and
+  course covers (`covers/{course.id}/…`); write/delete restricted to admins. Videos can also be
+  YouTube/Vimeo/MP4 **links**. Uploads are guarded client-side (video ≤ 50 MB; cover image ≤ 5 MB).
+  The bucket is shared across all courses.
+- **Certificate:** rendered from design tokens + `LOGO_DATA_URI`, downloaded as PDF via **lazy-loaded**
+  `jspdf` + `html2canvas` (dynamic `import()` only on download — kept out of the main bundle); the PDF
+  filename comes from the `certFileName` prop.
+- **Setup:** all SQL + bucket steps live in **[COURSE_SETUP.md](COURSE_SETUP.md)**. Progress is in
+  Supabase, **not** `window.storage` — do **not** add course keys to `LEGACY_KEYS`.
+
 ### [src/BookkeeperPro.jsx](src/BookkeeperPro.jsx) — the entire app (~15.1k lines)
 
 > Note: lines are long; prefer `Grep` over reading the whole file. Line numbers below are anchors,
@@ -81,7 +144,10 @@ The **two sanctioned exceptions** to the single-file rule (same spirit as the `m
 | Tool components | ~1740–end | ~60 self-contained functional components |
 
 **Notable tools → approximate line:** `Dashboard` 1749, `CoaGenerator` 2017, `Course` 2120,
-`BankFeed` 2214, `StatementConverter` 2411, `ProChat` 2764, `ResumeOptimizer` 3511,
+`CourseProgram` ~2782 (single-course Supabase video engine — builder + PDF certificate),
+`CourseCatalog` ~3630 (prefix-parameterized multi-course catalog) + the `QBOMastery` (`qbo-`) /
+`InterviewStrategyCatalog` (`interview-`, the `winstrat` subtab) / `ResumeStrategy` (`resume-`) wrappers right after it,
+`BankFeed` 2214, `StatementConverter` 2411, `ProChat` 2764,
 `AuthenticBranding` 4944, `ProposalGenerator` 5379, `EngagementLetter` 5658, `EmailTemplates` 6304,
 `PainPointsGenerator` 6629, `ClientPortalDemo` 6987, `IndustryAccounting` 7661, `USTax101` 7962,
 `MonthlyWorkflow` 8135, `MonthEndChecklist` 8336, `InvoiceCreator` 8618, `CoachAlexChat` 9025,
@@ -108,7 +174,9 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
 - **Provider/hook:** [src/auth/AuthProvider.jsx](src/auth/AuthProvider.jsx) wraps the app in
   [main.jsx](src/main.jsx). Any component reads auth via `const { session, user, profile, loading,
   configured, signUp, signIn, signOut, resetPassword } = useAuth()`. `profile` is the row from the
-  Supabase `profiles` table and carries `is_paid` / `plan` (used by the planned Phase-2 paywall).
+  Supabase `profiles` table and carries `is_paid` / `plan` (used by the planned Phase-2 paywall) and
+  `is_admin` (course-authoring gate — see the Course platform section). `profile` is fetched with
+  `.select('*')`, so new `profiles` columns ride along automatically without an AuthProvider change.
 - **The gate** lives in `BookkeeperProToolkit` just before its root `return` (~L1121): `if (loading)
   return <AuthSplash/>; if (!user) return <AuthScreen/>;`. `AuthScreen` (defined just above the root
   component) is the login/signup/reset UI, built from the design tokens (`C`, `SHEEN`, `GLASS`,
