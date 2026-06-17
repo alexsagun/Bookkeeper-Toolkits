@@ -49,12 +49,15 @@ by Row Level Security, not just the UI).
 > purges the course's uploaded videos + cover from storage **unless a duplicated course still uses
 > them**; deleting a single lesson behaves the same way. No manual SQL or Storage cleanup required.
 >
-> **Troubleshooting — Duplicate fails with a red banner / `400` in the console.** If **⋮ → Duplicate
-> course** errors and DevTools shows `POST …/rest/v1/courses → 400` (expand the logged error: `code`
-> is `PGRST204` or `42703`, "Could not find the 'source_course_id' column …"), the duplicate-course
-> migration hasn't been applied to this project. Run the two `alter table public.courses …` statements
-> above (the `month` + `source_course_id` columns) **plus** `notify pgrst, 'reload schema';` in the SQL
-> Editor, then retry. The in-app banner now spells out the exact Postgres error and this fix.
+> **Troubleshooting — Create/Duplicate fails with a red banner / `400` in the console.** If **New
+> course** or **⋮ → Duplicate course** errors and DevTools shows `POST …/rest/v1/courses → 400`
+> (expand the logged object: `code` is `PGRST204` or `42703`, "Could not find the **'course_date'**
+> column …" — or `'source_course_id'`), the course-platform migration hasn't been applied to this
+> project. **Easiest fix:** open [`db/2026-06-17-course-date-source-id.sql`](db/2026-06-17-course-date-source-id.sql)
+> and run it whole in the Supabase **SQL Editor** — it adds `course_date` / `month` / `source_course_id`
+> / `updated_at` (all `if not exists`, safe to re-run) and ends with `notify pgrst, 'reload schema';`.
+> That same block is also inline below (Step 1's "idempotent migration" lines). Retry afterward; the
+> in-app banner spells out the exact Postgres error and this fix.
 
 ---
 
@@ -109,11 +112,13 @@ create table if not exists public.courses (
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
--- For projects created before the duplicate-course feature: add the columns if missing (idempotent).
+-- Idempotent migration — for projects created before these columns existed, add any that are missing.
+-- (Also lives as a standalone, copy-pasteable file: db/2026-06-17-course-date-source-id.sql)
 alter table public.courses add column if not exists month text;        -- legacy cohort label (display fallback only)
 alter table public.courses add column if not exists course_date date;  -- structured editable cohort/run date (defaults to today)
 alter table public.courses add column if not exists source_course_id uuid
   references public.courses(id) on delete set null;
+alter table public.courses add column if not exists updated_at timestamptz not null default now(); -- written by edits/cover uploads
 notify pgrst, 'reload schema';  -- make PostgREST pick up the new columns immediately (avoids the 400 below)
 -- Note: `course_date` (date-only, YYYY-MM-DD) is the structured cohort date the creator picks; it defaults
 -- to today on create/duplicate and renders as an auto-derived "Month Year" badge. The older `month` text

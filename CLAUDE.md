@@ -18,8 +18,14 @@ templates) run fully offline with no API key.
 ## Tech stack
 
 - **React 18.3** + **Vite 5.4** (`@vitejs/plugin-react`).
-- **JavaScript + JSX only** — there is **no TypeScript, no ESLint/Prettier, no PostCSS or Tailwind config files**. Do not introduce build tooling, a type system, or new config without asking first.
-- **Tailwind CSS via CDN** (loaded in [index.html](index.html)) — utility classes work, but there is no `tailwind.config.js` and no JIT/build step for styles.
+- **JavaScript + JSX only** — there is **no TypeScript, no ESLint/Prettier**. Do not introduce a type system, a linter, or new build config without asking first.
+- **Tailwind CSS compiled via PostCSS** — config in [tailwind.config.js](tailwind.config.js) +
+  [postcss.config.js](postcss.config.js); the utility layers are imported once from
+  [src/index.css](src/index.css) via [src/main.jsx](src/main.jsx). The JIT scans `index.html` +
+  `src/**/*.{js,jsx}`. There is **no safelist** because colors/fonts come from inline `style` + the `C`
+  design tokens (no dynamically-built class names like `` `bg-${x}` ``) — if you ever add one, safelist
+  it or it will be purged. (The `standalone/` Google Apps Script build still uses the Tailwind **CDN**,
+  since it's a single self-contained file.)
 - **Lucide React** for icons, **XLSX** (spreadsheet parse/generate), **Mammoth** (.docx parse).
 - **Anthropic Claude API** for AI features, via a key-hiding proxy (see below).
 - **Supabase** (`@supabase/supabase-js`) for **user authentication** (email/password signup & login).

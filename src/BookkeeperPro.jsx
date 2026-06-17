@@ -2924,7 +2924,7 @@ function CourseProgram({
       const all = nested.flatMap(m => m.lessons);
       setActiveLessonId(prev => prev || (all.find(l => !done.has(l.id)) || all[0])?.id || null);
     } catch (e) {
-      console.error('[CourseProgram] load failed:', e);
+      logDbError('[CourseProgram] load', e, { slug, courseId });
       const msg = e?.message || '';
       // The course tables don't exist yet (COURSE_SETUP.md not run) — treat as "not configured"
       // and show a friendly setup/coming-soon state instead of a raw red Postgres error.
@@ -2981,8 +2981,8 @@ function CourseProgram({
       }
       goAdjacent(lesson, 1);
     } catch (e) {
-      console.error('[CourseProgram] progress failed:', e);
-      setErr(e.message || 'Could not save your progress.');
+      logDbError('[CourseProgram] progress', e, { courseId: course?.id });
+      setErr(describeDbError(e, 'Could not save your progress.'));
     }
   }
 
@@ -2998,8 +2998,8 @@ function CourseProgram({
       await load();
       setMode('edit');
     } catch (e) {
-      console.error('[CourseProgram] create failed:', e);
-      setErr(e.message || 'Could not create the course.');
+      logDbError('[CourseProgram] create', e, { slug });
+      setErr(describeDbError(e, 'Could not create the course.'));
     } finally { setCreating(false); }
   }
 
@@ -3014,7 +3014,7 @@ function CourseProgram({
       }).eq('id', course.id);
       if (error) throw error;
       await load();
-    } catch (e) { setErr(e.message || 'Could not save course details.'); }
+    } catch (e) { logDbError('[CourseProgram] saveMeta', e, { courseId: course.id }); setErr(describeDbError(e, 'Could not save course details.')); }
     finally { setMetaBusy(false); }
   }
   async function togglePublished() {
@@ -3024,7 +3024,7 @@ function CourseProgram({
         .update({ published: !course.published }).eq('id', course.id);
       if (error) throw error;
       await load();
-    } catch (e) { setErr(e.message || 'Could not change publish state.'); }
+    } catch (e) { logDbError('[CourseProgram] togglePublished', e, { courseId: course.id }); setErr(describeDbError(e, 'Could not change publish state.')); }
     finally { setMetaBusy(false); }
   }
 
@@ -3036,7 +3036,7 @@ function CourseProgram({
         .insert({ course_id: course.id, title: 'New module', position: modules.length });
       if (error) throw error;
       await load();
-    } catch (e) { setErr(e.message || 'Could not add module.'); }
+    } catch (e) { logDbError('[CourseProgram] addModule', e, { courseId: course.id }); setErr(describeDbError(e, 'Could not add module.')); }
     finally { setStructBusy(false); }
   }
   async function renameModule(m, title) {
@@ -3045,7 +3045,7 @@ function CourseProgram({
       const { error } = await supabase.from('course_modules').update({ title }).eq('id', m.id);
       if (error) throw error;
       setModules(ms => ms.map(x => x.id === m.id ? { ...x, title } : x));
-    } catch (e) { setErr(e.message || 'Could not rename module.'); }
+    } catch (e) { logDbError('[CourseProgram] renameModule', e, { moduleId: m.id }); setErr(describeDbError(e, 'Could not rename module.')); }
   }
   async function deleteModule(m) {
     if (!window.confirm(`Delete "${m.title}" and all its lessons? This cannot be undone.`)) return;
@@ -3053,7 +3053,7 @@ function CourseProgram({
       const { error } = await supabase.from('course_modules').delete().eq('id', m.id);
       if (error) throw error;
       await load();
-    } catch (e) { setErr(e.message || 'Could not delete module.'); }
+    } catch (e) { logDbError('[CourseProgram] deleteModule', e, { moduleId: m.id }); setErr(describeDbError(e, 'Could not delete module.')); }
   }
   async function moveModule(idx, dir) {
     const j = idx + dir;
@@ -3063,7 +3063,7 @@ function CourseProgram({
     try {
       await Promise.all(arr.map((m, i) => supabase.from('course_modules').update({ position: i }).eq('id', m.id)));
       await load();
-    } catch (e) { setErr(e.message || 'Could not reorder modules.'); }
+    } catch (e) { logDbError('[CourseProgram] moveModule', e, { courseId: course.id }); setErr(describeDbError(e, 'Could not reorder modules.')); }
   }
 
   // ── Builder: lessons ──
@@ -3077,7 +3077,7 @@ function CourseProgram({
       if (error) throw error;
       await load();
       setEditingLesson({ ...data });
-    } catch (e) { setErr(e.message || 'Could not add lesson.'); }
+    } catch (e) { logDbError('[CourseProgram] addLesson', e, { courseId: course.id, moduleId: m.id }); setErr(describeDbError(e, 'Could not add lesson.')); }
     finally { setStructBusy(false); }
   }
   async function deleteLesson(l) {
@@ -3091,7 +3091,7 @@ function CourseProgram({
       if (l.video_provider === 'upload' && l.storage_path) await removeMediaIfUnreferenced([l.storage_path]);
       setActiveLessonId(prev => (prev === l.id ? null : prev)); // don't keep a deleted lesson active
       await load();
-    } catch (e) { setErr(e.message || 'Could not delete lesson.'); }
+    } catch (e) { logDbError('[CourseProgram] deleteLesson', e, { courseId: course.id, lessonId: l.id }); setErr(describeDbError(e, 'Could not delete lesson.')); }
   }
   async function moveLesson(m, idx, dir) {
     const j = idx + dir;
@@ -3101,7 +3101,7 @@ function CourseProgram({
     try {
       await Promise.all(arr.map((l, i) => supabase.from('course_lessons').update({ position: i }).eq('id', l.id)));
       await load();
-    } catch (e) { setErr(e.message || 'Could not reorder lessons.'); }
+    } catch (e) { logDbError('[CourseProgram] moveLesson', e, { courseId: course.id, moduleId: m.id }); setErr(describeDbError(e, 'Could not reorder lessons.')); }
   }
 
   async function uploadVideo(file) {
@@ -3123,8 +3123,8 @@ function CourseProgram({
       if (error) throw error;
       setEditingLesson(d => ({ ...d, storage_path: path, video_provider: 'upload', video_url: '' }));
     } catch (e) {
-      console.error('[CourseProgram] upload failed:', e);
-      setErr(e.message || 'Video upload failed — check the file size and that you have admin access.');
+      logDbError('[CourseProgram] video upload', e, { courseId: course.id });
+      setErr(describeDbError(e, 'Video upload failed — check the file size and that you have admin access.'));
     } finally {
       setUploading(false);
     }
@@ -3162,7 +3162,7 @@ function CourseProgram({
       if (previewUrl) { URL.revokeObjectURL(previewUrl); setPreviewUrl(null); }
       setEditingLesson(null);
       await load();
-    } catch (e) { setErr(e.message || 'Could not save lesson.'); }
+    } catch (e) { logDbError('[CourseProgram] saveLesson', e, { courseId: course?.id, lessonId: d.id }); setErr(describeDbError(e, 'Could not save lesson.')); }
     finally { setSavingLesson(false); }
   }
 
@@ -3741,13 +3741,35 @@ async function removeMediaIfUnreferenced(rawPaths) {
   }
 }
 
+// Pull the underlying PostgrestError fields off a thrown error. Our multi-step flows wrap the real
+// error on `.cause` (with a friendly prefix as `.message`), so unwrap to that for code/details/hint.
+function dbErrorFields(e) {
+  const root = (e && e.cause) || e || {};
+  return {
+    code: root.code || e?.code,
+    message: root.message || e?.message,
+    details: root.details,
+    hint: root.hint,
+  };
+}
+
+// Structured console logging for a Supabase failure — replaces terse `console.error('… failed', e)`
+// (which renders as an unhelpful "Object undefined") with the operation, its context (module/course),
+// and the Postgrest code/message/details/hint, so failures are debuggable from the console alone.
+function logDbError(tag, e, context) {
+  const { code, message, details, hint } = dbErrorFields(e);
+  console.error(`${tag} failed`, { code, message, details, hint, ...(context || {}) });
+}
+
 // Turn a thrown error into a human-readable banner string. Unwraps our friendly-wrapped errors
 // (which stash the real PostgrestError on `.cause`) and pulls through the underlying message,
-// details, hint, and code — so a duplicate/cover/delete failure shows WHY instead of an opaque
-// "[object Object]". A missing-column code (PGRST204 / 42703 — the duplicate-feature migration not
-// yet applied) gets a targeted next-step hint.
-function describeDbError(e) {
-  if (!e) return 'Something went wrong. Please try again.';
+// details, hint, and code — so a create/duplicate/cover/delete failure shows WHY instead of an opaque
+// "[object Object]". A missing-column code (PGRST204 / 42703 — the course-platform migration not yet
+// applied) gets a targeted next-step hint. `fallback` is an operation-specific default message used
+// only when the error carries no usable text.
+function describeDbError(e, fallback) {
+  const generic = fallback || 'Something went wrong. Please try again.';
+  if (!e) return generic;
   const root = e.cause || e;                        // unwrap to the underlying Postgres error
   const code = root.code || e.code;
   const parts = [];
@@ -3756,10 +3778,10 @@ function describeDbError(e) {
   if (root.details && root.details !== root.message) parts.push(root.details);
   if (root.hint) parts.push(`Hint: ${root.hint}`);
   if (code === 'PGRST204' || code === '42703') {
-    parts.push('The course-duplication database migration hasn’t been applied yet — run the SQL in COURSE_SETUP.md (the month / source_course_id columns), then “notify pgrst, \'reload schema\';”.');
+    parts.push('The course database migration hasn’t been applied yet — run the SQL in db/2026-06-17-course-date-source-id.sql (or the migration block in COURSE_SETUP.md, which adds course_date / month / source_course_id / updated_at), then “notify pgrst, \'reload schema\';”.');
   }
   if (code) parts.push(`(code ${code})`);
-  return parts.filter(Boolean).join(' — ') || 'Something went wrong. Please try again.';
+  return parts.filter(Boolean).join(' — ') || generic;
 }
 
 // ── Multi-course catalog (prefix-scoped) ──
@@ -3826,7 +3848,7 @@ function CourseCatalog({
         setCounts(cnt); setDone(dn);
       } else { setCounts({}); setDone({}); }
     } catch (e) {
-      console.error('[CourseCatalog] load failed:', e);
+      logDbError('[CourseCatalog] load', e, { module: prefix });
       const msg = e?.message || '';
       if (e?.code === 'PGRST205' || /schema cache|could not find the table|does not exist/i.test(msg)) {
         setNotConfigured(true); setCourses([]);
@@ -3856,8 +3878,8 @@ function CourseCatalog({
       await loadCatalog();
       setSelectedId(res.data.id);                              // drop the admin straight into the new course (builder)
     } catch (e) {
-      console.error('[CourseCatalog] create failed:', e, e?.cause);
-      setErr(describeDbError(e));
+      logDbError('[CourseCatalog] create', e, { module: prefix });
+      setErr(describeDbError(e, 'Could not create the course.'));
     } finally { setBusy(false); }
   }
 
@@ -3933,10 +3955,10 @@ function CourseCatalog({
       setLastDuplicatedId(newCourseId);
       setSelectedId(newCourseId);
     } catch (e) {
-      console.error('[CourseCatalog] duplicate failed:', e, e?.cause);
+      logDbError('[CourseCatalog] duplicate', e, { module: prefix, sourceId: c.id });
       // Roll back a partially-built copy so we never leave a course without its lessons.
       if (newCourseId) { try { await supabase.from('courses').delete().eq('id', newCourseId); } catch (_) { /* best-effort */ } }
-      setErr(describeDbError(e));
+      setErr(describeDbError(e, 'Could not duplicate the course.'));
     } finally { setBusy(false); }
   }
 
@@ -3956,8 +3978,8 @@ function CourseCatalog({
       if (c.cover_path && c.cover_path !== path) await removeMediaIfUnreferenced([c.cover_path]);
       await loadCatalog();
     } catch (e) {
-      console.error('[CourseCatalog] cover upload failed:', e, e?.cause);
-      setErr(describeDbError(e));
+      logDbError('[CourseCatalog] cover upload', e, { module: prefix, courseId: c.id });
+      setErr(describeDbError(e, 'Could not upload the cover image.'));
     } finally { setBusy(false); }
   }
 
@@ -3990,8 +4012,8 @@ function CourseCatalog({
       if (lastDuplicatedId === c.id) setLastDuplicatedId(null);
       await loadCatalog();
     } catch (e) {
-      console.error('[CourseCatalog] delete failed:', e, e?.cause);
-      setErr(describeDbError(e));
+      logDbError('[CourseCatalog] delete', e, { module: prefix, courseId: c.id });
+      setErr(describeDbError(e, 'Could not delete the course.'));
     } finally { setBusy(false); }
   }
 
@@ -4006,7 +4028,7 @@ function CourseCatalog({
     try {
       await Promise.all(arr.map((c, i) => supabase.from('courses').update({ position: i }).eq('id', c.id)));
       await loadCatalog();
-    } catch (e) { setErr(e.message || 'Could not reorder courses.'); await loadCatalog(); }
+    } catch (e) { logDbError('[CourseCatalog] reorder', e, { module: prefix }); setErr(describeDbError(e, 'Could not reorder courses.')); await loadCatalog(); }
     finally { setBusy(false); }
   }
 
