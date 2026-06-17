@@ -2951,6 +2951,15 @@ function CourseProgram({
   const isComplete = totalLessons > 0 && completedCount === totalLessons;
   const activeLesson = allLessons.find(l => l.id === activeLessonId) || null;
 
+  // Display + certificate metadata. Prefer the loaded course row, fall back to the prop defaults
+  // (which the catalog supplies per-prefix). This keeps a course opened from the Resume/Interview
+  // catalogs from showing the QBO defaults, and names the certificate after the actual course.
+  const displayTitle = course?.title || courseTitle;
+  const displaySubtitle = course?.subtitle || defaultSubtitle;
+  const certName = course?.title
+    ? `${course.title.replace(/[^\w]+/g, '-').replace(/^-+|-+$/g, '')}-Certificate.pdf`
+    : certFileName;
+
   // ── Learner actions ──
   function goAdjacent(lesson, delta) {
     const idx = allLessons.findIndex(l => l.id === lesson.id);
@@ -2991,7 +3000,7 @@ function CourseProgram({
     setCreating(true); setErr('');
     try {
       const { error } = await supabase.from('courses').insert({
-        slug, title: courseTitle, subtitle: defaultSubtitle, published: false,
+        slug, title: displayTitle, subtitle: displaySubtitle, published: false,
         course_date: todayISODate(),
       });
       if (error) throw error;
@@ -3181,7 +3190,7 @@ function CourseProgram({
       const ratio = Math.min(pw / canvas.width, ph / canvas.height);
       const w = canvas.width * ratio, h = canvas.height * ratio;
       pdf.addImage(img, 'PNG', (pw - w) / 2, (ph - h) / 2, w, h);
-      downloadFile(pdf.output('blob'), certFileName, 'application/pdf');
+      downloadFile(pdf.output('blob'), certName, 'application/pdf');
     } catch (e) {
       console.error('[CourseProgram] certificate failed:', e);
       setErr('Certificate download failed: ' + (e.message || 'unknown error'));
@@ -3611,7 +3620,7 @@ function CourseProgram({
       {course && (
         <div className="min-w-0">
           <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg sm:text-xl font-bold leading-tight truncate">{course.title}</div>
-          {(course.subtitle || defaultSubtitle) && <div className="text-xs text-slate-500 truncate">{course.subtitle || defaultSubtitle}</div>}
+          {displaySubtitle && <div className="text-xs text-slate-500 truncate">{displaySubtitle}</div>}
         </div>
       )}
     </div>
@@ -3780,6 +3789,11 @@ function describeDbError(e, fallback) {
   if (code === 'PGRST204' || code === '42703') {
     parts.push('The course database migration hasn’t been applied yet — run the SQL in db/2026-06-17-course-date-source-id.sql (or the migration block in COURSE_SETUP.md, which adds course_date / month / source_course_id / updated_at), then “notify pgrst, \'reload schema\';”.');
   }
+  // Storage upload/playback failure when the bucket was never created (COURSE_SETUP.md Step 2).
+  const hay = [e.message, root.message, root.details, root.hint].filter(Boolean).join(' ');
+  if (/bucket/i.test(hay) && /not found|does not exist/i.test(hay)) {
+    parts.push('The “course-media” storage bucket may be missing — create it as a public bucket and add the storage policies from COURSE_SETUP.md Step 2, then retry.');
+  }
   if (code) parts.push(`(code ${code})`);
   return parts.filter(Boolean).join(' — ') || generic;
 }
@@ -3856,7 +3870,7 @@ function CourseCatalog({
     } finally { setLoading(false); }
   }
 
-  useEffect(() => { if (user?.id) loadCatalog(); /* eslint-disable-next-line */ }, [user?.id]);
+  useEffect(() => { if (user?.id) loadCatalog(); /* eslint-disable-next-line */ }, [user?.id, prefix]);
 
   // ── Admin actions (RLS also enforces is_admin server-side) ──
   async function createCourse() {
@@ -4035,6 +4049,7 @@ function CourseCatalog({
   // ── Open one course in the shared engine (key forces clean state per course) ──
   if (selectedId) {
     return <CourseProgram key={selectedId} courseId={selectedId}
+      eyebrow={eyebrow} courseTitle={title} comingSoonText={comingSoonDesc}
       initialNotice={selectedId === lastDuplicatedId
         ? '✓ Course duplicated as a draft. Edit the title, month, and lessons below, then publish when ready.'
         : null}

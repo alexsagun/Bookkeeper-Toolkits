@@ -242,7 +242,7 @@ const { text, data } = await callClaude({ system, messages }, { returnData: true
   state; never assume success. It returns the joined text content, so no manual `.filter/.map` needed.
 - **Never** put the API key, `x-api-key`, or `anthropic-version` in client code. The proxy adds them.
   - Dev: [vite.config.js](vite.config.js) injects `x-api-key` + `anthropic-version: 2023-06-01`.
-  - Prod: [api/anthropic/[...path].js](api/anthropic/[...path].js) (Vercel serverless) does the same.
+  - Prod: [api/anthropic/v1/messages.js](api/anthropic/v1/messages.js) (Vercel serverless, exact-path) does the same.
 - For JSON responses, tools strip ```` ```json ```` fences before `JSON.parse` (see `BankFeed`, ~L2214).
 - For vision (PDF/image), tools send base64 `image`/`document` blocks in `messages[].content` (see
   `StatementConverter`, ~L2411).
@@ -272,7 +272,7 @@ const { text, data } = await callClaude({ system, messages }, { returnData: true
 ## Deployment
 
 - **Vercel:** push to GitHub → import project → set `ANTHROPIC_API_KEY` (Production + Preview) → deploy.
-  The serverless function at `api/anthropic/[...path].js` replaces the dev proxy automatically.
+  The serverless function at `api/anthropic/v1/messages.js` replaces the dev proxy automatically.
 - **Google Apps Script (alternate):** [standalone/index.html](standalone/index.html) is a self-contained
   build for embedding in Google Sheets.
 - `dist/` is build output and is gitignored — don't edit it by hand.
