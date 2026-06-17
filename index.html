@@ -2,11 +2,12 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Ultimate Remote Bookkeeper Toolkits</title>
-    <!-- Tailwind via CDN: the component uses Tailwind utility classes throughout
-         (matches the standalone GAS build's approach so styling renders identically). -->
-    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Tailwind is compiled through PostCSS now (see tailwind.config.js / postcss.config.js and the
+         `import './index.css'` in src/main.jsx) — no production CDN. The standalone/ GAS build still
+         uses the CDN since it's a single self-contained file. -->
   </head>
   <body>
     <div id="root"></div>

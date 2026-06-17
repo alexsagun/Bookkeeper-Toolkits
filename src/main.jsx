@@ -1,5 +1,6 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
+import './index.css';                 // Tailwind (compiled via PostCSS) — replaces the old CDN <script>
 import BookkeeperProToolkit from './BookkeeperPro.jsx';
 import { AuthProvider } from './auth/AuthProvider.jsx';
 

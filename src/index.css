@@ -1,0 +1,6 @@
+/* Tailwind entry — compiled by PostCSS (replaces the cdn.tailwindcss.com Play CDN that was loaded in
+   index.html). Imported once from src/main.jsx. The app's branded surfaces still use inline-style
+   design tokens + the in-component <style> blocks; this file only supplies the utility layers. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
