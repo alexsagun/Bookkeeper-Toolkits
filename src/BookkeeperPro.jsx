@@ -706,6 +706,25 @@ function downloadFile(content, filename, mimeType) {
   }
 }
 
+// ── Date helpers (timezone-safe, date-only) ──────────────────────────
+// Used by the course platform for the editable cohort/run date (`courses.course_date`).
+// We deliberately avoid `new Date('2026-06-17')` (parsed as UTC midnight → shifts a day in
+// negative offsets) and `toISOString().slice(0,10)` for "today" (UTC date) — both stay LOCAL
+// so the date a creator picks is always the date that displays back.
+function todayISODate() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+// Format a YYYY-MM-DD string with no timezone drift (parse the parts, build a LOCAL date).
+function formatCourseDate(iso, opts) {
+  if (!iso) return '';
+  const [y, m, d] = String(iso).split('-').map(Number);
+  if (!y || !m || !d) return '';
+  return new Date(y, m - 1, d).toLocaleDateString('en-US', opts || { month: 'long', day: 'numeric', year: 'numeric' });
+}
+// Auto-derived "June 2026" cohort label from a YYYY-MM-DD course date.
+const cohortLabel = (iso) => formatCourseDate(iso, { month: 'long', year: 'numeric' });
+
 
 // ═══════════════════════════════════════════════════════════════════
 // SHARED HOOK: CURRENCY TOGGLE (USD ↔ PHP)
@@ -2837,7 +2856,7 @@ function CourseProgram({
   const showHead = !embedded && !onBack;                 // the catalog/suite supplies its own header instead
 
   const [course, setCourse] = useState(null);
-  const [courseDraft, setCourseDraft] = useState({ title: '', subtitle: '', description: '', month: '' });
+  const [courseDraft, setCourseDraft] = useState({ title: '', subtitle: '', description: '', month: '', course_date: '' });
   const [notice, setNotice] = useState(initialNotice);   // dismissible green banner shown once on arrival
   const [modules, setModules] = useState([]);            // [{ ...module, lessons: [...] }]
   const [doneIds, setDoneIds] = useState(new Set());
@@ -2878,6 +2897,7 @@ function CourseProgram({
       setCourseDraft({
         title: courseRow.title || '', subtitle: courseRow.subtitle || '',
         description: courseRow.description || '', month: courseRow.month || '',
+        course_date: courseRow.course_date || '',
       });
 
       const [{ data: mods, error: mErr }, { data: lessons, error: lErr }] = await Promise.all([
@@ -2972,6 +2992,7 @@ function CourseProgram({
     try {
       const { error } = await supabase.from('courses').insert({
         slug, title: courseTitle, subtitle: defaultSubtitle, published: false,
+        course_date: todayISODate(),
       });
       if (error) throw error;
       await load();
@@ -2988,7 +3009,7 @@ function CourseProgram({
     try {
       const { error } = await supabase.from('courses').update({
         title: courseDraft.title, subtitle: courseDraft.subtitle,
-        description: courseDraft.description, month: (courseDraft.month || '').trim() || null,
+        description: courseDraft.description, course_date: courseDraft.course_date || null,
         updated_at: new Date().toISOString(),
       }).eq('id', course.id);
       if (error) throw error;
@@ -3361,10 +3382,18 @@ function CourseProgram({
                 className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
             </label>
             <label className="block sm:col-span-2">
-              <span className="text-xs font-semibold text-slate-500 inline-flex items-center gap-1.5"><CalendarClock size={13} /> Month / cohort <span className="font-normal text-slate-400">· optional, e.g. for monthly re-runs</span></span>
-              <input value={courseDraft.month} onChange={e => setCourseDraft(d => ({ ...d, month: e.target.value }))}
-                placeholder="e.g. June 2026"
-                className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+              <span className="text-xs font-semibold text-slate-500 inline-flex items-center gap-1.5"><CalendarClock size={13} /> Course Date / Cohort Date</span>
+              <div className="mt-1 flex flex-wrap items-center gap-2">
+                <input type="date" value={courseDraft.course_date || ''}
+                  onChange={e => setCourseDraft(d => ({ ...d, course_date: e.target.value }))}
+                  className="px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+                <button type="button" onClick={() => setCourseDraft(d => ({ ...d, course_date: todayISODate() }))}
+                  className="px-3 py-2 rounded-lg border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-50">Today</button>
+                {courseDraft.course_date
+                  ? <span className="text-xs font-semibold px-2 py-1 rounded-full" style={{ background: '#EFF6FF', color: ROYAL }}>Cohort: {cohortLabel(courseDraft.course_date)}</span>
+                  : course.month ? <span className="text-xs text-slate-400">Legacy label: {course.month}</span> : null}
+              </div>
+              <span className="block mt-1 text-[11px] text-slate-400">Defaults to today. Update this for monthly cohorts or future course runs.</span>
             </label>
             <label className="block sm:col-span-2">
               <span className="text-xs font-semibold text-slate-500">Description</span>
@@ -3818,10 +3847,10 @@ function CourseCatalog({
       let slug = base, n = 2;
       while (existing.has(slug)) slug = `${base}-${n++}`;
       const position = courses.length ? Math.max(...courses.map(c => c.position ?? 0)) + 1 : 0;
-      let res = await supabase.from('courses').insert({ slug, title, subtitle: '', published: false, position }).select('*').single();
+      let res = await supabase.from('courses').insert({ slug, title, subtitle: '', published: false, position, course_date: todayISODate() }).select('*').single();
       if (res.error && res.error.code === '23505') {           // slug collision race — retry once with a unique suffix
         slug = `${base}-${Date.now().toString(36).slice(-4)}`;
-        res = await supabase.from('courses').insert({ slug, title, subtitle: '', published: false, position }).select('*').single();
+        res = await supabase.from('courses').insert({ slug, title, subtitle: '', published: false, position, course_date: todayISODate() }).select('*').single();
       }
       if (res.error) throw res.error;
       await loadCatalog();
@@ -3862,7 +3891,7 @@ function CourseCatalog({
       const coursePayload = {
         slug, title: newTitle,
         subtitle: src.subtitle ?? '', description: src.description ?? null,
-        month: src.month ?? null, cover_path: src.cover_path ?? null,
+        course_date: todayISODate(), cover_path: src.cover_path ?? null,  // default the cohort date to today, not the source's (avoids a June re-run inheriting May)
         source_course_id: src.id, published: false, position,
       };
       let res = await supabase.from('courses').insert(coursePayload).select('*').single();
@@ -4099,7 +4128,7 @@ function CourseCatalog({
 
                 <div className="p-4 flex-1 flex flex-col">
                   <button onClick={() => openCourse(c.id)} className="text-left flex-1">
-                    {c.month && <div className="mb-1.5 inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full" style={{ background: '#EFF6FF', color: ROYAL }}><CalendarClock size={11} /> {c.month}</div>}
+                    {(c.course_date || c.month) && <div className="mb-1.5 inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full" style={{ background: '#EFF6FF', color: ROYAL }}><CalendarClock size={11} /> {c.course_date ? cohortLabel(c.course_date) : c.month}</div>}
                     <div style={{ fontFamily: fontDisplay, color: NAVY }} className="font-bold text-[15px] leading-tight">{c.title}</div>
                     {c.subtitle && <div className="text-xs text-slate-500 mt-1 line-clamp-2">{c.subtitle}</div>}
                   </button>

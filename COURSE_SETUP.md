@@ -37,9 +37,10 @@ by Row Level Security, not just the UI).
 > **Duplicate course (monthly re-runs).** **⋮ → Duplicate course** clones a course's structure +
 > lessons into a **new independent DRAFT** ("Copy of …"), reusing the original's video links/uploads
 > and cover **by reference** (no files are copied — copy-on-write), and stamping `source_course_id`
-> for lineage. Per-user data (progress, completions, certificates) is **not** copied. The copy opens
-> straight in the builder so you can rename it, set the **Month** field (e.g. May → June), tweak
-> lessons, and publish. Because videos are shared until you change them, **storage deletes are
+> for lineage. Per-user data (progress, completions, certificates) is **not** copied. The duplicate's
+> **Course Date / Cohort Date** defaults to **today** (it is not copied from the source), so a new
+> monthly re-run never inherits last month's date. The copy opens straight in the builder so you can
+> rename it, adjust the course date if needed, tweak lessons, and publish. Because videos are shared until you change them, **storage deletes are
 > reference-aware**: replacing/deleting a lesson video or deleting a whole course only removes a file
 > when **no other course still references it**, so deleting one monthly edition never breaks another.
 >
@@ -100,18 +101,24 @@ create table if not exists public.courses (
   subtitle    text,
   description text,
   cover_path  text,
-  month       text,                                                  -- optional label for monthly re-runs (e.g. "June 2026")
+  month       text,                                                  -- LEGACY free-text cohort label (e.g. "June 2026"); kept as a display fallback only
+  course_date date,                                                  -- editable cohort/run date chosen by the creator (defaults to today; YYYY-MM-DD, timezone-safe). Card shows an auto-derived "Month Year" label.
   source_course_id uuid references public.courses(id) on delete set null, -- set when a course was duplicated from another (lineage)
   published   boolean not null default false,
   position    integer not null default 0,
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
--- For projects created before the duplicate-course feature: add the two columns if missing (idempotent).
-alter table public.courses add column if not exists month text;
+-- For projects created before the duplicate-course feature: add the columns if missing (idempotent).
+alter table public.courses add column if not exists month text;        -- legacy cohort label (display fallback only)
+alter table public.courses add column if not exists course_date date;  -- structured editable cohort/run date (defaults to today)
 alter table public.courses add column if not exists source_course_id uuid
   references public.courses(id) on delete set null;
 notify pgrst, 'reload schema';  -- make PostgREST pick up the new columns immediately (avoids the 400 below)
+-- Note: `course_date` (date-only, YYYY-MM-DD) is the structured cohort date the creator picks; it defaults
+-- to today on create/duplicate and renders as an auto-derived "Month Year" badge. The older `month` text
+-- column is retained ONLY as a display fallback for legacy rows that have no course_date — no backfill is
+-- run, so existing month labels keep showing until an admin opens the course and saves a date.
 
 create table if not exists public.course_modules (
   id         uuid primary key default gen_random_uuid(),

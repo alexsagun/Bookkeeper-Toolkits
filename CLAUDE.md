@@ -89,8 +89,12 @@ progress live in Supabase so they reach **all** students across devices. Two pie
   auto-slug, and isolation between catalogs), **`embedded`** (drop the page `SectionHead` when nested
   in a subtab), and copy props `eyebrow` / `title` / `adminDesc` / `studentDesc` / `newCourseTitle` /
   `comingSoonDesc`. Each prefix is its own namespace, so catalogs never see each other's courses.
-  Catalogs reuse the `courses.slug` prefix + the `cover_path` / `position` / **`month`** /
-  **`source_course_id`** columns (the last two were added for duplication — see COURSE_SETUP.md).
+  Catalogs reuse the `courses.slug` prefix + the `cover_path` / `position` / **`course_date`** /
+  **`source_course_id`** columns (the last added for duplication — see COURSE_SETUP.md). **`course_date`**
+  is a date-only (`YYYY-MM-DD`) editable cohort/run date that **defaults to today** on create/duplicate;
+  the card renders an **auto-derived "Month Year" badge** from it via the `cohortLabel()` helper. The
+  older `month` text column is retained **only as a display fallback** for legacy rows with no
+  `course_date` (no backfill is run).
 
 Wrappers:
 - `QBOMastery()` — the `qbomastery` tab (Training & Skills) → **`<CourseCatalog />`** (defaults →
@@ -108,7 +112,7 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
 `<CourseCatalog prefix="…" …/>` with its own prefix + copy and wire the nav sync points. To add a
 *single-course* tab, write a `CourseProgram` wrapper with its own `slug` + labels.
 
-- **Tables:** `courses` (incl. `month` label + `source_course_id` lineage for duplicates) →
+- **Tables:** `courses` (incl. `course_date` editable cohort date + legacy `month` label fallback + `source_course_id` lineage for duplicates) →
   `course_modules` → `course_lessons` (`type` video/text, link or uploaded video), `lesson_progress`
   (per-user completion), `course_completions` (stamps the certificate date). All keyed by `course_id`,
   so one schema serves every course.
@@ -122,8 +126,10 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
   modules + lessons into a new **draft** "Copy of …" (3 inserts via client-generated module UUIDs;
   rollback-deletes the new course if any child insert fails), **reusing** the original's
   `video_url`/`storage_path`/`cover_path` by reference (copy-on-write — no files copied) and setting
-  `source_course_id`. Per-user `lesson_progress`/`course_completions` are **not** copied. It then opens
-  the copy in the builder with a one-time success banner (`CourseProgram`'s `initialNotice` prop).
+  `source_course_id`. The duplicate's `course_date` **defaults to today** (it is *not* copied from the
+  source — so a new monthly re-run never inherits last month's date). Per-user
+  `lesson_progress`/`course_completions` are **not** copied. It then opens the copy in the builder with
+  a one-time success banner (`CourseProgram`'s `initialNotice` prop).
 - **In-app delete = data cleanup (reference-aware):** `CourseCatalog.deleteCourse()` deletes the row
   (FK cascade clears modules/lessons/progress/completions) then calls the module-level
   `removeMediaIfUnreferenced()` to purge the course's storage files **only when no other course still
