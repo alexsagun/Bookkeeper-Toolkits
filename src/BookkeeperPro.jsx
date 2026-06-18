@@ -1291,10 +1291,10 @@ export default function BookkeeperProToolkit() {
       number: '02',
       desc: 'Land US clients',
       groups: [
-        { label: 'Self Discovery',          tabIds: ['brand'] },
-        { label: 'Profile Optimization',    tabIds: ['resumestrategy', 'linkedinopt'] },
-        { label: 'Interview',               tabIds: ['coachalex', 'interview', 'mockinterview', 'qbdiag'] },
-        { label: 'Proposal / Cover Letters', tabIds: ['painpoints', 'proposal'] },
+        { key: 'self-discovery', label: 'Self Discovery',          tabIds: ['brand'] },
+        { key: 'profile-opt',    label: 'Profile Optimization',    tabIds: ['resumestrategy', 'linkedinopt'] },
+        { key: 'interview',      label: 'Interview',               tabIds: ['coachalex', 'interview', 'mockinterview', 'qbdiag'] },
+        { key: 'proposal',       label: 'Proposal / Cover Letters', tabIds: ['painpoints', 'proposal'] },
       ],
       tabs: [
         // Self Discovery
@@ -1318,10 +1318,10 @@ export default function BookkeeperProToolkit() {
       number: '03',
       desc: 'Onboard · operate · close the year',
       groups: [
-        { label: 'Client Onboarding',  tabIds: ['engagement', 'onboarding', 'coa', 'invoice'] },
-        { label: 'Daily Tasks',        tabIds: ['cpaai', 'bankfeed', 'converter', 'emails', 'calculators'] },
-        { label: 'Monthly Tasks',      tabIds: ['workflow', 'monthend', 'sopgen', 'salestax', 'budgeting', 'forecasting'] },
-        { label: 'Year-End Tasks',     tabIds: ['yearendcheck', 'form1099'] },
+        { key: 'onboarding',  label: 'Client Onboarding',  tabIds: ['engagement', 'onboarding', 'coa', 'invoice'] },
+        { key: 'daily',       label: 'Daily Tasks',        tabIds: ['cpaai', 'bankfeed', 'converter', 'emails', 'calculators'] },
+        { key: 'monthly',     label: 'Monthly Tasks',      tabIds: ['workflow', 'monthend', 'sopgen', 'salestax', 'budgeting', 'forecasting'] },
+        { key: 'yearend',     label: 'Year-End Tasks',     tabIds: ['yearendcheck', 'form1099'] },
       ],
       tabs: [
         // Client Onboarding
@@ -1349,9 +1349,27 @@ export default function BookkeeperProToolkit() {
     },
   ];
 
+  // Stable, label-independent keys for the global (admin-controlled) label overrides stored in
+  // Supabase `sidebar_settings`. Renaming a label only changes its display text — never the id,
+  // route, or grouping — because everything keys off these, not the visible label.
+  const stageItemKey = (stageId) => `stage:${stageId}`;
+  const tabItemKey   = (tabId)   => `tab:${tabId}`;
+  const groupItemKey = (stageId, gKey) => `group:${stageId}:${gKey}`;
+
+  // Code-default label for every navigation item, keyed by item_key. This is the fallback when no
+  // admin override exists — and the single source of truth, so a stale per-user localStorage label
+  // can never shadow the global value.
+  const defaultLabelByKey = {};
+  DEFAULT_STAGES.forEach(s => {
+    defaultLabelByKey[stageItemKey(s.id)] = s.label;
+    s.tabs.forEach(t => { defaultLabelByKey[tabItemKey(t.id)] = t.label; });
+    (s.groups || []).forEach(g => { defaultLabelByKey[groupItemKey(s.id, g.key)] = g.label; });
+  });
+
   // ─────────────────────────────────────────────────────────────
-  // SIDEBAR STATE: stages (renamable/reorderable), collapsed, edit mode
-  // Lazy-init from window.storage so customizations persist across sessions.
+  // SIDEBAR STATE: stages (reorderable), collapsed, edit mode.
+  // Order + collapse persist per-user via window.storage; LABELS are global and
+  // admin-controlled via Supabase `sidebar_settings` (see labelByKey/draftLabels below).
   // ─────────────────────────────────────────────────────────────
   const [stages, setStages] = useState(DEFAULT_STAGES);
   const [collapsedStages, setCollapsedStages] = useState(new Set());
@@ -1359,7 +1377,19 @@ export default function BookkeeperProToolkit() {
   const [editMode, setEditMode] = useState(false);
   const [editingTabId, setEditingTabId] = useState(null);
   const [editingStageId, setEditingStageId] = useState(null);
+  const [editingGroupKey, setEditingGroupKey] = useState(null);
   const [storageReady, setStorageReady] = useState(false);
+
+  // Global label overrides: { item_key: custom_label } loaded from Supabase (every user reads
+  // them, so the whole app shows the admin's labels). `draftLabels` holds an admin's in-progress
+  // edits (local only) until "Done" upserts them. Effective label = draft ?? global ?? code default.
+  const isAdmin = !!profile?.is_admin;
+  const [labelByKey, setLabelByKey] = useState({});
+  const [draftLabels, setDraftLabels] = useState({});
+  const [savingLabels, setSavingLabels] = useState(false);
+  const [labelsErr, setLabelsErr] = useState('');
+  const [labelsNotice, setLabelsNotice] = useState('');
+  const effLabel = (key, fallback) => draftLabels[key] ?? labelByKey[key] ?? defaultLabelByKey[key] ?? fallback;
 
   // Helper: serialize stages without icons (icons are components, not serializable)
   const stagesToStorable = (stgs) => stgs.map(s => ({
@@ -1539,10 +1569,11 @@ export default function BookkeeperProToolkit() {
     });
   };
 
-  // Toggle a sub-group open/closed (key format: `${stageId}:${groupLabel}`)
+  // Toggle a sub-group open/closed (expandedGroups key format: `${stageId}:${group.key}` — keyed off
+  // the STABLE group key, not the label, so collapse-state survives an admin renaming the group).
   // Default behavior: groups are COLLAPSED until expanded. Sets contain expanded groups.
-  const toggleGroup = (stageId, groupLabel) => {
-    const key = `${stageId}:${groupLabel}`;
+  const toggleGroup = (stageId, gKey) => {
+    const key = `${stageId}:${gKey}`;
     setExpandedGroups(prev => {
       const next = new Set(prev);
       next.has(key) ? next.delete(key) : next.add(key);
@@ -1558,7 +1589,7 @@ export default function BookkeeperProToolkit() {
       if (!stage.groups || !Array.isArray(stage.groups)) continue;
       for (const g of stage.groups) {
         if (g.tabIds && g.tabIds.includes(tab)) {
-          const key = `${stage.id}:${g.label}`;
+          const key = `${stage.id}:${g.key}`;
           setExpandedGroups(prev => {
             if (prev.has(key)) return prev;
             const next = new Set(prev);
@@ -1571,27 +1602,128 @@ export default function BookkeeperProToolkit() {
     }
   }, [tab, stages]);
 
-  // Rename a tab
-  const renameTab = (stageId, tabId, newLabel) => {
-    if (!newLabel.trim()) return;
-    setStages(prev => prev.map(s => s.id !== stageId ? s : {
-      ...s,
-      tabs: s.tabs.map(t => t.id === tabId ? { ...t, label: newLabel.trim() } : t),
-    }));
+  // ── Global, admin-controlled sidebar labels (Supabase `sidebar_settings`) ──
+  // Renames are staged locally in `draftLabels` (Enter/blur confirms a field) and only persisted
+  // to Supabase on "Done", so editing several labels makes one batched write, not one per keystroke.
+
+  // Stage a label edit locally (no DB write yet). Empty input is ignored.
+  const stageDraft = (itemKey, newLabel) => {
+    const trimmed = (newLabel || '').trim();
+    if (!trimmed) return;
+    setDraftLabels(prev => ({ ...prev, [itemKey]: trimmed }));
+  };
+  const renameTab   = (tabId, newLabel)            => stageDraft(tabItemKey(tabId), newLabel);
+  const renameStage = (stageId, newLabel)          => stageDraft(stageItemKey(stageId), newLabel);
+  const renameGroup = (stageId, gKey, newLabel)    => stageDraft(groupItemKey(stageId, gKey), newLabel);
+
+  // Fetch all global label overrides. Runs for EVERY signed-in user so the whole app shows the
+  // admin's labels. Falls back to code defaults (never throws) if the table is missing or the read
+  // fails — the sidebar always renders.
+  const fetchSidebarLabels = async () => {
+    try {
+      const { data, error } = await supabase.from('sidebar_settings').select('item_key, custom_label');
+      if (error) throw error;
+      const map = {};
+      (data || []).forEach(r => { if (r && r.item_key) map[r.item_key] = r.custom_label; });
+      setLabelByKey(map);
+      return true;
+    } catch (e) {
+      logDbError('[sidebar] load labels', e, {});
+      const msg = e?.message || '';
+      // Missing-table is an expected "not set up yet" state — quietly fall back to defaults.
+      if (!(e?.code === 'PGRST205' || /schema cache|could not find the table|does not exist/i.test(msg))) {
+        // A real read failure: surface it to the admin only (students just see defaults).
+        if (isAdmin) setLabelsErr('Sidebar settings could not be loaded. Showing default labels.');
+      }
+      return false;
+    }
   };
 
-  // Rename a stage
-  const renameStage = (stageId, newLabel) => {
-    if (!newLabel.trim()) return;
-    setStages(prev => prev.map(s => s.id === stageId ? { ...s, label: newLabel.trim() } : s));
+  // Load global labels on mount (and whenever the signed-in user changes).
+  useEffect(() => {
+    if (!user) return;
+    fetchSidebarLabels();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
+
+  // "Done": persist every staged label edit, then refetch from the saved source. Stays in edit mode
+  // on failure with the typed edits intact, so a failed save never silently looks successful.
+  const saveSidebarLabels = async () => {
+    setLabelsErr(''); setLabelsNotice('');
+    // Diff drafts against what's already effective; an edit back to the code default DELETES its row.
+    const upserts = [];
+    const deletes = [];
+    Object.entries(draftLabels).forEach(([key, label]) => {
+      const current = labelByKey[key] ?? defaultLabelByKey[key];
+      if (label === current) return;                       // no real change
+      if (label === defaultLabelByKey[key]) deletes.push(key);
+      else upserts.push({ item_key: key, custom_label: label, updated_by: user?.id || null, updated_at: new Date().toISOString() });
+    });
+    if (upserts.length === 0 && deletes.length === 0) {     // nothing changed — just exit
+      setDraftLabels({}); setEditMode(false); setEditingTabId(null); setEditingStageId(null); setEditingGroupKey(null);
+      return;
+    }
+    setSavingLabels(true);
+    try {
+      if (upserts.length) {
+        const { error } = await supabase.from('sidebar_settings').upsert(upserts, { onConflict: 'item_key' });
+        if (error) throw error;
+      }
+      if (deletes.length) {
+        const { error } = await supabase.from('sidebar_settings').delete().in('item_key', deletes);
+        if (error) throw error;
+      }
+      await fetchSidebarLabels();                           // re-read the saved source of truth
+      setDraftLabels({});
+      setEditingTabId(null); setEditingStageId(null); setEditingGroupKey(null);
+      setEditMode(false);
+      setLabelsNotice('Sidebar labels saved.');
+    } catch (e) {
+      logDbError('[sidebar] save labels', e, { userId: user?.id, isAdmin, keys: [...upserts.map(u => u.item_key), ...deletes] });
+      const permission = e?.code === '42501' || /row-level security|permission/i.test(e?.message || '');
+      setLabelsErr(permission
+        ? 'You do not have permission to customize navigation.'
+        : describeDbError(e, 'Could not save sidebar changes. Please try again.'));
+      // Stay in edit mode; keep draftLabels so the admin doesn't lose their edits.
+    } finally {
+      setSavingLabels(false);
+    }
   };
 
-  // Reset all customizations
-  const resetSidebar = () => {
-    if (typeof window !== 'undefined' && window.confirm && !window.confirm('Reset sidebar to defaults? Your custom labels and order will be lost.')) return;
-    setStages(DEFAULT_STAGES);
-    setCollapsedStages(new Set());
+  // Enter customize mode (admin only): clear any stale drafts/messages.
+  const enterCustomize = () => {
+    setDraftLabels({}); setLabelsErr(''); setLabelsNotice('');
+    setEditingTabId(null); setEditingStageId(null); setEditingGroupKey(null);
+    setEditMode(true);
+  };
+
+  // "Cancel": discard unsaved edits and leave edit mode (last-saved labels restored).
+  const cancelSidebarEdit = () => {
+    setDraftLabels({}); setLabelsErr('');
+    setEditingTabId(null); setEditingStageId(null); setEditingGroupKey(null);
     setEditMode(false);
+  };
+
+  // "Reset to default": remove ALL overrides globally (labels revert to code defaults for everyone).
+  const resetSidebarLabels = async () => {
+    if (typeof window !== 'undefined' && window.confirm &&
+        !window.confirm('Reset all sidebar labels to their defaults for everyone? This cannot be undone.')) return;
+    setLabelsErr(''); setLabelsNotice(''); setSavingLabels(true);
+    try {
+      const { error } = await supabase.from('sidebar_settings').delete().neq('item_key', '');
+      if (error) throw error;
+      await fetchSidebarLabels();
+      setDraftLabels({});
+      setLabelsNotice('Sidebar labels reset to defaults.');
+    } catch (e) {
+      logDbError('[sidebar] reset labels', e, { userId: user?.id, isAdmin });
+      const permission = e?.code === '42501' || /row-level security|permission/i.test(e?.message || '');
+      setLabelsErr(permission
+        ? 'You do not have permission to customize navigation.'
+        : describeDbError(e, 'Could not reset sidebar labels. Please try again.'));
+    } finally {
+      setSavingLabels(false);
+    }
   };
 
   // ─── Drag and drop handlers (tab within a stage, or stage reorder) ──
@@ -2066,29 +2198,55 @@ export default function BookkeeperProToolkit() {
             </div>
           )}
 
-          {/* Edit-mode toggle */}
-          <div className="mt-4 flex items-center gap-2">
-            <button onClick={() => { setEditMode(!editMode); setEditingTabId(null); setEditingStageId(null); }}
-              className={`flex-1 px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5 ${editMode ? 'text-white' : ''}`}
-              style={editMode
-                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px ${C.primary}55` }
-                : { background: 'rgba(15,18,23,0.04)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}` }
-              }>
-              <Edit3 size={11} />
-              {editMode ? 'Done' : 'Customize'}
-            </button>
-            {editMode && (
-              <button onClick={resetSidebar}
-                title="Reset to defaults"
-                className="px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition"
-                style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: `1px solid rgba(208,35,35,0.15)` }}>
-                Reset
-              </button>
-            )}
-          </div>
-          {editMode && (
-            <div className="mt-2 text-[10px] leading-relaxed" style={{ color: C.textMute }}>
-              Click any label to rename · Drag handle to reorder · Click stage to collapse
+          {/* Customize sidebar — admin only. Renames persist globally (Supabase) on "Done". */}
+          {isAdmin && (
+            <div className="mt-4">
+              {!editMode ? (
+                <button onClick={enterCustomize}
+                  className="w-full px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5"
+                  style={{ background: 'rgba(15,18,23,0.04)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}` }}>
+                  <Edit3 size={11} />
+                  Customize
+                </button>
+              ) : (
+                <>
+                  <div className="flex items-center gap-2">
+                    <button onClick={saveSidebarLabels} disabled={savingLabels}
+                      className="flex-1 px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5 text-white"
+                      style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px ${C.primary}55`, opacity: savingLabels ? 0.65 : 1, cursor: savingLabels ? 'default' : 'pointer' }}>
+                      {savingLabels ? <Loader2 size={11} className="animate-spin" /> : <Check size={11} />}
+                      {savingLabels ? 'Saving…' : 'Done'}
+                    </button>
+                    <button onClick={cancelSidebarEdit} disabled={savingLabels}
+                      title="Discard unsaved changes"
+                      className="px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition"
+                      style={{ background: 'rgba(15,18,23,0.04)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}`, opacity: savingLabels ? 0.65 : 1 }}>
+                      Cancel
+                    </button>
+                    <button onClick={resetSidebarLabels} disabled={savingLabels}
+                      title="Reset all labels to defaults (everyone)"
+                      className="px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition"
+                      style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: `1px solid rgba(208,35,35,0.15)`, opacity: savingLabels ? 0.65 : 1 }}>
+                      Reset
+                    </button>
+                  </div>
+                  <div className="mt-2 text-[10px] leading-relaxed" style={{ color: C.textMute }}>
+                    Click any label to rename · Press Enter to confirm a field · Done saves for everyone
+                  </div>
+                </>
+              )}
+              {labelsErr && (
+                <div className="mt-2 text-[10px] leading-relaxed flex items-start gap-1.5" style={{ color: C.red }}>
+                  <AlertCircle size={11} className="flex-shrink-0 mt-px" />
+                  <span>{labelsErr}</span>
+                </div>
+              )}
+              {labelsNotice && !labelsErr && (
+                <div className="mt-2 text-[10px] leading-relaxed flex items-start gap-1.5" style={{ color: C.primary }}>
+                  <CheckCircle2 size={11} className="flex-shrink-0 mt-px" />
+                  <span>{labelsNotice}</span>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -2133,7 +2291,7 @@ export default function BookkeeperProToolkit() {
                         {editMode && editingStageId === stage.id ? (
                           <input
                             autoFocus
-                            defaultValue={stage.label}
+                            defaultValue={effLabel(stageItemKey(stage.id), stage.label)}
                             onBlur={(e) => { renameStage(stage.id, e.target.value); setEditingStageId(null); }}
                             onKeyDown={(e) => {
                               if (e.key === 'Enter') { renameStage(stage.id, e.target.value); setEditingStageId(null); }
@@ -2149,7 +2307,7 @@ export default function BookkeeperProToolkit() {
                             style={{ color: containsActive ? C.text : C.textSoft }}
                             onClick={editMode ? (e) => { e.stopPropagation(); setEditingStageId(stage.id); } : undefined}
                             title={editMode ? 'Click to rename' : ''}>
-                            {stage.label}
+                            {effLabel(stageItemKey(stage.id), stage.label)}
                           </div>
                         )}
                         {!isCollapsed && <div className="text-[10px] leading-tight mt-0.5" style={{ color: C.textMute }}>{stage.desc}</div>}
@@ -2168,6 +2326,7 @@ export default function BookkeeperProToolkit() {
                     const Icon = t.icon;
                     const active = tab === t.id;
                     const isEditingThis = editMode && editingTabId === t.id;
+                    const tLabel = effLabel(tabItemKey(t.id), t.label);
                     return (
                       <div key={t.id}
                         draggable={editMode}
@@ -2183,10 +2342,10 @@ export default function BookkeeperProToolkit() {
                             <Icon size={16} style={{ color: C.primary }} />
                             <input
                               autoFocus
-                              defaultValue={t.label}
-                              onBlur={(e) => { renameTab(stage.id, t.id, e.target.value); setEditingTabId(null); }}
+                              defaultValue={tLabel}
+                              onBlur={(e) => { renameTab(t.id, e.target.value); setEditingTabId(null); }}
                               onKeyDown={(e) => {
-                                if (e.key === 'Enter') { renameTab(stage.id, t.id, e.target.value); setEditingTabId(null); }
+                                if (e.key === 'Enter') { renameTab(t.id, e.target.value); setEditingTabId(null); }
                                 if (e.key === 'Escape') { setEditingTabId(null); }
                               }}
                               className="gh-input flex-1"
@@ -2206,7 +2365,7 @@ export default function BookkeeperProToolkit() {
                             onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}
                             title={editMode ? 'Click to rename' : ''}>
                             <Icon size={15} style={{ color: active ? C.primary : C.textMute, flexShrink: 0 }} />
-                            <span className="flex-1 truncate">{t.label}</span>
+                            <span className="flex-1 truncate">{tLabel}</span>
                             {editMode && <Edit3 size={11} style={{ color: C.textMute }} className="opacity-0 group-hover:opacity-100 transition" />}
                           </button>
                         )}
@@ -2214,60 +2373,86 @@ export default function BookkeeperProToolkit() {
                     );
                   };
 
-                  // Grouped rendering (e.g., Client Management & Delivery with 4 sub-groups)
-                  if (stage.groups && Array.isArray(stage.groups) && stage.groups.length > 0 && !editMode) {
+                  // Grouped rendering (e.g., Client Management & Delivery with sub-groups). In edit
+                  // mode we still show the group headers — now editable — with every tab expanded,
+                  // so an admin can rename the group sub-headers too (keyed off the stable group key).
+                  if (stage.groups && Array.isArray(stage.groups) && stage.groups.length > 0) {
                     const tabById = {};
                     stage.tabs.forEach(t => { tabById[t.id] = t; });
                     return stage.groups.map((g, gi) => {
                       const groupTabs = g.tabIds.map(id => tabById[id]).filter(Boolean);
                       if (groupTabs.length === 0) return null;
-                      const groupKey = `${stage.id}:${g.label}`;
+                      const gItemKey = groupItemKey(stage.id, g.key);
+                      const gLabel = effLabel(gItemKey, g.label);
                       const containsActiveTab = groupTabs.some(t => t.id === tab);
-                      // Group is expanded only if user explicitly expanded it. Auto-expand on tab change is handled by a useEffect.
-                      const isGroupExpanded = expandedGroups.has(groupKey);
+                      // Always expanded in edit mode (admin sees every tab); else honor the user's toggle.
+                      const isGroupExpanded = editMode || expandedGroups.has(`${stage.id}:${g.key}`);
+                      const isEditingThisGroup = editMode && editingGroupKey === gItemKey;
                       return (
                         <React.Fragment key={`grp-${gi}`}>
-                          <button
-                            onClick={() => toggleGroup(stage.id, g.label)}
-                            className={`w-full ${hasNumber ? 'pl-9 pr-6' : 'pl-3 pr-3'} ${gi === 0 ? 'mt-1' : 'mt-3'} mb-1 flex items-center gap-2 group rounded-md py-1 transition`}
-                            style={{ cursor: 'pointer' }}
-                            onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(15,18,23,0.02)'; }}
-                            onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
-                            title={isGroupExpanded ? 'Hide tools' : `Show ${groupTabs.length} tools`}>
-                            <ChevronDown
-                              size={10}
-                              style={{ color: containsActiveTab ? C.primary : C.textMute }}
-                              className={`flex-shrink-0 transition-transform ${isGroupExpanded ? '' : '-rotate-90'}`}
-                            />
-                            <span
-                              className="text-[10px] uppercase tracking-[0.12em] font-bold"
-                              style={{
-                                color: containsActiveTab ? C.primary : C.textMute,
-                                letterSpacing: '0.12em',
-                              }}>
-                              {g.label}
-                            </span>
-                            <span className="flex-1 h-px" style={{ background: GLASS.borderSoft }} />
-                            <span
-                              className="text-[9px] font-bold px-1.5 rounded gh-tnum"
-                              style={{
-                                color: containsActiveTab ? C.primary : C.textMute,
-                                background: containsActiveTab ? 'rgba(10,132,255,0.08)' : 'rgba(15,18,23,0.04)',
-                                fontFamily: fontMono,
-                                minWidth: 18,
-                                textAlign: 'center',
-                                lineHeight: '14px',
-                              }}>
-                              {groupTabs.length}
-                            </span>
-                          </button>
+                          {isEditingThisGroup ? (
+                            <div className={`w-full ${hasNumber ? 'pl-9 pr-6' : 'pl-3 pr-3'} ${gi === 0 ? 'mt-1' : 'mt-3'} mb-1`}>
+                              <input
+                                autoFocus
+                                defaultValue={gLabel}
+                                onBlur={(e) => { renameGroup(stage.id, g.key, e.target.value); setEditingGroupKey(null); }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') { renameGroup(stage.id, g.key, e.target.value); setEditingGroupKey(null); }
+                                  if (e.key === 'Escape') { setEditingGroupKey(null); }
+                                }}
+                                className="gh-input w-full"
+                                style={{ fontSize: 10, padding: '4px 8px', textTransform: 'uppercase', letterSpacing: '0.12em' }}
+                              />
+                            </div>
+                          ) : (
+                            <button
+                              onClick={() => editMode ? setEditingGroupKey(gItemKey) : toggleGroup(stage.id, g.key)}
+                              className={`w-full ${hasNumber ? 'pl-9 pr-6' : 'pl-3 pr-3'} ${gi === 0 ? 'mt-1' : 'mt-3'} mb-1 flex items-center gap-2 group rounded-md py-1 transition`}
+                              style={{ cursor: 'pointer' }}
+                              onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(15,18,23,0.02)'; }}
+                              onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                              title={editMode ? 'Click to rename' : (isGroupExpanded ? 'Hide tools' : `Show ${groupTabs.length} tools`)}>
+                              {!editMode && (
+                                <ChevronDown
+                                  size={10}
+                                  style={{ color: containsActiveTab ? C.primary : C.textMute }}
+                                  className={`flex-shrink-0 transition-transform ${isGroupExpanded ? '' : '-rotate-90'}`}
+                                />
+                              )}
+                              <span
+                                className="text-[10px] uppercase tracking-[0.12em] font-bold"
+                                style={{
+                                  color: containsActiveTab ? C.primary : C.textMute,
+                                  letterSpacing: '0.12em',
+                                }}>
+                                {gLabel}
+                              </span>
+                              <span className="flex-1 h-px" style={{ background: GLASS.borderSoft }} />
+                              {editMode ? (
+                                <Edit3 size={11} style={{ color: C.textMute }} className="flex-shrink-0" />
+                              ) : (
+                                <span
+                                  className="text-[9px] font-bold px-1.5 rounded gh-tnum"
+                                  style={{
+                                    color: containsActiveTab ? C.primary : C.textMute,
+                                    background: containsActiveTab ? 'rgba(10,132,255,0.08)' : 'rgba(15,18,23,0.04)',
+                                    fontFamily: fontMono,
+                                    minWidth: 18,
+                                    textAlign: 'center',
+                                    lineHeight: '14px',
+                                  }}>
+                                  {groupTabs.length}
+                                </span>
+                              )}
+                            </button>
+                          )}
                           {isGroupExpanded && groupTabs.map(renderTab)}
                         </React.Fragment>
                       );
                     });
                   }
 
-                  // Flat rendering (default for all other stages)
+                  // Flat rendering (stages without groups: Home, Training & Skills)
                   return stage.tabs.map(renderTab);
                 })()}
               </div>

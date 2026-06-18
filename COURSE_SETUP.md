@@ -362,3 +362,44 @@ Students see published content immediately, complete lessons, and earn the certi
   read policy above exists; check the browser console for a CORS error.
 - **Writes rejected while authoring** — you're not an admin for the requesting session (RLS). Re-check
   Step 4.
+
+---
+
+## Sidebar customization (admin-only navigation labels)
+
+The sidebar **Customize** button (admin-only) lets an admin rename navigation labels — stage headers
+("Training & Skills"), tab items ("QuickBooks Online Mastering"), and group sub-headers ("Profile
+Optimization") — and have the change show for **every** user on every device. The renames are stored
+in a `sidebar_settings` table (global, admin-write / authenticated-read), keyed by a **stable
+`item_key`** (e.g. `tab:qbomastery`, `stage:training`, `group:jobsearch:profile-optimization`) so a
+rename only changes the displayed text — routes, module ids, and course filtering are untouched.
+
+**Run this once** (also a standalone copy at `db/2026-06-18-sidebar-settings.sql`). It reuses the
+`public.is_admin()` helper from Step 1:
+
+```sql
+create table if not exists public.sidebar_settings (
+  item_key     text primary key,
+  custom_label text not null,
+  updated_by   uuid references auth.users(id) on delete set null,
+  updated_at   timestamptz not null default now(),
+  created_at   timestamptz not null default now()
+);
+
+alter table public.sidebar_settings enable row level security;
+
+drop policy if exists sidebar_settings_read on public.sidebar_settings;
+create policy sidebar_settings_read on public.sidebar_settings
+  for select to authenticated using (true);
+
+drop policy if exists sidebar_settings_admin_write on public.sidebar_settings;
+create policy sidebar_settings_admin_write on public.sidebar_settings
+  for all to authenticated using (public.is_admin()) with check (public.is_admin());
+
+notify pgrst, 'reload schema';
+```
+
+Then, as an admin: **Customize → click a label → type → Enter → Done**. Press **Cancel** to discard,
+or **Reset to default** to clear all overrides (deletes the rows; labels revert to code defaults). If
+the table is missing, the app falls back to the built-in labels and logs a console warning — it never
+breaks the sidebar.

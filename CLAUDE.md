@@ -183,11 +183,24 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
 
 A single `tab` string in the root selects which tool renders. Three pieces must stay in sync:
 
-1. **Sidebar config** (`DEFAULT_STAGES` array, ~L779–864): `{ id, number, label, groups: [{ label, tabIds }], tabs: [{ id, label, icon }] }`.
+1. **Sidebar config** (`DEFAULT_STAGES` array, ~L779–864): `{ id, number, label, groups: [{ key, label, tabIds }], tabs: [{ id, label, icon }] }`. Each group carries a stable `key` (label-independent — see below).
 2. **Render switch** (~L1704–1738): `{tab === 'someid' && <SomeComponent />}`.
 3. **Dashboard roadmap tiles** (~L1756–1829): optional `{ id, label, desc, icon, color }` entries.
 
-Sidebar customizations (rename, reorder, collapse) persist to `window.storage` under `sidebar:*` keys.
+**Sidebar customization is split by concern:**
+- **Labels are global + admin-controlled** via the Supabase `sidebar_settings` table (admin-write,
+  authenticated-read RLS — mirrors the `courses` pattern; SQL in COURSE_SETUP.md +
+  `db/2026-06-18-sidebar-settings.sql`). The **Customize** button is gated by `profile.is_admin`;
+  an admin renames stage headers, tab items, **and** group sub-headers, edits stage locally in
+  `draftLabels` (Enter confirms a field), then **Done** upserts the changes and refetches. Every
+  user reads these rows, so renames show app-wide and survive refresh / logout-login / redeploy.
+  Labels are stored against a **stable `item_key`** (`stage:<id>` / `tab:<id>` /
+  `group:<stageId>:<groupKey>`) — never the visible label — so renaming never touches routes,
+  module ids, or course filtering. Effective label = `draftLabels[k] ?? labelByKey[k] ??
+  defaultLabelByKey[k]`; missing table → falls back to code defaults (never crashes).
+- **Order + collapse/expanded-groups stay per-user** in `window.storage` under `sidebar:*` keys
+  (unchanged). `expandedGroups` keys off the group `key`, not its label, so collapse-state survives
+  a rename. Do **not** add a label key to `LEGACY_KEYS` — labels now live in Supabase.
 
 ## Authentication (Supabase — Phase 1)
 
