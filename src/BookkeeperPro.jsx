@@ -1616,6 +1616,14 @@ export default function BookkeeperProToolkit() {
   const renameStage = (stageId, newLabel)          => stageDraft(stageItemKey(stageId), newLabel);
   const renameGroup = (stageId, gKey, newLabel)    => stageDraft(groupItemKey(stageId, gKey), newLabel);
 
+  // The `sidebar_settings` table hasn't been created in Supabase yet (PostgREST PGRST205 / "could
+  // not find the table"). Distinct from a permissions failure — the fix is to run the migration.
+  const isMissingTableErr = (e) =>
+    e?.code === 'PGRST205' || /schema cache|could not find the table|does not exist/i.test(e?.message || '');
+  // One actionable, copy-anywhere hint for the un-provisioned state (mirrors describeDbError's
+  // course-migration hint). Shown to admins only — students just see default labels.
+  const SIDEBAR_SETUP_HINT = "Sidebar customization isn’t set up in the database yet — run db/2026-06-18-sidebar-settings.sql in your Supabase SQL Editor (see COURSE_SETUP.md), then try again.";
+
   // Fetch all global label overrides. Runs for EVERY signed-in user so the whole app shows the
   // admin's labels. Falls back to code defaults (never throws) if the table is missing or the read
   // fails — the sidebar always renders.
@@ -1629,11 +1637,10 @@ export default function BookkeeperProToolkit() {
       return true;
     } catch (e) {
       logDbError('[sidebar] load labels', e, {});
-      const msg = e?.message || '';
-      // Missing-table is an expected "not set up yet" state — quietly fall back to defaults.
-      if (!(e?.code === 'PGRST205' || /schema cache|could not find the table|does not exist/i.test(msg))) {
-        // A real read failure: surface it to the admin only (students just see defaults).
-        if (isAdmin) setLabelsErr('Sidebar settings could not be loaded. Showing default labels.');
+      // Surface to admins only (students silently get defaults): tell them how to fix the missing
+      // table up-front, or note a genuine read failure.
+      if (isAdmin) {
+        setLabelsErr(isMissingTableErr(e) ? SIDEBAR_SETUP_HINT : 'Sidebar settings could not be loaded. Showing default labels.');
       }
       return false;
     }
@@ -1681,8 +1688,9 @@ export default function BookkeeperProToolkit() {
     } catch (e) {
       logDbError('[sidebar] save labels', e, { userId: user?.id, isAdmin, keys: [...upserts.map(u => u.item_key), ...deletes] });
       const permission = e?.code === '42501' || /row-level security|permission/i.test(e?.message || '');
-      setLabelsErr(permission
-        ? 'You do not have permission to customize navigation.'
+      setLabelsErr(
+        isMissingTableErr(e) ? SIDEBAR_SETUP_HINT
+        : permission ? 'You do not have permission to customize navigation.'
         : describeDbError(e, 'Could not save sidebar changes. Please try again.'));
       // Stay in edit mode; keep draftLabels so the admin doesn't lose their edits.
     } finally {
@@ -1718,8 +1726,9 @@ export default function BookkeeperProToolkit() {
     } catch (e) {
       logDbError('[sidebar] reset labels', e, { userId: user?.id, isAdmin });
       const permission = e?.code === '42501' || /row-level security|permission/i.test(e?.message || '');
-      setLabelsErr(permission
-        ? 'You do not have permission to customize navigation.'
+      setLabelsErr(
+        isMissingTableErr(e) ? SIDEBAR_SETUP_HINT
+        : permission ? 'You do not have permission to customize navigation.'
         : describeDbError(e, 'Could not reset sidebar labels. Please try again.'));
     } finally {
       setSavingLabels(false);
