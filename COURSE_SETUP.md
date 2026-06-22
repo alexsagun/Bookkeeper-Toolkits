@@ -403,3 +403,96 @@ Then, as an admin: **Customize → click a label → type → Enter → Done**. 
 or **Reset to default** to clear all overrides (deletes the rows; labels revert to code defaults). If
 the table is missing, the app falls back to the built-in labels and logs a console warning — it never
 breaks the sidebar.
+
+## Feature guides (Mock Interview Simulator video)
+
+The **Mock Interview Simulator** tab is a *guided page*: it shows a short admin-uploaded explainer
+video (title + description) and a **"Open Mock Interview Simulator"** button that opens the external
+simulator (`https://app.sesame.com/`) in a new tab. The curated content lives in a `feature_guides`
+table (global, admin-write / authenticated-read), keyed by a stable **`feature_key`**
+(`mock_interview_simulator`). It's generic — future guided pages reuse the same table with a new
+`feature_key`.
+
+**Run this once** (also a standalone copy at `db/2026-06-22-feature-guides.sql`). It reuses the
+`public.is_admin()` helper from Step 1:
+
+```sql
+create table if not exists public.feature_guides (
+  feature_key    text primary key,                                  -- e.g. 'mock_interview_simulator'
+  title          text,
+  description    text,
+  video_url      text,                                              -- pasted YouTube / Vimeo / MP4 link
+  video_path     text,                                              -- course-media storage path (when uploaded)
+  video_provider text,                                              -- 'upload' | 'youtube' | 'vimeo' | 'mp4'
+  external_url   text,                                              -- CTA target; blank → app default (Sesame)
+  is_active      boolean not null default true,
+  updated_by     uuid references auth.users(id) on delete set null,
+  created_at     timestamptz not null default now(),
+  updated_at     timestamptz not null default now()
+);
+
+alter table public.feature_guides enable row level security;
+
+drop policy if exists feature_guides_read on public.feature_guides;
+create policy feature_guides_read on public.feature_guides
+  for select to authenticated using (true);
+
+drop policy if exists feature_guides_admin_write on public.feature_guides;
+create policy feature_guides_admin_write on public.feature_guides
+  for all to authenticated using (public.is_admin()) with check (public.is_admin());
+
+notify pgrst, 'reload schema';
+```
+
+Uploaded videos **reuse the existing `course-media` bucket** (Step 2) under the
+`feature-guides/<feature_key>/…` prefix — **no new bucket** is needed (its policies key only on the
+bucket id, not the path). Make sure you're flagged admin (Step 4) before saving:
+`update public.profiles set is_admin = true where email = '…';`.
+
+Then, as an admin: open the **Mock Interview Simulator** tab → **Edit guide** → paste a YouTube/Vimeo
+link **or** upload an MP4 (≤ 50 MB) → add a title/description (optionally change the external URL) →
+**Save**. Every user then sees the video + the CTA button. If the table is missing (or no row exists),
+the page degrades to a clean empty state with the working button — it never breaks.
+
+### Video-completion gate (unlock the simulator after watching)
+
+The **"Open Mock Interview Simulator"** button is **gated behind watching the guide video**: it starts
+grey/disabled ("Watch the video to unlock simulator") and turns blue/clickable only once the user
+finishes the video (native `<video>` end event, or the YouTube/Vimeo player API for embeds). Completion
+is stored **per user** in a `feature_video_completions` table and tracked against the **current video
+version** (the guide's `video_path`/`video_url`), so replacing the guide video re-locks the button until
+the new one is watched. If **no** video is uploaded, the button stays available (users aren't blocked by
+missing content).
+
+**Run this once** (also a standalone copy at `db/2026-06-22-feature-video-completions.sql`):
+
+```sql
+create table if not exists public.feature_video_completions (
+  id            uuid primary key default gen_random_uuid(),
+  user_id       uuid not null references auth.users(id) on delete cascade,
+  feature_key   text not null,                 -- 'mock_interview_simulator'
+  video_version text,                           -- which video was completed
+  completed     boolean not null default true,
+  completed_at  timestamptz not null default now(),
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now(),
+  unique (user_id, feature_key)
+);
+
+alter table public.feature_video_completions enable row level security;
+
+drop policy if exists fvc_select_own on public.feature_video_completions;
+create policy fvc_select_own on public.feature_video_completions
+  for select to authenticated using (user_id = auth.uid());
+drop policy if exists fvc_insert_own on public.feature_video_completions;
+create policy fvc_insert_own on public.feature_video_completions
+  for insert to authenticated with check (user_id = auth.uid());
+drop policy if exists fvc_update_own on public.feature_video_completions;
+create policy fvc_update_own on public.feature_video_completions
+  for update to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+notify pgrst, 'reload schema';
+```
+
+If this table is missing the app still works — the gate unlocks for the current session when the video
+ends, it just won't persist across refresh until you run the migration (admins see a one-line hint).

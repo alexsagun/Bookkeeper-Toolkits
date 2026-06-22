@@ -77,7 +77,9 @@ The **two sanctioned exceptions** to the single-file rule (same spirit as the `m
 
 The course platform is the **first in-app tool to read/write Supabase directly**
 (`import { supabase } from './lib/supabase'`) instead of `window.storage`. Course content + per-user
-progress live in Supabase so they reach **all** students across devices. Two pieces:
+progress live in Supabase so they reach **all** students across devices. (The `MockInterviewSimulator`
+guided page is the **second** such tool — it reads/writes the admin-curated `feature_guides` row
+directly; see the "Feature guides" subsection in [COURSE_SETUP.md](COURSE_SETUP.md).) Two pieces:
 
 - **`CourseProgram`** — the generic **single-course engine** (learner player, admin builder, lesson
   editor, completion + branded PDF certificate). Props: `slug`, **`courseId`** (load by id — catalog
@@ -175,7 +177,13 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
 `PainPointsGenerator` 6629, `ClientPortalDemo` 6987, `IndustryAccounting` 7661, `USTax101` 7962,
 `MonthlyWorkflow` 8135, `MonthEndChecklist` 8336, `InvoiceCreator` 8618, `CoachAlexChat` 9025,
 `CPAAIChat` 9178, `AccountingCalculators` 10181, `NicheSelectorQuiz` 10328, `CertificationTracker` 10583,
-`LinkedInOptimizer` 10732, `MockInterviewSimulator` 10897, `DiscoveryCallSimulator` 11164,
+`LinkedInOptimizer` 10732, `MockInterviewSimulator` 10897 (a **guided-video + external-link page** —
+admin-uploaded explainer video + a "Open Mock Interview Simulator" button to the external
+`https://app.sesame.com/`; Supabase-backed via the `feature_guides` table — **not** the old internal
+AI simulator. The CTA is **gated behind watching the guide video** — grey/disabled until the video ends
+[native `<video>` / YouTube IFrame API / Vimeo SDK via the `GuideVideoPlayer` child], then blue; per-user
+completion persists in `feature_video_completions` and re-locks when the admin replaces the video),
+`DiscoveryCallSimulator` 11164,
 `SOPGenerator` 11471, `ClientHealthScore` 12136, `CapacityPlanner` 13358, `PaymentTracker` 13542,
 `QBDiagnostic` 14293, `BudgetingTool` 15483, `ForecastingTool` 15958.
 
