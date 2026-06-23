@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import {
   LayoutDashboard, BookOpen, FileSpreadsheet, Receipt, FileText,
   MessageCircle, FileCheck2, Percent, ClipboardList, Sparkles,
@@ -3093,6 +3093,27 @@ function CourseProgram({
   );
   const [certBusy, setCertBusy] = useState(false);
   const certRef = useRef(null);
+  const certScaleRef = useRef(null);   // outer responsive wrapper (measured)
+  const [certScale, setCertScale] = useState(1);
+  const [certBoxH, setCertBoxH]   = useState(0);
+
+  // Scale the fixed-width (900px) certificate card down to fit its container, so the on-screen
+  // preview is smaller/responsive while certRef keeps its intrinsic size for full-quality PDF/print.
+  useLayoutEffect(() => {
+    if (mode !== 'certificate') return;
+    const wrap = certScaleRef.current, card = certRef.current;
+    if (!wrap || !card) return;
+    const INTRINSIC = 900, PAD = 18;   // PAD leaves room for the card's drop-shadow halo
+    const recompute = () => {
+      const s = Math.min(1, (wrap.clientWidth - PAD * 2) / INTRINSIC);
+      setCertScale(s);
+      setCertBoxH(card.offsetHeight * s + PAD * 2);   // offsetHeight is unaffected by the transform
+    };
+    recompute();
+    const ro = new ResizeObserver(recompute);
+    ro.observe(wrap); ro.observe(card);
+    return () => ro.disconnect();
+  }, [mode, studentName, course, completion]);
 
   // ── Load course + curriculum + this user's progress ──
   async function load() {
@@ -3773,25 +3794,26 @@ function CourseProgram({
           </button>
         </div>
 
-        <div className="overflow-x-auto pb-2">
+        <div ref={certScaleRef} style={{ width: '100%', maxWidth: 756, margin: '0 auto', padding: 18, boxSizing: 'border-box', height: certBoxH || undefined, overflow: 'hidden' }}>
+          <div style={{ width: 900, transform: `scale(${certScale})`, transformOrigin: 'top left' }}>
           <div ref={certRef} style={{
             width: 900, margin: '0 auto', background: '#ffffff', position: 'relative',
             padding: 24, boxSizing: 'border-box', fontFamily: fontBody,
             border: `2px solid ${C.primary}`, borderRadius: 18,
             boxShadow: '0 10px 40px rgba(10,132,255,0.12)',
           }}>
-            <div style={{ border: `1px solid ${C.accent}`, borderRadius: 12, padding: '40px 48px', textAlign: 'center', background: 'linear-gradient(180deg,#ffffff,#F7FAFF)' }}>
-              <img src={LOGO_DATA_URI} alt="" style={{ width: 68, height: 68, objectFit: 'contain', margin: '0 auto 8px' }} />
+            <div style={{ border: `1px solid ${C.accent}`, borderRadius: 12, padding: '26px 44px', textAlign: 'center', background: 'linear-gradient(180deg,#ffffff,#F7FAFF)' }}>
+              <img src={LOGO_DATA_URI} alt="" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto 4px' }} />
               <div style={{ fontFamily: fontDisplay, fontSize: 13, letterSpacing: '0.32em', textTransform: 'uppercase', color: C.primary, fontWeight: 700 }}>Certificate of Completion</div>
-              <div style={{ height: 2, width: 64, background: `linear-gradient(90deg, ${C.primary}, ${C.accent})`, margin: '14px auto 22px', borderRadius: 2 }} />
+              <div style={{ height: 2, width: 64, background: `linear-gradient(90deg, ${C.primary}, ${C.accent})`, margin: '10px auto 14px', borderRadius: 2 }} />
               <div style={{ fontSize: 12, letterSpacing: '0.18em', textTransform: 'uppercase', color: C.textSoft, fontWeight: 600 }}>This certificate is awarded to</div>
               <div style={{ fontFamily: fontDisplay, fontSize: 38, fontWeight: 800, color: NAVY, margin: '6px 0 4px', maxWidth: 760, marginLeft: 'auto', marginRight: 'auto', overflowWrap: 'break-word' }}>{studentName || 'Your Name'}</div>
-              <div style={{ width: 380, height: 1, background: C.border, margin: '8px auto 22px' }} />
+              <div style={{ width: 380, height: 1, background: C.border, margin: '8px auto 14px' }} />
               <div style={{ fontSize: 12, letterSpacing: '0.18em', textTransform: 'uppercase', color: C.textSoft, fontWeight: 600 }}>For successfully completing the course</div>
               <div style={{ fontFamily: fontDisplay, fontSize: 24, fontWeight: 700, color: C.primary, margin: '6px auto 2px', maxWidth: 760, overflowWrap: 'break-word' }}>{course.title}</div>
               {course.subtitle && <div style={{ fontSize: 13, color: C.textMute, maxWidth: 520, margin: '6px auto 0' }}>{course.subtitle}</div>}
-              <div style={{ fontSize: 13, lineHeight: 1.6, color: C.textSoft, maxWidth: 620, margin: '16px auto 0' }}>{certDesc}</div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginTop: 36, padding: '0 12px' }}>
+              <div style={{ fontSize: 13, lineHeight: 1.6, color: C.textSoft, maxWidth: 620, margin: '12px auto 0' }}>{certDesc}</div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginTop: 24, padding: '0 12px' }}>
                 <div style={{ textAlign: 'center' }}>
                   <div style={{ fontFamily: fontDisplay, fontSize: 20, color: NAVY, fontWeight: 700 }}>Alex Sagun</div>
                   <div style={{ width: 160, height: 1, background: C.border, margin: '4px auto' }} />
@@ -3804,11 +3826,12 @@ function CourseProgram({
                   <div style={{ fontSize: 11, color: C.textMute, letterSpacing: '0.08em', textTransform: 'uppercase' }}>Date Completed</div>
                 </div>
               </div>
-              <div style={{ marginTop: 22, paddingTop: 14, borderTop: `1px solid ${C.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 10.5, letterSpacing: '0.04em', color: C.textMute, textTransform: 'uppercase' }}>
+              <div style={{ marginTop: 14, paddingTop: 10, borderTop: `1px solid ${C.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 10.5, letterSpacing: '0.04em', color: C.textMute, textTransform: 'uppercase' }}>
                 <span>Certificate ID:&nbsp;<span style={{ fontFamily: fontMono, letterSpacing: 0 }}>{certId}</span></span>
                 <span>Issued: {dateStr}</span>
               </div>
             </div>
+          </div>
           </div>
         </div>
       </div>
