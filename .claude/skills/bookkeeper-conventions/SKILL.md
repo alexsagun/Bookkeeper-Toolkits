@@ -82,8 +82,10 @@ don't need to add auth checks inside a tool. See the "Authentication" section in
 - **Download/export:** use the `downloadFile(content, filename, mimeType)` helper (~L679) — e.g.
   `downloadFile(csv, 'chart-of-accounts.csv', 'text/csv')`.
 - **Spreadsheets:** the `xlsx` library (`XLSX`) parses/builds Excel; see `StatementConverter` /
-  `CoaGenerator`.
-- **Word docs:** `mammoth` extracts text from `.docx`.
+  `CoaGenerator`. Import it lazily — `const XLSX = await import('xlsx')` — so it stays out of the main bundle.
+- **Word docs (`.docx`):** not currently wired into the app. If you add `.docx` parsing, lazy-load a
+  parser (e.g. `mammoth`) via dynamic `import()` and re-add it to `package.json` — it was removed as an
+  unused dependency.
 - **Images/PDF for Claude vision:** read the file to base64 and send as an `image`/`document` content
   block in `messages[].content` (see `StatementConverter`, ~L2411).
 
@@ -103,9 +105,11 @@ than rolling your own USD↔PHP conversion.
 
 ## Navigation
 
-A tool is reachable only when its `id` appears in all three: the sidebar `DEFAULT_STAGES` config
-(~L779–864), the render switch (~L1704–1738), and optionally the Dashboard tiles (~L1756–1829). Keep
-the `id` identical across all three.
+A tool is reachable only when its `id` appears in: the sidebar `DEFAULT_STAGES` config, the
+`renderTabContent(tabId)` switch (which the `visitedTabs` keep-alive map calls — this replaced the
+old `{tab === 'id' && …}` chain), and `TAB_ROUTES` (its stable URL path, for deep-linking / new-tab),
+plus optionally the Dashboard tiles. Keep the `id` identical across all of them. Navigation is
+URL-routed + keep-alive — see CLAUDE.md → "Navigation model".
 
 ## Don'ts
 

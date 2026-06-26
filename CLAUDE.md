@@ -26,7 +26,8 @@ templates) run fully offline with no API key.
   design tokens (no dynamically-built class names like `` `bg-${x}` ``) — if you ever add one, safelist
   it or it will be purged. (The `standalone/` Google Apps Script build still uses the Tailwind **CDN**,
   since it's a single self-contained file.)
-- **Lucide React** for icons, **XLSX** (spreadsheet parse/generate), **Mammoth** (.docx parse).
+- **Lucide React** for icons, **XLSX** (spreadsheet parse/generate) — XLSX is **lazy-loaded** via
+  dynamic `import()` so it stays out of the main bundle.
 - **Anthropic Claude API** for AI features, via a key-hiding proxy (see below).
 - **Supabase** (`@supabase/supabase-js`) for **user authentication** (email/password signup & login).
   See the "Authentication" section below. This is Phase 1; a paid-subscriber gate is the planned Phase 2.
@@ -165,7 +166,7 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
 | Shared AI helper | 16–62 | `callClaude()` (L27) — the single entry point every AI tool uses (see AI/proxy pattern) |
 | Imports + domain data | 1–620 | `COA_BASE` (L68), `COA_INDUSTRY` (L121), `INDUSTRY_NOTES` (L341), `VENDOR_PATTERNS` (L367), `COURSE_MODULES` (L463), checklists, `TIPS` (L603) |
 | Design system + helpers | 620–770 | colors `C` (L624), `SHEEN` (L654), `GLASS` (L657), fonts `fontDisplay` (L671) / `fontMono` (L673), `downloadFile()` (L679), `useCurrency()` (L712), `CurrencyToggle()` (L748) |
-| Root component | 774–~1700 | `BookkeeperProToolkit` (L774): `tab` state, sidebar `DEFAULT_STAGES` config (~L779–864), drag-drop reorder, rename/persist to `window.storage` (`sidebar:*` keys, ~L940–988), and the **render switch** (~L1704–1738) |
+| Root component | 774–~1700 | `BookkeeperProToolkit` (L774): `tab` state, sidebar `DEFAULT_STAGES` config (~L779–864), drag-drop reorder, rename/persist to `window.storage` (`sidebar:*` keys, ~L940–988), and the **keep-alive render** (`renderTabContent(tabId)` switch + `visitedTabs` map). URL-routing helpers (`TAB_ROUTES`, `readAppRoute`, `writeAppRoute`, `tabHref`, `shouldHandleInAppClick`) sit at the **top of the file** (module scope). |
 | Tool components | ~1740–end | ~60 self-contained functional components |
 
 **Notable tools → approximate line:** `Dashboard` 1749, `CoaGenerator` 2017, `Course` 2120,
@@ -177,23 +178,46 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
 `PainPointsGenerator` 6629, `ClientPortalDemo` 6987, `IndustryAccounting` 7661, `USTax101` 7962,
 `MonthlyWorkflow` 8135, `MonthEndChecklist` 8336, `InvoiceCreator` 8618, `CoachAlexChat` 9025,
 `CPAAIChat` 9178, `AccountingCalculators` 10181, `NicheSelectorQuiz` 10328, `CertificationTracker` 10583,
-`LinkedInOptimizer` 10732, `MockInterviewSimulator` 10897 (a **guided-video + external-link page** —
+`LinkedInOptimizer` 10732, `MockInterviewSimulator` (a **guided-video + external-link page** —
 admin-uploaded explainer video + a "Open Mock Interview Simulator" button to the external
 `https://app.sesame.com/`; Supabase-backed via the `feature_guides` table — **not** the old internal
 AI simulator. The CTA is **gated behind watching the guide video** — grey/disabled until the video ends
 [native `<video>` / YouTube IFrame API / Vimeo SDK via the `GuideVideoPlayer` child], then blue; per-user
-completion persists in `feature_video_completions` and re-locks when the admin replaces the video),
+completion persists in `feature_video_completions` and re-locks when the admin replaces the video. It
+takes an **`embedded`** prop and now renders as the **2nd sub-tab inside `InterviewPrep`** (Job Interview
+Mastery), not a standalone sidebar item; when `embedded` it drops its own `SectionHead`. The legacy
+`mockinterview` tab id is kept only as a defensive render-switch redirect → `<InterviewPrep initialSub="mock" />`),
 `DiscoveryCallSimulator` 11164,
 `SOPGenerator` 11471, `ClientHealthScore` 12136, `CapacityPlanner` 13358, `PaymentTracker` 13542,
 `QBDiagnostic` 14293, `BudgetingTool` 15483, `ForecastingTool` 15958.
 
 ### Navigation model
 
-A single `tab` string in the root selects which tool renders. Three pieces must stay in sync:
+A single `tab` string in the root selects which tool renders, and navigation is **URL-routed +
+keep-alive** (see below). Four pieces must stay in sync when adding/removing a tool:
 
-1. **Sidebar config** (`DEFAULT_STAGES` array, ~L779–864): `{ id, number, label, groups: [{ key, label, tabIds }], tabs: [{ id, label, icon }] }`. Each group carries a stable `key` (label-independent — see below).
-2. **Render switch** (~L1704–1738): `{tab === 'someid' && <SomeComponent />}`.
-3. **Dashboard roadmap tiles** (~L1756–1829): optional `{ id, label, desc, icon, color }` entries.
+1. **Sidebar config** (`DEFAULT_STAGES` array): `{ id, number, label, groups: [{ key, label, tabIds }], tabs: [{ id, label, icon }] }`. Each group carries a stable `key` (label-independent — see below).
+2. **`renderTabContent(tabId)`** — a `switch (tabId)` in the root that returns each tool's element. This replaced the old `{tab === 'id' && <Cmp/>}` chain.
+3. **`TAB_ROUTES`** (module scope, top of file) — maps each tab id to a stable URL path (e.g. `qbomastery → /courses/quickbooks-online-mastery`). Powers deep-linking, refresh, and "open in new tab"; `VALID_APP_TABS` is derived from it.
+4. **Dashboard roadmap tiles**: optional `{ id, label, desc, icon, color }` entries.
+
+**Navigation is URL-routed and state-preserving:**
+- `readAppRoute()` / `writeAppRoute()` / `tabHref()` (module scope) sync the active tab — and a few
+  inner states (`?sub=` for `InterviewPrep`, `?course=<id>` for a catalog) — to the URL via the
+  History API. `vercel.json` rewrites all non-`/api` paths to `/`, so pretty-path deep links never
+  404. The root restores the tab from the URL **after** the auth gate, persists the last tab to
+  `window.storage` (`nav:lastTab`), and handles Back/Forward via a `popstate` listener.
+- **Sidebar items are real `<a href={tabHref(id)}>` links.** Plain left-click navigates in-app
+  (`shouldHandleInAppClick(e)` then `preventDefault` + `setTab`); Ctrl/Cmd/middle-click opens the
+  section in a new browser tab natively; a hover `ExternalLink` icon opens it in a new tab explicitly.
+  In edit/Customize mode the item falls back to a rename `<button>` (so drag-reorder/rename are
+  unchanged). Auth still gates a new tab — it shows `AuthScreen`, then restores `?...` after login.
+- **Keep-alive mounting:** the root renders one panel per *visited* tab
+  (`Array.from(visitedTabs).map(tabId => <div hidden={tabId!==tab}>{renderTabContent(tabId)}</div>)`),
+  so a tool mounts on first visit and then **stays mounted** (hidden via CSS) — its local state,
+  scroll, and in-flight work survive tab switches, and Supabase-backed tools (`CourseProgram`/
+  `CourseCatalog`) no longer refetch on return. Per-tab scroll is saved/restored via `sessionStorage`
+  (`nav:scroll:<tab>`). The old `<div key={tab}>` (which destroyed state on every switch) is gone.
 
 **Sidebar customization is split by concern:**
 - **Labels are global + admin-controlled** via the Supabase `sidebar_settings` table (admin-write,
@@ -219,8 +243,11 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   [main.jsx](src/main.jsx). Any component reads auth via `const { session, user, profile, loading,
   configured, signUp, signIn, signOut, resetPassword } = useAuth()`. `profile` is the row from the
   Supabase `profiles` table and carries `is_paid` / `plan` (used by the planned Phase-2 paywall) and
-  `is_admin` (course-authoring gate — see the Course platform section). `profile` is fetched with
-  `.select('*')`, so new `profiles` columns ride along automatically without an AuthProvider change.
+  `is_admin` (course-authoring gate — see the Course platform section). `profile` is fetched with an
+  **explicit column list** (`PROFILE_SELECT` = `id,email,full_name,avatar_url,is_paid,plan,is_admin`),
+  with a one-time fallback to a legacy set (no `avatar_url`/`is_admin`) if those columns don't exist yet
+  — so a not-yet-migrated `profiles` table degrades gracefully instead of erroring. When you add a
+  `profiles` column the client needs, add it to `PROFILE_SELECT` in `AuthProvider.jsx`.
 - **The gate** lives in `BookkeeperProToolkit` just before its root `return` (~L1121): `if (loading)
   return <AuthSplash/>; if (!user) return <AuthScreen/>;`. `AuthScreen` (defined just above the root
   component) is the login/signup/reset UI, built from the design tokens (`C`, `SHEEN`, `GLASS`,
@@ -302,8 +329,9 @@ const { text, data } = await callClaude({ system, messages }, { returnData: true
 
 - **Match existing in-file patterns** — functional components, local `useState`, design tokens, and
   the `callClaude()` AI pattern above.
-- **Adding a tool** = new component in `BookkeeperPro.jsx` + wire it into the sidebar config and the
-  render switch. See the **add-bookkeeper-tool** skill in [.claude/skills/](.claude/skills/).
+- **Adding a tool** = new component in `BookkeeperPro.jsx` + wire it into the sidebar config, the
+  `renderTabContent(tabId)` switch, and `TAB_ROUTES` (so it deep-links and opens in a new tab). See
+  the **add-bookkeeper-tool** skill in [.claude/skills/](.claude/skills/).
 - **Keep the single-file architecture** unless a refactor is explicitly requested.
 - **Preserve the two shims** in `main.jsx`.
 - **Don't** add TypeScript, a linter, or new build config without asking.
@@ -339,8 +367,11 @@ A living plan — each phase is independent and can be approved/started on its o
 - **Phase 0 — Documentation (done):** this CLAUDE.md + the two skills; refreshed for the centralized
   `callClaude()` AI helper and re-baselined line anchors.
 - **Phase 1 — Polish & deploy:** verify the Vercel build and `ANTHROPIC_API_KEY`; confirm the AI path
-  works in production; reduce bundle size (the XLSX and app chunks are large — lazy-load XLSX/Mammoth
-  and consider code-splitting the heaviest tools); audit error/empty states across AI tools.
+  works in production; reduce bundle size. **Done:** XLSX/jspdf/html2canvas are lazy-loaded via
+  dynamic `import()`, and `vite.config.js` splits `react`/`react-dom`, `@supabase/supabase-js`, and
+  `lucide-react` into cacheable vendor chunks. **Still open:** the single-file app chunk is large by
+  design — true per-tool code-splitting would require breaking the single-file rule (deferred to
+  Phase 3). Audit error/empty states across AI tools.
 - **Phase 2 — Add tools/features:** ship new tools with the **add-bookkeeper-tool** skill so they stay
   consistent with the navigation model and design system.
 - **Phase 3 — Incremental code quality:** extract shared helpers opportunistically; only when a tool is

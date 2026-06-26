@@ -11,6 +11,22 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [react()],
+    build: {
+      rollupOptions: {
+        output: {
+          // Split the always-loaded vendors out of the single app chunk so they
+          // cache independently across deploys and download in parallel. The heavy,
+          // feature-specific libs (xlsx, jspdf, html2canvas) are already code-split
+          // automatically because they're loaded via dynamic `import()` on demand —
+          // do NOT list them here or they'd be forced back into a static chunk.
+          manualChunks: {
+            'react-vendor': ['react', 'react-dom'],
+            'supabase': ['@supabase/supabase-js'],
+            'icons': ['lucide-react'],
+          },
+        },
+      },
+    },
     server: {
       proxy: {
         '/api/anthropic': {

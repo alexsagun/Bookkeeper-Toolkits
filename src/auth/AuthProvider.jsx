@@ -29,7 +29,7 @@ export const useAuth = () => useContext(AuthContext);
 // when a tool introduces a new persisted key (see bookkeeper-conventions skill).
 const LEGACY_KEYS = [
   'currency:pref', 'currency:rate',
-  'sidebar:stages', 'sidebar:collapsed', 'sidebar:expandedGroups', 'sidebar:version',
+  'sidebar:stages', 'sidebar:collapsed', 'sidebar:expandedGroups', 'sidebar:version', 'sidebar:railCollapsed',
   'certs:completed', 'certs:inProgress',
   'health:clients',
   'timetrack:entries', 'timetrack:clients', 'timetrack:rates',
@@ -38,12 +38,15 @@ const LEGACY_KEYS = [
   'persfin:transactions',
   'qbdiag:name', 'qbdiag:firm', 'qbdiag:email',
   'budget:state', 'forecast:state',
+  'nav:lastTab', 'nav:interviewSub',
 ];
 
 // Marker (raw, un-namespaced) recording which uid adopted the legacy global data.
 // Ensures the migration runs exactly once and never leaks the first user's data
 // to a second account on a shared browser.
 const LEGACY_MARKER = 'auth:legacyMigratedTo';
+const PROFILE_SELECT = 'id,email,full_name,avatar_url,is_paid,plan,is_admin';
+const PROFILE_SELECT_LEGACY = 'id,email,full_name,avatar_url,is_paid,plan';
 
 function migrateLegacyData(uid) {
   if (typeof window === 'undefined' || !uid) return;
@@ -155,16 +158,25 @@ export function AuthProvider({ children }) {
       return;
     }
     let active = true;
-    supabase
-      .from('profiles')
-      .select('*')
-      .eq('id', uid)
-      .single()
-      .then(({ data, error }) => {
+    (async () => {
+      let { data, error } = await supabase
+        .from('profiles')
+        .select(PROFILE_SELECT)
+        .eq('id', uid)
+        .single();
+      if (error && (error.code === 'PGRST204' || /is_admin|schema cache|column/i.test(error.message || ''))) {
+        const fallback = await supabase
+          .from('profiles')
+          .select(PROFILE_SELECT_LEGACY)
+          .eq('id', uid)
+          .single();
+        data = fallback.data;
+        error = fallback.error;
+      }
         if (!active) return;
         if (error) console.error('[auth] profile fetch failed:', error.message);
         setProfile(data ?? null);
-      });
+    })();
     return () => {
       active = false;
     };

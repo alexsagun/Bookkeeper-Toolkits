@@ -86,15 +86,22 @@ Reference implementations to copy from: `BankFeed` (~L2214, JSON output + fence 
 Always handle `busy` (disable the button / show a spinner) and `err` (the app must degrade
 gracefully when no key is set).
 
-## Step 3 — Wire it into navigation (three edits)
+## Step 3 — Wire it into navigation (four edits)
 
-1. **Sidebar config** (`DEFAULT_STAGES` array, ~L779–864): add `{ id: 'mytool', label: 'My New Tool', icon: SomeIcon }`
+The app is **URL-routed + keep-alive** (see CLAUDE.md → "Navigation model"). A new tool needs:
+
+1. **Sidebar config** (`DEFAULT_STAGES` array): add `{ id: 'mytool', label: 'My New Tool', icon: SomeIcon }`
    to the right stage's `tabs`, and add `'mytool'` to a group's `tabIds`.
-2. **Render switch** (~L1704–1738): add `{tab === 'mytool' && <MyNewTool />}`.
-3. **(Optional) Dashboard tile** (~L1756–1829): add `{ id: 'mytool', label, desc, icon, color }` if it
-   should appear on the Home roadmap.
+2. **`renderTabContent(tabId)` switch** (in the root component): add `case 'mytool': return <MyNewTool />;`.
+   (This replaced the old `{tab === 'mytool' && <MyNewTool />}` chain — do **not** add a bare conditional;
+   the `visitedTabs` keep-alive map calls `renderTabContent`.)
+3. **`TAB_ROUTES`** (module scope, top of file): add `mytool: '/my-new-tool',` so the tool has a stable
+   URL (deep-link, refresh, and "open in new tab" all key off this; `VALID_APP_TABS` derives from it).
+   Use a unique, human-readable path.
+4. **(Optional) Dashboard tile**: add `{ id: 'mytool', label, desc, icon, color }` if it should appear
+   on the Home roadmap.
 
-The `id` must be identical in all three places.
+The `id` must be identical in the sidebar config, the `renderTabContent` case, and `TAB_ROUTES`.
 
 ## Step 4 — Verify
 

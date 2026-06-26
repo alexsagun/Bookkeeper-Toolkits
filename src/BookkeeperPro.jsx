@@ -7,15 +7,143 @@ import {
   TrendingUp, Shield, Award, Zap, Quote, TrendingDown, Calculator,
   Image as ImageIcon, FileType2, Printer, Edit3, Briefcase,
   MessageSquare, Mic, Eye, HelpCircle, User, Target,
-  Building2, Landmark, CalendarClock, ExternalLink,
-  Heart, DollarSign, Phone, AlertCircle, Activity, Clock, Wallet,
+  Building2, Landmark, CalendarClock, CalendarCheck, ExternalLink,
+  Heart, HeartHandshake, DollarSign, Phone, AlertCircle, Activity, Clock, Wallet,
   PieChart, Linkedin, ArrowUp, ArrowDown, X, Copy, Check,
   TrendingUp as Growth, BookMarked, Globe, Coins, GraduationCap,
   LogOut, Lock, Mail, KeyRound, Menu,
-  Plus, Trash2, Save, Play, Video, ArrowRight, ArrowLeft, ChevronUp, MoreVertical
+  Plus, Trash2, Save, Play, Video, ArrowRight, ArrowLeft, ChevronUp, MoreVertical,
+  PanelLeftClose, PanelLeftOpen
 } from 'lucide-react';
 import { useAuth } from './auth/AuthProvider.jsx';
 import { supabase } from './lib/supabase';
+
+const DEFAULT_APP_TAB = 'dashboard';
+
+const TAB_ROUTES = {
+  dashboard: '/',
+  course: '/courses/accounting-101',
+  qbomastery: '/courses/quickbooks-online-mastery',
+  industryacc: '/industry-accounting',
+  ustax: '/us-tax-101',
+  chat: '/proadvisor-chat',
+  coachalex: '/booking/coach-alex',
+  cpaai: '/booking/us-cpa',
+  resumestrategy: '/courses/resume-winning-strategy',
+  linkedinopt: '/profile-optimization/book-with-alex',
+  interview: '/job-interview-mastery',
+  brand: '/authentic-branding',
+  qbdiag: '/quickbooks-diagnostic',
+  painpoints: '/painpoints-solutions',
+  proposal: '/proposal-generator',
+  engagement: '/engagement-letter',
+  onboarding: '/client-onboarding',
+  coa: '/chart-of-accounts',
+  invoice: '/invoice-creator',
+  bankfeed: '/bank-feed-ai',
+  converter: '/statement-to-csv',
+  emails: '/email-templates',
+  calculators: '/accounting-calculators',
+  workflow: '/monthly-workflow',
+  monthend: '/month-end-checklist',
+  sopgen: '/sop-generator',
+  salestax: '/sales-tax',
+  budgeting: '/budgeting',
+  forecasting: '/forecasting',
+  yearendcheck: '/year-end-checklist',
+  form1099: '/1099-prep',
+  mockinterview: '/job-interview-mastery?sub=mock',
+};
+
+const ROUTE_TO_TAB = Object.entries(TAB_ROUTES).reduce((acc, [tab, href]) => {
+  if (tab === 'mockinterview') return acc;
+  const path = href.split('?')[0].replace(/\/+$/, '') || '/';
+  acc[path] = { tab };
+  return acc;
+}, {
+  '/quickbooks-online-mastery': { tab: 'qbomastery' },
+  '/resume-winning-strategy': { tab: 'resumestrategy' },
+  '/mock-interview-simulator': { tab: 'interview', interviewSub: 'mock' },
+});
+
+const VALID_APP_TABS = new Set(Object.keys(TAB_ROUTES));
+const INTERVIEW_SUBTAB_IDS = new Set(['winstrat', 'mock', 'common', 'accounting', 'body', 'jdgen', 'salary']);
+
+function normalizePath(pathname = '/') {
+  const path = String(pathname || '/').replace(/\/+$/, '');
+  return path || '/';
+}
+
+function normalizeInterviewSub(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  const aliases = {
+    'interview-winning-strategy': 'winstrat',
+    winning: 'winstrat',
+    strategy: 'winstrat',
+    'mock-interview-simulator': 'mock',
+    mockinterview: 'mock',
+    questions: 'common',
+    qa: 'common',
+    qna: 'common',
+    'accounting-questions': 'accounting',
+    'body-language': 'body',
+    jd: 'jdgen',
+    'jd-question-generator': 'jdgen',
+    'salary-negotiation': 'salary',
+  };
+  const normalized = aliases[raw] || raw;
+  return INTERVIEW_SUBTAB_IDS.has(normalized) ? normalized : null;
+}
+
+function tabHref(tabId, opts = {}) {
+  const base = TAB_ROUTES[tabId] || `/?tab=${encodeURIComponent(tabId || DEFAULT_APP_TAB)}`;
+  const [rawPath, rawQuery = ''] = base.split('?');
+  const params = new URLSearchParams(rawQuery);
+  const interviewSub = normalizeInterviewSub(opts.interviewSub || opts.sub);
+  if (tabId === 'interview' && interviewSub && interviewSub !== 'winstrat') params.set('sub', interviewSub);
+  if (opts.courseId) params.set('course', opts.courseId);
+  const qs = params.toString();
+  return `${rawPath || '/'}${qs ? `?${qs}` : ''}`;
+}
+
+function readAppRoute() {
+  if (typeof window === 'undefined') {
+    return { tab: DEFAULT_APP_TAB, interviewSub: null, explicit: false, courseId: null };
+  }
+  const path = normalizePath(window.location.pathname);
+  const params = new URLSearchParams(window.location.search);
+  const route = ROUTE_TO_TAB[path] || null;
+  const queryTab = params.get('tab');
+  const queryTabIsTopLevel = queryTab && VALID_APP_TABS.has(queryTab);
+  const queryTabAsInterviewSub = normalizeInterviewSub(queryTab);
+  let tab = queryTabIsTopLevel ? queryTab : (route?.tab || DEFAULT_APP_TAB);
+  let interviewSub = normalizeInterviewSub(params.get('sub')) || route?.interviewSub || null;
+
+  if (tab === 'mockinterview') {
+    tab = 'interview';
+    interviewSub = 'mock';
+  } else if (tab === 'interview' && queryTabAsInterviewSub) {
+    interviewSub = queryTabAsInterviewSub;
+  }
+
+  return {
+    tab: VALID_APP_TABS.has(tab) ? tab : DEFAULT_APP_TAB,
+    interviewSub,
+    explicit: path !== '/' || params.has('tab') || params.has('sub') || params.has('course'),
+    courseId: params.get('course') || null,
+  };
+}
+
+function writeAppRoute(tabId, opts = {}) {
+  if (typeof window === 'undefined' || !window.history) return;
+  const href = tabHref(tabId, opts);
+  const method = opts.replace ? 'replaceState' : 'pushState';
+  window.history[method]({ tab: tabId, interviewSub: opts.interviewSub || null }, '', href);
+}
+
+function shouldHandleInAppClick(e) {
+  return e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey && !e.defaultPrevented;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // SHARED: ANTHROPIC API HELPER
@@ -1236,7 +1364,91 @@ function WelcomeOverlay({ name, onClose }) {
 
 export default function BookkeeperProToolkit() {
   const { user, profile, loading, recovery, signOut } = useAuth();
-  const [tab, setTab] = useState('dashboard');
+  const initialRouteRef = useRef(null);
+  if (!initialRouteRef.current) initialRouteRef.current = readAppRoute();
+
+  const [tab, setTabState] = useState(initialRouteRef.current.tab);
+  const [interviewSubRoute, setInterviewSubRoute] = useState(initialRouteRef.current.interviewSub);
+  const [visitedTabs, setVisitedTabs] = useState(() => new Set([initialRouteRef.current.tab]));
+  const mainRef = useRef(null);
+  const activeTabRef = useRef(initialRouteRef.current.tab);
+  const scrollPositionsRef = useRef({});
+
+  const rememberScroll = (tabId = activeTabRef.current) => {
+    if (!mainRef.current || !tabId) return;
+    const top = mainRef.current.scrollTop || 0;
+    scrollPositionsRef.current[tabId] = top;
+    try { sessionStorage.setItem(`nav:scroll:${tabId}`, String(top)); } catch {}
+  };
+
+  const restoreScroll = (tabId) => {
+    if (!mainRef.current || !tabId) return;
+    let top = scrollPositionsRef.current[tabId] || 0;
+    try {
+      const stored = sessionStorage.getItem(`nav:scroll:${tabId}`);
+      if (stored != null) top = parseInt(stored, 10) || 0;
+    } catch {}
+    requestAnimationFrame(() => {
+      if (mainRef.current) mainRef.current.scrollTop = top;
+    });
+  };
+
+  const setTab = (nextTab, opts = {}) => {
+    const isLegacyMock = nextTab === 'mockinterview';
+    const normalizedTab = isLegacyMock ? 'interview' : nextTab;
+    if (!VALID_APP_TABS.has(nextTab) && !VALID_APP_TABS.has(normalizedTab)) return;
+    const nextInterviewSub = normalizeInterviewSub(opts.interviewSub || opts.sub) || (isLegacyMock ? 'mock' : null);
+    rememberScroll();
+    setTabState(normalizedTab);
+    if (normalizedTab === 'interview' && nextInterviewSub) setInterviewSubRoute(nextInterviewSub);
+    writeAppRoute(normalizedTab, { interviewSub: nextInterviewSub, replace: opts.replace });
+  };
+
+  useEffect(() => {
+    setVisitedTabs(prev => {
+      if (prev.has(tab)) return prev;
+      const next = new Set(prev);
+      next.add(tab);
+      return next;
+    });
+    restoreScroll(tab);
+    activeTabRef.current = tab;
+  }, [tab]);
+
+  useEffect(() => {
+    if (!user?.id || initialRouteRef.current.explicit) return;
+    let active = true;
+    window.storage.get('nav:lastTab')
+      .then(r => {
+        const saved = r?.value;
+        if (active && saved && VALID_APP_TABS.has(saved) && saved !== tab) setTab(saved, { replace: true });
+      })
+      .catch(() => {});
+    return () => { active = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
+
+  useEffect(() => {
+    if (!user?.id) return;
+    window.storage.set('nav:lastTab', tab).catch(() => {});
+  }, [user?.id, tab]);
+
+  useEffect(() => {
+    const onPopState = () => {
+      rememberScroll();
+      const next = readAppRoute();
+      setTabState(next.tab);
+      setInterviewSubRoute(next.interviewSub);
+    };
+    window.addEventListener('popstate', onPopState);
+    window.addEventListener('beforeunload', rememberScroll);
+    return () => {
+      window.removeEventListener('popstate', onPopState);
+      window.removeEventListener('beforeunload', rememberScroll);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Mobile nav drawer (the sidebar is a static column on lg+, an off-canvas
   // drawer below it). Auto-closes whenever the active tab changes.
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -1277,7 +1489,7 @@ export default function BookkeeperProToolkit() {
       desc: 'Build your foundation',
       tabs: [
         { id: 'course',     label: 'Accounting 101',         icon: BookOpen },
-        { id: 'qbomastery', label: 'QuickBooks Online Mastering', icon: GraduationCap },
+        { id: 'qbomastery', label: 'QuickBooks Online Mastery', icon: GraduationCap },
         { id: 'industryacc',label: 'Industry Accounting',    icon: Building2 },
         { id: 'ustax',      label: 'US Tax 101',             icon: Landmark },
         { id: 'chat',       label: 'ProAdvisor Chat',        icon: MessageCircle },
@@ -1293,7 +1505,7 @@ export default function BookkeeperProToolkit() {
       groups: [
         { key: 'self-discovery', label: 'Self Discovery',          tabIds: ['brand'] },
         { key: 'profile-opt',    label: 'Profile Optimization',    tabIds: ['resumestrategy', 'linkedinopt'] },
-        { key: 'interview',      label: 'Interview',               tabIds: ['coachalex', 'interview', 'mockinterview', 'qbdiag'] },
+        { key: 'interview',      label: 'Interview',               tabIds: ['coachalex', 'interview', 'qbdiag'] },
         { key: 'proposal',       label: 'Proposal / Cover Letters', tabIds: ['painpoints', 'proposal'] },
       ],
       tabs: [
@@ -1301,11 +1513,10 @@ export default function BookkeeperProToolkit() {
         { id: 'brand',         label: 'Authentic Branding',       icon: User },
         // Profile Optimization
         { id: 'resumestrategy', label: 'Resume Winning Strategy',  icon: GraduationCap },
-        { id: 'linkedinopt',   label: 'LinkedIn Optimizer',       icon: Linkedin },
+        { id: 'linkedinopt',   label: 'Book 1-on-1 with Alex',     icon: CalendarCheck },
         // Interview
-        { id: 'coachalex',     label: 'Coach Alex AI',            icon: MessageCircle },
+        { id: 'coachalex',     label: 'Personalized Coaching With Alex', icon: HeartHandshake },
         { id: 'interview',     label: 'Job Interview Mastery',     icon: Mic },
-        { id: 'mockinterview', label: 'Mock Interview Simulator', icon: Mic },
         { id: 'qbdiag',        label: 'Free QB Diagnostic',       icon: Shield },
         // Proposal / Cover Letters
         { id: 'painpoints',    label: 'Painpoints & Solutions',   icon: Target },
@@ -1379,6 +1590,10 @@ export default function BookkeeperProToolkit() {
   const [editingStageId, setEditingStageId] = useState(null);
   const [editingGroupKey, setEditingGroupKey] = useState(null);
   const [storageReady, setStorageReady] = useState(false);
+  // Desktop-only icon-rail collapse (mobile keeps its existing off-canvas drawer). Default = expanded,
+  // so the look is unchanged until the user collapses it; the saved preference takes over after load.
+  const [railCollapsed, setRailCollapsed] = useState(false);
+  const toggleRail = () => setRailCollapsed(v => !v);
 
   // Global label overrides: { item_key: custom_label } loaded from Supabase (every user reads
   // them, so the whole app shows the admin's labels). `draftLabels` holds an admin's in-progress
@@ -1520,6 +1735,10 @@ export default function BookkeeperProToolkit() {
               if (Array.isArray(arr)) setExpandedGroups(new Set(arr));
             } catch (e) {/* ignore */}
           }
+          const railRes = await window.storage.get('sidebar:railCollapsed').catch(() => null);
+          if (!cancelled && railRes && railRes.value != null) {
+            setRailCollapsed(railRes.value === 'true');
+          }
         }
       } catch (e) {/* ignore */}
       if (!cancelled) setStorageReady(true);
@@ -1559,6 +1778,20 @@ export default function BookkeeperProToolkit() {
       window.storage.set('sidebar:expandedGroups', JSON.stringify(Array.from(expandedGroups))).catch(() => {});
     }
   }, [expandedGroups, storageReady]);
+
+  // Persist desktop icon-rail collapse preference on change
+  useEffect(() => {
+    if (!storageReady) return;
+    if (typeof window !== 'undefined' && window.storage) {
+      window.storage.set('sidebar:railCollapsed', String(railCollapsed)).catch(() => {});
+    }
+  }, [railCollapsed, storageReady]);
+
+  // Customizing labels requires the full sidebar (you can't rename what the rail hides), so entering
+  // edit mode force-expands. Keeps the admin label-customization workflow fully intact.
+  useEffect(() => {
+    if (editMode && railCollapsed) setRailCollapsed(false);
+  }, [editMode, railCollapsed]);
 
   // Toggle a stage open/closed
   const toggleStage = (stageId) => {
@@ -1735,6 +1968,16 @@ export default function BookkeeperProToolkit() {
     }
   };
 
+  useEffect(() => {
+    if (!editMode || Object.keys(draftLabels).length === 0) return;
+    const onBeforeUnload = (e) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [editMode, draftLabels]);
+
   // ─── Drag and drop handlers (tab within a stage, or stage reorder) ──
   const dragRef = useRef({ kind: null, stageId: null, tabId: null });
 
@@ -1798,6 +2041,43 @@ export default function BookkeeperProToolkit() {
       return next;
     });
     dragRef.current = { kind: null, stageId: null, tabId: null };
+  };
+
+  const renderTabContent = (tabId) => {
+    switch (tabId) {
+      case 'dashboard': return <Dashboard goto={setTab} />;
+      case 'coa': return <CoaGenerator />;
+      case 'course': return <Course />;
+      case 'qbomastery': return <QBOMastery />;
+      case 'industryacc': return <IndustryAccounting />;
+      case 'ustax': return <USTax101 />;
+      case 'bankfeed': return <BankFeed />;
+      case 'converter': return <StatementConverter />;
+      case 'chat': return <ProChat />;
+      case 'coachalex': return <CoachAlexChat />;
+      case 'cpaai': return <CPAAIChat />;
+      case 'resumestrategy': return <ResumeStrategy />;
+      case 'interview': return <InterviewPrep initialSub={interviewSubRoute || undefined} />;
+      case 'brand': return <AuthenticBranding standalone />;
+      case 'painpoints': return <PainPointsGenerator />;
+      case 'proposal': return <ProposalGenerator />;
+      case 'engagement': return <EngagementLetter />;
+      case 'invoice': return <InvoiceCreator />;
+      case 'emails': return <EmailTemplates />;
+      case 'workflow': return <MonthlyWorkflow />;
+      case 'monthend': return <MonthEndChecklist />;
+      case 'yearendcheck': return <YearEndChecklist />;
+      case 'form1099': return <Form1099 />;
+      case 'salestax': return <SalesTax />;
+      case 'calculators': return <AccountingCalculators />;
+      case 'onboarding': return <Onboarding />;
+      case 'linkedinopt': return <LinkedInOptimizer />;
+      case 'qbdiag': return <QBDiagnostic />;
+      case 'sopgen': return <SOPGenerator />;
+      case 'budgeting': return <BudgetingTool />;
+      case 'forecasting': return <ForecastingTool />;
+      default: return <Dashboard goto={setTab} />;
+    }
   };
 
   // ── Auth gate ── unauthenticated users never see the app shell below.
@@ -2137,7 +2417,7 @@ export default function BookkeeperProToolkit() {
         backdropFilter: 'blur(40px) saturate(180%)',
         WebkitBackdropFilter: 'blur(40px) saturate(180%)',
         borderRight: `1px solid ${GLASS.borderSoft}`,
-      }} className={`w-72 flex-shrink-0 flex flex-col h-screen z-50 fixed inset-y-0 left-0 transform transition-transform duration-300 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:relative lg:inset-auto lg:translate-x-0 lg:transition-none`}>
+      }} className={`w-72 ${railCollapsed ? 'lg:w-[76px]' : 'lg:w-72'} flex-shrink-0 flex flex-col h-screen z-50 fixed inset-y-0 left-0 transform transition-transform duration-300 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:relative lg:inset-auto lg:translate-x-0 lg:transition-[width] lg:duration-300 lg:ease-in-out`}>
         {/* Subtle right-edge highlight */}
         <div className="absolute top-0 right-0 bottom-0 w-px" style={{ background: 'linear-gradient(180deg, transparent 0%, rgba(10,132,255,0.08) 50%, transparent 100%)' }} />
 
@@ -2151,7 +2431,7 @@ export default function BookkeeperProToolkit() {
           <X size={18} style={{ color: C.textMute }} />
         </button>
 
-        <div className="px-5 py-5" style={{ borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+        <div className={`px-5 py-5 ${railCollapsed ? 'lg:hidden' : ''}`} style={{ borderBottom: `1px solid ${GLASS.borderSoft}` }}>
           <div className="flex items-center gap-3">
             <img
               src={LOGO_DATA_URI}
@@ -2185,6 +2465,16 @@ export default function BookkeeperProToolkit() {
                 built by <span style={{ color: C.primary, fontWeight: 600 }}>Alex Sagun</span>
               </div>
             </div>
+            {/* Collapse to icon-rail — desktop only (mobile uses the X / hamburger) */}
+            <button
+              onClick={toggleRail}
+              title="Collapse sidebar"
+              aria-label="Collapse sidebar"
+              className="hidden lg:flex flex-shrink-0 items-center justify-center rounded-lg transition hover:opacity-80"
+              style={{ width: 30, height: 30, background: 'rgba(15,18,23,0.04)', border: `1px solid ${GLASS.borderSoft}`, color: C.textMute }}
+            >
+              <PanelLeftClose size={16} />
+            </button>
           </div>
 
           {/* Signed-in identity + sign out */}
@@ -2260,7 +2550,94 @@ export default function BookkeeperProToolkit() {
           )}
         </div>
 
-        <nav className="flex-1 py-2 overflow-y-auto">
+        {/* Rail header — desktop only, shown when collapsed (logo + expand toggle + compact identity) */}
+        {railCollapsed && (
+          <div className="hidden lg:flex flex-col items-center gap-3 px-2 py-4" style={{ borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+            <img src={LOGO_DATA_URI} alt="Get Hired With Alex"
+              style={{ width: 38, height: 38, objectFit: 'contain', filter: 'drop-shadow(0 4px 12px rgba(10,132,255,0.18))' }} />
+            <button
+              onClick={toggleRail}
+              title="Expand sidebar"
+              aria-label="Expand sidebar"
+              className="flex items-center justify-center rounded-lg transition hover:opacity-80"
+              style={{ width: 36, height: 36, background: 'rgba(15,18,23,0.04)', border: `1px solid ${GLASS.borderSoft}`, color: C.textMute }}
+            >
+              <PanelLeftOpen size={18} />
+            </button>
+            {user && (
+              <div className="flex flex-col items-center gap-2 mt-1">
+                <div className="flex items-center justify-center flex-shrink-0 rounded-full text-white text-[11px] font-bold"
+                  title={profile?.full_name || user.email}
+                  style={{ width: 30, height: 30, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+                  {(((profile?.full_name || user.email || '?').trim()[0]) || '?').toUpperCase()}
+                </div>
+                <button onClick={() => signOut()} title="Sign out" aria-label="Sign out"
+                  className="flex-shrink-0 p-1.5 rounded-lg transition hover:opacity-80" style={{ color: C.textMute }}>
+                  <LogOut size={15} />
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Rail nav — desktop only, flat icon list (every tool reachable in one click, with tooltips) */}
+        {railCollapsed && (
+          <nav className="hidden lg:flex flex-col flex-1 py-3 overflow-y-auto items-center gap-1">
+            {stages.map((stage, sIdx) => {
+              const hasNumber = !!stage.number;
+              const containsActive = stage.tabs.some(t => t.id === tab);
+              return (
+                <React.Fragment key={`rail-${stage.id}`}>
+                  {hasNumber && (
+                    <div className="flex flex-col items-center w-full mt-1.5 mb-0.5">
+                      {sIdx > 0 && <div className="h-px w-7 mb-2" style={{ background: GLASS.borderSoft }} />}
+                      <span style={{
+                        background: containsActive ? `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` : 'rgba(10,132,255,0.10)',
+                        color: containsActive ? 'white' : C.primary,
+                        fontFamily: fontMono,
+                        boxShadow: containsActive ? `inset 0 1px 0 rgba(255,255,255,0.35), 0 2px 6px -2px ${C.primary}55` : 'none',
+                      }} className="text-[9px] font-bold px-1.5 py-0.5 rounded-md tracking-wider flex-shrink-0">
+                        {stage.number}
+                      </span>
+                    </div>
+                  )}
+                  {stage.tabs.map(t => {
+                    const Icon = t.icon;
+                    const active = tab === t.id;
+                    const tLabel = effLabel(tabItemKey(t.id), t.label);
+                    return (
+                      <a
+                        key={t.id}
+                        href={tabHref(t.id)}
+                        onClick={(e) => {
+                          if (!shouldHandleInAppClick(e)) return;
+                          e.preventDefault();
+                          setTab(t.id);
+                        }}
+                        title={tLabel}
+                        aria-label={tLabel}
+                        className="flex items-center justify-center rounded-xl flex-shrink-0"
+                        style={{
+                          width: 44,
+                          height: 44,
+                          background: active ? 'rgba(10,132,255,0.12)' : 'transparent',
+                          color: active ? C.primary : C.textMute,
+                          boxShadow: active ? `inset 0 0 0 1px rgba(10,132,255,0.18)` : 'none',
+                          transition: `background 200ms ${EASE}, color 200ms ${EASE}`,
+                        }}
+                        onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'rgba(15,18,23,0.03)'; }}
+                        onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}>
+                        <Icon size={18} />
+                      </a>
+                    );
+                  })}
+                </React.Fragment>
+              );
+            })}
+          </nav>
+        )}
+
+        <nav className={`flex-1 py-2 overflow-y-auto ${railCollapsed ? 'lg:hidden' : ''}`}>
           {stages.map((stage, sIdx) => {
             const containsActive = stage.tabs.some(t => t.id === tab);
             const isCollapsed = collapsedStages.has(stage.id);
@@ -2361,10 +2738,10 @@ export default function BookkeeperProToolkit() {
                               style={{ fontSize: 13, padding: '4px 10px' }}
                             />
                           </div>
-                        ) : (
+                        ) : editMode ? (
                           <button
-                            onClick={() => editMode ? setEditingTabId(t.id) : setTab(t.id)}
-                            className={`flex-1 text-left ${hasNumber ? 'pl-6' : 'pl-3'} pr-3 py-2 flex items-center gap-3 text-[13px] rounded-lg ${active && !editMode ? 'nav-item-active' : ''}`}
+                            onClick={() => setEditingTabId(t.id)}
+                            className={`flex-1 text-left ${hasNumber ? 'pl-6' : 'pl-3'} pr-3 py-2 flex items-center gap-3 text-[13px] rounded-lg`}
                             style={{
                               color: active ? C.primary : C.textSoft,
                               fontWeight: active ? 600 : 500,
@@ -2372,11 +2749,44 @@ export default function BookkeeperProToolkit() {
                             }}
                             onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'rgba(15,18,23,0.03)'; }}
                             onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}
-                            title={editMode ? 'Click to rename' : ''}>
+                            title="Click to rename">
                             <Icon size={15} style={{ color: active ? C.primary : C.textMute, flexShrink: 0 }} />
                             <span className="flex-1 truncate">{tLabel}</span>
-                            {editMode && <Edit3 size={11} style={{ color: C.textMute }} className="opacity-0 group-hover:opacity-100 transition" />}
+                            <Edit3 size={11} style={{ color: C.textMute }} className="opacity-0 group-hover:opacity-100 transition" />
                           </button>
+                        ) : (
+                          <>
+                            <a
+                              href={tabHref(t.id)}
+                              onClick={(e) => {
+                                if (!shouldHandleInAppClick(e)) return;
+                                e.preventDefault();
+                                setTab(t.id);
+                              }}
+                              className={`flex-1 text-left ${hasNumber ? 'pl-6' : 'pl-3'} pr-3 py-2 flex items-center gap-3 text-[13px] rounded-lg ${active ? 'nav-item-active' : ''}`}
+                              style={{
+                                color: active ? C.primary : C.textSoft,
+                                fontWeight: active ? 600 : 500,
+                                transition: `background 200ms ${EASE}, color 200ms ${EASE}`,
+                              }}
+                              onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'rgba(15,18,23,0.03)'; }}
+                              onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}>
+                              <Icon size={15} style={{ color: active ? C.primary : C.textMute, flexShrink: 0 }} />
+                              <span className="flex-1 truncate">{tLabel}</span>
+                            </a>
+                            <a
+                              href={tabHref(t.id)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              aria-label={`Open ${tLabel} in new tab`}
+                              title={`Open ${tLabel} in new tab`}
+                              className="mr-2 flex-shrink-0 rounded-md p-1.5 opacity-60 transition group-hover:opacity-100 focus:opacity-100"
+                              style={{ color: C.textMute }}
+                              onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(15,18,23,0.05)'; }}
+                              onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}>
+                              <ExternalLink size={12} />
+                            </a>
+                          </>
                         )}
                       </div>
                     );
@@ -2469,7 +2879,7 @@ export default function BookkeeperProToolkit() {
           })}
         </nav>
 
-        <div className="px-6 py-4 text-[11px]" style={{ borderTop: `1px solid ${GLASS.borderSoft}`, color: C.textMute }}>
+        <div className={`px-6 py-4 text-[11px] ${railCollapsed ? 'lg:hidden' : ''}`} style={{ borderTop: `1px solid ${GLASS.borderSoft}`, color: C.textMute }}>
           <div className="flex items-center gap-2 mb-1">
             <Award size={12} style={{ color: C.primary }} />
             <span style={{ color: C.textSoft, fontWeight: 500, lineHeight: 1.35 }}>Making Success Easier</span>
@@ -2479,7 +2889,12 @@ export default function BookkeeperProToolkit() {
       </aside>
 
       {/* MAIN */}
-      <main className="flex-1 overflow-y-auto">
+      <main
+        ref={mainRef}
+        onScroll={() => {
+          if (mainRef.current) scrollPositionsRef.current[tab] = mainRef.current.scrollTop || 0;
+        }}
+        className="flex-1 overflow-y-auto">
         {/* Mobile top bar — hamburger opens the drawer (hidden on lg+) */}
         <div
           className="lg:hidden sticky top-0 z-30 flex items-center gap-3 px-4 py-3"
@@ -2501,45 +2916,18 @@ export default function BookkeeperProToolkit() {
         {/* Phase 2 paywall hooks here — to restrict to paid students, wrap this
             <div> so that `!profile?.is_paid && !FREE_TABS.has(tab)` renders a
             <PaywallOverlay/> instead of the tool. profile.is_paid comes from useAuth(). */}
-        <div key={tab} className="fade-in p-4 sm:p-6 lg:p-10 max-w-7xl mx-auto">
-          {tab === 'dashboard'   && <Dashboard goto={setTab} />}
-          {tab === 'coa'         && <CoaGenerator />}
-          {tab === 'course'      && <Course />}
-          {tab === 'qbomastery'  && <QBOMastery />}
-          {tab === 'industryacc' && <IndustryAccounting />}
-          {tab === 'ustax'       && <USTax101 />}
-          {tab === 'bankfeed'    && <BankFeed />}
-          {tab === 'converter'   && <StatementConverter />}
-          {tab === 'chat'        && <ProChat />}
-          {tab === 'coachalex'   && <CoachAlexChat />}
-          {tab === 'cpaai'       && <CPAAIChat />}
-          {tab === 'resumestrategy' && <ResumeStrategy />}
-          {tab === 'interview'   && <InterviewPrep />}
-          {tab === 'brand'       && <AuthenticBranding standalone />}
-          {tab === 'painpoints'  && <PainPointsGenerator />}
-          {/* hidden: Client Portal Demo (removed from toolkit) — uncomment to restore */}
-          {/* {tab === 'portal'      && <ClientPortalDemo />} */}
-          {tab === 'proposal'    && <ProposalGenerator />}
-          {tab === 'engagement'  && <EngagementLetter />}
-          {tab === 'invoice'     && <InvoiceCreator />}
-          {tab === 'emails'      && <EmailTemplates />}
-          {tab === 'workflow'    && <MonthlyWorkflow />}
-          {tab === 'monthend'    && <MonthEndChecklist />}
-          {tab === 'yearendcheck'&& <YearEndChecklist />}
-          {tab === 'form1099'    && <Form1099 />}
-          {tab === 'salestax'    && <SalesTax />}
-          {tab === 'calculators' && <AccountingCalculators />}
-          {tab === 'onboarding'  && <Onboarding />}
-          {/* Training & Skills additions */}
-          {/* Job Application additions */}
-          {tab === 'linkedinopt' && <LinkedInOptimizer />}
-          {tab === 'mockinterview' && <MockInterviewSimulator />}
-          {tab === 'qbdiag'      && <QBDiagnostic />}
-          {/* Daily additions */}
-          {tab === 'sopgen'      && <SOPGenerator />}
-          {tab === 'budgeting'   && <BudgetingTool />}
-          {tab === 'forecasting' && <ForecastingTool />}
-        </div>
+        {Array.from(visitedTabs).map(tabId => {
+          const active = tabId === tab;
+          return (
+            <div
+              key={tabId}
+              hidden={!active}
+              aria-hidden={!active}
+              className={`${active ? 'fade-in ' : ''}p-4 sm:p-6 lg:p-10 max-w-7xl mx-auto`}>
+              {renderTabContent(tabId)}
+            </div>
+          );
+        })}
       </main>
     </div>
   );
@@ -2563,7 +2951,7 @@ function Dashboard({ goto }) {
       desc: 'Build your foundation as a US bookkeeper',
       tiles: [
         { id: 'course',      label: 'Accounting 101',      desc: '8 modules · self-paced',          icon: BookOpen,        color: '#1E40AF' },
-        { id: 'qbomastery',  label: 'QBO Mastering Programme', desc: 'Video course · certificate',  icon: GraduationCap,   color: '#2563EB' },
+        { id: 'qbomastery',  label: 'QBO Mastery Program', desc: 'Video course · certificate',  icon: GraduationCap,   color: '#2563EB' },
         { id: 'industryacc', label: 'Industry Accounting', desc: '12 industries · QBO workflows',   icon: Building2,       color: '#3B82F6' },
         { id: 'ustax',       label: 'US Tax 101',          desc: 'Forms, deadlines, IRS links',     icon: Landmark,        color: '#0A1E3F' },
         { id: 'chat',        label: 'ProAdvisor Chat',     desc: 'Live mentor for clean-ups',       icon: MessageCircle,   color: '#0EA5E9' },
@@ -2578,7 +2966,7 @@ function Dashboard({ goto }) {
       groups: [
         { label: 'Self Discovery',          tabIds: ['brand'] },
         { label: 'Profile Optimization',    tabIds: ['resumestrategy', 'linkedinopt'] },
-        { label: 'Interview',               tabIds: ['coachalex', 'interview', 'mockinterview', 'qbdiag'] },
+        { label: 'Interview',               tabIds: ['coachalex', 'interview', 'qbdiag'] },
         { label: 'Proposal / Cover Letters', tabIds: ['painpoints', 'proposal'] },
       ],
       tiles: [
@@ -2586,11 +2974,10 @@ function Dashboard({ goto }) {
         { id: 'brand',         label: 'Authentic Branding',       desc: 'Psychological deep-dive to your brand', icon: User,      color: '#0A1E3F' },
         // Profile Optimization
         { id: 'resumestrategy', label: 'Resume Winning Strategy',  desc: 'Video courses · certificates',           icon: GraduationCap, color: '#1E40AF' },
-        { id: 'linkedinopt',   label: 'LinkedIn Optimizer',       desc: '1-on-1 LinkedIn optimization session',  icon: Linkedin,  color: '#0EA5E9' },
+        { id: 'linkedinopt',   label: 'Book 1-on-1 with Alex',     desc: '1-on-1 profile optimization session with Alex',  icon: CalendarCheck,  color: '#0EA5E9' },
         // Interview
-        { id: 'coachalex',     label: 'Coach Alex AI',            desc: 'Book 1-on-1 coaching with Alex',  icon: MessageCircle, color: '#0EA5E9' },
-        { id: 'interview',     label: 'Job Interview Mastery',     desc: 'Strategy course + CAR + Q&A + negotiation',  icon: Mic,       color: '#3B82F6' },
-        { id: 'mockinterview', label: 'Mock Interview Simulator', desc: 'Guided video + external simulator',     icon: Mic,       color: '#059669' },
+        { id: 'coachalex',     label: 'Personalized Coaching With Alex', desc: 'Personalized 1-on-1 coaching with Alex',  icon: HeartHandshake, color: '#0EA5E9' },
+        { id: 'interview',     label: 'Job Interview Mastery',     desc: 'Strategy course + mock simulator + Q&A + negotiation',  icon: Mic,       color: '#3B82F6' },
         { id: 'qbdiag',        label: 'Free QB Diagnostic',       desc: 'Hook prospects · audit P&L + BS',       icon: Shield,    color: '#DC2626' },
         // Proposal / Cover Letters
         { id: 'painpoints',    label: 'Painpoints & Solutions',   desc: 'AI-generated by industry',              icon: Target,    color: '#0EA5E9' },
@@ -3049,15 +3436,31 @@ function certModuleType(slug = '') {
   return 'general';
 }
 
+// Certificates always present each course as "… Program" — e.g. "Resume Winning Strategy" →
+// "Resume Winning Strategy Program" and "QuickBooks Mastery Course" → "QuickBooks Mastery Program".
+// We strip any trailing Course/Program/Programme on the stored title (course.title, editable in
+// Supabase) and append a single " Program". This affects ONLY the certificate's displayed title and
+// the downloaded PDF filename; catalog cards and the course-player header keep the stored title.
+function certificateTitle(rawTitle = '') {
+  const base = String(rawTitle).replace(/\s*(course|programme|program)\s*$/i, '').trim();
+  return base ? `${base} Program` : 'Program';
+}
+
+const COURSE_ROW_SELECT = 'id,slug,title,subtitle,description,month,course_date,published,position,cover_path,source_course_id,created_at,updated_at';
+const COURSE_MODULE_SELECT = 'id,course_id,title,position';
+const COURSE_LESSON_SELECT = 'id,module_id,course_id,title,type,video_url,video_provider,storage_path,text_content,duration_label,position';
+const COURSE_COMPLETION_SELECT = 'id,user_id,course_id,completed_at,created_at';
+const FEATURE_GUIDE_SELECT = 'feature_key,title,description,video_url,video_path,video_provider,external_url,is_active,updated_by,created_at,updated_at';
+
 function CourseProgram({
   slug = 'qbo-mastery',
   courseId = null,                                       // catalog mode: load by id instead of slug
   onBack = null,                                         // catalog mode: show "← All courses" + its own course header
   eyebrow = 'Video Course',
-  courseTitle = 'QuickBooks Online Mastering Programme',
+  courseTitle = 'QuickBooks Online Mastery Program',
   defaultSubtitle = 'From setup to month-end — the complete QBO workflow for remote bookkeepers.',
-  certFileName = 'QBO-Mastering-Certificate.pdf',
-  comingSoonText = 'Your QuickBooks Online Mastering Programme is being prepared. Check back soon.',
+  certFileName = 'QBO-Mastery-Certificate.pdf',
+  comingSoonText = 'Your QuickBooks Online Mastery Program is being prepared. Check back soon.',
   embedded = false,                                      // hide the sticky SectionHead when nested inside a subtab
   initialNotice = null,                                  // one-time success banner (e.g. after duplicating a course)
 } = {}) {
@@ -3097,6 +3500,18 @@ function CourseProgram({
   const [certScale, setCertScale] = useState(1);
   const [certBoxH, setCertBoxH]   = useState(0);
 
+  const courseDraftFromRow = (row) => ({
+    title: row?.title || '',
+    subtitle: row?.subtitle || '',
+    description: row?.description || '',
+    month: row?.month || '',
+    course_date: row?.course_date || '',
+  });
+  const courseMetaDraftKey = (id) => `course:${id}:metaDraft`;
+  const lessonEditorDraftKey = (id) => `course:${id}:lessonDraft`;
+  const courseModeKey = (id) => `course:${id}:mode`;
+  const activeLessonKey = (id) => `course:${id}:activeLessonId`;
+
   // Scale the fixed-width (900px) certificate card down to fit its container, so the on-screen
   // preview is smaller/responsive while certRef keeps its intrinsic size for full-quality PDF/print.
   useLayoutEffect(() => {
@@ -3119,21 +3534,30 @@ function CourseProgram({
   async function load() {
     setLoading(true); setErr(''); setNotConfigured(false);
     try {
-      let cq = supabase.from('courses').select('*');
+      let cq = supabase.from('courses').select(COURSE_ROW_SELECT);
       cq = courseId ? cq.eq('id', courseId) : cq.eq('slug', slug);
       const { data: courseRow, error: cErr } = await cq.maybeSingle();
       if (cErr) throw cErr;
       if (!courseRow) { setCourse(null); setModules([]); setLoading(false); return; }
       setCourse(courseRow);
-      setCourseDraft({
-        title: courseRow.title || '', subtitle: courseRow.subtitle || '',
-        description: courseRow.description || '', month: courseRow.month || '',
-        course_date: courseRow.course_date || '',
-      });
+      let nextCourseDraft = courseDraftFromRow(courseRow);
+      if (isAdmin && typeof window !== 'undefined' && window.storage) {
+        try {
+          const stored = await window.storage.get(courseMetaDraftKey(courseRow.id));
+          if (stored?.value) {
+            const parsed = JSON.parse(stored.value);
+            if (parsed?.courseUpdatedAt === (courseRow.updated_at || '') && parsed?.draft) {
+              nextCourseDraft = { ...nextCourseDraft, ...parsed.draft };
+              setNotice(n => n || 'Restored unsaved course changes from this browser.');
+            }
+          }
+        } catch {}
+      }
+      setCourseDraft(nextCourseDraft);
 
       const [{ data: mods, error: mErr }, { data: lessons, error: lErr }] = await Promise.all([
-        supabase.from('course_modules').select('*').eq('course_id', courseRow.id).order('position'),
-        supabase.from('course_lessons').select('*').eq('course_id', courseRow.id).order('position'),
+        supabase.from('course_modules').select(COURSE_MODULE_SELECT).eq('course_id', courseRow.id).order('position'),
+        supabase.from('course_lessons').select(COURSE_LESSON_SELECT).eq('course_id', courseRow.id).order('position'),
       ]);
       if (mErr) throw mErr;
       if (lErr) throw lErr;
@@ -3145,7 +3569,7 @@ function CourseProgram({
       const [{ data: prog }, { data: comp }] = await Promise.all([
         supabase.from('lesson_progress').select('lesson_id')
           .eq('course_id', courseRow.id).eq('user_id', user.id),
-        supabase.from('course_completions').select('*')
+        supabase.from('course_completions').select(COURSE_COMPLETION_SELECT)
           .eq('course_id', courseRow.id).eq('user_id', user.id).maybeSingle(),
       ]);
       const done = new Set((prog || []).map(p => p.lesson_id));
@@ -3153,7 +3577,33 @@ function CourseProgram({
       setCompletion(comp || null);
 
       const all = nested.flatMap(m => m.lessons);
-      setActiveLessonId(prev => prev || (all.find(l => !done.has(l.id)) || all[0])?.id || null);
+      let storedActiveLessonId = null;
+      if (typeof window !== 'undefined' && window.storage) {
+        try { storedActiveLessonId = (await window.storage.get(activeLessonKey(courseRow.id)))?.value || null; } catch {}
+      }
+      setActiveLessonId(prev => {
+        if (prev && all.some(l => l.id === prev)) return prev;
+        if (storedActiveLessonId && all.some(l => l.id === storedActiveLessonId)) return storedActiveLessonId;
+        return (all.find(l => !done.has(l.id)) || all[0])?.id || null;
+      });
+      if (!initialNotice && typeof window !== 'undefined' && window.storage) {
+        try {
+          const storedMode = (await window.storage.get(courseModeKey(courseRow.id)))?.value;
+          if (['learn', 'edit', 'certificate'].includes(storedMode)) setMode(storedMode);
+        } catch {}
+      }
+      if (isAdmin && typeof window !== 'undefined' && window.storage) {
+        try {
+          const storedLessonDraft = await window.storage.get(lessonEditorDraftKey(courseRow.id));
+          if (storedLessonDraft?.value) {
+            const parsed = JSON.parse(storedLessonDraft.value);
+            if (parsed?.id && all.some(l => l.id === parsed.id)) {
+              setEditingLesson(parsed);
+              setNotice(n => n || 'Restored an unsaved lesson draft from this browser.');
+            }
+          }
+        } catch {}
+      }
     } catch (e) {
       logDbError('[CourseProgram] load', e, { slug, courseId });
       const msg = e?.message || '';
@@ -3170,7 +3620,7 @@ function CourseProgram({
     }
   }
 
-  useEffect(() => { if (user?.id) load(); /* eslint-disable-next-line */ }, [user?.id, courseId]);
+  useEffect(() => { if (user?.id) load(); /* eslint-disable-next-line */ }, [user?.id, courseId, isAdmin]);
   // Revoke the local preview object URL when it changes / on unmount.
   useEffect(() => () => { if (previewUrl) URL.revokeObjectURL(previewUrl); }, [previewUrl]);
 
@@ -3181,6 +3631,76 @@ function CourseProgram({
   const progressPct = totalLessons ? Math.round((completedCount / totalLessons) * 100) : 0;
   const isComplete = totalLessons > 0 && completedCount === totalLessons;
   const activeLesson = allLessons.find(l => l.id === activeLessonId) || null;
+  const savedCourseDraft = courseDraftFromRow(course);
+  const courseMetaDirty = !!(isAdmin && course && JSON.stringify(courseDraft) !== JSON.stringify(savedCourseDraft));
+  const originalEditingLesson = editingLesson ? allLessons.find(l => l.id === editingLesson.id) : null;
+  const lessonComparable = (l = {}) => ({
+    title: l.title || '',
+    type: l.type || 'video',
+    video_url: l.video_url || '',
+    video_provider: l.video_provider || null,
+    storage_path: l.storage_path || null,
+    text_content: l.text_content || '',
+    duration_label: l.duration_label || '',
+  });
+  const lessonDraftDirty = !!(isAdmin && editingLesson && originalEditingLesson &&
+    JSON.stringify(lessonComparable(editingLesson)) !== JSON.stringify(lessonComparable(originalEditingLesson)));
+  const hasUnsavedCourseWork = courseMetaDirty || lessonDraftDirty;
+
+  const clearStoredValue = (key) => {
+    if (typeof window !== 'undefined' && window.storage && key) window.storage.set(key, '').catch(() => {});
+  };
+  const clearLessonDraft = () => course?.id && clearStoredValue(lessonEditorDraftKey(course.id));
+  const closeLessonEditor = () => {
+    if (savingLesson) return;
+    if (lessonDraftDirty && !window.confirm('Discard unsaved lesson changes?')) return;
+    clearLessonDraft();
+    if (previewUrl) { URL.revokeObjectURL(previewUrl); setPreviewUrl(null); }
+    setEditingLesson(null);
+  };
+  const confirmLeaveCourse = () => !hasUnsavedCourseWork || window.confirm('You have unsaved course changes. Leave this course without saving?');
+
+  useEffect(() => {
+    if (!course?.id || !isAdmin || typeof window === 'undefined' || !window.storage) return;
+    const key = courseMetaDraftKey(course.id);
+    if (!courseMetaDirty) {
+      clearStoredValue(key);
+      return;
+    }
+    const timer = setTimeout(() => {
+      window.storage.set(key, JSON.stringify({
+        courseUpdatedAt: course.updated_at || '',
+        draft: courseDraft,
+        savedAt: new Date().toISOString(),
+      })).catch(() => {});
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [course?.id, course?.updated_at, isAdmin, courseMetaDirty, courseDraft]);
+
+  useEffect(() => {
+    if (!course?.id || !isAdmin || !editingLesson || typeof window === 'undefined' || !window.storage) return;
+    window.storage.set(lessonEditorDraftKey(course.id), JSON.stringify(editingLesson)).catch(() => {});
+  }, [course?.id, isAdmin, editingLesson]);
+
+  useEffect(() => {
+    if (!hasUnsavedCourseWork) return;
+    const onBeforeUnload = (e) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [hasUnsavedCourseWork]);
+
+  useEffect(() => {
+    if (!course?.id || !activeLessonId || typeof window === 'undefined' || !window.storage) return;
+    window.storage.set(activeLessonKey(course.id), activeLessonId).catch(() => {});
+  }, [course?.id, activeLessonId]);
+
+  useEffect(() => {
+    if (!course?.id || typeof window === 'undefined' || !window.storage) return;
+    window.storage.set(courseModeKey(course.id), mode).catch(() => {});
+  }, [course?.id, mode]);
 
   // Display + certificate metadata. Prefer the loaded course row, fall back to the prop defaults
   // (which the catalog supplies per-prefix). This keeps a course opened from the Resume/Interview
@@ -3188,7 +3708,7 @@ function CourseProgram({
   const displayTitle = course?.title || courseTitle;
   const displaySubtitle = course?.subtitle || defaultSubtitle;
   const certName = course?.title
-    ? `${course.title.replace(/[^\w]+/g, '-').replace(/^-+|-+$/g, '')}-Certificate.pdf`
+    ? `${certificateTitle(course.title).replace(/[^\w]+/g, '-').replace(/^-+|-+$/g, '')}-Certificate.pdf`
     : certFileName;
 
   // ── Learner actions ──
@@ -3215,7 +3735,7 @@ function CourseProgram({
           { onConflict: 'user_id,course_id', ignoreDuplicates: true }
         );
         if (cErr) throw cErr;
-        const { data: c2 } = await supabase.from('course_completions').select('*')
+        const { data: c2 } = await supabase.from('course_completions').select(COURSE_COMPLETION_SELECT)
           .eq('user_id', user.id).eq('course_id', course.id).maybeSingle();
         setCompletion(c2 || { completed_at: new Date().toISOString() });
       }
@@ -3253,6 +3773,7 @@ function CourseProgram({
         updated_at: new Date().toISOString(),
       }).eq('id', course.id);
       if (error) throw error;
+      clearStoredValue(courseMetaDraftKey(course.id));
       await load();
     } catch (e) { logDbError('[CourseProgram] saveMeta', e, { courseId: course.id }); setErr(describeDbError(e, 'Could not save course details.')); }
     finally { setMetaBusy(false); }
@@ -3313,7 +3834,7 @@ function CourseProgram({
       const { data, error } = await supabase.from('course_lessons').insert({
         module_id: m.id, course_id: course.id, title: 'New lesson',
         type: 'video', position: (m.lessons?.length || 0),
-      }).select('*').single();
+      }).select(COURSE_LESSON_SELECT).single();
       if (error) throw error;
       await load();
       setEditingLesson({ ...data });
@@ -3400,6 +3921,7 @@ function CourseProgram({
       // other course (e.g. a duplicate that reused this path) still references it (copy-on-write).
       if (oldPath && oldPath !== payload.storage_path) await removeMediaIfUnreferenced([oldPath]);
       if (previewUrl) { URL.revokeObjectURL(previewUrl); setPreviewUrl(null); }
+      clearLessonDraft();
       setEditingLesson(null);
       await load();
     } catch (e) { logDbError('[CourseProgram] saveLesson', e, { courseId: course?.id, lessonId: d.id }); setErr(describeDbError(e, 'Could not save lesson.')); }
@@ -3685,11 +4207,11 @@ function CourseProgram({
     const d = editingLesson;
     const detected = d.type === 'video' && d.video_provider !== 'upload' ? parseVideoUrl(d.video_url).provider : null;
     return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(15,18,23,0.45)' }} onClick={() => !savingLesson && setEditingLesson(null)}>
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(15,18,23,0.45)' }} onClick={closeLessonEditor}>
         <div className="bg-white rounded-2xl w-full max-w-xl max-h-[88vh] overflow-y-auto shadow-2xl" onClick={e => e.stopPropagation()}>
           <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between sticky top-0 bg-white">
             <div style={{ fontFamily: fontDisplay, color: NAVY }} className="font-bold">Edit lesson</div>
-            <button onClick={() => !savingLesson && setEditingLesson(null)} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
+            <button onClick={closeLessonEditor} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
           </div>
           <div className="p-5 space-y-4">
             <label className="block">
@@ -3748,7 +4270,7 @@ function CourseProgram({
             </label>
           </div>
           <div className="px-5 py-4 border-t border-slate-100 flex justify-end gap-2 sticky bottom-0 bg-white">
-            <button onClick={() => setEditingLesson(null)} disabled={savingLesson} className="px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 border border-slate-200">Cancel</button>
+            <button onClick={closeLessonEditor} disabled={savingLesson} className="px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 border border-slate-200">Cancel</button>
             <button onClick={saveLesson} disabled={savingLesson} className="px-5 py-2 rounded-xl text-white text-sm font-semibold inline-flex items-center gap-2"
               style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
               {savingLesson ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />} Save lesson
@@ -3810,7 +4332,7 @@ function CourseProgram({
               <div style={{ fontFamily: fontDisplay, fontSize: 38, fontWeight: 800, color: NAVY, margin: '6px 0 4px', maxWidth: 760, marginLeft: 'auto', marginRight: 'auto', overflowWrap: 'break-word' }}>{studentName || 'Your Name'}</div>
               <div style={{ width: 380, height: 1, background: C.border, margin: '8px auto 14px' }} />
               <div style={{ fontSize: 12, letterSpacing: '0.18em', textTransform: 'uppercase', color: C.textSoft, fontWeight: 600 }}>For successfully completing the course</div>
-              <div style={{ fontFamily: fontDisplay, fontSize: 24, fontWeight: 700, color: C.primary, margin: '6px auto 2px', maxWidth: 760, overflowWrap: 'break-word' }}>{course.title}</div>
+              <div style={{ fontFamily: fontDisplay, fontSize: 24, fontWeight: 700, color: C.primary, margin: '6px auto 2px', maxWidth: 760, overflowWrap: 'break-word' }}>{certificateTitle(course.title)}</div>
               {course.subtitle && <div style={{ fontSize: 13, color: C.textMute, maxWidth: 520, margin: '6px auto 0' }}>{course.subtitle}</div>}
               <div style={{ fontSize: 13, lineHeight: 1.6, color: C.textSoft, maxWidth: 620, margin: '12px auto 0' }}>{certDesc}</div>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginTop: 24, padding: '0 12px' }}>
@@ -3858,7 +4380,7 @@ function CourseProgram({
   // In catalog mode, give the open course a back button + its own compact header (the catalog supplies the page title).
   const backBar = onBack ? (
     <div className="mb-4 flex items-center gap-3 flex-wrap">
-      <button onClick={onBack} className="inline-flex items-center gap-2 text-sm font-semibold text-slate-600 hover:text-slate-900 px-3 py-1.5 rounded-lg border border-slate-200 bg-white shadow-sm">
+      <button onClick={() => { if (confirmLeaveCourse()) onBack(); }} className="inline-flex items-center gap-2 text-sm font-semibold text-slate-600 hover:text-slate-900 px-3 py-1.5 rounded-lg border border-slate-200 bg-white shadow-sm">
         <ArrowLeft size={16} /> All courses
       </button>
       {course && (
@@ -4063,6 +4585,11 @@ function CourseCatalog({
 } = {}) {
   const { user, profile } = useAuth();
   const isAdmin = !!profile?.is_admin;
+  const catalogTabId = prefix === 'resume-' ? 'resumestrategy' : prefix === 'interview-' ? 'interview' : 'qbomastery';
+  const catalogInterviewSub = prefix === 'interview-' ? 'winstrat' : null;
+  const initialCatalogRouteRef = useRef(null);
+  if (!initialCatalogRouteRef.current) initialCatalogRouteRef.current = readAppRoute();
+  const initialSelectedId = initialCatalogRouteRef.current.tab === catalogTabId ? initialCatalogRouteRef.current.courseId : null;
 
   const [courses, setCourses] = useState([]);
   const [counts, setCounts] = useState({});            // course_id -> total lessons
@@ -4070,14 +4597,36 @@ function CourseCatalog({
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState('');
   const [notConfigured, setNotConfigured] = useState(false);
-  const [selectedId, setSelectedId] = useState(null);  // null = grid; otherwise the open course
+  const [selectedId, setSelectedId] = useState(initialSelectedId);  // null = grid; otherwise the open course
   const [busy, setBusy] = useState(false);             // create / delete / reorder / cover / duplicate in flight
   const [menuOpenId, setMenuOpenId] = useState(null);  // which card's ⋮ action menu is open
   const [lastDuplicatedId, setLastDuplicatedId] = useState(null); // highlight + open the fresh copy in the builder
 
   // Open a course in the builder, clearing any transient menu/highlight UI. (The post-duplicate
   // auto-open uses setSelectedId directly so its one-time success banner still shows.)
-  function openCourse(id) { setMenuOpenId(null); setLastDuplicatedId(null); setSelectedId(id); }
+  function writeCatalogRoute(courseId, replace = false) {
+    writeAppRoute(catalogTabId, { courseId, interviewSub: catalogInterviewSub, replace });
+  }
+  function openCourse(id, opts = {}) {
+    setMenuOpenId(null);
+    setLastDuplicatedId(null);
+    setSelectedId(id);
+    writeCatalogRoute(id, !!opts.replace);
+  }
+  function closeCourse() {
+    setMenuOpenId(null);
+    setSelectedId(null);
+    writeCatalogRoute(null, true);
+    loadCatalog();
+  }
+  useEffect(() => {
+    const onPopState = () => {
+      const route = readAppRoute();
+      if (route.tab === catalogTabId) setSelectedId(route.courseId || null);
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [catalogTabId]);
   // Close the ⋮ menu on Escape while one is open.
   useEffect(() => {
     if (!menuOpenId) return;
@@ -4090,7 +4639,7 @@ function CourseCatalog({
     setLoading(true); setErr(''); setNotConfigured(false);
     try {
       const { data: rows, error: cErr } = await supabase
-        .from('courses').select('*').ilike('slug', `${prefix}%`).order('position').order('created_at');
+        .from('courses').select(COURSE_ROW_SELECT).ilike('slug', `${prefix}%`).order('position').order('created_at');
       if (cErr) throw cErr;
       const list = rows || [];
       setCourses(list);
@@ -4127,14 +4676,14 @@ function CourseCatalog({
       let slug = base, n = 2;
       while (existing.has(slug)) slug = `${base}-${n++}`;
       const position = courses.length ? Math.max(...courses.map(c => c.position ?? 0)) + 1 : 0;
-      let res = await supabase.from('courses').insert({ slug, title, subtitle: '', published: false, position, course_date: todayISODate() }).select('*').single();
+      let res = await supabase.from('courses').insert({ slug, title, subtitle: '', published: false, position, course_date: todayISODate() }).select(COURSE_ROW_SELECT).single();
       if (res.error && res.error.code === '23505') {           // slug collision race — retry once with a unique suffix
         slug = `${base}-${Date.now().toString(36).slice(-4)}`;
-        res = await supabase.from('courses').insert({ slug, title, subtitle: '', published: false, position, course_date: todayISODate() }).select('*').single();
+        res = await supabase.from('courses').insert({ slug, title, subtitle: '', published: false, position, course_date: todayISODate() }).select(COURSE_ROW_SELECT).single();
       }
       if (res.error) throw res.error;
       await loadCatalog();
-      setSelectedId(res.data.id);                              // drop the admin straight into the new course (builder)
+      openCourse(res.data.id);                                 // drop the admin straight into the new course (builder)
     } catch (e) {
       logDbError('[CourseCatalog] create', e, { module: prefix });
       setErr(describeDbError(e, 'Could not create the course.'));
@@ -4152,9 +4701,9 @@ function CourseCatalog({
     try {
       // 1. Load the source fresh (its row + ordered modules + ordered lessons).
       const [{ data: src, error: e1 }, { data: mods, error: e2 }, { data: lessons, error: e3 }] = await Promise.all([
-        supabase.from('courses').select('*').eq('id', c.id).single(),
-        supabase.from('course_modules').select('*').eq('course_id', c.id).order('position'),
-        supabase.from('course_lessons').select('*').eq('course_id', c.id).order('position'),
+        supabase.from('courses').select(COURSE_ROW_SELECT).eq('id', c.id).single(),
+        supabase.from('course_modules').select(COURSE_MODULE_SELECT).eq('course_id', c.id).order('position'),
+        supabase.from('course_lessons').select(COURSE_LESSON_SELECT).eq('course_id', c.id).order('position'),
       ]);
       if (e1) throw e1;
       if (e2 || e3) throw (e2 || e3);
@@ -4174,10 +4723,10 @@ function CourseCatalog({
         course_date: todayISODate(), cover_path: src.cover_path ?? null,  // default the cohort date to today, not the source's (avoids a June re-run inheriting May)
         source_course_id: src.id, published: false, position,
       };
-      let res = await supabase.from('courses').insert(coursePayload).select('*').single();
+      let res = await supabase.from('courses').insert(coursePayload).select(COURSE_ROW_SELECT).single();
       if (res.error && res.error.code === '23505') {           // slug collision race — retry once with a unique suffix
         slug = `${base}-${Date.now().toString(36).slice(-4)}`;
-        res = await supabase.from('courses').insert({ ...coursePayload, slug }).select('*').single();
+        res = await supabase.from('courses').insert({ ...coursePayload, slug }).select(COURSE_ROW_SELECT).single();
       }
       if (res.error) throw res.error;
       newCourseId = res.data.id;
@@ -4212,6 +4761,7 @@ function CourseCatalog({
       await loadCatalog();
       setLastDuplicatedId(newCourseId);
       setSelectedId(newCourseId);
+      writeCatalogRoute(newCourseId, false);
     } catch (e) {
       logDbError('[CourseCatalog] duplicate', e, { module: prefix, sourceId: c.id });
       // Roll back a partially-built copy so we never leave a course without its lessons.
@@ -4266,7 +4816,7 @@ function CourseCatalog({
       if (error) throw error;
       // After the row (and its lessons) are gone, drop only files no surviving course references.
       await removeMediaIfUnreferenced([...candidates]);
-      if (selectedId === c.id) setSelectedId(null);
+      if (selectedId === c.id) { setSelectedId(null); writeCatalogRoute(null, true); }
       if (lastDuplicatedId === c.id) setLastDuplicatedId(null);
       await loadCatalog();
     } catch (e) {
@@ -4297,7 +4847,7 @@ function CourseCatalog({
       initialNotice={selectedId === lastDuplicatedId
         ? '✓ Course duplicated as a draft. Edit the title, month, and lessons below, then publish when ready.'
         : null}
-      onBack={() => { setMenuOpenId(null); setSelectedId(null); loadCatalog(); }} />;
+      onBack={closeCourse} />;
   }
 
   const errorBanner = err ? (
@@ -5784,20 +6334,49 @@ function LoanAmortization() {
 // ═══════════════════════════════════════════════════════════════════
 
 const INTERVIEW_SUBTABS = [
+  { id: 'winstrat',   label: 'Interview Winning Strategy', icon: Crown, desc: 'A video course library: the mindset, scripts, and tactics that win the offer' },
+  { id: 'mock',       label: 'Mock Interview Simulator', icon: Video, desc: 'Watch the guide, then open the external mock-interview simulator to practice' },
   { id: 'common',     label: 'Common Interview Q&A', icon: MessageSquare, desc: 'The 12 questions you WILL be asked — with weak vs strong answers' },
   { id: 'accounting', label: 'Accounting Questions', icon: FileSpreadsheet, desc: 'Technical bookkeeping and QBO questions every employer asks' },
-  { id: 'car',        label: 'CAR Storytelling',     icon: Target, desc: 'Context → Action → Result method for behavioral questions' },
   { id: 'body',       label: 'Body Language',        icon: Eye, desc: 'On-camera presence, eye contact, posture, energy' },
   { id: 'jdgen',      label: 'JD Question Generator', icon: HelpCircle, desc: 'Paste any job description, get the exact questions they will ask' },
   { id: 'salary',     label: 'Salary Negotiation',   icon: TrendingUp, desc: 'Anchor high, defend with value, lock in 20-40% above their first offer' },
-  { id: 'winstrat',   label: 'Interview Winning Strategy', icon: Crown, desc: 'A video course library: the mindset, scripts, and tactics that win the offer' },
 ];
 
-function InterviewPrep() {
-  const [sub, setSub] = useState('common');
+function InterviewPrep({ initialSub = null }) {
+  const normalizedInitialSub = normalizeInterviewSub(initialSub);
+  const [sub, setSubState] = useState(normalizedInitialSub || 'winstrat');
+
+  useEffect(() => {
+    if (normalizedInitialSub) setSubState(normalizedInitialSub);
+  }, [normalizedInitialSub]);
+
+  useEffect(() => {
+    if (normalizedInitialSub || typeof window === 'undefined' || !window.storage) return;
+    let active = true;
+    window.storage.get('nav:interviewSub')
+      .then(r => {
+        const saved = normalizeInterviewSub(r?.value);
+        if (active && saved) setSubState(saved);
+      })
+      .catch(() => {});
+    return () => { active = false; };
+  }, [normalizedInitialSub]);
+
+  const setSub = (nextSub) => {
+    const normalized = normalizeInterviewSub(nextSub) || 'winstrat';
+    setSubState(normalized);
+    if (typeof window !== 'undefined' && window.storage) {
+      window.storage.set('nav:interviewSub', normalized).catch(() => {});
+    }
+    if (typeof window !== 'undefined' && readAppRoute().tab === 'interview') {
+      writeAppRoute('interview', { interviewSub: normalized, replace: true });
+    }
+  };
+
   return (
     <div>
-      <SectionHead eyebrow="Tool 07" title="Job Interview Mastery" desc="Seven tools to turn a nervous candidate into a confident hire. Body language, CAR storytelling, common questions (weak vs strong), JD-generated questions, accounting Q&A, salary negotiation, and a full Interview Winning Strategy video course library." />
+      <SectionHead eyebrow="Tool 07" title="Job Interview Mastery" desc="Seven tools to turn a nervous candidate into a confident hire. A full Interview Winning Strategy video course library, a guided mock interview simulator, common questions (weak vs strong), JD-generated questions, accounting Q&A, body language, and salary negotiation." />
 
       {/* Subtab nav */}
       <div className="mt-6 mb-6">
@@ -5815,16 +6394,16 @@ function InterviewPrep() {
             );
           })}
         </div>
-        <div className="text-xs text-slate-500 mt-2 ml-1">{INTERVIEW_SUBTABS.find(t => t.id === sub).desc}</div>
+        <div className="text-xs text-slate-500 mt-2 ml-1">{INTERVIEW_SUBTABS.find(t => t.id === sub)?.desc}</div>
       </div>
 
+      {sub === 'winstrat' && <InterviewStrategyCatalog embedded />}
+      {sub === 'mock' && <MockInterviewSimulator embedded />}
       {sub === 'common' && <CommonInterviewQA />}
       {sub === 'accounting' && <AccountingInterviewQA />}
-      {sub === 'car' && <CARStorytelling />}
       {sub === 'body' && <BodyLanguage />}
       {sub === 'jdgen' && <JDQuestionGenerator />}
       {sub === 'salary' && <SalaryNegotiation />}
-      {sub === 'winstrat' && <InterviewStrategyCatalog embedded />}
     </div>
   );
 }
@@ -6103,118 +6682,7 @@ function ErrorNote({ msg, onClose, className = 'mt-4' }) {
   );
 }
 
-// ─── SUBTAB 3: CAR Storytelling ──────────────────────────────────────
-function CARStorytelling() {
-  const [scenario, setScenario] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [story, setStory] = useState(null);
-  const [err, setErr] = useState('');
-
-  const generate = async () => {
-    if (!scenario.trim()) return;
-    setBusy(true);
-    setStory(null);
-    setErr('');
-    try {
-      const sys = `You are an executive interview coach who specializes in the CAR storytelling method (Context, Action, Result). You help international remote bookkeepers craft compelling answers to behavioral interview questions for US clients.
-
-Rules:
-- Generate a complete CAR story based on the candidate's raw scenario
-- Context: 1-2 sentences setting the stage (what was happening, what was at stake)
-- Action: 2-4 sentences on what THE CANDIDATE specifically did. Use "I" not "we." Be concrete.
-- Result: 1-2 sentences with a measurable outcome (numbers, time saved, money saved, problem prevented)
-- Total story length: 90-120 seconds spoken (about 200-280 words)
-- Conversational tone — not corporate, not rehearsed
-- If the candidate didn't provide a clear metric, invent a reasonable one and tag it with [verify]
-
-Output as a JSON object with keys: context, action, result, fullStory (a 200-280 word version stitched together for delivery), suggestedQuestions (an array of 3-5 behavioral interview questions this story would answer well).`;
-
-      const user = `My raw scenario or experience:\n\n${scenario}\n\nTurn this into a polished CAR story.`;
-
-      const raw = (await callClaude({ max_tokens: 1500, system: sys, messages: [{ role: 'user', content: user }] })).trim();
-      const cleaned = raw.replace(/```json|```/g, '').trim();
-      setStory(JSON.parse(cleaned));
-    } catch (e) {
-      setErr('Failed to generate story: ' + (e.message || 'unknown error'));
-    }
-    setBusy(false);
-  };
-
-  return (
-    <div>
-      <div style={{ background: SHEEN }} className="glass-card p-6 rounded-2xl mb-4">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-center">
-          <div className="p-4 rounded-xl" style={{ background: ICE, border: `1px solid ${CYAN}30` }}>
-            <div className="text-2xl mb-1">🎬</div>
-            <div className="font-bold text-sm" style={{ color: NAVY }}>CONTEXT</div>
-            <div className="text-xs text-slate-600 mt-1">Set the scene. What was the situation? What was at stake?</div>
-          </div>
-          <div className="p-4 rounded-xl" style={{ background: ICE, border: `1px solid ${CYAN}30` }}>
-            <div className="text-2xl mb-1">⚡</div>
-            <div className="font-bold text-sm" style={{ color: NAVY }}>ACTION</div>
-            <div className="text-xs text-slate-600 mt-1">What did YOU specifically do? Use "I" not "we." Be specific.</div>
-          </div>
-          <div className="p-4 rounded-xl" style={{ background: ICE, border: `1px solid ${CYAN}30` }}>
-            <div className="text-2xl mb-1">🎯</div>
-            <div className="font-bold text-sm" style={{ color: NAVY }}>RESULT</div>
-            <div className="text-xs text-slate-600 mt-1">What changed? Use a number, a percentage, or a saved hour.</div>
-          </div>
-        </div>
-      </div>
-
-      <div style={{ background: SHEEN }} className="glass-card p-6 rounded-2xl">
-        <label className="text-xs uppercase tracking-wider font-bold text-slate-600 block mb-2">Describe your scenario in your own words</label>
-        <div className="text-xs text-slate-500 mb-3">Be raw and specific. Don't try to make it sound professional. Tell it like you'd tell a friend.</div>
-        <textarea value={scenario} onChange={e => setScenario(e.target.value)}
-          placeholder="Example: 'A few months ago my client's books were really messed up. There were like 6 months of unreconciled bank accounts and they were worried about taxes. I worked extra hours and got it all done before tax deadline.'"
-          className="w-full h-32 p-4 rounded-xl border border-slate-200 bg-white text-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-200 outline-none resize-none" />
-        <button onClick={generate} disabled={busy || !scenario.trim()}
-          className="sheen-btn mt-4 text-white font-bold py-3 px-8 rounded-xl shadow-lg text-sm tracking-wide flex items-center gap-2 disabled:opacity-50">
-          {busy ? <><Loader2 size={16} className="animate-spin" /> Crafting your story...</> : <><Target size={16} /> Generate CAR Story</>}
-        </button>
-        <ErrorNote msg={err} onClose={() => setErr('')} />
-      </div>
-
-      {story && (
-        <div className="mt-6 fade-in space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
-              <div className="text-[10px] uppercase tracking-[0.2em] font-bold mb-2" style={{ color: ROYAL }}>🎬 Context</div>
-              <div className="text-sm text-slate-800 leading-relaxed">{story.context}</div>
-            </div>
-            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
-              <div className="text-[10px] uppercase tracking-[0.2em] font-bold mb-2" style={{ color: ROYAL }}>⚡ Action</div>
-              <div className="text-sm text-slate-800 leading-relaxed">{story.action}</div>
-            </div>
-            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
-              <div className="text-[10px] uppercase tracking-[0.2em] font-bold mb-2" style={{ color: ROYAL }}>🎯 Result</div>
-              <div className="text-sm text-slate-800 leading-relaxed">{story.result}</div>
-            </div>
-          </div>
-
-          <div className="glossy-card p-7 rounded-2xl border border-slate-200">
-            <div className="text-[10px] uppercase tracking-[0.2em] font-bold mb-3" style={{ color: ROYAL }}>📣 Full story — practice saying this out loud</div>
-            <div className="text-base text-slate-800 leading-relaxed italic">{story.fullStory}</div>
-          </div>
-
-          <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
-            <div className="text-[10px] uppercase tracking-[0.2em] font-bold mb-2" style={{ color: ROYAL }}>This story answers these interview questions:</div>
-            <ul className="space-y-1.5 mt-2">
-              {(story.suggestedQuestions || []).map((q, i) => (
-                <li key={i} className="flex items-start gap-2 text-sm text-slate-700">
-                  <CheckCircle2 size={14} className="text-blue-500 flex-shrink-0 mt-0.5" />
-                  <span>{q}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─── SUBTAB 4: Body Language ─────────────────────────────────────────
+// ─── SUBTAB: Body Language ───────────────────────────────────────────
 const BODY_LANGUAGE_TIPS = [
   {
     category: 'Camera & Setup (the foundation)',
@@ -10573,7 +11041,7 @@ const LINKEDIN_BOOKING_URL   = 'https://scheduler.zoom.us/alexander-sagun/1-on-1
 const COACH_ALEX_BOOKING_URL = 'https://scheduler.zoom.us/alexander-sagun/1-on-1-resume-and-interview-coaching';
 const US_CPA_BOOKING_URL     = 'https://scheduler.zoom.us/alexander-sagun/1-on-1qbocoaching';
 
-function BookingPage({ eyebrow, title, intro, Icon, headline, message, benefits, ctaLabel, bookingUrl }) {
+function BookingPage({ eyebrow, title, intro, Icon, headline, message, benefits, ctaLabel, bookingUrl, showClosingCta = true }) {
   const live = !!bookingUrl && !bookingUrl.startsWith('[') && bookingUrl.trim() !== '';
 
   const renderCta = (full) => live ? (
@@ -10608,7 +11076,7 @@ function BookingPage({ eyebrow, title, intro, Icon, headline, message, benefits,
           </div>
           <div className="flex-1">
             <div className="gh-label mb-2" style={{ color: C.primary, fontSize: 11 }}>1-on-1 Session</div>
-            <h2 style={{ fontFamily: fontDisplay, color: C.text, letterSpacing: '-0.02em', fontWeight: 600 }} className="text-2xl leading-snug">{headline}</h2>
+            <h2 style={{ fontFamily: fontDisplay, color: C.text, letterSpacing: '-0.02em', fontWeight: 600 }} className="text-2xl leading-snug break-words">{headline}</h2>
             <p className="mt-3 text-[15px] leading-relaxed max-w-2xl" style={{ color: C.textSoft }}>{message}</p>
             <div className="mt-5">{renderCta(false)}</div>
           </div>
@@ -10631,13 +11099,15 @@ function BookingPage({ eyebrow, title, intro, Icon, headline, message, benefits,
       </div>
 
       {/* Closing CTA */}
-      <div style={{ background: SHEEN }} className="glass-card p-6 md:p-8 flex flex-col sm:flex-row sm:items-center justify-between gap-5">
-        <div>
-          <h3 style={{ fontFamily: fontDisplay, color: C.text, letterSpacing: '-0.015em', fontWeight: 600 }} className="text-xl">Ready to get personalized support?</h3>
-          <p className="mt-1.5 text-[14px] leading-relaxed" style={{ color: C.textSoft }}>Book your 1-on-1 session and get tailored, practical guidance with clear next steps.</p>
+      {showClosingCta && (
+        <div style={{ background: SHEEN }} className="glass-card p-6 md:p-8 flex flex-col sm:flex-row sm:items-center justify-between gap-5">
+          <div>
+            <h3 style={{ fontFamily: fontDisplay, color: C.text, letterSpacing: '-0.015em', fontWeight: 600 }} className="text-xl">Ready to get personalized support?</h3>
+            <p className="mt-1.5 text-[14px] leading-relaxed" style={{ color: C.textSoft }}>Book your 1-on-1 session and get tailored, practical guidance with clear next steps.</p>
+          </div>
+          <div className="flex-shrink-0">{renderCta(true)}</div>
         </div>
-        <div className="flex-shrink-0">{renderCta(true)}</div>
-      </div>
+      )}
     </div>
   );
 }
@@ -10665,6 +11135,7 @@ function CoachAlexChat() {
       ]}
       ctaLabel="Book a Session with Coach Alex"
       bookingUrl={COACH_ALEX_BOOKING_URL}
+      showClosingCta={false}
     />
   );
 }
@@ -10694,6 +11165,7 @@ function CPAAIChat() {
       ]}
       ctaLabel="Book US CPA Guidance Session"
       bookingUrl={US_CPA_BOOKING_URL}
+      showClosingCta={false}
     />
   );
 }
@@ -11752,300 +12224,29 @@ function NicheSelectorQuiz({ goto }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// COMPONENT: CERTIFICATION TRACKER (Training & Skills)
-// ═══════════════════════════════════════════════════════════════════
-
-const CERTIFICATIONS = [
-  {
-    id: 'qbo-proadvisor',
-    name: 'QuickBooks Online ProAdvisor',
-    org: 'Intuit',
-    cost: 'FREE',
-    time: '8–12 hours of study',
-    priority: 'P0 — START HERE',
-    why: 'The #1 certification US bookkeeping clients look for. Free, online, and US-firm-recognized. Without this, most US firms won\'t even take a meeting.',
-    how: 'Sign up at https://quickbooks.intuit.com/accountants/proadvisor/ → Free QBO Accountant account → Complete training modules → Pass exam (multiple attempts allowed).',
-    url: 'https://quickbooks.intuit.com/accountants/proadvisor/',
-    tier: 'foundation',
-  },
-  {
-    id: 'qbo-advanced',
-    name: 'QuickBooks Online Advanced Certified ProAdvisor',
-    org: 'Intuit',
-    cost: 'FREE',
-    time: '15–20 hours of study',
-    priority: 'P1 — within 6 months of P0',
-    why: 'Separates you from the 80% of certified bookkeepers who only have the basic cert. Covers complex scenarios, multi-currency, advanced reporting.',
-    how: 'Available only after completing basic ProAdvisor cert. Complete Advanced training track inside QBO Accountant dashboard.',
-    url: 'https://quickbooks.intuit.com/accountants/proadvisor/',
-    tier: 'foundation',
-  },
-  {
-    id: 'xero',
-    name: 'Xero Advisor Certification',
-    org: 'Xero',
-    cost: 'FREE',
-    time: '6–8 hours of study',
-    priority: 'P1 — adds market reach',
-    why: 'Xero is the #2 cloud accounting platform — strong in real estate, agencies, and Australian-owned US businesses. Adds 30% more addressable market.',
-    how: 'Sign up at https://www.xero.com/us/partners/ → Free partner account → Complete Xero Advisor learning track → Take certification exam.',
-    url: 'https://www.xero.com/us/partner-programs/partners/',
-    tier: 'foundation',
-  },
-  {
-    id: 'gusto',
-    name: 'Gusto Partner Certification',
-    org: 'Gusto',
-    cost: 'FREE',
-    time: '3–4 hours',
-    priority: 'P2 — payroll specialty',
-    why: 'Gusto is the dominant small-business payroll platform. Cert lets you become a Gusto Partner — referral revenue + free Gusto for your own business.',
-    how: 'Apply at https://gusto.com/partners → Complete Gusto Partner Certification training.',
-    url: 'https://gusto.com/partners',
-    tier: 'specialty',
-  },
-  {
-    id: 'a2x',
-    name: 'A2X Certified Advisor',
-    org: 'A2X',
-    cost: 'FREE',
-    time: '2–3 hours',
-    priority: 'P2 — IF e-commerce niche',
-    why: 'A2X is THE integration for Shopify/Amazon/Etsy → QBO/Xero. If you target e-commerce clients, this cert opens A2X\'s partner directory which sends you leads.',
-    how: 'Apply to A2X Partner Program at a2xaccounting.com/partners → Complete Advisor training.',
-    url: 'https://www.a2xaccounting.com/partners',
-    tier: 'specialty',
-  },
-  {
-    id: 'hubdoc',
-    name: 'Hubdoc Certified',
-    org: 'Hubdoc / Xero',
-    cost: 'FREE',
-    time: '1–2 hours',
-    priority: 'P3 — quick win',
-    why: 'Document collection tool used by many bookkeepers. Easy cert, shows clients you have a documented receipt-capture workflow.',
-    how: 'Sign up at hubdoc.com → Free account → Complete Hubdoc certification.',
-    url: 'https://www.hubdoc.com/certification',
-    tier: 'specialty',
-  },
-  {
-    id: 'dext',
-    name: 'Dext (Receipt Bank) Certified',
-    org: 'Dext',
-    cost: 'FREE',
-    time: '1–2 hours',
-    priority: 'P3 — quick win',
-    why: 'Receipt automation platform — competing with Hubdoc. Many US firms use Dext. Quick certification, partner directory listing.',
-    how: 'Apply at dext.com/partners → Complete training and assessment.',
-    url: 'https://dext.com/us/partners',
-    tier: 'specialty',
-  },
-  {
-    id: 'karbon',
-    name: 'Karbon Practice Excellence',
-    org: 'Karbon',
-    cost: 'FREE',
-    time: '4–6 hours',
-    priority: 'P3 — IF working with firms',
-    why: 'Karbon is the leading practice-management software for US accounting firms. Knowing it makes you instantly useful as a Tier 1 production hire.',
-    how: 'Apply for Karbon Academy access at karbonhq.com → Complete Practice Excellence certification.',
-    url: 'https://karbonhq.com/academy/',
-    tier: 'specialty',
-  },
-  {
-    id: 'cpb',
-    name: 'Certified Professional Bookkeeper (CPB) — NACPB',
-    org: 'NACPB (National Assn of Certified Public Bookkeepers)',
-    cost: '$50/mo membership + $100 exam',
-    time: '60–80 hours of self-study',
-    priority: 'P3 — credibility boost',
-    why: 'US-recognized bookkeeper credential. Adds legitimacy on LinkedIn and proposals. Optional but valuable for serious career remote bookkeepers.',
-    how: 'Join NACPB (~$50/mo) → Complete the 4 required exams (Accounting, QuickBooks, Bookkeeping Certification, Payroll) → Maintain CE credits.',
-    url: 'https://www.nacpb.org/',
-    tier: 'credential',
-  },
-  {
-    id: 'cb',
-    name: 'Certified Bookkeeper (CB) — AIPB',
-    org: 'AIPB (American Institute of Professional Bookkeepers)',
-    cost: '$429 for non-members',
-    time: '80–100 hours of self-study',
-    priority: 'P3 — credibility boost',
-    why: 'Long-standing US bookkeeper credential. Requires 2 years experience or equivalent. AIPB cert is well-recognized in US small business.',
-    how: 'Study with AIPB workbooks → Pass 4-part national exam (Adjusting Entries, Error Correction, Payroll, Depreciation, Inventory, Internal Controls) → 2 years experience.',
-    url: 'https://www.aipb.org/',
-    tier: 'credential',
-  },
-];
-
-function CertificationTracker() {
-  const [completed, setCompleted] = useState(new Set());
-  const [inProgress, setInProgress] = useState(new Set());
-
-  // Load state
-  useEffect(() => {
-    if (typeof window !== 'undefined' && window.storage) {
-      window.storage.get('certs:completed').then(r => {
-        if (r && r.value) {
-          try { setCompleted(new Set(JSON.parse(r.value))); } catch (e) {}
-        }
-      }).catch(() => {});
-      window.storage.get('certs:inProgress').then(r => {
-        if (r && r.value) {
-          try { setInProgress(new Set(JSON.parse(r.value))); } catch (e) {}
-        }
-      }).catch(() => {});
-    }
-  }, []);
-
-  const persist = (key, set) => {
-    if (typeof window !== 'undefined' && window.storage) {
-      window.storage.set(key, JSON.stringify(Array.from(set))).catch(() => {});
-    }
-  };
-
-  const toggle = (id, list, setList, key) => {
-    const next = new Set(list);
-    next.has(id) ? next.delete(id) : next.add(id);
-    setList(next);
-    persist(key, next);
-  };
-
-  const markCompleted = (id) => {
-    const c = new Set(completed); c.add(id); setCompleted(c); persist('certs:completed', c);
-    const p = new Set(inProgress); p.delete(id); setInProgress(p); persist('certs:inProgress', p);
-  };
-
-  const markInProgress = (id) => {
-    const p = new Set(inProgress); p.add(id); setInProgress(p); persist('certs:inProgress', p);
-    const c = new Set(completed); c.delete(id); setCompleted(c); persist('certs:completed', c);
-  };
-
-  const reset = (id) => {
-    const c = new Set(completed); c.delete(id); setCompleted(c); persist('certs:completed', c);
-    const p = new Set(inProgress); p.delete(id); setInProgress(p); persist('certs:inProgress', p);
-  };
-
-  const tierOrder = ['foundation', 'specialty', 'credential'];
-  const tierLabels = {
-    foundation: { label: 'Foundation Certifications', desc: 'Start here — required for serious credibility', color: NAVY },
-    specialty: { label: 'Specialty Certifications', desc: 'Niche-specific or quick-win credentials', color: ROYAL },
-    credential: { label: 'Professional Credentials', desc: 'Advanced US bookkeeping credentials — optional but powerful', color: CYAN },
-  };
-
-  return (
-    <div>
-      <SectionHead eyebrow="Training & Skills · Tool" title="Certification Tracker" desc="The roadmap of certifications that build your credibility as a US remote bookkeeper. Track what you've completed, what's in progress, and what's next. Most P0/P1 certifications are FREE." />
-
-      <div style={{ background: SHEEN }} className="glass-card p-5 rounded-2xl mt-6 mb-5">
-        <div className="flex gap-3 items-start">
-          <Lightbulb size={20} style={{ color: ROYAL }} className="flex-shrink-0 mt-0.5" />
-          <div className="text-sm text-slate-700 leading-relaxed">
-            <span className="font-bold" style={{ color: NAVY }}>Recommended order:</span> Start with QBO ProAdvisor (free, ~8 hours). Add QBO Advanced + Xero within 6 months. Then add 1-2 specialty certs aligned to your niche. Credentials (CPB/CB) are optional but add real weight on LinkedIn and proposals.
-          </div>
-        </div>
-      </div>
-
-      {/* Summary cards */}
-      <div className="grid grid-cols-3 gap-3 mb-6">
-        <div className="p-5 rounded-2xl bg-white border border-slate-200 shadow-sm">
-          <div className="text-[10px] uppercase tracking-wider font-bold text-slate-500">Completed</div>
-          <div style={{ color: ROYAL, fontFamily: fontDisplay }} className="text-3xl font-bold mt-1">{completed.size}</div>
-          <div className="text-xs text-slate-400">of {CERTIFICATIONS.length} total</div>
-        </div>
-        <div className="p-5 rounded-2xl bg-white border border-slate-200 shadow-sm">
-          <div className="text-[10px] uppercase tracking-wider font-bold text-slate-500">In Progress</div>
-          <div style={{ color: NAVY, fontFamily: fontDisplay }} className="text-3xl font-bold mt-1">{inProgress.size}</div>
-        </div>
-        <div className="p-5 rounded-2xl text-white shadow-md" style={{ background: `linear-gradient(135deg, ${ROYAL} 0%, ${CYAN} 100%)` }}>
-          <div className="text-[10px] uppercase tracking-wider font-bold opacity-80">Progress</div>
-          <div style={{ fontFamily: fontDisplay }} className="text-3xl font-bold mt-1">{Math.round((completed.size / CERTIFICATIONS.length) * 100)}%</div>
-        </div>
-      </div>
-
-      {tierOrder.map(tier => {
-        const certs = CERTIFICATIONS.filter(c => c.tier === tier);
-        const t = tierLabels[tier];
-        return (
-          <div key={tier} className="mb-6">
-            <div className="mb-3">
-              <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">{t.label}</div>
-              <div className="text-xs text-slate-500">{t.desc}</div>
-            </div>
-            <div className="space-y-3">
-              {certs.map(c => {
-                const isCompleted = completed.has(c.id);
-                const isInProgress = inProgress.has(c.id);
-                return (
-                  <div key={c.id} className={`bg-white rounded-2xl border-2 shadow-sm overflow-hidden ${isCompleted ? '' : ''}`}
-                    style={{ borderColor: isCompleted ? CYAN : isInProgress ? '#FCD34D' : '#E5E7EB' }}>
-                    <div className="p-5">
-                      <div className="flex items-start justify-between gap-3 mb-3">
-                        <div className="flex-1">
-                          <div className="flex items-center gap-2 mb-1">
-                            {isCompleted && <CheckCircle2 size={18} style={{ color: ROYAL }} />}
-                            {isInProgress && <Loader2 size={18} className="text-amber-500" />}
-                            <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded" style={{ background: ICE, color: NAVY }}>{c.priority}</span>
-                          </div>
-                          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg font-bold">{c.name}</div>
-                          <div className="text-xs text-slate-500">{c.org} · {c.cost} · {c.time}</div>
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          {!isCompleted && !isInProgress && (
-                            <button onClick={() => markInProgress(c.id)} className="text-xs font-bold px-3 py-1.5 rounded-lg bg-amber-100 text-amber-800 hover:bg-amber-200 transition">Start</button>
-                          )}
-                          {isInProgress && (
-                            <button onClick={() => markCompleted(c.id)} className="text-xs font-bold px-3 py-1.5 rounded-lg text-white shadow"
-                              style={{ background: `linear-gradient(135deg, ${ROYAL} 0%, ${CYAN} 100%)` }}>✓ Mark Done</button>
-                          )}
-                          {(isCompleted || isInProgress) && (
-                            <button onClick={() => reset(c.id)} className="text-[10px] text-slate-500 hover:text-slate-700">Reset</button>
-                          )}
-                        </div>
-                      </div>
-                      <div className="text-sm text-slate-700 mb-2"><span className="font-bold" style={{ color: ROYAL }}>Why this matters:</span> {c.why}</div>
-                      <div className="text-sm text-slate-700 mb-3"><span className="font-bold" style={{ color: ROYAL }}>How to get it:</span> {c.how}</div>
-                      <a href={c.url} target="_blank" rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1.5 text-xs font-bold text-blue-700 hover:text-blue-900">
-                        <ExternalLink size={12} /> {c.url}
-                      </a>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-
-
-// ═══════════════════════════════════════════════════════════════════
-// COMPONENT: LINKEDIN OPTIMIZATION 1-ON-1 BOOKING (Job Application)
+// COMPONENT: PROFILE OPTIMIZATION 1-ON-1 BOOKING (Job Application) — "Book 1-on-1 with Alex"
 // ═══════════════════════════════════════════════════════════════════
 
 function LinkedInOptimizer() {
   return (
     <BookingPage
       eyebrow="Job Application · 1-on-1"
-      title="Book 1-on-1 LinkedIn Optimization Coaching"
-      intro="Work one-on-one to sharpen your LinkedIn profile — headline, About section, and overall positioning — so US firm owners see a clear, credible remote bookkeeper when they find you."
-      Icon={Linkedin}
-      headline="Position your LinkedIn profile to get noticed"
-      message="This session helps you improve your LinkedIn profile, position your experience more professionally, strengthen your headline and summary, sharpen your skills positioning, improve overall profile clarity, and present yourself better for job opportunities — with clear next steps you can apply right away."
+      title="Book 1-on-1 Profile Optimization With Alex"
+      intro="Work one-on-one with Alex to sharpen your resume, Online Jobs.ph profile, and LinkedIn presence so US firm owners see a clear, credible remote bookkeeper when they find you."
+      Icon={CalendarCheck}
+      headline="Position Your Resume/Online Jobs.ph/LinkedIn Profile To Get Noticed"
+      message="This session helps you improve your resume, online job profile, professional positioning, headline, summary, skills presentation, overall profile clarity, and career visibility so you can present yourself better for job opportunities with clear next steps you can apply right away."
       benefits={[
-        'Full profile review and positioning',
+        'Resume, Online Jobs.ph, and LinkedIn profile review',
         'Headline and summary improvement',
-        'About-section rewrite guidance',
-        'Skills and experience positioning',
-        'Job-search visibility and clarity',
+        'Professional positioning and clarity',
+        'Skills and experience presentation',
+        'Career visibility for job opportunities',
         'Clear, practical next steps',
       ]}
-      ctaLabel="Book LinkedIn Optimization Session"
+      ctaLabel="Book 1-on-1 Profile Optimization Coaching"
       bookingUrl={LINKEDIN_BOOKING_URL}
+      showClosingCta={false}
     />
   );
 }
@@ -12182,7 +12383,7 @@ function GuideVideoPlayer({ guide, onComplete }) {
   return null;
 }
 
-function MockInterviewSimulator() {
+function MockInterviewSimulator({ embedded = false }) {
   const { user, profile } = useAuth();
   const isAdmin = !!profile?.is_admin;
 
@@ -12206,7 +12407,7 @@ function MockInterviewSimulator() {
     setLoading(true); setErr(''); setNotConfigured(false);
     try {
       const { data, error } = await supabase
-        .from('feature_guides').select('*').eq('feature_key', MOCK_INTERVIEW_FEATURE_KEY).maybeSingle();
+        .from('feature_guides').select(FEATURE_GUIDE_SELECT).eq('feature_key', MOCK_INTERVIEW_FEATURE_KEY).maybeSingle();
       if (error) throw error;
       setGuide(data || null);
     } catch (e) {
@@ -12233,6 +12434,26 @@ function MockInterviewSimulator() {
   // against this version). No video → the CTA stays available (don't block on missing content).
   const videoVersion = guide?.video_path || guide?.video_url || '';
   const unlocked = !hasVideo || completed;
+  const guideComparable = (g = {}) => ({
+    title: g.title || '',
+    description: g.description || '',
+    video_url: g.video_provider && g.video_provider !== 'upload' ? (g.video_url || '') : '',
+    video_path: g.video_path || null,
+    video_provider: g.video_provider || null,
+    external_url: g.external_url || '',
+  });
+  const guideDraftDirty = !!(editing && draft &&
+    JSON.stringify(guideComparable(draft)) !== JSON.stringify(guideComparable(guide)));
+
+  useEffect(() => {
+    if (!guideDraftDirty) return;
+    const onBeforeUnload = (e) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [guideDraftDirty]);
 
   // Load this user's completion for the current video version. Re-runs when the user or the
   // video changes. A missing completions table degrades gracefully (gate works for the session,
@@ -12301,6 +12522,7 @@ function MockInterviewSimulator() {
   }
 
   function cancelEditor() {
+    if (guideDraftDirty && !window.confirm('Discard unsaved guide changes?')) return;
     if (previewUrl) { URL.revokeObjectURL(previewUrl); setPreviewUrl(null); }
     setDraft(null); setEditing(false); setErr('');
   }
@@ -12411,8 +12633,8 @@ function MockInterviewSimulator() {
 
   return (
     <div>
-      <SectionHead eyebrow="Job Application · Tool" title="Mock Interview Simulator"
-        desc="Watch this short guide to understand how to use the mock interview simulator. After reviewing the instructions, click the button below to open the simulator in a new tab." />
+      {!embedded && <SectionHead eyebrow="Job Application · Tool" title="Mock Interview Simulator"
+        desc="Watch this short guide to understand how to use the mock interview simulator. After reviewing the instructions, click the button below to open the simulator in a new tab." />}
 
       {loading ? (
         <div className="mt-10 flex items-center justify-center text-slate-400">
