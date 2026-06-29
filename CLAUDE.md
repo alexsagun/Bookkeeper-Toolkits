@@ -241,17 +241,36 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
 
 - **Provider/hook:** [src/auth/AuthProvider.jsx](src/auth/AuthProvider.jsx) wraps the app in
   [main.jsx](src/main.jsx). Any component reads auth via `const { session, user, profile, loading,
-  configured, signUp, signIn, signOut, resetPassword } = useAuth()`. `profile` is the row from the
-  Supabase `profiles` table and carries `is_paid` / `plan` (used by the planned Phase-2 paywall) and
-  `is_admin` (course-authoring gate — see the Course platform section). `profile` is fetched with an
-  **explicit column list** (`PROFILE_SELECT` = `id,email,full_name,avatar_url,is_paid,plan,is_admin`),
-  with a one-time fallback to a legacy set (no `avatar_url`/`is_admin`) if those columns don't exist yet
-  — so a not-yet-migrated `profiles` table degrades gracefully instead of erroring. When you add a
-  `profiles` column the client needs, add it to `PROFILE_SELECT` in `AuthProvider.jsx`.
-- **The gate** lives in `BookkeeperProToolkit` just before its root `return` (~L1121): `if (loading)
-  return <AuthSplash/>; if (!user) return <AuthScreen/>;`. `AuthScreen` (defined just above the root
-  component) is the login/signup/reset UI, built from the design tokens (`C`, `SHEEN`, `GLASS`,
-  `fontDisplay`, `LOGO_DATA_URI`).
+  profileReady, configured, signUp, signIn, signOut, resetPassword, refreshProfile } = useAuth()`.
+  `profile` is the row from the Supabase `profiles` table and carries `is_paid` / `plan` (used by the
+  planned Phase-2 paywall), `is_admin` (course-authoring gate — see the Course platform section), and
+  `approval_status` / `rejection_reason` (the temporary admin-approval gate — see below). `profileReady`
+  is true once the first profile fetch for the current user has settled (the gate waits on it so a
+  pending user never flashes the dashboard); `refreshProfile()` re-reads the row (used by the Pending
+  screen's poll). `profile` is fetched with an **explicit column list** (`PROFILE_SELECT` =
+  `id,email,full_name,avatar_url,is_paid,plan,is_admin,approval_status,rejection_reason`), with a
+  **3-tier fallback** (`fetchProfileRow`) that narrows the columns on a missing-column error — so a
+  not-yet-migrated `profiles` table degrades gracefully (and never loses `is_admin` just because the
+  approval columns are absent). When you add a `profiles` column the client needs, add it to
+  `PROFILE_SELECT` in `AuthProvider.jsx`.
+- **The gate** lives in `BookkeeperProToolkit` just before its root `return`: `if (loading) return
+  <AuthSplash/>; if (recovery) return <UpdatePasswordScreen/>; if (!user) return <AuthScreen/>;` then
+  the **admin-approval gate** — `if (!profileReady) return <AuthSplash/>;` and, when
+  `REQUIRE_ADMIN_APPROVAL` and `!profile.is_admin`, `approval_status==='pending'` → `<PendingApprovalScreen/>`
+  / `'rejected'` → `<RejectedScreen/>`. `AuthScreen` (defined just above the root component) is the
+  login/signup/reset UI, built from the design tokens (`C`, `SHEEN`, `GLASS`, `fontDisplay`, `LOGO_DATA_URI`).
+- **Admin-approval gate (temporary, Phase-1.5):** new email/Google signups default to
+  `approval_status='pending'` and are held on `PendingApprovalScreen` until an admin approves them in
+  the **Access Requests** admin tab (`accessrequests` route; admin-only sidebar entry + pending-count
+  badge; component `AccessRequests`). Approve/reject writes `profiles` directly (RLS:
+  `profiles_admin_select` / `profiles_admin_update` — users can't self-approve) and emails the user via
+  the **env-gated** serverless fn `api/notify-access.js` (Resend; non-fatal if `RESEND_API_KEY` /
+  `RESEND_FROM` unset). Backend defense-in-depth: `public.is_approved()` gates the course/feature
+  `*_read` RLS too. Toggle the whole feature with `REQUIRE_ADMIN_APPROVAL` (module const in
+  BookkeeperPro.jsx, default on; off via `VITE_REQUIRE_ADMIN_APPROVAL=false`). SQL +
+  walkthrough: [db/2026-06-29-user-approval.sql](db/2026-06-29-user-approval.sql) +
+  [ADMIN_APPROVAL_SETUP.md](ADMIN_APPROVAL_SETUP.md). Approval state is server-side — **not** in
+  `LEGACY_KEYS`.
 - **Sign-out + identity** render in the sidebar header (just below the "built by Alex Sagun" line).
 - **Per-user data:** all `window.storage` keys are auto-namespaced per user (see the main.jsx shim
   note). Tools need no changes. A one-time migration in `AuthProvider` adopts any pre-auth global

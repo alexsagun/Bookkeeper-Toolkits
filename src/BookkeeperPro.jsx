@@ -9,19 +9,29 @@ import {
   MessageSquare, Mic, Eye, HelpCircle, User, Target,
   Building2, Landmark, CalendarClock, CalendarCheck, ExternalLink,
   Heart, HeartHandshake, DollarSign, Phone, AlertCircle, Activity, Clock, Wallet,
-  PieChart, Linkedin, ArrowUp, ArrowDown, X, Copy, Check,
+  PieChart, ArrowUp, ArrowDown, X, Copy, Check,
   TrendingUp as Growth, BookMarked, Globe, Coins, GraduationCap,
   LogOut, Lock, Mail, KeyRound, Menu,
   Plus, Trash2, Save, Play, Video, ArrowRight, ArrowLeft, ChevronUp, MoreVertical,
-  PanelLeftClose, PanelLeftOpen
+  PanelLeftClose, PanelLeftOpen, RefreshCw, UserCheck, UserX, ShieldCheck, Hourglass
 } from 'lucide-react';
 import { useAuth } from './auth/AuthProvider.jsx';
 import { supabase } from './lib/supabase';
 
 const DEFAULT_APP_TAB = 'dashboard';
 
+// ── Temporary admin-approval gate ──────────────────────────────────────────────
+// When true (default), new signups land on a "pending approval" screen until an admin
+// approves them in the Access Requests panel; admins always pass. Flip OFF for open access
+// later WITHOUT a code change by setting VITE_REQUIRE_ADMIN_APPROVAL=false (then rebuild).
+// The real security boundary is RLS (db/2026-06-29-user-approval.sql) — this flag only
+// governs the client-side gate UI. See ADMIN_APPROVAL_SETUP.md.
+const REQUIRE_ADMIN_APPROVAL =
+  String(import.meta.env.VITE_REQUIRE_ADMIN_APPROVAL ?? 'true').toLowerCase() !== 'false';
+
 const TAB_ROUTES = {
   dashboard: '/',
+  accessrequests: '/admin/access-requests',
   course: '/courses/accounting-101',
   qbomastery: '/courses/quickbooks-online-mastery',
   industryacc: '/industry-accounting',
@@ -1362,8 +1372,217 @@ function WelcomeOverlay({ name, onClose }) {
   );
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Temporary admin-approval gate screens. New signups (email + Google) are held
+// here until an admin approves them in the Access Requests panel. Styled to match
+// AuthScreen / WelcomeOverlay (full-screen glass card on the app-bg mesh).
+// ───────────────────────────────────────────────────────────────────────────
+function PendingApprovalScreen({ email, uid, onSignOut, onRefresh }) {
+  const [checking, setChecking] = useState(false);
+  const [checkedAt, setCheckedAt] = useState(null);
+  // Hold the latest refresh fn in a ref so the poll effect runs once (refreshProfile is a
+  // fresh reference every AuthProvider render — depending on it would reset the interval).
+  const refreshRef = useRef(onRefresh);
+  refreshRef.current = onRefresh;
+
+  const check = async () => {
+    if (checking) return;
+    setChecking(true);
+    try { await refreshRef.current?.(); setCheckedAt(Date.now()); }
+    finally { setChecking(false); }
+  };
+
+  // INSTANT advance: subscribe to UPDATEs on this user's OWN profile row. The moment an admin
+  // approves (or rejects), Realtime fires → we refetch the profile → the gate re-renders straight
+  // into the dashboard (or the Rejected screen) with no reload and no click. RLS still applies
+  // (own_profile_select), so a user only ever receives changes to their own row. The component
+  // unmounts the instant the gate advances, so the channel auto-closes. Requires the profiles
+  // table to be in the supabase_realtime publication (db/2026-06-29-profiles-realtime.sql); if it
+  // isn't, this is simply inert and the poll/focus fallback below still advances the user.
+  useEffect(() => {
+    if (!uid) return;
+    const ch = supabase
+      .channel(`profile-approval-${uid}`)
+      .on('postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'profiles', filter: `id=eq.${uid}` },
+        () => { refreshRef.current?.(); })
+      .subscribe();
+    return () => { supabase.removeChannel(ch); };
+  }, [uid]);
+
+  // Fallback so it advances even if Realtime isn't enabled: a light auto-poll (every 30s) plus a
+  // re-check on tab focus AND window focus. The focus/visibility re-checks cover the common case
+  // (the user flipping back to this tab/window), so the interval can stay slow to spare the DB.
+  // `visibilitychange` only fires for tab switches within one window — `window`'s `focus` event
+  // catches switching between two separate browser windows (e.g. an admin window beside an
+  // incognito test-user window), which visibilitychange misses.
+  useEffect(() => {
+    const tick = () => { refreshRef.current?.(); };
+    tick(); // re-check immediately on mount (e.g. right after a page refresh) — don't wait for the interval
+    const id = setInterval(tick, 30000);
+    const onVis = () => { if (document.visibilityState === 'visible') tick(); };
+    document.addEventListener('visibilitychange', onVis);
+    window.addEventListener('focus', tick);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVis);
+      window.removeEventListener('focus', tick);
+    };
+  }, []);
+
+  return (
+    <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+        .gh-app-bg { background:
+          radial-gradient(1200px 600px at 70% -10%, rgba(90,200,250,0.12), transparent 60%),
+          radial-gradient(900px 500px at -10% 110%, rgba(10,132,255,0.10), transparent 55%),
+          ${C.bg}; }
+        .auth-in { animation: authIn .5s cubic-bezier(.16,1,.3,1) both; }
+        @keyframes authIn { from { opacity:0; transform: translateY(10px) scale(.985); } to { opacity:1; transform:none; } }
+        @keyframes pendPulse { 0%,100% { transform: scale(1); opacity:1 } 50% { transform: scale(1.06); opacity:.85 } }
+      `}</style>
+
+      <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
+        background: GLASS.cardDeep,
+        backdropFilter: 'blur(30px) saturate(180%)',
+        WebkitBackdropFilter: 'blur(30px) saturate(180%)',
+        border: `1px solid ${GLASS.border}`,
+        boxShadow: '0 24px 60px -12px rgba(10,30,80,0.22), inset 0 1px 0 rgba(255,255,255,0.6)',
+      }}>
+        {/* Header */}
+        <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+          <img src={LOGO_DATA_URI} alt="Toolkits by Alex" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
+          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>Access Pending Approval</div>
+          <div className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>Toolkits by Alex</div>
+        </div>
+
+        <div className="px-8 py-7">
+          <div className="flex justify-center">
+            <div className="flex items-center justify-center rounded-2xl" style={{
+              width: 64, height: 64,
+              background: 'rgba(255,159,10,0.12)', border: '1px solid rgba(255,159,10,0.25)',
+              animation: 'pendPulse 2.4s ease-in-out infinite',
+            }}>
+              <Hourglass size={28} style={{ color: C.amber }} />
+            </div>
+          </div>
+
+          <p className="mt-5 text-center" style={{ fontSize: 13.5, color: C.textSoft, lineHeight: 1.6 }}>
+            Your account has been created successfully, but access to <span style={{ fontWeight: 600, color: C.text }}>Toolkits by Alex</span> requires admin approval. Please wait while an admin reviews your request — you'll be let in automatically once approved.
+          </p>
+
+          {email && (
+            <div className="mt-4 flex items-center justify-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'rgba(15,18,23,0.035)', border: `1px solid ${GLASS.borderSoft}` }}>
+              <Mail size={14} style={{ color: C.textMute }} />
+              <span className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{email}</span>
+            </div>
+          )}
+
+          {checkedAt && !checking && (
+            <div className="mt-3 text-center" style={{ fontSize: 11.5, color: C.textMute }}>
+              Still pending — we'll keep checking automatically.
+            </div>
+          )}
+
+          <button onClick={check} disabled={checking}
+            className="mt-5 w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+            {checking ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
+            {checking ? 'Checking…' : 'Check approval status'}
+          </button>
+
+          <button onClick={onSignOut}
+            className="mt-2.5 w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition hover:opacity-90"
+            style={{ background: C.white, border: `1px solid ${C.border}`, color: C.textSoft }}>
+            <LogOut size={15} /> Sign out
+          </button>
+
+          <p className="mt-5 text-center" style={{ fontSize: 11, color: C.textMute, lineHeight: 1.5 }}>
+            Need help? Contact{' '}
+            <a href="mailto:alex.capinding.sagun@gmail.com" style={{ color: C.primary, fontWeight: 600 }}>support</a>.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RejectedScreen({ email, reason, onSignOut }) {
+  return (
+    <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+        .gh-app-bg { background:
+          radial-gradient(1200px 600px at 70% -10%, rgba(90,200,250,0.10), transparent 60%),
+          radial-gradient(900px 500px at -10% 110%, rgba(208,35,35,0.06), transparent 55%),
+          ${C.bg}; }
+        .auth-in { animation: authIn .5s cubic-bezier(.16,1,.3,1) both; }
+        @keyframes authIn { from { opacity:0; transform: translateY(10px) scale(.985); } to { opacity:1; transform:none; } }
+      `}</style>
+
+      <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
+        background: GLASS.cardDeep,
+        backdropFilter: 'blur(30px) saturate(180%)',
+        WebkitBackdropFilter: 'blur(30px) saturate(180%)',
+        border: `1px solid ${GLASS.border}`,
+        boxShadow: '0 24px 60px -12px rgba(10,30,80,0.22), inset 0 1px 0 rgba(255,255,255,0.6)',
+      }}>
+        <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+          <img src={LOGO_DATA_URI} alt="Toolkits by Alex" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
+          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>Access Request Not Approved</div>
+          <div className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>Toolkits by Alex</div>
+        </div>
+
+        <div className="px-8 py-7">
+          <div className="flex justify-center">
+            <div className="flex items-center justify-center rounded-2xl" style={{
+              width: 64, height: 64,
+              background: 'rgba(208,35,35,0.10)', border: '1px solid rgba(208,35,35,0.22)',
+            }}>
+              <UserX size={28} style={{ color: C.red }} />
+            </div>
+          </div>
+
+          <p className="mt-5 text-center" style={{ fontSize: 13.5, color: C.textSoft, lineHeight: 1.6 }}>
+            Your access request was not approved at this time. If you believe this was a mistake, please contact support or reach out to the admin team.
+          </p>
+
+          {reason && (
+            <div className="mt-4 flex items-start gap-2.5 px-3.5 py-3 rounded-xl" style={{ background: 'rgba(208,35,35,0.06)', border: '1px solid rgba(208,35,35,0.16)' }}>
+              <AlertTriangle size={15} className="flex-shrink-0 mt-px" style={{ color: C.red }} />
+              <div style={{ fontSize: 12.5, color: C.text, lineHeight: 1.5 }}>
+                <span style={{ fontWeight: 600 }}>Reason: </span>{reason}
+              </div>
+            </div>
+          )}
+
+          {email && (
+            <div className="mt-4 flex items-center justify-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'rgba(15,18,23,0.035)', border: `1px solid ${GLASS.borderSoft}` }}>
+              <Mail size={14} style={{ color: C.textMute }} />
+              <span className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{email}</span>
+            </div>
+          )}
+
+          <a href="mailto:alex.capinding.sagun@gmail.com"
+            className="mt-5 w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+            <Mail size={15} /> Contact support
+          </a>
+
+          <button onClick={onSignOut}
+            className="mt-2.5 w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition hover:opacity-90"
+            style={{ background: C.white, border: `1px solid ${C.border}`, color: C.textSoft }}>
+            <LogOut size={15} /> Sign out
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function BookkeeperProToolkit() {
-  const { user, profile, loading, recovery, signOut } = useAuth();
+  const { user, profile, loading, profileReady, recovery, signOut, refreshProfile } = useAuth();
   const initialRouteRef = useRef(null);
   if (!initialRouteRef.current) initialRouteRef.current = readAppRoute();
 
@@ -1599,6 +1818,21 @@ export default function BookkeeperProToolkit() {
   // them, so the whole app shows the admin's labels). `draftLabels` holds an admin's in-progress
   // edits (local only) until "Done" upserts them. Effective label = draft ?? global ?? code default.
   const isAdmin = !!profile?.is_admin;
+  // Pending-approval count for the admin sidebar badge (temporary approval workflow). Only
+  // admins can read other profiles (RLS), so this stays 0 / inert for everyone else. Stays 0
+  // gracefully if the approval migration hasn't been run yet.
+  const [pendingCount, setPendingCount] = useState(0);
+  const refreshPendingCount = async () => {
+    if (!isAdmin) return;
+    try {
+      const { count, error } = await supabase
+        .from('profiles')
+        .select('id', { count: 'exact', head: true })
+        .eq('approval_status', 'pending');
+      if (!error) setPendingCount(count || 0);
+    } catch { /* table/column not migrated — leave at 0 */ }
+  };
+  useEffect(() => { refreshPendingCount(); /* eslint-disable-next-line */ }, [isAdmin]);
   const [labelByKey, setLabelByKey] = useState({});
   const [draftLabels, setDraftLabels] = useState({});
   const [savingLabels, setSavingLabels] = useState(false);
@@ -2046,6 +2280,7 @@ export default function BookkeeperProToolkit() {
   const renderTabContent = (tabId) => {
     switch (tabId) {
       case 'dashboard': return <Dashboard goto={setTab} />;
+      case 'accessrequests': return <AccessRequests onCountChange={refreshPendingCount} />;
       case 'coa': return <CoaGenerator />;
       case 'course': return <Course />;
       case 'qbomastery': return <QBOMastery />;
@@ -2084,6 +2319,23 @@ export default function BookkeeperProToolkit() {
   if (loading)  return <AuthSplash />;
   if (recovery) return <UpdatePasswordScreen />;  // returned from a reset-link
   if (!user)    return <AuthScreen />;
+
+  // ── Admin-approval gate (temporary; toggle via REQUIRE_ADMIN_APPROVAL) ──
+  // Wait for the first profile fetch so a pending user never briefly sees the dashboard.
+  // Admins always pass. If the migration hasn't run yet, approval_status is undefined and
+  // this gate is inert (fail-open) — so deploying the code before the SQL never locks anyone out.
+  if (!profileReady) return <AuthSplash />;
+  if (REQUIRE_ADMIN_APPROVAL && !profile?.is_admin) {
+    if (profile?.approval_status === 'pending') {
+      // Secret-safe diagnostic for the "stuck on Pending" case: shows whose status the gate read.
+      console.debug('[gate] holding on Pending', { uid: user?.id, email: user?.email, approval_status: profile?.approval_status, is_admin: profile?.is_admin });
+      return <PendingApprovalScreen email={user?.email} uid={user?.id} onSignOut={signOut} onRefresh={refreshProfile} />;
+    }
+    if (profile?.approval_status === 'rejected') {
+      console.debug('[gate] holding on Rejected', { uid: user?.id, email: user?.email });
+      return <RejectedScreen email={user?.email} reason={profile?.rejection_reason} onSignOut={signOut} />;
+    }
+  }
 
   return (
     <div data-theme="light" style={{ fontFamily: fontBody, color: C.text }} className="h-screen w-full flex overflow-hidden gh-app-bg">
@@ -2497,6 +2749,26 @@ export default function BookkeeperProToolkit() {
             </div>
           )}
 
+          {/* Access Requests — admin only (temporary approval workflow). Badge = pending count. */}
+          {isAdmin && (
+            <a
+              href={tabHref('accessrequests')}
+              onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('accessrequests'); } }}
+              className="mt-4 w-full px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5"
+              style={tab === 'accessrequests'
+                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px ${C.primary}55` }
+                : { background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
+              <ShieldCheck size={11} />
+              Access Requests
+              {pendingCount > 0 && (
+                <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[9px] font-bold"
+                  style={{ background: tab === 'accessrequests' ? 'rgba(255,255,255,0.25)' : C.amber, color: 'white' }}>
+                  {pendingCount}
+                </span>
+              )}
+            </a>
+          )}
+
           {/* Customize sidebar — admin only. Renames persist globally (Supabase) on "Done". */}
           {isAdmin && (
             <div className="mt-4">
@@ -2583,6 +2855,25 @@ export default function BookkeeperProToolkit() {
         {/* Rail nav — desktop only, flat icon list (every tool reachable in one click, with tooltips) */}
         {railCollapsed && (
           <nav className="hidden lg:flex flex-col flex-1 py-3 overflow-y-auto items-center gap-1">
+            {isAdmin && (
+              <a
+                href={tabHref('accessrequests')}
+                onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('accessrequests'); } }}
+                title={`Access Requests${pendingCount ? ` (${pendingCount} pending)` : ''}`}
+                aria-label="Access Requests"
+                className="relative flex items-center justify-center rounded-xl transition mb-1"
+                style={tab === 'accessrequests'
+                  ? { width: 40, height: 40, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white' }
+                  : { width: 40, height: 40, background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
+                <ShieldCheck size={18} />
+                {pendingCount > 0 && (
+                  <span className="absolute -top-1 -right-1 px-1 rounded-full text-[9px] font-bold flex items-center justify-center"
+                    style={{ minWidth: 16, height: 16, background: C.amber, color: 'white', border: '2px solid white' }}>
+                    {pendingCount}
+                  </span>
+                )}
+              </a>
+            )}
             {stages.map((stage, sIdx) => {
               const hasNumber = !!stage.number;
               const containsActive = stage.tabs.some(t => t.id === tab);
@@ -2934,6 +3225,338 @@ export default function BookkeeperProToolkit() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// COMPONENT: ACCESS REQUESTS (admin-only — temporary approval workflow)
+// ═══════════════════════════════════════════════════════════════════
+// Admins review new signups here: see pending/approved/rejected users and
+// approve or reject them. Reads/writes the `profiles` row directly (RLS:
+// profiles_admin_select / profiles_admin_update — see db/2026-06-29-user-approval.sql).
+// Approve/reject works with or without email (api/notify-access is env-gated).
+
+const APPROVAL_SETUP_HINT =
+  "The approval workflow isn’t set up in the database yet — run db/2026-06-29-user-approval.sql in your Supabase SQL Editor (see ADMIN_APPROVAL_SETUP.md), then refresh.";
+
+// A "column / table doesn't exist" PostgREST error → the migration hasn't been run on this project.
+function isApprovalNotConfiguredErr(e) {
+  const code = e?.code || '';
+  return code === 'PGRST204' || code === 'PGRST205' || code === '42703' || code === '42P01' ||
+    /approval_status|does not exist|schema cache|could not find|relation/i.test(e?.message || '');
+}
+
+function AccessRequests({ onCountChange }) {
+  const { user, profile } = useAuth();
+  const isAdmin = !!profile?.is_admin;
+
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+  const [notConfigured, setNotConfigured] = useState(false);
+  const [filter, setFilter] = useState('pending');        // pending | approved | rejected
+  const [busyId, setBusyId] = useState(null);             // row currently approving/rejecting
+  const [notice, setNotice] = useState('');
+  const [rejectFor, setRejectFor] = useState(null);       // row pending rejection (modal)
+  const [rejectReason, setRejectReason] = useState('');
+
+  // Close the reject modal on Escape (matches the other modals/menus in the app). Don't close
+  // mid-request — wait until the approve/reject call settles (busyId cleared).
+  useEffect(() => {
+    if (!rejectFor) return;
+    const onKey = (e) => { if (e.key === 'Escape' && busyId == null) { setRejectFor(null); setRejectReason(''); } };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [rejectFor, busyId]);
+
+  const load = async () => {
+    setLoading(true); setErr(''); setNotConfigured(false);
+    try {
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('id,email,full_name,avatar_url,approval_status,rejection_reason,approved_at,rejected_at,created_at')
+        .order('created_at', { ascending: false });
+      if (error) {
+        if (isApprovalNotConfiguredErr(error)) setNotConfigured(true);
+        else setErr(error.message || 'Could not load users.');
+        setRows([]);
+      } else {
+        setRows(data || []);
+      }
+    } catch (e) {
+      setErr(String(e?.message || e));
+      setRows([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+  useEffect(() => { if (isAdmin) load(); /* eslint-disable-next-line */ }, [isAdmin]);
+
+  // Best-effort email (never blocks the approval). Returns { ok } / { skipped } / { ok:false }.
+  const notifyAccess = async (payload) => {
+    try {
+      const { data: s } = await supabase.auth.getSession();
+      const token = s?.session?.access_token;
+      const res = await fetch('/api/notify-access', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) return { ok: false };
+      return await res.json().catch(() => ({ ok: false }));
+    } catch {
+      return { ok: false };
+    }
+  };
+
+  const emailSuffix = (mail) =>
+    mail?.ok ? ' · email sent' : mail?.skipped ? ' · email not configured' : ' · email not sent';
+
+  const setStatus = async (row, status, reason = null) => {
+    setBusyId(row.id); setErr(''); setNotice('');
+    const nowIso = new Date().toISOString();
+    const patch = status === 'approved'
+      ? { approval_status: 'approved', approved_at: nowIso, approved_by: user?.id || null,
+          rejected_at: null, rejected_by: null, rejection_reason: null, updated_at: nowIso }
+      : { approval_status: 'rejected', rejected_at: nowIso, rejected_by: user?.id || null,
+          rejection_reason: reason, approved_at: null, approved_by: null, updated_at: nowIso };
+    try {
+      // .select() so we can CONFIRM a row actually changed. PostgREST returns NO error when an
+      // UPDATE matches 0 rows (e.g. the admin RLS policy isn't applied or you aren't really
+      // is_admin) — without this check the panel would show a false "Approved" while the DB row
+      // stays 'pending', trapping the user on the Pending screen forever. See ADMIN_APPROVAL_SETUP.md.
+      const { data, error } = await supabase
+        .from('profiles').update(patch).eq('id', row.id)
+        .select('id, approval_status');
+      if (error) throw error;
+      const updated = Array.isArray(data) ? data[0] : null;
+      console.debug('[access] setStatus', { adminId: user?.id, targetId: row.id, status, rowsAffected: data?.length ?? 0, newStatus: updated?.approval_status });
+      if (!updated) {
+        throw new Error(
+          'No row was updated — your admin permissions may not be applied. Re-run db/2026-06-29-user-approval.sql in Supabase (it creates the profiles_admin_update policy), confirm you are flagged is_admin, then sign out and back in.'
+        );
+      }
+      // Drive local state from the DB's actual value, not an optimistic guess.
+      setRows(prev => prev.map(r => r.id === row.id
+        ? { ...r, approval_status: updated.approval_status, rejection_reason: status === 'rejected' ? reason : null }
+        : r));
+      onCountChange?.();
+      const mail = await notifyAccess({ email: row.email, fullName: row.full_name, status, reason });
+      setNotice(`${status === 'approved' ? 'Approved' : 'Rejected'} ${row.email}${emailSuffix(mail)}.`);
+    } catch (e) {
+      console.error('[access] setStatus failed', { targetId: row.id, status, code: e?.code, message: e?.message });
+      setErr(e?.message || `Could not ${status === 'approved' ? 'approve' : 'reject'} this user.`);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const approve = (row) => setStatus(row, 'approved');
+  const openReject = (row) => { setRejectFor(row); setRejectReason(''); };
+  const confirmReject = async () => {
+    const row = rejectFor;
+    if (!row) return;
+    await setStatus(row, 'rejected', rejectReason.trim() || null);
+    setRejectFor(null); setRejectReason('');
+  };
+
+  const counts = {
+    pending: rows.filter(r => (r.approval_status || 'pending') === 'pending').length,
+    approved: rows.filter(r => r.approval_status === 'approved').length,
+    rejected: rows.filter(r => r.approval_status === 'rejected').length,
+  };
+  const visible = rows.filter(r => (r.approval_status || 'pending') === filter);
+
+  const fmtDate = (s) => {
+    if (!s) return '—';
+    const d = new Date(s);
+    return isNaN(d) ? '—' : d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  };
+  const signupMethod = (r) => (r.avatar_url ? 'Google' : 'Email');
+  const initialOf = (r) => (((r.full_name || r.email || '?').trim()[0]) || '?').toUpperCase();
+
+  const STATUS_STYLE = {
+    pending:  { label: 'Pending',  bg: 'rgba(255,159,10,0.12)', bd: 'rgba(255,159,10,0.30)', fg: '#9A6200' },
+    approved: { label: 'Approved', bg: 'rgba(40,166,71,0.12)',  bd: 'rgba(40,166,71,0.30)',  fg: '#1B7A35' },
+    rejected: { label: 'Rejected', bg: 'rgba(208,35,35,0.10)',  bd: 'rgba(208,35,35,0.26)',  fg: C.red },
+  };
+  const StatusPill = ({ status }) => {
+    const s = STATUS_STYLE[status] || STATUS_STYLE.pending;
+    return (
+      <span className="px-2.5 py-1 rounded-full text-[11px] font-bold" style={{ background: s.bg, color: s.fg, border: `1px solid ${s.bd}` }}>
+        {s.label}
+      </span>
+    );
+  };
+
+  if (!isAdmin) {
+    return (
+      <div>
+        <SectionHead eyebrow="Admin" title="Access Requests" desc="Approve or reject new user signups." />
+        <div className="glass-card p-8 text-center" style={{ maxWidth: 520, margin: '24px auto 0' }}>
+          <Shield size={28} className="mx-auto" style={{ color: C.textMute }} />
+          <div className="mt-3" style={{ fontWeight: 700, fontSize: 15, color: C.text }}>Admins only</div>
+          <div className="mt-1.5" style={{ fontSize: 13, color: C.textSoft }}>
+            This area is restricted to administrators. If you need access, contact the admin team.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <SectionHead eyebrow="Admin" title="Access Requests" desc="Review new signups and approve or reject access." gold />
+
+      {/* Filter tabs */}
+      <div className="mt-6 flex flex-wrap items-center gap-2">
+        {[['pending', 'Pending'], ['approved', 'Approved'], ['rejected', 'Rejected']].map(([key, label]) => {
+          const active = filter === key;
+          const s = STATUS_STYLE[key];
+          return (
+            <button key={key} onClick={() => setFilter(key)}
+              className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition"
+              style={active
+                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px ${C.primary}55` }
+                : { background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+              {label}
+              <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold"
+                style={active ? { background: 'rgba(255,255,255,0.25)', color: 'white' } : { background: s.bg, color: s.fg }}>
+                {counts[key]}
+              </span>
+            </button>
+          );
+        })}
+        <div className="flex-1" />
+        <button onClick={load} disabled={loading}
+          className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition disabled:opacity-60"
+          style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+          {loading ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />} Refresh
+        </button>
+      </div>
+
+      {/* Notices */}
+      {notice && (
+        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: '#ECFDF5', borderColor: '#6EE7B7' }}>
+          <CheckCircle2 size={18} className="text-emerald-600 mt-0.5 flex-shrink-0" />
+          <div className="text-sm text-emerald-800 flex-1">{notice}</div>
+          <button onClick={() => setNotice('')} className="text-emerald-500 hover:text-emerald-700"><X size={16} /></button>
+        </div>
+      )}
+      {err && (
+        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: '#FEF2F2', borderColor: '#FCA5A5' }}>
+          <AlertTriangle size={18} className="text-red-500 mt-0.5 flex-shrink-0" />
+          <div className="text-sm text-red-700 flex-1">{err}</div>
+          <button onClick={() => setErr('')} className="text-red-400 hover:text-red-600"><X size={16} /></button>
+        </div>
+      )}
+
+      {/* Body */}
+      {notConfigured ? (
+        <div className="mt-6 glass-card p-8 text-center" style={{ maxWidth: 560, margin: '24px auto 0' }}>
+          <AlertCircle size={26} className="mx-auto" style={{ color: C.amber }} />
+          <div className="mt-3" style={{ fontWeight: 700, fontSize: 15, color: C.text }}>Finish backend setup</div>
+          <div className="mt-1.5" style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>{APPROVAL_SETUP_HINT}</div>
+        </div>
+      ) : loading ? (
+        <div className="mt-10 flex flex-col items-center justify-center" style={{ color: C.textMute }}>
+          <Loader2 size={24} className="animate-spin" style={{ color: C.primary }} />
+          <div className="mt-3 text-sm">Loading users…</div>
+        </div>
+      ) : visible.length === 0 ? (
+        <div className="mt-6 rounded-2xl border-2 border-dashed p-12 text-center" style={{ borderColor: C.border, color: C.textMute }}>
+          <Hourglass size={26} className="mx-auto" style={{ color: C.textMute }} />
+          <div className="mt-3 text-sm font-medium">No {filter} users.</div>
+          {filter === 'pending' && <div className="mt-1 text-xs">New signups will appear here for review.</div>}
+        </div>
+      ) : (
+        <div className="mt-5 space-y-2.5">
+          {visible.map(r => {
+            const status = r.approval_status || 'pending';
+            const rowBusy = busyId === r.id;
+            return (
+              <div key={r.id} className="glass-card p-4 flex flex-wrap items-center gap-4">
+                <div className="flex items-center justify-center flex-shrink-0 rounded-full text-white text-sm font-bold"
+                  style={{ width: 40, height: 40, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+                  {initialOf(r)}
+                </div>
+                <div className="flex-1 min-w-[180px]">
+                  <div className="truncate" style={{ fontWeight: 700, fontSize: 14, color: C.text }}>
+                    {r.full_name || r.email?.split('@')[0] || 'Unknown'}
+                  </div>
+                  <div className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{r.email}</div>
+                  <div className="mt-1 flex items-center gap-3 flex-wrap" style={{ fontSize: 11, color: C.textMute }}>
+                    <span className="inline-flex items-center gap-1"><Mail size={11} /> {signupMethod(r)}</span>
+                    <span className="inline-flex items-center gap-1"><Clock size={11} /> {fmtDate(r.created_at)}</span>
+                  </div>
+                </div>
+                <StatusPill status={status} />
+                <div className="flex items-center gap-2">
+                  {status !== 'approved' && (
+                    <button onClick={() => approve(r)} disabled={rowBusy}
+                      className="px-3.5 py-2 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 transition disabled:opacity-60"
+                      style={{ background: `linear-gradient(180deg, #34C759, #28A647)`, boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px rgba(40,166,71,0.4)' }}>
+                      {rowBusy ? <Loader2 size={14} className="animate-spin" /> : <UserCheck size={14} />} Approve
+                    </button>
+                  )}
+                  {status !== 'rejected' && (
+                    <button onClick={() => openReject(r)} disabled={rowBusy}
+                      className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
+                      style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: '1px solid rgba(208,35,35,0.20)' }}>
+                      <UserX size={14} /> Reject
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Reject confirmation modal */}
+      {rejectFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(15,18,23,0.45)' }}
+          onClick={() => { if (busyId == null) { setRejectFor(null); setRejectReason(''); } }}>
+          <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="px-6 pt-6 pb-4" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+              <div className="flex items-center gap-2.5">
+                <div className="flex items-center justify-center rounded-xl flex-shrink-0" style={{ width: 38, height: 38, background: 'rgba(208,35,35,0.10)', border: '1px solid rgba(208,35,35,0.22)' }}>
+                  <UserX size={18} style={{ color: C.red }} />
+                </div>
+                <div>
+                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 16, color: C.text }}>Reject this user?</div>
+                  <div className="truncate" style={{ fontSize: 12.5, color: C.textSoft, maxWidth: 300 }}>{rejectFor.email}</div>
+                </div>
+              </div>
+            </div>
+            <div className="px-6 py-5">
+              <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+                They’ll be blocked from the dashboard and shown the “Access Request Not Approved” screen. You can approve them again later.
+              </p>
+              <label className="block mt-4 mb-1.5" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                Reason (optional — shown to the user)
+              </label>
+              <textarea value={rejectReason} onChange={e => setRejectReason(e.target.value)} rows={3}
+                placeholder="e.g. We couldn’t verify your details. Please reach out to re-apply."
+                className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
+                style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+              <div className="mt-5 flex items-center justify-end gap-2.5">
+                <button onClick={() => { setRejectFor(null); setRejectReason(''); }} disabled={busyId != null}
+                  className="px-4 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-60"
+                  style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+                  Cancel
+                </button>
+                <button onClick={confirmReject} disabled={busyId != null}
+                  className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
+                  style={{ background: `linear-gradient(180deg, #E04545, ${C.red})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.25), 0 4px 12px -2px ${C.red}55` }}>
+                  {busyId != null ? <Loader2 size={15} className="animate-spin" /> : <UserX size={15} />} Reject user
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // COMPONENT: DASHBOARD
 // ═══════════════════════════════════════════════════════════════════
 
@@ -2951,7 +3574,7 @@ function Dashboard({ goto }) {
       desc: 'Build your foundation as a US bookkeeper',
       tiles: [
         { id: 'course',      label: 'Accounting 101',      desc: '8 modules · self-paced',          icon: BookOpen,        color: '#1E40AF' },
-        { id: 'qbomastery',  label: 'QBO Mastery Program', desc: 'Video course · certificate',  icon: GraduationCap,   color: '#2563EB' },
+        { id: 'qbomastery',  label: 'QuickBooks Online Mastery', desc: 'Video course · certificate',  icon: GraduationCap,   color: '#2563EB' },
         { id: 'industryacc', label: 'Industry Accounting', desc: '12 industries · QBO workflows',   icon: Building2,       color: '#3B82F6' },
         { id: 'ustax',       label: 'US Tax 101',          desc: 'Forms, deadlines, IRS links',     icon: Landmark,        color: '#0A1E3F' },
         { id: 'chat',        label: 'ProAdvisor Chat',     desc: 'Live mentor for clean-ups',       icon: MessageCircle,   color: '#0EA5E9' },
@@ -3449,7 +4072,10 @@ function certificateTitle(rawTitle = '') {
 const COURSE_ROW_SELECT = 'id,slug,title,subtitle,description,month,course_date,published,position,cover_path,source_course_id,created_at,updated_at';
 const COURSE_MODULE_SELECT = 'id,course_id,title,position';
 const COURSE_LESSON_SELECT = 'id,module_id,course_id,title,type,video_url,video_provider,storage_path,text_content,duration_label,position';
-const COURSE_COMPLETION_SELECT = 'id,user_id,course_id,completed_at,created_at';
+// course_completions has only (user_id, course_id, completed_at) — composite PK, no id/created_at
+// columns (see COURSE_SETUP.md). Selecting non-existent columns returns a PostgREST 400, so request
+// only what the table actually has (the code only ever reads completed_at).
+const COURSE_COMPLETION_SELECT = 'user_id,course_id,completed_at';
 const FEATURE_GUIDE_SELECT = 'feature_key,title,description,video_url,video_path,video_provider,external_url,is_active,updated_by,created_at,updated_at';
 
 function CourseProgram({
@@ -3782,7 +4408,7 @@ function CourseProgram({
     setMetaBusy(true); setErr('');
     try {
       const { error } = await supabase.from('courses')
-        .update({ published: !course.published }).eq('id', course.id);
+        .update({ published: !course.published, updated_at: new Date().toISOString() }).eq('id', course.id);
       if (error) throw error;
       await load();
     } catch (e) { logDbError('[CourseProgram] togglePublished', e, { courseId: course.id }); setErr(describeDbError(e, 'Could not change publish state.')); }
@@ -4834,7 +5460,7 @@ function CourseCatalog({
     setCourses(arr);                                           // optimistic
     setBusy(true); setErr('');
     try {
-      await Promise.all(arr.map((c, i) => supabase.from('courses').update({ position: i }).eq('id', c.id)));
+      await Promise.all(arr.map((c, i) => supabase.from('courses').update({ position: i, updated_at: new Date().toISOString() }).eq('id', c.id)));
       await loadCatalog();
     } catch (e) { logDbError('[CourseCatalog] reorder', e, { module: prefix }); setErr(describeDbError(e, 'Could not reorder courses.')); await loadCatalog(); }
     finally { setBusy(false); }
@@ -4913,7 +5539,7 @@ function CourseCatalog({
             const total = counts[c.id] || 0;
             const dn = Math.min(done[c.id] || 0, total);
             const pct = total ? Math.round((dn / total) * 100) : 0;
-            const cover = c.cover_path ? supabase.storage.from('course-media').getPublicUrl(c.cover_path).data.publicUrl : null;
+            const cover = c.cover_path ? supabase.storage.from('course-media').getPublicUrl(c.cover_path)?.data?.publicUrl : null;
             const menuOpen = menuOpenId === c.id;
             const highlight = lastDuplicatedId === c.id;
             return (

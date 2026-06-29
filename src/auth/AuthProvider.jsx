@@ -5,14 +5,18 @@
 // Wraps <BookkeeperProToolkit/> in main.jsx. Any component reads auth state via
 // the useAuth() hook:
 //
-//   const { session, user, profile, loading, recovery, configured,
+//   const { session, user, profile, loading, profileReady, recovery, configured,
 //           signUp, signIn, signInWithGoogle, signOut, resetPassword,
-//           resendConfirmation, updatePassword, clearRecovery } = useAuth();
+//           resendConfirmation, updatePassword, clearRecovery, refreshProfile } = useAuth();
 //
 // Responsibilities:
 //  1. Track the Supabase session (initial load + live changes), and server-validate
 //     the cached session so deleted/disabled accounts are signed out (not left stale).
-//  2. Load the user's `profiles` row (carries is_paid / plan for the Phase-2 gate).
+//  2. Load the user's `profiles` row (carries is_paid / plan for the Phase-2 gate, and
+//     approval_status / rejection_reason for the temporary admin-approval gate). Expose
+//     `profileReady` (have we finished the first fetch for this user?) so the app shell is
+//     never flashed before approval status is known, and `refreshProfile()` so the pending
+//     screen can poll for an admin's decision.
 //  3. Point the per-user storage namespace at the current uid BEFORE the
 //     authenticated shell renders (window.__setStorageUser, installed in main.jsx).
 //  4. One-time adopt any pre-auth ("legacy") global localStorage data into the
@@ -45,8 +49,37 @@ const LEGACY_KEYS = [
 // Ensures the migration runs exactly once and never leaks the first user's data
 // to a second account on a shared browser.
 const LEGACY_MARKER = 'auth:legacyMigratedTo';
-const PROFILE_SELECT = 'id,email,full_name,avatar_url,is_paid,plan,is_admin';
+// Preferred column set. Degrades gracefully on a not-yet-migrated project: first drop the
+// approval columns (added by db/2026-06-29-user-approval.sql), then drop is_admin/avatar_url
+// (added by COURSE_SETUP.md). This ordering means a project missing ONLY the approval columns
+// still keeps is_admin — so the admin never loses their controls in the window between deploy
+// and running the migration, and the approval gate simply stays inert (no approval_status).
+const PROFILE_SELECT = 'id,email,full_name,avatar_url,is_paid,plan,is_admin,approval_status,rejection_reason';
+const PROFILE_SELECT_NO_APPROVAL = 'id,email,full_name,avatar_url,is_paid,plan,is_admin';
 const PROFILE_SELECT_LEGACY = 'id,email,full_name,avatar_url,is_paid,plan';
+
+// A PostgREST "column / schema cache" error — i.e. the requested column doesn't exist yet on
+// this project — so we should retry with a smaller column set rather than treat it as fatal.
+function isMissingColumnError(error) {
+  return Boolean(
+    error &&
+      (error.code === 'PGRST204' ||
+        /approval_status|rejection_reason|is_admin|avatar_url|schema cache|column/i.test(error.message || ''))
+  );
+}
+
+// Fetch the profile row, narrowing the column list on each missing-column error so a
+// partially-migrated `profiles` table degrades instead of failing outright.
+async function fetchProfileRow(uid) {
+  for (const cols of [PROFILE_SELECT, PROFILE_SELECT_NO_APPROVAL, PROFILE_SELECT_LEGACY]) {
+    const { data, error } = await supabase.from('profiles').select(cols).eq('id', uid).single();
+    if (!error) return { data, error: null };
+    if (!isMissingColumnError(error)) return { data: null, error }; // genuine failure — stop retrying
+  }
+  // Even the legacy set failed with a column error (shouldn't happen) — report the last attempt.
+  const { data, error } = await supabase.from('profiles').select(PROFILE_SELECT_LEGACY).eq('id', uid).single();
+  return { data: data ?? null, error };
+}
 
 function migrateLegacyData(uid) {
   if (typeof window === 'undefined' || !uid) return;
@@ -92,6 +125,10 @@ async function accountRevoked() {
 export function AuthProvider({ children }) {
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
+  // The uid we've finished a profile fetch for. Lets the gate wait for the first fetch
+  // (so a pending user never briefly sees the dashboard) without an extra loading flag —
+  // and stays set across refreshProfile() refetches (profile is non-null then, so no flash).
+  const [profileFetchedFor, setProfileFetchedFor] = useState(null);
   const [loading, setLoading] = useState(true);
   // True after the user returns from a password-reset email link, until they set
   // a new password. The reset link signs them in with a recovery session, so the
@@ -155,38 +192,46 @@ export function AuthProvider({ children }) {
     const uid = session?.user?.id;
     if (!uid) {
       setProfile(null);
+      setProfileFetchedFor(null);
       return;
     }
     let active = true;
     (async () => {
-      let { data, error } = await supabase
-        .from('profiles')
-        .select(PROFILE_SELECT)
-        .eq('id', uid)
-        .single();
-      if (error && (error.code === 'PGRST204' || /is_admin|schema cache|column/i.test(error.message || ''))) {
-        const fallback = await supabase
-          .from('profiles')
-          .select(PROFILE_SELECT_LEGACY)
-          .eq('id', uid)
-          .single();
-        data = fallback.data;
-        error = fallback.error;
-      }
-        if (!active) return;
-        if (error) console.error('[auth] profile fetch failed:', error.message);
-        setProfile(data ?? null);
+      const { data, error } = await fetchProfileRow(uid);
+      if (!active) return;
+      if (error) console.error('[auth] profile fetch failed:', error.message);
+      setProfile(data ?? null);
+      setProfileFetchedFor(uid); // mark "first fetch done" even on error (fail open, don't hang the gate)
     })();
     return () => {
       active = false;
     };
   }, [session?.user?.id]);
 
+  // Re-read the profile on demand (e.g. the Pending Approval screen's "Check status" button /
+  // poll). Keeps profileFetchedFor unchanged (same uid), so the existing profile stays visible
+  // and the gate doesn't flash a splash while refreshing.
+  async function refreshProfile() {
+    const uid = session?.user?.id;
+    if (!uid) return null;
+    const { data, error } = await fetchProfileRow(uid);
+    if (error) {
+      console.error('[auth] profile refresh failed:', error.message);
+      return null;
+    }
+    setProfile(data ?? null);
+    return data ?? null;
+  }
+
   const value = {
     session,
     user: session?.user ?? null,
     profile,
     loading,
+    // True once the first profile fetch for the current user has settled (or there's no user).
+    // The gate waits on this so it never renders the app/approval screens with a stale null profile.
+    profileReady: !session?.user || profileFetchedFor === session?.user?.id,
+    refreshProfile,
     recovery,
     configured: supabaseConfigured,
     signUp: (email, password, fullName) =>
