@@ -13,7 +13,7 @@ import {
   TrendingUp as Growth, BookMarked, Globe, Coins, GraduationCap,
   LogOut, Lock, Mail, KeyRound, Menu,
   Plus, Trash2, Save, Play, Video, ArrowRight, ArrowLeft, ChevronUp, MoreVertical,
-  PanelLeftClose, PanelLeftOpen, RefreshCw, UserCheck, UserX, ShieldCheck, Hourglass
+  PanelLeftClose, PanelLeftOpen, RefreshCw, UserCheck, UserX, ShieldCheck, Hourglass, Bell, BellOff, Volume2
 } from 'lucide-react';
 import { useAuth } from './auth/AuthProvider.jsx';
 import { supabase } from './lib/supabase';
@@ -29,9 +29,53 @@ const DEFAULT_APP_TAB = 'dashboard';
 const REQUIRE_ADMIN_APPROVAL =
   String(import.meta.env.VITE_REQUIRE_ADMIN_APPROVAL ?? 'true').toLowerCase() !== 'false';
 
+// ── Manual enrollment / payment-verification gate ──────────────────────────────
+// When true (default), a signed-in NON-admin user with profiles.is_paid = false is held
+// on the in-app Enrollment Paywall (pricing cards → manual payment instructions → proof
+// upload) and then a "payment under review" screen, until an admin approves the request
+// in the Enrollments admin tab — which flips is_paid / plan / approval_status in ONE
+// action (it subsumes the older pending-approval screen for new signups). This is manual
+// payment VERIFICATION, not online checkout. Flip OFF without a code change by setting
+// VITE_REQUIRE_ENROLLMENT=false (then rebuild). The real security boundary is RLS
+// (db/2026-07-04-enrollment.sql) — this flag only governs the client-side gate UI.
+// See ENROLLMENT_SETUP.md.
+const REQUIRE_ENROLLMENT =
+  String(import.meta.env.VITE_REQUIRE_ENROLLMENT ?? 'true').toLowerCase() !== 'false';
+
+// Fallback pricing cards mirroring the enrollment_plans seed (db/2026-07-04-enrollment.sql).
+// Used only when the table is missing/empty so the paywall never renders blank; the live
+// table (admin-editable) always wins when it loads. Prices are FIXED ₱ (PHP) bank-transfer
+// amounts — format with phpFmt, never useCurrency (no USD conversion applies here).
+const ENROLLMENT_PLANS_FALLBACK = [
+  { key: 'core_self_paced', name: 'QBO Mastery Only', tagline: 'Core · Self-Paced', price_php: 999, compare_at_php: null, badge: null, limit_note: null, position: 1, access_days: 60, support_days: null,
+    features: ['Simulated annual bookkeeping project for an NY-based construction company', '60-day QBO Mastery course access', 'Weekly Discord chat (Thu)'] },
+  { key: 'sampler', name: 'Sampler Session', tagline: 'Essentials', price_php: 1499, compare_at_php: null, badge: null, limit_note: 'Limited offer', position: 2, access_days: 60, support_days: 30,
+    features: ['1 Live Zoom Session (3 hours)', '60-day course access', '30-day group chat support'] },
+  { key: 'silver_self_paced', name: 'QBO + Resume Combo', tagline: 'Silver · Self-Paced', price_php: 1999, compare_at_php: null, badge: null, limit_note: null, position: 3, access_days: 60, support_days: null,
+    features: ['Simulated annual bookkeeping project for an NY-based construction company', '60-day QBO Mastery course access', '60-day Resume & Interview course access', 'Weekly Discord chat (Thu)'] },
+  { key: 'gold_live', name: 'Live Group Track', tagline: 'Gold Package', price_php: 9999, compare_at_php: 35000, badge: 'BEST VALUE', limit_note: null, position: 4, access_days: 180, support_days: null,
+    features: ['Simulated annual bookkeeping project for an NY-based construction company', '12 LIVE Group Zoom Trainings (MWF 9am to 11am PH time)', '180-day resume + interview course access', 'Weekly group consult until hired', 'Discord chat support until and after hired'] },
+  { key: 'vip', name: 'Personalized Coaching Program', tagline: 'VIP Package', price_php: 15999, compare_at_php: 35000, badge: 'BEST SELLER', limit_note: 'Limited to 10 slots per month', position: 5, access_days: 180, support_days: null,
+    features: ['Simulated annual bookkeeping project for an NY-based construction company', '12 Live Group Zoom Trainings (MWF 9am to 11am PH Time)', '1-on-1 Resume & Interview Coaching (1 session)', 'Weekly group consult until hired', 'Discord chat support until and after hired'] },
+];
+const PLAN_LABELS = ENROLLMENT_PLANS_FALLBACK.reduce((m, p) => { m[p.key] = p.name; return m; }, {});
+const phpFmt = (n) => '₱' + Number(n || 0).toLocaleString('en-US');
+
+// Manual-payment instructions shown on the paywall when payment_settings hasn't loaded
+// (mirrors the db seed; the admin-editable table wins once fetched).
+const PAYMENT_SETTINGS_FALLBACK = {
+  account_name: 'Alexander Sagun',
+  bpi: '4359-11-9572',
+  security_bank: '00000-2729-5323',
+  gcash: '0905-415-7015',
+  notify_email: 'alex.capinding.sagun@gmail.com',
+  note: '',
+};
+
 const TAB_ROUTES = {
   dashboard: '/',
   accessrequests: '/admin/access-requests',
+  enrollments: '/admin/enrollments',
   course: '/courses/accounting-101',
   qbomastery: '/courses/quickbooks-online-mastery',
   industryacc: '/industry-accounting',
@@ -1581,8 +1625,933 @@ function RejectedScreen({ email, reason, onSignOut }) {
   );
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Manual enrollment / payment-verification gate (REQUIRE_ENROLLMENT).
+// Full-screen student screens + the gate data hook. Styled like AuthScreen /
+// PendingApprovalScreen (glass cards on the app-bg mesh — these render OUTSIDE
+// the app shell, so they carry their own scoped <style>). Admin review lives in
+// the AdminEnrollments component (Enrollments tab). See ENROLLMENT_SETUP.md.
+// ───────────────────────────────────────────────────────────────────────────
+
+const ENROLLMENT_SETUP_HINT =
+  "The enrollment workflow isn’t set up in the database yet — run db/2026-07-04-enrollment.sql in your Supabase SQL Editor (see ENROLLMENT_SETUP.md), then refresh.";
+
+// A "column / table doesn't exist" PostgREST error → the enrollment migration hasn't run.
+function isEnrollmentNotConfiguredErr(e) {
+  const code = e?.code || '';
+  return code === 'PGRST204' || code === 'PGRST205' || code === '42703' || code === '42P01' ||
+    /enrollment_requests|enrollment_plans|payment_settings|does not exist|schema cache|could not find|relation/i.test(e?.message || '');
+}
+
+const fmtEnrollDate = (s) => {
+  if (!s) return '—';
+  const d = new Date(s);
+  return isNaN(d) ? '—' : d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+};
+
+// Subscription access math (client mirror of the date check in public.is_enrolled()).
+// ends_at === undefined (column missing — lifecycle migration not run) and
+// ends_at === null (legacy pre-lifecycle row) both mean "no expiry" — so a deploy
+// ahead of db/2026-07-04-subscription-lifecycle.sql can never lock a member out.
+function subAccess(sub) {
+  if (!sub) return { has: false, valid: false, legacy: false, ends: null, daysLeft: null, inGrace: false, expired: false };
+  const legacy = sub.ends_at === undefined || sub.ends_at === null;
+  const ends = legacy ? null : new Date(sub.ends_at);
+  const graceEnd = !legacy && sub.grace_ends_at ? new Date(sub.grace_ends_at) : null;
+  const now = Date.now();
+  const active = sub.status === 'active';
+  const inGrace = active && !legacy && ends <= now && !!graceEnd && graceEnd > now;
+  const valid = active && (legacy || ends > now || inGrace);
+  const daysLeft = legacy ? null : Math.ceil((ends.getTime() - now) / 86400000);
+  return { has: true, valid, legacy, ends, daysLeft, inGrace, expired: !valid };
+}
+
+// The gate decision, as one named state (root gate switches on it):
+//   pass           → app shell (valid subscription, or grandfathered paid user)
+//   renew_pending  → paid member, term ended, renewal submitted → review screen
+//   finalizing     → request approved, profile/subscription flip in flight
+//   expired        → paid member, term ended, no live renewal → expired screen
+//   pending        → unpaid, first payment under review
+//   paywall_notice → unpaid, prior request rejected/expired → paywall w/ notice
+//   paywall        → unpaid, no request yet
+function enrollGateState({ profile, latestReq: r, sub }) {
+  const acc = subAccess(sub);
+  const overdue = r?.status === 'pending_review' && r?.expires_at && new Date(r.expires_at) < new Date();
+  const pendingReq = r?.status === 'pending_review' && !overdue;
+  if (profile?.is_paid) {
+    if (acc.valid || !acc.has) return 'pass';   // active term, or paid before the subscriptions era
+    // Paid but the term ended — only a request NEWER than the ended term counts as a renewal.
+    const reqIsRenewal = r && sub?.started_at && new Date(r.created_at) > new Date(sub.started_at);
+    if (pendingReq && reqIsRenewal) return 'renew_pending';
+    if (r?.status === 'approved' && reqIsRenewal) return 'finalizing';
+    return 'expired';
+  }
+  if (pendingReq) return 'pending';
+  if (r?.status === 'approved') return 'finalizing';
+  if (r) return 'paywall_notice';
+  return 'paywall';
+}
+
+// Gate data hook — fetches the signed-in user's LATEST enrollment request and LATEST
+// subscription. Runs for every non-admin (paid users too — their term may have
+// expired); admins and signed-out users pay zero query cost. Fail-open on request
+// errors (configured:false → the root gate falls back to the legacy approval
+// behavior), so a missing migration or a broken query can never lock anyone out.
+function useEnrollmentGate(user, profile, profileReady) {
+  const active = REQUIRE_ENROLLMENT && !!user && profileReady && !profile?.is_admin;
+  const uid = user?.id;
+  const [ready, setReady] = useState(false);
+  const [configured, setConfigured] = useState(true);
+  const [latestReq, setLatestReq] = useState(null);
+  const [sub, setSub] = useState(null);
+  const [reloadKey, setReloadKey] = useState(0);
+
+  useEffect(() => {
+    if (!active || !uid) { setReady(false); setLatestReq(null); setSub(null); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const [reqRes, subRes] = await Promise.all([
+          supabase.from('enrollment_requests').select('*').eq('user_id', uid)
+            .order('created_at', { ascending: false }).limit(1).maybeSingle(),
+          supabase.from('subscriptions').select('*').eq('user_id', uid)
+            .order('created_at', { ascending: false }).limit(1).maybeSingle(),
+        ]);
+        if (cancelled) return;
+        if (reqRes.error) {
+          if (!isEnrollmentNotConfiguredErr(reqRes.error)) console.error('[enroll] gate load failed', reqRes.error);
+          setConfigured(false);   // fail-open → legacy gate
+          setLatestReq(null);
+        } else {
+          setConfigured(true);
+          setLatestReq(reqRes.data || null);
+        }
+        // A subscription error NEVER unconfigures the gate: on an old-schema deploy
+        // (enrollment migration only) sub stays null and profiles.is_paid remains
+        // authoritative — paid users pass, the unpaid flow is unchanged.
+        if (subRes.error) {
+          if (!isEnrollmentNotConfiguredErr(subRes.error)) console.error('[enroll] subscription load failed', subRes.error);
+          setSub(null);
+        } else {
+          setSub(subRes.data || null);
+        }
+      } catch (e) {
+        if (!cancelled) { console.error('[enroll] gate load failed', e); setConfigured(false); setLatestReq(null); setSub(null); }
+      } finally {
+        if (!cancelled) setReady(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [active, uid, reloadKey]);
+
+  // refresh(row?) — pass the freshly-inserted request for an instant transition to the
+  // pending screen; a refetch still follows to stay truthful to the DB.
+  const refresh = (row) => { if (row && row.id) setLatestReq(row); setReloadKey(k => k + 1); };
+  const state = enrollGateState({ profile, latestReq, sub });
+  return { active, ready: active ? ready : true, configured, latestReq, sub, state, refresh };
+}
+
+// The paywall: pricing cards → manual payment instructions + proof-upload form.
+// Also hosts the "rejected / expired — resubmit" notice step (priorRequest present).
+// Renewal mode (renewal + currentSub): same flow reused for membership renewals —
+// a banner shows the current/previous term, cards mark the current plan, and an
+// optional onClose renders a Back pill (expired screen / in-app renew overlay).
+function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, onSignOut, renewal, currentSub, onClose }) {
+  const showNotice = !!priorRequest;   // rejected, expired, or overdue-pending
+  const [step, setStep] = useState(showNotice ? 'notice' : 'plans');   // notice | plans | form
+  const [plans, setPlans] = useState(ENROLLMENT_PLANS_FALLBACK);
+  const [pay, setPay] = useState(PAYMENT_SETTINGS_FALLBACK);
+  const [selected, setSelected] = useState(null);
+
+  const [fullName, setFullName] = useState(profile?.full_name || '');
+  const [phone, setPhone] = useState('');
+  const [cityCountry, setCityCountry] = useState('');
+  const [background, setBackground] = useState('');
+  const [amountPaid, setAmountPaid] = useState('');
+  const [reference, setReference] = useState('');
+  const [file, setFile] = useState(null);
+  const [agree, setAgree] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data, error } = await supabase
+          .from('enrollment_plans').select('*').eq('active', true).order('position', { ascending: true });
+        if (!cancelled && !error && data?.length) {
+          setPlans(data.map(p => ({ ...p, features: Array.isArray(p.features) ? p.features : [] })));
+        }
+      } catch { /* fallback plans already shown */ }
+      try {
+        const { data } = await supabase.from('payment_settings').select('key,value');
+        if (!cancelled && data?.length) setPay(s => ({ ...s, ...Object.fromEntries(data.map(r => [r.key, r.value])) }));
+      } catch { /* fallback details already shown */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const selectPlan = (p) => {
+    setSelected(p);
+    setAmountPaid(String(p.price_php ?? ''));
+    setErr('');
+    setStep('form');
+  };
+
+  const handleFile = (f) => {
+    setErr('');
+    if (!f) return;
+    if (!/^image\/(png|jpe?g|webp)$|^application\/pdf$/i.test(f.type)) {
+      setErr('Please upload your receipt as a PNG, JPG, WEBP or PDF file.');
+      return;
+    }
+    if (f.size > 5 * 1024 * 1024) {
+      setErr(`That file is ${(f.size / 1024 / 1024).toFixed(1)} MB — the receipt upload limit is 5 MB.`);
+      return;
+    }
+    setFile(f);
+  };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (busy) return;
+    setErr('');
+    if (!selected) { setErr('Please choose a package first.'); setStep('plans'); return; }
+    if (!file) { setErr('Please upload a screenshot or PDF of your payment.'); return; }
+    const amt = Number(amountPaid);
+    if (!fullName.trim()) { setErr('Please enter your full name.'); return; }
+    if (!amt || amt <= 0) { setErr('Please enter the amount you sent.'); return; }
+    if (!agree) { setErr('Please confirm the checkbox before submitting.'); return; }
+
+    setBusy(true);
+    let uploadedPath = null;
+    try {
+      // An overdue pending request blocks the one-pending-per-user index — the student is
+      // allowed (RLS enroll_req_own_expire) to expire their own overdue row and resubmit.
+      if (priorRequest && priorRequest.status === 'pending_review' && overdue) {
+        await supabase.from('enrollment_requests')
+          .update({ status: 'expired', updated_at: new Date().toISOString() })
+          .eq('id', priorRequest.id).eq('status', 'pending_review');
+      }
+
+      const safe = file.name.replace(/[^\w.\-]+/g, '_');
+      const path = `${user.id}/${crypto.randomUUID()}-${safe}`;
+      const { error: upErr } = await supabase.storage.from('enrollment-receipts')
+        .upload(path, file, { upsert: false, contentType: file.type || 'application/octet-stream' });
+      if (upErr) throw upErr;
+      uploadedPath = path;
+
+      const { data: row, error } = await supabase.from('enrollment_requests').insert({
+        user_id: user.id,
+        plan_key: selected.key,
+        plan_name: selected.name,
+        full_name: fullName.trim(),
+        email: user.email,
+        phone: phone.trim() || null,
+        city_country: cityCountry.trim() || null,
+        background: background.trim() || null,
+        amount_expected: Number(selected.price_php || 0),
+        amount_paid: amt,
+        payment_reference: reference.trim() || null,
+        receipt_path: path,
+      }).select().single();
+      if (error) {
+        // Best-effort cleanup of the orphaned upload (delete-own storage policy covers it).
+        try { await supabase.storage.from('enrollment-receipts').remove([path]); } catch { /* best-effort */ }
+        if (error.code === '23505') {
+          // Double-submit (e.g. two tabs): a pending request already exists — just show it.
+          onSubmitted?.();
+          return;
+        }
+        if (isEnrollmentNotConfiguredErr(error)) throw new Error(ENROLLMENT_SETUP_HINT);
+        throw error;
+      }
+
+      // Best-effort admin alert (fire-and-forget; env-gated server-side).
+      try {
+        const { data: s } = await supabase.auth.getSession();
+        const token = s?.session?.access_token;
+        fetch('/api/notify-enrollment', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+          body: JSON.stringify({ action: 'submitted', requestId: row.id }),
+        }).catch(() => {});
+      } catch { /* best-effort */ }
+
+      onSubmitted?.(row);   // gate re-renders straight into the pending-review screen
+    } catch (e2) {
+      console.error('[enroll] submit failed', e2);
+      // If the row insert never happened but the file uploaded, it was already removed above;
+      // any earlier failure leaves nothing behind.
+      if (uploadedPath === null) { /* upload failed — nothing to clean */ }
+      setErr(e2?.message || 'Could not submit your enrollment. Please try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const inputCls = 'w-full px-3.5 py-2.5 rounded-xl text-sm outline-none transition';
+  const inputStyle = { background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody };
+  const labelCls = 'block mb-1.5';
+  const labelStyle = { fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' };
+  const cardStyle = {
+    background: GLASS.cardDeep,
+    backdropFilter: 'blur(28px) saturate(160%)',
+    WebkitBackdropFilter: 'blur(28px) saturate(160%)',
+    border: `1px solid ${GLASS.border}`,
+    boxShadow: '0 20px 50px -16px rgba(10,30,80,0.18), inset 0 1px 0 rgba(255,255,255,0.6)',
+  };
+
+  const priorState = priorRequest ? (priorRequest.status === 'rejected' ? 'rejected' : 'expired') : null;
+
+  return (
+    <div className="h-screen w-full overflow-y-auto gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+        .gh-app-bg { background:
+          radial-gradient(1200px 600px at 70% -10%, rgba(90,200,250,0.12), transparent 60%),
+          radial-gradient(900px 500px at -10% 110%, rgba(10,132,255,0.10), transparent 55%),
+          ${C.bg}; }
+        .auth-in { animation: authIn .5s cubic-bezier(.16,1,.3,1) both; }
+        @keyframes authIn { from { opacity:0; transform: translateY(10px) scale(.985); } to { opacity:1; transform:none; } }
+      `}</style>
+
+      <div className="auth-in w-full max-w-5xl mx-auto px-5 md:px-8 py-8 md:py-12">
+        {/* Header */}
+        <div className="text-center">
+          <img src={LOGO_DATA_URI} alt="Toolkits by Alex" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
+          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 24, letterSpacing: '-0.02em', color: C.text }}>
+            {renewal ? 'Renew your membership' : 'Enroll in Toolkits by Alex'}
+          </div>
+          <div className="mt-1.5 mx-auto" style={{ fontSize: 13.5, color: C.textSoft, maxWidth: 520, lineHeight: 1.55 }}>
+            {renewal
+              ? 'Pick your next package, send your payment, and upload the proof — Coach Alex’s team will manually review your renewal (usually within 24 hours).'
+              : 'Pick your package, send your payment, and upload the proof — Coach Alex’s team will manually review your enrollment (usually within 24 hours).'}
+          </div>
+          <div className="mt-3 flex items-center justify-center gap-2 flex-wrap">
+            {user?.email && (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full" style={{ background: 'rgba(15,18,23,0.035)', border: `1px solid ${GLASS.borderSoft}`, fontSize: 12, color: C.textSoft }}>
+                <Mail size={12} style={{ color: C.textMute }} /> {user.email}
+              </span>
+            )}
+            {onClose && (
+              <button onClick={onClose} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full transition hover:opacity-80"
+                style={{ background: C.white, border: `1px solid ${C.border}`, fontSize: 12, fontWeight: 600, color: C.textSoft }}>
+                <ArrowLeft size={12} /> Back
+              </button>
+            )}
+            <button onClick={onSignOut} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full transition hover:opacity-80"
+              style={{ background: C.white, border: `1px solid ${C.border}`, fontSize: 12, fontWeight: 600, color: C.textSoft }}>
+              <LogOut size={12} /> Sign out
+            </button>
+          </div>
+        </div>
+
+        {/* Renewal banner — the current/previous term at a glance */}
+        {renewal && step === 'plans' && (() => {
+          const acc = subAccess(currentSub);
+          const planName = currentSub ? (PLAN_LABELS[currentSub.plan_key] || currentSub.plan_key) : null;
+          return (
+            <div className="mt-6 mx-auto rounded-2xl px-5 py-4 flex items-start gap-3" style={{ ...cardStyle, maxWidth: 640 }}>
+              <div className="flex items-center justify-center rounded-xl flex-shrink-0" style={{ width: 40, height: 40, background: 'rgba(10,132,255,0.09)', border: '1px solid rgba(10,132,255,0.20)' }}>
+                <RefreshCw size={18} style={{ color: C.primary }} />
+              </div>
+              <div style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.55 }}>
+                <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 14, color: C.text }}>
+                  {acc.valid ? 'Renewing early — smart move' : 'Welcome back'}
+                </div>
+                {planName && <>Current plan: <span style={{ fontWeight: 600, color: C.text }}>{planName}</span>. </>}
+                {acc.valid && !acc.legacy && (
+                  <>Your access runs until <span style={{ fontWeight: 600, color: C.text }}>{fmtEnrollDate(currentSub.ends_at)}</span> ({acc.daysLeft} day{acc.daysLeft === 1 ? '' : 's'} left). Renewing now <span style={{ fontWeight: 600, color: C.text }}>extends from that date</span> — you never lose days.</>
+                )}
+                {acc.valid && acc.legacy && (
+                  <>Your current membership has no expiry date; approving a renewal starts a dated term from its approval.</>
+                )}
+                {!acc.valid && acc.has && (
+                  <>Your access ended {currentSub?.ends_at ? <>on <span style={{ fontWeight: 600, color: C.text }}>{fmtEnrollDate(currentSub.ends_at)}</span></> : 'recently'}. Pick a package below to get back in — access restarts as soon as your payment is verified.</>
+                )}
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* Rejected / expired notice step */}
+        {step === 'notice' && priorRequest && (
+          <div className="mt-8 mx-auto rounded-3xl overflow-hidden" style={{ ...cardStyle, maxWidth: 520 }}>
+            <div className="px-7 pt-7 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+              <div className="flex justify-center">
+                <div className="flex items-center justify-center rounded-2xl" style={{
+                  width: 64, height: 64,
+                  background: priorState === 'rejected' ? 'rgba(208,35,35,0.10)' : 'rgba(255,159,10,0.12)',
+                  border: priorState === 'rejected' ? '1px solid rgba(208,35,35,0.22)' : '1px solid rgba(255,159,10,0.25)',
+                }}>
+                  {priorState === 'rejected'
+                    ? <AlertTriangle size={28} style={{ color: C.red }} />
+                    : <Clock size={28} style={{ color: C.amber }} />}
+                </div>
+              </div>
+              <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>
+                {priorState === 'rejected' ? 'Payment proof needs another look' : 'Your enrollment request expired'}
+              </div>
+            </div>
+            <div className="px-7 py-6">
+              <p className="text-center" style={{ fontSize: 13.5, color: C.textSoft, lineHeight: 1.6 }}>
+                {priorState === 'rejected'
+                  ? 'We couldn’t verify your payment yet — no worries, this is usually a small mix-up. Check the reason below and resubmit your proof.'
+                  : 'Your submission wasn’t completed within the 3-day review window, so it expired. You can resubmit your payment proof right now — it only takes a minute.'}
+              </p>
+              {priorState === 'rejected' && priorRequest.rejection_reason && (
+                <div className="mt-4 flex items-start gap-2.5 px-3.5 py-3 rounded-xl" style={{ background: 'rgba(208,35,35,0.06)', border: '1px solid rgba(208,35,35,0.16)' }}>
+                  <AlertTriangle size={15} className="flex-shrink-0 mt-px" style={{ color: C.red }} />
+                  <div style={{ fontSize: 12.5, color: C.text, lineHeight: 1.5 }}>
+                    <span style={{ fontWeight: 600 }}>Reason: </span>{priorRequest.rejection_reason}
+                  </div>
+                </div>
+              )}
+              <div className="mt-4 rounded-xl px-3.5 py-3" style={{ background: 'rgba(15,18,23,0.03)', border: `1px solid ${GLASS.borderSoft}` }}>
+                {[['Package', priorRequest.plan_name || PLAN_LABELS[priorRequest.plan_key] || priorRequest.plan_key],
+                  ['Amount sent', phpFmt(priorRequest.amount_paid)],
+                  ['Submitted', fmtEnrollDate(priorRequest.created_at)]].map(([k, v]) => (
+                  <div key={k} className="flex items-center justify-between py-1" style={{ fontSize: 12.5 }}>
+                    <span style={{ color: C.textMute }}>{k}</span>
+                    <span style={{ color: C.text, fontWeight: 600 }}>{v}</span>
+                  </div>
+                ))}
+              </div>
+              <button onClick={() => setStep('plans')}
+                className="mt-5 w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition"
+                style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+                <RefreshCw size={15} /> Choose a package & resubmit
+              </button>
+              <p className="mt-4 text-center" style={{ fontSize: 11, color: C.textMute }}>
+                Questions? Contact <a href={`mailto:${pay.notify_email || PAYMENT_SETTINGS_FALLBACK.notify_email}`} style={{ color: C.primary, fontWeight: 600 }}>support</a>.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Pricing cards */}
+        {step === 'plans' && (
+          <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-3 items-stretch">
+            {plans.map((p) => {
+              const compare = Number(p.compare_at_php || 0);
+              const price = Number(p.price_php || 0);
+              const save = compare > price ? compare - price : 0;
+              const pct = save ? Math.round((save / compare) * 100) : 0;
+              const featured = !!p.badge;
+              return (
+                <div key={p.key} className="rounded-3xl overflow-hidden flex flex-col p-6" style={{
+                  ...cardStyle,
+                  border: featured ? '1.5px solid rgba(10,132,255,0.40)' : `1px solid ${GLASS.border}`,
+                  boxShadow: featured
+                    ? `0 24px 60px -16px rgba(10,132,255,0.28), inset 0 1px 0 rgba(255,255,255,0.6)`
+                    : cardStyle.boxShadow,
+                }}>
+                  <div className="flex items-center justify-between gap-2">
+                    <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: C.textMute }}>{p.tagline || ' '}</div>
+                    {p.badge && (
+                      <span className="px-2.5 py-1 rounded-full text-[10px] font-bold text-white inline-flex items-center gap-1"
+                        style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `0 4px 10px -2px ${C.primary}55` }}>
+                        <Sparkles size={10} /> {p.badge}
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-2" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 17, letterSpacing: '-0.01em', color: C.text }}>{p.name}</div>
+                  <div className="mt-2 flex items-baseline gap-2 flex-wrap">
+                    <span style={{ fontFamily: fontDisplay, fontWeight: 800, fontSize: 28, letterSpacing: '-0.02em', color: C.text }}>{phpFmt(price)}</span>
+                    {compare > price && (
+                      <span style={{ fontSize: 13.5, color: C.textMute, textDecoration: 'line-through' }}>{phpFmt(compare)}</span>
+                    )}
+                  </div>
+                  {save > 0 && (
+                    <div className="mt-1" style={{ fontSize: 11, fontWeight: 700, color: C.primary }}>Save {phpFmt(save)} · {pct}% OFF</div>
+                  )}
+                  {p.limit_note && (
+                    <div className="mt-2 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg self-start" style={{ background: 'rgba(255,159,10,0.10)', border: '1px solid rgba(255,159,10,0.25)', fontSize: 11, fontWeight: 600, color: '#9A6200' }}>
+                      <Clock size={11} /> {p.limit_note}
+                    </div>
+                  )}
+                  <div className="mt-2 flex items-center gap-2 flex-wrap">
+                    {Number(p.access_days) > 0 && (
+                      <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg" style={{ background: 'rgba(10,132,255,0.07)', border: '1px solid rgba(10,132,255,0.20)', fontSize: 11, fontWeight: 600, color: C.primary }}>
+                        <CalendarClock size={11} /> {p.access_days}-day access{Number(p.support_days) > 0 ? ` · ${p.support_days}-day support` : ''}
+                      </span>
+                    )}
+                    {renewal && currentSub?.plan_key === p.key && (
+                      <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg" style={{ background: 'rgba(48,161,78,0.09)', border: '1px solid rgba(48,161,78,0.25)', fontSize: 11, fontWeight: 600, color: C.green }}>
+                        <Check size={11} /> Current plan
+                      </span>
+                    )}
+                  </div>
+                  <ul className="mt-4 space-y-2 flex-1">
+                    {(p.features || []).map((f, i) => (
+                      <li key={i} className="flex items-start gap-2" style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.45 }}>
+                        <Check size={14} className="flex-shrink-0 mt-0.5" style={{ color: C.primary }} /> {f}
+                      </li>
+                    ))}
+                  </ul>
+                  <button onClick={() => selectPlan(p)}
+                    className="mt-5 w-full py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 transition hover:opacity-95"
+                    style={featured
+                      ? { color: 'white', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }
+                      : { color: C.primary, background: 'rgba(10,132,255,0.07)', border: '1px solid rgba(10,132,255,0.22)' }}>
+                    Enroll — {phpFmt(price)} <ArrowRight size={14} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Payment instructions + proof form */}
+        {step === 'form' && selected && (
+          <div className="mt-8">
+            <button onClick={() => { setStep('plans'); setErr(''); }}
+              className="inline-flex items-center gap-1.5 text-xs font-semibold transition hover:opacity-80" style={{ color: C.primary }}>
+              <ArrowLeft size={13} /> All packages
+            </button>
+
+            <div className="mt-3 grid gap-5 lg:grid-cols-[1fr,360px] items-start">
+              {/* Form card */}
+              <form onSubmit={submit} className="rounded-3xl p-6 md:p-7" style={cardStyle}>
+                <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 16, color: C.text }}>Your enrollment details</div>
+                <p className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>
+                  Submit your payment proof and Coach Alex’s team will manually review your enrollment.
+                </p>
+
+                <div className="mt-5 grid gap-3.5 sm:grid-cols-2">
+                  <div>
+                    <label className={labelCls} style={labelStyle}>Full name *</label>
+                    <input className={inputCls} style={inputStyle} value={fullName} onChange={e => setFullName(e.target.value)} placeholder="Juan dela Cruz" required />
+                  </div>
+                  <div>
+                    <label className={labelCls} style={labelStyle}>Email</label>
+                    <input className={inputCls} style={{ ...inputStyle, background: 'rgba(15,18,23,0.03)', color: C.textSoft }} value={user?.email || ''} readOnly />
+                  </div>
+                  <div>
+                    <label className={labelCls} style={labelStyle}>Phone</label>
+                    <input className={inputCls} style={inputStyle} value={phone} onChange={e => setPhone(e.target.value)} placeholder="09XX-XXX-XXXX" />
+                  </div>
+                  <div>
+                    <label className={labelCls} style={labelStyle}>City & country</label>
+                    <input className={inputCls} style={inputStyle} value={cityCountry} onChange={e => setCityCountry(e.target.value)} placeholder="Manila, Philippines" />
+                  </div>
+                  <div className="sm:col-span-2">
+                    <label className={labelCls} style={labelStyle}>Course / background</label>
+                    <textarea className={inputCls + ' resize-none'} style={inputStyle} rows={2} value={background} onChange={e => setBackground(e.target.value)}
+                      placeholder="e.g. BS Accountancy · 3 yrs PH bookkeeping · currently an audit associate" />
+                  </div>
+                  <div>
+                    <label className={labelCls} style={labelStyle}>Amount paid / sent (₱) *</label>
+                    <input className={inputCls} style={{ ...inputStyle, fontFamily: fontMono }} type="number" min="1" step="any"
+                      value={amountPaid} onChange={e => setAmountPaid(e.target.value)} placeholder={String(selected.price_php)} required />
+                  </div>
+                  <div>
+                    <label className={labelCls} style={labelStyle}>Payment reference no.</label>
+                    <input className={inputCls} style={{ ...inputStyle, fontFamily: fontMono }} value={reference} onChange={e => setReference(e.target.value)} placeholder="e.g. GCash ref. 9001234567" />
+                  </div>
+                </div>
+
+                {/* Receipt upload */}
+                <div className="mt-4">
+                  <label className={labelCls} style={labelStyle}>Screenshot of payment *</label>
+                  <div
+                    onClick={() => fileInputRef.current?.click()}
+                    onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                    onDrop={(e) => { e.preventDefault(); e.stopPropagation(); handleFile(e.dataTransfer.files?.[0]); }}
+                    className="rounded-2xl p-6 text-center cursor-pointer transition"
+                    style={{ border: `2px dashed ${file ? 'rgba(40,166,71,0.45)' : 'rgba(10,132,255,0.30)'}`, background: file ? 'rgba(40,166,71,0.05)' : 'rgba(10,132,255,0.03)' }}>
+                    <input ref={fileInputRef} type="file" className="hidden"
+                      accept=".pdf,.png,.jpg,.jpeg,.webp,application/pdf,image/png,image/jpeg,image/webp"
+                      onChange={(e) => { handleFile(e.target.files?.[0]); e.target.value = ''; }} />
+                    {file ? (
+                      <div className="flex items-center justify-center gap-2" style={{ fontSize: 13, fontWeight: 600, color: '#1B7A35' }}>
+                        <CheckCircle2 size={16} /> {file.name} <span style={{ color: C.textMute, fontWeight: 500 }}>· {(file.size / 1024 / 1024).toFixed(1)} MB</span>
+                      </div>
+                    ) : (
+                      <>
+                        <Upload size={22} className="mx-auto" style={{ color: C.primary }} />
+                        <div className="mt-2" style={{ fontSize: 13, fontWeight: 600, color: C.text }}>Click to upload or drag & drop</div>
+                        <div className="mt-0.5" style={{ fontSize: 11.5, color: C.textMute }}>Your GCash / BPI / Security Bank receipt · PDF, PNG, JPG or WEBP · up to 5 MB</div>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* Confirmation */}
+                <label className="mt-4 flex items-start gap-2.5 cursor-pointer select-none">
+                  <input type="checkbox" checked={agree} onChange={e => setAgree(e.target.checked)} className="mt-0.5" />
+                  <span style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.5 }}>
+                    I confirm I sent <span style={{ fontWeight: 700, color: C.text }}>{phpFmt(Number(amountPaid) || selected.price_php)}</span> to one of the accounts listed here, and I understand access is granted after Coach Alex’s team manually verifies my payment.
+                  </span>
+                </label>
+
+                {err && (
+                  <div className="mt-4 flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs" style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: '1px solid rgba(208,35,35,0.18)' }}>
+                    <AlertTriangle size={14} className="flex-shrink-0 mt-px" /> <span>{err}</span>
+                  </div>
+                )}
+
+                <button type="submit" disabled={busy}
+                  className="mt-5 w-full py-3 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+                  style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+                  {busy ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
+                  {busy ? 'Submitting…' : 'Submit my enrollment'}
+                </button>
+                <p className="mt-2.5 text-center" style={{ fontSize: 11, color: C.textMute }}>
+                  This is a manual review, not an online checkout — you’ll see a confirmation screen right after submitting.
+                </p>
+              </form>
+
+              {/* Payment instructions card */}
+              <div className="rounded-3xl overflow-hidden" style={cardStyle}>
+                <div className="px-6 pt-5 pb-4" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 15, color: C.text }}>How to pay</div>
+                  <div className="mt-1" style={{ fontSize: 12, color: C.textSoft }}>
+                    Send <span style={{ fontWeight: 700, color: C.text }}>{phpFmt(selected.price_php)}</span> for <span style={{ fontWeight: 600 }}>{selected.name}</span> to any account below.
+                  </div>
+                </div>
+                <div className="px-6 py-5">
+                  {[
+                    ['BPI', pay.bpi, Landmark],
+                    ['Security Bank', pay.security_bank, Landmark],
+                    ['GCash', pay.gcash, Phone],
+                    ['Account name', pay.account_name, Wallet],
+                  ].filter(([, v]) => v).map(([k, v, Icon]) => (
+                    <div key={k} className="flex items-center justify-between gap-3 py-2.5" style={{ borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+                      <span className="inline-flex items-center gap-2" style={{ fontSize: 12, color: C.textSoft }}>
+                        <Icon size={13} style={{ color: C.textMute }} /> {k}
+                      </span>
+                      <span style={{ fontFamily: fontMono, fontSize: 12.5, fontWeight: 600, color: C.text }}>{v}</span>
+                    </div>
+                  ))}
+                  {pay.note && (
+                    <div className="mt-3 px-3 py-2.5 rounded-xl" style={{ background: 'rgba(10,132,255,0.05)', border: '1px solid rgba(10,132,255,0.14)', fontSize: 12, color: C.textSoft, lineHeight: 1.5 }}>
+                      {pay.note}
+                    </div>
+                  )}
+                  {pay.notify_email && (
+                    <div className="mt-3 flex items-start gap-2" style={{ fontSize: 11.5, color: C.textMute, lineHeight: 1.5 }}>
+                      <Mail size={13} className="flex-shrink-0 mt-px" />
+                      <span>Optionally, also email your proof to <a href={`mailto:${pay.notify_email}`} style={{ color: C.primary, fontWeight: 600 }}>{pay.notify_email}</a>.</span>
+                    </div>
+                  )}
+                  <div className="mt-4 flex items-start gap-2 px-3 py-2.5 rounded-xl" style={{ background: 'rgba(255,159,10,0.08)', border: '1px solid rgba(255,159,10,0.22)', fontSize: 11.5, color: '#7A4B00', lineHeight: 1.5 }}>
+                    <Clock size={13} className="flex-shrink-0 mt-px" />
+                    <span>Manual review — Coach Alex’s team verifies payments personally, usually within 24 hours.</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// "Payment under review" screen — shown after submitting (and, with finalizing=true,
+// during the brief window where the request is approved but the profile flip hasn't
+// landed yet). renewal=true swaps the copy for a membership renewal (an expired member
+// resubmitting). Clone of PendingApprovalScreen: realtime + poll/focus fallback.
+function EnrollmentPendingScreen({ request, finalizing, renewal, email, uid, onSignOut, onRefreshProfile, onRefreshRequest }) {
+  const [checking, setChecking] = useState(false);
+  const [checkedAt, setCheckedAt] = useState(null);
+  // Latest refresh fns in refs so the poll effect runs once (refreshProfile is a fresh
+  // reference every AuthProvider render — depending on it would reset the interval).
+  const refreshRef = useRef(null);
+  refreshRef.current = () => { onRefreshProfile?.(); onRefreshRequest?.(); };
+
+  const check = async () => {
+    if (checking) return;
+    setChecking(true);
+    try { await Promise.resolve(refreshRef.current?.()); setCheckedAt(Date.now()); }
+    finally { setChecking(false); }
+  };
+
+  // INSTANT advance on approval: admin approve flips profiles.is_paid → the profiles
+  // channel fires → refreshProfile → the gate re-renders into the dashboard. A reject
+  // flips this user's request row → the enrollment_requests channel fires → the gate
+  // shows the resubmit notice. RLS applies to both (own rows only). Requires the tables
+  // in the supabase_realtime publication (db/2026-07-04-enrollment.sql §8 + the profiles
+  // realtime migration); if absent, these are inert and the poll below still advances.
+  useEffect(() => {
+    if (!uid) return;
+    const chProfile = supabase
+      .channel(`profile-enroll-${uid}`)
+      .on('postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'profiles', filter: `id=eq.${uid}` },
+        () => { refreshRef.current?.(); })
+      .subscribe();
+    const chReq = supabase
+      .channel(`enroll-req-${uid}`)
+      .on('postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'enrollment_requests', filter: `user_id=eq.${uid}` },
+        () => { refreshRef.current?.(); })
+      .subscribe();
+    // A renewal approval INSERTs a fresh subscriptions row (approve_subscription RPC) —
+    // hearing it advances an expired member instantly. Inert unless subscriptions is in
+    // the realtime publication (db/2026-07-04-subscription-lifecycle.sql §8).
+    const chSub = supabase
+      .channel(`enroll-sub-${uid}`)
+      .on('postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'subscriptions', filter: `user_id=eq.${uid}` },
+        () => { refreshRef.current?.(); })
+      .subscribe();
+    return () => { supabase.removeChannel(chProfile); supabase.removeChannel(chReq); supabase.removeChannel(chSub); };
+  }, [uid]);
+
+  // Fallback poll + focus/visibility re-checks (same shape as PendingApprovalScreen).
+  useEffect(() => {
+    const tick = () => { refreshRef.current?.(); };
+    tick();
+    const id = setInterval(tick, 30000);
+    const onVis = () => { if (document.visibilityState === 'visible') tick(); };
+    document.addEventListener('visibilitychange', onVis);
+    window.addEventListener('focus', tick);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVis);
+      window.removeEventListener('focus', tick);
+    };
+  }, []);
+
+  const firstName = (request?.full_name || '').trim().split(/\s+/)[0] || null;
+
+  return (
+    <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+        .gh-app-bg { background:
+          radial-gradient(1200px 600px at 70% -10%, rgba(90,200,250,0.12), transparent 60%),
+          radial-gradient(900px 500px at -10% 110%, rgba(10,132,255,0.10), transparent 55%),
+          ${C.bg}; }
+        .auth-in { animation: authIn .5s cubic-bezier(.16,1,.3,1) both; }
+        @keyframes authIn { from { opacity:0; transform: translateY(10px) scale(.985); } to { opacity:1; transform:none; } }
+        @keyframes pendPulse { 0%,100% { transform: scale(1); opacity:1 } 50% { transform: scale(1.06); opacity:.85 } }
+      `}</style>
+
+      <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
+        background: GLASS.cardDeep,
+        backdropFilter: 'blur(30px) saturate(180%)',
+        WebkitBackdropFilter: 'blur(30px) saturate(180%)',
+        border: `1px solid ${GLASS.border}`,
+        boxShadow: '0 24px 60px -12px rgba(10,30,80,0.22), inset 0 1px 0 rgba(255,255,255,0.6)',
+      }}>
+        {/* Header */}
+        <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+          <img src={LOGO_DATA_URI} alt="Toolkits by Alex" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
+          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>
+            {finalizing ? 'Approved — finalizing your access…' : renewal ? 'Renewal Under Review' : 'Payment Under Review'}
+          </div>
+          <div className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>Toolkits by Alex</div>
+        </div>
+
+        <div className="px-8 py-7">
+          <div className="flex justify-center">
+            <div className="flex items-center justify-center rounded-2xl" style={{
+              width: 64, height: 64,
+              background: finalizing ? 'rgba(40,166,71,0.12)' : 'rgba(255,159,10,0.12)',
+              border: finalizing ? '1px solid rgba(40,166,71,0.30)' : '1px solid rgba(255,159,10,0.25)',
+              animation: 'pendPulse 2.4s ease-in-out infinite',
+            }}>
+              {finalizing
+                ? <CheckCircle2 size={28} style={{ color: C.green }} />
+                : <Hourglass size={28} style={{ color: C.amber }} />}
+            </div>
+          </div>
+
+          <p className="mt-5 text-center" style={{ fontSize: 13.5, color: C.textSoft, lineHeight: 1.6 }}>
+            {finalizing
+              ? 'Your payment was verified! We’re unlocking your toolkit now — this screen will advance automatically in a moment.'
+              : renewal
+              ? <>Thanks{firstName ? <span style={{ fontWeight: 600, color: C.text }}>, {firstName}</span> : ''} — we received your renewal request. Your payment is now <span style={{ fontWeight: 600, color: C.text }}>pending manual review</span> by Coach Alex’s team. Your access resumes automatically the moment it’s verified.</>
+              : <>Thanks{firstName ? <span style={{ fontWeight: 600, color: C.text }}>, {firstName}</span> : ''} — we received your enrollment request. Your payment is now <span style={{ fontWeight: 600, color: C.text }}>pending manual review</span> by Coach Alex’s team. You’ll be let in automatically the moment it’s verified.</>}
+          </p>
+
+          {request && (
+            <div className="mt-4 rounded-xl px-3.5 py-2.5" style={{ background: 'rgba(15,18,23,0.03)', border: `1px solid ${GLASS.borderSoft}` }}>
+              {[['Package', request.plan_name || PLAN_LABELS[request.plan_key] || request.plan_key],
+                ['Amount sent', phpFmt(request.amount_paid)],
+                ...(request.payment_reference ? [['Reference', request.payment_reference]] : []),
+                ['Submitted', fmtEnrollDate(request.created_at)],
+                ['Review by', fmtEnrollDate(request.expires_at)]].map(([k, v]) => (
+                <div key={k} className="flex items-center justify-between gap-3 py-1" style={{ fontSize: 12.5 }}>
+                  <span style={{ color: C.textMute }}>{k}</span>
+                  <span className="text-right" style={{ color: C.text, fontWeight: 600 }}>{v}</span>
+                </div>
+              ))}
+              <div className="flex items-center justify-between gap-3 py-1" style={{ fontSize: 12.5 }}>
+                <span style={{ color: C.textMute }}>Status</span>
+                <span className="px-2 py-0.5 rounded-full text-[11px] font-bold" style={finalizing
+                  ? { background: 'rgba(40,166,71,0.12)', color: '#1B7A35', border: '1px solid rgba(40,166,71,0.30)' }
+                  : { background: 'rgba(255,159,10,0.12)', color: '#9A6200', border: '1px solid rgba(255,159,10,0.30)' }}>
+                  {finalizing ? 'Approved' : 'Pending review'}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {email && (
+            <div className="mt-4 flex items-center justify-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'rgba(15,18,23,0.035)', border: `1px solid ${GLASS.borderSoft}` }}>
+              <Mail size={14} style={{ color: C.textMute }} />
+              <span className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{email}</span>
+            </div>
+          )}
+
+          {checkedAt && !checking && !finalizing && (
+            <div className="mt-3 text-center" style={{ fontSize: 11.5, color: C.textMute }}>
+              Still under review — we’ll keep checking automatically.
+            </div>
+          )}
+
+          <button onClick={check} disabled={checking}
+            className="mt-5 w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+            {checking ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
+            {checking ? 'Checking…' : 'Check review status'}
+          </button>
+
+          <button onClick={onSignOut}
+            className="mt-2.5 w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition hover:opacity-90"
+            style={{ background: C.white, border: `1px solid ${C.border}`, color: C.textSoft }}>
+            <LogOut size={15} /> Sign out
+          </button>
+
+          <p className="mt-5 text-center" style={{ fontSize: 11, color: C.textMute, lineHeight: 1.5 }}>
+            Need help? Contact{' '}
+            <a href="mailto:alex.capinding.sagun@gmail.com" style={{ color: C.primary, fontWeight: 600 }}>support</a>.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// "Membership expired" screen — a paid member whose subscription term ended and who has
+// no live renewal under review. Full-screen block (same pattern as the pending screen)
+// with a Renew CTA that hands off to the paywall in renewal mode. Prior history stays
+// visible: the ended term's details render here; past requests remain in the DB.
+function MembershipExpiredScreen({ sub, latestReq, email, onRenew, onSignOut }) {
+  const acc = subAccess(sub);
+  const planName = sub ? (PLAN_LABELS[sub.plan_key] || sub.plan_key) : null;
+  const endedDaysAgo = acc.ends ? Math.max(0, Math.floor((Date.now() - acc.ends.getTime()) / 86400000)) : null;
+  // Only a REJECTED renewal attempt (newer than the ended term) is worth surfacing here.
+  const rejectedRenewal = latestReq?.status === 'rejected' && sub?.started_at &&
+    new Date(latestReq.created_at) > new Date(sub.started_at) ? latestReq : null;
+
+  return (
+    <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+        .gh-app-bg { background:
+          radial-gradient(1200px 600px at 70% -10%, rgba(90,200,250,0.12), transparent 60%),
+          radial-gradient(900px 500px at -10% 110%, rgba(10,132,255,0.10), transparent 55%),
+          ${C.bg}; }
+        .auth-in { animation: authIn .5s cubic-bezier(.16,1,.3,1) both; }
+        @keyframes authIn { from { opacity:0; transform: translateY(10px) scale(.985); } to { opacity:1; transform:none; } }
+      `}</style>
+
+      <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
+        background: GLASS.cardDeep,
+        backdropFilter: 'blur(30px) saturate(180%)',
+        WebkitBackdropFilter: 'blur(30px) saturate(180%)',
+        border: `1px solid ${GLASS.border}`,
+        boxShadow: '0 24px 60px -12px rgba(10,30,80,0.22), inset 0 1px 0 rgba(255,255,255,0.6)',
+      }}>
+        <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+          <img src={LOGO_DATA_URI} alt="Toolkits by Alex" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
+          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>
+            Your membership has ended
+          </div>
+          <div className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>Toolkits by Alex</div>
+        </div>
+
+        <div className="px-8 py-7">
+          <div className="flex justify-center">
+            <div className="flex items-center justify-center rounded-2xl" style={{
+              width: 64, height: 64,
+              background: 'rgba(208,35,35,0.08)', border: '1px solid rgba(208,35,35,0.20)',
+            }}>
+              <CalendarClock size={28} style={{ color: C.red }} />
+            </div>
+          </div>
+
+          <p className="mt-5 text-center" style={{ fontSize: 13.5, color: C.textSoft, lineHeight: 1.6 }}>
+            {planName
+              ? <>Your <span style={{ fontWeight: 600, color: C.text }}>{planName}</span> access{acc.ends ? <> ended on <span style={{ fontWeight: 600, color: C.text }}>{fmtEnrollDate(sub.ends_at)}</span>{endedDaysAgo != null && endedDaysAgo > 0 ? ` (${endedDaysAgo} day${endedDaysAgo === 1 ? '' : 's'} ago)` : ' (today)'}</> : ' has ended'}.</>
+              : 'Your membership access has ended.'}
+            {' '}Renew to pick up right where you left off — all your progress and data are safe.
+          </p>
+
+          {rejectedRenewal && (
+            <div className="mt-4 flex items-start gap-2.5 px-3.5 py-3 rounded-xl" style={{ background: 'rgba(208,35,35,0.06)', border: '1px solid rgba(208,35,35,0.16)' }}>
+              <AlertTriangle size={15} className="flex-shrink-0 mt-px" style={{ color: C.red }} />
+              <div style={{ fontSize: 12.5, color: C.text, lineHeight: 1.5 }}>
+                <span style={{ fontWeight: 600 }}>Your last renewal needs another look{rejectedRenewal.rejection_reason ? ': ' : '.'}</span>
+                {rejectedRenewal.rejection_reason || ''} You can resubmit your payment proof below.
+              </div>
+            </div>
+          )}
+
+          {sub && (
+            <div className="mt-4 rounded-xl px-3.5 py-2.5" style={{ background: 'rgba(15,18,23,0.03)', border: `1px solid ${GLASS.borderSoft}` }}>
+              {[['Plan', planName],
+                ['Started', fmtEnrollDate(sub.started_at)],
+                ['Ended', sub.ends_at ? fmtEnrollDate(sub.ends_at) : '—']].map(([k, v]) => (
+                <div key={k} className="flex items-center justify-between gap-3 py-1" style={{ fontSize: 12.5 }}>
+                  <span style={{ color: C.textMute }}>{k}</span>
+                  <span className="text-right" style={{ color: C.text, fontWeight: 600 }}>{v}</span>
+                </div>
+              ))}
+              <div className="flex items-center justify-between gap-3 py-1" style={{ fontSize: 12.5 }}>
+                <span style={{ color: C.textMute }}>Status</span>
+                <span className="px-2 py-0.5 rounded-full text-[11px] font-bold" style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: '1px solid rgba(208,35,35,0.20)' }}>
+                  Expired
+                </span>
+              </div>
+            </div>
+          )}
+
+          {email && (
+            <div className="mt-4 flex items-center justify-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'rgba(15,18,23,0.035)', border: `1px solid ${GLASS.borderSoft}` }}>
+              <Mail size={14} style={{ color: C.textMute }} />
+              <span className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{email}</span>
+            </div>
+          )}
+
+          <button onClick={onRenew}
+            className="mt-5 w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition hover:opacity-95"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+            <RefreshCw size={15} /> Renew your membership
+          </button>
+
+          <button onClick={onSignOut}
+            className="mt-2.5 w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition hover:opacity-90"
+            style={{ background: C.white, border: `1px solid ${C.border}`, color: C.textSoft }}>
+            <LogOut size={15} /> Sign out
+          </button>
+
+          <p className="mt-5 text-center" style={{ fontSize: 11, color: C.textMute, lineHeight: 1.5 }}>
+            Questions about your membership? Contact{' '}
+            <a href={`mailto:${PAYMENT_SETTINGS_FALLBACK.notify_email}`} style={{ color: C.primary, fontWeight: 600 }}>support</a>.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function BookkeeperProToolkit() {
   const { user, profile, loading, profileReady, recovery, signOut, refreshProfile } = useAuth();
+  // Enrollment/payment gate data (REQUIRE_ENROLLMENT). Inert (zero queries) for admins
+  // and signed-out visitors; paid users ARE checked (their term may have expired) —
+  // see useEnrollmentGate. renewNow = expired member clicked "Renew" (expired screen →
+  // paywall handoff; reset on submit).
+  const enroll = useEnrollmentGate(user, profile, profileReady);
+  const [renewNow, setRenewNow] = useState(false);
   const initialRouteRef = useRef(null);
   if (!initialRouteRef.current) initialRouteRef.current = readAppRoute();
 
@@ -1833,6 +2802,21 @@ export default function BookkeeperProToolkit() {
     } catch { /* table/column not migrated — leave at 0 */ }
   };
   useEffect(() => { refreshPendingCount(); /* eslint-disable-next-line */ }, [isAdmin]);
+  // Pending-enrollment count for the admin sidebar badge (Enrollments tab — manual payment
+  // review). Same shape as refreshPendingCount: admin-only, inert if the enrollment
+  // migration (db/2026-07-04-enrollment.sql) hasn't been run yet.
+  const [enrollPendingCount, setEnrollPendingCount] = useState(0);
+  const refreshEnrollPendingCount = async () => {
+    if (!isAdmin) return;
+    try {
+      const { count, error } = await supabase
+        .from('enrollment_requests')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', 'pending_review');
+      if (!error) setEnrollPendingCount(count || 0);
+    } catch { /* table not migrated — leave at 0 */ }
+  };
+  useEffect(() => { refreshEnrollPendingCount(); /* eslint-disable-next-line */ }, [isAdmin]);
   const [labelByKey, setLabelByKey] = useState({});
   const [draftLabels, setDraftLabels] = useState({});
   const [savingLabels, setSavingLabels] = useState(false);
@@ -2281,6 +3265,7 @@ export default function BookkeeperProToolkit() {
     switch (tabId) {
       case 'dashboard': return <Dashboard goto={setTab} />;
       case 'accessrequests': return <AccessRequests onCountChange={refreshPendingCount} />;
+      case 'enrollments': return <AdminEnrollments onCountChange={refreshEnrollPendingCount} />;
       case 'coa': return <CoaGenerator />;
       case 'course': return <Course />;
       case 'qbomastery': return <QBOMastery />;
@@ -2320,20 +3305,73 @@ export default function BookkeeperProToolkit() {
   if (recovery) return <UpdatePasswordScreen />;  // returned from a reset-link
   if (!user)    return <AuthScreen />;
 
-  // ── Admin-approval gate (temporary; toggle via REQUIRE_ADMIN_APPROVAL) ──
-  // Wait for the first profile fetch so a pending user never briefly sees the dashboard.
-  // Admins always pass. If the migration hasn't run yet, approval_status is undefined and
-  // this gate is inert (fail-open) — so deploying the code before the SQL never locks anyone out.
+  // ── Admin-approval + enrollment gates ──
+  // Wait for the first profile fetch so a pending/unpaid user never briefly sees the dashboard.
+  // Admins always pass everything. Both gates fail OPEN when their migration hasn't run, so
+  // deploying the code before the SQL never locks anyone out.
   if (!profileReady) return <AuthSplash />;
+
+  // 1) Old-flow hard ban outranks the paywall — a rejected account can't pay its way around it.
+  if (REQUIRE_ADMIN_APPROVAL && !profile?.is_admin && profile?.approval_status === 'rejected') {
+    console.debug('[gate] holding on Rejected', { uid: user?.id, email: user?.email });
+    return <RejectedScreen email={user?.email} reason={profile?.rejection_reason} onSignOut={signOut} />;
+  }
+
+  // 2) Enrollment/payment gate (REQUIRE_ENROLLMENT) — subsumes the pending-approval screen for
+  //    unpaid users AND enforces subscription expiry for paid members. The decision lives in
+  //    enrollGateState() (see its state table); this switch only picks the screen. If
+  //    db/2026-07-04-enrollment.sql hasn't run (enroll.configured=false), we fall through to
+  //    the legacy approval gate below.
+  if (enroll.active) {
+    if (!enroll.ready) return <AuthSplash />;   // one fast own-rows fetch; avoids a paywall flash
+    if (enroll.configured) {
+      const r = enroll.latestReq;
+      const overdue = r?.status === 'pending_review' && r?.expires_at && new Date(r.expires_at) < new Date();
+      switch (enroll.state) {
+        case 'pending':
+        case 'renew_pending':
+        case 'finalizing':
+          // 'finalizing' = request approved while the profile/subscription flip is still in
+          // flight — hold on the review screen until the gate data catches up.
+          console.debug('[gate] holding on Enrollment review', { uid: user?.id, status: r?.status, state: enroll.state });
+          return <EnrollmentPendingScreen request={r} finalizing={enroll.state === 'finalizing'}
+            renewal={enroll.state === 'renew_pending'}
+            email={user?.email} uid={user?.id} onSignOut={signOut}
+            onRefreshProfile={refreshProfile} onRefreshRequest={enroll.refresh} />;
+        case 'expired': {
+          console.debug('[gate] holding on Membership expired', { uid: user?.id, renewNow });
+          // priorRequest only when it can matter: a rejected/expired renewal shows its notice,
+          // and an OVERDUE pending row MUST be passed so the paywall's self-expire frees the
+          // one-pending unique index before the renewal insert.
+          const prior = r && (r.status === 'rejected' || r.status === 'expired' || overdue) ? r : null;
+          if (!renewNow) {
+            return <MembershipExpiredScreen sub={enroll.sub} latestReq={r} email={user?.email}
+              onRenew={() => setRenewNow(true)} onSignOut={signOut} />;
+          }
+          return <EnrollmentPaywall user={user} profile={profile} renewal currentSub={enroll.sub}
+            priorRequest={prior} overdue={!!overdue} onClose={() => setRenewNow(false)}
+            onSubmitted={(row) => { setRenewNow(false); enroll.refresh(row); }} onSignOut={signOut} />;
+        }
+        case 'paywall':
+        case 'paywall_notice':
+          // No request yet, rejected, expired, or overdue-pending → paywall (with a resubmit
+          // notice step when a prior request exists).
+          return <EnrollmentPaywall user={user} profile={profile} priorRequest={r} overdue={!!overdue}
+            onSubmitted={enroll.refresh} onSignOut={signOut} />;
+        case 'pass':
+        default:
+          break;   // valid membership (or grandfathered) → app shell below
+      }
+    }
+  }
+
+  // 3) Legacy admin-approval gate (REQUIRE_ADMIN_APPROVAL) — the active gate when the enrollment
+  //    feature is off or its migration hasn't run. ('rejected' is already handled above.)
   if (REQUIRE_ADMIN_APPROVAL && !profile?.is_admin) {
     if (profile?.approval_status === 'pending') {
       // Secret-safe diagnostic for the "stuck on Pending" case: shows whose status the gate read.
       console.debug('[gate] holding on Pending', { uid: user?.id, email: user?.email, approval_status: profile?.approval_status, is_admin: profile?.is_admin });
       return <PendingApprovalScreen email={user?.email} uid={user?.id} onSignOut={signOut} onRefresh={refreshProfile} />;
-    }
-    if (profile?.approval_status === 'rejected') {
-      console.debug('[gate] holding on Rejected', { uid: user?.id, email: user?.email });
-      return <RejectedScreen email={user?.email} reason={profile?.rejection_reason} onSignOut={signOut} />;
     }
   }
 
@@ -2769,6 +3807,26 @@ export default function BookkeeperProToolkit() {
             </a>
           )}
 
+          {/* Enrollments — admin only (manual payment review). Badge = pending submissions. */}
+          {isAdmin && (
+            <a
+              href={tabHref('enrollments')}
+              onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('enrollments'); } }}
+              className="mt-2 w-full px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5"
+              style={tab === 'enrollments'
+                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px ${C.primary}55` }
+                : { background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
+              <Receipt size={11} />
+              Enrollments
+              {enrollPendingCount > 0 && (
+                <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[9px] font-bold"
+                  style={{ background: tab === 'enrollments' ? 'rgba(255,255,255,0.25)' : C.amber, color: 'white' }}>
+                  {enrollPendingCount}
+                </span>
+              )}
+            </a>
+          )}
+
           {/* Customize sidebar — admin only. Renames persist globally (Supabase) on "Done". */}
           {isAdmin && (
             <div className="mt-4">
@@ -2870,6 +3928,25 @@ export default function BookkeeperProToolkit() {
                   <span className="absolute -top-1 -right-1 px-1 rounded-full text-[9px] font-bold flex items-center justify-center"
                     style={{ minWidth: 16, height: 16, background: C.amber, color: 'white', border: '2px solid white' }}>
                     {pendingCount}
+                  </span>
+                )}
+              </a>
+            )}
+            {isAdmin && (
+              <a
+                href={tabHref('enrollments')}
+                onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('enrollments'); } }}
+                title={`Enrollments${enrollPendingCount ? ` (${enrollPendingCount} pending)` : ''}`}
+                aria-label="Enrollments"
+                className="relative flex items-center justify-center rounded-xl transition mb-1"
+                style={tab === 'enrollments'
+                  ? { width: 40, height: 40, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white' }
+                  : { width: 40, height: 40, background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
+                <Receipt size={18} />
+                {enrollPendingCount > 0 && (
+                  <span className="absolute -top-1 -right-1 px-1 rounded-full text-[9px] font-bold flex items-center justify-center"
+                    style={{ minWidth: 16, height: 16, background: C.amber, color: 'white', border: '2px solid white' }}>
+                    {enrollPendingCount}
                   </span>
                 )}
               </a>
@@ -3557,6 +4634,1152 @@ function AccessRequests({ onCountChange }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// COMPONENT: ENROLLMENTS (admin-only — manual payment review)
+// ═══════════════════════════════════════════════════════════════════
+// Admins review payment-proof submissions here: preview the receipt (signed URL —
+// the enrollment-receipts bucket is PRIVATE), then Approve (flips the request +
+// profiles.is_paid/plan/approval_status + an active subscriptions row in one
+// action), Reject with a reason (student can resubmit), or Mark expired. Also
+// hosts the admin-editable payment instructions (payment_settings) shown on the
+// student paywall, and an opt-in sound alert for new submissions.
+// See db/2026-07-04-enrollment.sql + ENROLLMENT_SETUP.md.
+
+function AdminEnrollments({ onCountChange }) {
+  const { user, profile } = useAuth();
+  const isAdmin = !!profile?.is_admin;
+
+  const [rows, setRows] = useState([]);
+  const [profilesById, setProfilesById] = useState({});
+  const [subsByUser, setSubsByUser] = useState({});   // user_id → LATEST subscription row
+  const [plansByKey, setPlansByKey] = useState({});   // plan key → enrollment_plans row (durations)
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+  const [notConfigured, setNotConfigured] = useState(false);
+  const [filter, setFilter] = useState('pending');   // pending | overdue | renewals | approved | rejected | expired | active | expiring | ended
+  const [busyId, setBusyId] = useState(null);
+  const [notice, setNotice] = useState('');
+  const [approveFor, setApproveFor] = useState(null);   // row pending approval (confirm modal)
+  const [rejectFor, setRejectFor] = useState(null);     // row pending rejection (modal)
+  const [rejectReason, setRejectReason] = useState('');
+  const [receiptView, setReceiptView] = useState(null); // { url, name } image preview modal
+  const [expandedId, setExpandedId] = useState(null);
+  const [notesDraft, setNotesDraft] = useState({});
+  // Admin-editable payment instructions (shown on the student paywall).
+  const [payOpen, setPayOpen] = useState(false);
+  const [payDraft, setPayDraft] = useState(PAYMENT_SETTINGS_FALLBACK);
+  const [paySaving, setPaySaving] = useState(false);
+  // Opt-in sound alert for new submissions (browsers block audio before a user gesture,
+  // so the AudioContext is only ever created inside a click / pointerdown).
+  const [soundOn, setSoundOn] = useState(false);
+  const soundOnRef = useRef(false);
+  const audioCtxRef = useRef(null);
+
+  // Close any open modal on Escape (matches AccessRequests). Not mid-request.
+  useEffect(() => {
+    if (!rejectFor && !approveFor && !receiptView) return;
+    const onKey = (e) => {
+      if (e.key === 'Escape' && busyId == null) {
+        setRejectFor(null); setRejectReason(''); setApproveFor(null); setReceiptView(null);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [rejectFor, approveFor, receiptView, busyId]);
+
+  const load = async (silent = false) => {
+    if (!silent) { setLoading(true); }
+    setErr(''); setNotConfigured(false);
+    try {
+      // Truthful statuses first: flip overdue active subscriptions to 'expired'
+      // (admin-only RPC; missing pre-lifecycle-migration → silently skipped).
+      try { await supabase.rpc('expire_overdue_subscriptions'); } catch { /* best-effort */ }
+
+      const [reqRes, subRes, planRes] = await Promise.all([
+        supabase.from('enrollment_requests').select('*').order('created_at', { ascending: false }),
+        supabase.from('subscriptions').select('*').order('created_at', { ascending: false }),
+        supabase.from('enrollment_plans').select('*'),
+      ]);
+      const { data, error } = reqRes;
+      if (error) {
+        if (isEnrollmentNotConfiguredErr(error)) setNotConfigured(true);
+        else setErr(error.message || 'Could not load enrollment requests.');
+        setRows([]);
+      } else {
+        setRows(data || []);
+        // Second query (no FK-embed fragility): the linked profiles, for the
+        // "grant incomplete" check and the Google/Email signup hint.
+        const ids = [...new Set((data || []).map(r => r.user_id).filter(Boolean))];
+        if (ids.length) {
+          const { data: profs } = await supabase
+            .from('profiles').select('id,is_paid,avatar_url').in('id', ids);
+          setProfilesById(Object.fromEntries((profs || []).map(p => [p.id, p])));
+        } else {
+          setProfilesById({});
+        }
+      }
+      // Latest subscription per user (rows come newest-first) — powers the membership
+      // strip, the lifecycle filters, and the approve-modal projection. Old-schema
+      // tolerant: an error just leaves the map empty.
+      if (!subRes.error && Array.isArray(subRes.data)) {
+        const m = {};
+        for (const s of subRes.data) if (!m[s.user_id]) m[s.user_id] = s;
+        setSubsByUser(m);
+      } else {
+        setSubsByUser({});
+      }
+      const planList = (!planRes.error && planRes.data?.length) ? planRes.data : ENROLLMENT_PLANS_FALLBACK;
+      setPlansByKey(Object.fromEntries(planList.map(p => [p.key, p])));
+    } catch (e) {
+      setErr(String(e?.message || e));
+      setRows([]);
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  };
+  useEffect(() => { if (isAdmin) load(); /* eslint-disable-next-line */ }, [isAdmin]);
+
+  // Payment-settings editor state — load current values once.
+  useEffect(() => {
+    if (!isAdmin) return;
+    (async () => {
+      try {
+        const { data, error } = await supabase.from('payment_settings').select('key,value');
+        if (!error && data?.length) setPayDraft(d => ({ ...d, ...Object.fromEntries(data.map(r => [r.key, r.value])) }));
+      } catch { /* table not migrated — editor shows fallbacks */ }
+    })();
+  }, [isAdmin]);
+
+  // Restore the sound-alert preference (per-user, namespaced window.storage key).
+  useEffect(() => {
+    (async () => {
+      try {
+        if (typeof window !== 'undefined' && window.storage) {
+          const v = await window.storage.get('enroll:soundAlert');
+          if (v === '1') { setSoundOn(true); soundOnRef.current = true; }
+        }
+      } catch { /* default off */ }
+    })();
+  }, []);
+
+  // If the pref was restored ON, prime the AudioContext on the admin's FIRST gesture in
+  // this session (autoplay policy: audio must start inside a user gesture).
+  useEffect(() => {
+    if (!soundOn) return;
+    const prime = () => {
+      try {
+        if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+        audioCtxRef.current.resume?.();
+      } catch { /* no audio support */ }
+    };
+    window.addEventListener('pointerdown', prime, { once: true });
+    return () => window.removeEventListener('pointerdown', prime);
+  }, [soundOn]);
+
+  // Clearly-audible new-submission alert: an ascending A5→D6→G6 triangle arpeggio at
+  // ~3× the old single-beep gain, played twice (~1.7s total). Fully synthesized via
+  // WebAudio — no audio asset to bundle, and it still only ever plays after the admin
+  // opted in (browsers block audio before a user gesture — see the priming effect above).
+  const chime = () => {
+    try {
+      const ctx = audioCtxRef.current;
+      if (!ctx || ctx.state === 'suspended') return;
+      const seq = (t0) => {
+        [[880, 0], [1174.66, 0.16], [1567.98, 0.32]].forEach(([freq, dt]) => {
+          const o = ctx.createOscillator();
+          const g = ctx.createGain();
+          o.type = 'triangle'; o.frequency.value = freq;
+          g.gain.setValueAtTime(0.0001, t0 + dt);
+          g.gain.exponentialRampToValueAtTime(0.3, t0 + dt + 0.02);
+          g.gain.exponentialRampToValueAtTime(0.0001, t0 + dt + 0.45);
+          o.connect(g); g.connect(ctx.destination);
+          o.start(t0 + dt); o.stop(t0 + dt + 0.5);
+        });
+      };
+      seq(ctx.currentTime);
+      seq(ctx.currentTime + 0.85);
+    } catch { /* best-effort */ }
+  };
+
+  // Play the alert on demand (Test button / toggle-on confirmation). Runs inside a
+  // click, so it can also create/resume the AudioContext — the autoplay unlock.
+  const playTestSound = async () => {
+    try {
+      if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      await audioCtxRef.current.resume?.();
+      chime();
+    } catch { /* no audio support */ }
+  };
+
+  const toggleSound = async () => {
+    const next = !soundOn;
+    setSoundOn(next);
+    soundOnRef.current = next;
+    if (next) await playTestSound();   // audible confirmation — also proves audio is unlocked
+    try { window.storage?.set('enroll:soundAlert', next ? '1' : '0'); } catch { /* non-fatal */ }
+  };
+
+  // Live refresh on new submissions (admins receive all rows via enroll_req_admin_all).
+  // Inert if the table isn't in the realtime publication — the Refresh button still works.
+  useEffect(() => {
+    if (!isAdmin) return;
+    const ch = supabase
+      .channel('enrollment-requests-admin')
+      .on('postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'enrollment_requests' },
+        () => {
+          load(true);
+          onCountChange?.();
+          if (soundOnRef.current) chime();
+        })
+      .subscribe();
+    return () => { supabase.removeChannel(ch); };
+    /* eslint-disable-next-line */
+  }, [isAdmin]);
+
+  // Best-effort decision email to the student (never blocks the review action).
+  const notifyDecision = async (payload) => {
+    try {
+      const { data: s } = await supabase.auth.getSession();
+      const token = s?.session?.access_token;
+      const res = await fetch('/api/notify-enrollment', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ action: 'decision', ...payload }),
+      });
+      if (!res.ok) return { ok: false };
+      return await res.json().catch(() => ({ ok: false }));
+    } catch {
+      return { ok: false };
+    }
+  };
+  const emailSuffix = (mail) =>
+    mail?.ok ? ' · email sent' : mail?.skipped ? ' · email not configured' : ' · email not sent';
+
+  // Approve = the ONE admin action that unlocks a student. Ordering matters (no client
+  // transactions): ① request row (cheap write that also proves admin RLS is live) →
+  // ② profiles grant (THE unlock) → ③ subscriptions record (best-effort; never blocks).
+  // Every update uses .select() to confirm a row actually changed (PostgREST reports no
+  // error on a 0-row RLS-filtered update — same guard as AccessRequests.setStatus).
+  const doApprove = async (r) => {
+    setBusyId(r.id); setErr(''); setNotice('');
+    const nowIso = new Date().toISOString();
+    try {
+      const { data: reqUpd, error: reqErr } = await supabase
+        .from('enrollment_requests')
+        .update({ status: 'approved', rejection_reason: null, reviewed_at: nowIso, reviewed_by: user?.id || null, updated_at: nowIso })
+        .eq('id', r.id)
+        .select('id,status');
+      if (reqErr) throw reqErr;
+      if (!reqUpd?.[0]) {
+        throw new Error('No request row was updated — your admin permissions may not be applied. Re-run db/2026-07-04-enrollment.sql in Supabase, confirm you are flagged is_admin, then sign out and back in.');
+      }
+
+      // Profile grant. Full patch first; if the approval-migration columns are missing
+      // (42703/PGRST204), retry with just the payment fields so approve still works.
+      const fullPatch = {
+        is_paid: true, plan: r.plan_key,
+        approval_status: 'approved', approved_at: nowIso, approved_by: user?.id || null,
+        rejected_at: null, rejected_by: null, rejection_reason: null, updated_at: nowIso,
+      };
+      let profUpd = await supabase.from('profiles').update(fullPatch).eq('id', r.user_id).select('id,is_paid');
+      if (profUpd.error && isEnrollmentNotConfiguredErr(profUpd.error)) {
+        profUpd = await supabase.from('profiles').update({ is_paid: true, plan: r.plan_key }).eq('id', r.user_id).select('id,is_paid');
+      }
+      if (profUpd.error) throw profUpd.error;
+      if (!profUpd.data?.[0]) {
+        throw new Error('The request was marked approved but the student profile could not be unlocked (0 rows updated). Click Approve again to retry; if it persists, re-run db/2026-06-29-user-approval.sql (profiles_admin_update policy).');
+      }
+
+      // Subscription record — the lifecycle RPC grants a DATED term in one transaction
+      // (extends from the current expiry on early renewals, supersedes the old active
+      // row, stamps ends_at from the plan's access_days). Falls back to the legacy
+      // update-else-insert (no ends_at → no expiry) when the RPC isn't migrated yet
+      // (db/2026-07-04-subscription-lifecycle.sql). Non-fatal either way.
+      let subNote = '';
+      try {
+        const rpc = await supabase.rpc('approve_subscription', {
+          p_user_id: r.user_id, p_plan_key: r.plan_key, p_request_id: r.id,
+        });
+        if (rpc.error) {
+          if (!isEnrollmentNotConfiguredErr(rpc.error)) throw rpc.error;
+          // Lifecycle migration not run — legacy grant (idempotent update-else-insert).
+          const upd = await supabase
+            .from('subscriptions')
+            .update({ plan_key: r.plan_key, request_id: r.id, approved_by: user?.id || null, started_at: nowIso })
+            .eq('user_id', r.user_id).eq('status', 'active')
+            .select('id');
+          if (upd.error) throw upd.error;
+          if (!upd.data?.length) {
+            const ins = await supabase.from('subscriptions').insert({
+              user_id: r.user_id, plan_key: r.plan_key, status: 'active',
+              started_at: nowIso, approved_by: user?.id || null, request_id: r.id,
+            });
+            if (ins.error) throw ins.error;
+          }
+        } else if (rpc.data?.ends_at) {
+          subNote = ` · access until ${fmtEnrollDate(rpc.data.ends_at)}`;
+        }
+      } catch (subErr) {
+        console.error('[enroll] subscription write failed', subErr);
+        subNote = ' · subscription record failed (access still granted — Approve again to retry)';
+      }
+
+      setRows(prev => prev.map(x => x.id === r.id
+        ? { ...x, status: 'approved', rejection_reason: null, reviewed_at: nowIso, reviewed_by: user?.id || null }
+        : x));
+      setProfilesById(prev => ({ ...prev, [r.user_id]: { ...(prev[r.user_id] || { id: r.user_id }), is_paid: true } }));
+      onCountChange?.();
+      load(true);   // refresh the membership strip/filters with the new subscription term
+      const mail = await notifyDecision({ email: r.email, fullName: r.full_name, status: 'approved', planName: r.plan_name });
+      setNotice(`Approved ${r.email} — ${r.plan_name}${emailSuffix(mail)}${subNote}.`);
+    } catch (e) {
+      console.error('[enroll] approve failed', { id: r.id, code: e?.code, message: e?.message });
+      setErr(e?.message || 'Could not approve this enrollment.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  // Reject (with reason) or Mark expired — the student stays blocked and can resubmit.
+  const doDecline = async (r, status, reason = null) => {
+    setBusyId(r.id); setErr(''); setNotice('');
+    const nowIso = new Date().toISOString();
+    try {
+      const { data, error } = await supabase
+        .from('enrollment_requests')
+        .update({ status, rejection_reason: reason, reviewed_at: nowIso, reviewed_by: user?.id || null, updated_at: nowIso })
+        .eq('id', r.id)
+        .select('id,status');
+      if (error) throw error;
+      if (!data?.[0]) {
+        throw new Error('No row was updated — your admin permissions may not be applied. Re-run db/2026-07-04-enrollment.sql, confirm you are flagged is_admin, then sign out and back in.');
+      }
+      setRows(prev => prev.map(x => x.id === r.id
+        ? { ...x, status, rejection_reason: reason, reviewed_at: nowIso, reviewed_by: user?.id || null }
+        : x));
+      onCountChange?.();
+      const mail = await notifyDecision({ email: r.email, fullName: r.full_name, status, reason, planName: r.plan_name });
+      setNotice(`${status === 'expired' ? 'Marked expired' : 'Rejected'}: ${r.email}${emailSuffix(mail)}.`);
+    } catch (e) {
+      console.error('[enroll] decline failed', { id: r.id, status, code: e?.code, message: e?.message });
+      setErr(e?.message || 'Could not update this request.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const confirmReject = async () => {
+    const row = rejectFor;
+    if (!row) return;
+    await doDecline(row, 'rejected', rejectReason.trim() || null);
+    setRejectFor(null); setRejectReason('');
+  };
+
+  const saveNotes = async (r) => {
+    const val = (notesDraft[r.id] ?? '').trim();
+    try {
+      const { data, error } = await supabase
+        .from('enrollment_requests')
+        .update({ admin_notes: val || null, updated_at: new Date().toISOString() })
+        .eq('id', r.id)
+        .select('id');
+      if (error) throw error;
+      if (!data?.[0]) throw new Error('Note not saved (0 rows updated).');
+      setRows(prev => prev.map(x => x.id === r.id ? { ...x, admin_notes: val || null } : x));
+      setNotice('Note saved.');
+    } catch (e) {
+      setErr(e?.message || 'Could not save the note.');
+    }
+  };
+
+  // Receipt preview — FIRST signed-URL use in the codebase: the bucket is private, so
+  // getPublicUrl would 400. Images open in a modal; PDFs open in a new tab.
+  const viewReceipt = async (r) => {
+    if (!r.receipt_path) { setErr('No receipt was uploaded with this request.'); return; }
+    try {
+      const { data, error } = await supabase.storage
+        .from('enrollment-receipts')
+        .createSignedUrl(r.receipt_path, 600);
+      if (error) throw error;
+      const url = data?.signedUrl;
+      if (!url) throw new Error('Could not create a signed URL.');
+      if (/\.pdf$/i.test(r.receipt_path)) window.open(url, '_blank', 'noopener');
+      else setReceiptView({ url, name: r.full_name || r.email });
+    } catch (e) {
+      console.error('[enroll] receipt preview failed', e);
+      setErr('Could not open the receipt: ' + (e?.message || e) + ' (check the enrollment-receipts bucket + policies).');
+    }
+  };
+
+  const savePaySettings = async () => {
+    setPaySaving(true); setErr(''); setNotice('');
+    try {
+      const payload = Object.entries(payDraft).map(([key, value]) => ({
+        key, value: value ?? '', updated_by: user?.id || null, updated_at: new Date().toISOString(),
+      }));
+      const { error } = await supabase.from('payment_settings').upsert(payload, { onConflict: 'key' });
+      if (error) throw error;
+      setNotice('Payment details saved — students see them on the paywall immediately.');
+      setPayOpen(false);
+    } catch (e) {
+      setErr(e?.message || 'Could not save payment details.');
+    } finally {
+      setPaySaving(false);
+    }
+  };
+
+  const isOverdue = (r) => r.status === 'pending_review' && r.expires_at && new Date(r.expires_at) < new Date();
+  const daysInfo = (r) => {
+    if (r.status !== 'pending_review' || !r.expires_at) return null;
+    const ms = new Date(r.expires_at) - Date.now();
+    const days = Math.max(1, Math.ceil(Math.abs(ms) / 86400000));
+    return ms >= 0 ? `${days}d left` : `${days}d overdue`;
+  };
+
+  // ── Membership (subscription) helpers ──────────────────────────────
+  // Cards stay request-centric; the membership filters dedupe to each user's LATEST
+  // request so one student = one card. A pending request from someone with a prior
+  // subscription term is a RENEWAL.
+  const subOf = (r) => subsByUser[r.user_id] || null;
+  const isRenewalReq = (r) => {
+    const s = subOf(r);
+    return r.status === 'pending_review' && !!s?.started_at && new Date(r.created_at) > new Date(s.started_at);
+  };
+  const latestReqIdByUser = {};
+  for (const row of rows) if (!latestReqIdByUser[row.user_id]) latestReqIdByUser[row.user_id] = row.id;
+  const isLatestOf = (r) => latestReqIdByUser[r.user_id] === r.id;
+  const memberActive = (r) => isLatestOf(r) && subAccess(subOf(r)).valid;
+  const memberExpiring = (r) => {
+    const a = subAccess(subOf(r));
+    return isLatestOf(r) && a.valid && !a.legacy && a.daysLeft != null && a.daysLeft <= 14;
+  };
+  const memberEnded = (r) => {
+    const a = subAccess(subOf(r));
+    return isLatestOf(r) && a.has && a.expired;
+  };
+  // "Approve will grant access until…" — mirrors approve_subscription(): extend from a
+  // still-running dated term, otherwise start from now. null = plan has no duration.
+  const projectedEnd = (r) => {
+    const days = Number(plansByKey[r.plan_key]?.access_days);
+    if (!days) return null;
+    const a = subAccess(subOf(r));
+    const base = a.valid && !a.legacy && a.ends ? a.ends.getTime() : Date.now();
+    return new Date(base + days * 86400000);
+  };
+
+  const counts = {
+    pending: rows.filter(r => r.status === 'pending_review').length,
+    overdue: rows.filter(isOverdue).length,
+    renewals: rows.filter(isRenewalReq).length,
+    approved: rows.filter(r => r.status === 'approved').length,
+    rejected: rows.filter(r => r.status === 'rejected').length,
+    expired: rows.filter(r => r.status === 'expired').length,
+    active: rows.filter(memberActive).length,
+    expiring: rows.filter(memberExpiring).length,
+    ended: rows.filter(memberEnded).length,
+  };
+  const visible = rows.filter(r =>
+    filter === 'pending' ? r.status === 'pending_review'
+    : filter === 'overdue' ? isOverdue(r)
+    : filter === 'renewals' ? isRenewalReq(r)
+    : filter === 'active' ? memberActive(r)
+    : filter === 'expiring' ? memberExpiring(r)
+    : filter === 'ended' ? memberEnded(r)
+    : r.status === filter);
+
+  const initialOf = (r) => (((r.full_name || r.email || '?').trim()[0]) || '?').toUpperCase();
+
+  const STATUS_STYLE = {
+    pending_review: { label: 'Pending',  bg: 'rgba(255,159,10,0.12)', bd: 'rgba(255,159,10,0.30)', fg: '#9A6200' },
+    overdue:        { label: 'Overdue',  bg: 'rgba(255,159,10,0.20)', bd: 'rgba(255,159,10,0.50)', fg: '#7A4B00' },
+    renewals:       { label: 'Renewal',  bg: 'rgba(10,132,255,0.10)', bd: 'rgba(10,132,255,0.25)', fg: C.primary },
+    approved:       { label: 'Approved', bg: 'rgba(40,166,71,0.12)',  bd: 'rgba(40,166,71,0.30)',  fg: '#1B7A35' },
+    rejected:       { label: 'Rejected', bg: 'rgba(208,35,35,0.10)',  bd: 'rgba(208,35,35,0.26)',  fg: C.red },
+    expired:        { label: 'Expired',  bg: 'rgba(15,18,23,0.06)',   bd: 'rgba(15,18,23,0.14)',   fg: C.textSoft },
+    active:         { label: 'Active',   bg: 'rgba(40,166,71,0.12)',  bd: 'rgba(40,166,71,0.30)',  fg: '#1B7A35' },
+    expiring:       { label: 'Expiring', bg: 'rgba(255,159,10,0.12)', bd: 'rgba(255,159,10,0.30)', fg: '#9A6200' },
+    ended:          { label: 'Ended',    bg: 'rgba(208,35,35,0.08)',  bd: 'rgba(208,35,35,0.20)',  fg: C.red },
+  };
+  const StatusPill = ({ request }) => {
+    const s = STATUS_STYLE[isOverdue(request) ? 'overdue' : request.status] || STATUS_STYLE.pending_review;
+    return (
+      <span className="px-2.5 py-1 rounded-full text-[11px] font-bold" style={{ background: s.bg, color: s.fg, border: `1px solid ${s.bd}` }}>
+        {s.label}
+      </span>
+    );
+  };
+
+  const PAY_FIELDS = [
+    ['account_name', 'Account name'],
+    ['bpi', 'BPI account'],
+    ['security_bank', 'Security Bank account'],
+    ['gcash', 'GCash number'],
+    ['notify_email', 'Proof / support email'],
+    ['note', 'Extra note (optional, shown to students)'],
+  ];
+
+  if (!isAdmin) {
+    return (
+      <div>
+        <SectionHead eyebrow="Admin" title="Enrollments" desc="Review student payment proofs and approve enrollments." />
+        <div className="glass-card p-8 text-center" style={{ maxWidth: 520, margin: '24px auto 0' }}>
+          <Shield size={28} className="mx-auto" style={{ color: C.textMute }} />
+          <div className="mt-3" style={{ fontWeight: 700, fontSize: 15, color: C.text }}>Admins only</div>
+          <div className="mt-1.5" style={{ fontSize: 13, color: C.textSoft }}>
+            This area is restricted to administrators. If you need access, contact the admin team.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <SectionHead eyebrow="Admin" title="Enrollments" desc="Manual payment review — verify a student’s payment proof, then approve to unlock their toolkit, or reject with a reason so they can resubmit." gold />
+
+      {/* Filter tabs (payment requests · memberships) + sound toggle/test + refresh */}
+      <div className="mt-6 flex flex-wrap items-center gap-2">
+        {[['pending', 'Pending'], ['overdue', 'Overdue'], ['renewals', 'Renewals'], ['approved', 'Approved'], ['rejected', 'Rejected'], ['expired', 'Expired'],
+          null,   // divider: requests | memberships
+          ['active', 'Active'], ['expiring', 'Expiring soon'], ['ended', 'Ended']].map((entry, i) => {
+          if (!entry) return <span key={`div-${i}`} className="mx-1 self-stretch" style={{ width: 1, background: C.border }} />;
+          const [key, label] = entry;
+          const active = filter === key;
+          const s = STATUS_STYLE[key === 'pending' ? 'pending_review' : key];
+          return (
+            <button key={key} onClick={() => setFilter(key)}
+              className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition"
+              style={active
+                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px ${C.primary}55` }
+                : { background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+              {label}
+              <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold"
+                style={active ? { background: 'rgba(255,255,255,0.25)', color: 'white' } : { background: s.bg, color: s.fg }}>
+                {counts[key]}
+              </span>
+            </button>
+          );
+        })}
+        <div className="flex-1" />
+        <button onClick={toggleSound}
+          title={soundOn ? 'Sound alert on new submissions: ON' : 'Sound alert on new submissions: OFF'}
+          className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition"
+          style={soundOn
+            ? { background: 'rgba(10,132,255,0.08)', color: C.primary, border: '1px solid rgba(10,132,255,0.22)' }
+            : { background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+          {soundOn ? <Bell size={14} /> : <BellOff size={14} />} {soundOn ? 'Sound on' : 'Sound off'}
+        </button>
+        {soundOn && (
+          <button onClick={playTestSound}
+            title="Play the new-submission alert so you can check the volume"
+            className="px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition"
+            style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+            <Volume2 size={14} /> Test
+          </button>
+        )}
+        <button onClick={() => load()} disabled={loading}
+          className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition disabled:opacity-60"
+          style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+          {loading ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />} Refresh
+        </button>
+      </div>
+
+      {/* Payment details editor (what students see on the paywall) */}
+      <div className="mt-4 glass-card overflow-hidden">
+        <button onClick={() => setPayOpen(o => !o)}
+          className="w-full px-5 py-3.5 flex items-center gap-2.5 text-left transition hover:opacity-90">
+          <Wallet size={16} style={{ color: C.primary }} />
+          <span style={{ fontWeight: 700, fontSize: 13.5, color: C.text }}>Payment details</span>
+          <span style={{ fontSize: 12, color: C.textMute }}>— the accounts students are told to pay (editable)</span>
+          <span className="flex-1" />
+          {payOpen ? <ChevronUp size={16} style={{ color: C.textMute }} /> : <ChevronDown size={16} style={{ color: C.textMute }} />}
+        </button>
+        {payOpen && (
+          <div className="px-5 pb-5" style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
+            <div className="mt-4 grid gap-3.5 sm:grid-cols-2">
+              {PAY_FIELDS.map(([key, label]) => (
+                <div key={key} className={key === 'note' ? 'sm:col-span-2' : ''}>
+                  <label className="block mb-1.5" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>{label}</label>
+                  <input value={payDraft[key] ?? ''} onChange={e => setPayDraft(d => ({ ...d, [key]: e.target.value }))}
+                    className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none transition"
+                    style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: key === 'note' ? fontBody : fontMono }} />
+                </div>
+              ))}
+            </div>
+            <div className="mt-4 flex items-center justify-end gap-2.5">
+              <button onClick={() => setPayOpen(false)} disabled={paySaving}
+                className="px-4 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-60"
+                style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+                Cancel
+              </button>
+              <button onClick={savePaySettings} disabled={paySaving}
+                className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
+                style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px ${C.primary}55` }}>
+                {paySaving ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />} {paySaving ? 'Saving…' : 'Save for everyone'}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Notices */}
+      {notice && (
+        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: '#ECFDF5', borderColor: '#6EE7B7' }}>
+          <CheckCircle2 size={18} className="text-emerald-600 mt-0.5 flex-shrink-0" />
+          <div className="text-sm text-emerald-800 flex-1">{notice}</div>
+          <button onClick={() => setNotice('')} className="text-emerald-500 hover:text-emerald-700"><X size={16} /></button>
+        </div>
+      )}
+      {err && (
+        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: '#FEF2F2', borderColor: '#FCA5A5' }}>
+          <AlertTriangle size={18} className="text-red-500 mt-0.5 flex-shrink-0" />
+          <div className="text-sm text-red-700 flex-1">{err}</div>
+          <button onClick={() => setErr('')} className="text-red-400 hover:text-red-600"><X size={16} /></button>
+        </div>
+      )}
+
+      {/* Body */}
+      {notConfigured ? (
+        <div className="mt-6 glass-card p-8 text-center" style={{ maxWidth: 560, margin: '24px auto 0' }}>
+          <AlertCircle size={26} className="mx-auto" style={{ color: C.amber }} />
+          <div className="mt-3" style={{ fontWeight: 700, fontSize: 15, color: C.text }}>Finish backend setup</div>
+          <div className="mt-1.5" style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>{ENROLLMENT_SETUP_HINT}</div>
+        </div>
+      ) : loading ? (
+        <div className="mt-10 flex flex-col items-center justify-center" style={{ color: C.textMute }}>
+          <Loader2 size={24} className="animate-spin" style={{ color: C.primary }} />
+          <div className="mt-3 text-sm">Loading enrollment requests…</div>
+        </div>
+      ) : visible.length === 0 ? (
+        <div className="mt-6 rounded-2xl border-2 border-dashed p-12 text-center" style={{ borderColor: C.border, color: C.textMute }}>
+          <Receipt size={26} className="mx-auto" style={{ color: C.textMute }} />
+          <div className="mt-3 text-sm font-medium">
+            {({ pending: 'No pending enrollment requests.', overdue: 'No overdue enrollment requests.',
+                renewals: 'No renewal requests waiting for review.', approved: 'No approved enrollment requests.',
+                rejected: 'No rejected enrollment requests.', expired: 'No expired enrollment requests.',
+                active: 'No active memberships.', expiring: 'No memberships expiring in the next 14 days.',
+                ended: 'No ended memberships.' })[filter]}
+          </div>
+          {filter === 'pending' && <div className="mt-1 text-xs">New payment-proof submissions will appear here for review.</div>}
+        </div>
+      ) : (
+        <div className="mt-5 space-y-2.5">
+          {visible.map(r => {
+            const rowBusy = busyId === r.id;
+            const overdueRow = isOverdue(r);
+            const prof = profilesById[r.user_id];
+            const grantIncomplete = r.status === 'approved' && prof && prof.is_paid === false;
+            const amountMismatch = Number(r.amount_paid) !== Number(r.amount_expected);
+            const expanded = expandedId === r.id;
+            return (
+              <div key={r.id} className="glass-card p-4">
+                <div className="flex flex-wrap items-center gap-4">
+                  <div className="flex items-center justify-center flex-shrink-0 rounded-full text-white text-sm font-bold"
+                    style={{ width: 40, height: 40, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+                    {initialOf(r)}
+                  </div>
+                  <div className="flex-1 min-w-[200px]">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="truncate" style={{ fontWeight: 700, fontSize: 14, color: C.text }}>
+                        {r.full_name || r.email?.split('@')[0] || 'Unknown'}
+                      </span>
+                      {grantIncomplete && (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold" style={{ background: 'rgba(208,35,35,0.10)', color: C.red, border: '1px solid rgba(208,35,35,0.26)' }}>
+                          grant incomplete — Approve again
+                        </span>
+                      )}
+                      {isRenewalReq(r) && (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold inline-flex items-center gap-1" style={{ background: 'rgba(10,132,255,0.10)', color: C.primary, border: '1px solid rgba(10,132,255,0.25)' }}>
+                          <RefreshCw size={9} /> Renewal
+                        </span>
+                      )}
+                    </div>
+                    <div className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{r.email}</div>
+                    <div className="mt-1 flex items-center gap-3 flex-wrap" style={{ fontSize: 11, color: C.textMute }}>
+                      {r.phone && <span className="inline-flex items-center gap-1"><Phone size={11} /> {r.phone}</span>}
+                      {r.city_country && <span className="inline-flex items-center gap-1"><Globe size={11} /> {r.city_country}</span>}
+                      <span className="inline-flex items-center gap-1"><Clock size={11} /> {fmtEnrollDate(r.created_at)}</span>
+                      {daysInfo(r) && (
+                        <span className="inline-flex items-center gap-1 font-semibold" style={{ color: overdueRow ? '#B45309' : C.textMute }}>
+                          <Hourglass size={11} /> {daysInfo(r)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="min-w-[150px]">
+                    <div style={{ fontSize: 12, fontWeight: 700, color: C.text }}>{r.plan_name || PLAN_LABELS[r.plan_key] || r.plan_key}</div>
+                    <div style={{ fontFamily: fontMono, fontSize: 13, fontWeight: 700, color: C.text }}>{phpFmt(r.amount_paid)}</div>
+                    {amountMismatch && (
+                      <div style={{ fontSize: 10.5, fontWeight: 600, color: '#B45309' }}>expected {phpFmt(r.amount_expected)}</div>
+                    )}
+                    {r.payment_reference && (
+                      <div className="truncate" style={{ fontFamily: fontMono, fontSize: 10.5, color: C.textMute, maxWidth: 160 }} title={r.payment_reference}>
+                        ref: {r.payment_reference}
+                      </div>
+                    )}
+                  </div>
+                  <StatusPill request={r} />
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {r.receipt_path && (
+                      <button onClick={() => viewReceipt(r)} disabled={rowBusy}
+                        className="px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
+                        style={{ background: 'rgba(10,132,255,0.07)', color: C.primary, border: '1px solid rgba(10,132,255,0.20)' }}>
+                        <Eye size={14} /> Receipt
+                      </button>
+                    )}
+                    {(r.status !== 'approved' || grantIncomplete) && (
+                      <button onClick={() => setApproveFor(r)} disabled={rowBusy}
+                        className="px-3.5 py-2 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 transition disabled:opacity-60"
+                        style={{ background: `linear-gradient(180deg, #34C759, #28A647)`, boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px rgba(40,166,71,0.4)' }}>
+                        {rowBusy ? <Loader2 size={14} className="animate-spin" /> : <UserCheck size={14} />} Approve
+                      </button>
+                    )}
+                    {r.status === 'pending_review' && (
+                      <button onClick={() => { setRejectFor(r); setRejectReason(''); }} disabled={rowBusy}
+                        className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
+                        style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: '1px solid rgba(208,35,35,0.20)' }}>
+                        <UserX size={14} /> Reject
+                      </button>
+                    )}
+                    {overdueRow && (
+                      <button onClick={() => doDecline(r, 'expired', null)} disabled={rowBusy}
+                        className="px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
+                        style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+                        <Clock size={14} /> Mark expired
+                      </button>
+                    )}
+                    <button onClick={() => { setExpandedId(expanded ? null : r.id); setNotesDraft(d => ({ ...d, [r.id]: d[r.id] ?? (r.admin_notes || '') })); }}
+                      className="p-2 rounded-xl transition"
+                      style={{ background: C.white, color: C.textMute, border: `1px solid ${C.border}` }}
+                      title={expanded ? 'Hide details' : 'Show details'}>
+                      {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Membership strip — the student's CURRENT subscription term (latest row) */}
+                {(() => {
+                  const s = subOf(r);
+                  if (!s) return null;
+                  const a = subAccess(s);
+                  const mPlan = plansByKey[s.plan_key];
+                  const daysPast = !a.legacy && a.ends ? Math.max(0, Math.floor((Date.now() - a.ends.getTime()) / 86400000)) : null;
+                  const mStyle = a.valid
+                    ? (!a.legacy && a.daysLeft != null && a.daysLeft <= 14 ? STATUS_STYLE.expiring : STATUS_STYLE.active)
+                    : STATUS_STYLE.ended;
+                  return (
+                    <div className="mt-3 pt-3 flex items-center gap-x-3 gap-y-1.5 flex-wrap" style={{ borderTop: `1px dashed ${GLASS.borderSoft}`, fontSize: 11.5, color: C.textMute }}>
+                      <span style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase' }}>Membership</span>
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-bold" style={{ background: mStyle.bg, color: mStyle.fg, border: `1px solid ${mStyle.bd}` }}>
+                        {a.valid ? (a.legacy ? 'Active · no expiry' : (a.daysLeft != null && a.daysLeft <= 14 ? 'Expiring soon' : 'Active')) : 'Ended'}
+                      </span>
+                      <span style={{ fontWeight: 600, color: C.textSoft }}>{mPlan?.name || PLAN_LABELS[s.plan_key] || s.plan_key}</span>
+                      <span>{fmtEnrollDate(s.started_at)} → {a.legacy ? 'no expiry' : fmtEnrollDate(s.ends_at)}</span>
+                      {!a.legacy && (
+                        <span className="inline-flex items-center gap-1 font-semibold" style={{ fontFamily: fontMono, color: a.valid ? (a.daysLeft <= 3 ? C.red : a.daysLeft <= 14 ? '#B45309' : C.textSoft) : C.red }}>
+                          <CalendarClock size={11} /> {a.valid ? `${a.daysLeft}d left` : `ended ${daysPast}d ago`}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                {expanded && (
+                  <div className="mt-3.5 pt-3.5 grid gap-3.5 md:grid-cols-2" style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
+                    <div>
+                      <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: C.textMute }}>Background</div>
+                      <div className="mt-1.5" style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>
+                        {r.background || '—'}
+                      </div>
+                      {r.rejection_reason && r.status === 'rejected' && (
+                        <div className="mt-3 px-3 py-2.5 rounded-xl" style={{ background: 'rgba(208,35,35,0.06)', border: '1px solid rgba(208,35,35,0.16)', fontSize: 12, color: C.text }}>
+                          <span style={{ fontWeight: 600 }}>Rejection reason: </span>{r.rejection_reason}
+                        </div>
+                      )}
+                      <div className="mt-3 flex items-center gap-3 flex-wrap" style={{ fontSize: 11, color: C.textMute }}>
+                        <span>Review window ends: <span style={{ fontWeight: 600, color: C.textSoft }}>{fmtEnrollDate(r.expires_at)}</span></span>
+                        {r.reviewed_at && <span>Reviewed: <span style={{ fontWeight: 600, color: C.textSoft }}>{fmtEnrollDate(r.reviewed_at)}</span></span>}
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: C.textMute }}>Admin note (private)</div>
+                      <textarea value={notesDraft[r.id] ?? ''} onChange={e => setNotesDraft(d => ({ ...d, [r.id]: e.target.value }))} rows={3}
+                        placeholder="e.g. Verified GCash ref against the bank app on Jul 4."
+                        className="mt-1.5 w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
+                        style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+                      <div className="mt-2 flex justify-end">
+                        <button onClick={() => saveNotes(r)}
+                          className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition"
+                          style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+                          <Save size={13} /> Save note
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Approve confirmation modal */}
+      {approveFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(15,18,23,0.45)' }}
+          onClick={() => { if (busyId == null) setApproveFor(null); }}>
+          <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="px-6 pt-6 pb-4" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+              <div className="flex items-center gap-2.5">
+                <div className="flex items-center justify-center rounded-xl flex-shrink-0" style={{ width: 38, height: 38, background: 'rgba(40,166,71,0.12)', border: '1px solid rgba(40,166,71,0.30)' }}>
+                  <UserCheck size={18} style={{ color: C.green }} />
+                </div>
+                <div>
+                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 16, color: C.text }}>Approve this enrollment?</div>
+                  <div className="truncate" style={{ fontSize: 12.5, color: C.textSoft, maxWidth: 300 }}>{approveFor.email}</div>
+                </div>
+              </div>
+            </div>
+            <div className="px-6 py-5">
+              <div className="rounded-xl px-3.5 py-2.5" style={{ background: 'rgba(15,18,23,0.03)', border: `1px solid ${GLASS.borderSoft}` }}>
+                {[['Package', approveFor.plan_name || approveFor.plan_key],
+                  ['Amount sent', phpFmt(approveFor.amount_paid)],
+                  ['Expected', phpFmt(approveFor.amount_expected)],
+                  ...(approveFor.payment_reference ? [['Reference', approveFor.payment_reference]] : []),
+                  ...(Number(plansByKey[approveFor.plan_key]?.access_days) > 0
+                    ? [['Access period', `${plansByKey[approveFor.plan_key].access_days} days`]] : [])].map(([k, v]) => (
+                  <div key={k} className="flex items-center justify-between gap-3 py-1" style={{ fontSize: 12.5 }}>
+                    <span style={{ color: C.textMute }}>{k}</span>
+                    <span style={{ color: C.text, fontWeight: 600 }}>{v}</span>
+                  </div>
+                ))}
+              </div>
+              {(() => {
+                const end = projectedEnd(approveFor);
+                const a = subAccess(subOf(approveFor));
+                if (!end) return null;
+                return (
+                  <div className="mt-3 flex items-start gap-2.5 px-3.5 py-2.5 rounded-xl" style={{ background: 'rgba(10,132,255,0.06)', border: '1px solid rgba(10,132,255,0.18)' }}>
+                    <CalendarClock size={15} className="flex-shrink-0 mt-px" style={{ color: C.primary }} />
+                    <div style={{ fontSize: 12.5, color: C.text, lineHeight: 1.5 }}>
+                      Will grant access until <span style={{ fontWeight: 700 }}>{fmtEnrollDate(end)}</span>
+                      {a.valid && !a.legacy ? <> — extends from their current expiry ({fmtEnrollDate(subOf(approveFor).ends_at)}), so unused days carry over.</> : '.'}
+                    </div>
+                  </div>
+                );
+              })()}
+              <p className="mt-3.5" style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+                This marks their payment verified and <span style={{ fontWeight: 600, color: C.text }}>unlocks the full toolkit</span> for their account immediately (plan: {approveFor.plan_key}).
+              </p>
+              <div className="mt-5 flex items-center justify-end gap-2.5">
+                <button onClick={() => setApproveFor(null)} disabled={busyId != null}
+                  className="px-4 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-60"
+                  style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+                  Cancel
+                </button>
+                <button onClick={async () => { const row = approveFor; setApproveFor(null); await doApprove(row); }} disabled={busyId != null}
+                  className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
+                  style={{ background: `linear-gradient(180deg, #34C759, #28A647)`, boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px rgba(40,166,71,0.4)' }}>
+                  {busyId != null ? <Loader2 size={15} className="animate-spin" /> : <UserCheck size={15} />} Approve & unlock
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Reject confirmation modal */}
+      {rejectFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(15,18,23,0.45)' }}
+          onClick={() => { if (busyId == null) { setRejectFor(null); setRejectReason(''); } }}>
+          <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="px-6 pt-6 pb-4" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+              <div className="flex items-center gap-2.5">
+                <div className="flex items-center justify-center rounded-xl flex-shrink-0" style={{ width: 38, height: 38, background: 'rgba(208,35,35,0.10)', border: '1px solid rgba(208,35,35,0.22)' }}>
+                  <UserX size={18} style={{ color: C.red }} />
+                </div>
+                <div>
+                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 16, color: C.text }}>Reject this payment proof?</div>
+                  <div className="truncate" style={{ fontSize: 12.5, color: C.textSoft, maxWidth: 300 }}>{rejectFor.email} · {rejectFor.plan_name}</div>
+                </div>
+              </div>
+            </div>
+            <div className="px-6 py-5">
+              <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+                They stay locked out of the toolkit, see your reason on the enrollment screen, and can resubmit new payment proof anytime.
+              </p>
+              <label className="block mt-4 mb-1.5" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                Reason (shown to the student)
+              </label>
+              <textarea value={rejectReason} onChange={e => setRejectReason(e.target.value)} rows={3}
+                placeholder="e.g. We couldn’t find this reference number in our account — please double-check and resubmit."
+                className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
+                style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+              <div className="mt-5 flex items-center justify-end gap-2.5">
+                <button onClick={() => { setRejectFor(null); setRejectReason(''); }} disabled={busyId != null}
+                  className="px-4 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-60"
+                  style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+                  Cancel
+                </button>
+                <button onClick={confirmReject} disabled={busyId != null}
+                  className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
+                  style={{ background: `linear-gradient(180deg, #E04545, ${C.red})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.25), 0 4px 12px -2px ${C.red}55` }}>
+                  {busyId != null ? <Loader2 size={15} className="animate-spin" /> : <UserX size={15} />} Reject proof
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Receipt image preview modal (signed URL — private bucket) */}
+      {receiptView && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(15,18,23,0.60)' }}
+          onClick={() => setReceiptView(null)}>
+          <div className="bg-white rounded-2xl shadow-2xl overflow-hidden max-w-3xl w-full" onClick={e => e.stopPropagation()}>
+            <div className="px-5 py-3.5 flex items-center gap-3" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+              <Receipt size={16} style={{ color: C.primary }} />
+              <div className="flex-1 truncate" style={{ fontWeight: 700, fontSize: 13.5, color: C.text }}>
+                Payment receipt — {receiptView.name}
+              </div>
+              <a href={receiptView.url} target="_blank" rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition"
+                style={{ background: 'rgba(10,132,255,0.07)', color: C.primary, border: '1px solid rgba(10,132,255,0.20)' }}>
+                <ExternalLink size={12} /> Open full size
+              </a>
+              <button onClick={() => setReceiptView(null)} className="p-1.5 rounded-lg transition hover:opacity-70" style={{ color: C.textMute }}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="p-4 flex items-center justify-center" style={{ background: 'rgba(15,18,23,0.03)' }}>
+              <img src={receiptView.url} alt="Payment receipt" className="max-w-full rounded-xl" style={{ maxHeight: '70vh', objectFit: 'contain' }} />
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// COMPONENT: MEMBERSHIP PANEL (Dashboard) — the student's subscription at a glance
+// ═══════════════════════════════════════════════════════════════════
+// Self-contained (owns its useAuth/fetches) so Dashboard's signature stays untouched.
+// Fail-silent by design: admins, gate-off builds, query errors, and users with no
+// membership data all render null — the dashboard must never break because of this.
+// "Renew" opens the paywall in renewal mode as a full-screen overlay (no route/gate
+// change); while the renewal is pending the member keeps full access.
+
+function MembershipPanel() {
+  const { user, profile, signOut } = useAuth();
+  const uid = user?.id;
+  const isAdmin = !!profile?.is_admin;
+  const [sub, setSub] = useState(null);
+  const [reqs, setReqs] = useState([]);
+  const [plan, setPlan] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+  const [renewOpen, setRenewOpen] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+  const reload = () => setReloadKey(k => k + 1);
+
+  useEffect(() => {
+    if (!REQUIRE_ENROLLMENT || !uid || isAdmin) { setLoaded(false); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const [subRes, reqRes] = await Promise.all([
+          supabase.from('subscriptions').select('*').eq('user_id', uid)
+            .order('created_at', { ascending: false }).limit(1).maybeSingle(),
+          supabase.from('enrollment_requests').select('*').eq('user_id', uid)
+            .order('created_at', { ascending: false }).limit(5),
+        ]);
+        if (cancelled) return;
+        const s = subRes.error ? null : (subRes.data || null);
+        const r = reqRes.error ? [] : (reqRes.data || []);
+        setSub(s); setReqs(r);
+        const planKey = s?.plan_key || r.find(x => x.status === 'approved')?.plan_key || profile?.plan || null;
+        if (planKey) {
+          let p = null;
+          try {
+            const { data } = await supabase.from('enrollment_plans').select('*').eq('key', planKey).maybeSingle();
+            p = data || null;
+          } catch { /* fallback below */ }
+          if (!cancelled) setPlan(p || ENROLLMENT_PLANS_FALLBACK.find(x => x.key === planKey) || null);
+        } else if (!cancelled) {
+          setPlan(null);
+        }
+        if (!cancelled) setLoaded(true);
+      } catch (e) {
+        console.error('[membership] panel load failed', e);
+        if (!cancelled) setLoaded(false);   // fail-silent: panel just doesn't render
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [uid, isAdmin, profile?.plan, reloadKey]);
+
+  // Live updates (inert without the realtime publication) + a slow poll/focus fallback,
+  // same shape as EnrollmentPendingScreen.
+  useEffect(() => {
+    if (!REQUIRE_ENROLLMENT || !uid || isAdmin) return;
+    const chSub = supabase.channel(`member-sub-${uid}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'subscriptions', filter: `user_id=eq.${uid}` }, reload)
+      .subscribe();
+    const chReq = supabase.channel(`member-req-${uid}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'enrollment_requests', filter: `user_id=eq.${uid}` }, reload)
+      .subscribe();
+    const id = setInterval(reload, 60000);
+    const onFocus = () => reload();
+    window.addEventListener('focus', onFocus);
+    return () => {
+      supabase.removeChannel(chSub); supabase.removeChannel(chReq);
+      clearInterval(id); window.removeEventListener('focus', onFocus);
+    };
+  }, [uid, isAdmin]);
+
+  if (!REQUIRE_ENROLLMENT || !uid || isAdmin || !loaded) return null;
+  const latest = reqs[0] || null;
+  const latestApproved = reqs.find(r => r.status === 'approved') || null;
+  if (!sub && !latest) return null;   // nothing to show (e.g. paywall off for this account)
+
+  const acc = subAccess(sub);
+  const newerThanTerm = latest && sub?.started_at && new Date(latest.created_at) > new Date(sub.started_at);
+  const renewalPending = latest?.status === 'pending_review' && !!newerThanTerm;
+  const renewalRejected = latest?.status === 'rejected' && !!newerThanTerm;
+  const daysLeft = acc.valid && !acc.legacy ? acc.daysLeft : null;
+  const planName = plan?.name || PLAN_LABELS[sub?.plan_key || latestApproved?.plan_key] || sub?.plan_key || latestApproved?.plan_key || 'Membership';
+  const entitlements = Array.isArray(plan?.entitlement_summary) ? plan.entitlement_summary : [];
+
+  const pill = renewalPending
+    ? { label: 'Renewal under review', bg: 'rgba(10,132,255,0.10)', bd: 'rgba(10,132,255,0.25)', fg: C.primary }
+    : daysLeft != null && daysLeft <= 3
+    ? { label: `Expires in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`, bg: 'rgba(208,35,35,0.08)', bd: 'rgba(208,35,35,0.22)', fg: C.red }
+    : daysLeft != null && daysLeft <= 14
+    ? { label: 'Expiring soon', bg: 'rgba(255,159,10,0.12)', bd: 'rgba(255,159,10,0.30)', fg: '#9A6200' }
+    : acc.valid || !acc.has
+    ? { label: 'Active', bg: 'rgba(40,166,71,0.10)', bd: 'rgba(40,166,71,0.28)', fg: '#1B7A35' }
+    : { label: 'Expired', bg: 'rgba(208,35,35,0.08)', bd: 'rgba(208,35,35,0.22)', fg: C.red };
+
+  const warnTier = daysLeft == null || renewalPending ? null : daysLeft <= 3 ? 'red' : daysLeft <= 7 ? 'amber7' : daysLeft <= 14 ? 'amber14' : null;
+  const renewPrimary = warnTier === 'red' || warnTier === 'amber7';
+  const showRenew = !renewalPending && (acc.has ? !acc.legacy : false);
+  const supportEmail = PAYMENT_SETTINGS_FALLBACK.notify_email;
+
+  const facts = [
+    ['Plan', planName],
+    ['Started', sub?.started_at ? fmtEnrollDate(sub.started_at) : latestApproved ? fmtEnrollDate(latestApproved.reviewed_at || latestApproved.created_at) : '—'],
+    ['Expires', acc.has ? (acc.legacy ? 'No expiry' : fmtEnrollDate(sub.ends_at)) : 'No expiry'],
+    ['Amount paid', latestApproved ? phpFmt(latestApproved.amount_paid) : '—'],
+  ];
+
+  return (
+    <div className="glass-card p-6 mb-8 relative overflow-hidden">
+      <div className="absolute -top-12 -right-12 w-48 h-48 rounded-full pointer-events-none"
+        style={{ background: `radial-gradient(circle, ${C.primary}14 0%, transparent 60%)` }} />
+
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div>
+          <div className="gh-label mb-1.5" style={{ color: C.primary }}>Your membership</div>
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <span style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.01em', color: C.text }}>{planName}</span>
+            {plan?.tagline && <span style={{ fontSize: 12, color: C.textMute }}>{plan.tagline}</span>}
+            <span className="px-2.5 py-1 rounded-full text-[11px] font-bold" style={{ background: pill.bg, border: `1px solid ${pill.bd}`, color: pill.fg }}>
+              {pill.label}
+            </span>
+          </div>
+        </div>
+        {showRenew && (
+          <button onClick={() => setRenewOpen(true)}
+            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-bold transition hover:opacity-95"
+            style={renewPrimary
+              ? { color: 'white', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }
+              : { color: C.primary, background: 'rgba(10,132,255,0.07)', border: '1px solid rgba(10,132,255,0.22)' }}>
+            <RefreshCw size={14} /> {acc.valid ? 'Renew early' : 'Renew'}
+          </button>
+        )}
+      </div>
+
+      <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {facts.map(([k, v]) => (
+          <div key={k} className="rounded-xl px-3.5 py-2.5" style={{ background: 'rgba(15,18,23,0.03)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textMute }}>{k}</div>
+            <div className="mt-0.5" style={{ fontSize: 13.5, fontWeight: 600, color: C.text }}>{v}</div>
+          </div>
+        ))}
+      </div>
+
+      {daysLeft != null && daysLeft > 0 && (
+        <div className="mt-3 flex items-center gap-2" style={{ fontSize: 12.5, color: C.textSoft }}>
+          <CalendarClock size={14} style={{ color: warnTier ? (warnTier === 'red' ? C.red : C.amber) : C.textMute }} />
+          <span className="gh-tnum" style={{ fontFamily: fontMono, fontWeight: 600, color: warnTier === 'red' ? C.red : C.text }}>
+            {daysLeft} day{daysLeft === 1 ? '' : 's'}
+          </span>
+          <span>of access remaining</span>
+        </div>
+      )}
+
+      {entitlements.length > 0 && (
+        <div className="mt-3 flex items-center gap-2 flex-wrap">
+          {entitlements.map((e, i) => (
+            <span key={i} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg" style={{ background: 'rgba(10,132,255,0.06)', border: '1px solid rgba(10,132,255,0.16)', fontSize: 11.5, fontWeight: 600, color: C.textSoft }}>
+              <Check size={11} style={{ color: C.primary }} /> {e}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {warnTier && (
+        <div className="mt-4 flex items-start gap-2.5 px-3.5 py-3 rounded-xl" style={warnTier === 'red'
+          ? { background: 'rgba(208,35,35,0.06)', border: '1px solid rgba(208,35,35,0.18)' }
+          : { background: 'rgba(255,159,10,0.08)', border: '1px solid rgba(255,159,10,0.25)' }}>
+          <AlertTriangle size={15} className="flex-shrink-0 mt-px" style={{ color: warnTier === 'red' ? C.red : C.amber }} />
+          <div style={{ fontSize: 12.5, color: C.text, lineHeight: 1.5 }}>
+            {warnTier === 'red'
+              ? <><span style={{ fontWeight: 700 }}>Your access ends {daysLeft === 1 ? 'tomorrow' : `in ${daysLeft} days`}.</span> Renew now to keep your courses and tools — renewing early extends from your current expiry, so you never lose days.</>
+              : warnTier === 'amber7'
+              ? <><span style={{ fontWeight: 700 }}>{daysLeft} days of access left.</span> Renew early to extend from your current expiry date.</>
+              : <>Your membership expires on <span style={{ fontWeight: 600 }}>{fmtEnrollDate(sub.ends_at)}</span> ({daysLeft} days). You can renew any time — early renewals extend from that date.</>}
+          </div>
+        </div>
+      )}
+
+      {renewalPending && (
+        <div className="mt-4 flex items-start gap-2.5 px-3.5 py-3 rounded-xl" style={{ background: 'rgba(10,132,255,0.06)', border: '1px solid rgba(10,132,255,0.18)' }}>
+          <Hourglass size={15} className="flex-shrink-0 mt-px" style={{ color: C.primary }} />
+          <div style={{ fontSize: 12.5, color: C.text, lineHeight: 1.5 }}>
+            <span style={{ fontWeight: 700 }}>Your renewal is under review.</span> You keep full access while Coach Alex’s team verifies your payment
+            {latest?.plan_name ? <> for <span style={{ fontWeight: 600 }}>{latest.plan_name}</span></> : ''} (submitted {fmtEnrollDate(latest?.created_at)}).
+          </div>
+        </div>
+      )}
+
+      {renewalRejected && (
+        <div className="mt-4 flex items-start gap-2.5 px-3.5 py-3 rounded-xl" style={{ background: 'rgba(208,35,35,0.06)', border: '1px solid rgba(208,35,35,0.16)' }}>
+          <AlertTriangle size={15} className="flex-shrink-0 mt-px" style={{ color: C.red }} />
+          <div style={{ fontSize: 12.5, color: C.text, lineHeight: 1.5 }}>
+            <span style={{ fontWeight: 700 }}>Your renewal needs another look{latest?.rejection_reason ? ': ' : '.'}</span>
+            {latest?.rejection_reason || ''} Use the Renew button to resubmit your payment proof.
+          </div>
+        </div>
+      )}
+
+      <div className="mt-4" style={{ fontSize: 11, color: C.textMute }}>
+        Questions about your membership? Contact{' '}
+        <a href={`mailto:${supportEmail}`} style={{ color: C.primary, fontWeight: 600 }}>support</a>.
+      </div>
+
+      {renewOpen && (
+        <div className="fixed inset-0 z-50 gh-app-bg" style={{ background: C.bg }}>
+          <EnrollmentPaywall user={user} profile={profile} renewal currentSub={sub}
+            priorRequest={renewalRejected ? latest : null}
+            onClose={() => setRenewOpen(false)}
+            onSubmitted={() => { setRenewOpen(false); reload(); }}
+            onSignOut={signOut} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // COMPONENT: DASHBOARD
 // ═══════════════════════════════════════════════════════════════════
 
@@ -3658,6 +5881,9 @@ function Dashboard({ goto }) {
           Everything you need to operate like a seasoned US bookkeeper — from your first client to your hundredth.
         </p>
       </div>
+
+      {/* Membership / subscription status (students only; fail-silent) */}
+      <MembershipPanel />
 
       {/* Tip of the day — quieter, more refined */}
       <div className="glass-card p-6 mb-8 flex gap-5 items-start relative overflow-hidden">

@@ -43,6 +43,7 @@ const LEGACY_KEYS = [
   'qbdiag:name', 'qbdiag:firm', 'qbdiag:email',
   'budget:state', 'forecast:state',
   'nav:lastTab', 'nav:interviewSub',
+  'enroll:soundAlert',
 ];
 
 // Marker (raw, un-namespaced) recording which uid adopted the legacy global data.

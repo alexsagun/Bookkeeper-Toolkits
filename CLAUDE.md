@@ -255,10 +255,14 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   `PROFILE_SELECT` in `AuthProvider.jsx`.
 - **The gate** lives in `BookkeeperProToolkit` just before its root `return`: `if (loading) return
   <AuthSplash/>; if (recovery) return <UpdatePasswordScreen/>; if (!user) return <AuthScreen/>;` then
-  the **admin-approval gate** — `if (!profileReady) return <AuthSplash/>;` and, when
-  `REQUIRE_ADMIN_APPROVAL` and `!profile.is_admin`, `approval_status==='pending'` → `<PendingApprovalScreen/>`
-  / `'rejected'` → `<RejectedScreen/>`. `AuthScreen` (defined just above the root component) is the
-  login/signup/reset UI, built from the design tokens (`C`, `SHEEN`, `GLASS`, `fontDisplay`, `LOGO_DATA_URI`).
+  `if (!profileReady) return <AuthSplash/>;` and a **3-step gate**: ① old-flow ban —
+  `approval_status==='rejected'` → `<RejectedScreen/>` (outranks the paywall; a ban can't be paid
+  around); ② the **enrollment/payment gate** (see the Enrollment bullet below) — for unpaid
+  non-admins it renders `<EnrollmentPaywall/>` / `<EnrollmentPendingScreen/>` and **subsumes** the
+  pending-approval screen; ③ the legacy admin-approval gate — `approval_status==='pending'` →
+  `<PendingApprovalScreen/>` (active only when enrollment is off or not migrated). `AuthScreen`
+  (defined just above the root component) is the login/signup/reset UI, built from the design
+  tokens (`C`, `SHEEN`, `GLASS`, `fontDisplay`, `LOGO_DATA_URI`).
 - **Admin-approval gate (temporary, Phase-1.5):** new email/Google signups default to
   `approval_status='pending'` and are held on `PendingApprovalScreen` until an admin approves them in
   the **Access Requests** admin tab (`accessrequests` route; admin-only sidebar entry + pending-count
@@ -271,6 +275,56 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   walkthrough: [db/2026-06-29-user-approval.sql](db/2026-06-29-user-approval.sql) +
   [ADMIN_APPROVAL_SETUP.md](ADMIN_APPROVAL_SETUP.md). Approval state is server-side — **not** in
   `LEGACY_KEYS`.
+- **Enrollment/payment gate (manual verification — the shipped form of the Phase-2 paywall):** a
+  signed-in non-admin without a valid membership is held on the full-screen `EnrollmentPaywall`
+  (5 pricing cards from the `enrollment_plans` table with an in-code fallback; ₱ prices formatted
+  by `phpFmt`, **never** `useCurrency`; admin-editable payment instructions from
+  `payment_settings`; receipt upload to the **private** `enrollment-receipts` bucket at
+  `<uid>/<uuid>-<name>`), then on `EnrollmentPendingScreen` (realtime + poll, like
+  PendingApprovalScreen) until an admin reviews the `enrollment_requests` row in the
+  **Enrollments** admin tab (`enrollments` route `/admin/enrollments`; component
+  `AdminEnrollments`; own sidebar badge = pending_review HEAD-count). Requests are append-only for
+  students (statuses `pending_review/approved/rejected/expired`; unique partial index = one
+  pending per user; resubmit inserts a new row; the only student UPDATE is self-expiring an
+  overdue row); **Approve** writes request → profile (`is_paid`,`plan`,`approval_status`) →
+  a **dated subscription term** via the admin-guarded `approve_subscription()` RPC (falls back to
+  the legacy no-expiry update-else-insert when the lifecycle migration is missing); **Reject/
+  expire** keeps the student blocked with a resubmit path. Receipt preview uses `createSignedUrl`
+  (the app's **first** signed-URL use — everything else is public-bucket `getPublicUrl`). Emails
+  via env-gated `api/notify-enrollment.js` (`RESEND_API_KEY`/`RESEND_FROM`, optional
+  `NOTIFY_ADMIN_EMAIL` + `APP_URL` for the "Review in Enrollments" button; the submitted alert
+  carries a Type: Renewal/New row). Toggle with `REQUIRE_ENROLLMENT` (module const, default on;
+  off via `VITE_REQUIRE_ENROLLMENT=false`). Enrollment state is server-side — **not** in
+  `LEGACY_KEYS` (the one exception: the admin sound-alert pref `enroll:soundAlert`, which IS a
+  client pref and IS in `LEGACY_KEYS`; the alert itself is a WebAudio 3-tone chime with a Test
+  button, opt-in per autoplay policy).
+- **Subscription lifecycle (durations / expiry / renewal —
+  [db/2026-07-04-subscription-lifecycle.sql](db/2026-07-04-subscription-lifecycle.sql), runs
+  AFTER the enrollment migration):** every plan carries `access_days` (60 Core/Sampler/Silver,
+  180 Gold/VIP; `support_days` informational; `entitlement_summary` jsonb chips) and every
+  `subscriptions` row is a dated **term** (`ends_at`, `grace_ends_at`, lineage via
+  `renewed_from_subscription_id`; `ends_at IS NULL` = legacy no-expiry — grandfathered).
+  **The date is the authority:** `public.is_enrolled()` is rewritten to require an active,
+  non-expired subscription (or the legacy/no-rows grandfather fallback) — all content `*_read`
+  RLS enforces expiry server-side with zero policy changes; `profiles.is_paid` is now only a
+  cache. Terms are granted solely by `approve_subscription(p_user_id, p_plan_key, p_request_id)`
+  (SECURITY DEFINER, internal `is_admin()` guard; one transaction: supersede active row → insert
+  new term; renewal stacking = `greatest(now, current ends_at) + access_days`, so early renewal
+  never loses days; grace knob `v_grace_days`, default 0). `expire_overdue_subscriptions()`
+  lazily flips overdue rows' `status` (cosmetic — called on Enrollments-tab load). Client side:
+  `useEnrollmentGate` fetches the latest request + latest subscription for every non-admin
+  (paid users too) and reduces to a named state via `enrollGateState()`/`subAccess()` (pure
+  helpers next to the hook; `ends_at === undefined` tolerates the old schema); the root gate
+  switches over that state → `EnrollmentPendingScreen` (`renewal`/`finalizing` props),
+  **`MembershipExpiredScreen`** (expired member → Renew → paywall in `renewal` mode with
+  `currentSub`/`onClose`), or the paywall. The Dashboard renders **`MembershipPanel`**
+  (self-contained useAuth/fetch/realtime; fail-silent null on any error): plan, status pill,
+  start/expiry dates, days remaining, amount paid, entitlement chips, warnings at 14/7/3 days,
+  and a Renew button that opens the paywall as a fixed overlay — a member with a pending
+  renewal keeps full access. `AdminEnrollments` adds membership filters (Renewals / Active /
+  Expiring soon / Ended), a per-card membership strip, and an "access until {date}" projection
+  in the approve modal. Docs: [ENROLLMENT_SETUP.md](ENROLLMENT_SETUP.md) ("Membership lifecycle
+  & renewal"). Migration order: user-approval → enrollment → subscription-lifecycle.
 - **Sign-out + identity** render in the sidebar header (just below the "built by Alex Sagun" line).
 - **Per-user data:** all `window.storage` keys are auto-namespaced per user (see the main.jsx shim
   note). Tools need no changes. A one-time migration in `AuthProvider` adopts any pre-auth global
@@ -280,9 +334,11 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
 - **Backend setup:** a `profiles` table + RLS + a signup trigger must exist in Supabase. Email
   confirmation and Site/Redirect URLs are configured in the Supabase dashboard. See README / the
   setup steps for the exact SQL.
-- **Phase 2 (not built):** restrict tools to paid students via a `FREE_TABS` allowlist + a paywall
-  overlay at the render switch (`// Phase 2 paywall hooks here` comment), with `is_paid` flipped
-  **server-side** by a Stripe/Gumroad webhook (never client-side — tighten the RLS update policy then).
+- **Phase 2 status:** the paid gate shipped as the **manual enrollment workflow** above (full-app
+  gate keyed on `is_paid`, flipped only by an admin — RLS has no user-update policy on `profiles`).
+  The old seam comments (`FREE_TABS` allowlist + `// Phase 2 paywall hooks here` at the render
+  switch) remain unused — they're the hook for a future *partial* free-preview mode and/or a
+  Stripe/Gumroad webhook that flips `is_paid` server-side without manual review.
 
 ## AI / proxy pattern
 
@@ -335,6 +391,13 @@ const { text, data } = await callClaude({ system, messages }, { returnData: true
   time, so they must be set in Vercel (Prod + Preview) *before* building. The anon key is safe to
   expose; Supabase **Row Level Security** is the real boundary. Without them, the app loads but the
   auth screen shows a "not configured" notice.
+- **Feature flags (public, `VITE_`-prefixed, both default ON):** `VITE_REQUIRE_ADMIN_APPROVAL=false`
+  disables the admin-approval gate; `VITE_REQUIRE_ENROLLMENT=false` disables the enrollment paywall.
+  Rebuild after changing either. RLS remains the real boundary in both cases.
+- **Email (server-only, optional):** `RESEND_API_KEY` + `RESEND_FROM` enable the approval + enrollment
+  notification emails (`api/notify-access.js` / `api/notify-enrollment.js`); `NOTIFY_ADMIN_EMAIL`
+  optionally overrides where "new enrollment submitted" alerts go. All are non-fatal when unset, and
+  none run under `npm run dev` (serverless functions are Vercel-only).
 
 ## Deployment
 
@@ -402,7 +465,15 @@ A living plan — each phase is independent and can be approved/started on its o
 - **Auth Phase 1 — Signup/login (done):** Supabase email/password gate, `AuthProvider`/`useAuth()`,
   per-user storage namespacing + legacy migration, sidebar identity/sign-out. See the Authentication
   section. Requires the Supabase `profiles` table/RLS/trigger + the two `VITE_SUPABASE_*` env vars.
-- **Auth Phase 2 — Restrict to paid students (planned):** free-preview gating via a `FREE_TABS`
-  allowlist + a paywall overlay at the render switch; `is_paid` flipped server-side by a Stripe/Gumroad
-  checkout webhook (provider choice TBD); tighten the `profiles` RLS so users can't self-grant. Optional
-  later: full cloud data sync (move tool data from namespaced localStorage into Supabase for cross-device).
+- **Auth Phase 2 — Restrict to paid students (SHIPPED as the manual enrollment gate + subscription
+  lifecycle):** unpaid non-admins are held on the in-app Enrollment Paywall (manual payment +
+  receipt upload + admin review); approval now grants a **dated term** (plan `access_days` →
+  `subscriptions.ends_at`), expiry locks the member on a Membership Expired screen, and renewal
+  reuses the same paywall/review flow (early renewals extend from the current expiry) — see the
+  "Enrollment/payment gate" + "Subscription lifecycle" bullets in the Authentication section +
+  [ENROLLMENT_SETUP.md](ENROLLMENT_SETUP.md). `is_paid` is admin-flipped only (no user update
+  policy on `profiles`) and is now a cache — `public.is_enrolled()` date-checks the subscription.
+  Still open for a later iteration: a `FREE_TABS` free-preview mode (seam comments remain at the
+  render switch), an automated Stripe/Gumroad webhook to grant terms without manual review, and
+  full cloud data sync (move tool data from namespaced localStorage into Supabase for
+  cross-device).
