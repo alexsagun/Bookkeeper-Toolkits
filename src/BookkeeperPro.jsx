@@ -2226,7 +2226,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
                     <div className="mt-1" style={{ fontSize: 11, fontWeight: 700, color: C.primary }}>Save {phpFmt(save)} · {pct}% OFF</div>
                   )}
                   {p.limit_note && (
-                    <div className="mt-2 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg self-start" style={{ background: 'rgba(255,159,10,0.10)', border: '1px solid rgba(255,159,10,0.25)', fontSize: 11, fontWeight: 600, color: '#9A6200' }}>
+                    <div className="mt-2 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg self-start" style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', fontSize: 11, fontWeight: 600, color: 'var(--status-warn-fg)' }}>
                       <Clock size={11} /> {p.limit_note}
                     </div>
                   )}
@@ -2324,7 +2324,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
                       accept=".pdf,.png,.jpg,.jpeg,.webp,application/pdf,image/png,image/jpeg,image/webp"
                       onChange={(e) => { handleFile(e.target.files?.[0]); e.target.value = ''; }} />
                     {file ? (
-                      <div className="flex items-center justify-center gap-2" style={{ fontSize: 13, fontWeight: 600, color: '#1B7A35' }}>
+                      <div className="flex items-center justify-center gap-2" style={{ fontSize: 13, fontWeight: 600, color: 'var(--status-ok-fg)' }}>
                         <CheckCircle2 size={16} /> {file.name} <span style={{ color: C.textMute, fontWeight: 500 }}>· {(file.size / 1024 / 1024).toFixed(1)} MB</span>
                       </div>
                     ) : (
@@ -2395,7 +2395,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
                       <span>Optionally, also email your proof to <a href={`mailto:${pay.notify_email}`} style={{ color: C.primary, fontWeight: 600 }}>{pay.notify_email}</a>.</span>
                     </div>
                   )}
-                  <div className="mt-4 flex items-start gap-2 px-3 py-2.5 rounded-xl" style={{ background: 'rgba(255,159,10,0.08)', border: '1px solid rgba(255,159,10,0.22)', fontSize: 11.5, color: '#7A4B00', lineHeight: 1.5 }}>
+                  <div className="mt-4 flex items-start gap-2 px-3 py-2.5 rounded-xl" style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', fontSize: 11.5, color: 'var(--status-warn-strong-fg)', lineHeight: 1.5 }}>
                     <Clock size={13} className="flex-shrink-0 mt-px" />
                     <span>Manual review — Coach Alex’s team verifies payments personally, usually within 24 hours.</span>
                   </div>
@@ -2534,8 +2534,8 @@ function EnrollmentPendingScreen({ request, finalizing, renewal, email, uid, onS
               <div className="flex items-center justify-between gap-3 py-1" style={{ fontSize: 12.5 }}>
                 <span style={{ color: C.textMute }}>Status</span>
                 <span className="px-2 py-0.5 rounded-full text-[11px] font-bold" style={finalizing
-                  ? { background: 'rgba(40,166,71,0.12)', color: '#1B7A35', border: '1px solid rgba(40,166,71,0.30)' }
-                  : { background: 'rgba(255,159,10,0.12)', color: '#9A6200', border: '1px solid rgba(255,159,10,0.30)' }}>
+                  ? { background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)', border: '1px solid var(--status-ok-bd)' }
+                  : { background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)', border: '1px solid var(--status-warn-bd)' }}>
                   {finalizing ? 'Approved' : 'Pending review'}
                 </span>
               </div>
@@ -4428,14 +4428,14 @@ function AccessRequests({ onCountChange }) {
 
       {/* Notices */}
       {notice && (
-        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: '#ECFDF5', borderColor: '#6EE7B7' }}>
+        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: 'var(--status-ok-bg)', borderColor: 'var(--status-ok-bd)' }}>
           <CheckCircle2 size={18} className="text-emerald-600 mt-0.5 flex-shrink-0" />
           <div className="text-sm text-emerald-800 flex-1">{notice}</div>
           <button onClick={() => setNotice('')} className="text-emerald-500 hover:text-emerald-700"><X size={16} /></button>
         </div>
       )}
       {err && (
-        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: '#FEF2F2', borderColor: '#FCA5A5' }}>
+        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: 'var(--status-danger-bg)', borderColor: 'var(--status-danger-bd)' }}>
           <AlertTriangle size={18} className="text-red-500 mt-0.5 flex-shrink-0" />
           <div className="text-sm text-red-700 flex-1">{err}</div>
           <button onClick={() => setErr('')} className="text-red-400 hover:text-red-600"><X size={16} /></button>
@@ -5163,14 +5163,14 @@ function AdminEnrollments({ onCountChange }) {
 
       {/* Notices */}
       {notice && (
-        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: '#ECFDF5', borderColor: '#6EE7B7' }}>
+        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: 'var(--status-ok-bg)', borderColor: 'var(--status-ok-bd)' }}>
           <CheckCircle2 size={18} className="text-emerald-600 mt-0.5 flex-shrink-0" />
           <div className="text-sm text-emerald-800 flex-1">{notice}</div>
           <button onClick={() => setNotice('')} className="text-emerald-500 hover:text-emerald-700"><X size={16} /></button>
         </div>
       )}
       {err && (
-        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: '#FEF2F2', borderColor: '#FCA5A5' }}>
+        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: 'var(--status-danger-bg)', borderColor: 'var(--status-danger-bd)' }}>
           <AlertTriangle size={18} className="text-red-500 mt-0.5 flex-shrink-0" />
           <div className="text-sm text-red-700 flex-1">{err}</div>
           <button onClick={() => setErr('')} className="text-red-400 hover:text-red-600"><X size={16} /></button>
@@ -5250,7 +5250,7 @@ function AdminEnrollments({ onCountChange }) {
                       {r.city_country && <span className="inline-flex items-center gap-1"><Globe size={11} /> {r.city_country}</span>}
                       <span className="inline-flex items-center gap-1"><Clock size={11} /> {fmtEnrollDate(r.created_at)}</span>
                       {daysInfo(r) && (
-                        <span className="inline-flex items-center gap-1 font-semibold" style={{ color: overdueRow ? '#B45309' : C.textMute }}>
+                        <span className="inline-flex items-center gap-1 font-semibold" style={{ color: overdueRow ? 'var(--status-warn-fg)' : C.textMute }}>
                           <Hourglass size={11} /> {daysInfo(r)}
                         </span>
                       )}
@@ -5260,7 +5260,7 @@ function AdminEnrollments({ onCountChange }) {
                     <div style={{ fontSize: 12, fontWeight: 700, color: C.text }}>{r.plan_name || PLAN_LABELS[r.plan_key] || r.plan_key}</div>
                     <div style={{ fontFamily: fontMono, fontSize: 13, fontWeight: 700, color: C.text }}>{phpFmt(r.amount_paid)}</div>
                     {amountMismatch && (
-                      <div style={{ fontSize: 10.5, fontWeight: 600, color: '#B45309' }}>expected {phpFmt(r.amount_expected)}</div>
+                      <div style={{ fontSize: 10.5, fontWeight: 600, color: 'var(--status-warn-fg)' }}>expected {phpFmt(r.amount_expected)}</div>
                     )}
                     {r.payment_reference && (
                       <div className="truncate" style={{ fontFamily: fontMono, fontSize: 10.5, color: C.textMute, maxWidth: 160 }} title={r.payment_reference}>
@@ -5326,7 +5326,7 @@ function AdminEnrollments({ onCountChange }) {
                       <span style={{ fontWeight: 600, color: C.textSoft }}>{mPlan?.name || PLAN_LABELS[s.plan_key] || s.plan_key}</span>
                       <span>{fmtEnrollDate(s.started_at)} → {a.legacy ? 'no expiry' : fmtEnrollDate(s.ends_at)}</span>
                       {!a.legacy && (
-                        <span className="inline-flex items-center gap-1 font-semibold" style={{ fontFamily: fontMono, color: a.valid ? (a.daysLeft <= 3 ? C.red : a.daysLeft <= 14 ? '#B45309' : C.textSoft) : C.red }}>
+                        <span className="inline-flex items-center gap-1 font-semibold" style={{ fontFamily: fontMono, color: a.valid ? (a.daysLeft <= 3 ? C.red : a.daysLeft <= 14 ? 'var(--status-warn-fg)' : C.textSoft) : C.red }}>
                           <CalendarClock size={11} /> {a.valid ? `${a.daysLeft}d left` : `ended ${daysPast}d ago`}
                         </span>
                       )}
@@ -5599,14 +5599,14 @@ function MembershipPanel() {
   const entitlements = Array.isArray(plan?.entitlement_summary) ? plan.entitlement_summary : [];
 
   const pill = renewalPending
-    ? { label: 'Renewal under review', bg: 'rgba(10,132,255,0.10)', bd: 'rgba(10,132,255,0.25)', fg: C.primary }
+    ? { label: 'Renewal under review', bg: 'var(--status-info-bg)', bd: 'var(--status-info-bd)', fg: 'var(--status-info-fg)' }
     : daysLeft != null && daysLeft <= 3
-    ? { label: `Expires in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`, bg: 'rgba(208,35,35,0.08)', bd: 'rgba(208,35,35,0.22)', fg: C.red }
+    ? { label: `Expires in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`, bg: 'var(--status-danger-bg)', bd: 'var(--status-danger-bd)', fg: 'var(--status-danger-fg)' }
     : daysLeft != null && daysLeft <= 14
-    ? { label: 'Expiring soon', bg: 'rgba(255,159,10,0.12)', bd: 'rgba(255,159,10,0.30)', fg: '#9A6200' }
+    ? { label: 'Expiring soon', bg: 'var(--status-warn-bg)', bd: 'var(--status-warn-bd)', fg: 'var(--status-warn-fg)' }
     : acc.valid || !acc.has
-    ? { label: 'Active', bg: 'rgba(40,166,71,0.10)', bd: 'rgba(40,166,71,0.28)', fg: '#1B7A35' }
-    : { label: 'Expired', bg: 'rgba(208,35,35,0.08)', bd: 'rgba(208,35,35,0.22)', fg: C.red };
+    ? { label: 'Active', bg: 'var(--status-ok-bg)', bd: 'var(--status-ok-bd)', fg: 'var(--status-ok-fg)' }
+    : { label: 'Expired', bg: 'var(--status-danger-bg)', bd: 'var(--status-danger-bd)', fg: 'var(--status-danger-fg)' };
 
   const warnTier = daysLeft == null || renewalPending ? null : daysLeft <= 3 ? 'red' : daysLeft <= 7 ? 'amber7' : daysLeft <= 14 ? 'amber14' : null;
   const renewPrimary = warnTier === 'red' || warnTier === 'amber7';
@@ -6089,7 +6089,7 @@ function CoaGenerator() {
             </div>
           </div>
 
-          <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: '#F0F9FF', borderColor: GOLD }}>
+          <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: GOLD }}>
             <div className="flex gap-3 items-start">
               <Lightbulb size={20} style={{ color: GOLD }} className="flex-shrink-0 mt-0.5" />
               <div>
@@ -6174,7 +6174,7 @@ function Course() {
                   <div className="border-t border-slate-100 pt-4">
                     <div className="text-slate-700 whitespace-pre-line leading-relaxed text-[15px]">{m.body}</div>
 
-                    <div className="mt-5 p-5 rounded-xl" style={{ background: 'linear-gradient(135deg, #EFF6FF 0%, #DBEAFE 100%)' }}>
+                    <div className="mt-5 p-5 rounded-xl" style={{ background: 'var(--status-info-bg)' }}>
                       <div className="text-xs font-bold tracking-wider uppercase mb-2" style={{ color: ROYAL }}>💡 Quick Quiz</div>
                       <div className="text-slate-800 font-medium">{m.quiz}</div>
                       <button onClick={() => toggleAnswer(i)}
@@ -6893,7 +6893,7 @@ function CourseProgram({
                   </button>
                   <div className="flex items-center gap-2">
                     {doneIds.has(activeLesson.id) ? (
-                      <span className="px-4 py-2.5 rounded-xl text-sm font-semibold inline-flex items-center gap-2" style={{ background: '#DCFCE7', color: '#166534' }}>
+                      <span className="px-4 py-2.5 rounded-xl text-sm font-semibold inline-flex items-center gap-2" style={{ background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)' }}>
                         <Check size={16} /> Completed
                       </span>
                     ) : (
@@ -6907,7 +6907,7 @@ function CourseProgram({
                       className="px-5 py-2.5 rounded-xl text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-40"
                       style={doneIds.has(activeLesson.id)
                         ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff' }
-                        : { background: '#F1F5F9', color: C.textSoft }}>
+                        : { background: 'var(--wash-strong)', color: C.textSoft }}>
                       Next <ArrowRight size={15} />
                     </button>
                   </div>
@@ -6930,7 +6930,7 @@ function CourseProgram({
           <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
             <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg font-bold flex items-center gap-2"><Edit3 size={18} /> Course settings</div>
             <button onClick={togglePublished} disabled={metaBusy} className="px-4 py-2 rounded-xl text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-60"
-              style={course.published ? { background: '#DCFCE7', color: '#166534' } : { background: '#FEF3C7', color: '#92400E' }}>
+              style={course.published ? { background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)' } : { background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)' }}>
               {metaBusy ? <Loader2 size={15} className="animate-spin" /> : course.published ? <Eye size={15} /> : <Lock size={15} />}
               {course.published ? 'Published' : 'Draft'}
               <span className="opacity-60 font-normal">· click to {course.published ? 'unpublish' : 'publish'}</span>
@@ -6956,7 +6956,7 @@ function CourseProgram({
                 <button type="button" onClick={() => setCourseDraft(d => ({ ...d, course_date: todayISODate() }))}
                   className="px-3 py-2 rounded-lg border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-50">Today</button>
                 {courseDraft.course_date
-                  ? <span className="text-xs font-semibold px-2 py-1 rounded-full" style={{ background: '#EFF6FF', color: ROYAL }}>Cohort: {cohortLabel(courseDraft.course_date)}</span>
+                  ? <span className="text-xs font-semibold px-2 py-1 rounded-full" style={{ background: 'var(--status-info-bg)', color: 'var(--status-info-fg)' }}>Cohort: {cohortLabel(courseDraft.course_date)}</span>
                   : course.month ? <span className="text-xs text-slate-400">Legacy label: {course.month}</span> : null}
               </div>
               <span className="block mt-1 text-[11px] text-slate-400">Defaults to today. Update this for monthly cohorts or future course runs.</span>
@@ -7027,7 +7027,7 @@ function CourseProgram({
               {['video', 'text'].map(t => (
                 <button key={t} onClick={() => setEditingLesson(s => ({ ...s, type: t }))}
                   className="px-4 py-2 rounded-xl text-sm font-semibold capitalize inline-flex items-center gap-2"
-                  style={d.type === t ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff' } : { background: '#F1F5F9', color: C.textSoft }}>
+                  style={d.type === t ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff' } : { background: 'var(--wash-strong)', color: C.textSoft }}>
                   {t === 'video' ? <Play size={14} /> : <FileText size={14} />} {t}
                 </button>
               ))}
@@ -7169,7 +7169,7 @@ function CourseProgram({
 
   // ── Shell ──
   const errorBanner = err ? (
-    <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: '#FEF2F2', borderColor: '#FCA5A5' }}>
+    <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: 'var(--status-danger-bg)', borderColor: 'var(--status-danger-bd)' }}>
       <AlertTriangle size={18} className="text-red-500 mt-0.5 flex-shrink-0" />
       <div className="text-sm text-red-700 flex-1">{err}</div>
       <button onClick={() => setErr('')} className="text-red-400 hover:text-red-600"><X size={16} /></button>
@@ -7177,7 +7177,7 @@ function CourseProgram({
   ) : null;
 
   const noticeBanner = notice ? (
-    <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: '#ECFDF5', borderColor: '#6EE7B7' }}>
+    <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: 'var(--status-ok-bg)', borderColor: 'var(--status-ok-bd)' }}>
       <CheckCircle2 size={18} className="text-emerald-600 mt-0.5 flex-shrink-0" />
       <div className="text-sm text-emerald-800 flex-1">{notice}</div>
       <button onClick={() => setNotice(null)} className="text-emerald-500 hover:text-emerald-700"><X size={16} /></button>
@@ -7228,7 +7228,7 @@ function CourseProgram({
                 : 'No course exists yet. Click “Create course” to set it up, then add your modules and lessons in the builder.'}
           </div>
           {isAdmin && notConfigured && (
-            <div className="mt-4 inline-flex items-center gap-2 text-xs font-semibold px-3 py-1.5 rounded-full" style={{ background: '#FEF3C7', color: '#92400E' }}>
+            <div className="mt-4 inline-flex items-center gap-2 text-xs font-semibold px-3 py-1.5 rounded-full" style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)' }}>
               <AlertTriangle size={13} /> See COURSE_SETUP.md
             </div>
           )}
@@ -7254,7 +7254,7 @@ function CourseProgram({
         <div className="flex items-center gap-2 text-sm text-slate-500">
           <BookMarked size={15} /> {modules.length} modules · {totalLessons} lessons
           {!course.published && isAdmin && (
-            <span className="ml-1 px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: '#FEF3C7', color: '#92400E' }}>Draft — not published</span>
+            <span className="ml-1 px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)' }}>Draft — not published</span>
           )}
         </div>
         {isAdmin && (
@@ -7658,7 +7658,7 @@ function CourseCatalog({
   }
 
   const errorBanner = err ? (
-    <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: '#FEF2F2', borderColor: '#FCA5A5' }}>
+    <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: 'var(--status-danger-bg)', borderColor: 'var(--status-danger-bd)' }}>
       <AlertTriangle size={18} className="text-red-500 mt-0.5 flex-shrink-0" />
       <div className="text-sm text-red-700 flex-1">{err}</div>
       <button onClick={() => setErr('')} className="text-red-400 hover:text-red-600"><X size={16} /></button>
@@ -7694,7 +7694,7 @@ function CourseCatalog({
               : comingSoonDesc}
           </div>
           {isAdmin && (
-            <div className="mt-4 inline-flex items-center gap-2 text-xs font-semibold px-3 py-1.5 rounded-full" style={{ background: '#FEF3C7', color: '#92400E' }}>
+            <div className="mt-4 inline-flex items-center gap-2 text-xs font-semibold px-3 py-1.5 rounded-full" style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)' }}>
               <AlertTriangle size={13} /> See COURSE_SETUP.md
             </div>
           )}
@@ -7730,8 +7730,8 @@ function CourseCatalog({
                   {cover
                     ? <img src={cover} alt="" className="absolute inset-0 w-full h-full object-cover" />
                     : <div className="absolute inset-0 flex items-center justify-center" style={{ background: `linear-gradient(135deg, ${ROYAL}, ${CYAN})` }}><GraduationCap size={44} className="text-white/90" /></div>}
-                  {isAdmin && !c.published && <span className="absolute top-2 left-2 px-2 py-0.5 rounded-full text-[10px] font-bold" style={{ background: '#FEF3C7', color: '#92400E' }}>Draft</span>}
-                  {total > 0 && pct === 100 && <span className={`absolute top-2 ${isAdmin ? 'right-11' : 'right-2'} px-2 py-0.5 rounded-full text-[10px] font-bold inline-flex items-center gap-1`} style={{ background: '#DCFCE7', color: '#166534' }}><Award size={11} /> Done</span>}
+                  {isAdmin && !c.published && <span className="absolute top-2 left-2 px-2 py-0.5 rounded-full text-[10px] font-bold" style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)' }}>Draft</span>}
+                  {total > 0 && pct === 100 && <span className={`absolute top-2 ${isAdmin ? 'right-11' : 'right-2'} px-2 py-0.5 rounded-full text-[10px] font-bold inline-flex items-center gap-1`} style={{ background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)' }}><Award size={11} /> Done</span>}
                 </button>
 
                 {/* Admin ⋮ action menu (Edit / Duplicate / cover / reorder / Delete) */}
@@ -7766,7 +7766,7 @@ function CourseCatalog({
 
                 <div className="p-4 flex-1 flex flex-col">
                   <button onClick={() => openCourse(c.id)} className="text-left flex-1">
-                    {(c.course_date || c.month) && <div className="mb-1.5 inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full" style={{ background: '#EFF6FF', color: ROYAL }}><CalendarClock size={11} /> {c.course_date ? cohortLabel(c.course_date) : c.month}</div>}
+                    {(c.course_date || c.month) && <div className="mb-1.5 inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full" style={{ background: 'var(--status-info-bg)', color: 'var(--status-info-fg)' }}><CalendarClock size={11} /> {c.course_date ? cohortLabel(c.course_date) : c.month}</div>}
                     <div style={{ fontFamily: fontDisplay, color: NAVY }} className="font-bold text-[15px] leading-tight">{c.title}</div>
                     {c.subtitle && <div className="text-xs text-slate-500 mt-1 line-clamp-2">{c.subtitle}</div>}
                   </button>
@@ -8551,7 +8551,7 @@ function Form1099() {
               ))}
             </div>
           </div>
-          <div className="flex-1 md:max-w-md p-4 rounded-xl border-l-4" style={{ background: 'linear-gradient(135deg, #EFF6FF 0%, #DBEAFE 100%)', borderColor: ROYAL }}>
+          <div className="flex-1 md:max-w-md p-4 rounded-xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: ROYAL }}>
             <div className="text-xs font-bold uppercase tracking-wider" style={{ color: ROYAL }}>1099-NEC / 1099-MISC Threshold</div>
             <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-3xl font-bold mt-1">${threshold.toLocaleString()}</div>
             <div className="text-xs text-slate-700 mt-1 leading-relaxed">
@@ -8598,7 +8598,7 @@ function Form1099() {
         })}
       </div>
 
-      <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: '#F0F9FF', borderColor: GOLD }}>
+      <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: GOLD }}>
         <div className="flex gap-3">
           <Lightbulb size={20} style={{ color: GOLD }} className="flex-shrink-0 mt-0.5" />
           <div>
@@ -8641,7 +8641,7 @@ function SalesTax() {
         ))}
       </div>
 
-      <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: '#F0F9FF', borderColor: GOLD }}>
+      <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: GOLD }}>
         <div className="flex gap-3">
           <Lightbulb size={20} style={{ color: GOLD }} className="flex-shrink-0 mt-0.5" />
           <div>
@@ -8713,7 +8713,7 @@ function Onboarding() {
         ))}
       </div>
 
-      <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: '#F0F9FF', borderColor: GOLD }}>
+      <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: GOLD }}>
         <div className="flex gap-3">
           <Lightbulb size={20} style={{ color: GOLD }} className="flex-shrink-0 mt-0.5" />
           <div>
@@ -8725,7 +8725,7 @@ function Onboarding() {
         </div>
       </div>
 
-      <div className="mt-4 p-5 rounded-2xl border-l-4" style={{ background: '#EFF6FF', borderColor: ROYAL }}>
+      <div className="mt-4 p-5 rounded-2xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: ROYAL }}>
         <div className="flex gap-3">
           <Shield size={20} style={{ color: ROYAL }} className="flex-shrink-0 mt-0.5" />
           <div>
@@ -8926,7 +8926,7 @@ function Depreciation() {
             </table>
           </div>
 
-          <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: '#F0F9FF', borderColor: GOLD }}>
+          <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: GOLD }}>
             <div className="flex gap-3">
               <Lightbulb size={20} style={{ color: GOLD }} className="flex-shrink-0 mt-0.5" />
               <div>
@@ -9119,7 +9119,7 @@ function LoanAmortization() {
             </div>
           </div>
 
-          <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: '#F0F9FF', borderColor: GOLD }}>
+          <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: GOLD }}>
             <div className="flex gap-3">
               <Lightbulb size={20} style={{ color: GOLD }} className="flex-shrink-0 mt-0.5" />
               <div>
@@ -9271,7 +9271,7 @@ function CommonInterviewQAInner({ data }) {
                     {/* Weak vs Strong side-by-side */}
                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
                       {/* WEAK */}
-                      <div className="rounded-xl overflow-hidden border-2 border-red-200" style={{ background: '#FEF2F2' }}>
+                      <div className="rounded-xl overflow-hidden border-2 border-red-200" style={{ background: 'var(--status-danger-bg)' }}>
                         <div className="px-4 py-2 bg-red-100 border-b border-red-200 flex items-center gap-2">
                           <span className="text-[10px] font-bold tracking-[0.2em] uppercase text-red-700">✗ Weak Answer</span>
                           <span className="text-[9px] text-red-600 italic">(what most candidates say)</span>
@@ -9367,7 +9367,7 @@ function AccountingInterviewQAInner({ data }) {
 function ErrorNote({ msg, onClose, className = 'mt-4' }) {
   if (!msg) return null;
   return (
-    <div className={`${className} flex items-start gap-3 p-4 rounded-xl border`} style={{ background: '#FEF2F2', borderColor: '#FCA5A5' }}>
+    <div className={`${className} flex items-start gap-3 p-4 rounded-xl border`} style={{ background: 'var(--status-danger-bg)', borderColor: 'var(--status-danger-bd)' }}>
       <AlertTriangle size={18} className="text-red-500 mt-0.5 flex-shrink-0" />
       <div className="text-sm text-red-700 flex-1">{msg}</div>
       {onClose && <button onClick={onClose} className="text-red-400 hover:text-red-600"><X size={16} /></button>}
@@ -9528,7 +9528,7 @@ Generate 3-5 questions per category. Make them realistic — what a US hiring ma
               </div>
               <div className="p-4 space-y-3">
                 {cat.questions.map((q, qi) => (
-                  <div key={qi} className="p-4 rounded-xl border border-slate-100 hover:border-blue-200 transition" style={{ background: '#FAFCFF' }}>
+                  <div key={qi} className="p-4 rounded-xl border border-slate-100 hover:border-blue-200 transition" style={{ background: 'var(--wash)' }}>
                     <div className="flex items-start gap-3">
                       <div style={{ background: ICE, color: NAVY }} className="w-7 h-7 rounded-lg flex items-center justify-center font-bold text-xs flex-shrink-0">
                         {qi + 1}
@@ -9842,7 +9842,7 @@ ${(profile.authenticWeaknesses || []).map(w => `
           </div>
           <div className="p-4 space-y-3">
             {profile.topStrengths.map((s, i) => (
-              <div key={i} className="p-4 rounded-xl border border-slate-100" style={{ background: '#FAFCFF' }}>
+              <div key={i} className="p-4 rounded-xl border border-slate-100" style={{ background: 'var(--wash)' }}>
                 <div className="flex items-start gap-3">
                   <div style={{ background: `linear-gradient(135deg, ${ROYAL} 0%, ${CYAN} 100%)` }} className="w-8 h-8 rounded-lg flex items-center justify-center text-white font-bold text-xs flex-shrink-0 shadow-md">
                     {i + 1}
@@ -9870,7 +9870,7 @@ ${(profile.authenticWeaknesses || []).map(w => `
           </div>
           <div className="p-4 space-y-3">
             {profile.authenticWeaknesses.map((w, i) => (
-              <div key={i} className="p-4 rounded-xl border border-slate-100" style={{ background: '#FAFCFF' }}>
+              <div key={i} className="p-4 rounded-xl border border-slate-100" style={{ background: 'var(--wash)' }}>
                 <div style={{ color: NAVY }} className="font-bold text-base">{w.weakness}</div>
                 <div className="text-xs text-slate-600 mt-2 leading-relaxed">
                   <span className="font-semibold" style={{ color: ROYAL }}>Root cause: </span>{w.rootCause}
@@ -9909,7 +9909,7 @@ ${(profile.authenticWeaknesses || []).map(w => `
           </div>
         </div>
 
-        <div className="p-5 rounded-2xl border-l-4" style={{ background: '#F0F9FF', borderColor: ROYAL }}>
+        <div className="p-5 rounded-2xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: ROYAL }}>
           <div className="flex gap-3">
             <Lightbulb size={20} style={{ color: ROYAL }} className="flex-shrink-0 mt-0.5" />
             <div>
@@ -10181,7 +10181,7 @@ Output the email/document directly with no preamble or explanation. Use heavy wh
       <SectionHead eyebrow="Job Application · Tool" title="Proposal & Outreach Generator (Remote Bookkeeper)" desc="Hormozi × Martell direct-response style — laser-focused on the bookkeeping and accounting pain points a REMOTE bookkeeper solves for US clients. Every output centers on the financial outcomes you deliver, with remote-delivery advantages (cost, focus, timezone) baked in naturally." />
 
       {/* Style callout */}
-      <div className="mt-6 p-4 rounded-2xl border border-blue-200 flex items-center gap-3" style={{ background: 'linear-gradient(135deg, #EFF6FF 0%, #DBEAFE 100%)' }}>
+      <div className="mt-6 p-4 rounded-2xl border border-blue-200 flex items-center gap-3" style={{ background: 'var(--status-info-bg)' }}>
         <Sparkles size={18} style={{ color: ROYAL }} className="flex-shrink-0" />
         <div className="text-sm text-slate-800">
           <span className="font-bold" style={{ color: ROYAL }}>Style guide:</span> Short sentences. Specific numbers. One CTA. P.S. on every email. Zero corporate clichés. Built on the playbook used by Alex Hormozi (Acquisition.com) and Dan Martell (SaaS Academy).
@@ -10800,13 +10800,13 @@ ${sectionsHtml}
                 maxWidth: '740px',
                 width: '100%',
                 boxShadow: '0 20px 60px -20px rgba(10,30,63,0.25), 0 4px 12px -4px rgba(10,30,63,0.08), 0 0 0 1px rgba(255,255,255,1) inset',
-                backgroundImage: 'linear-gradient(180deg, #ffffff 0%, #FAFCFF 100%)',
+                backgroundImage: 'linear-gradient(180deg, var(--surface-2) 0%, var(--c-bg) 100%)',
               }}>
               <div className="whitespace-pre-wrap text-slate-800 text-sm leading-relaxed" style={{ fontFamily: fontBody }}>{generated}</div>
             </div>
           </div>
 
-          <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: '#F0F9FF', borderColor: ROYAL }}>
+          <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: ROYAL }}>
             <div className="flex gap-3">
               <Shield size={20} style={{ color: ROYAL }} className="flex-shrink-0 mt-0.5" />
               <div>
@@ -11063,7 +11063,7 @@ function SalaryNegotiationInner({ data }) {
         </div>
       </div>
 
-      <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: '#F0F9FF', borderColor: ROYAL }}>
+      <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: ROYAL }}>
         <div className="flex gap-3">
           <Lightbulb size={20} style={{ color: ROYAL }} className="flex-shrink-0 mt-0.5" />
           <div>
@@ -11322,7 +11322,7 @@ Generated by Get Hired With Alex · US Bookkeeper Ultimate Tool Kits
 
       {/* Error display */}
       {error && !busy && (
-        <div className="mt-4 p-4 rounded-xl border-l-4" style={{ background: '#FEF2F2', borderColor: '#DC2626' }}>
+        <div className="mt-4 p-4 rounded-xl border-l-4" style={{ background: 'var(--status-danger-bg)', borderColor: 'var(--c-red)' }}>
           <div className="flex gap-3 items-start">
             <AlertTriangle size={18} className="text-red-600 flex-shrink-0 mt-0.5" />
             <div className="flex-1">
@@ -11379,12 +11379,12 @@ Generated by Get Hired With Alex · US Bookkeeper Ultimate Tool Kits
                     </div>
                   </div>
                   {p.remoteAdvantage && (
-                    <div className="ml-12 mt-3 p-3 rounded-lg border-2" style={{ background: '#ECFDF5', borderColor: '#10B981' }}>
-                      <div className="text-[10px] uppercase tracking-wider font-bold mb-1" style={{ color: '#047857' }}>🌏 Why a Remote Bookkeeper Wins This</div>
+                    <div className="ml-12 mt-3 p-3 rounded-lg border-2" style={{ background: 'var(--status-ok-bg)', borderColor: 'var(--c-green)' }}>
+                      <div className="text-[10px] uppercase tracking-wider font-bold mb-1" style={{ color: 'var(--status-ok-fg)' }}>🌏 Why a Remote Bookkeeper Wins This</div>
                       <div className="text-sm text-slate-700 leading-relaxed">{p.remoteAdvantage}</div>
                     </div>
                   )}
-                  <div className="ml-12 mt-3 p-4 rounded-lg" style={{ background: '#F0F9FF', border: `1px solid ${CYAN}40` }}>
+                  <div className="ml-12 mt-3 p-4 rounded-lg" style={{ background: 'var(--status-info-bg)', border: `1px solid ${CYAN}40` }}>
                     <div className="text-[10px] uppercase tracking-wider font-bold mb-1.5" style={{ color: ROYAL }}>💬 Say this in your sales pitch</div>
                     <div className="text-sm italic text-slate-800 leading-relaxed">"{p.salesPhrase}"</div>
                   </div>
@@ -11459,7 +11459,7 @@ function ClientPortalDemo() {
       </div>
 
       {/* Mock client portal — the deliverable */}
-      <div className="rounded-2xl overflow-hidden shadow-2xl border border-slate-200" style={{ background: '#F8FAFF' }}>
+      <div className="rounded-2xl overflow-hidden shadow-2xl border border-slate-200" style={{ background: 'var(--wash)' }}>
         {/* Portal header */}
         <div style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-6 py-4 text-white">
           <div className="flex items-center justify-between">
@@ -11514,7 +11514,7 @@ function ClientPortalDemo() {
         </div>
       </div>
 
-      <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: '#F0F9FF', borderColor: ROYAL }}>
+      <div className="mt-6 p-5 rounded-2xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: ROYAL }}>
         <div className="flex gap-3">
           <Sparkles size={20} style={{ color: ROYAL }} className="flex-shrink-0 mt-0.5" />
           <div>
@@ -11737,7 +11737,7 @@ function PortalCashFlow() {
           if (s.type === 'header' || s.type === 'subtotal' || s.type === 'total') {
             return (
               <div key={i} className={`flex items-center justify-between p-3 rounded-lg ${s.type === 'total' ? 'text-white' : ''}`}
-                style={s.type === 'total' ? { background: `linear-gradient(135deg, ${ROYAL} 0%, ${CYAN} 100%)` } : { background: '#F8FAFF' }}>
+                style={s.type === 'total' ? { background: `linear-gradient(135deg, ${ROYAL} 0%, ${CYAN} 100%)` } : { background: 'var(--wash)' }}>
                 <div className={`text-sm font-bold ${s.type === 'total' ? '' : 'text-slate-800'}`}>{s.label}</div>
                 <div className="text-sm font-mono font-bold">${s.value.toLocaleString()}</div>
               </div>
@@ -11858,9 +11858,9 @@ function PortalActions() {
       <div className="space-y-2">
         {items.map((it, i) => {
           const colors = {
-            urgent: { bg: '#FEE2E2', text: '#991B1B', label: 'URGENT' },
+            urgent: { bg: 'var(--status-danger-bg)', text: 'var(--status-danger-fg)', label: 'URGENT' },
             normal: { bg: ICE, text: NAVY, label: 'REVIEW' },
-            fyi: { bg: '#D1FAE5', text: '#065F46', label: 'FYI' },
+            fyi: { bg: 'var(--status-ok-bg)', text: 'var(--status-ok-fg)', label: 'FYI' },
           };
           const c = colors[it.priority];
           return (
@@ -11972,7 +11972,7 @@ function IndustryAccountingInner({ data }) {
 
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
           <div className="px-5 py-3 border-b border-red-200 bg-red-50">
-            <div style={{ fontFamily: fontDisplay, color: '#991B1B' }} className="text-base font-bold">🚩 Red Flags in Their Existing Books</div>
+            <div style={{ fontFamily: fontDisplay, color: 'var(--status-danger-fg)' }} className="text-base font-bold">🚩 Red Flags in Their Existing Books</div>
             <div className="text-xs text-red-700 mt-0.5">Spot these in diagnostics = cleanup engagement</div>
           </div>
           <div className="p-4 space-y-2">
@@ -12143,7 +12143,7 @@ function MonthlyWorkflowInner({ data }) {
           {MONTHLY_WORKFLOW.map((p, i) => (
             <button key={i} onClick={() => setActive(i)}
               className={`flex-1 min-w-[100px] p-3 rounded-xl transition text-left ${active === i ? 'shadow-lg' : 'opacity-60 hover:opacity-100'}`}
-              style={{ background: active === i ? `linear-gradient(135deg, ${p.color} 0%, ${p.color}CC 100%)` : `${p.color}15`, color: active === i ? 'white' : p.color }}>
+              style={{ background: active === i ? `linear-gradient(135deg, ${p.color} 0%, ${p.color}CC 100%)` : 'var(--primary-tint)', color: active === i ? 'white' : 'var(--navy)' }}>
               <div className="text-[10px] font-bold uppercase tracking-wider mb-1">{p.range}</div>
               <div className="text-xs font-bold leading-tight">{p.label}</div>
             </button>
@@ -12161,7 +12161,7 @@ function MonthlyWorkflowInner({ data }) {
             </div>
             <div className="p-4 space-y-2">
               {p.tasks.map((t, i) => (
-                <div key={i} className="p-4 rounded-xl border border-slate-100" style={{ background: '#FAFCFF' }}>
+                <div key={i} className="p-4 rounded-xl border border-slate-100" style={{ background: 'var(--wash)' }}>
                   <div className="flex items-start gap-3">
                     <span className="text-[10px] font-bold tracking-wider px-2 py-1 rounded-lg flex-shrink-0 mt-0.5" style={{ background: ICE, color: NAVY }}>
                       {t.time}
@@ -12186,7 +12186,7 @@ function MonthlyWorkflowInner({ data }) {
           {MONTHLY_WORKFLOW.map((p, i) => (
             <div key={i} className="flex items-start gap-4 py-2 border-b border-slate-100 last:border-0">
               <div className="w-24 flex-shrink-0">
-                <div className="text-xs font-bold" style={{ color: p.color }}>{p.range}</div>
+                <div className="text-xs font-bold" style={{ color: 'var(--navy)' }}>{p.range}</div>
               </div>
               <div className="flex-1">
                 <div className="font-bold text-sm text-slate-800">{p.label}</div>
@@ -12784,7 +12784,7 @@ ${showTimesheet && timesheet.length > 0 && timesheetSubtotal > 0 ? `
       </div>
 
       {/* Pro Tip */}
-      <div className="mt-5 p-4 rounded-xl border-l-4" style={{ background: '#F0F9FF', borderColor: ROYAL }}>
+      <div className="mt-5 p-4 rounded-xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: ROYAL }}>
         <div className="flex gap-3 items-start">
           <Lightbulb size={18} style={{ color: ROYAL }} className="flex-shrink-0 mt-0.5" />
           <div className="text-sm text-slate-700 leading-relaxed">
@@ -13253,7 +13253,7 @@ function PrepaidAmortization() {
       </div>
 
       {/* ProAdvisor tip */}
-      <div className="p-4 rounded-xl border-l-4" style={{ background: '#F0F9FF', borderColor: ROYAL }}>
+      <div className="p-4 rounded-xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: ROYAL }}>
         <div className="flex gap-3 items-start">
           <Lightbulb size={18} style={{ color: ROYAL }} className="flex-shrink-0 mt-0.5" />
           <div className="text-sm text-slate-700 leading-relaxed">
@@ -13353,7 +13353,7 @@ function SalesTaxCalculator() {
         </div>
       </div>
 
-      <div className="mt-5 p-4 rounded-xl border-l-4" style={{ background: '#F0F9FF', borderColor: ROYAL }}>
+      <div className="mt-5 p-4 rounded-xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: ROYAL }}>
         <div className="flex gap-3 items-start">
           <Lightbulb size={18} style={{ color: ROYAL }} className="flex-shrink-0 mt-0.5" />
           <div className="text-sm text-slate-700 leading-relaxed">
@@ -15182,12 +15182,12 @@ ${output.referenceTable.rows.map(row => `<tr>${row.map(c => `<td>${esc(c)}</td>`
           </div>
 
           {output && output.error && (
-            <div className="p-4 rounded-xl border-l-4 mt-2" style={{ background: '#FEF2F2', borderColor: '#D02323' }}>
+            <div className="p-4 rounded-xl border-l-4 mt-2" style={{ background: 'var(--status-danger-bg)', borderColor: 'var(--c-red)' }}>
               <div className="flex gap-3 items-start">
                 <AlertTriangle size={18} className="flex-shrink-0 mt-0.5" style={{ color: '#D02323' }} />
                 <div className="flex-1">
                   <div className="font-bold mb-1" style={{ color: '#7F1D1D' }}>SOP Generation Failed</div>
-                  <div className="text-sm leading-relaxed" style={{ color: '#991B1B' }}>{output.error}</div>
+                  <div className="text-sm leading-relaxed" style={{ color: 'var(--status-danger-fg)' }}>{output.error}</div>
                   <button onClick={() => generate()} className="mt-2.5 text-xs font-bold px-3 py-1.5 rounded-lg text-white" style={{ background: '#D02323' }}>
                     Try Again
                   </button>
@@ -15377,12 +15377,12 @@ ${output.referenceTable.rows.map(row => `<tr>${row.map(c => `<td>${esc(c)}</td>`
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div className="p-4 rounded-xl" style={{ background: 'rgba(255,159,10,0.06)', border: '1px solid rgba(255,159,10,0.20)' }}>
-                    <div className="text-xs uppercase tracking-wider font-bold mb-2 flex items-center gap-1.5" style={{ color: '#B45309' }}>
+                    <div className="text-xs uppercase tracking-wider font-bold mb-2 flex items-center gap-1.5" style={{ color: 'var(--status-warn-fg)' }}>
                       <AlertTriangle size={12} /> Common Pitfalls
                     </div>
                     <ul className="space-y-1.5 text-sm" style={{ color: '#78350F' }}>
                       {output.commonPitfalls && output.commonPitfalls.map((p, i) => (
-                        <li key={i} className="flex gap-2"><span className="font-bold flex-shrink-0" style={{ color: '#B45309' }}>{i + 1}.</span><span>{p}</span></li>
+                        <li key={i} className="flex gap-2"><span className="font-bold flex-shrink-0" style={{ color: 'var(--status-warn-fg)' }}>{i + 1}.</span><span>{p}</span></li>
                       ))}
                     </ul>
                   </div>
@@ -15413,7 +15413,7 @@ ${output.referenceTable.rows.map(row => `<tr>${row.map(c => `<td>${esc(c)}</td>`
                 </button>
               </div>
               <div className="p-6 space-y-5">
-                <div className="p-4 rounded-xl border-l-4" style={{ background: '#F0F9FF', borderColor: ROYAL }}>
+                <div className="p-4 rounded-xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: ROYAL }}>
                   <div className="text-xs uppercase tracking-wider font-bold mb-2" style={{ color: ROYAL }}>📋 Props / Setup (have these ready)</div>
                   <ul className="space-y-1 text-sm" style={{ color: NAVY }}>
                     {output.props && output.props.map((p, i) => (
@@ -15509,10 +15509,10 @@ function ClientHealthScore() {
   };
 
   const getStatus = (score) => {
-    if (score >= 80) return { label: '🟢 Healthy', color: '#059669', bg: '#D1FAE5' };
-    if (score >= 65) return { label: '🟡 Watch', color: '#D97706', bg: '#FEF3C7' };
-    if (score >= 50) return { label: '🟠 At Risk', color: '#EA580C', bg: '#FED7AA' };
-    return { label: '🔴 Critical', color: '#DC2626', bg: '#FEE2E2' };
+    if (score >= 80) return { label: '🟢 Healthy', color: 'var(--status-ok-fg)', bg: 'var(--status-ok-bg)' };
+    if (score >= 65) return { label: '🟡 Watch', color: 'var(--status-warn-fg)', bg: 'var(--status-warn-bg)' };
+    if (score >= 50) return { label: '🟠 At Risk', color: 'var(--status-warn-strong-fg)', bg: 'var(--status-warn-strong-bg)' };
+    return { label: '🔴 Critical', color: 'var(--status-danger-fg)', bg: 'var(--status-danger-bg)' };
   };
 
   const getActionItems = (client) => {
@@ -15544,13 +15544,13 @@ function ClientHealthScore() {
           <div className="text-[10px] uppercase tracking-wider font-bold text-slate-500">Total MRR</div>
           <div style={{ color: ROYAL, fontFamily: fontDisplay }} className="text-3xl font-bold mt-1">${totalMRR.toLocaleString()}</div>
         </div>
-        <div className="p-5 rounded-2xl shadow-sm" style={{ background: '#D1FAE5' }}>
-          <div className="text-[10px] uppercase tracking-wider font-bold" style={{ color: '#065F46' }}>Healthy (80+)</div>
-          <div style={{ color: '#065F46', fontFamily: fontDisplay }} className="text-3xl font-bold mt-1">{healthyCount}</div>
+        <div className="p-5 rounded-2xl shadow-sm" style={{ background: 'var(--status-ok-bg)' }}>
+          <div className="text-[10px] uppercase tracking-wider font-bold" style={{ color: 'var(--status-ok-fg)' }}>Healthy (80+)</div>
+          <div style={{ color: 'var(--status-ok-fg)', fontFamily: fontDisplay }} className="text-3xl font-bold mt-1">{healthyCount}</div>
         </div>
-        <div className="p-5 rounded-2xl shadow-sm" style={{ background: '#FEE2E2' }}>
-          <div className="text-[10px] uppercase tracking-wider font-bold" style={{ color: '#991B1B' }}>At Risk (&lt;65)</div>
-          <div style={{ color: '#991B1B', fontFamily: fontDisplay }} className="text-3xl font-bold mt-1">{atRiskCount}</div>
+        <div className="p-5 rounded-2xl shadow-sm" style={{ background: 'var(--status-danger-bg)' }}>
+          <div className="text-[10px] uppercase tracking-wider font-bold" style={{ color: 'var(--status-danger-fg)' }}>At Risk (&lt;65)</div>
+          <div style={{ color: 'var(--status-danger-fg)', fontFamily: fontDisplay }} className="text-3xl font-bold mt-1">{atRiskCount}</div>
         </div>
       </div>
 
@@ -15767,7 +15767,7 @@ Watch items / concerns: ${watchItems || '(none flagged)'}`;
             <div className="text-xs text-blue-200">Duration: {script.duration}</div>
           </div>
           <div className="p-6 space-y-5">
-            <div className="p-4 rounded-xl border-l-4" style={{ background: '#F0F9FF', borderColor: ROYAL }}>
+            <div className="p-4 rounded-xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: ROYAL }}>
               <div className="text-xs uppercase tracking-wider font-bold mb-2" style={{ color: ROYAL }}>📋 Pre-Call Checklist</div>
               <ul className="space-y-1 text-sm" style={{ color: NAVY }}>
                 {script.preCallChecklist && script.preCallChecklist.map((p, i) => (
@@ -15810,7 +15810,7 @@ Watch items / concerns: ${watchItems || '(none flagged)'}`;
               <div className="text-sm text-slate-700 leading-relaxed p-4 rounded-lg bg-slate-50 italic">"{script.closingScript}"</div>
             </div>
 
-            <div className="p-4 rounded-xl border-l-4" style={{ background: '#FEF3C7', borderColor: '#D97706' }}>
+            <div className="p-4 rounded-xl border-l-4" style={{ background: 'var(--status-warn-bg)', borderColor: 'var(--c-amber)' }}>
               <div className="text-xs uppercase tracking-wider font-bold mb-2 text-amber-800">⏰ After-Call Actions (within 24 hours)</div>
               <ul className="space-y-1 text-sm text-amber-900">
                 {script.afterCallActions && script.afterCallActions.map((a, i) => (
@@ -15999,7 +15999,7 @@ Reason for raise: ${reasonLabels[reason]}`;
             </div>
           </div>
 
-          <div className="p-5 rounded-2xl border-l-4" style={{ background: '#FEF3C7', borderColor: '#D97706' }}>
+          <div className="p-5 rounded-2xl border-l-4" style={{ background: 'var(--status-warn-bg)', borderColor: 'var(--c-amber)' }}>
             <div className="text-xs uppercase tracking-wider font-bold mb-2 text-amber-800">⛔ What NOT to Say</div>
             <ul className="space-y-1 text-sm text-amber-900">
               {output.whatNotToSay && output.whatNotToSay.map((w, i) => (
@@ -16208,7 +16208,7 @@ Current monthly fee: $${monthlyFee}`;
           )}
 
           {output.tax_prep_referral_strategy && (
-            <div className="p-5 rounded-2xl border-l-4" style={{ background: '#F0F9FF', borderColor: ROYAL }}>
+            <div className="p-5 rounded-2xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: ROYAL }}>
               <div className="text-xs uppercase tracking-wider font-bold mb-2" style={{ color: ROYAL }}>💼 Tax Prep Referral Strategy</div>
               <div className="text-sm text-slate-700">{output.tax_prep_referral_strategy}</div>
             </div>
@@ -16271,14 +16271,14 @@ function DifficultClientPlaybookInner({ data }) {
             </ul>
           </div>
 
-          <div className="p-4 rounded-xl border-l-4" style={{ background: '#F0F9FF', borderColor: ROYAL }}>
+          <div className="p-4 rounded-xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: ROYAL }}>
             <div className="text-xs uppercase tracking-wider font-bold mb-2" style={{ color: ROYAL }}>🤔 Salvage vs Fire Decision</div>
             <div className="text-sm text-slate-700">{scenario.decision}</div>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="p-4 rounded-xl border border-slate-200 bg-emerald-50">
-              <div className="text-xs uppercase tracking-wider font-bold mb-3" style={{ color: '#065F46' }}>✅ Salvage Path</div>
+              <div className="text-xs uppercase tracking-wider font-bold mb-3" style={{ color: 'var(--status-ok-fg)' }}>✅ Salvage Path</div>
               <ol className="space-y-2 text-sm text-emerald-900 list-decimal list-inside">
                 {scenario.salvageSteps.map((s, i) => (
                   <li key={i} className="leading-relaxed">{s}</li>
@@ -16286,7 +16286,7 @@ function DifficultClientPlaybookInner({ data }) {
               </ol>
             </div>
             <div className="p-4 rounded-xl border border-slate-200 bg-red-50">
-              <div className="text-xs uppercase tracking-wider font-bold mb-3" style={{ color: '#991B1B' }}>🔥 Fire Path</div>
+              <div className="text-xs uppercase tracking-wider font-bold mb-3" style={{ color: 'var(--status-danger-fg)' }}>🔥 Fire Path</div>
               <ol className="space-y-2 text-sm text-red-900 list-decimal list-inside">
                 {scenario.fireSteps.map((s, i) => (
                   <li key={i} className="leading-relaxed">{s}</li>
@@ -16663,7 +16663,7 @@ function CapacityPlanner() {
         <div className="mb-5 space-y-2">
           <div className="text-[10px] uppercase tracking-[0.2em] font-bold text-slate-500 mb-2">🎯 Recommendations for You</div>
           {recommendations.map((r, i) => {
-            const colorMap = { high: { bg: '#FEF2F2', border: '#DC2626' }, medium: { bg: '#FEF3C7', border: '#D97706' }, low: { bg: '#F0F9FF', border: ROYAL } };
+            const colorMap = { high: { bg: 'var(--status-danger-bg)', border: 'var(--c-red)' }, medium: { bg: 'var(--status-warn-bg)', border: 'var(--c-amber)' }, low: { bg: 'var(--status-info-bg)', border: ROYAL } };
             const c = colorMap[r.urgency];
             return (
               <div key={i} className="p-4 rounded-xl border-l-4" style={{ background: c.bg, borderColor: c.border }}>
@@ -16878,8 +16878,8 @@ function PaymentTracker() {
                 return b.dueDate.localeCompare(a.dueDate);
               }).map(inv => {
                 const overdueDays = inv.status === 'overdue' ? daysOverdue(inv.dueDate) : 0;
-                const statusColor = inv.status === 'paid' ? '#059669' : inv.status === 'overdue' ? '#DC2626' : '#0EA5E9';
-                const statusBg = inv.status === 'paid' ? '#D1FAE5' : inv.status === 'overdue' ? '#FEE2E2' : '#DBEAFE';
+                const statusColor = inv.status === 'paid' ? 'var(--status-ok-fg)' : inv.status === 'overdue' ? 'var(--status-danger-fg)' : 'var(--status-info-fg)';
+                const statusBg = inv.status === 'paid' ? 'var(--status-ok-bg)' : inv.status === 'overdue' ? 'var(--status-danger-bg)' : 'var(--status-info-bg)';
                 return (
                   <tr key={inv.id} className="border-t border-slate-100">
                     <td className="px-4 py-3">
@@ -17186,7 +17186,7 @@ function PHUSMoneyGuide() {
               </div>
             </div>
           ))}
-          <div className="p-4 rounded-xl border-l-4" style={{ background: '#F0F9FF', borderColor: ROYAL }}>
+          <div className="p-4 rounded-xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: ROYAL }}>
             <div className="flex gap-3 items-start">
               <Lightbulb size={18} style={{ color: ROYAL }} className="flex-shrink-0 mt-0.5" />
               <div className="text-sm text-slate-700 leading-relaxed">
@@ -17206,11 +17206,11 @@ function PHUSMoneyGuide() {
               <div className="text-xs uppercase tracking-wider font-bold mb-2" style={{ color: ROYAL }}>{opt.rate}</div>
               <div className="text-sm text-slate-700 mb-3"><span className="font-bold">Who qualifies:</span> {opt.who}</div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
-                <div className="p-3 rounded-lg" style={{ background: '#F0FDF4' }}>
+                <div className="p-3 rounded-lg" style={{ background: 'var(--status-ok-bg)' }}>
                   <div className="text-[10px] uppercase font-bold text-emerald-700 mb-1">Pros</div>
                   <ul className="text-xs text-slate-700 space-y-0.5">{opt.pros.map((x,i) => <li key={i}>• {x}</li>)}</ul>
                 </div>
-                <div className="p-3 rounded-lg" style={{ background: '#FEF2F2' }}>
+                <div className="p-3 rounded-lg" style={{ background: 'var(--status-danger-bg)' }}>
                   <div className="text-[10px] uppercase font-bold text-red-700 mb-1">Cons</div>
                   <ul className="text-xs text-slate-700 space-y-0.5">{opt.cons.map((x,i) => <li key={i}>• {x}</li>)}</ul>
                 </div>
@@ -17221,7 +17221,7 @@ function PHUSMoneyGuide() {
               </div>
             </div>
           ))}
-          <div className="p-4 rounded-xl border-l-4" style={{ background: '#FEF3C7', borderColor: '#D97706' }}>
+          <div className="p-4 rounded-xl border-l-4" style={{ background: 'var(--status-warn-bg)', borderColor: 'var(--c-amber)' }}>
             <div className="flex gap-3 items-start">
               <AlertTriangle size={18} className="text-amber-700 flex-shrink-0 mt-0.5" />
               <div className="text-sm text-amber-900 leading-relaxed">
@@ -17244,7 +17244,8 @@ function PHUSMoneyGuide() {
             </div>
           </div>
           {phRegSteps.map((step, i) => {
-            const colors = { critical: { bg: '#FEF2F2', border: '#DC2626', label: 'CRITICAL' }, recommended: { bg: '#FEF3C7', border: '#D97706', label: 'RECOMMENDED' }, optional: { bg: '#F0F9FF', border: ROYAL, label: 'OPTIONAL' } };
+            // border stays literal — it doubles as a bg under white text (step circle); fg is the token for text on the tinted bg
+            const colors = { critical: { bg: 'var(--status-danger-bg)', border: '#DC2626', fg: 'var(--status-danger-fg)', label: 'CRITICAL' }, recommended: { bg: 'var(--status-warn-bg)', border: '#D97706', fg: 'var(--status-warn-fg)', label: 'RECOMMENDED' }, optional: { bg: 'var(--status-info-bg)', border: ROYAL, fg: 'var(--status-info-fg)', label: 'OPTIONAL' } };
             const c = colors[step.urgency];
             return (
               <div key={i} className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
@@ -17253,7 +17254,7 @@ function PHUSMoneyGuide() {
                   <div className="flex-1">
                     <div className="flex items-center gap-2 mb-1">
                       <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-base font-bold">{step.title}</div>
-                      <span className="text-[9px] uppercase font-bold tracking-wider px-2 py-0.5 rounded" style={{ background: c.bg, color: c.border }}>{c.label}</span>
+                      <span className="text-[9px] uppercase font-bold tracking-wider px-2 py-0.5 rounded" style={{ background: c.bg, color: c.fg }}>{c.label}</span>
                     </div>
                     <div className="text-sm text-slate-700 leading-relaxed">{step.detail}</div>
                   </div>
@@ -17293,7 +17294,7 @@ function PHUSMoneyGuide() {
               <li><strong>Send it to your US client:</strong> They keep it on file. They don't send it to the IRS — it just supports their decision not to withhold.</li>
             </ol>
           </div>
-          <div className="p-4 rounded-xl border-l-4" style={{ background: '#FEF3C7', borderColor: '#D97706' }}>
+          <div className="p-4 rounded-xl border-l-4" style={{ background: 'var(--status-warn-bg)', borderColor: 'var(--c-amber)' }}>
             <div className="flex gap-3 items-start">
               <AlertTriangle size={18} className="text-amber-700 flex-shrink-0 mt-0.5" />
               <div className="text-sm text-amber-900 leading-relaxed">
@@ -17398,7 +17399,7 @@ function PersonalFinanceTracker() {
 
       {/* Tax reserve alert */}
       {recommendedTaxReserve > 50 && (
-        <div className="mb-5 p-4 rounded-xl border-l-4" style={{ background: '#FEF3C7', borderColor: '#D97706' }}>
+        <div className="mb-5 p-4 rounded-xl border-l-4" style={{ background: 'var(--status-warn-bg)', borderColor: 'var(--c-amber)' }}>
           <div className="flex gap-3 items-start">
             <AlertTriangle size={18} className="text-amber-700 flex-shrink-0 mt-0.5" />
             <div className="text-sm text-amber-900 leading-relaxed">
@@ -17442,10 +17443,10 @@ function PersonalFinanceTracker() {
               <tbody>
                 {transactions.sort((a,b) => b.date.localeCompare(a.date)).map(t => {
                   const typeStyles = {
-                    income: { bg: '#D1FAE5', color: '#059669', icon: '💰' },
-                    expense: { bg: '#FEE2E2', color: '#DC2626', icon: '💸' },
-                    tax: { bg: '#FEF3C7', color: '#D97706', icon: '🏛️' },
-                    savings: { bg: '#DBEAFE', color: ROYAL, icon: '🏦' },
+                    income: { bg: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)', icon: '💰' },
+                    expense: { bg: 'var(--status-danger-bg)', color: 'var(--status-danger-fg)', icon: '💸' },
+                    tax: { bg: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)', icon: '🏛️' },
+                    savings: { bg: 'var(--status-info-bg)', color: 'var(--status-info-fg)', icon: '🏦' },
                   };
                   const s = typeStyles[t.type];
                   return (
@@ -18083,10 +18084,11 @@ ${(report.strategicInsights || []).map(s => `
     setError(null);
   };
 
+  // bg is themed; border stays literal — it doubles as a bg under white text (severity chip)
   const sevConfig = {
-    critical: { bg: '#FEF2F2', border: '#DC2626', label: 'CRITICAL', icon: '🔴' },
-    high:     { bg: '#FEF3C7', border: '#D97706', label: 'HIGH',     icon: '🟠' },
-    medium:   { bg: '#F0F9FF', border: ROYAL,    label: 'MEDIUM',   icon: '🔵' },
+    critical: { bg: 'var(--status-danger-bg)', border: '#DC2626', label: 'CRITICAL', icon: '🔴' },
+    high:     { bg: 'var(--status-warn-bg)',   border: '#D97706', label: 'HIGH',     icon: '🟠' },
+    medium:   { bg: 'var(--status-info-bg)',   border: ROYAL,    label: 'MEDIUM',   icon: '🔵' },
   };
 
   const gradeColor = (grade) => {
@@ -18182,7 +18184,7 @@ ${(report.strategicInsights || []).map(s => `
           </div>
 
           {/* Tip card */}
-          <div className="p-4 rounded-xl border-l-4" style={{ background: '#F0F9FF', borderColor: ROYAL }}>
+          <div className="p-4 rounded-xl border-l-4" style={{ background: 'var(--status-info-bg)', borderColor: ROYAL }}>
             <div className="flex gap-3 items-start">
               <Lightbulb size={18} style={{ color: ROYAL }} className="flex-shrink-0 mt-0.5" />
               <div className="text-sm text-slate-700 leading-relaxed">
@@ -18217,7 +18219,7 @@ ${(report.strategicInsights || []).map(s => `
 
           {/* File upload error display */}
           {fileError && (
-            <div className="p-3 rounded-lg border-l-4" style={{ background: '#FEF2F2', borderColor: '#DC2626' }}>
+            <div className="p-3 rounded-lg border-l-4" style={{ background: 'var(--status-danger-bg)', borderColor: 'var(--c-red)' }}>
               <div className="flex gap-2 items-center">
                 <AlertTriangle size={16} className="text-red-600 flex-shrink-0" />
                 <div className="text-sm text-red-800">{fileError}</div>
@@ -18356,7 +18358,7 @@ ${(report.strategicInsights || []).map(s => `
           )}
 
           {error && !busy && (
-            <div className="p-4 rounded-xl border-l-4" style={{ background: '#FEF2F2', borderColor: '#DC2626' }}>
+            <div className="p-4 rounded-xl border-l-4" style={{ background: 'var(--status-danger-bg)', borderColor: 'var(--c-red)' }}>
               <div className="flex gap-3 items-start">
                 <AlertTriangle size={18} className="text-red-600 flex-shrink-0 mt-0.5" />
                 <div className="flex-1">
@@ -18484,18 +18486,18 @@ ${(report.strategicInsights || []).map(s => `
 
             {/* Quick Wins */}
             {report.quickWins && report.quickWins.length > 0 && (
-              <div className="p-8 border-b border-slate-200" style={{ background: '#F0FDF4' }}>
+              <div className="p-8 border-b border-slate-200" style={{ background: 'var(--status-ok-bg)' }}>
                 <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold mb-1">⚡ Quick Wins (Week 1)</div>
                 <div className="text-sm text-slate-500 mb-4">Things I can fix or improve in the first week of working together</div>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   {report.quickWins.map((w, i) => (
-                    <div key={i} className="p-4 rounded-xl bg-white border-2" style={{ borderColor: '#059669' }}>
+                    <div key={i} className="p-4 rounded-xl bg-white border-2" style={{ borderColor: 'var(--c-green)' }}>
                       <div className="flex items-start gap-2">
-                        <CheckCircle2 size={18} className="flex-shrink-0 mt-0.5" style={{ color: '#059669' }} />
+                        <CheckCircle2 size={18} className="flex-shrink-0 mt-0.5" style={{ color: 'var(--c-green)' }} />
                         <div className="flex-1">
                           <div style={{ color: NAVY, fontFamily: fontDisplay }} className="font-bold text-base mb-1">{w.title}</div>
                           <div className="text-sm text-slate-700 leading-relaxed mb-2">{w.description}</div>
-                          <div className="text-xs font-bold inline-block px-2 py-1 rounded" style={{ background: '#D1FAE5', color: '#059669' }}>💰 {w.impactHours}</div>
+                          <div className="text-xs font-bold inline-block px-2 py-1 rounded" style={{ background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)' }}>💰 {w.impactHours}</div>
                         </div>
                       </div>
                     </div>
@@ -18531,7 +18533,7 @@ ${(report.strategicInsights || []).map(s => `
                               <td className="px-4 py-3 text-center font-mono font-bold" style={{ color: NAVY }}>{c.yourValue}</td>
                               <td className="px-4 py-3 text-center text-slate-600 font-mono">{c.industryRange}</td>
                               <td className="px-4 py-3 text-center">
-                                <span className="px-2 py-1 rounded text-xs font-bold" style={{ background: isGood ? '#D1FAE5' : isOff ? '#FEE2E2' : '#FEF3C7', color: isGood ? '#059669' : isOff ? '#DC2626' : '#D97706' }}>{c.verdict}</span>
+                                <span className="px-2 py-1 rounded text-xs font-bold" style={{ background: isGood ? 'var(--status-ok-bg)' : isOff ? 'var(--status-danger-bg)' : 'var(--status-warn-bg)', color: isGood ? 'var(--status-ok-fg)' : isOff ? 'var(--status-danger-fg)' : 'var(--status-warn-fg)' }}>{c.verdict}</span>
                               </td>
                             </tr>
                           );
@@ -18590,7 +18592,7 @@ ${(report.strategicInsights || []).map(s => `
                   </div>
                 </div>
                 {report.recommendedScope.estimatedMonthlyHours && (
-                  <div className="mt-4 p-4 rounded-lg text-center" style={{ background: NAVY, color: 'white' }}>
+                  <div className="mt-4 p-4 rounded-lg text-center" style={{ background: INK.navy, color: 'white' }}>
                     <span className="text-xs uppercase tracking-wider opacity-80">Estimated monthly hours</span>
                     <span style={{ fontFamily: fontDisplay }} className="ml-3 text-xl font-bold">{report.recommendedScope.estimatedMonthlyHours}</span>
                   </div>
@@ -18613,7 +18615,7 @@ ${(report.strategicInsights || []).map(s => `
           </div>
 
           {/* How to use this report */}
-          <div className="p-5 rounded-xl border-l-4 print:hidden" style={{ background: '#F0FDF4', borderColor: '#059669' }}>
+          <div className="p-5 rounded-xl border-l-4 print:hidden" style={{ background: 'var(--status-ok-bg)', borderColor: 'var(--c-green)' }}>
             <div className="flex gap-3 items-start">
               <Lightbulb size={20} style={{ color: '#059669' }} className="flex-shrink-0 mt-0.5" />
               <div className="text-sm text-slate-700 leading-relaxed">
