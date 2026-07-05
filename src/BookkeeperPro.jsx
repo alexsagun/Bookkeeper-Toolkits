@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import {
   LayoutDashboard, BookOpen, FileSpreadsheet, Receipt, FileText,
   MessageCircle, FileCheck2, Percent, ClipboardList, Sparkles,
@@ -2606,6 +2606,67 @@ function MembershipExpiredScreen({ sub, latestReq, email, onRenew, onSignOut }) 
   );
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// KEEP-ALIVE TAB RENDERING
+// renderToolContent + TabPanel live at module scope so TabPanel can be
+// React.memo'd: with stable props (setTab and the badge refreshers are
+// useCallback'd in the root), hidden keep-alive panels bail out of every
+// root re-render — only the active tab re-renders on state changes, and a
+// tab switch re-renders exactly two panels. Tool state/scroll still
+// survives switches (panels stay mounted; visitedTabs is never pruned —
+// unmounting would kill in-flight AI work).
+// Adding a tool = a new case here + sidebar config + TAB_ROUTES (CLAUDE.md).
+// ═══════════════════════════════════════════════════════════════════
+function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, interviewSub }) {
+  switch (tabId) {
+    case 'dashboard': return <Dashboard goto={goto} />;
+    case 'accessrequests': return <AccessRequests onCountChange={onAccessCount} />;
+    case 'enrollments': return <AdminEnrollments onCountChange={onEnrollCount} />;
+    case 'coa': return <CoaGenerator />;
+    case 'course': return <Course />;
+    case 'qbomastery': return <QBOMastery />;
+    case 'industryacc': return <IndustryAccounting />;
+    case 'ustax': return <USTax101 />;
+    case 'bankfeed': return <BankFeed />;
+    case 'converter': return <StatementConverter />;
+    case 'chat': return <ProChat />;
+    case 'coachalex': return <CoachAlexChat />;
+    case 'cpaai': return <CPAAIChat />;
+    case 'resumestrategy': return <ResumeStrategy />;
+    case 'interview': return <InterviewPrep initialSub={interviewSub || undefined} />;
+    case 'brand': return <AuthenticBranding standalone />;
+    case 'painpoints': return <PainPointsGenerator />;
+    case 'proposal': return <ProposalGenerator />;
+    case 'engagement': return <EngagementLetter />;
+    case 'invoice': return <InvoiceCreator />;
+    case 'emails': return <EmailTemplates />;
+    case 'workflow': return <MonthlyWorkflow />;
+    case 'monthend': return <MonthEndChecklist />;
+    case 'yearendcheck': return <YearEndChecklist />;
+    case 'form1099': return <Form1099 />;
+    case 'salestax': return <SalesTax />;
+    case 'calculators': return <AccountingCalculators />;
+    case 'onboarding': return <Onboarding />;
+    case 'linkedinopt': return <LinkedInOptimizer />;
+    case 'qbdiag': return <QBDiagnostic />;
+    case 'sopgen': return <SOPGenerator />;
+    case 'budgeting': return <BudgetingTool />;
+    case 'forecasting': return <ForecastingTool />;
+    default: return <Dashboard goto={goto} />;
+  }
+}
+
+const TabPanel = React.memo(function TabPanel({ tabId, active, goto, onAccessCount, onEnrollCount, interviewSub }) {
+  return (
+    <div
+      hidden={!active}
+      aria-hidden={!active}
+      className={`${active ? 'fade-in ' : ''}p-4 sm:p-6 lg:p-10 max-w-7xl mx-auto`}>
+      {renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, interviewSub })}
+    </div>
+  );
+});
+
 export default function BookkeeperProToolkit() {
   const { user, profile, loading, profileReady, recovery, signOut, refreshProfile } = useAuth();
   // Theme runs above the auth gate so pre-auth screens are themed too
@@ -2627,12 +2688,14 @@ export default function BookkeeperProToolkit() {
   const activeTabRef = useRef(initialRouteRef.current.tab);
   const scrollPositionsRef = useRef({});
 
-  const rememberScroll = (tabId = activeTabRef.current) => {
+  // Stable identity (only refs + setters inside) — setTab depends on it, and setTab
+  // must stay referentially stable so memoized TabPanels skip root re-renders.
+  const rememberScroll = useCallback((tabId = activeTabRef.current) => {
     if (!mainRef.current || !tabId) return;
     const top = mainRef.current.scrollTop || 0;
     scrollPositionsRef.current[tabId] = top;
     try { sessionStorage.setItem(`nav:scroll:${tabId}`, String(top)); } catch {}
-  };
+  }, []);
 
   const restoreScroll = (tabId) => {
     if (!mainRef.current || !tabId) return;
@@ -2646,7 +2709,9 @@ export default function BookkeeperProToolkit() {
     });
   };
 
-  const setTab = (nextTab, opts = {}) => {
+  // useCallback([]): everything touched is a stable setter, ref, or module-scope
+  // helper — passed as `goto` to every memoized TabPanel and to Dashboard.
+  const setTab = useCallback((nextTab, opts = {}) => {
     const isLegacyMock = nextTab === 'mockinterview';
     const normalizedTab = isLegacyMock ? 'interview' : nextTab;
     if (!VALID_APP_TABS.has(nextTab) && !VALID_APP_TABS.has(normalizedTab)) return;
@@ -2655,7 +2720,7 @@ export default function BookkeeperProToolkit() {
     setTabState(normalizedTab);
     if (normalizedTab === 'interview' && nextInterviewSub) setInterviewSubRoute(nextInterviewSub);
     writeAppRoute(normalizedTab, { interviewSub: nextInterviewSub, replace: opts.replace });
-  };
+  }, [rememberScroll]);
 
   useEffect(() => {
     setVisitedTabs(prev => {
@@ -2856,7 +2921,8 @@ export default function BookkeeperProToolkit() {
   // admins can read other profiles (RLS), so this stays 0 / inert for everyone else. Stays 0
   // gracefully if the approval migration hasn't been run yet.
   const [pendingCount, setPendingCount] = useState(0);
-  const refreshPendingCount = async () => {
+  // useCallback: passed to the memoized Access Requests TabPanel (onAccessCount).
+  const refreshPendingCount = useCallback(async () => {
     if (!isAdmin) return;
     try {
       const { count, error } = await supabase
@@ -2865,13 +2931,14 @@ export default function BookkeeperProToolkit() {
         .eq('approval_status', 'pending');
       if (!error) setPendingCount(count || 0);
     } catch { /* table/column not migrated — leave at 0 */ }
-  };
+  }, [isAdmin]);
   useEffect(() => { refreshPendingCount(); /* eslint-disable-next-line */ }, [isAdmin]);
   // Pending-enrollment count for the admin sidebar badge (Enrollments tab — manual payment
   // review). Same shape as refreshPendingCount: admin-only, inert if the enrollment
   // migration (db/2026-07-04-enrollment.sql) hasn't been run yet.
   const [enrollPendingCount, setEnrollPendingCount] = useState(0);
-  const refreshEnrollPendingCount = async () => {
+  // useCallback: passed to the memoized Enrollments TabPanel (onEnrollCount).
+  const refreshEnrollPendingCount = useCallback(async () => {
     if (!isAdmin) return;
     try {
       const { count, error } = await supabase
@@ -2880,7 +2947,7 @@ export default function BookkeeperProToolkit() {
         .eq('status', 'pending_review');
       if (!error) setEnrollPendingCount(count || 0);
     } catch { /* table not migrated — leave at 0 */ }
-  };
+  }, [isAdmin]);
   useEffect(() => { refreshEnrollPendingCount(); /* eslint-disable-next-line */ }, [isAdmin]);
   const [labelByKey, setLabelByKey] = useState({});
   const [draftLabels, setDraftLabels] = useState({});
@@ -3324,45 +3391,6 @@ export default function BookkeeperProToolkit() {
       return next;
     });
     dragRef.current = { kind: null, stageId: null, tabId: null };
-  };
-
-  const renderTabContent = (tabId) => {
-    switch (tabId) {
-      case 'dashboard': return <Dashboard goto={setTab} />;
-      case 'accessrequests': return <AccessRequests onCountChange={refreshPendingCount} />;
-      case 'enrollments': return <AdminEnrollments onCountChange={refreshEnrollPendingCount} />;
-      case 'coa': return <CoaGenerator />;
-      case 'course': return <Course />;
-      case 'qbomastery': return <QBOMastery />;
-      case 'industryacc': return <IndustryAccounting />;
-      case 'ustax': return <USTax101 />;
-      case 'bankfeed': return <BankFeed />;
-      case 'converter': return <StatementConverter />;
-      case 'chat': return <ProChat />;
-      case 'coachalex': return <CoachAlexChat />;
-      case 'cpaai': return <CPAAIChat />;
-      case 'resumestrategy': return <ResumeStrategy />;
-      case 'interview': return <InterviewPrep initialSub={interviewSubRoute || undefined} />;
-      case 'brand': return <AuthenticBranding standalone />;
-      case 'painpoints': return <PainPointsGenerator />;
-      case 'proposal': return <ProposalGenerator />;
-      case 'engagement': return <EngagementLetter />;
-      case 'invoice': return <InvoiceCreator />;
-      case 'emails': return <EmailTemplates />;
-      case 'workflow': return <MonthlyWorkflow />;
-      case 'monthend': return <MonthEndChecklist />;
-      case 'yearendcheck': return <YearEndChecklist />;
-      case 'form1099': return <Form1099 />;
-      case 'salestax': return <SalesTax />;
-      case 'calculators': return <AccountingCalculators />;
-      case 'onboarding': return <Onboarding />;
-      case 'linkedinopt': return <LinkedInOptimizer />;
-      case 'qbdiag': return <QBDiagnostic />;
-      case 'sopgen': return <SOPGenerator />;
-      case 'budgeting': return <BudgetingTool />;
-      case 'forecasting': return <ForecastingTool />;
-      default: return <Dashboard goto={setTab} />;
-    }
   };
 
   // ── Auth gate ── unauthenticated users never see the app shell below.
@@ -4037,21 +4065,20 @@ export default function BookkeeperProToolkit() {
             Bookkeeper Toolkits
           </div>
         </div>
-        {/* Phase 2 paywall hooks here — to restrict to paid students, wrap this
-            <div> so that `!profile?.is_paid && !FREE_TABS.has(tab)` renders a
+        {/* Phase 2 paywall hooks here — to restrict to paid students, wrap the
+            <TabPanel> so that `!profile?.is_paid && !FREE_TABS.has(tabId)` renders a
             <PaywallOverlay/> instead of the tool. profile.is_paid comes from useAuth(). */}
-        {Array.from(visitedTabs).map(tabId => {
-          const active = tabId === tab;
-          return (
-            <div
-              key={tabId}
-              hidden={!active}
-              aria-hidden={!active}
-              className={`${active ? 'fade-in ' : ''}p-4 sm:p-6 lg:p-10 max-w-7xl mx-auto`}>
-              {renderTabContent(tabId)}
-            </div>
-          );
-        })}
+        {Array.from(visitedTabs).map(tabId => (
+          <TabPanel
+            key={tabId}
+            tabId={tabId}
+            active={tabId === tab}
+            goto={setTab}
+            onAccessCount={refreshPendingCount}
+            onEnrollCount={refreshEnrollPendingCount}
+            interviewSub={tabId === 'interview' ? (interviewSubRoute || undefined) : undefined}
+          />
+        ))}
       </main>
     </div>
   );
