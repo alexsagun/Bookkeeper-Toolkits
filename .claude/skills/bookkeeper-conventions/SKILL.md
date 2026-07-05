@@ -8,19 +8,34 @@ description: House coding conventions for the Ultimate Remote Bookkeeper Toolkit
 The app is one file — [src/BookkeeperPro.jsx](../../../src/BookkeeperPro.jsx) — plus the entry shims
 in [src/main.jsx](../../../src/main.jsx). Make edits blend in with what's already there.
 
-## Design system (use the in-file tokens)
+## Design system (theme-aware tokens)
 
-Defined near the top of the file:
+The app has **light + dark themes** driven by the `data-theme` attribute on `<html>` (`useTheme`
+hook + `ThemeToggle`; pre-paint boot script in `index.html`). The tokens near the top of the file
+are **CSS custom-property references**, with the actual per-theme values in
+[src/index.css](../../../src/index.css):
 
-- `C` (~L624) — color palette: `C.primary` `#0A84FF`, `C.text`, `C.textSoft`, `C.textMute`,
-  `C.green`, `C.amber`, `C.red`, `C.bg`, etc.
-- `GLASS` (~L657) — glass-card rgba surfaces (`GLASS.card`, `GLASS.cardElev`, `GLASS.border`…).
-- `SHEEN` (~L654) — the standard top-light gradient for headers/buttons.
-- Fonts (~L671): `fontDisplay` / `fontBody` (Inter), `fontMono` (JetBrains Mono, ~L673).
+- `C` — color palette: `C.primary` = `var(--c-primary)`, `C.text`, `C.textSoft`, `C.textMute`,
+  `C.green`, `C.amber`, `C.red`, `C.bg`, `C.white` (a *surface*, dark-aware), etc.
+- `GLASS` — glass surfaces (`GLASS.card`, `GLASS.cardElev`, `GLASS.border`…), `SHEEN` — the
+  top-light gradient. Both var-backed, both theme automatically.
+- `INK` — **frozen literal hex palette** for anything that leaves the DOM: Word `.doc` builders,
+  the certificate + print window, html2canvas/PDF. `var()` doesn't resolve in an exported document —
+  always use `INK.*` there (and `INK.navy` for band gradients under `text-white`).
+- Fonts: `fontDisplay` / `fontBody` (Inter), `fontMono` (JetBrains Mono) — loaded once from
+  `index.html`; **never** add a Google-Fonts `@import` in a component `<style>`.
 
 **Do:** `style={{ color: C.text, fontFamily: fontDisplay }}` and the `glass-card` class for panels.
-**Don't:** hardcode hex colors or invent new fonts — reuse the tokens so the glass-morphism look stays
-consistent. Use Tailwind utilities for layout (`flex`, `grid`, `gap-*`, `rounded-*`, spacing).
+**Do:** use the semantic status tokens for pills/banners — `var(--status-warn-bg/-bd/-fg)`,
+`--status-ok-*`, `--status-danger-*`, `--status-info-*`, `--status-neutral-*`, `--status-warn-strong-*`.
+**Don't:** hardcode hex colors, and **never** concat an alpha suffix onto a token
+(`` `${C.primary}66` `` is broken CSS against a var) — use the alpha tokens: `var(--primary-glow)`
+(≈66), `--primary-glow-soft` (55), `--primary-selection` (33), `--primary-halo` (1A),
+`--primary-tint` (14), `--green-ring(-faint)`, `--red-glow`, `--focus-ring`, `--wash`, `--wash-strong`.
+**Tailwind:** layout utilities freely; for *color* utilities prefer ones already covered by the dark
+compat layer at the bottom of `index.css` (`bg-white`, `text-slate-*`, `border-slate-*`,
+red/emerald/amber families) — a new color utility needs a compat rule or a `dark:` variant.
+**QA every change in BOTH themes** (cycle the sidebar Sun/Moon/Monitor toggle) before calling it done.
 
 ## AI calls (use the shared `callClaude()` helper)
 
@@ -67,7 +82,27 @@ See the **add-bookkeeper-tool** skill for the full copy-paste snippet, and `Bank
   signed-in user (`u:<uid>:<key>`) by the shim in `main.jsx`. Keep calling `window.storage` with
   **plain keys** — do **not** add a uid prefix yourself. When you add a **new persisted key**, also add
   it to the `LEGACY_KEYS` list in [src/auth/AuthProvider.jsx](../../../src/auth/AuthProvider.jsx) so a
-  pre-auth value gets migrated into the first account.
+  pre-auth value gets migrated into the first account. (`ui:theme` additionally mirrors a bare
+  `localStorage` copy for the pre-paint boot script — that dual-write is unique to the theme; don't
+  copy it for ordinary tool keys.)
+
+- **Bulky static content goes in `src/data/*.js`** (pure data only — no components), lazy-loaded so
+  it stays out of the main bundle. Pattern: a module-scope loader + a thin wrapper around the tool:
+
+  ```jsx
+  const loadMyToolData = () => import('./data/my-tool.js');   // module scope
+  function MyTool(props) {
+    const { mod, err } = useLazyData(loadMyToolData);
+    if (!mod) return <DataLoadingCard err={err} />;
+    return <MyToolInner {...props} data={mod} />;
+  }
+  function MyToolInner({ data }) {
+    const { MY_BIG_CONSTANT } = data;
+    // …original component body…
+  ```
+
+  See `EmailTemplates` / `IndustryAccounting` as references. Small constants (< a few kB) can stay
+  in the main file.
 
 ## Auth context (`useAuth()`)
 
@@ -106,14 +141,17 @@ than rolling your own USD↔PHP conversion.
 ## Navigation
 
 A tool is reachable only when its `id` appears in: the sidebar `DEFAULT_STAGES` config, the
-`renderTabContent(tabId)` switch (which the `visitedTabs` keep-alive map calls — this replaced the
-old `{tab === 'id' && …}` chain), and `TAB_ROUTES` (its stable URL path, for deep-linking / new-tab),
-plus optionally the Dashboard tiles. Keep the `id` identical across all of them. Navigation is
-URL-routed + keep-alive — see CLAUDE.md → "Navigation model".
+**module-scope `renderToolContent(tabId, handlers)` switch** (rendered through the memoized
+`TabPanel` keep-alive — hidden tabs skip root re-renders because every TabPanel prop is
+referentially stable; don't pass it per-render values), and `TAB_ROUTES` (its stable URL path, for
+deep-linking / new-tab), plus optionally the Dashboard tiles. Keep the `id` identical across all of
+them. Navigation is URL-routed + keep-alive — see CLAUDE.md → "Navigation model".
 
 ## Don'ts
 
-- Don't remove the `window.storage` or fetch shims in `main.jsx`.
+- Don't remove the `window.storage` or fetch shims in `main.jsx`, or the theme boot script in `index.html`.
 - Don't introduce TypeScript, ESLint/Prettier, or a Tailwind/PostCSS config.
-- Don't split the app into modules unless a refactor is explicitly requested — single file is the default.
+- Don't split the app into modules unless a refactor is explicitly requested — single file is the
+  default (`src/data/*.js` pure-data modules are the one sanctioned carve-out).
 - Don't expose the API key client-side in any form.
+- Don't ship UI checked in only one theme — dark and light are both first-class.

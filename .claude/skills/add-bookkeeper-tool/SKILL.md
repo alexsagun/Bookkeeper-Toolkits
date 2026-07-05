@@ -92,16 +92,18 @@ The app is **URL-routed + keep-alive** (see CLAUDE.md → "Navigation model"). A
 
 1. **Sidebar config** (`DEFAULT_STAGES` array): add `{ id: 'mytool', label: 'My New Tool', icon: SomeIcon }`
    to the right stage's `tabs`, and add `'mytool'` to a group's `tabIds`.
-2. **`renderTabContent(tabId)` switch** (in the root component): add `case 'mytool': return <MyNewTool />;`.
-   (This replaced the old `{tab === 'mytool' && <MyNewTool />}` chain — do **not** add a bare conditional;
-   the `visitedTabs` keep-alive map calls `renderTabContent`.)
+2. **`renderToolContent(tabId, handlers)` switch** (module scope, just above the root component): add
+   `case 'mytool': return <MyNewTool />;`. (Do **not** add a bare `{tab === 'mytool' && …}` conditional;
+   the memoized `TabPanel` keep-alive map calls `renderToolContent`. If the tool needs a callback from
+   the root, thread it through `handlers` and make sure the root passes a **stable** — `useCallback` —
+   reference to `<TabPanel/>`, or hidden tabs lose their re-render bailout.)
 3. **`TAB_ROUTES`** (module scope, top of file): add `mytool: '/my-new-tool',` so the tool has a stable
    URL (deep-link, refresh, and "open in new tab" all key off this; `VALID_APP_TABS` derives from it).
    Use a unique, human-readable path.
 4. **(Optional) Dashboard tile**: add `{ id: 'mytool', label, desc, icon, color }` if it should appear
    on the Home roadmap.
 
-The `id` must be identical in the sidebar config, the `renderTabContent` case, and `TAB_ROUTES`.
+The `id` must be identical in the sidebar config, the `renderToolContent` case, and `TAB_ROUTES`.
 
 ## Step 4 — Verify
 
@@ -111,7 +113,10 @@ npm run dev
 
 Open the app, click the new tab in the sidebar, and exercise the tool. For AI tools, confirm a real
 request succeeds (requires `ANTHROPIC_API_KEY` in `.env`) and that it shows a friendly error when the
-key is missing.
+key is missing. **Check the tool in both themes** (Sun/Moon/Monitor toggle in the sidebar profile
+area) — dark mode is first-class; use the theme tokens per the bookkeeper-conventions skill and never
+concat alpha suffixes onto `C.*`. If the tool ships a large static data constant, put it in
+`src/data/*.js` and wire it with `useLazyData` + `DataLoadingCard` (see conventions skill).
 
 ## Guardrails
 
