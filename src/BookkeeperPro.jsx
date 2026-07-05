@@ -17961,7 +17961,7 @@ ${(report.strategicInsights || []).map(s => `
 </div>
 
 </body></html>`;
-    downloadFile('\ufeff', html, `QB_Diagnostic_${(companyName || 'Report').replace(/[^a-zA-Z0-9]/g, '_')}_${new Date().toISOString().slice(0,10)}.doc`, 'application/msword');
+    downloadFile('\ufeff' + html, `QB_Diagnostic_${(companyName || 'Report').replace(/[^a-zA-Z0-9]/g, '_')}_${new Date().toISOString().slice(0,10)}.doc`, 'application/msword');
   };
 
   const printReport = () => window.print();
