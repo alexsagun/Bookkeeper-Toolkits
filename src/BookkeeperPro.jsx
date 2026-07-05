@@ -1082,6 +1082,59 @@ function ThemeToggle({ pref, onCycle, fixed, size = 15 }) {
   );
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// LAZY DATA MODULES (src/data/*.js)
+// The bulky static content (question banks, playbooks, templates) lives in
+// pure-data modules under src/data/ and stays OUT of the main bundle — Vite
+// code-splits each dynamic import below into its own chunk, fetched once on
+// the first visit of the consuming tab (keep-alive keeps it mounted after).
+// Pattern for a consuming tool: a thin wrapper component calls
+// useLazyData(loader) and renders <DataLoadingCard/> until the module
+// arrives, then hands the module to the real component as `data`.
+// ═══════════════════════════════════════════════════════════════════
+const loadInterviewQAData = () => import('./data/interview-qa.js');
+const loadBrandingData = () => import('./data/branding.js');
+const loadEmailTemplatesData = () => import('./data/email-templates.js');
+const loadSalaryData = () => import('./data/salary.js');
+const loadIndustryAccountingData = () => import('./data/industry-accounting.js');
+const loadUsTaxData = () => import('./data/us-tax.js');
+const loadWorkflowsData = () => import('./data/workflows.js');
+const loadNicheData = () => import('./data/niche.js');
+const loadDifficultClientsData = () => import('./data/difficult-clients.js');
+
+function useLazyData(loader) {
+  const [mod, setMod] = useState(null);
+  const [err, setErr] = useState(null);
+  useEffect(() => {
+    let on = true;
+    loader()
+      .then(m => { if (on) setMod(m); })
+      .catch(e => { console.error('[data] lazy module failed to load', e); if (on) setErr(e); });
+    return () => { on = false; };
+    // loader is a module-scope arrow — identity is stable, mount-only is correct
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return { mod, err };
+}
+
+function DataLoadingCard({ err }) {
+  return (
+    <div className="glass-card p-10 flex items-center justify-center gap-3" style={{ minHeight: 180 }}>
+      {err ? (
+        <>
+          <AlertTriangle size={18} style={{ color: C.amber, flexShrink: 0 }} />
+          <span style={{ color: C.textSoft, fontSize: 14 }}>Couldn't load this section — check your connection and reload the page.</span>
+        </>
+      ) : (
+        <>
+          <Loader2 size={18} className="animate-spin" style={{ color: C.primary, flexShrink: 0 }} />
+          <span style={{ color: C.textSoft, fontSize: 14 }}>Loading…</span>
+        </>
+      )}
+    </div>
+  );
+}
+
 // Reusable inline currency selector UI
 function CurrencyToggle({ currency, setCurrency, fxRate, setFxRate, compact }) {
   return (
@@ -9052,118 +9105,15 @@ function InterviewPrep({ initialSub = null }) {
 }
 
 // ─── SUBTAB 1: Common Interview Q&A ──────────────────────────────────
-const COMMON_QUESTIONS = [
-  {
-    q: 'Tell me about yourself.',
-    why: 'This is your 90-second elevator pitch. Most candidates fumble this — yours will be tight.',
-    approach: 'Use Present–Past–Future. Anchor with specific company names, months, and years. Generic = forgettable. Specific = hireable.',
-    weak: `"I'm a bookkeeper based in the Philippines with several years of experience. I've worked with different clients across different industries. I'm hardworking, detail-oriented, and I love numbers. I'm passionate about helping businesses grow through clean books."`,
-    weakWhy: 'Generic. Could describe anyone. No company names, no dates, no proof. The interviewer hears the same speech 50 times a week.',
-    strong: `"I'm Maria — a remote bookkeeper based in Manila, currently managing month-end close for three US clients: Sunrise E-Commerce (a Shopify brand doing about $2.4M/year), Ramirez Real Estate Group (six rental properties in Texas), and Bright Path Marketing (a 12-person agency).\n\nMy most defining project was at Sunrise from March 2024 through July 2024. They came to me with 18 months of unreconciled books, no opening balances, and a tax extension running out in September. I led the cleanup solo — reconstructed bank feeds, fixed $34,000 in miscategorized expenses (most of it became legitimate tax deductions), and delivered clean books two weeks before the extension deadline. Their CPA called it the cleanest handoff she'd seen in three years.\n\nThat's what excites me about this role. You mentioned in the posting that you need someone who can own multi-entity close and catch the small stuff before the client does. That's exactly the rhythm I've built at Sunrise and Ramirez."`,
-    strongWhy: 'Names a real client, exact months (March 2024 – July 2024), specific numbers ($34K, 18 months, three clients), and ties the proof directly to the job description. Uses CAR: Context (cleanup needed, deadline) → Action (led solo, reconstructed, fixed) → Result (clean handoff, deadline beat). This sounds like a person — not a resume.',
-  },
-  {
-    q: 'Why do you want to work for us?',
-    why: 'They want to know if you researched them or are mass-applying. Be specific.',
-    approach: 'Mention something concrete about THEM (their website, LinkedIn post, client niche, founder). Then tie to your skills with a real example.',
-    weak: `"I want to work for you because I love your company culture and I admire what you do. I've heard great things about your team and I think this would be a great opportunity for me to grow and contribute. I'm passionate about bookkeeping and I think we'd be a great fit."`,
-    weakWhy: 'Could be sent to any company on Earth. Zero research evidence. "Great culture" and "passionate" are filler words.',
-    strong: `"Two reasons. First, I went through your client list on your website and saw that 70% of your portfolio is real estate investors and property managers. From January 2023 through today, I've been doing the books for Ramirez Real Estate Group — six properties, trust accounting, the whole stack. That's the work I want to do more of, not less.\n\nSecond, I read your founder Jenna's post on LinkedIn from October 2025 — the one about how she trained her team to treat each rental property as a profit center using QBO classes. That's exactly how I built Ramirez's reporting in February 2024. So when I saw this role, it felt less like a job listing and more like a conversation I was already in."`,
-    strongWhy: 'Names the founder, references a specific LinkedIn post with the month, cites their actual client niche, and connects to a real engagement (Ramirez, January 2023, February 2024). Proves research without bragging.',
-  },
-  {
-    q: 'What is your greatest strength?',
-    why: 'Most candidates give boring answers ("hardworking," "detail-oriented"). Stand out with one specific strength + proof.',
-    approach: 'Pick ONE strength relevant to the role. Tell a CAR-style mini-story with a real company name, date, and dollar outcome.',
-    weak: `"My greatest strength is attention to detail. I'm really careful with numbers and I make sure everything is accurate. I double-check my work and I'm very organized. I think this is important in bookkeeping because even small mistakes can cause big problems."`,
-    weakWhy: 'Says "attention to detail" which every bookkeeper claims. No proof, no story, no outcome.',
-    strong: `"Catching small numbers before they become big problems.\n\nIn August 2024, while reconciling the credit card for Sunrise E-Commerce, I noticed two charges from the same vendor — $1,247 and $1,247.50 — three days apart. The invoice numbers were one digit off but the amounts and vendor were nearly identical. Turned out the supplier had double-billed and the AP person was about to approve both.\n\nContext: monthly close was already in flight and we had 200+ transactions to process. Action: I flagged it, pulled the original PO, and emailed the supplier with both invoices side-by-side. Result: $1,247 refunded within 48 hours, and the supplier added a duplicate-billing check to their system.\n\nThat's the pattern. The pattern recognition came from my first mentor at BPI Insurance back in 2019 — she made us reconcile every account every month, no shortcuts. That training is what I trust most when something feels off."`,
-    strongWhy: 'CAR structure done right. Specific date (August 2024), real company (Sunrise), exact dollar amount, real outcome. Even references an old mentor with year (BPI Insurance, 2019) to add depth. Memorable.',
-  },
-  {
-    q: 'What is your greatest weakness?',
-    why: 'Trap question. NEVER say "I work too hard." NEVER lie. Show self-awareness + fix.',
-    approach: 'Pick a REAL weakness that is not core to the job. Tell what you did about it with a specific date. End on growth.',
-    weak: `"My greatest weakness is that I'm a perfectionist. I sometimes spend too much time on small details. But I'm working on it by trying to balance speed and quality. I also work too hard sometimes and forget to take breaks."`,
-    weakWhy: 'Two of the most overused fake-weakness answers. Interviewers literally roll their eyes at "perfectionist" and "work too hard."',
-    strong: `"Public speaking on live client review calls.\n\nWhen I started doing monthly review calls for Bright Path Marketing in May 2024, I would over-prepare for two hours, then still read off notes for the first five minutes of the call. The client noticed — Mark, the founder, told me in June 2024 that I sounded more confident in emails than on Zoom.\n\nThat feedback stung but it was fair. So in July 2024, I joined a Toastmasters group online — Manila Online Speakers Club. I committed to one prepared speech a month. By November 2024, I was hosting Bright Path's monthly review without a script. I just bring three talking points and let the data tell the story.\n\nIt's still not my comfort zone. But it's no longer something I avoid — and Mark mentioned in January 2025 that my call presence is now one of the reasons he refers other agency owners to me."`,
-    strongWhy: 'A real weakness (public speaking) — not a fake one. Specific timeline (May → June → July → November 2024 → January 2025) shows real growth. Names the client and the founder. Ends with proof that the fix worked.',
-  },
-  {
-    q: 'Why are you leaving your current job? / Why are you looking?',
-    why: 'NEVER badmouth past employers. Frame as moving TO something, not away from.',
-    approach: 'Be honest but professional. Talk about growth, scope, or fit. Use specific dates and details.',
-    weak: `"My current job is okay but I feel like I'm not growing anymore. The boss is sometimes difficult and the pay is too low. I want a better company that values me and gives me more opportunities."`,
-    weakWhy: 'Badmouths the current employer ("boss is difficult", "pay is too low"). Red flag for the interviewer — if you talk this way about your current boss, you will talk this way about theirs.',
-    strong: `"My current role at TaskCo BPO has been great for two years — I started there in September 2023 doing data entry, and by January 2025 I was managing the books for three small SMB clients independently. I learned QBO, I learned the rhythm of monthly close, I learned how to manage multiple clients without dropping balls.\n\nBut I've hit the ceiling of what I can learn here. All three clients are small, single-entity, cash-basis. I want to stretch into multi-entity work, accrual basis, and a team where there are senior people I can learn from.\n\nWhen I read your job posting last week, the part about 'team-based engagements with mentorship' was the exact line that made me apply. That's what I'm moving toward — not away from anything."`,
-    strongWhy: 'Specific employer name (TaskCo BPO), exact dates (September 2023, January 2025), positive framing of past work, clear "moving toward" language tied to the actual JD.',
-  },
-  {
-    q: 'Where do you see yourself in 5 years?',
-    why: 'They are testing ambition AND commitment. Do not say "your job." Do not say "running my own firm" if applying to a firm.',
-    approach: 'Show you have thought about it. Tie growth to their kind of company, not away from it.',
-    weak: `"In 5 years I see myself in a more senior role with more responsibilities. Hopefully earning more and growing in my career. Maybe leading a team or running my own bookkeeping firm someday."`,
-    weakWhy: '"Running my own firm" when applying to a firm = "I will leave you the moment I can." Vague otherwise. No depth.',
-    strong: `"By 2030 I want to be the lead bookkeeper on your most complex engagements — the cleanups, the multi-entity work, the clients other people would be intimidated by.\n\nSpecifically: I want my QuickBooks Advanced Certification done by end of 2026 — I'm halfway through the modules already. By 2027 I want to add Xero certification because I noticed three of your clients in your portfolio use it. By 2028 I want to have led at least one full cleanup or migration project end-to-end on a team.\n\nI'm not interested in starting my own firm. I want depth, not breadth. I want to be the expert on a team — the person clients ask for by name."`,
-    strongWhy: 'Concrete timeline (2026, 2027, 2028, 2030). Specific certifications. Mentions doing research on their client base (Xero). Closes with the "no I am not your future competitor" line that hiring managers love.',
-  },
-  {
-    q: 'Tell me about a time you made a mistake.',
-    why: 'They want to see ownership and learning, not excuses.',
-    approach: 'Use CAR. Take full responsibility. Show what you learned and the system fix you put in place.',
-    weak: `"I once made a mistake at work but I quickly fixed it. I learned from it and now I am more careful. Mistakes happen but the important thing is to learn from them and move forward."`,
-    weakWhy: 'No story, no specifics, no accountability. Reads as evasive — interviewer feels the candidate is hiding something.',
-    strong: `"April 2024, my second month with Sunrise E-Commerce.\n\nContext: The client received a $4,200 refund from a returned wholesale order. I categorized it as 'Other Income' instead of as a refund against Sales — overstated their revenue for the quarter.\n\nAction: I caught it during the bank rec the following week when the numbers didn't tie. I emailed the founder, Elena, that same evening — told her exactly what happened, walked her through the impact, and showed her the correcting journal entry I was about to post. I also built a personal checklist: any transaction over $1,000 gets flagged for a second review before posting.\n\nResult: We refiled the corrected Q2 numbers with her CPA before the deadline. Elena thanked me for the same-day flag — she said most of her past bookkeepers would have hidden it. And the $1K-review rule I built that day is still part of my workflow today.\n\nWhat I learned: mistakes aren't the problem. Hiding them is. And the best fix is always a system, not just willpower."`,
-    strongWhy: 'Real CAR structure. Names the client (Sunrise), founder (Elena), exact month (April 2024), exact dollar amount ($4,200), exact rule built ($1K review). Closes with a one-line lesson. This is a textbook strong answer.',
-  },
-  {
-    q: 'Tell me about a difficult client situation.',
-    why: 'They want to see emotional intelligence and problem-solving.',
-    approach: 'CAR method. Show empathy, communication, and resolution. Never blame the client.',
-    weak: `"I had a difficult client who never sent receipts on time. He was always angry and rude. I tried my best but it was very stressful. Eventually I just had to be patient and keep reminding him."`,
-    weakWhy: 'Blames the client ("angry and rude"). Shows no real solution — "patience" is not a system. Sounds passive.',
-    strong: `"James, the owner at Ramirez Real Estate, from February 2024 through April 2024.\n\nContext: Six rental properties, receipts arriving 6-8 weeks late, then James would get frustrated when his books weren't current. By the end of March 2024, I'd reconciled what I could but two properties were 90 days behind.\n\nAction: I realized James wasn't being difficult — he was overwhelmed running six properties solo. So I built him a simple workflow. Set up a shared Google Drive folder where he could just photograph receipts on his phone and drop them in. Recorded a 4-minute Loom video walking through it. Scheduled a 15-minute weekly Friday check-in instead of waiting for month-end.\n\nResult: By May 2024, receipts were coming in within 48 hours. Books stayed current. In June 2024, James referred his real estate partner to me. The fix wasn't a stricter policy — it was making it easier for him to win."`,
-    strongWhy: 'Names the client (James, Ramirez Real Estate), specific months (Feb-April 2024, May 2024, June 2024). The narrative arc is compelling: empathy → system → result → referral.',
-  },
-  {
-    q: 'How do you handle deadlines and pressure?',
-    why: 'Bookkeeping is deadline-driven. They want proof you can deliver under pressure.',
-    approach: 'Show a SYSTEM, not just hustle. Reference a specific high-pressure month.',
-    weak: `"I work well under pressure. I'm able to prioritize and stay calm. When things are stressful I just focus and get the work done. Deadlines motivate me to perform better."`,
-    weakWhy: 'Pure cliché. Every candidate says "I work well under pressure." Zero proof.',
-    strong: `"I work backwards from the deadline.\n\nFor month-end close at Sunrise E-Commerce, the deadline is the 10th. So by the 5th, all bank feeds are categorized. By the 7th, reconciliations are done. By the 9th, I've reviewed everything one more time. That gives me one buffer day.\n\nThe real test was January 2025 — year-end close for all three of my clients hit at the same time, and Sunrise added a surprise cleanup of October-December 2024 because their previous bookkeeper had left. Three closes, one cleanup, fifteen days.\n\nWhat I did: I told all three clients on January 2nd which week each of them would get my focus. Sunrise's cleanup got the first week, Bright Path's standard close got week two, Ramirez's multi-entity close got week three. Nobody got bumped. Nobody got late.\n\nWhen pressure spikes, I don't work later — I re-prioritize and communicate early. Communication is what keeps pressure manageable."`,
-    strongWhy: 'Specific company (Sunrise), specific month (January 2025), real scenario (year-end + cleanup), and a clear SYSTEM (backwards scheduling, week-by-week assignment, early communication).',
-  },
-  {
-    q: 'How do you handle constructive criticism / feedback?',
-    why: 'They want to know you are coachable.',
-    approach: 'Show you welcome it. Give a specific example with date + the improvement that followed.',
-    weak: `"I welcome feedback. I think it's important to keep learning. I always try to apply feedback to improve myself and become better at my job."`,
-    weakWhy: 'Says all the right words but proves nothing. No example = the interviewer assumes you actually can\'t take feedback.',
-    strong: `"Honestly? I crave it.\n\nIn September 2024, my supervisor at TaskCo — her name is Karen — told me my client emails were too long. Clients were skimming and missing the key questions.\n\nThat stung at first because I prided myself on being thorough. But she was right. I went back through my last 10 sent emails and counted the response rates — about 60%.\n\nThe next week I rewrote my email format using the BLUF method: Bottom Line Up Front. Subject line states the action needed. First sentence is the ask. Details follow. Three bullet points max.\n\nBy November 2024, response rate on the same type of email had jumped to over 95%. Karen flagged it in my year-end review.\n\nFeedback that specific is rare. So when I get it, I act on it the same week."`,
-    strongWhy: 'Names the supervisor (Karen), specific months (September → November 2024), measurable outcome (60% → 95%). Shows the candidate took the feedback as a system change, not a personality change.',
-  },
-  {
-    q: 'Do you have any questions for us?',
-    why: 'NEVER say no. This is your chance to look engaged and qualified.',
-    approach: 'Ask 2-3 thoughtful questions. Avoid pay/benefits in the first interview.',
-    weak: `"No, I think you covered everything. I'm just excited about the opportunity."`,
-    weakWhy: '"I have no questions" tells the interviewer you are not actually thinking critically about the role. It signals "I will take any job."',
-    strong: `"Three quick ones.\n\nFirst — what does the first 90 days look like for someone in this role? Is there a structured onboarding, or do I dive in with a client right away?\n\nSecond — what does success look like at the 6-month mark? If we were sitting here in May 2026 doing a review, what would I have done or delivered that would make this hire a clear win for you?\n\nThird — what's the biggest challenge the person who held this role before me ran into? I'd rather know now than find out in month two.\n\nAnd if I can squeeze in a fourth — when do you expect to make a decision? I want to be respectful of your timeline."`,
-    strongWhy: 'Three smart, specific questions that signal seriousness. The "May 2026 review" line is a power move — it gets the interviewer mentally placing you in the role.',
-  },
-  {
-    q: 'Why should we hire you?',
-    why: 'The closer. Sum up your value in 60 seconds.',
-    approach: 'Pick 3 specific things from the job description and tie each to a proof point with company name + date.',
-    weak: `"You should hire me because I'm hardworking, dedicated, and I have the right skills for this job. I'm a fast learner and I work well in a team. I would bring value to your company and I'd love the opportunity."`,
-    weakWhy: 'Generic adjectives ("hardworking, dedicated, fast learner") with no proof. The interviewer hears this 20 times a week.',
-    strong: `"Three reasons.\n\nOne — you said in the JD you need someone who can own multi-entity close. From February 2024 through today, I've been doing exactly that for Ramirez Real Estate — six properties, each tracked as its own class in QBO, with consolidated and per-property statements every month. Never missed a close.\n\nTwo — you need someone comfortable with cleanups. March 2024 through July 2024, I led Sunrise E-Commerce's 18-month cleanup solo. Found $34,000 in miscategorized expenses, delivered books two weeks ahead of their tax extension deadline.\n\nThree — you want someone who communicates proactively, not reactively. My clients hear from me before they need to ask. Last month — October 2025 — I caught a $1,247 duplicate vendor payment at Sunrise before the AP person approved it. That's the rhythm I'd bring to your team.\n\nThe rest — software fluency, attention to detail, US tax basics — that's table stakes. Those three things are what would make me valuable specifically to your team."`,
-    strongWhy: 'Three JD-matched proof points, each with a real company name, specific dates (Feb 2024 onward, March-July 2024, October 2025), and concrete numbers ($34K, $1,247, 18 months). The "table stakes" line is psychologically powerful — it positions the candidate as already past the basics.',
-  },
-];
+// COMMON_QUESTIONS now lives in src/data/interview-qa.js (lazy-loaded — see useLazyData).
 
-function CommonInterviewQA() {
+function CommonInterviewQA(props) {
+  const { mod, err } = useLazyData(loadInterviewQAData);
+  if (!mod) return <DataLoadingCard err={err} />;
+  return <CommonInterviewQAInner {...props} data={mod} />;
+}
+function CommonInterviewQAInner({ data }) {
+  const { COMMON_QUESTIONS } = data;
   const [openIdx, setOpenIdx] = useState(0);
   return (
     <div>
@@ -9251,26 +9201,15 @@ function CommonInterviewQA() {
 }
 
 // ─── SUBTAB 2: Accounting Interview Q&A ──────────────────────────────
-const ACCOUNTING_QUESTIONS = [
-  { q: 'What are the three main financial statements?', a: 'Income Statement (P&L) — shows revenue and expenses over a period. Balance Sheet — shows assets, liabilities, and equity at a point in time. Statement of Cash Flows — shows cash movement across operating, investing, and financing activities.' },
-  { q: 'What is the accounting equation?', a: 'Assets = Liabilities + Equity. This is the foundation of double-entry bookkeeping. Every transaction must keep this equation in balance.' },
-  { q: 'What is the difference between cash basis and accrual basis accounting?', a: 'Cash basis: revenue recorded when cash is received, expenses when paid. Simple but doesn\'t show true profitability. Accrual basis: revenue recorded when earned, expenses when incurred — required by GAAP and gives a more accurate picture. Most small businesses use cash basis for tax, accrual for management reporting.' },
-  { q: 'What is a journal entry? Walk me through one.', a: 'A journal entry is a record of a transaction with at least one debit and one credit. Example: Client pays a $500 utility bill from checking — Debit Utilities Expense $500, Credit Cash $500. Total debits must always equal total credits.' },
-  { q: 'How do you reconcile a bank account?', a: 'I start with the ending balance per QBO, then compare every transaction to the bank statement. I check off matching items, add anything on the statement not in QBO (bank fees, interest), and investigate anything in QBO not yet cleared. Final QBO balance + outstanding deposits − outstanding checks should equal bank statement balance. I never force-balance with adjustments.' },
-  { q: 'What is Undeposited Funds?', a: 'In QBO, Undeposited Funds is a holding account for customer payments received but not yet deposited to the bank. It lets you group multiple payments into a single deposit that matches what hits the bank. Critical to clear it monthly — when payments pile up there unmatched, it signals broken workflow.' },
-  { q: 'What is the difference between Accounts Receivable and Accounts Payable?', a: 'A/R is money customers OWE you for invoices you sent but haven\'t collected. It\'s an asset. A/P is money YOU OWE vendors for bills you received but haven\'t paid. It\'s a liability.' },
-  { q: 'How do you handle depreciation?', a: 'Depreciation spreads the cost of a fixed asset over its useful life. Common methods: Straight-Line (equal yearly amount), Double-Declining Balance (accelerated), MACRS (US tax standard). Monthly entry: Debit Depreciation Expense, Credit Accumulated Depreciation. The tax preparer usually handles MACRS; book depreciation often uses Straight-Line.' },
-  { q: 'What is a chart of accounts?', a: 'The full list of accounts a business uses to record transactions, organized by type (Assets, Liabilities, Equity, Income, Expenses) and usually numbered. A clean Chart of Accounts is the foundation of clean books — too few accounts and you can\'t see anything, too many and reports become noise.' },
-  { q: 'What is the difference between an expense and a cost of goods sold (COGS)?', a: 'COGS is the direct cost of producing or delivering what was sold — materials, direct labor, freight. It reduces Gross Profit. Operating Expenses are indirect costs to run the business — rent, software, admin payroll. They reduce Operating Income. The distinction matters because Gross Margin is a key health metric, and COGS misclassification distorts it.' },
-  { q: 'What is deferred revenue?', a: 'Deferred Revenue is cash received before the work is done or product delivered. It\'s a LIABILITY, not income, until earned. Example: a client prepays $12,000 for a 12-month SaaS subscription. Initially: Debit Cash $12K, Credit Deferred Revenue $12K. Each month: Debit Deferred Revenue $1K, Credit Revenue $1K.' },
-  { q: 'How would you handle a transaction you\'re not sure how to categorize?', a: 'First, I check if the client has a similar past transaction I can model from. If not, I ask the client directly — usually a quick screenshot and one question. If I still can\'t determine the right account, I post to a clearly-named holding account like "Ask My Accountant" or "Uncategorized — Review" and flag it for review. I never guess on transactions over $100.' },
-  { q: 'What\'s the difference between debits and credits?', a: 'They\'re directional entries that keep the accounting equation in balance. Debits INCREASE Assets, Expenses, and Owner Draws. Credits INCREASE Liabilities, Equity, Income, and Capital. Mnemonic: DEAD CLIC. Every transaction has at least one debit and one credit, and they must always equal.' },
-  { q: 'What is the matching principle?', a: 'A GAAP rule that says expenses should be recorded in the same period as the revenue they helped generate. Example: if you sell a product in December but pay the supplier in January, you record both in December under accrual accounting. This produces accurate period profitability.' },
-  { q: 'How do you handle a credit card reconciliation?', a: 'Same process as a bank rec — match every transaction to the statement, check for missing items, reconcile to the ending balance. Critical extra step: confirm any annual fees, finance charges, or interest are captured. I reconcile credit cards monthly without fail because they\'re a common source of duplicate expense booking when not maintained.' },
-  { q: 'Walk me through how you would clean up a messy QBO file.', a: 'Step 1: Diagnostic — review Chart of Accounts, run all-time P&L and Balance Sheet, identify red flags (negative balances on assets, uncategorized expenses, unreconciled accounts). Step 2: Establish a clear "starting point" date with the client. Step 3: Reconcile bank and credit card accounts month by month from oldest. Step 4: Fix mis-categorized transactions in batches. Step 5: Clean up A/R and A/P aging. Step 6: Adjust opening balances if needed. Step 7: Document everything in a cleanup report for the client.' },
-];
+// ACCOUNTING_QUESTIONS now lives in src/data/interview-qa.js (lazy-loaded — see useLazyData).
 
-function AccountingInterviewQA() {
+function AccountingInterviewQA(props) {
+  const { mod, err } = useLazyData(loadInterviewQAData);
+  if (!mod) return <DataLoadingCard err={err} />;
+  return <AccountingInterviewQAInner {...props} data={mod} />;
+}
+function AccountingInterviewQAInner({ data }) {
+  const { ACCOUNTING_QUESTIONS } = data;
   const [openIdx, setOpenIdx] = useState(0);
   return (
     <div>
@@ -9326,73 +9265,15 @@ function ErrorNote({ msg, onClose, className = 'mt-4' }) {
 }
 
 // ─── SUBTAB: Body Language ───────────────────────────────────────────
-const BODY_LANGUAGE_TIPS = [
-  {
-    category: 'Camera & Setup (the foundation)',
-    icon: '📹',
-    tips: [
-      { tip: 'Camera at eye level', detail: 'Stack books or a laptop stand. If they\'re looking down at you, you look small. If they\'re looking up, you look intimidating. Eye level = peer level.' },
-      { tip: 'Light from in front, not behind', detail: 'A window behind you turns you into a silhouette. Face a window or use a ring light. Soft, natural light is best.' },
-      { tip: 'Clean, neutral background', detail: 'Plain wall, bookshelf, or a tidy room. NEVER an unmade bed, kitchen mess, or busy clutter. Background is part of your first impression.' },
-      { tip: 'Use a wired internet connection', detail: 'WiFi drops mid-sentence kill momentum. Plug in an ethernet cable for interview day. Test your connection 30 minutes before.' },
-      { tip: 'Microphone close to your mouth', detail: 'Built-in laptop mics sound thin and distant. A simple lapel mic or headset mic ($20) changes how authoritative you sound.' },
-    ]
-  },
-  {
-    category: 'Posture & Energy',
-    icon: '🧍',
-    tips: [
-      { tip: 'Sit up straight, shoulders back', detail: 'Confident posture changes your voice. Try it now: slouch and say "I\'m confident." Then sit up tall and say it. Hear the difference?' },
-      { tip: 'Lean slightly forward when listening', detail: 'It signals engagement. Don\'t hunch — just an inch or two forward when they\'re speaking. Lean back slightly when you\'re answering.' },
-      { tip: 'Feet flat on the floor', detail: 'Crossing your legs makes you slouch and fidget. Both feet planted = stable, grounded energy that comes through on camera.' },
-      { tip: 'Smile genuinely at the start and end', detail: 'You don\'t need to grin through the whole interview, but smile when you greet and when you say goodbye. It anchors you as warm and approachable.' },
-      { tip: 'Match their energy level — then add 10%', detail: 'If they\'re calm and analytical, don\'t come in like a sales rep. If they\'re upbeat, match it. Always be slightly MORE energetic than them — never less.' },
-    ]
-  },
-  {
-    category: 'Eye Contact (the #1 secret)',
-    icon: '👁️',
-    tips: [
-      { tip: 'Look at the CAMERA when speaking, not at their face', detail: 'When you look at their face on screen, it looks like you\'re looking down to them. Look at the camera lens — to them, that IS eye contact.' },
-      { tip: 'Put a sticky note next to your camera', detail: 'Write the interviewer\'s name on a sticky note next to your camera. Glance at it before each answer. It reminds you to look at the lens AND personalizes your speech.' },
-      { tip: 'Look at their face when LISTENING', detail: 'Eye contact while they speak shows you\'re engaged. Eye contact at the camera when YOU speak shows you\'re confident.' },
-      { tip: 'Don\'t stare at yourself', detail: 'It\'s tempting to look at your own video feed. Hide it. Go into your video settings and hide your own preview. You\'ll instantly appear more present.' },
-    ]
-  },
-  {
-    category: 'Hands & Gestures',
-    icon: '🙌',
-    tips: [
-      { tip: 'Keep hands visible, not under the desk', detail: 'Hidden hands subconsciously read as hidden intentions. Keep them in frame when gesturing — but don\'t wave them wildly.' },
-      { tip: 'Open palm gestures', detail: 'Open palms = honesty and openness. Pointing fingers, fists, or chopping motions feel aggressive on camera. Use open palms when emphasizing.' },
-      { tip: 'Don\'t touch your face', detail: 'Touching your face — especially your mouth or nose — reads as nervousness or deception. Keep hands away from your face.' },
-      { tip: 'Pause your gestures when not making a point', detail: 'Constant movement is distracting. Use gestures to emphasize key words, then let your hands rest. Stillness = confidence.' },
-    ]
-  },
-  {
-    category: 'Voice & Pace',
-    icon: '🎙️',
-    tips: [
-      { tip: 'Slow down 20% more than feels natural', detail: 'When nervous, we speed up. Your natural pace already feels slow when nervous — so consciously slow down even further. Pauses make you sound confident, not unsure.' },
-      { tip: 'Use 1-2 second pauses BEFORE answering', detail: 'It\'s tempting to jump right in. Don\'t. Take a beat. It signals thoughtfulness and gives you time to structure your answer.' },
-      { tip: 'Vary your tone — don\'t monotone', detail: 'Upspeak (ending every sentence going UP) makes you sound unsure. Downspeak (ending DOWN) sounds authoritative. Mix it up but lean toward downspeak at the end of statements.' },
-      { tip: 'Lower your voice slightly when stating credentials', detail: 'When you say "I\'ve managed three QuickBooks Online clients for two years," drop your tone slightly. It signals certainty.' },
-    ]
-  },
-  {
-    category: 'Common Mistakes to Avoid',
-    icon: '🚫',
-    tips: [
-      { tip: 'Don\'t apologize for your accent', detail: 'NEVER say "sorry for my English." It primes them to hear flaws. Own your voice. If they don\'t understand a word, they\'ll ask.' },
-      { tip: 'Don\'t over-apologize generally', detail: 'Filipinos especially over-apologize. Replace "I\'m sorry" with "Thank you for clarifying" or "Let me rephrase that."' },
-      { tip: 'Don\'t fidget with pens, jewelry, hair, or chairs', detail: 'Swivel chairs are the enemy. Use a stable chair. Move pens off camera before starting.' },
-      { tip: 'Don\'t read off notes', detail: 'It\'s obvious on camera. Keep one sticky note with 3-4 keywords if you need them — never a script. They want a conversation, not a recital.' },
-      { tip: 'Don\'t end early', detail: 'Always end an answer with intent. Avoid trailing off with "yeah, so..." or "I think that\'s it." End with a clean stop. Confident silence beats nervous filler.' },
-    ]
-  },
-];
+// BODY_LANGUAGE_TIPS now lives in src/data/interview-qa.js (lazy-loaded — see useLazyData).
 
-function BodyLanguage() {
+function BodyLanguage(props) {
+  const { mod, err } = useLazyData(loadInterviewQAData);
+  if (!mod) return <DataLoadingCard err={err} />;
+  return <BodyLanguageInner {...props} data={mod} />;
+}
+function BodyLanguageInner({ data }) {
+  const { BODY_LANGUAGE_TIPS } = data;
   return (
     <div>
       <div style={{ background: SHEEN }} className="glass-card p-5 rounded-2xl mb-4">
@@ -9563,38 +9444,15 @@ Generate 3-5 questions per category. Make them realistic — what a US hiring ma
 }
 
 // ─── SUBTAB 6: Authentic Personal Branding ─────────────────────────
-const BRANDING_QUESTIONS = [
-  { section: 'Childhood', icon: '🧒', items: [
-    { id: 'c1', q: 'As a child, what activity could you do for hours without getting bored or tired?', hint: 'This often reveals your natural energy source.' },
-    { id: 'c2', q: 'What did teachers, parents, or relatives most often praise you for?', hint: 'Patterns of praise reveal innate strengths others have seen in you for years.' },
-    { id: 'c3', q: 'When you got in trouble as a kid, what was it usually for?', hint: 'Your "flaws" often hide your strengths in disguise.' },
-    { id: 'c4', q: 'Was there a moment in childhood where you felt deeply proud of yourself? What was it?', hint: 'This memory is often a core value still driving you today.' },
-    { id: 'c5', q: 'What was your role in your family? (Peacemaker, achiever, caretaker, problem-solver, rebel, etc.)', hint: 'These early family roles often become professional patterns.' },
-  ]},
-  { section: 'School Life', icon: '🎓', items: [
-    { id: 's1', q: 'Which subjects came easily to you that seemed hard for others?', hint: 'Effortless skill is the truest measure of natural strength.' },
-    { id: 's2', q: 'Which group projects or moments at school did you enjoy MOST? What was your role?', hint: 'Your favorite role in a team is the role you should look for in your career.' },
-    { id: 's3', q: 'When did you feel most confident in school? What were you doing?', hint: 'Confidence patterns reveal your authentic zone of contribution.' },
-    { id: 's4', q: 'When did you feel out of place or "not enough" in school? What was the situation?', hint: 'These moments often shape limiting beliefs — knowing them helps you separate truth from old story.' },
-    { id: 's5', q: 'Who was the teacher or mentor who saw something in you others did not? What did they see?', hint: 'They often saw a true strength before you could name it yourself.' },
-  ]},
-  { section: 'Past Work Experience', icon: '💼', items: [
-    { id: 'w1', q: 'In your work history, what is the project or accomplishment you are MOST proud of? Why?', hint: 'The "why" matters more than the "what." It reveals your driver.' },
-    { id: 'w2', q: 'What kind of tasks energize you at work? You lose track of time doing them.', hint: 'These are your "flow state" activities — your core professional brand.' },
-    { id: 'w3', q: 'What kind of tasks drain you? You procrastinate or rush through them.', hint: 'These reveal your authentic weaknesses — avoid roles built around them.' },
-    { id: 'w4', q: 'When have colleagues or managers praised you most? What words did they use?', hint: 'External validation patterns are clues to your strongest brand attributes.' },
-    { id: 'w5', q: 'What is one piece of feedback you have received more than once across different jobs?', hint: 'Recurring feedback (positive OR negative) reveals consistent traits — your true brand signals.' },
-    { id: 'w6', q: 'If a previous client/manager described you in 3 words, what would they say?', hint: 'How others describe you is your CURRENT brand — whether you chose it or not.' },
-  ]},
-  { section: 'Values & Vision', icon: '✨', items: [
-    { id: 'v1', q: 'What injustice or problem in the world bothers you the most?', hint: 'Your strongest values live inside what makes you angry or sad.' },
-    { id: 'v2', q: 'If money was not a factor, what kind of work would you still want to do?', hint: 'This uncovers your intrinsic motivation — the brand foundation.' },
-    { id: 'v3', q: 'What kind of person do you want clients to think of when they think of you?', hint: 'This is the brand you ASPIRE to. Real branding closes the gap between current and aspired.' },
-    { id: 'v4', q: 'What do you believe about your industry that most others do not believe?', hint: 'Your unique perspective IS your brand differentiator.' },
-  ]},
-];
+// BRANDING_QUESTIONS now lives in src/data/branding.js (lazy-loaded — see useLazyData).
 
-function AuthenticBranding() {
+function AuthenticBranding(props) {
+  const { mod, err } = useLazyData(loadBrandingData);
+  if (!mod) return <DataLoadingCard err={err} />;
+  return <AuthenticBrandingInner {...props} data={mod} />;
+}
+function AuthenticBrandingInner({ data }) {
+  const { BRANDING_QUESTIONS } = data;
   const [answers, setAnswers] = useState({});
   const [busy, setBusy] = useState(false);
   const [profile, setProfile] = useState(null);
@@ -10858,106 +10716,15 @@ ${sectionsHtml}
 // COMPONENT: EMAIL TEMPLATES GENERATOR
 // ═══════════════════════════════════════════════════════════════════
 
-const EMAIL_TEMPLATES = [
-  {
-    id: 'fs_delivery',
-    label: 'Sending Financial Statements',
-    icon: '📊',
-    desc: 'Monthly FS delivery to client with brief commentary',
-    prompt: 'Email delivering monthly Profit & Loss and Balance Sheet to a US client. Include 2-3 highlights/observations. Friendly but professional. 100-140 words.',
-    fields: ['Client name', 'Month/Period (e.g., October 2025)', 'Key observation 1 (e.g., revenue up 12%)', 'Key observation 2 (optional)'],
-  },
-  {
-    id: 'open_questions',
-    label: 'Open Questions to Client',
-    icon: '❓',
-    desc: 'Asking client to clarify uncategorized transactions',
-    prompt: 'Email asking the US client to clarify a list of uncategorized transactions found during monthly close. Be specific, list transactions clearly, set a friendly deadline. 80-120 words plus the transaction list.',
-    fields: ['Client name', 'List of transactions needing clarification', 'Deadline (e.g., by Friday)'],
-  },
-  {
-    id: 'w9_request',
-    label: 'W-9 Request to Vendor',
-    icon: '📝',
-    desc: 'Requesting W-9 from a vendor for 1099 prep',
-    prompt: 'Email to a US vendor requesting a completed W-9 form for 1099-NEC reporting. Professional, brief. Explain why needed, mention IRS requirement, set deadline. Include backup withholding warning if no response. 90-130 words.',
-    fields: ['Vendor name', 'Your firm name', 'Client name (whose vendor it is)', 'Deadline'],
-  },
-  {
-    id: 'collection_first',
-    label: 'First Collection Reminder',
-    icon: '💵',
-    desc: 'Friendly reminder for overdue invoice (5-15 days)',
-    prompt: 'Email sent on behalf of a US client to remind a customer about an overdue invoice. Friendly, assumes oversight. Include invoice number, amount, due date, days overdue. 80-100 words.',
-    fields: ['Customer name', 'Invoice number', 'Invoice amount', 'Original due date', 'Your client (the business)'],
-  },
-  {
-    id: 'collection_second',
-    label: 'Second Collection Reminder',
-    icon: '⏰',
-    desc: 'Firmer reminder (30+ days overdue)',
-    prompt: 'Email for a 30+ day overdue invoice. More direct than first reminder, still professional. Mention possible late fees / collections action. Request specific response by a date. 100-130 words.',
-    fields: ['Customer name', 'Invoice number', 'Invoice amount', 'Original due date', 'Your client (the business)', 'Days overdue'],
-  },
-  {
-    id: 'salary_raise',
-    label: 'Asking for Salary/Rate Raise',
-    icon: '📈',
-    desc: 'Asking your client for a rate increase',
-    prompt: 'Email to a US client (you are their remote bookkeeper) asking for a rate increase. Professional, confident, value-focused. List 3-4 specific value points delivered. State new rate, effective date. 130-180 words.',
-    fields: ['Client name', 'Your name', 'Current monthly rate', 'New proposed rate', 'Effective date', 'Value points delivered (briefly)'],
-  },
-  {
-    id: 'document_request',
-    label: 'Requesting Documents from Client',
-    icon: '📎',
-    desc: 'Asking for receipts, statements, or supporting docs',
-    prompt: 'Email asking a US client to send specific documents for the bookkeeping process (e.g., receipts, bank statements, loan documents). List items clearly. Friendly tone, clear deadline. 90-120 words.',
-    fields: ['Client name', 'List of documents needed', 'Reason needed', 'Deadline'],
-  },
-  {
-    id: 'onboarding_welcome',
-    label: 'New Client Welcome Email',
-    icon: '🎉',
-    desc: 'Day-1 onboarding welcome with next steps',
-    prompt: 'Welcome email to a brand new US bookkeeping client on Day 1. Warm and confident. Outline first 2 weeks of onboarding. List 3-4 things they need to do (W-9 to you, QBO Accountant invite, share past bank statements). 140-180 words.',
-    fields: ['Client name', 'Your name', 'Your firm name', 'Onboarding call date (if scheduled)'],
-  },
-  {
-    id: 'monthend_close',
-    label: 'Month-End Close Notification',
-    icon: '📅',
-    desc: 'Notifying client books are closed for the month',
-    prompt: 'Email notifying a US client that month-end close is complete. Brief, professional. Mention reconciled status, attach/note that FS will follow, ask if they want a quick call. 80-110 words.',
-    fields: ['Client name', 'Month closed (e.g., October 2025)', 'Anything notable from the close'],
-  },
-  {
-    id: 'tax_referral',
-    label: 'Tax Season Referral to CPA',
-    icon: '🤝',
-    desc: 'Connecting client with a CPA for tax filing',
-    prompt: 'Email connecting a US bookkeeping client with a CPA for tax filing season. Explain what you (bookkeeper) have prepared, what the CPA will receive, who to expect contact from. Reassuring, professional. 110-150 words.',
-    fields: ['Client name', 'CPA name (referred)', 'Tax year', 'Documents being passed over'],
-  },
-  {
-    id: 'price_increase',
-    label: 'Annual Price Increase Notice',
-    icon: '💰',
-    desc: 'Notifying existing clients of annual rate adjustment',
-    prompt: 'Email to existing US client announcing an annual rate increase (typically 5-10%). Professional, frames as standard practice. Mention effective date (give 60-day notice). Reaffirm value. 120-150 words.',
-    fields: ['Client name', 'Current rate', 'New rate', 'Effective date', 'Percent increase'],
-  },
-  {
-    id: 'project_offboard',
-    label: 'Offboarding / Disengagement',
-    icon: '👋',
-    desc: 'Ending an engagement gracefully',
-    prompt: 'Email ending a US bookkeeping engagement with a client. Professional, no-burning-bridges. Confirm last service date, mention final deliverables, offer to transition records to new bookkeeper. 110-150 words.',
-    fields: ['Client name', 'Last service date', 'Reason (brief, optional)', 'New bookkeeper info if known'],
-  },
-];
+// EMAIL_TEMPLATES now lives in src/data/email-templates.js (lazy-loaded — see useLazyData).
 
-function EmailTemplates() {
+function EmailTemplates(props) {
+  const { mod, err } = useLazyData(loadEmailTemplatesData);
+  if (!mod) return <DataLoadingCard err={err} />;
+  return <EmailTemplatesInner {...props} data={mod} />;
+}
+function EmailTemplatesInner({ data }) {
+  const { EMAIL_TEMPLATES } = data;
   const [selected, setSelected] = useState(EMAIL_TEMPLATES[0].id);
   const [fieldValues, setFieldValues] = useState({});
   const [generated, setGenerated] = useState('');
@@ -11091,95 +10858,17 @@ Do not add any preamble or commentary. Output ONLY the email.`;
 // COMPONENT: SALARY NEGOTIATION (Interview Prep subtab)
 // ═══════════════════════════════════════════════════════════════════
 
-const SALARY_TACTICS = [
-  {
-    phase: 'Before the Interview',
-    icon: '🎯',
-    tips: [
-      { tip: 'Research market rates for YOUR specific role', detail: 'US bookkeepers earn $18-$45/hr. Filipino remote bookkeepers serving US clients earn $6-$25/hr. AI-fluent bookkeepers command $15-$30/hr. Know your tier before walking in.' },
-      { tip: 'Define your three numbers', detail: 'Walkaway (the lowest you accept), Target (your honest goal), Anchor (your stated ask — 20-30% above target). NEVER reveal your walkaway.' },
-      { tip: 'Calculate your value in dollars saved/earned', detail: 'A client who pays you $1,500/month should see at least $5,000/month in value back (tax savings caught, hours freed, cash flow visibility). Quantify yours before negotiating.' },
-      { tip: 'Have a competing option ready (even a soft one)', detail: 'Having ANY alternative shifts your psychology from desperate to confident. It doesn\'t need to be a firm offer — could just be an active conversation with another firm.' },
-    ]
-  },
-  {
-    phase: 'When They Ask "What Are You Looking For?"',
-    icon: '💬',
-    tips: [
-      { tip: 'NEVER name a number first', detail: 'Whoever names a number first loses negotiation leverage. Deflect: "I\'d love to understand the role better first — what does your budget look like for someone with my experience?"' },
-      { tip: 'If forced, give a range — and start HIGH', detail: 'If they insist, give a range where your TARGET is at the BOTTOM. Example: target $15/hr → say "$18-$25/hr depending on scope." Anchoring high reframes the negotiation.' },
-      { tip: 'Use the "based on my research" framing', detail: '"Based on what I\'ve seen for similar remote bookkeeping roles serving US clients with QuickBooks expertise, I\'d expect this role to land in the $20-$28/hr range." This sounds researched, not greedy.' },
-      { tip: 'Never apologize for your number', detail: 'After stating a number, SHUT UP. Silence is your friend. Don\'t fill space with "but I\'m flexible" or "I know that\'s high." Let the number breathe.' },
-    ]
-  },
-  {
-    phase: 'When They Make an Offer',
-    icon: '📊',
-    tips: [
-      { tip: 'Always counter — even if it sounds good', detail: 'Studies show 84% of employers expect a counter. Not countering signals lack of confidence. Even adding 10-15% is normal and expected.' },
-      { tip: 'Use the "Hmm... pause" technique', detail: 'When they state a number, just pause and say "Hmm. That\'s a bit below what I was targeting." Watch what happens — most employers will immediately ask "what were you targeting?" That\'s when you anchor higher.' },
-      { tip: 'Counter with a specific reason, not just a number', detail: '"I was hoping for $22/hr. Here\'s why: I have 3 active US clients, hold QBO ProAdvisor certification, and can handle the multi-entity work in your JD without ramp-up time."' },
-      { tip: 'Negotiate the WHOLE package, not just rate', detail: 'If they can\'t move on rate, ask for: PTO, annual rate increases (5-10%/year guaranteed), training budget, equipment stipend, performance bonuses, faster review cycles.' },
-    ]
-  },
-  {
-    phase: 'Handling Pushback',
-    icon: '🛡️',
-    tips: [
-      { tip: '"That\'s the highest we can offer" → push gently', detail: '"I appreciate that. Is there any flexibility on a sign-on bonus, faster first review, or a performance bonus structure?" Always probe the wall before accepting it.' },
-      { tip: '"We have other candidates" → calmly affirm your value', detail: '"That makes sense — I\'m sure they\'re strong. What I bring is X, Y, and Z. If those are the gaps you\'re trying to fill, I\'m worth the conversation."' },
-      { tip: '"We need an answer today" → buy 24-48 hours', detail: '"This is a big decision and I want to give you a thoughtful yes. Can I confirm by tomorrow EOD?" 99% of employers will say yes. Pressure tactics signal desperation on THEIR side, not yours.' },
-      { tip: 'Never threaten or ultimatum', detail: 'Threats burn bridges and rarely work. Replace "I\'ll walk if not..." with "I\'d really love to make this work. Help me understand what flexibility exists."' },
-    ]
-  },
-  {
-    phase: 'Annual Raises & Rate Reviews',
-    icon: '📈',
-    tips: [
-      { tip: 'Lock in annual review in the engagement letter', detail: 'Build it in upfront: "Rate reviewed annually on engagement anniversary." This makes raises a default, not a confrontation.' },
-      { tip: 'Document wins all year long', detail: 'Keep a running "Wins Doc" — every catch, every cleanup, every late-night save. When raise season comes, you have receipts.' },
-      { tip: 'Ask for 8-12% per year minimum', detail: 'Inflation alone runs 3-4%. A "performance" raise must be on TOP of inflation. Aiming for 8-12% nets you 4-8% real growth. Below 5% is going backward.' },
-      { tip: 'Tie raises to client-side wins', detail: '"Your revenue grew 22% this year. I caught $14K in misclassified expenses that became deductions. The market rate for this work is now $22-$28/hr. Let\'s land at $24."' },
-    ]
-  },
-];
+// SALARY_TACTICS now lives in src/data/salary.js (lazy-loaded — see useLazyData).
 
-const SALARY_SCRIPTS = [
-  {
-    scenario: 'When asked "What\'s your expected salary?" in the first interview',
-    response: `"That's a great question. I want to make sure I'm giving you a thoughtful answer, so let me ask first — what does the budget look like for this role given the scope and experience level you're targeting?"
+// SALARY_SCRIPTS now lives in src/data/salary.js (lazy-loaded — see useLazyData).
 
-If they push: "Based on what I've seen for remote bookkeeping roles with multi-entity QBO experience, I'd expect this to land in the $20-$28/hr range — but I'm open to discussing once I understand the full scope better."`
-  },
-  {
-    scenario: 'When you receive a written offer below your target',
-    response: `"Thank you for the offer — I'm genuinely excited about the role.
-
-I want to be transparent: I was targeting closer to $24/hr based on three things. First, I currently manage [X] US clients with similar scope. Second, my QBO ProAdvisor certification means zero ramp-up time. Third, the multi-entity work in this role is exactly where my last two cleanups added the most value.
-
-Is there room to move toward $24, or could we structure a 6-month review where we revisit based on early wins?"`
-  },
-  {
-    scenario: 'When they say "We can\'t go higher" but you want to push',
-    response: `"I hear you, and I appreciate the transparency on the rate ceiling.
-
-If the base rate is locked, can we explore: a guaranteed annual increase of 8% built into the engagement letter, a $500 sign-on for equipment, or quarterly bonus tied to retention of my book of clients?
-
-I'd love to find a structure that works for both of us."`
-  },
-  {
-    scenario: 'Asking for a raise after 12 months',
-    response: `"Hi [Client] — I want to talk through the annual review we built into our engagement.
-
-Quick recap of the year: I closed every month on time, caught $X in misclassified expenses, brought your A/R aging from [X] days down to [Y], and added [project/system] to the workflow.
-
-The market rate for the work I'm doing has moved to $22-$26/hr. I'd like to land at $24/hr going forward — that's an 8% increase from where we started, plus a 5% performance bump on top.
-
-Open to a quick call this week to align?"`
-  },
-];
-
-function SalaryNegotiation() {
+function SalaryNegotiation(props) {
+  const { mod, err } = useLazyData(loadSalaryData);
+  if (!mod) return <DataLoadingCard err={err} />;
+  return <SalaryNegotiationInner {...props} data={mod} />;
+}
+function SalaryNegotiationInner({ data }) {
+  const { SALARY_TACTICS, SALARY_SCRIPTS } = data;
   return (
     <div>
       <div style={{ background: SHEEN }} className="glass-card p-5 rounded-2xl mb-4">
@@ -12084,237 +11773,15 @@ function PortalActions() {
 // COMPONENT: INDUSTRY ACCOUNTING PROCESS (Training & Skills)
 // ═══════════════════════════════════════════════════════════════════
 
-const INDUSTRY_ACCOUNTING = [
-  {
-    id: 'construction',
-    name: 'Construction',
-    icon: '🏗️',
-    tagline: 'Job costing is the whole game.',
-    nuances: [
-      { title: 'Job costing by project', detail: 'Every dollar of labor, material, and subcontractor cost must be tagged to a specific job. Use QBO "Projects" or "Classes" — never just dump to a generic COGS account. Without job-level data, the owner has no idea which jobs make money.' },
-      { title: 'WIP (Work-in-Progress) accounting', detail: 'For long-term contracts, use percentage-of-completion or completed-contract method. WIP schedule reconciles billed-vs-earned each month. Underbilling = receivable; overbilling = deferred revenue (liability).' },
-      { title: 'Retention receivable / payable', detail: 'GC keeps 5-10% of each progress payment until job is complete (retention). Track separately on the Balance Sheet — it sits in A/R but you cannot collect until punch list is signed off.' },
-      { title: 'Change orders documentation', detail: 'Never bill a change order without written client approval. Track approved vs pending change orders as separate line items. Disputes here destroy job profitability.' },
-      { title: 'Equipment depreciation & rental', detail: 'Owned equipment: depreciate over useful life and allocate to jobs via burden rate. Rented equipment: tag rental cost to the specific job it served.' },
-      { title: '1099 subcontractors', detail: 'Construction has the highest 1099 risk. Every sub paid $600+ needs W-9 collected BEFORE first payment. Track sub liability insurance certificates — expired COIs expose the GC to lawsuits.' },
-    ],
-    coaHighlights: ['Job Materials (5010)', 'Subcontractor Costs (5020)', 'Equipment Rental (5030)', 'Job Labor (5040)', 'Permits & Inspections (5050)', 'WIP Asset (1450)', 'Retention Receivable (1460)', 'Customer Deposits / Deferred Rev (2350)'],
-    redFlags: ['Single "Materials" expense bucket with no project tags', 'No WIP schedule reconciled monthly', 'Missing W-9s for active subcontractors', 'Retention sitting in regular A/R aging report', 'No tracking of change orders separate from base contract'],
-    remoteAdvantage: ['Many GCs are field-based and behind on books — perfect cleanup engagement for a remote bookkeeper working evenings (their morning) US time.', 'Subcontractor W-9 chasing + 1099 prep is high-volume, low-skill US work that\'s ideal to delegate offshore at $20-$30/hour.', 'WIP schedule maintenance and job-cost reporting are weekly recurring tasks — a remote bookkeeper can own this and free the owner to be on-site.', 'Pitch line: "I handle your bank feeds, subcontractor 1099 tracking, retention aging, and WIP schedule every week — so you stay on-site and stop closing books at midnight on Sundays."'],
-  },
-  {
-    id: 'ecommerce',
-    name: 'E-Commerce',
-    icon: '🛒',
-    tagline: 'Channel reconciliation will haunt you.',
-    nuances: [
-      { title: 'Multi-channel revenue reconciliation', detail: 'Shopify, Amazon, eBay, Etsy each report differently. Gross sales ≠ deposits. Each platform takes fees, holds for refunds, and pays out on different cycles. Reconcile each channel\'s payout reports to the bank deposit.' },
-      { title: 'Sales tax nexus (economic + physical)', detail: 'Selling to a state with $100K+ revenue OR 200+ transactions triggers nexus. Each state has its own threshold. Marketplace facilitator laws (Amazon, Etsy) shift some collection — but not all states. Track nexus per state.' },
-      { title: 'Inventory accounting', detail: 'COGS must move with inventory sold (FIFO, weighted-avg, or specific identification). Most QBO files book inventory wrong — they expense purchases instead of capitalizing to Inventory Asset and relieving COGS on sale.' },
-      { title: 'Returns & chargebacks', detail: 'A return is NEGATIVE revenue, not an expense. Chargebacks need their own account to track patterns. High chargeback rate = fraud problem or product problem.' },
-      { title: 'Merchant processor fees', detail: 'Shopify Payments, Stripe, PayPal, Amazon Pay each take a different percentage. Book fees to a clear "Merchant Processing Fees" account — never net against revenue. The gross-up matters for sales tax filings.' },
-      { title: 'Ad spend separate from COGS', detail: 'Facebook/Google ads are an Operating Expense, not COGS. The exception: paid traffic ads tied to specific products in cost-of-acquisition models may be classified as variable selling cost.' },
-    ],
-    coaHighlights: ['Inventory Asset (1300)', 'Shopify Revenue (4010)', 'Amazon Revenue (4020)', 'Etsy Revenue (4030)', 'Returns & Allowances (4900)', 'Cost of Goods Sold (5010)', 'Merchant Processing Fees (5100)', 'Shipping Income (4400)', 'Shipping Expense (5400)', 'Ad Spend - Meta (6310)', 'Ad Spend - Google (6320)'],
-    redFlags: ['Inventory expensed as purchased instead of capitalized', 'Sales tax not tracked per state', 'Revenue booked at gross of merchant fees', 'No A2X, Synder, or LinkMyBooks integration for channel sync', 'Returns hitting Misc Expense instead of contra-revenue'],
-    remoteAdvantage: ['E-comm sellers run 24/7 globally — a Manila-based bookkeeper covers US overnight hours and processes sales/refunds before the owner even wakes up.', 'A2X, Synder, LinkMyBooks reconciliations are repetitive and rule-based — perfect for a trained remote bookkeeper to own end-to-end.', 'Multi-channel revenue reconciliation eats 8-15 hours a week — that is 50%+ of a $1,500-$3,000/month engagement, easily justified.', 'Pitch line: "I reconcile your Shopify, Amazon, and Etsy payouts daily, track sales tax nexus per state, and deliver clean monthly financials by the 10th — at a fraction of a US bookkeeper rate."'],
-  },
-  {
-    id: 'lawfirm',
-    name: 'Law Firm',
-    icon: '⚖️',
-    tagline: 'IOLTA compliance or you lose your license.',
-    nuances: [
-      { title: 'IOLTA trust accounting', detail: 'Client funds (retainers, settlements) MUST be in a separate Interest on Lawyers Trust Account. Never commingle with operating. Three-way reconciliation monthly: bank statement = trust ledger = sum of client ledger balances.' },
-      { title: 'Operating vs trust accounts', detail: 'Earned fees move from trust to operating only AFTER work is performed and billed. Moving early = co-mingling = bar complaint. Track every transfer with the matching invoice.' },
-      { title: 'Retainer accounting', detail: 'Unearned retainer = LIABILITY in trust (Client Funds Held). As work is billed, debit the liability and credit revenue. The trust balance must always equal client ledger sum.' },
-      { title: 'Case cost advances (hard vs soft)', detail: 'Hard costs (filing fees, expert witnesses) = receivable, reimbursable. Soft costs (postage, copies) = expense, may or may not be billable. Track separately per matter.' },
-      { title: 'Matter-level profitability', detail: 'Bill time, expenses, and costs per matter. Use Classes or Projects in QBO. Without matter-level reporting, partners cannot see which practice areas are profitable.' },
-      { title: 'Contingency fee accounting', detail: 'No revenue recognized until case settles. Costs advanced sit as receivable. When settlement hits: receivable cleared, settlement split per fee agreement, client share disbursed from trust.' },
-    ],
-    coaHighlights: ['IOLTA Trust Account (1010)', 'Operating Account (1020)', 'Client Funds Held - Liability (2100)', 'Advanced Case Costs - Receivable (1410)', 'Earned Fee Income (4010)', 'Contingency Fee Income (4020)', 'Filing Fee Reimbursements (4050)', 'Bar Dues (6210)'],
-    redFlags: ['Single bank account for trust + operating', 'Three-way trust rec not performed monthly', 'Retainer booked as income before earned', 'No matter-level cost tracking', 'Negative balance in any client trust ledger (bar violation)'],
-    remoteAdvantage: ['IOLTA three-way reconciliation is high-stakes, monthly, rule-based work — exactly what a trained remote bookkeeper should own to free the partner.', 'Matter-level cost tracking and retainer drawdown can be done remotely with weekly reports — partners hate this admin work.', 'Many small law firms are 1-3 lawyers + 1 paralegal — no budget for a US bookkeeper, but $1,500/month for a remote pro is in reach.', 'Pitch line: "I handle your IOLTA reconciliation, retainer-to-revenue conversions, and matter-level profitability reports — so you stay in court, not in QBO."'],
-  },
-  {
-    id: 'realestate',
-    name: 'Real Estate (Investor / Property Mgmt)',
-    icon: '🏘️',
-    tagline: 'Each property is its own profit center.',
-    nuances: [
-      { title: 'Property-by-property tracking', detail: 'Every rental property is its own class/project in QBO. Income, expenses, and capital improvements get tagged. Owners need to see profitability per door — not just total.' },
-      { title: 'Security deposits (liability, NOT income)', detail: 'Security deposits = LIABILITY on Balance Sheet. Most jurisdictions require deposits held in a separate account. Releasing partial deposit on move-out is a journal entry, not a refund expense.' },
-      { title: 'Capital improvements vs repairs', detail: 'Replacing a roof = capitalize and depreciate (Section 1250 property, 27.5 years residential). Patching a roof = repair, expense immediately. Get this wrong and you over/understate taxable income significantly.' },
-      { title: 'Depreciation strategy', detail: 'Residential rental: 27.5 years straight-line. Commercial: 39 years. Land never depreciates. Cost segregation studies can accelerate depreciation on components.' },
-      { title: 'Section 1031 like-kind exchanges', detail: 'Selling one property and rolling proceeds into another via a Qualified Intermediary defers capital gains. The accounting requires tracking deferred gain on the new property\'s basis.' },
-      { title: 'Owner draws vs distributions', detail: 'LLC owner pulling money: draws (single-member LLC) or distributions (multi-member). Never wages — landlord cannot be on payroll of their own rental.' },
-    ],
-    coaHighlights: ['Operating Bank (1010)', 'Security Deposit Trust (1020)', 'Land - 123 Main St (1500)', 'Building - 123 Main St (1510)', 'Accumulated Depreciation - 123 Main St (1515)', 'Security Deposits Held - Liability (2100)', 'Rental Income (4010)', 'Late Fees Income (4050)', 'HOA Dues (6100)', 'Property Management Fees (6200)', 'Repairs & Maintenance (6300)', 'Capital Improvements (1525)'],
-    redFlags: ['Security deposits mixed with operating cash', 'Roof replacements expensed instead of capitalized', 'No per-property P&L generated monthly', 'Mortgage principal hitting expense instead of liability paydown', 'Personal expenses run through the rental'],
-    remoteAdvantage: ['Per-property class tracking is repetitive and tedious — landlords with 3+ properties hire remote bookkeepers specifically to own this.', 'Security deposit liability tracking, capital improvement vs repair categorization, mortgage statement splits — all weekly tasks delegable offshore.', 'Many investors own properties across multiple states — a remote bookkeeper running QBO classes is more cost-effective than a US-based property manager.', 'Pitch line: "I run per-property P&Ls every month, track every security deposit as a liability, and flag every roof-vs-repair categorization decision — so you can buy your next door."'],
-  },
-  {
-    id: 'restaurant',
-    name: 'Restaurant / F&B',
-    icon: '🍽️',
-    tagline: 'Watch food cost % like a hawk.',
-    nuances: [
-      { title: 'Food cost percentage tracking', detail: 'Food Cost % = (Beginning Inventory + Purchases - Ending Inventory) ÷ Food Sales. Target: 28-35%. Drift above 35% = recipe drift, theft, or waste. Calculate weekly, not monthly.' },
-      { title: 'Tip pooling & reporting', detail: 'Cash tips = employee income, reported to IRS. Credit card tips passed through to employees, also reported. Tip credit (paying below minimum wage) requires meticulous tracking per state.' },
-      { title: 'POS integration', detail: 'Toast, Square, Clover should sync daily sales into QBO. Each day creates a Sales Receipt: gross sales, sales tax collected, tips collected, fees deducted, net deposit. Without integration, daily reconciliation is hell.' },
-      { title: 'Cash vs accrual inventory', detail: 'Most small restaurants stay cash basis for tax. But for management reporting, accrual is essential — inventory swings $5K week-to-week distort profitability if not capitalized.' },
-      { title: 'Linens, paper, smallwares', detail: 'Plates, glasses, table linens: capitalize if over $2,500 (de minimis safe harbor) and depreciate. Smaller items expense immediately. Smallwares replacement is often 1-3% of revenue.' },
-      { title: 'Liquor license & permits', detail: 'Annual fees, health permits, liquor license renewals — all separate accounts. Many jurisdictions require posting the license. Track expiration in the engagement letter system.' },
-    ],
-    coaHighlights: ['Operating Cash (1010)', 'Inventory - Food (1310)', 'Inventory - Liquor (1320)', 'Food Sales (4010)', 'Beverage Sales - NA (4020)', 'Beverage Sales - Alcohol (4030)', 'Food Cost (5010)', 'Beverage Cost (5020)', 'Server Wages (6010)', 'Kitchen Wages (6020)', 'Tips Payable - Liability (2200)', 'POS Fees (6310)'],
-    redFlags: ['Food Cost % above 38% for three months running', 'POS not integrated with QBO', 'Tips treated as restaurant revenue instead of pass-through liability', 'No weekly inventory count', 'Liquor and food revenue not separated (sales tax issue)'],
-    remoteAdvantage: ['Restaurant owners work 14-hour days — they need someone reconciling POS deposits while they sleep. Time-zone alignment is your edge.', 'Daily sales summary entries from Toast/Square/Clover are pattern-based and ideal for a remote bookkeeper to automate.', 'Weekly food cost % calculation, tip pool reconciliation, vendor payment scheduling — recurring tasks where a remote bookkeeper saves 10+ hours a week.', 'Pitch line: "I post your daily sales receipts, reconcile your tips pool, calculate your food cost % every Monday, and deliver a flash P&L every Friday — at a third of what a local bookkeeper costs."'],
-  },
-  {
-    id: 'medical',
-    name: 'Medical / Healthcare',
-    icon: '🏥',
-    tagline: 'Insurance contractual adjustments are the killer.',
-    nuances: [
-      { title: 'Insurance contractual adjustments', detail: 'Provider bills $500 for a visit. Insurance contract allows $180. The $320 difference is a contractual adjustment — contra-revenue, NOT bad debt. This eats 30-50% of gross billings for most practices.' },
-      { title: 'Patient responsibility (copay, coinsurance, deductible)', detail: 'After insurance pays, patient owes the balance. Track per encounter. Aging on patient A/R is far worse than insurance A/R — write-off policy needs to be explicit.' },
-      { title: 'HIPAA considerations in workflow', detail: 'Bookkeeper should never see PHI (patient health information). Receive only summary reports from billing software (eClinicalWorks, Kareo, Athena). Sign a Business Associate Agreement (BAA).' },
-      { title: 'CPT code revenue tracking', detail: 'High-margin procedures (CPT codes) need separate revenue accounts. Owner needs to see which services drive profit. E&M visits, procedures, ancillary (lab, imaging) — separate buckets.' },
-      { title: 'Provider compensation models', detail: 'Salary, productivity-based (RVU), or hybrid. Each requires different tracking. Productivity models need RVU x conversion factor reporting tied to billing.' },
-      { title: 'Medical malpractice insurance', detail: 'Significant fixed cost ($5K-$50K+/year per provider). Tail coverage and prior acts riders are commonly missed. Capitalize and amortize if paid annually.' },
-    ],
-    coaHighlights: ['Operating Cash (1010)', 'Patient A/R (1210)', 'Insurance A/R (1220)', 'Allowance for Doubtful Accounts (1290)', 'Gross Service Revenue - E&M (4010)', 'Gross Service Revenue - Procedures (4020)', 'Contractual Adjustments (4900)', 'Bad Debt Expense (6800)', 'Provider Wages (6010)', 'Medical Supplies (5010)', 'Malpractice Insurance (6220)'],
-    redFlags: ['Revenue booked at gross billings (no contractual adjustment)', 'No patient vs insurance A/R distinction', 'Bookkeeper receiving PHI without BAA', 'Single "Medical Revenue" account', 'No bad debt write-off policy'],
-    remoteAdvantage: ['HIPAA-compliant remote bookkeepers (signed BAA, summary reports only) can fully serve small practices without ever touching PHI.', 'Contractual adjustment posting from EOB summaries is repetitive — perfect for a remote bookkeeper trained on Kareo/Athena reports.', 'Patient AR aging follow-up, insurance AR review, and bad debt reserve calculations are weekly tasks practices delegate gladly.', 'Pitch line: "I post your contractual adjustments from your billing software, reconcile patient AR, and deliver a clean monthly P&L by the 12th — fully HIPAA-compliant, no PHI ever touched."'],
-  },
-  {
-    id: 'saas',
-    name: 'SaaS / Software',
-    icon: '💻',
-    tagline: 'Deferred revenue is your biggest line item.',
-    nuances: [
-      { title: 'Deferred revenue (THE big one)', detail: 'Client pays $12,000 for an annual subscription. Day 1: Debit Cash $12K, Credit Deferred Revenue (liability) $12K. Each month: Debit Deferred Rev $1K, Credit Revenue $1K. ASC 606 compliance — recognize as service is delivered, not when cash hits.' },
-      { title: 'MRR / ARR tracking', detail: 'Monthly Recurring Revenue and Annual Recurring Revenue are the lifeblood metrics. New MRR + Expansion - Churn = Net MRR change. These come from billing systems (Stripe, Chargebee), not QBO directly.' },
-      { title: 'CAC (Customer Acquisition Cost)', detail: 'Total sales + marketing spend ÷ new customers acquired. SaaS investors require this. CAC payback period < 12 months is the goal.' },
-      { title: 'R&D vs capitalized software costs', detail: 'Internal-use software development can be capitalized under ASC 350-40 (preliminary stage = expense; application development = capitalize; post-implementation = expense). Most early-stage SaaS expenses everything.' },
-      { title: 'Stock-based compensation', detail: 'Options granted to employees: expense over vesting period using Black-Scholes valuation. Critical for VC-backed startups before any funding round.' },
-      { title: 'Revenue recognition complexity', detail: 'Setup fees: spread over expected customer life, not collected upfront. Multi-element arrangements (software + support + training) require allocating transaction price to each performance obligation.' },
-    ],
-    coaHighlights: ['Operating Cash (1010)', 'Stripe Pending (1110)', 'Accounts Receivable (1210)', 'Capitalized Software (1610)', 'Subscription Revenue (4010)', 'Implementation Revenue (4020)', 'Professional Services Revenue (4030)', 'Deferred Revenue - Short Term (2300)', 'Deferred Revenue - Long Term (2700)', 'Hosting & Infrastructure (5010)', 'Engineering Wages (6010)', 'Sales & Marketing (6310)'],
-    redFlags: ['Annual subscriptions booked as revenue at billing instead of deferred', 'No MRR/ARR reporting alongside P&L', 'Setup fees recognized immediately', 'No tracking of customer churn', 'Hosting costs miscategorized as office expense'],
-    remoteAdvantage: ['Deferred revenue accounting is THE bookkeeping pain point for SaaS founders — and a remote bookkeeper trained on ASC 606 is gold to them.', 'Stripe/Chargebee monthly journal entries, MRR/ARR tracking, churn cohort reports — recurring high-skill work that justifies $2K-$5K/month engagements.', 'SaaS founders are tech-native — they prefer Slack + Loom over phone calls, which is the remote bookkeeper natural workflow.', 'Pitch line: "I run your monthly deferred revenue schedule, recognize your Stripe/Chargebee revenue properly under ASC 606, and deliver MRR/ARR dashboards every month — so when you raise your next round, your books are diligence-ready."'],
-  },
-  {
-    id: 'agency',
-    name: 'Marketing / Creative Agency',
-    icon: '🎨',
-    tagline: 'Pass-throughs vs revenue is the #1 mistake.',
-    nuances: [
-      { title: 'Media buys: pass-through vs principal', detail: 'If client gives agency $50K for ad buys and agency runs them through their own ad accounts, the $50K is REVENUE (and the buy is COGS). If client pays the platform directly, agency only records the management fee as revenue. ASC 606 "principal vs agent" decision.' },
-      { title: 'Project-based revenue (retainer vs project)', detail: 'Retainer: monthly recognition, even billings. Project: revenue recognized as deliverables completed. Mixing these in one revenue line destroys profitability analysis.' },
-      { title: 'Utilization rate tracking', detail: '(Billable hours ÷ Total hours worked) × 100. Target: 65-75% for senior staff. Below 50% = pricing or staffing problem. Above 85% = burnout coming.' },
-      { title: 'Contractor vs employee classification', detail: 'Agencies use lots of freelancers. Misclassification audits are common. If you control how, when, and where they work — it\'s employee, not contractor.' },
-      { title: 'Software stack as COGS or OpEx', detail: 'Adobe, Figma, Canva, Slack: OpEx. But client-specific software (ad platforms, CRM seats for client) may be billed back as project cost (COGS).' },
-      { title: 'Project profitability tracking', detail: 'Tag every hour and expense to a project/client. Run monthly Profit-by-Project reports. Without this, agencies under-price the unprofitable work and over-deliver on it.' },
-    ],
-    coaHighlights: ['Operating Cash (1010)', 'A/R (1210)', 'Unbilled Revenue (1230)', 'Retainer Revenue (4010)', 'Project Revenue (4020)', 'Media Buy Pass-Through Rev (4030)', 'Media Buy Cost (5010)', 'Contractor Costs - Project (5020)', 'Salaries - Account Mgmt (6010)', 'Salaries - Creative (6020)', 'Software Subscriptions (6310)'],
-    redFlags: ['Media buys netted against revenue instead of grossed up', 'No project-level profit tracking', 'Retainer + project revenue lumped together', 'Contractors paid as employees or vice versa', 'No utilization rate reporting'],
-    remoteAdvantage: ['Agencies are notoriously bad at separating retainer revenue from project revenue — a remote bookkeeper trained on agency models fixes this immediately.', 'Time-tracking integration (Harvest, Toggl, BigTime), project profitability reports, contractor 1099 tracking — recurring work delegable offshore.', 'Agency owners are remote-team native (they manage creative contractors globally), so they are the easiest "yes" for hiring a remote bookkeeper.', 'Pitch line: "I separate your retainer MRR from project revenue, track project-level profitability every week, and own all your contractor 1099 prep — so you stop guessing which client is actually profitable."'],
-  },
-  {
-    id: 'nonprofit',
-    name: 'Nonprofit',
-    icon: '🤝',
-    tagline: 'Fund accounting, not for-profit accounting.',
-    nuances: [
-      { title: 'Restricted vs unrestricted net assets', detail: 'Donations come with strings. Unrestricted: use anywhere. Temporarily restricted: must spend on specific purpose/timeframe. Permanently restricted: endowment principal preserved. Three separate net asset categories on balance sheet.' },
-      { title: 'Functional expense allocation', detail: 'Every expense must be coded to Program, Management & General, or Fundraising. Form 990 requires this. Allocate rent, utilities, salaries across functions using time studies or square footage.' },
-      { title: 'In-kind donations', detail: 'Donated goods/services valued at fair market value, booked as both revenue and expense. Donated services only recorded if they require specialized skills (e.g., donated legal work, not donated stuffing-envelopes).' },
-      { title: 'Form 990 / 990-EZ filing', detail: 'Annual IRS filing. Public document. Reveals every salary over $100K, every contractor over $100K, related-party transactions. Bookkeeping must support these disclosures.' },
-      { title: 'Grant accounting', detail: 'Conditional grants (must meet milestones): recognize as conditions met. Unconditional grants: recognize immediately at fair value. Track restriction releases as separate journal entries.' },
-      { title: 'Fundraising event accounting', detail: 'Ticket sales = revenue. Sponsorships = contribution income. Direct event costs (venue, catering) = expense. Gross all up; reporting net misleads donors and Form 990.' },
-    ],
-    coaHighlights: ['Operating Cash (1010)', 'Investments - Endowment (1500)', 'Contributions Receivable (1410)', 'Pledges Receivable (1420)', 'Unrestricted Contributions (4010)', 'Temp Restricted Contributions (4020)', 'Government Grants (4100)', 'In-Kind Contributions (4150)', 'Program Expenses (6010)', 'Management & General (6500)', 'Fundraising Expenses (6600)', 'Net Assets - Unrestricted (3100)', 'Net Assets - Temp Restricted (3200)', 'Net Assets - Perm Restricted (3300)'],
-    redFlags: ['No functional expense allocation', 'Restricted donations spent on unrestricted purposes', 'In-kind donations not recorded', 'Fundraising events reported net instead of gross', 'No tracking of donor restrictions or release of restrictions'],
-    remoteAdvantage: ['Nonprofit boards are unpaid volunteers — they cannot afford a US bookkeeper but desperately need clean books for Form 990 + funders.', 'Functional expense allocation, grant restriction tracking, in-kind donation recording — recurring rule-based work ideal for remote delivery.', 'Nonprofits run on tight budgets — a remote bookkeeper at $1,000-$2,000/month is the difference between clean Form 990 and a board crisis.', 'Pitch line: "I track every donor restriction, allocate functional expenses every month, and prepare your books to be Form 990-ready by January 31 — so your ED can focus on the mission, not the spreadsheet."'],
-  },
-  {
-    id: 'trucking',
-    name: 'Trucking / Logistics',
-    icon: '🚚',
-    tagline: 'Per-mile economics and IFTA filings.',
-    nuances: [
-      { title: 'Per-mile cost analysis', detail: 'Total fixed costs (truck payment, insurance, permits) ÷ miles driven = fixed cost per mile. Variable cost per mile (fuel, maintenance, tolls). Owner-operators live or die by knowing their break-even cost per mile.' },
-      { title: 'IFTA (International Fuel Tax Agreement)', detail: 'Quarterly filing for trucks crossing state lines. Report miles driven in each state and fuel purchased in each state. Net out the over/under-paid tax. Missing IFTA filings = lost authority to operate.' },
-      { title: 'Driver settlements', detail: 'Owner-operators pay drivers per mile or percentage of load. Settlements: driver pay - fuel advances - chargebacks (damage, lumpers). Track per-driver, per-load.' },
-      { title: 'Fuel cards & detention pay', detail: 'EFS, Comdata fuel cards: integrate with QBO to auto-categorize. Detention pay (driver waiting at shipper): separate income account.' },
-      { title: 'Equipment depreciation', detail: 'Tractors: 3-year MACRS for OTR (over-the-road). Trailers: 5-year MACRS. Section 179 election can expense up to $1.2M annually (2026 limit). Bonus depreciation: 60% for 2026 placed-in-service.' },
-      { title: 'DOT compliance & per-diem', detail: 'Driver per-diem (meals & lodging while on the road): IRS standard rate $69/day in 2026 — 80% deductible. Track days on the road per driver.' },
-    ],
-    coaHighlights: ['Operating Cash (1010)', 'Tractors - Asset (1500)', 'Trailers - Asset (1510)', 'Accumulated Depreciation (1515)', 'Trucking Revenue - Linehaul (4010)', 'Fuel Surcharge Income (4020)', 'Detention/Layover Income (4030)', 'Fuel (5010)', 'Driver Wages (5020)', 'Owner-Operator Settlements (5030)', 'Truck Maintenance (5040)', 'Tolls (5050)', 'IFTA Tax Expense (5060)', 'DOT Permits (6210)'],
-    redFlags: ['No IFTA filings on record', 'No per-mile cost tracking', 'Drivers classified as employees but paid 1099 (or vice versa)', 'Fuel card not reconciled monthly', 'No per-diem tracking'],
-    remoteAdvantage: ['IFTA quarterly filings, fuel card reconciliation, driver settlement processing — high-volume, rule-based work delegable offshore.', 'Owner-operators are on the road 5-6 days a week — they have NO time to do books, and a remote bookkeeper covering off-hours is perfect.', 'Per-mile cost analysis and per-truck profitability reports are weekly recurring deliverables a remote bookkeeper can fully own.', 'Pitch line: "I file your IFTA every quarter, reconcile your fuel cards weekly, process driver settlements, and deliver per-mile and per-truck profitability every Friday — so you stay focused on the road and on hiring drivers."'],
-  },
-  {
-    id: 'professional',
-    name: 'Professional Services (Consulting, Engineering, Architecture)',
-    icon: '💼',
-    tagline: 'Time-and-billing is the heartbeat.',
-    nuances: [
-      { title: 'Time tracking → invoice flow', detail: 'Every consultant tracks hours per project. Time data flows to invoice. Most firms use Harvest, Toggl, BigTime, or Clio (legal). Without time tracking, you cannot bill, cannot calculate utilization, cannot price next engagement.' },
-      { title: 'Project budget vs actual', detail: 'Fixed-fee project: track actual hours/cost against budgeted. When you blow the budget, you need to know IN THE MOMENT, not at year-end. Report weekly.' },
-      { title: 'WIP (work-in-progress) for unbilled time', detail: 'Hours worked but not yet invoiced sit as Unbilled Revenue (asset) until invoiced. Move to A/R on invoice. Failure to track WIP = revenue understatement.' },
-      { title: 'Reimbursable expenses (markups)', detail: 'Travel, materials, sub-consultant costs billed to client. Mark up by 5-10% per engagement letter. Track per project. Pass-through travel is NOT revenue (or is, depending on agreement).' },
-      { title: 'Realization rate', detail: '(Amount billed ÷ Standard rate × Hours worked) × 100. If realization < 85%, you\'re writing off too much. Common in legal and consulting where client objects to time.' },
-      { title: 'Effective billing rate', detail: 'Total revenue ÷ Total billable hours = effective hourly rate. Track this monthly per consultant. Senior consultants below their target rate signal a scope/scoping problem.' },
-    ],
-    coaHighlights: ['Operating Cash (1010)', 'A/R (1210)', 'Unbilled Revenue / WIP (1230)', 'Consulting Revenue (4010)', 'Reimbursable Expense Income (4050)', 'Subcontractor / Sub-consultant Cost (5010)', 'Reimbursable Expenses (5050)', 'Salaries - Senior Consultants (6010)', 'Salaries - Junior Staff (6020)', 'Professional Liability Insurance (6220)', 'Continuing Education (6240)'],
-    redFlags: ['No time tracking system', 'WIP not reconciled monthly', 'Reimbursable expenses netted against revenue', 'No utilization or realization rate reporting', 'Fixed-fee projects with no budget vs actual'],
-    remoteAdvantage: ['Time-and-billing data flowing from Harvest/BigTime/Toggl into QBO is rule-based work a remote bookkeeper can own end-to-end.', 'WIP reconciliation, realization rate calculation, project budget vs actual tracking — weekly recurring work that frees the principal.', 'Consultants/engineers/architects are time-poor solo operators — perfect target for a $1,500-$3,000/month remote engagement.', 'Pitch line: "I sync your time tracker to QBO every week, reconcile WIP every month, and deliver realization rate and project-budget reports every Monday — so you stop billing late and stop writing off time."'],
-  },
-  {
-    id: 'startup',
-    name: 'Tech Startup (Pre-Revenue / Seed)',
-    icon: '🚀',
-    tagline: 'Investor-ready books are the goal.',
-    nuances: [
-      { title: 'Runway calculation', detail: 'Months of cash on hand at current burn rate. Cash ÷ Average Monthly Burn = Runway months. Investors and founders watch this weekly. Below 6 months = active fundraising mode.' },
-      { title: 'Founder loans vs equity', detail: 'Money founder puts in: is it a loan (with note, repayable) or equity (capital contribution, ownership %)? Classification has tax implications. Document everything.' },
-      { title: 'SAFE / Convertible Note accounting', detail: 'SAFE (Simple Agreement for Future Equity): liability until conversion, then equity. Convertible Notes: liability + accrued interest, converts at next priced round. Both have valuation caps and discounts to track.' },
-      { title: 'R&D capitalization (Section 174)', detail: 'Since 2022, R&D costs MUST be capitalized and amortized over 5 years (domestic) or 15 years (foreign). Massively impacts taxable income for early-stage companies. Track all R&D meticulously.' },
-      { title: 'Stock-based compensation (Black-Scholes)', detail: 'Options granted to employees: expense over vesting period using option valuation. Cap table software (Carta, Pulley) usually generates the entries. Don\'t ignore — required for 409A and future funding rounds.' },
-      { title: 'Founder/CEO comp pre-Series A', detail: 'Most founders are NOT on payroll pre-revenue. Distributions or no comp. Once on payroll, must be reasonable salary per IRS guidance. Tracking matters for future M&A diligence.' },
-    ],
-    coaHighlights: ['Operating Cash (1010)', 'Founder Loans Receivable (1410)', 'Capitalized R&D (1610)', 'Capitalized Software Dev (1620)', 'SAFE Notes Outstanding (2410)', 'Convertible Notes Payable (2420)', 'Founder Loans Payable (2430)', 'Common Stock (3010)', 'Preferred Stock (3020)', 'Additional Paid-In Capital (3030)', 'R&D Expenses (6010)', 'Founder Compensation (6020)', 'Legal & Professional - Fundraising (6210)', 'Stock-Based Compensation (6610)'],
-    redFlags: ['Founders putting in cash with no documentation', 'R&D not capitalized post-2022 (Section 174 violation)', 'SAFE notes treated as equity instead of liability', 'No stock-based comp expense recorded', 'No runway calculation reported monthly'],
-    remoteAdvantage: ['Pre-revenue startups have ZERO budget for US bookkeepers but desperately need investor-ready books — remote is the only viable model.', 'Runway calculation, SAFE/convertible note tracking, R&D capitalization (Section 174) — high-skill work justifying $1,500-$3,000/month engagements.', 'Tech founders live in Slack, Notion, Linear — they prefer async remote bookkeepers over old-school in-person CPAs anyway.', 'Pitch line: "I keep your books investor-ready every month, track every SAFE note and convertible note correctly, and deliver runway calculation every Monday — so when your VC asks for a data room, you are ready in 24 hours, not 4 weeks."'],
-  },
-  {
-    id: 'accountingfirm',
-    name: 'Accounting / Tax / CFO Firm (Scaling with Remote Team)',
-    icon: '📊',
-    tagline: 'Your bottleneck is capacity — not pipeline. Remote talent is the unlock.',
-    nuances: [
-      { title: 'The "owner-as-bottleneck" problem', detail: 'Most US firms cap out at $300K-$600K revenue because the partner is the production engine. Every new client = more partner hours. Scaling past this requires moving from "partner does the work" to "partner reviews the work." That shift only happens when you have trained offshore/remote bookkeepers handling Tier 1 production. This is the single biggest scale unlock in the industry.' },
-      { title: 'Why Filipino bookkeepers are the unfair advantage', detail: 'US bookkeeper fully loaded cost: $55K-$85K/year. Filipino remote bookkeeper fully loaded cost: $18K-$36K/year. Same QBO certifications, same English fluency, often stronger work ethic and lower attrition. Firms that crack the offshore hiring playbook see gross margins jump from 35-40% (US-only labor) to 60-70%. This is not "cheap labor" — it is the model that lets US firms charge $500-$1,500/month per client and still scale.' },
-      { title: 'Service tiering: who does what', detail: 'Tier 1 (offshore bookkeeper, $15-$30/hr): bank feed coding, reconciliations, A/R, A/P, monthly close prep, draft financial statements. Tier 2 (US senior bookkeeper or remote ProAdvisor, $40-$75/hr): review, adjusting entries, client communication, advisory prep. Tier 3 (US partner/CPA, $150-$400/hr): tax strategy, advisory calls, sign-offs. Each tier has a target % of total billable work — typically 60% Tier 1, 25% Tier 2, 15% Tier 3.' },
-      { title: 'The standardization requirement', detail: 'Remote teams cannot work effectively without documented processes. SOPs (Standard Operating Procedures) for: client onboarding, monthly close, bank rec, A/R aging review, financial statement prep, file naming, ticket triage. Without SOPs, every new hire requires re-training the partner. With SOPs, a new offshore bookkeeper is productive in 2 weeks instead of 3 months.' },
-      { title: 'Practice management software is non-negotiable', detail: 'Karbon, Jetpack Workflow, Canopy, Financial Cents, Keeper — pick one. Firms scaling beyond 30 clients without it drown in email and missed deadlines. The tool tracks every recurring engagement, every deadline, every status per client. Offshore team members get clear queues without needing partner messages.' },
-      { title: 'Client per bookkeeper ratio (the productivity KPI)', detail: 'New offshore bookkeeper: 8-12 monthly bookkeeping clients. Experienced offshore bookkeeper after 12 months: 18-25 clients. US senior reviewer: oversees 35-50 clients across 2-3 offshore bookkeepers. Track this monthly. Below benchmark = training problem. Above benchmark = quality risk (review hours getting compressed).' },
-      { title: 'Realization & utilization (the firm KPIs)', detail: 'Realization rate: (Amount billed ÷ Standard rate × Hours worked) × 100. Target 90%+ on retainer, 80%+ tax prep, 70%+ cleanups. Utilization rate: (Billable hours ÷ Total hours worked) × 100. Target 65-75% for senior staff, 50-60% for partners. These two numbers determine whether the firm is profitable or burning out.' },
-      { title: 'Recurring vs project revenue mix', detail: 'Monthly retainer clients (bookkeeping, advisory, fractional CFO) = predictable MRR. Tax prep, audits, cleanups = project revenue. Goal: 70%+ revenue should be MRR. This is what makes a firm valuable to acquirers (5-8× MRR vs 1× project revenue). Track them in separate income accounts; do not lump them.' },
-      { title: 'Cleanup engagements: the offshore team\'s sweet spot', detail: 'Cleanups (5-18 months of messy books) are the highest-margin engagement type — typical fee $3K-$25K, delivered in 4-8 weeks. Offshore bookkeepers can knock these out fast because the work is structured (rebuild from bank statements, recategorize, reconcile, deliver). Many firms make 40-50% of their first-year revenue from cleanups alone.' },
-      { title: 'Subcontractor accounting (the offshore line item)', detail: 'Offshore bookkeepers are SUBCONTRACTOR COSTS in COGS (not employee wages). Each gets a contractor agreement, W-8 BEN on file, and a 1099-NEC at year-end if paid through US payroll. If paid via Deel/Remote/Wise direct to a Philippine bank, different treatment — track that gross-up. Margin per service line collapses if subcontractor rates aren\'t managed weekly.' },
-      { title: 'Client trust account & data security', detail: 'Many firms hold client funds for tax payments, payroll services, sales tax remittance. Separate trust account, never commingle. Offshore staff accessing client QBO files must be on a separate "team member" role with audit logs. SOC 2 compliance and signed NDAs from every offshore team member are table stakes for clients who care.' },
-      { title: 'Hiring playbook for remote bookkeepers', detail: 'Source: OnlineJobs.ph, BeyondHQ, Toptal, referrals from existing Filipino team. Test: 2-3 hour paid skills test (categorize 50 transactions, reconcile a messy bank statement, draft a P&L). Onboard: 2-week shadow period with senior reviewer + structured SOP walkthroughs. Retain: monthly raises tied to client load + clear promotion path to senior reviewer.' },
-    ],
-    coaHighlights: ['Operating Cash (1010)', 'Client Trust Account (1020)', 'Accounts Receivable (1210)', 'Unbilled Revenue / WIP (1230)', 'Client Funds Held - Liability (2100)', 'MRR - Bookkeeping Services (4010)', 'MRR - Fractional CFO / Advisory (4015)', 'Project Revenue - Tax Prep (4020)', 'Project Revenue - Audit (4030)', 'Project Revenue - Cleanup / Catch-Up (4040)', 'Project Revenue - Advisory (4050)', 'Subcontractor Costs - Offshore Bookkeepers (5010)', 'Subcontractor Costs - Contract Tax Preparers (5020)', 'Practice Mgmt Software - Karbon/Jetpack/Canopy (6325)', 'Tax Prep Software - Drake/Lacerte/UltraTax (6320)', 'Professional Liability Insurance E&O (6220)', 'CPA Licensing & CPE (6240)', 'Partner Salaries (6010)', 'US Staff Salaries (6020)', 'Partner Distributions (3500)'],
-    redFlags: ['Partner still doing Tier 1 production work (categorizing transactions, doing recs)', 'No documented SOPs for monthly close or onboarding', 'No practice management software in use', 'Offshore bookkeepers paid as W-2 employees instead of subcontractors', 'No clients-per-bookkeeper ratio tracked', 'WIP balance growing month over month (collection / billing lag)', 'Revenue mix below 60% MRR (project-revenue dependent = risky valuation)', 'No realization or utilization rate reporting per team member', 'Client trust funds in operating account', 'No CPE tracking per CPA (license risk)', 'Offshore team without signed NDAs or SOC 2 compliance baseline'],
-    remoteAdvantage: ['YOU are the remote bookkeeper this firm is trying to hire. Read every nuance above through the lens of "what value do I deliver as the Tier 1 production engine?"', 'Position yourself by your client load capacity (target 18-25 monthly clients), realization rate (90%+ on retainer), and SOPs you can follow without partner hand-holding.', 'Show up with QBO/Xero ProAdvisor certifications, U.S. tax basics, industry-specific knowledge (everything in this Industry Accounting tab), and a portfolio of 2-3 sample monthly close packages.', 'Pitch line: "I can take 15-20 of your monthly bookkeeping clients off your plate, follow your SOPs from day one, deliver clean monthly closes by the 10th, and free you to do advisory work that bills at $300/hour — at a third of what a U.S. senior bookkeeper costs you."'],
-  },
-];
+// INDUSTRY_ACCOUNTING now lives in src/data/industry-accounting.js (lazy-loaded — see useLazyData).
 
-function IndustryAccounting() {
+function IndustryAccounting(props) {
+  const { mod, err } = useLazyData(loadIndustryAccountingData);
+  if (!mod) return <DataLoadingCard err={err} />;
+  return <IndustryAccountingInner {...props} data={mod} />;
+}
+function IndustryAccountingInner({ data }) {
+  const { INDUSTRY_ACCOUNTING } = data;
   const [active, setActive] = useState('construction');
   const ind = INDUSTRY_ACCOUNTING.find(i => i.id === active);
 
@@ -12442,180 +11909,15 @@ function IndustryAccounting() {
 // COMPONENT: US TAX 101 TRAINING
 // ═══════════════════════════════════════════════════════════════════
 
-const US_TAX_TOPICS = [
-  {
-    id: 'federalbasics',
-    title: 'Federal Income Tax · The Basics',
-    icon: '🇺🇸',
-    intro: 'Federal income tax is the largest tax most businesses pay. Understanding the entity-level filing requirements is non-negotiable for any US bookkeeper.',
-    points: [
-      { h: 'Tax year', t: 'Most businesses use the calendar year (Jan 1 – Dec 31). Some use a fiscal year ending elsewhere, but require IRS approval to elect.' },
-      { h: 'Cash vs accrual basis (for tax)', t: 'Businesses under $30M in revenue (2026 threshold) can use cash basis. Most small businesses do — simpler. C-corps and inventory-heavy businesses must use accrual.' },
-      { h: 'Estimated quarterly payments', t: 'Businesses paying $1,000+ in federal tax must pay estimates quarterly: April 15, June 15, September 15, January 15 (of next year). Bookkeepers track and remind clients.' },
-      { h: 'Self-employment tax', t: 'Sole props and single-member LLC owners pay 15.3% SE tax (12.4% Social Security + 2.9% Medicare) on net business income — on top of income tax. Critical for tax planning.' },
-    ],
-    links: [
-      { label: 'IRS · Business Taxes Overview', url: 'https://www.irs.gov/businesses' },
-      { label: 'IRS · Small Business Tax Center', url: 'https://www.irs.gov/businesses/small-businesses-self-employed' },
-      { label: 'IRS · Forms & Publications', url: 'https://www.irs.gov/forms-pubs' },
-      { label: 'IRS · Estimated Taxes (Form 1040-ES)', url: 'https://www.irs.gov/payments/estimated-taxes' },
-    ],
-  },
-  {
-    id: 'entitytypes',
-    title: 'Business Entity Types',
-    icon: '🏢',
-    intro: 'Tax treatment varies dramatically by entity type. Knowing the structure tells you which forms are filed and how income flows.',
-    points: [
-      { h: 'Sole Proprietor', t: 'Files Schedule C with personal 1040. No separate entity tax return. Pays SE tax on net income. Simplest structure. Owner = business.' },
-      { h: 'Single-Member LLC (SMLLC)', t: 'Default: disregarded entity — taxed same as sole prop (Schedule C). Can elect S-corp or C-corp taxation. Provides legal protection but no automatic tax benefit.' },
-      { h: 'Multi-Member LLC / Partnership', t: 'Files Form 1065. Issues K-1 to each member showing their share of income. Partners pay tax on K-1 income on personal return.' },
-      { h: 'S-Corporation', t: 'Files Form 1120-S. Owners are employees (must take "reasonable salary" via W-2) + receive K-1 distributions. SE tax savings vs sole prop is the big draw — but only if salary is reasonable.' },
-      { h: 'C-Corporation', t: 'Files Form 1120. Pays corporate income tax (21% federal flat rate). Then dividends to owners taxed again on personal return — "double taxation." Used mostly by larger businesses or those seeking VC.' },
-    ],
-    links: [
-      { label: 'IRS · Business Structures', url: 'https://www.irs.gov/businesses/small-businesses-self-employed/business-structures' },
-      { label: 'IRS · Form 1065 (Partnership)', url: 'https://www.irs.gov/forms-pubs/about-form-1065' },
-      { label: 'IRS · Form 1120-S (S-Corp)', url: 'https://www.irs.gov/forms-pubs/about-form-1120-s' },
-      { label: 'IRS · Form 1120 (C-Corp)', url: 'https://www.irs.gov/forms-pubs/about-form-1120' },
-      { label: 'IRS · Schedule C (Sole Prop)', url: 'https://www.irs.gov/forms-pubs/about-schedule-c-form-1040' },
-    ],
-  },
-  {
-    id: 'salestax',
-    title: 'Sales Tax & Nexus',
-    icon: '🧾',
-    intro: 'Sales tax is collected by the business from customers and remitted to the state. Each state has different rules — 45+ states have sales tax, but none are identical.',
-    points: [
-      { h: 'Physical nexus', t: 'Having an office, employee, inventory, or property in a state creates nexus. Even one remote worker in another state can trigger registration requirements.' },
-      { h: 'Economic nexus (post-Wayfair, 2018)', t: 'Most states have $100K revenue OR 200 transactions threshold. Once you cross it, you must register, collect, and remit. Watch this monthly per state.' },
-      { h: 'Marketplace facilitator laws', t: 'Amazon, Etsy, eBay, Walmart Marketplace collect and remit on the seller\'s behalf in most states. The seller is still responsible for non-marketplace sales (Shopify direct, retail, wholesale).' },
-      { h: 'Resale certificates', t: 'Sales to other businesses for resale are sales-tax-exempt with a valid resale certificate. Keep these on file or you\'re liable for the tax.' },
-      { h: 'Filing frequency', t: 'States assign monthly, quarterly, or annual filing based on volume. Filing on time but with $0 still requires a return. Missed deadlines incur penalties even on zero-tax filings.' },
-    ],
-    links: [
-      { label: 'IRS · Sales & Use Tax Overview', url: 'https://www.irs.gov/businesses/small-businesses-self-employed/sales-and-use-tax' },
-      { label: 'Streamlined Sales Tax Project', url: 'https://www.streamlinedsalestax.org/' },
-      { label: 'AICPA · State Tax Resources', url: 'https://www.aicpa-cima.com/topic/tax/state-and-local-tax' },
-    ],
-  },
-  {
-    id: 'payrolltax',
-    title: 'Payroll Tax',
-    icon: '👥',
-    intro: 'Once a business has even one W-2 employee, payroll tax becomes critical. Mistakes here create personal liability for owners and bookkeepers.',
-    points: [
-      { h: 'Federal withholding (FIT)', t: 'Employee\'s income tax withheld based on W-4. Sent to IRS along with employer portion of FICA. Frequency: monthly or semi-weekly depending on payroll size.' },
-      { h: 'FICA (Social Security + Medicare)', t: '15.3% total — split 7.65% employee, 7.65% employer. Social Security capped at $168,600 of wages (2024 limit; check current year). Medicare uncapped.' },
-      { h: 'FUTA (Federal Unemployment)', t: '6.0% on first $7,000 of each employee\'s wages, reduced to 0.6% net after state credit. Filed annually on Form 940.' },
-      { h: 'SUTA (State Unemployment)', t: 'State-specific rate (typically 1-6%) on wages up to state cap. New businesses start at "new employer rate," moves to experience-rated after several quarters.' },
-      { h: 'Form 941 (quarterly)', t: 'Reports wages paid, FIT withheld, FICA tax. Filed quarterly: April 30, July 31, October 31, January 31. Missing = penalty + interest.' },
-      { h: 'W-2 (annual)', t: 'Issued to every employee by January 31. Reports wages, withholding, FICA. Filed with Social Security Administration via W-3 transmittal.' },
-      { h: '1099-NEC (annual)', t: 'Issued to non-employees paid $600+ in a year for services. Due January 31. Construction, agencies, real estate clients all have heavy 1099 requirements.' },
-    ],
-    links: [
-      { label: 'IRS · Employer Tax Center', url: 'https://www.irs.gov/businesses/small-businesses-self-employed/employer-tax' },
-      { label: 'IRS · Form 941 (Quarterly Payroll)', url: 'https://www.irs.gov/forms-pubs/about-form-941' },
-      { label: 'IRS · Form 940 (FUTA)', url: 'https://www.irs.gov/forms-pubs/about-form-940' },
-      { label: 'IRS · Form W-2', url: 'https://www.irs.gov/forms-pubs/about-form-w-2' },
-      { label: 'IRS · Form 1099-NEC', url: 'https://www.irs.gov/forms-pubs/about-form-1099-nec' },
-      { label: 'IRS · Publication 15 (Employer Tax Guide)', url: 'https://www.irs.gov/publications/p15' },
-    ],
-  },
-  {
-    id: 'commonforms',
-    title: 'Common Tax Forms · The Bookkeeper Must Know',
-    icon: '📋',
-    intro: 'These are the forms you\'ll see week in and week out as a US bookkeeper. Know what each is for, who files it, and when.',
-    points: [
-      { h: 'Form W-9 (Request for Taxpayer ID)', t: 'Collected FROM contractors BEFORE you pay them. Captures their TIN/SSN for year-end 1099 reporting. Never pay $600+ without one on file.' },
-      { h: 'Form W-4 (Employee Withholding Cert)', t: 'New employees fill this out at hire. Determines how much federal income tax to withhold from each paycheck.' },
-      { h: 'Form W-2 (Wage & Tax Statement)', t: 'Issued to employees by January 31. Reports annual wages and withholding. Filed with SSA.' },
-      { h: 'Form 1099-NEC (Nonemployee Compensation)', t: 'Issued to contractors paid $600+ for services. Box 1 = total paid. Due January 31.' },
-      { h: 'Form 1099-MISC (Miscellaneous)', t: 'Rent, prizes, attorney payments, royalties. Still in use for these specific categories. Due February 28 (paper) / March 31 (electronic).' },
-      { h: 'Form 1099-K (Payment Card)', t: 'Issued by payment processors (Stripe, PayPal, Shopify). Threshold currently $5,000 (2024) phasing to $600 (delayed multiple times — check current year).' },
-      { h: 'Form 8832 (Entity Classification)', t: 'Used to elect a different tax classification (e.g., LLC electing to be taxed as a corporation).' },
-      { h: 'Form 2553 (S-Corp Election)', t: 'Filed by an eligible entity to elect S-corporation tax status. Must be filed by March 15 of the tax year (or within 2 months 15 days of incorporation).' },
-      { h: 'Schedule K-1', t: 'Issued by partnerships, S-corps, trusts to each owner showing their share of income. Owner attaches to personal 1040.' },
-      { h: 'Form 8829 (Home Office)', t: 'Deduction for portion of home used regularly and exclusively for business. Most sole props and SMLLC owners benefit.' },
-    ],
-    links: [
-      { label: 'IRS · All Forms & Publications', url: 'https://www.irs.gov/forms-instructions' },
-      { label: 'IRS · Form W-9', url: 'https://www.irs.gov/forms-pubs/about-form-w-9' },
-      { label: 'IRS · Form W-4', url: 'https://www.irs.gov/forms-pubs/about-form-w-4' },
-      { label: 'IRS · Form 1099-K', url: 'https://www.irs.gov/forms-pubs/about-form-1099-k' },
-      { label: 'IRS · Form 2553 (S-Corp Election)', url: 'https://www.irs.gov/forms-pubs/about-form-2553' },
-      { label: 'IRS · Schedule K-1', url: 'https://www.irs.gov/forms-pubs/about-schedule-k-1-form-1065' },
-    ],
-  },
-  {
-    id: 'deductions',
-    title: 'Common Business Deductions',
-    icon: '💰',
-    intro: 'Bookkeepers do not give tax advice — but they categorize transactions in ways that make deductions visible or invisible to the CPA. Knowing what\'s deductible affects your COA setup.',
-    points: [
-      { h: 'Ordinary & Necessary (the universal test)', t: 'IRS standard: an expense must be both ORDINARY (common in your industry) and NECESSARY (helpful for the business). If it fails either test, not deductible.' },
-      { h: 'Meals (50% deductible)', t: 'Business meals with clients/employees: 50% deductible. Restaurant meals were 100% in 2021-2022 (CARES) but back to 50%. Keep receipts + business purpose noted.' },
-      { h: 'Entertainment (0% deductible)', t: 'Since TCJA 2018, entertainment is no longer deductible. Sporting events, concerts, golf — not allowed. Only the food/beverage portion (if separately stated) at 50%.' },
-      { h: 'Vehicle expense (two methods)', t: 'Standard mileage rate (2026: ~67¢/mile, check current rate) OR Actual expenses (fuel, repairs, insurance, depreciation). Choose one method first year and stick with it.' },
-      { h: 'Home office (regular & exclusive use)', t: 'Square footage of office ÷ total home sq ft × eligible expenses (mortgage interest, property tax, utilities, depreciation). Simplified method: $5/sq ft up to $1,500.' },
-      { h: 'Section 179 + Bonus Depreciation', t: 'Section 179: deduct up to $1.16M (2024 limit) of qualifying equipment in year placed in service. Bonus depreciation: 60% for property placed in service in 2024 (phasing down).' },
-      { h: 'Qualified Business Income (QBI) deduction', t: '20% deduction on qualified pass-through business income. Sole props, partnerships, S-corps. Income limits and phase-outs apply. Schedule on Form 8995/8995-A.' },
-      { h: 'Health insurance (self-employed)', t: 'Self-employed health insurance premiums deductible above-the-line on 1040. Saves SE tax. Reported on Schedule 1.' },
-    ],
-    links: [
-      { label: 'IRS · Publication 535 (Business Expenses)', url: 'https://www.irs.gov/publications/p535' },
-      { label: 'IRS · Publication 463 (Travel/Meals/Vehicles)', url: 'https://www.irs.gov/publications/p463' },
-      { label: 'IRS · Publication 587 (Home Office)', url: 'https://www.irs.gov/publications/p587' },
-      { label: 'IRS · Section 179 Deduction', url: 'https://www.irs.gov/businesses/small-businesses-self-employed/section-179-expense' },
-      { label: 'IRS · QBI Deduction Overview', url: 'https://www.irs.gov/newsroom/qualified-business-income-deduction' },
-    ],
-  },
-  {
-    id: 'recordkeeping',
-    title: 'Recordkeeping Requirements',
-    icon: '🗂️',
-    intro: 'The IRS requires records to support every position on a tax return. As a bookkeeper, you create the audit trail.',
-    points: [
-      { h: 'How long to keep records', t: 'General rule: 3 years from filing date. BUT: 6 years if income underreported by 25%+. INDEFINITE if no return filed or fraud. 7 years for bad debt or worthless securities claims.' },
-      { h: 'What must be kept', t: 'Bank statements, credit card statements, receipts for any expense, deposit slips, payroll records, 1099s/W-2s, all tax returns filed, all forms filed (940, 941, state). Digital copies acceptable.' },
-      { h: 'Mileage logs', t: 'Required to deduct vehicle expense. Date, destination, business purpose, miles. Contemporaneous (kept as you drive) — not reconstructed after the fact.' },
-      { h: 'Receipt thresholds', t: 'Receipts technically required for any expense $75+. Best practice: keep receipts for everything. Apps like Dext, Hubdoc, QBO Receipt Snap make this painless.' },
-      { h: 'Bank reconciliation as audit defense', t: 'Reconciled bank statements are the bookkeeper\'s strongest audit defense. They prove transactions match real money movement, not estimates.' },
-    ],
-    links: [
-      { label: 'IRS · Recordkeeping for Business', url: 'https://www.irs.gov/businesses/small-businesses-self-employed/recordkeeping' },
-      { label: 'IRS · Publication 583 (Starting a Business & Recordkeeping)', url: 'https://www.irs.gov/publications/p583' },
-      { label: 'IRS · How Long Should I Keep Records', url: 'https://www.irs.gov/businesses/small-businesses-self-employed/how-long-should-i-keep-records' },
-    ],
-  },
-  {
-    id: 'compliance',
-    title: 'Compliance Calendar · Key Federal Deadlines',
-    icon: '📅',
-    intro: 'Missing federal deadlines incurs penalties + interest. Bookkeepers should track these in client engagement systems.',
-    points: [
-      { h: 'January 31', t: 'W-2 to employees · 1099-NEC to contractors · 1099-MISC (Box 7 obsolete, but other boxes) · Form 941 Q4 due · State unemployment Q4 due.' },
-      { h: 'February 28 / March 31', t: '1099-MISC paper filing (Feb 28) or e-filing (March 31). Includes 1099-DIV, 1099-INT, etc.' },
-      { h: 'March 15', t: 'Form 1065 (Partnership) and Form 1120-S (S-Corp) due. Extension Form 7004 gives until September 15.' },
-      { h: 'April 15', t: 'Form 1040 (individual) due · Form 1120 (C-Corp) due · Q1 estimated tax · Extension to October 15 via Form 4868.' },
-      { h: 'April 30', t: 'Form 941 Q1 due. State unemployment Q1 due.' },
-      { h: 'June 15', t: 'Q2 estimated tax. Form 1040 for US persons abroad.' },
-      { h: 'July 31', t: 'Form 941 Q2 due. State unemployment Q2 due. Form 5500 (retirement plans) due.' },
-      { h: 'September 15', t: 'Q3 estimated tax. Form 1065 / 1120-S extended deadline.' },
-      { h: 'October 15', t: 'Form 1040 extended deadline. Form 1120 (C-Corp) extended deadline.' },
-      { h: 'October 31', t: 'Form 941 Q3 due. State unemployment Q3 due.' },
-      { h: 'January 15 (next year)', t: 'Q4 estimated tax (final estimate of prior year).' },
-    ],
-    links: [
-      { label: 'IRS · Tax Calendar for Businesses', url: 'https://www.irs.gov/businesses/small-businesses-self-employed/online-tax-calendar' },
-      { label: 'IRS · Publication 509 (Tax Calendars)', url: 'https://www.irs.gov/publications/p509' },
-      { label: 'IRS · Form 7004 (Business Extension)', url: 'https://www.irs.gov/forms-pubs/about-form-7004' },
-    ],
-  },
-];
+// US_TAX_TOPICS now lives in src/data/us-tax.js (lazy-loaded — see useLazyData).
 
-function USTax101() {
+function USTax101(props) {
+  const { mod, err } = useLazyData(loadUsTaxData);
+  if (!mod) return <DataLoadingCard err={err} />;
+  return <USTax101Inner {...props} data={mod} />;
+}
+function USTax101Inner({ data }) {
+  const { US_TAX_TOPICS } = data;
   const [active, setActive] = useState('federalbasics');
   const topic = US_TAX_TOPICS.find(t => t.id === active);
 
@@ -12701,94 +12003,15 @@ function USTax101() {
 // COMPONENT: MONTHLY WORKFLOW (Day-by-Day Calendar Timeline)
 // ═══════════════════════════════════════════════════════════════════
 
-const MONTHLY_WORKFLOW = [
-  {
-    range: '1st – 3rd',
-    color: '#1E40AF',
-    label: 'Daily Rhythm Resumes',
-    tasks: [
-      { time: 'Daily', task: 'Categorize bank feeds from prior business day', detail: 'Match transactions to vendors, assign to correct accounts. Use Bank Feed AI tool for unfamiliar vendors.' },
-      { time: 'Daily', task: 'Check email for client documents, questions, or open invoices', detail: 'Respond same-day or within 24 hours. Speed of response is a brand asset.' },
-      { time: 'Day 1', task: 'Confirm prior month is officially closed in QBO', detail: 'Run Close the Books → set closing date to last day of prior month. Set password.' },
-    ],
-  },
-  {
-    range: '5th',
-    color: '#3B82F6',
-    label: 'Bank Statements Drop',
-    tasks: [
-      { time: 'Morning', task: 'Bank statements typically generate by the 5th of the month', detail: 'Download statements for all bank, credit card, and loan accounts for the just-closed month.' },
-      { time: 'Same day', task: 'Upload statements to QBO Document attachments', detail: 'Attach to the matching account in QBO for audit trail. Always.' },
-      { time: 'Same day', task: 'Run initial bank reconciliation', detail: 'Mark cleared transactions. Identify any unmatched items.' },
-    ],
-  },
-  {
-    range: '6th – 7th',
-    color: '#0EA5E9',
-    label: 'Open Questions to Client',
-    tasks: [
-      { time: 'Day 6', task: 'Compile list of "Open Questions" for the client', detail: 'Anything you cannot categorize confidently — bundle into ONE email, not 12 separate ones.' },
-      { time: 'Day 6', task: 'Send "Open Questions" email to client', detail: 'Use the BLUF method. Number each question. Attach screenshots. Make it easy to answer.' },
-      { time: 'Day 7', task: 'Continue reconciliations on accounts not waiting for answers', detail: 'Do not let one missing answer block 5 other accounts.' },
-    ],
-  },
-  {
-    range: '8th – 10th',
-    color: '#1E40AF',
-    label: 'Reconciliations & Adjustments',
-    tasks: [
-      { time: 'Day 8', task: 'Complete bank reconciliations for all accounts', detail: 'Bank, credit card, loan accounts. Each must reconcile to the statement.' },
-      { time: 'Day 8', task: 'Reconcile merchant processor statements (Stripe, Shopify, Square)', detail: 'Net of fees should match deposits. Differences = unreconciled fees or refunds.' },
-      { time: 'Day 9', task: 'Post recurring journal entries', detail: 'Depreciation, prepaid amortization, accrued expenses, deferred revenue recognition. Use memorized transactions in QBO.' },
-      { time: 'Day 9', task: 'Review A/R aging — send collection reminders', detail: 'Anything 30+ days past due: friendly reminder. 60+: phone call. 90+: collection process.' },
-      { time: 'Day 10', task: 'Final close — lock the books in QBO', detail: 'After reconciliations, journal entries, and review. Set closing date. Set password.' },
-    ],
-  },
-  {
-    range: '11th – 13th',
-    color: '#3B82F6',
-    label: 'Reports & Delivery',
-    tasks: [
-      { time: 'Day 11', task: 'Generate monthly financial statements', detail: 'P&L (current month + YTD), Balance Sheet, Cash Flow Statement. Compare to budget if available.' },
-      { time: 'Day 11', task: 'Generate KPI dashboard or executive summary', detail: 'Revenue, Net Income, Cash, A/R aging. Add 2-3 bullets of insights — not just numbers.' },
-      { time: 'Day 12', task: 'Deliver client portal / monthly report', detail: 'Use the Client Portal Demo template. Include action items, wins, and watch items.' },
-      { time: 'Day 13', task: 'Schedule monthly review call if not standing meeting', detail: '15-30 minutes. Walk through report. Address any questions. Confirm priorities for the coming month.' },
-    ],
-  },
-  {
-    range: '14th – 20th',
-    color: '#0EA5E9',
-    label: 'Tax & Compliance Window',
-    tasks: [
-      { time: 'Day 15', task: 'Process quarterly sales tax filings (if applicable)', detail: 'States typically due by 20th of month following quarter-end (varies). Calculate, file, pay.' },
-      { time: 'Day 15', task: 'Quarterly estimated tax reminder to client (if applicable)', detail: 'Q1: April 15. Q2: June 15. Q3: September 15. Q4: January 15. Calculate based on YTD profit + safe-harbor rules.' },
-      { time: 'Day 20', task: 'Review payroll tax filings (Form 941, state SUTA)', detail: 'Cross-check payroll provider filings against QBO. Catch reconciliation errors before they become IRS letters.' },
-    ],
-  },
-  {
-    range: '21st – 28th',
-    color: '#1E40AF',
-    label: 'Strategic Work',
-    tasks: [
-      { time: 'Day 22', task: 'Cash flow forecast update', detail: 'Project next 13 weeks of cash. Flag any negative balance projections. Critical for owner planning.' },
-      { time: 'Day 25', task: 'Budget vs actual analysis', detail: 'Run YTD budget vs actuals. Identify variance > 10%. Document explanations for owner review.' },
-      { time: 'Day 26', task: 'Review and update Chart of Accounts', detail: 'Are accounts being used correctly? Any new accounts needed for new business activities? Clean up unused accounts.' },
-      { time: 'Day 28', task: 'Pre-close week prep — prepare templates for next month', detail: 'Refresh any spreadsheets, pull standing reports, set up any recurring entries that need adjustment.' },
-    ],
-  },
-  {
-    range: 'Last Day',
-    color: '#0A1E3F',
-    label: 'Month-End Cutoff',
-    tasks: [
-      { time: 'EOD', task: 'Stop posting transactions for the current month', detail: 'Anything dated after the last day belongs to next month. This is the cutoff line.' },
-      { time: 'EOD', task: 'Take month-end inventory count (if applicable)', detail: 'For e-commerce, restaurants, retail. Reconciles to QBO Inventory Asset.' },
-      { time: 'EOD', task: 'Send "Month-End Documents Needed" reminder to client', detail: 'Receipts not yet sent, missing W-9s, anything still outstanding. Get ahead of next month\'s work.' },
-    ],
-  },
-];
+// MONTHLY_WORKFLOW now lives in src/data/workflows.js (lazy-loaded — see useLazyData).
 
-function MonthlyWorkflow() {
+function MonthlyWorkflow(props) {
+  const { mod, err } = useLazyData(loadWorkflowsData);
+  if (!mod) return <DataLoadingCard err={err} />;
+  return <MonthlyWorkflowInner {...props} data={mod} />;
+}
+function MonthlyWorkflowInner({ data }) {
+  const { MONTHLY_WORKFLOW } = data;
   const [active, setActive] = useState(0);
   return (
     <div>
@@ -12870,126 +12093,15 @@ function MonthlyWorkflow() {
 // COMPONENT: MONTH-END CHECKLIST
 // ═══════════════════════════════════════════════════════════════════
 
-const MONTH_END_CHECKLIST = [
-  {
-    section: '1. Bank & Credit Card Reconciliations',
-    icon: '🏦',
-    items: [
-      'All bank accounts reconciled to monthly statement',
-      'All credit card accounts reconciled to monthly statement',
-      'PayPal, Stripe, Square reconciled to processor reports',
-      'Bank statement PDFs attached in QBO for audit trail',
-      'Reconciliation discrepancies documented and resolved',
-      'Outstanding deposits & checks reviewed (no stale items)',
-    ],
-  },
-  {
-    section: '2. Accounts Receivable',
-    icon: '💰',
-    items: [
-      'All customer invoices for the period created and sent',
-      'A/R aging report reviewed — collections workflow active',
-      'Customer credits and refunds properly recorded',
-      'Bad debt write-offs reviewed (if applicable)',
-      'Deferred revenue (prepaid customers) reconciled',
-      'Sales tax liability per state matches A/R sales tax',
-    ],
-  },
-  {
-    section: '3. Accounts Payable',
-    icon: '📄',
-    items: [
-      'All vendor bills entered for the period',
-      'A/P aging report reviewed — payment schedule current',
-      'Outstanding bills reviewed for early-pay discounts',
-      '1099 vendor totals updated YTD (review quarterly minimum)',
-      'Recurring bills set up correctly in QBO',
-      'Credit memos from vendors properly applied',
-    ],
-  },
-  {
-    section: '4. Inventory (if applicable)',
-    icon: '📦',
-    items: [
-      'Physical inventory count performed and recorded',
-      'Inventory adjustments posted (shrinkage, damage, theft)',
-      'COGS calculated and posted using chosen method (FIFO, weighted-avg)',
-      'Inventory Asset on Balance Sheet reconciles to count',
-      'Slow-moving / obsolete inventory identified and reserved',
-    ],
-  },
-  {
-    section: '5. Fixed Assets & Depreciation',
-    icon: '🏢',
-    items: [
-      'New asset purchases capitalized to Fixed Assets',
-      'Asset disposals properly removed with gain/loss recorded',
-      'Monthly depreciation journal entry posted',
-      'Fixed asset register matches Balance Sheet',
-      'Section 179 / bonus depreciation tracked for tax',
-    ],
-  },
-  {
-    section: '6. Payroll',
-    icon: '👥',
-    items: [
-      'All payroll runs for the period processed and recorded in QBO',
-      'Payroll tax liabilities reconciled (FIT, FICA, FUTA, SUTA)',
-      'Employee benefits, retirement contributions recorded',
-      'PTO / vacation accruals updated',
-      'Payroll provider monthly report cross-checked to QBO',
-    ],
-  },
-  {
-    section: '7. Loans & Liabilities',
-    icon: '💳',
-    items: [
-      'Monthly loan payments split correctly (principal vs interest)',
-      'Loan balances on Balance Sheet match lender statements',
-      'Accrued interest calculated and recorded',
-      'Credit card balances reconciled to statements',
-      'Sales tax payable reconciled to filed returns',
-      'Payroll tax payable reconciled to deposits',
-    ],
-  },
-  {
-    section: '8. Recurring Journal Entries',
-    icon: '🔁',
-    items: [
-      'Prepaid expense amortization (insurance, software)',
-      'Accrued expenses for services received but not invoiced',
-      'Deferred revenue recognition (SaaS subscriptions)',
-      'Owner contributions / draws categorized correctly',
-      'Intercompany transactions reconciled (if multi-entity)',
-    ],
-  },
-  {
-    section: '9. Review & Analytics',
-    icon: '📊',
-    items: [
-      'P&L reviewed for unusual swings vs prior month',
-      'Balance Sheet reviewed — every account makes sense',
-      'Cash flow forecast updated',
-      'Budget vs actual variance analysis completed',
-      'KPI dashboard updated (revenue, margin, cash, A/R aging)',
-      'Open questions to client documented and sent',
-    ],
-  },
-  {
-    section: '10. Close & Deliver',
-    icon: '✅',
-    items: [
-      'Books locked in QBO with closing date password',
-      'Monthly financial statements generated',
-      'Client report / portal updated',
-      'Action items list prepared for client review call',
-      'Files archived in client folder (statements, returns, supporting docs)',
-      'Next month\'s recurring tasks scheduled',
-    ],
-  },
-];
+// MONTH_END_CHECKLIST now lives in src/data/workflows.js (lazy-loaded — see useLazyData).
 
-function MonthEndChecklist() {
+function MonthEndChecklist(props) {
+  const { mod, err } = useLazyData(loadWorkflowsData);
+  if (!mod) return <DataLoadingCard err={err} />;
+  return <MonthEndChecklistInner {...props} data={mod} />;
+}
+function MonthEndChecklistInner({ data }) {
+  const { MONTH_END_CHECKLIST } = data;
   const [checked, setChecked] = useState(new Set());
   const totalItems = MONTH_END_CHECKLIST.reduce((sum, s) => sum + s.items.length, 0);
   const progress = Math.round((checked.size / totalItems) * 100);
@@ -13071,114 +12183,15 @@ function MonthEndChecklist() {
 // COMPONENT: YEAR-END CHECKLIST
 // ═══════════════════════════════════════════════════════════════════
 
-const YEAR_END_CHECKLIST = [
-  {
-    section: '1. October – November · Pre-Close Prep',
-    icon: '🍂',
-    items: [
-      'Run preliminary YTD P&L and Balance Sheet — share with CPA early',
-      'Confirm CPA/tax preparer relationship and exchange engagement scope',
-      'Schedule mid-November tax planning meeting with client + CPA',
-      'Review W-9s on file for ALL vendors paid YTD',
-      'Identify vendors paid $600+ who don\'t have W-9s yet — request now',
-      'Verify legal name, address, EIN for all 1099 vendors',
-      'Begin year-end tax planning (Section 179 purchases, retirement contributions, etc.)',
-      'Review estimated tax payments YTD vs projected liability',
-    ],
-  },
-  {
-    section: '2. December · Last Month Operations',
-    icon: '❄️',
-    items: [
-      'Final purchases of fixed assets for Section 179 / bonus depreciation election',
-      'Bonus payments to employees processed before Dec 31',
-      'Year-end retirement plan contributions made',
-      'Charitable donations documented and receipted',
-      'All bank, credit card, and loan accounts reconciled through Dec 31',
-      'Inventory count completed Dec 31 (or last business day)',
-      'All A/R invoiced through year-end',
-      'All A/P bills entered through year-end',
-      'Year-end physical inventory adjustments posted',
-    ],
-  },
-  {
-    section: '3. January 1-15 · Initial Close',
-    icon: '🗓️',
-    items: [
-      'Final December reconciliations completed',
-      'All year-end adjusting journal entries posted (depreciation, prepaids, accruals)',
-      'Owner distributions / draws fully recorded',
-      'Inter-company eliminations completed (if multi-entity)',
-      'Run preliminary annual P&L and Balance Sheet',
-      'Compare results to budget and prior year',
-      'Identify any unusual items requiring CPA discussion',
-    ],
-  },
-  {
-    section: '4. January 15 – 31 · 1099s & W-2s',
-    icon: '📋',
-    items: [
-      'Q4 estimated tax payment due January 15',
-      'Pull 1099 vendor report for vendors paid $600+',
-      'Generate 1099-NEC forms for nonemployee compensation',
-      'Generate 1099-MISC forms for rent, attorney fees, royalties',
-      'Distribute 1099s to recipients by January 31',
-      'File 1099s with IRS by January 31',
-      'Verify all W-2s issued by payroll provider by January 31',
-      'Confirm W-3 transmittal filed with SSA by January 31',
-      'Q4 Form 941 filed by January 31',
-      'Annual Form 940 (FUTA) filed by January 31',
-      'State unemployment Q4 + annual reconciliation filed',
-    ],
-  },
-  {
-    section: '5. February – March · Books to CPA',
-    icon: '📤',
-    items: [
-      'Deliver final annual P&L to CPA',
-      'Deliver final Balance Sheet as of December 31',
-      'Deliver fixed asset schedule with current year additions/disposals',
-      'Deliver depreciation schedule for the year',
-      'Provide 1099 totals reconciliation',
-      'Provide loan amortization schedules (year-end principal balances)',
-      'Provide inventory roll-forward (beginning + purchases - COGS = ending)',
-      'Respond to CPA questions promptly',
-      'Lock prior year books once CPA confirms tax return is filed',
-    ],
-  },
-  {
-    section: '6. Year-End Tax Planning Review',
-    icon: '🎯',
-    items: [
-      'Section 179 deduction maximized (up to ~$1.16M for 2024)',
-      'Bonus depreciation evaluated (60% for 2024 placed-in-service)',
-      'Retirement plan contributions optimized (SEP-IRA, Solo 401k, SIMPLE)',
-      'Health insurance premiums tracked for self-employed deduction',
-      'QBI (Qualified Business Income) 20% deduction evaluated',
-      'Home office deduction calculated (if applicable)',
-      'Vehicle expense method chosen (standard mileage vs actual)',
-      'S-corp salary review — is owner taking "reasonable comp"?',
-      'Estimated tax safe harbor confirmed for next year',
-      'Discuss any major asset purchases planned for next year',
-    ],
-  },
-  {
-    section: '7. Forward-Looking · Next Year Prep',
-    icon: '🌱',
-    items: [
-      'Update client engagement letter with any rate changes',
-      'Set next year\'s monthly close schedule',
-      'Update recurring journal entries (depreciation, prepaids, etc.)',
-      'Review Chart of Accounts — clean up unused, add new as needed',
-      'Update budget / forecast for next year',
-      'Reset 1099 vendor tracking for new year',
-      'Calendar all next year tax deadlines',
-      'Lock prior year books permanently (closing date password)',
-    ],
-  },
-];
+// YEAR_END_CHECKLIST now lives in src/data/workflows.js (lazy-loaded — see useLazyData).
 
-function YearEndChecklist() {
+function YearEndChecklist(props) {
+  const { mod, err } = useLazyData(loadWorkflowsData);
+  if (!mod) return <DataLoadingCard err={err} />;
+  return <YearEndChecklistInner {...props} data={mod} />;
+}
+function YearEndChecklistInner({ data }) {
+  const { YEAR_END_CHECKLIST } = data;
   const [checked, setChecked] = useState(new Set());
   const totalItems = YEAR_END_CHECKLIST.reduce((sum, s) => sum + s.items.length, 0);
   const progress = Math.round((checked.size / totalItems) * 100);
@@ -14653,92 +13666,17 @@ function AccountingCalculators() {
 // COMPONENT: NICHE SELECTOR QUIZ (Training & Skills)
 // ═══════════════════════════════════════════════════════════════════
 
-const NICHE_QUESTIONS = [
-  {
-    q: 'Which type of work energizes you most?',
-    options: [
-      { label: 'Pattern-matching and reconciliation — finding mistakes others missed', tags: ['ecommerce', 'restaurant', 'medical'] },
-      { label: 'Complex narratives — long-running projects with many moving parts', tags: ['construction', 'lawfirm', 'professional'] },
-      { label: 'Strategic, forward-looking advisory work', tags: ['saas', 'startup', 'agency'] },
-      { label: 'Tracking inventory and physical goods', tags: ['ecommerce', 'restaurant', 'trucking'] },
-    ],
-  },
-  {
-    q: 'How comfortable are you with technology and integrations?',
-    options: [
-      { label: 'Very — I love connecting apps, building automations, learning new tools', tags: ['saas', 'ecommerce', 'startup', 'agency'] },
-      { label: 'Comfortable but prefer stable, well-known tools', tags: ['lawfirm', 'realestate', 'professional', 'medical'] },
-      { label: 'Prefer simple, traditional bookkeeping without complex integrations', tags: ['construction', 'restaurant', 'trucking'] },
-    ],
-  },
-  {
-    q: 'What kind of client communication style suits you?',
-    options: [
-      { label: 'Async-first — Slack, Loom, email, minimal calls', tags: ['saas', 'startup', 'agency', 'ecommerce'] },
-      { label: 'Hybrid — scheduled monthly calls + async between', tags: ['professional', 'medical', 'realestate', 'agency'] },
-      { label: 'Heavy real-time communication — calls, in-person feel, frequent touchpoints', tags: ['construction', 'restaurant', 'lawfirm'] },
-    ],
-  },
-  {
-    q: 'What client size are you targeting?',
-    options: [
-      { label: 'Solopreneurs and very small businesses ($100K–$500K revenue)', tags: ['professional', 'realestate', 'agency', 'startup'] },
-      { label: 'Small businesses ($500K–$3M revenue)', tags: ['ecommerce', 'restaurant', 'construction', 'medical', 'lawfirm'] },
-      { label: 'Growth-stage / scaling companies ($3M+ revenue)', tags: ['saas', 'accountingfirm', 'trucking'] },
-    ],
-  },
-  {
-    q: 'What technical specialization interests you most?',
-    options: [
-      { label: 'Tax-adjacent work — sales tax, 1099s, quarterly estimates', tags: ['ecommerce', 'professional', 'realestate'] },
-      { label: 'Industry-specific compliance (IOLTA, HIPAA, IFTA, trust accounting)', tags: ['lawfirm', 'medical', 'trucking', 'nonprofit'] },
-      { label: 'Advanced accounting (ASC 606, deferred revenue, equity, M&A)', tags: ['saas', 'startup', 'accountingfirm'] },
-      { label: 'Cost accounting / job costing / unit economics', tags: ['construction', 'restaurant', 'agency', 'professional'] },
-    ],
-  },
-  {
-    q: 'How important is recurring monthly revenue vs project-based work to you?',
-    options: [
-      { label: 'Strong preference for predictable monthly retainers', tags: ['saas', 'agency', 'medical', 'lawfirm', 'realestate'] },
-      { label: 'Mix of recurring + occasional cleanup/project work', tags: ['ecommerce', 'professional', 'restaurant', 'construction'] },
-      { label: 'Open to project-heavy work (cleanups, audits, special engagements)', tags: ['accountingfirm', 'nonprofit', 'startup'] },
-    ],
-  },
-  {
-    q: 'How do you feel about working with regulatory/compliance pressure?',
-    options: [
-      { label: 'I thrive on it — strict rules, deadlines, audits, regulations', tags: ['lawfirm', 'medical', 'trucking', 'nonprofit'] },
-      { label: 'Comfortable but not my main draw', tags: ['ecommerce', 'realestate', 'restaurant', 'professional'] },
-      { label: 'Prefer minimal regulatory complexity', tags: ['agency', 'saas', 'startup', 'construction'] },
-    ],
-  },
-  {
-    q: 'How important is geographic/state diversity in your client base?',
-    options: [
-      { label: 'I want clients across many US states (multi-state expertise)', tags: ['ecommerce', 'saas', 'accountingfirm', 'agency'] },
-      { label: 'A few states is fine — focused regional expertise', tags: ['realestate', 'construction', 'restaurant', 'medical'] },
-      { label: 'No preference — wherever the right clients are', tags: ['professional', 'startup', 'lawfirm', 'nonprofit'] },
-    ],
-  },
-];
+// NICHE_QUESTIONS now lives in src/data/niche.js (lazy-loaded — see useLazyData).
 
-const NICHE_PROFILES = {
-  construction: { name: 'Construction', icon: '🏗️', why: 'You like project-based narratives, cost tracking, and working with hands-on owners. Construction bookkeepers are well-paid because job costing and WIP accounting are technically demanding.' },
-  ecommerce: { name: 'E-Commerce', icon: '🛒', why: 'You like patterns, reconciliations, and tech tools. E-comm is the most "remote-bookkeeper-native" niche — async-first owners, cloud-based everything.' },
-  lawfirm: { name: 'Law Firm', icon: '⚖️', why: 'You can handle high-stakes compliance (IOLTA trust accounting) and like working with detail-oriented professionals. Law firms pay premium rates for trust-account expertise.' },
-  realestate: { name: 'Real Estate (Investor / PM)', icon: '🏘️', why: 'You like property-by-property tracking and the steady rhythm of rental income. Real estate investors are a fast-growing remote-bookkeeper niche.' },
-  restaurant: { name: 'Restaurant / F&B', icon: '🍽️', why: 'You enjoy hands-on operators and high-touch communication. Restaurants need weekly food-cost analysis — recurring high-frequency work.' },
-  medical: { name: 'Medical / Healthcare', icon: '🏥', why: 'You can handle HIPAA-adjacent workflows (with BAA) and complex insurance contractual adjustments. Medical practices are stable, recurring clients.' },
-  saas: { name: 'SaaS / Software', icon: '💻', why: 'You love technical accounting (ASC 606, deferred revenue, MRR/ARR) and tech-native founders. SaaS bookkeepers command the highest remote rates.' },
-  agency: { name: 'Marketing / Creative Agency', icon: '🎨', why: 'You like project profitability work and async-first founders. Agency owners are remote-team native — easiest "yes" for hiring a remote bookkeeper.' },
-  nonprofit: { name: 'Nonprofit', icon: '🤝', why: 'You like mission-driven work and fund accounting nuance. Nonprofits desperately need clean Form 990 prep and can pay $1K-$2K/month remote.' },
-  trucking: { name: 'Trucking / Logistics', icon: '🚚', why: 'You like operational rhythm work (IFTA filings, fuel cards, per-mile economics) and owner-operators who need everything done because they\'re on the road.' },
-  professional: { name: 'Professional Services', icon: '💼', why: 'You like time-and-billing work and helping solo consultants/engineers/architects. Predictable monthly retainer territory at $1.5K-$3K/month.' },
-  startup: { name: 'Tech Startup (Pre-Revenue / Seed)', icon: '🚀', why: 'You love modern tools (Carta, Stripe, Slack) and being part of fast-growth stories. Investor-ready books are your superpower.' },
-  accountingfirm: { name: 'Accounting / Tax / CFO Firm', icon: '📊', why: 'You want to scale by working with US firms as their Tier 1 production engine. This is the most strategic niche for an ambitious remote bookkeeper.' },
-};
+// NICHE_PROFILES now lives in src/data/niche.js (lazy-loaded — see useLazyData).
 
-function NicheSelectorQuiz({ goto }) {
+function NicheSelectorQuiz(props) {
+  const { mod, err } = useLazyData(loadNicheData);
+  if (!mod) return <DataLoadingCard err={err} />;
+  return <NicheSelectorQuizInner {...props} data={mod} />;
+}
+function NicheSelectorQuizInner({ goto, data }) {
+  const { NICHE_QUESTIONS, NICHE_PROFILES } = data;
   const [answers, setAnswers] = useState({});
   const [showResults, setShowResults] = useState(false);
 
@@ -17174,153 +16112,15 @@ Current monthly fee: $${monthlyFee}`;
 // COMPONENT: DIFFICULT CLIENT PLAYBOOK (Client Success & Growth)
 // ═══════════════════════════════════════════════════════════════════
 
-const DIFFICULT_SCENARIOS = [
-  {
-    id: 'late-payer',
-    title: 'Chronically Late Payer',
-    icon: '💸',
-    signs: ['Invoices regularly 30+ days overdue', 'Excuses repeatedly', 'Promises payment then doesn\'t deliver', 'Asks for "just one more week"'],
-    decision: 'Salvage IF: total relationship is profitable, communication is otherwise healthy, willing to switch to auto-pay or upfront retainer. Fire IF: 3+ months late, ignoring dunning emails, total receivable > 1 month of fees.',
-    salvageSteps: [
-      'Send firm but kind dunning email: "Hi [Name], invoice #X is now 30 days past due. Per our engagement letter, work pauses on day 45. Can you process payment this week, or share when I can expect it?"',
-      'Propose switch to auto-pay (Stripe ACH, $0.25 fee absorbed by you) or upfront retainer (next 3 months pre-paid)',
-      'If salvageable: send updated engagement letter with payment terms enforced (late fee 1.5%/mo, work pause day 45, termination day 60)',
-      'Document EVERY late instance in your records',
-    ],
-    fireSteps: [
-      'Send 30-day termination notice via email (not Slack/text)',
-      'Reference specific incidents and the engagement letter terms violated',
-      'Offer to deliver final work product upon receipt of outstanding balance',
-      'Be professional, no anger. "Effective [date+30], I will be transitioning the engagement. I can deliver your QBO file, working papers, and final P&L upon payment of outstanding balance of $X."',
-    ],
-    emailTemplate: `Subject: Outstanding Invoice + Engagement Update
+// DIFFICULT_SCENARIOS now lives in src/data/difficult-clients.js (lazy-loaded — see useLazyData).
 
-Hi [First Name],
-
-I wanted to reach out about Invoice #[X] (issued [date], totaling $[amount]). It's now [days] past due, and per our engagement letter, work pauses on day 45 of any past-due invoice.
-
-I'd love to keep our engagement on track. Can we either:
-1. Process payment this week, OR
-2. Switch to auto-pay (Stripe ACH) going forward so this doesn't happen again
-
-Let me know which works for you by [date]. Happy to jump on a quick call if helpful.
-
-Thanks,
-[Your Name]`,
-  },
-  {
-    id: 'scope-creeper',
-    title: 'Scope Creeper',
-    icon: '📋',
-    signs: ['"Quick question" turns into 2 hours of work', 'Sends financial requests outside agreed scope', '"Can you also handle the..."', 'No additional fee discussed'],
-    decision: 'Salvage IF: client is responsive, profitable overall, willing to negotiate scope formally. Fire IF: scope creep is constant despite multiple resets, owner doesn\'t respect your time, you\'re losing money.',
-    salvageSteps: [
-      'Run a scope audit: list every recurring task you do. Compare against engagement letter.',
-      'Schedule a 30-min "engagement review" call (not a "we need to talk" call)',
-      'Frame as: "I want to make sure we\'re still aligned. Here\'s what I\'m delivering today vs what we agreed to in the original SOW."',
-      'Propose: (1) new fee that includes current scope, OR (2) trim back to original scope, OR (3) add-on rates for additional work',
-      'Send updated engagement letter within 48 hours of the call',
-    ],
-    fireSteps: [
-      'If they refuse to formalize the new scope: 30-day notice',
-      'Use this language: "I\'ve enjoyed working together, but the scope of work has grown beyond what I can sustainably deliver at our current arrangement. Rather than continue to underserve you, I\'m giving 30 days notice."',
-    ],
-    emailTemplate: `Subject: Engagement Scope Review
-
-Hi [First Name],
-
-I'd love to schedule a 30-minute call this week or next to review our engagement.
-
-When we started together [months] ago, we scoped X, Y, Z. Over time, the work has naturally expanded to include A, B, C as well. I want to make sure we're properly aligned and that I'm able to deliver at the level you deserve.
-
-I have three options to discuss:
-1. Update the engagement to reflect current scope (with a fee adjustment)
-2. Refocus back to the original SOW
-3. Set up a hybrid: monthly fee for core scope + project-based for additional work
-
-When works for a 30-min call?
-
-Best,
-[Your Name]`,
-  },
-  {
-    id: 'abusive-comm',
-    title: 'Abusive Communication',
-    icon: '🚨',
-    signs: ['Rude or condescending messages', 'Yells / capitalizes / uses harsh language', 'Demands work outside business hours', 'Disrespects your culture or location', 'Threatens to leave bad reviews'],
-    decision: 'FIRE — almost always. Salvage ONLY if it was a single bad day, they apologized, and it\'s a high-value long-term client. Otherwise: this is non-negotiable.',
-    salvageSteps: [
-      'Schedule a call (not text/Slack — voice is required for this)',
-      'Be calm but firm: "I want to address how communication has been recently. I value our work together, but [specific examples] aren\'t how I work with any client. I need us to reset on tone."',
-      'Listen to their response. If they apologize and own it: continue with clear terms.',
-      'Document the conversation in email summary.',
-      'One-strike policy: any future incidents = immediate termination, no notice required.',
-    ],
-    fireSteps: [
-      'Don\'t respond to the abusive message immediately. Wait 24 hours.',
-      'Send termination email: "After consideration, I\'ve decided to end our engagement effective [date+30, or immediately if severe]. The communication on [date] doesn\'t align with how I work with clients."',
-      'Block them on all personal channels. Keep business email only for transition.',
-      'Deliver final work product cleanly. Don\'t respond to anger or guilt-trips.',
-      'You don\'t owe an explanation beyond this.',
-    ],
-    emailTemplate: `Subject: Ending Our Engagement
-
-[First Name],
-
-After careful consideration, I've decided to end our engagement effective [date+30 days, or "immediately" if severe].
-
-The communication on [specific date] is not how I work with clients, and I don't think continuing is the right fit for either of us.
-
-I will deliver:
-- Final reconciled QBO file through [date]
-- Working papers and reconciliations
-- Final P&L and Balance Sheet
-- 30-min transition call to your new bookkeeper (if desired)
-
-I wish you the best with your business.
-
-[Your Name]`,
-  },
-  {
-    id: 'ghosting',
-    title: 'Client Ghosting You',
-    icon: '👻',
-    signs: ['No response for 2+ weeks despite multiple follow-ups', 'Reads messages but doesn\'t reply', 'Cancels calls last-minute repeatedly', 'Missing data requests pile up'],
-    decision: 'Salvage IF: pays on time, just busy/disorganized, you can do most work without their input. Fire IF: payment also stops, work product can\'t be delivered without them, they\'ve gone fully silent for 30+ days.',
-    salvageSteps: [
-      'Try a different channel: if email is silent, try a text or Loom video',
-      'Make the ask SPECIFIC and easy: instead of "send me your receipts" try "send me a photo of your AmEx December statement — that\'s all I need to close the month"',
-      'Send a "I noticed" email: "Hi [Name], I haven\'t heard from you in 3 weeks. I want to make sure everything\'s okay. Is there something blocking our work together?"',
-      'Offer to simplify: "Would you prefer I pause monthly close and just keep books rolling forward until you have bandwidth?"',
-      'Send a Loom video — easier to consume than long emails',
-    ],
-    fireSteps: [
-      '30-day notice email: "I haven\'t been able to reach you in [X] weeks. I\'m unable to deliver the level of service you\'re paying for without your input."',
-      'Set a firm response deadline in the notice email',
-      'If still no response: send final invoice + termination summary on day 30',
-      'Keep records of every outreach attempt',
-    ],
-    emailTemplate: `Subject: Checking In + Path Forward
-
-Hi [First Name],
-
-I wanted to reach out — I haven't heard from you in [X] weeks, and I have a few items that need your input to close out [month].
-
-Specifically, I need:
-- [One small specific item]
-- [One small specific item]
-- [One small specific item]
-
-If life is busy, I totally get it — would you prefer I pause monthly close and just keep books rolling forward until you have bandwidth? That way you're not paying for work you can't make use of.
-
-Can you let me know by [Friday]? If I don't hear back, I'll assume we're pausing and follow up next month.
-
-Best,
-[Your Name]`,
-  },
-];
-
-function DifficultClientPlaybook() {
+function DifficultClientPlaybook(props) {
+  const { mod, err } = useLazyData(loadDifficultClientsData);
+  if (!mod) return <DataLoadingCard err={err} />;
+  return <DifficultClientPlaybookInner {...props} data={mod} />;
+}
+function DifficultClientPlaybookInner({ data }) {
+  const { DIFFICULT_SCENARIOS } = data;
   const [activeScenario, setActiveScenario] = useState(DIFFICULT_SCENARIOS[0].id);
   const scenario = DIFFICULT_SCENARIOS.find(s => s.id === activeScenario);
 

@@ -1,0 +1,316 @@
+// Monthly workflow + month-end/year-end checklists.
+// Extracted from src/BookkeeperPro.jsx as pure data — lazy-loaded on first visit
+// of the consuming tab via the useLazyData hook (see BookkeeperPro.jsx).
+
+export const MONTHLY_WORKFLOW = [
+  {
+    range: '1st – 3rd',
+    color: '#1E40AF',
+    label: 'Daily Rhythm Resumes',
+    tasks: [
+      { time: 'Daily', task: 'Categorize bank feeds from prior business day', detail: 'Match transactions to vendors, assign to correct accounts. Use Bank Feed AI tool for unfamiliar vendors.' },
+      { time: 'Daily', task: 'Check email for client documents, questions, or open invoices', detail: 'Respond same-day or within 24 hours. Speed of response is a brand asset.' },
+      { time: 'Day 1', task: 'Confirm prior month is officially closed in QBO', detail: 'Run Close the Books → set closing date to last day of prior month. Set password.' },
+    ],
+  },
+  {
+    range: '5th',
+    color: '#3B82F6',
+    label: 'Bank Statements Drop',
+    tasks: [
+      { time: 'Morning', task: 'Bank statements typically generate by the 5th of the month', detail: 'Download statements for all bank, credit card, and loan accounts for the just-closed month.' },
+      { time: 'Same day', task: 'Upload statements to QBO Document attachments', detail: 'Attach to the matching account in QBO for audit trail. Always.' },
+      { time: 'Same day', task: 'Run initial bank reconciliation', detail: 'Mark cleared transactions. Identify any unmatched items.' },
+    ],
+  },
+  {
+    range: '6th – 7th',
+    color: '#0EA5E9',
+    label: 'Open Questions to Client',
+    tasks: [
+      { time: 'Day 6', task: 'Compile list of "Open Questions" for the client', detail: 'Anything you cannot categorize confidently — bundle into ONE email, not 12 separate ones.' },
+      { time: 'Day 6', task: 'Send "Open Questions" email to client', detail: 'Use the BLUF method. Number each question. Attach screenshots. Make it easy to answer.' },
+      { time: 'Day 7', task: 'Continue reconciliations on accounts not waiting for answers', detail: 'Do not let one missing answer block 5 other accounts.' },
+    ],
+  },
+  {
+    range: '8th – 10th',
+    color: '#1E40AF',
+    label: 'Reconciliations & Adjustments',
+    tasks: [
+      { time: 'Day 8', task: 'Complete bank reconciliations for all accounts', detail: 'Bank, credit card, loan accounts. Each must reconcile to the statement.' },
+      { time: 'Day 8', task: 'Reconcile merchant processor statements (Stripe, Shopify, Square)', detail: 'Net of fees should match deposits. Differences = unreconciled fees or refunds.' },
+      { time: 'Day 9', task: 'Post recurring journal entries', detail: 'Depreciation, prepaid amortization, accrued expenses, deferred revenue recognition. Use memorized transactions in QBO.' },
+      { time: 'Day 9', task: 'Review A/R aging — send collection reminders', detail: 'Anything 30+ days past due: friendly reminder. 60+: phone call. 90+: collection process.' },
+      { time: 'Day 10', task: 'Final close — lock the books in QBO', detail: 'After reconciliations, journal entries, and review. Set closing date. Set password.' },
+    ],
+  },
+  {
+    range: '11th – 13th',
+    color: '#3B82F6',
+    label: 'Reports & Delivery',
+    tasks: [
+      { time: 'Day 11', task: 'Generate monthly financial statements', detail: 'P&L (current month + YTD), Balance Sheet, Cash Flow Statement. Compare to budget if available.' },
+      { time: 'Day 11', task: 'Generate KPI dashboard or executive summary', detail: 'Revenue, Net Income, Cash, A/R aging. Add 2-3 bullets of insights — not just numbers.' },
+      { time: 'Day 12', task: 'Deliver client portal / monthly report', detail: 'Use the Client Portal Demo template. Include action items, wins, and watch items.' },
+      { time: 'Day 13', task: 'Schedule monthly review call if not standing meeting', detail: '15-30 minutes. Walk through report. Address any questions. Confirm priorities for the coming month.' },
+    ],
+  },
+  {
+    range: '14th – 20th',
+    color: '#0EA5E9',
+    label: 'Tax & Compliance Window',
+    tasks: [
+      { time: 'Day 15', task: 'Process quarterly sales tax filings (if applicable)', detail: 'States typically due by 20th of month following quarter-end (varies). Calculate, file, pay.' },
+      { time: 'Day 15', task: 'Quarterly estimated tax reminder to client (if applicable)', detail: 'Q1: April 15. Q2: June 15. Q3: September 15. Q4: January 15. Calculate based on YTD profit + safe-harbor rules.' },
+      { time: 'Day 20', task: 'Review payroll tax filings (Form 941, state SUTA)', detail: 'Cross-check payroll provider filings against QBO. Catch reconciliation errors before they become IRS letters.' },
+    ],
+  },
+  {
+    range: '21st – 28th',
+    color: '#1E40AF',
+    label: 'Strategic Work',
+    tasks: [
+      { time: 'Day 22', task: 'Cash flow forecast update', detail: 'Project next 13 weeks of cash. Flag any negative balance projections. Critical for owner planning.' },
+      { time: 'Day 25', task: 'Budget vs actual analysis', detail: 'Run YTD budget vs actuals. Identify variance > 10%. Document explanations for owner review.' },
+      { time: 'Day 26', task: 'Review and update Chart of Accounts', detail: 'Are accounts being used correctly? Any new accounts needed for new business activities? Clean up unused accounts.' },
+      { time: 'Day 28', task: 'Pre-close week prep — prepare templates for next month', detail: 'Refresh any spreadsheets, pull standing reports, set up any recurring entries that need adjustment.' },
+    ],
+  },
+  {
+    range: 'Last Day',
+    color: '#0A1E3F',
+    label: 'Month-End Cutoff',
+    tasks: [
+      { time: 'EOD', task: 'Stop posting transactions for the current month', detail: 'Anything dated after the last day belongs to next month. This is the cutoff line.' },
+      { time: 'EOD', task: 'Take month-end inventory count (if applicable)', detail: 'For e-commerce, restaurants, retail. Reconciles to QBO Inventory Asset.' },
+      { time: 'EOD', task: 'Send "Month-End Documents Needed" reminder to client', detail: 'Receipts not yet sent, missing W-9s, anything still outstanding. Get ahead of next month\'s work.' },
+    ],
+  },
+];
+
+export const MONTH_END_CHECKLIST = [
+  {
+    section: '1. Bank & Credit Card Reconciliations',
+    icon: '🏦',
+    items: [
+      'All bank accounts reconciled to monthly statement',
+      'All credit card accounts reconciled to monthly statement',
+      'PayPal, Stripe, Square reconciled to processor reports',
+      'Bank statement PDFs attached in QBO for audit trail',
+      'Reconciliation discrepancies documented and resolved',
+      'Outstanding deposits & checks reviewed (no stale items)',
+    ],
+  },
+  {
+    section: '2. Accounts Receivable',
+    icon: '💰',
+    items: [
+      'All customer invoices for the period created and sent',
+      'A/R aging report reviewed — collections workflow active',
+      'Customer credits and refunds properly recorded',
+      'Bad debt write-offs reviewed (if applicable)',
+      'Deferred revenue (prepaid customers) reconciled',
+      'Sales tax liability per state matches A/R sales tax',
+    ],
+  },
+  {
+    section: '3. Accounts Payable',
+    icon: '📄',
+    items: [
+      'All vendor bills entered for the period',
+      'A/P aging report reviewed — payment schedule current',
+      'Outstanding bills reviewed for early-pay discounts',
+      '1099 vendor totals updated YTD (review quarterly minimum)',
+      'Recurring bills set up correctly in QBO',
+      'Credit memos from vendors properly applied',
+    ],
+  },
+  {
+    section: '4. Inventory (if applicable)',
+    icon: '📦',
+    items: [
+      'Physical inventory count performed and recorded',
+      'Inventory adjustments posted (shrinkage, damage, theft)',
+      'COGS calculated and posted using chosen method (FIFO, weighted-avg)',
+      'Inventory Asset on Balance Sheet reconciles to count',
+      'Slow-moving / obsolete inventory identified and reserved',
+    ],
+  },
+  {
+    section: '5. Fixed Assets & Depreciation',
+    icon: '🏢',
+    items: [
+      'New asset purchases capitalized to Fixed Assets',
+      'Asset disposals properly removed with gain/loss recorded',
+      'Monthly depreciation journal entry posted',
+      'Fixed asset register matches Balance Sheet',
+      'Section 179 / bonus depreciation tracked for tax',
+    ],
+  },
+  {
+    section: '6. Payroll',
+    icon: '👥',
+    items: [
+      'All payroll runs for the period processed and recorded in QBO',
+      'Payroll tax liabilities reconciled (FIT, FICA, FUTA, SUTA)',
+      'Employee benefits, retirement contributions recorded',
+      'PTO / vacation accruals updated',
+      'Payroll provider monthly report cross-checked to QBO',
+    ],
+  },
+  {
+    section: '7. Loans & Liabilities',
+    icon: '💳',
+    items: [
+      'Monthly loan payments split correctly (principal vs interest)',
+      'Loan balances on Balance Sheet match lender statements',
+      'Accrued interest calculated and recorded',
+      'Credit card balances reconciled to statements',
+      'Sales tax payable reconciled to filed returns',
+      'Payroll tax payable reconciled to deposits',
+    ],
+  },
+  {
+    section: '8. Recurring Journal Entries',
+    icon: '🔁',
+    items: [
+      'Prepaid expense amortization (insurance, software)',
+      'Accrued expenses for services received but not invoiced',
+      'Deferred revenue recognition (SaaS subscriptions)',
+      'Owner contributions / draws categorized correctly',
+      'Intercompany transactions reconciled (if multi-entity)',
+    ],
+  },
+  {
+    section: '9. Review & Analytics',
+    icon: '📊',
+    items: [
+      'P&L reviewed for unusual swings vs prior month',
+      'Balance Sheet reviewed — every account makes sense',
+      'Cash flow forecast updated',
+      'Budget vs actual variance analysis completed',
+      'KPI dashboard updated (revenue, margin, cash, A/R aging)',
+      'Open questions to client documented and sent',
+    ],
+  },
+  {
+    section: '10. Close & Deliver',
+    icon: '✅',
+    items: [
+      'Books locked in QBO with closing date password',
+      'Monthly financial statements generated',
+      'Client report / portal updated',
+      'Action items list prepared for client review call',
+      'Files archived in client folder (statements, returns, supporting docs)',
+      'Next month\'s recurring tasks scheduled',
+    ],
+  },
+];
+
+export const YEAR_END_CHECKLIST = [
+  {
+    section: '1. October – November · Pre-Close Prep',
+    icon: '🍂',
+    items: [
+      'Run preliminary YTD P&L and Balance Sheet — share with CPA early',
+      'Confirm CPA/tax preparer relationship and exchange engagement scope',
+      'Schedule mid-November tax planning meeting with client + CPA',
+      'Review W-9s on file for ALL vendors paid YTD',
+      'Identify vendors paid $600+ who don\'t have W-9s yet — request now',
+      'Verify legal name, address, EIN for all 1099 vendors',
+      'Begin year-end tax planning (Section 179 purchases, retirement contributions, etc.)',
+      'Review estimated tax payments YTD vs projected liability',
+    ],
+  },
+  {
+    section: '2. December · Last Month Operations',
+    icon: '❄️',
+    items: [
+      'Final purchases of fixed assets for Section 179 / bonus depreciation election',
+      'Bonus payments to employees processed before Dec 31',
+      'Year-end retirement plan contributions made',
+      'Charitable donations documented and receipted',
+      'All bank, credit card, and loan accounts reconciled through Dec 31',
+      'Inventory count completed Dec 31 (or last business day)',
+      'All A/R invoiced through year-end',
+      'All A/P bills entered through year-end',
+      'Year-end physical inventory adjustments posted',
+    ],
+  },
+  {
+    section: '3. January 1-15 · Initial Close',
+    icon: '🗓️',
+    items: [
+      'Final December reconciliations completed',
+      'All year-end adjusting journal entries posted (depreciation, prepaids, accruals)',
+      'Owner distributions / draws fully recorded',
+      'Inter-company eliminations completed (if multi-entity)',
+      'Run preliminary annual P&L and Balance Sheet',
+      'Compare results to budget and prior year',
+      'Identify any unusual items requiring CPA discussion',
+    ],
+  },
+  {
+    section: '4. January 15 – 31 · 1099s & W-2s',
+    icon: '📋',
+    items: [
+      'Q4 estimated tax payment due January 15',
+      'Pull 1099 vendor report for vendors paid $600+',
+      'Generate 1099-NEC forms for nonemployee compensation',
+      'Generate 1099-MISC forms for rent, attorney fees, royalties',
+      'Distribute 1099s to recipients by January 31',
+      'File 1099s with IRS by January 31',
+      'Verify all W-2s issued by payroll provider by January 31',
+      'Confirm W-3 transmittal filed with SSA by January 31',
+      'Q4 Form 941 filed by January 31',
+      'Annual Form 940 (FUTA) filed by January 31',
+      'State unemployment Q4 + annual reconciliation filed',
+    ],
+  },
+  {
+    section: '5. February – March · Books to CPA',
+    icon: '📤',
+    items: [
+      'Deliver final annual P&L to CPA',
+      'Deliver final Balance Sheet as of December 31',
+      'Deliver fixed asset schedule with current year additions/disposals',
+      'Deliver depreciation schedule for the year',
+      'Provide 1099 totals reconciliation',
+      'Provide loan amortization schedules (year-end principal balances)',
+      'Provide inventory roll-forward (beginning + purchases - COGS = ending)',
+      'Respond to CPA questions promptly',
+      'Lock prior year books once CPA confirms tax return is filed',
+    ],
+  },
+  {
+    section: '6. Year-End Tax Planning Review',
+    icon: '🎯',
+    items: [
+      'Section 179 deduction maximized (up to ~$1.16M for 2024)',
+      'Bonus depreciation evaluated (60% for 2024 placed-in-service)',
+      'Retirement plan contributions optimized (SEP-IRA, Solo 401k, SIMPLE)',
+      'Health insurance premiums tracked for self-employed deduction',
+      'QBI (Qualified Business Income) 20% deduction evaluated',
+      'Home office deduction calculated (if applicable)',
+      'Vehicle expense method chosen (standard mileage vs actual)',
+      'S-corp salary review — is owner taking "reasonable comp"?',
+      'Estimated tax safe harbor confirmed for next year',
+      'Discuss any major asset purchases planned for next year',
+    ],
+  },
+  {
+    section: '7. Forward-Looking · Next Year Prep',
+    icon: '🌱',
+    items: [
+      'Update client engagement letter with any rate changes',
+      'Set next year\'s monthly close schedule',
+      'Update recurring journal entries (depreciation, prepaids, etc.)',
+      'Review Chart of Accounts — clean up unused, add new as needed',
+      'Update budget / forecast for next year',
+      'Reset 1099 vendor tracking for new year',
+      'Calendar all next year tax deadlines',
+      'Lock prior year books permanently (closing date password)',
+    ],
+  },
+];
