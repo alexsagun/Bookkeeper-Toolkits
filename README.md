@@ -8,6 +8,13 @@
 
 The UI is a single large React component (`src/BookkeeperPro.jsx`) styled with Tailwind.
 
+> **Database / backend setup (Supabase):** for a **fresh** project, run
+> **[`db/000_full_database_bootstrap.sql`](db/000_full_database_bootstrap.sql)** once; for an **existing** one,
+> apply the dated `db/*.sql` files in the order documented in `db/README.md`. Full run order + per-file index:
+> **[`db/README.md`](db/README.md)**. Dashboard walkthroughs: [AUTH_SETUP.md](AUTH_SETUP.md),
+> [COURSE_SETUP.md](COURSE_SETUP.md), [ADMIN_APPROVAL_SETUP.md](ADMIN_APPROVAL_SETUP.md),
+> [ENROLLMENT_SETUP.md](ENROLLMENT_SETUP.md).
+
 ---
 
 ## Quickstart

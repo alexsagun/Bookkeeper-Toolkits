@@ -42,40 +42,50 @@ begin
 end $$;
 
 -- ───────────────────────────────────────────────────────────────────
--- 1) enrollment_plans — access duration + support window + entitlement chips.
---    access_days NULL = a plan that never expires. support_days is informational
---    (shown to the student/admin; not RLS-enforced). entitlement_summary is a
---    short jsonb array of chips (e.g. ["60-day course access"]) for compact UI —
---    features stays the long marketing bullet list.
+-- 1) enrollment_plans — access duration + support window + entitlement chips,
+--    plus a FIRST-RUN-ONLY duration seed.
+--    access_days NULL = a plan that never expires (lifetime). support_days is
+--    informational (shown to the student/admin; not RLS-enforced).
+--    entitlement_summary is a short jsonb array of chips (e.g. ["60-day access"])
+--    for compact UI — features stays the long marketing bullet list.
+--
+--    ⚠ IDEMPOTENCY: NULL is a MEANINGFUL value here (lifetime), so we can't use
+--    "where access_days is null" as the not-yet-seeded sentinel — that would let
+--    a re-run silently re-impose 60/180 days on a plan an admin deliberately made
+--    lifetime. Instead we seed ONLY on the first run (detected by the access_days
+--    column being absent before this file adds it). After that, in-app admin edits
+--    (including setting a plan to lifetime) always survive re-runs.
 -- ───────────────────────────────────────────────────────────────────
-alter table public.enrollment_plans add column if not exists access_days  int;
-alter table public.enrollment_plans add column if not exists support_days int;
-alter table public.enrollment_plans add column if not exists entitlement_summary jsonb not null default '[]'::jsonb;
+do $$
+declare
+  v_fresh boolean;
+begin
+  v_fresh := not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'enrollment_plans' and column_name = 'access_days'
+  );
+
+  alter table public.enrollment_plans add column if not exists access_days  int;
+  alter table public.enrollment_plans add column if not exists support_days int;
+  alter table public.enrollment_plans add column if not exists entitlement_summary jsonb not null default '[]'::jsonb;
+
+  if v_fresh then
+    update public.enrollment_plans set access_days = 60                    where key = 'core_self_paced';
+    update public.enrollment_plans set access_days = 60, support_days = 30 where key = 'sampler';
+    update public.enrollment_plans set access_days = 60                    where key = 'silver_self_paced';
+    update public.enrollment_plans set access_days = 180                   where key = 'gold_live';
+    update public.enrollment_plans set access_days = 180                   where key = 'vip';
+
+    update public.enrollment_plans set entitlement_summary = '["60-day QBO Mastery access","Weekly Discord chat"]'::jsonb                  where key = 'core_self_paced';
+    update public.enrollment_plans set entitlement_summary = '["60-day course access","30-day group chat support","1 live Zoom session"]'::jsonb where key = 'sampler';
+    update public.enrollment_plans set entitlement_summary = '["60-day QBO Mastery access","60-day Resume & Interview access"]'::jsonb      where key = 'silver_self_paced';
+    update public.enrollment_plans set entitlement_summary = '["180-day full access","12 live group trainings","Weekly consult until hired"]'::jsonb where key = 'gold_live';
+    update public.enrollment_plans set entitlement_summary = '["180-day full access","1-on-1 coaching","Weekly consult until hired"]'::jsonb where key = 'vip';
+  end if;
+end $$;
 
 -- ───────────────────────────────────────────────────────────────────
--- 2) Duration seeds — only where still unset (access_days IS NULL /
---    entitlement_summary still empty), so in-app admin edits survive re-runs,
---    mirroring the ON CONFLICT DO NOTHING plan seeds.
--- ───────────────────────────────────────────────────────────────────
-update public.enrollment_plans set access_days = 60                    where key = 'core_self_paced'   and access_days is null;
-update public.enrollment_plans set access_days = 60, support_days = 30 where key = 'sampler'           and access_days is null;
-update public.enrollment_plans set access_days = 60                    where key = 'silver_self_paced' and access_days is null;
-update public.enrollment_plans set access_days = 180                   where key = 'gold_live'         and access_days is null;
-update public.enrollment_plans set access_days = 180                   where key = 'vip'               and access_days is null;
-
-update public.enrollment_plans set entitlement_summary = '["60-day QBO Mastery access","Weekly Discord chat"]'::jsonb
-  where key = 'core_self_paced' and entitlement_summary = '[]'::jsonb;
-update public.enrollment_plans set entitlement_summary = '["60-day course access","30-day group chat support","1 live Zoom session"]'::jsonb
-  where key = 'sampler' and entitlement_summary = '[]'::jsonb;
-update public.enrollment_plans set entitlement_summary = '["60-day QBO Mastery access","60-day Resume & Interview access"]'::jsonb
-  where key = 'silver_self_paced' and entitlement_summary = '[]'::jsonb;
-update public.enrollment_plans set entitlement_summary = '["180-day full access","12 live group trainings","Weekly consult until hired"]'::jsonb
-  where key = 'gold_live' and entitlement_summary = '[]'::jsonb;
-update public.enrollment_plans set entitlement_summary = '["180-day full access","1-on-1 coaching","Weekly consult until hired"]'::jsonb
-  where key = 'vip' and entitlement_summary = '[]'::jsonb;
-
--- ───────────────────────────────────────────────────────────────────
--- 3) subscriptions — the lifecycle columns. ends_at NULL = legacy non-expiring
+-- 2) subscriptions — the lifecycle columns. ends_at NULL = legacy non-expiring
 --    (see grandfathering note in the header). renewed_from_subscription_id links
 --    a renewal to the term it superseded, preserving full history.
 -- ───────────────────────────────────────────────────────────────────
@@ -89,7 +99,7 @@ create index if not exists subscriptions_user_created on public.subscriptions (u
 create index if not exists subscriptions_status_ends  on public.subscriptions (status, ends_at);
 
 -- ───────────────────────────────────────────────────────────────────
--- 4) Date-aware is_enrolled() — THE access check. Every content read-policy
+-- 3) Date-aware is_enrolled() — THE access check. Every content read-policy
 --    (courses/modules/lessons/feature_guides, enrollment.sql section 7) already
 --    calls this function, so rewriting it enforces expiry server-side with zero
 --    policy changes. The date comparison is the authority: an overdue row still
@@ -116,7 +126,7 @@ as $$
 $$;
 
 -- ───────────────────────────────────────────────────────────────────
--- 5) approve_subscription() — the ONLY way a term is granted/renewed. Called by
+-- 4) approve_subscription() — the ONLY way a term is granted/renewed. Called by
 --    the admin Enrollments tab on Approve. Runs supersede + insert in ONE
 --    transaction, so the subscriptions_one_active unique index can never be
 --    violated mid-flight. SECURITY DEFINER with an internal admin guard —
@@ -154,6 +164,13 @@ begin
     limit 1
     for update;
 
+  -- Idempotency: if this exact request already granted the current active term,
+  -- return it unchanged. Makes a double-click / retry a no-op (no double-extend);
+  -- a genuine renewal is a NEW request row, so it still stacks correctly.
+  if v_prev.id is not null and v_prev.status = 'active' and v_prev.request_id = p_request_id then
+    return v_prev;
+  end if;
+
   -- Renewal stacking: extend from the current expiry while a dated term is still
   -- running; otherwise (expired, no prior sub, or legacy NULL-ends row) start
   -- from now. A legacy non-expiring member who renews converts to a dated term.
@@ -189,7 +206,7 @@ revoke all on function public.approve_subscription(uuid, text, uuid) from public
 grant execute on function public.approve_subscription(uuid, text, uuid) to authenticated;
 
 -- ───────────────────────────────────────────────────────────────────
--- 6) expire_overdue_subscriptions() — cosmetic status sweep. The date check in
+-- 5) expire_overdue_subscriptions() — cosmetic status sweep. The date check in
 --    is_enrolled() is what actually denies access; this just flips overdue
 --    'active' rows to 'expired' so admin filters and the student panel read
 --    truthfully. Called best-effort when the admin opens the Enrollments tab.
@@ -222,7 +239,7 @@ revoke all on function public.expire_overdue_subscriptions() from public;
 grant execute on function public.expire_overdue_subscriptions() to authenticated;
 
 -- ───────────────────────────────────────────────────────────────────
--- 7) Grandfathering — deliberately NO backfill. Existing subscription rows keep
+-- 6) Grandfathering — deliberately NO backfill. Existing subscription rows keep
 --    ends_at = NULL (never expire) and paid profiles without rows pass via the
 --    is_enrolled() fallback, so running this file locks nobody out. If you later
 --    want to put legacy members on the clock, run something like the snippet
@@ -238,7 +255,7 @@ grant execute on function public.expire_overdue_subscriptions() to authenticated
 -- ───────────────────────────────────────────────────────────────────
 
 -- ───────────────────────────────────────────────────────────────────
--- 8) Realtime on subscriptions (optional but recommended): the dashboard
+-- 7) Realtime on subscriptions (optional but recommended): the dashboard
 --    membership panel and the renewal pending screen advance the instant an
 --    admin approves. RLS still applies — students only receive their own rows.
 --    Without this, the app falls back to a poll / on-focus refetch.
@@ -255,7 +272,7 @@ begin
   end if;
 end $$;
 
--- 9) Refresh PostgREST's schema cache so the new columns/functions are usable immediately.
+-- 8) Refresh PostgREST's schema cache so the new columns/functions are usable immediately.
 notify pgrst, 'reload schema';
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -267,7 +284,7 @@ notify pgrst, 'reload schema';
 --     and sees the Membership Expired screen with a Renew button; renewal goes
 --     through the same pricing + receipt-upload + admin-review flow.
 --   • Existing members keep access: legacy rows have ends_at = NULL (no expiry)
---     until their next renewal. See section 7 to put them on the clock instead.
+--     until their next renewal. See section 6 to put them on the clock instead.
 --   • The student Dashboard now shows a membership panel (plan, status, days
 --     remaining, renew button) with warnings at 14 / 7 / 3 days left.
 --   • Grace period is OFF; edit v_grace_days in approve_subscription() to add one.

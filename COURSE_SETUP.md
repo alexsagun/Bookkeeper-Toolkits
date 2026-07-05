@@ -1,5 +1,11 @@
 # Course Setup — QuickBooks Online Mastering Programme
 
+> **Fresh Supabase project?** Run **[`db/000_full_database_bootstrap.sql`](db/000_full_database_bootstrap.sql)**
+> once — it already includes everything below — then see **[`db/README.md`](db/README.md)**. The Step 1 / Step 2
+> SQL below now also lives as the dated migrations **[`db/2026-06-16-course-platform-base.sql`](db/2026-06-16-course-platform-base.sql)**
+> and **[`db/2026-06-16-course-platform-storage.sql`](db/2026-06-16-course-platform-storage.sql)** (for existing
+> installs); the Dashboard "New bucket" step is still described here.
+
 One-time backend setup for the **QBO Mastering Programme** (the Thinkific-style video course in the
 Training & Skills section). This adds course tables, per-user progress, a media bucket, and an
 **admin authoring gate** to your existing Supabase project. It builds on the auth backend already

@@ -1,5 +1,11 @@
 # Authentication setup (Supabase)
 
+> **Fresh Supabase project?** Run **[`db/000_full_database_bootstrap.sql`](db/000_full_database_bootstrap.sql)**
+> once to stand up the whole schema in a single step, then follow the Dashboard steps below (env vars,
+> email confirmation, redirect URLs, Google). Run order + per-file index: **[`db/README.md`](db/README.md)**.
+> The `profiles` + signup-trigger SQL in §3 below now also lives as the dated migration
+> **[`db/2026-06-15-auth-profiles-base.sql`](db/2026-06-15-auth-profiles-base.sql)** for existing installs.
+
 The toolkit is gated behind Supabase auth — email/password **and** Google one-click sign-in. Until
 you create a Supabase project and add the two env vars, the app loads but the login screen shows a
 "not configured" notice. Follow these one-time steps.

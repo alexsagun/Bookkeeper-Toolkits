@@ -1808,7 +1808,10 @@ function subAccess(sub) {
   const active = sub.status === 'active';
   const inGrace = active && !legacy && ends <= now && !!graceEnd && graceEnd > now;
   const valid = active && (legacy || ends > now || inGrace);
-  const daysLeft = legacy ? null : Math.ceil((ends.getTime() - now) / 86400000);
+  // Days remaining until the term ends. Inside a grace window the term has already
+  // passed, so measure to the grace end (never show a negative "N days left").
+  const daysLeft = legacy ? null
+    : Math.max(0, Math.ceil(((inGrace ? graceEnd.getTime() : ends.getTime()) - now) / 86400000));
   return { has: true, valid, legacy, ends, daysLeft, inGrace, expired: !valid };
 }
 
@@ -1860,13 +1863,28 @@ function useEnrollmentGate(user, profile, profileReady) {
     let cancelled = false;
     (async () => {
       try {
-        const [reqRes, subRes] = await Promise.all([
-          supabase.from('enrollment_requests').select('*').eq('user_id', uid)
-            .order('created_at', { ascending: false }).limit(1).maybeSingle(),
-          supabase.from('subscriptions').select('*').eq('user_id', uid)
-            .order('created_at', { ascending: false }).limit(1).maybeSingle(),
+        // The two gate queries now block the app shell for every non-admin, so a
+        // STALLED (never-resolving) fetch must not trap the user on AuthSplash
+        // forever. Race against a timeout that fails OPEN: ready=true, configured
+        // stays true, sub stays null → a paid member passes (RLS still enforces
+        // expiry on content), an unpaid user hits the paywall as usual.
+        const TIMEOUT = Symbol('enroll-gate-timeout');
+        const raced = await Promise.race([
+          Promise.all([
+            supabase.from('enrollment_requests').select('*').eq('user_id', uid)
+              .order('created_at', { ascending: false }).limit(1).maybeSingle(),
+            supabase.from('subscriptions').select('*').eq('user_id', uid)
+              .order('created_at', { ascending: false }).limit(1).maybeSingle(),
+          ]),
+          new Promise((resolve) => setTimeout(() => resolve(TIMEOUT), 7000)),
         ]);
         if (cancelled) return;
+        if (raced === TIMEOUT) {
+          console.warn('[enroll] gate load timed out — failing open');
+          setLatestReq(null); setSub(null);
+          return;   // finally sets ready=true; configured unchanged (fail-open)
+        }
+        const [reqRes, subRes] = raced;
         if (reqRes.error) {
           if (!isEnrollmentNotConfiguredErr(reqRes.error)) console.error('[enroll] gate load failed', reqRes.error);
           setConfigured(false);   // fail-open → legacy gate
@@ -2400,13 +2418,15 @@ function EnrollmentPendingScreen({ request, finalizing, renewal, email, uid, onS
   const [checkedAt, setCheckedAt] = useState(null);
   // Latest refresh fns in refs so the poll effect runs once (refreshProfile is a fresh
   // reference every AuthProvider render — depending on it would reset the interval).
+  // Returns a promise so the manual "Check" button can truthfully await the refetch
+  // (onRefreshProfile is async; onRefreshRequest just bumps state and resolves at once).
   const refreshRef = useRef(null);
-  refreshRef.current = () => { onRefreshProfile?.(); onRefreshRequest?.(); };
+  refreshRef.current = () => Promise.all([onRefreshProfile?.(), onRefreshRequest?.()]);
 
   const check = async () => {
     if (checking) return;
     setChecking(true);
-    try { await Promise.resolve(refreshRef.current?.()); setCheckedAt(Date.now()); }
+    try { await refreshRef.current?.(); setCheckedAt(Date.now()); }
     finally { setChecking(false); }
   };
 
@@ -2562,13 +2582,65 @@ function EnrollmentPendingScreen({ request, finalizing, renewal, email, uid, onS
 // no live renewal under review. Full-screen block (same pattern as the pending screen)
 // with a Renew CTA that hands off to the paywall in renewal mode. Prior history stays
 // visible: the ended term's details render here; past requests remain in the DB.
-function MembershipExpiredScreen({ sub, latestReq, email, onRenew, onSignOut }) {
+function MembershipExpiredScreen({ sub, latestReq, email, uid, onRenew, onSignOut, onRefreshProfile, onRefreshRequest }) {
   const acc = subAccess(sub);
   const planName = sub ? (PLAN_LABELS[sub.plan_key] || sub.plan_key) : null;
   const endedDaysAgo = acc.ends ? Math.max(0, Math.floor((Date.now() - acc.ends.getTime()) / 86400000)) : null;
   // Only a REJECTED renewal attempt (newer than the ended term) is worth surfacing here.
   const rejectedRenewal = latestReq?.status === 'rejected' && sub?.started_at &&
     new Date(latestReq.created_at) > new Date(sub.started_at) ? latestReq : null;
+
+  const [checking, setChecking] = useState(false);
+  const refreshRef = useRef(null);
+  refreshRef.current = () => Promise.all([onRefreshProfile?.(), onRefreshRequest?.()]);
+
+  const check = async () => {
+    if (checking) return;
+    setChecking(true);
+    try { await refreshRef.current?.(); } finally { setChecking(false); }
+  };
+
+  // Advance the instant an admin approves a renewal while the member is parked here:
+  // approve_subscription INSERTs a fresh active subscriptions row → the gate refetch
+  // sees a valid term → state flips to 'pass'. RLS scopes every channel to own rows;
+  // all are inert (poll still covers it) unless the tables are in the realtime
+  // publication (enrollment.sql §8 + subscription-lifecycle.sql §7).
+  useEffect(() => {
+    if (!uid) return;
+    const chSub = supabase
+      .channel(`expired-sub-${uid}`)
+      .on('postgres_changes',
+        { event: '*', schema: 'public', table: 'subscriptions', filter: `user_id=eq.${uid}` },
+        () => { refreshRef.current?.(); })
+      .subscribe();
+    const chProfile = supabase
+      .channel(`expired-profile-${uid}`)
+      .on('postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'profiles', filter: `id=eq.${uid}` },
+        () => { refreshRef.current?.(); })
+      .subscribe();
+    const chReq = supabase
+      .channel(`expired-req-${uid}`)
+      .on('postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'enrollment_requests', filter: `user_id=eq.${uid}` },
+        () => { refreshRef.current?.(); })
+      .subscribe();
+    return () => { supabase.removeChannel(chSub); supabase.removeChannel(chProfile); supabase.removeChannel(chReq); };
+  }, [uid]);
+
+  // Fallback poll + focus/visibility re-checks (same shape as EnrollmentPendingScreen).
+  useEffect(() => {
+    const tick = () => { refreshRef.current?.(); };
+    const id = setInterval(tick, 30000);
+    const onVis = () => { if (document.visibilityState === 'visible') tick(); };
+    document.addEventListener('visibilitychange', onVis);
+    window.addEventListener('focus', tick);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVis);
+      window.removeEventListener('focus', tick);
+    };
+  }, []);
 
   return (
     <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
@@ -2644,6 +2716,12 @@ function MembershipExpiredScreen({ sub, latestReq, email, onRenew, onSignOut }) 
             className="mt-5 w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition hover:opacity-95"
             style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
             <RefreshCw size={15} /> Renew your membership
+          </button>
+
+          <button onClick={check} disabled={checking}
+            className="mt-2.5 w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition hover:opacity-90 disabled:opacity-60"
+            style={{ background: C.white, border: `1px solid ${C.border}`, color: C.textSoft }}>
+            <RefreshCw size={15} className={checking ? 'animate-spin' : ''} /> {checking ? 'Checking…' : 'Check status'}
           </button>
 
           <button onClick={onSignOut}
@@ -3495,7 +3573,8 @@ export default function BookkeeperProToolkit() {
           const prior = r && (r.status === 'rejected' || r.status === 'expired' || overdue) ? r : null;
           if (!renewNow) {
             return <MembershipExpiredScreen sub={enroll.sub} latestReq={r} email={user?.email}
-              onRenew={() => setRenewNow(true)} onSignOut={signOut} />;
+              uid={user?.id} onRenew={() => setRenewNow(true)} onSignOut={signOut}
+              onRefreshProfile={refreshProfile} onRefreshRequest={enroll.refresh} />;
           }
           return <EnrollmentPaywall user={user} profile={profile} renewal currentSub={enroll.sub}
             priorRequest={prior} overdue={!!overdue} onClose={() => setRenewNow(false)}
@@ -4594,7 +4673,7 @@ function AdminEnrollments({ onCountChange }) {
       try {
         if (typeof window !== 'undefined' && window.storage) {
           const v = await window.storage.get('enroll:soundAlert');
-          if (v === '1') { setSoundOn(true); soundOnRef.current = true; }
+          if (v?.value === '1') { setSoundOn(true); soundOnRef.current = true; }   // shim returns { value }
         }
       } catch { /* default off */ }
     })();
@@ -4694,27 +4773,70 @@ function AdminEnrollments({ onCountChange }) {
   const emailSuffix = (mail) =>
     mail?.ok ? ' · email sent' : mail?.skipped ? ' · email not configured' : ' · email not sent';
 
-  // Approve = the ONE admin action that unlocks a student. Ordering matters (no client
-  // transactions): ① request row (cheap write that also proves admin RLS is live) →
-  // ② profiles grant (THE unlock) → ③ subscriptions record (best-effort; never blocks).
-  // Every update uses .select() to confirm a row actually changed (PostgREST reports no
-  // error on a 0-row RLS-filtered update — same guard as AccessRequests.setStatus).
+  // Approve = the ONE admin action that unlocks a student. Post-lifecycle the DATED
+  // SUBSCRIPTION is the real access grant (is_enrolled() checks it; profiles.is_paid is
+  // only a cache), so ordering is: ① subscription term → ② profiles cache → ③ request row.
+  // The grant goes FIRST and each step is fatal, so a failure leaves the request
+  // pending_review (Approve button intact — retryable) and never strands a member on
+  // "approved" with no active term. Every update uses .select() to catch 0-row RLS
+  // filtering (PostgREST reports no error on a 0-row update).
   const doApprove = async (r) => {
     setBusyId(r.id); setErr(''); setNotice('');
     const nowIso = new Date().toISOString();
     try {
-      const { data: reqUpd, error: reqErr } = await supabase
-        .from('enrollment_requests')
-        .update({ status: 'approved', rejection_reason: null, reviewed_at: nowIso, reviewed_by: user?.id || null, updated_at: nowIso })
-        .eq('id', r.id)
-        .select('id,status');
-      if (reqErr) throw reqErr;
-      if (!reqUpd?.[0]) {
-        throw new Error('No request row was updated — your admin permissions may not be applied. Re-run db/2026-07-04-enrollment.sql in Supabase, confirm you are flagged is_admin, then sign out and back in.');
+      // ① Subscription term — the lifecycle RPC grants a DATED term in one transaction
+      //    (extends from the current expiry on early renewals, supersedes the old active
+      //    row, stamps ends_at from the plan's access_days; idempotent per request_id).
+      let subNote = '', grantedEndsAt;
+      const rpc = await supabase.rpc('approve_subscription', {
+        p_user_id: r.user_id, p_plan_key: r.plan_key, p_request_id: r.id,
+      });
+      if (rpc.error) {
+        if (!isEnrollmentNotConfiguredErr(rpc.error)) throw rpc.error;
+        // Lifecycle migration not run (or a transient schema-cache miss) — replicate the
+        // RPC client-side so even the fallback grants a proper DATED term, never a
+        // no-expiry lifetime row or a zero-day renewal. Extend from the current valid
+        // term; skip if this exact request already granted the active row (retry-safe).
+        const prev = subsByUser[r.user_id] || null;
+        if (prev?.status === 'active' && prev.request_id === r.id) {
+          grantedEndsAt = prev.ends_at ?? undefined;
+        } else {
+          const accessDays = Number(plansByKey[r.plan_key]?.access_days) || null;
+          const prevAcc = subAccess(prev);
+          const baseMs = (prev?.status === 'active' && prevAcc.valid && prev.ends_at)
+            ? new Date(prev.ends_at).getTime() : Date.now();
+          grantedEndsAt = accessDays ? new Date(baseMs + accessDays * 86400000).toISOString() : null;
+          if (prev?.status === 'active') {
+            const sup = await supabase.from('subscriptions')
+              .update({ status: 'expired', updated_at: nowIso })
+              .eq('user_id', r.user_id).eq('status', 'active');
+            if (sup.error) throw sup.error;
+          }
+          const fullRow = {
+            user_id: r.user_id, plan_key: r.plan_key, status: 'active',
+            started_at: nowIso, ends_at: grantedEndsAt, approved_by: user?.id || null,
+            request_id: r.id, renewed_from_subscription_id: prev?.id || null, updated_at: nowIso,
+          };
+          let ins = await supabase.from('subscriptions').insert(fullRow).select('ends_at');
+          if (ins.error && isEnrollmentNotConfiguredErr(ins.error)) {
+            // Pre-lifecycle subscriptions table lacks ends_at/etc — minimal legacy insert.
+            ins = await supabase.from('subscriptions').insert({
+              user_id: r.user_id, plan_key: r.plan_key, status: 'active',
+              started_at: nowIso, approved_by: user?.id || null, request_id: r.id,
+            }).select('id');
+            grantedEndsAt = undefined;
+          }
+          if (ins.error) throw ins.error;
+        }
+      } else {
+        grantedEndsAt = rpc.data?.ends_at ?? null;
       }
+      if (grantedEndsAt) subNote = ` · access until ${fmtEnrollDate(grantedEndsAt)}`;
+      else if (grantedEndsAt === null) subNote = ' · no expiry';
 
-      // Profile grant. Full patch first; if the approval-migration columns are missing
-      // (42703/PGRST204), retry with just the payment fields so approve still works.
+      // ② Profile cache — is_paid/plan/approval_status (a convenience cache + the legacy
+      //    grandfather signal; NOT the access authority). Full patch first; if the
+      //    approval-migration columns are missing (42703/PGRST204), retry minimal.
       const fullPatch = {
         is_paid: true, plan: r.plan_key,
         approval_status: 'approved', approved_at: nowIso, approved_by: user?.id || null,
@@ -4726,41 +4848,19 @@ function AdminEnrollments({ onCountChange }) {
       }
       if (profUpd.error) throw profUpd.error;
       if (!profUpd.data?.[0]) {
-        throw new Error('The request was marked approved but the student profile could not be unlocked (0 rows updated). Click Approve again to retry; if it persists, re-run db/2026-06-29-user-approval.sql (profiles_admin_update policy).');
+        throw new Error('The subscription term was granted but the student profile could not be updated (0 rows). Click Approve again to retry; if it persists, re-run db/2026-06-29-user-approval.sql (profiles_admin_update policy).');
       }
 
-      // Subscription record — the lifecycle RPC grants a DATED term in one transaction
-      // (extends from the current expiry on early renewals, supersedes the old active
-      // row, stamps ends_at from the plan's access_days). Falls back to the legacy
-      // update-else-insert (no ends_at → no expiry) when the RPC isn't migrated yet
-      // (db/2026-07-04-subscription-lifecycle.sql). Non-fatal either way.
-      let subNote = '';
-      try {
-        const rpc = await supabase.rpc('approve_subscription', {
-          p_user_id: r.user_id, p_plan_key: r.plan_key, p_request_id: r.id,
-        });
-        if (rpc.error) {
-          if (!isEnrollmentNotConfiguredErr(rpc.error)) throw rpc.error;
-          // Lifecycle migration not run — legacy grant (idempotent update-else-insert).
-          const upd = await supabase
-            .from('subscriptions')
-            .update({ plan_key: r.plan_key, request_id: r.id, approved_by: user?.id || null, started_at: nowIso })
-            .eq('user_id', r.user_id).eq('status', 'active')
-            .select('id');
-          if (upd.error) throw upd.error;
-          if (!upd.data?.length) {
-            const ins = await supabase.from('subscriptions').insert({
-              user_id: r.user_id, plan_key: r.plan_key, status: 'active',
-              started_at: nowIso, approved_by: user?.id || null, request_id: r.id,
-            });
-            if (ins.error) throw ins.error;
-          }
-        } else if (rpc.data?.ends_at) {
-          subNote = ` · access until ${fmtEnrollDate(rpc.data.ends_at)}`;
-        }
-      } catch (subErr) {
-        console.error('[enroll] subscription write failed', subErr);
-        subNote = ' · subscription record failed (access still granted — Approve again to retry)';
+      // ③ Request row → approved (cheap write, done LAST so an earlier failure keeps it
+      //    pending_review and the Approve button available for a retry).
+      const { data: reqUpd, error: reqErr } = await supabase
+        .from('enrollment_requests')
+        .update({ status: 'approved', rejection_reason: null, reviewed_at: nowIso, reviewed_by: user?.id || null, updated_at: nowIso })
+        .eq('id', r.id)
+        .select('id,status');
+      if (reqErr) throw reqErr;
+      if (!reqUpd?.[0]) {
+        throw new Error('Access was granted but the request row could not be marked approved (0 rows) — check is_admin / re-run db/2026-07-04-enrollment.sql. Approve again to retry.');
       }
 
       setRows(prev => prev.map(x => x.id === r.id
@@ -5107,7 +5207,18 @@ function AdminEnrollments({ onCountChange }) {
             const rowBusy = busyId === r.id;
             const overdueRow = isOverdue(r);
             const prof = profilesById[r.user_id];
-            const grantIncomplete = r.status === 'approved' && prof && prof.is_paid === false;
+            const memberSub = subsByUser[r.user_id];
+            // "grant incomplete" = an approved request that didn't actually unlock the
+            // student, so re-Approve is safe and re-runs the grant: either the profile
+            // cache never flipped (is_paid false), OR the member's latest subscription is
+            // invalid AND wasn't produced by THIS request (a renewal whose subscription
+            // grant failed — is_paid stays true but is_enrolled() is false server-side).
+            // The request_id guard avoids false-flagging a term this request granted that
+            // simply expired later (that needs a fresh renewal request, not a re-approve).
+            const grantIncomplete = r.status === 'approved' && (
+              (prof && prof.is_paid === false) ||
+              (memberSub && memberSub.request_id !== r.id && !subAccess(memberSub).valid)
+            );
             const amountMismatch = Number(r.amount_paid) !== Number(r.amount_expected);
             const expanded = expandedId === r.id;
             return (

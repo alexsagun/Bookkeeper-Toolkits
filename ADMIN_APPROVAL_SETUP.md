@@ -1,5 +1,10 @@
 # Admin approval gate (temporary) — setup
 
+> **Fresh Supabase project?** Run **[`db/000_full_database_bootstrap.sql`](db/000_full_database_bootstrap.sql)**
+> once — the approval-gate schema is already included — then see **[`db/README.md`](db/README.md)**. On an
+> **existing** install, run the dated migrations referenced below in the order documented in
+> [`db/README.md`](db/README.md).
+
 While the app is invite-only (pre public launch), **new signups can't reach the dashboard until an
 admin approves them**. Anyone can still sign up (email or Google); they just land on an **"Access
 Pending Approval"** screen until you approve (or reject) them from the in-app **Access Requests**

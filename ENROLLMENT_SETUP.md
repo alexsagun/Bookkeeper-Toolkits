@@ -1,5 +1,10 @@
 # Enrollment & manual-payment gate — setup
 
+> **Fresh Supabase project?** Run **[`db/000_full_database_bootstrap.sql`](db/000_full_database_bootstrap.sql)**
+> once — the enrollment + subscription-lifecycle schema is already included — then see
+> **[`db/README.md`](db/README.md)**. On an **existing** install, run the dated migrations referenced below
+> in order (`db/2026-07-04-enrollment.sql` → `db/2026-07-04-subscription-lifecycle.sql`).
+
 Students now enroll **inside the app**: a signed-in user who hasn't paid is held on an
 **Enrollment Paywall** (pricing cards → manual payment instructions → payment-proof upload)
 and then a **"Payment Under Review"** screen, until you approve their submission from the
@@ -253,8 +258,23 @@ Vercel deploy (health check: open `/api/notify-enrollment` in a browser).
   where user_id = '…' order by created_at desc limit 1;`. The `ends_at` date is the authority.
   Hand-extend with `update public.subscriptions set ends_at = ends_at + interval '7 days' where
   id = '…';` — the change is live immediately (RLS + panel both read the date).
-- **Approve notice says "subscription record failed"** — the profile grant still succeeded
-  (access is open); click **Approve again** to retry the term. If it persists, confirm Step 1b
-  ran (the `approve_subscription` function must exist).
+- **Approve showed an error partway through** — the grant runs subscription → profile →
+  request in that order, and any step failing stops the rest, so the request stays
+  **pending** with the **Approve** button still shown. Just click **Approve again** (it is
+  retry-safe: `approve_subscription()` is idempotent per request, so a re-approve of the same
+  request never double-extends). If it persists, confirm Step 1b ran (the `approve_subscription`
+  function must exist) and that you're flagged `is_admin`.
+- **An approved member shows "grant incomplete — Approve again"** — their approved request
+  didn't leave them with a valid active term (e.g. a renewal whose subscription grant failed).
+  Click **Approve** on that row to re-run the grant. (A membership that simply expired over
+  time is **not** flagged — that needs a fresh renewal request from the student, not a
+  re-approve.)
 - **Panel/admin dates look right but content is still blocked** — `is_enrolled()` may be the
   old boolean version. Re-run Step 1b (it re-creates the date-aware function).
+- **An expired member briefly saw the dashboard shell** — the client gate fails **open** if the
+  subscription lookup errors or times out (so a network blip never traps a paying member on a
+  spinner). Course/feature content stays blocked server-side by RLS regardless, and the shell
+  corrects itself on the next load. No action needed.
+- **The admin sound alert didn't chime on a new submission** — browsers block audio until you
+  interact with the page. Click anywhere in the tab once (or press the **Test** button beside
+  the Sound toggle) to unlock it for the session; the pref itself persists across sessions.
