@@ -44,6 +44,11 @@ const LEGACY_KEYS = [
   'budget:state', 'forecast:state',
   'nav:lastTab', 'nav:interviewSub',
   'enroll:soundAlert',
+  // Theme pref. Note: useTheme also keeps a BARE localStorage mirror of this key
+  // on every change (for the index.html no-flash boot script + signed-out screens),
+  // and adopts the bare value into a signed-in account with no saved pref itself —
+  // this migration entry only covers the classic first-login path.
+  'ui:theme',
 ];
 
 // Marker (raw, un-namespaced) recording which uid adopted the legacy global data.

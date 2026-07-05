@@ -13,7 +13,8 @@ import {
   TrendingUp as Growth, BookMarked, Globe, Coins, GraduationCap,
   LogOut, Lock, Mail, KeyRound, Menu,
   Plus, Trash2, Save, Play, Video, ArrowRight, ArrowLeft, ChevronUp, MoreVertical,
-  PanelLeftClose, PanelLeftOpen, RefreshCw, UserCheck, UserX, ShieldCheck, Hourglass, Bell, BellOff, Volume2
+  PanelLeftClose, PanelLeftOpen, RefreshCw, UserCheck, UserX, ShieldCheck, Hourglass, Bell, BellOff, Volume2,
+  Sun, Moon, Monitor
 } from 'lucide-react';
 import { useAuth } from './auth/AuthProvider.jsx';
 import { supabase } from './lib/supabase';
@@ -980,6 +981,105 @@ function useCurrency() {
   return { currency, setCurrency, fxRate, setFxRate, convert, fmt, fmt2 };
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// SHARED HOOK: THEME (light / dark / system)
+// The resolved theme is the data-theme attribute on <html> — the CSS
+// variables in src/index.css do the actual restyling. First paint is
+// handled by the inline boot script in index.html, which reads the BARE
+// localStorage key 'ui:theme' (raw pref) and stashes it on
+// window.__themePref. This hook keeps three places in sync:
+//   1. <html data-theme> + the <meta name="theme-color"> tag,
+//   2. the bare localStorage mirror (what the boot script + signed-out
+//      screens see),
+//   3. the per-user window.storage copy (namespaced u:<uid>:ui:theme),
+//      so each account keeps its own preference across devices/logins.
+// ═══════════════════════════════════════════════════════════════════
+const THEME_PREFS = ['light', 'dark', 'system'];
+
+function resolveThemePref(pref) {
+  if (pref === 'light' || pref === 'dark') return pref;
+  try {
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  } catch { return 'light'; }
+}
+
+function applyResolvedTheme(resolved) {
+  document.documentElement.setAttribute('data-theme', resolved);
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute('content', resolved === 'dark' ? '#06090F' : '#F7FAFF');
+}
+
+function useTheme(uid) {
+  const [pref, setPref] = useState(() =>
+    (typeof window !== 'undefined' && THEME_PREFS.includes(window.__themePref)) ? window.__themePref : 'system');
+  const [loaded, setLoaded] = useState(false);
+  const prefRef = useRef(pref);
+  prefRef.current = pref;
+
+  // Re-read the stored pref whenever the storage namespace changes (sign-in/out).
+  // window.storage resolves 'ui:theme' per-user when signed in, bare when signed out.
+  // A signed-in account with no saved pref adopts the current (pre-login) choice.
+  useEffect(() => {
+    let on = true;
+    (async () => {
+      try {
+        if (typeof window !== 'undefined' && window.storage) {
+          const r = await window.storage.get('ui:theme').catch(() => null);
+          if (!on) return;
+          if (r && THEME_PREFS.includes(r.value)) setPref(r.value);
+          else if (uid) window.storage.set('ui:theme', prefRef.current).catch(() => {});
+        }
+      } catch { /* ignore */ }
+      if (on) setLoaded(true);
+    })();
+    return () => { on = false; };
+  }, [uid]);
+
+  // Apply + persist on change. The bare mirror always stores the RAW pref
+  // ('system', not its resolution) so system-mode users keep following the OS.
+  useEffect(() => {
+    applyResolvedTheme(resolveThemePref(pref));
+    try { localStorage.setItem('ui:theme', pref); } catch { /* ignore */ }
+    if (loaded && typeof window !== 'undefined' && window.storage) {
+      window.storage.set('ui:theme', pref).catch(() => {});
+    }
+  }, [pref, loaded]);
+
+  // Follow live OS changes while in system mode.
+  useEffect(() => {
+    if (pref !== 'system' || typeof window === 'undefined' || !window.matchMedia) return;
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const onChange = () => applyResolvedTheme(mq.matches ? 'dark' : 'light');
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, [pref]);
+
+  const cycleTheme = () => setPref(p => (p === 'light' ? 'dark' : p === 'dark' ? 'system' : 'light'));
+  return { pref, cycleTheme };
+}
+
+// Compact icon-only theme switcher (sidebar profile area + auth screen).
+// Cycles light → dark → system; the icon shows the CURRENT preference.
+const THEME_META = {
+  light:  { Icon: Sun,     label: 'Light theme',  next: 'dark' },
+  dark:   { Icon: Moon,    label: 'Dark theme',   next: 'system' },
+  system: { Icon: Monitor, label: 'System theme', next: 'light' },
+};
+function ThemeToggle({ pref, onCycle, fixed, size = 15 }) {
+  const meta = THEME_META[pref] || THEME_META.system;
+  const Icon = meta.Icon;
+  const title = `${meta.label} — switch to ${meta.next} mode`;
+  return (
+    <button onClick={onCycle} title={title} aria-label={title}
+      className={fixed
+        ? 'fixed top-4 right-4 z-50 p-2.5 rounded-xl glass-card transition hover:opacity-80'
+        : 'flex-shrink-0 p-1.5 rounded-lg transition hover:opacity-80'}
+      style={{ color: C.textMute }}>
+      <Icon size={size} />
+    </button>
+  );
+}
+
 // Reusable inline currency selector UI
 function CurrencyToggle({ currency, setCurrency, fxRate, setFxRate, compact }) {
   return (
@@ -1085,7 +1185,7 @@ function PendingConfirm({ email, busy, cooldown, err, notice, onResend, onBack }
 
 // Full-screen login / signup / password-reset gate. Renders instead of the app
 // shell when no user is signed in. Reuses the app's design tokens + glass look.
-function AuthScreen() {
+function AuthScreen({ themePref, onCycleTheme } = {}) {
   const { signIn, signUp, resetPassword, signInWithGoogle, resendConfirmation, configured } = useAuth();
   const [mode, setMode] = useState('signin'); // 'signin' | 'signup' | 'reset'
   const [email, setEmail] = useState('');
@@ -1189,6 +1289,7 @@ function AuthScreen() {
 
   return (
     <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
+      {onCycleTheme && <ThemeToggle pref={themePref} onCycle={onCycleTheme} fixed size={16} />}
       <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
         background: GLASS.cardDeep,
         backdropFilter: 'blur(30px) saturate(180%)',
@@ -2505,6 +2606,9 @@ function MembershipExpiredScreen({ sub, latestReq, email, onRenew, onSignOut }) 
 
 export default function BookkeeperProToolkit() {
   const { user, profile, loading, profileReady, recovery, signOut, refreshProfile } = useAuth();
+  // Theme runs above the auth gate so pre-auth screens are themed too
+  // (the data-theme attribute lives on <html>, not on this component's DOM).
+  const { pref: themePref, cycleTheme } = useTheme(user?.id);
   // Enrollment/payment gate data (REQUIRE_ENROLLMENT). Inert (zero queries) for admins
   // and signed-out visitors; paid users ARE checked (their term may have expired) —
   // see useEnrollmentGate. renewNow = expired member clicked "Renew" (expired screen →
@@ -3262,7 +3366,7 @@ export default function BookkeeperProToolkit() {
   // ── Auth gate ── unauthenticated users never see the app shell below.
   if (loading)  return <AuthSplash />;
   if (recovery) return <UpdatePasswordScreen />;  // returned from a reset-link
-  if (!user)    return <AuthScreen />;
+  if (!user)    return <AuthScreen themePref={themePref} onCycleTheme={cycleTheme} />;
 
   // ── Admin-approval + enrollment gates ──
   // Wait for the first profile fetch so a pending/unpaid user never briefly sees the dashboard.
@@ -3428,6 +3532,7 @@ export default function BookkeeperProToolkit() {
                 </div>
                 <div className="truncate" style={{ fontSize: 10, color: C.textMute, lineHeight: 1.3 }}>{user.email}</div>
               </div>
+              <ThemeToggle pref={themePref} onCycle={cycleTheme} />
               <button onClick={() => signOut()} title="Sign out"
                 className="flex-shrink-0 p-1.5 rounded-lg transition hover:opacity-80" style={{ color: C.textMute }}>
                 <LogOut size={15} />
@@ -3549,6 +3654,7 @@ export default function BookkeeperProToolkit() {
                   style={{ width: 30, height: 30, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
                   {(((profile?.full_name || user.email || '?').trim()[0]) || '?').toUpperCase()}
                 </div>
+                <ThemeToggle pref={themePref} onCycle={cycleTheme} />
                 <button onClick={() => signOut()} title="Sign out" aria-label="Sign out"
                   className="flex-shrink-0 p-1.5 rounded-lg transition hover:opacity-80" style={{ color: C.textMute }}>
                   <LogOut size={15} />
