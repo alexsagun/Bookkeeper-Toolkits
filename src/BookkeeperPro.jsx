@@ -1786,10 +1786,13 @@ function enrollGateState({ profile, latestReq: r, sub }) {
 }
 
 // Gate data hook — fetches the signed-in user's LATEST enrollment request and LATEST
-// subscription. Runs for every non-admin (paid users too — their term may have
-// expired); admins and signed-out users pay zero query cost. Fail-open on request
-// errors (configured:false → the root gate falls back to the legacy approval
-// behavior), so a missing migration or a broken query can never lock anyone out.
+// subscription. The fetch starts as soon as a uid exists (in parallel with the
+// profile fetch — it doesn't wait for profileReady, which used to serialize two
+// network round-trips into every student's startup); the returned `active`/`ready`
+// gate semantics still key off profileReady, so nothing renders early. Admins fire
+// the same two own-row queries (0 rows; negligible). Fail-open on request errors
+// (configured:false → the root gate falls back to the legacy approval behavior),
+// so a missing migration or a broken query can never lock anyone out.
 function useEnrollmentGate(user, profile, profileReady) {
   const active = REQUIRE_ENROLLMENT && !!user && profileReady && !profile?.is_admin;
   const uid = user?.id;
@@ -1800,7 +1803,7 @@ function useEnrollmentGate(user, profile, profileReady) {
   const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
-    if (!active || !uid) { setReady(false); setLatestReq(null); setSub(null); return; }
+    if (!REQUIRE_ENROLLMENT || !uid) { setReady(false); setLatestReq(null); setSub(null); return; }
     let cancelled = false;
     (async () => {
       try {
@@ -1835,7 +1838,7 @@ function useEnrollmentGate(user, profile, profileReady) {
       }
     })();
     return () => { cancelled = true; };
-  }, [active, uid, reloadKey]);
+  }, [uid, reloadKey]);
 
   // refresh(row?) — pass the freshly-inserted request for an instant transition to the
   // pending screen; a refetch still follows to stay truthful to the DB.

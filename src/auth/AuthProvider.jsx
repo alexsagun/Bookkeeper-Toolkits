@@ -151,19 +151,33 @@ export function AuthProvider({ children }) {
 
     (async () => {
       const { data } = await supabase.auth.getSession();
-      let valid = data.session ?? null;
+      const cached = data.session ?? null;
+      if (!cached) {
+        if (!mounted) return;
+        applyStorageUser(null);
+        setSession(null);
+        setLoading(false);
+        return;
+      }
+      // Set the session optimistically so the profile fetch (effect below) and the
+      // enrollment-gate queries start NOW, in parallel with the revoke check — the
+      // old sequential order added a full network round-trip to every startup.
+      // `loading` stays true until the revoke verdict, so nothing renders for a
+      // revoked account (the gate shows AuthSplash while loading).
+      applyStorageUser(cached.user?.id ?? null);
+      if (mounted) setSession(cached);
       // getSession() only reads the locally-cached token — a deleted/disabled
       // account still looks "logged in". Re-check against the auth server and drop
       // the session if the account is truly gone (401/403). Any other failure
       // (network/5xx) fails open so an offline user with a valid account stays in.
-      if (valid && (await accountRevoked())) {
-        await supabase.auth.signOut();
-        valid = null;
+      if (await accountRevoked()) {
+        await supabase.auth.signOut(); // onAuthStateChange clears session + storage namespace
+        if (mounted) {
+          applyStorageUser(null);
+          setSession(null);
+        }
       }
-      if (!mounted) return;
-      applyStorageUser(valid?.user?.id ?? null);
-      setSession(valid);
-      setLoading(false);
+      if (mounted) setLoading(false);
     })();
 
     const { data: sub } = supabase.auth.onAuthStateChange((event, nextSession) => {
@@ -182,10 +196,14 @@ export function AuthProvider({ children }) {
 
   // Re-validate when the user returns to the tab, so a mid-session account deletion
   // signs them out promptly instead of waiting for the next token refresh (~1h).
+  // Throttled to once per minute — rapid tab switching shouldn't burn auth round-trips.
   useEffect(() => {
     if (!supabaseConfigured) return;
+    let lastCheck = 0;
     const onVisible = async () => {
       if (document.visibilityState !== 'visible') return;
+      if (Date.now() - lastCheck < 60_000) return;
+      lastCheck = Date.now();
       const { data } = await supabase.auth.getSession();
       if (data.session && (await accountRevoked())) await supabase.auth.signOut();
     };
