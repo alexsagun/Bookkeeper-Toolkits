@@ -5,10 +5,37 @@
     <link rel="icon" type="image/png" href="/favicon.png" />
     <link rel="apple-touch-icon" href="/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#F7FAFF" />
     <title>Ultimate Remote Bookkeeper Toolkits</title>
     <!-- Tailwind is compiled through PostCSS now (see tailwind.config.js / postcss.config.js and the
          `import './index.css'` in src/main.jsx) — no production CDN. The standalone/ GAS build still
          uses the CDN since it's a single self-contained file. -->
+    <!-- Fonts load once, globally (the per-component @imports were removed). -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" />
+    <!-- No-flash theme boot (DO NOT REMOVE): sets data-theme on <html> before first paint.
+         Reads the BARE localStorage key 'ui:theme' (raw pref: light|dark|system) — the
+         window.storage shim namespaces keys per user, but the boot mirror is deliberately
+         un-namespaced so pre-auth screens and first paint are themed. The useTheme hook in
+         src/BookkeeperPro.jsx keeps this key in sync. -->
+    <style>html{background:#F7FAFF}html[data-theme="dark"]{background:#06090F}</style>
+    <script>
+      (function () {
+        var p = null;
+        try { p = localStorage.getItem('ui:theme'); } catch (e) {}
+        if (p !== 'light' && p !== 'dark' && p !== 'system') p = null;
+        var dark = p === 'dark' || (!p || p === 'system'
+          ? !!(window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches)
+          : false);
+        document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+        window.__themePref = p || 'system';
+        if (dark) {
+          var m = document.querySelector('meta[name="theme-color"]');
+          if (m) m.setAttribute('content', '#06090F');
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

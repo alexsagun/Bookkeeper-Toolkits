@@ -807,45 +807,76 @@ const TIPS = [
 // ═══════════════════════════════════════════════════════════════════
 
 // ── Primary palette ──
+// Every value is a CSS custom-property reference — the actual light/dark hex
+// values live in src/index.css (`:root` + `[data-theme="dark"]`), and the
+// active theme is the data-theme attribute on <html> (see useTheme).
+// Because these are var() strings they only work INSIDE the app's DOM:
+//  • never string-concat an alpha suffix (`${C.primary}66` is broken CSS) —
+//    use the alpha tokens (--primary-glow, --primary-tint, …) instead;
+//  • anything that leaves the DOM (Word .doc exports, the certificate print
+//    window, html2canvas) must use the frozen literal INK palette below.
 const C = {
-  // Blues
-  primary:   '#0A84FF',   // iOS systemBlue — primary action
-  primaryHi: '#3D8BFF',   // bright lift
-  primaryLo: '#0057B8',   // deep base for gradients
-  accent:    '#5AC8FA',   // cyan accent
-  soft:      '#6FAAFF',   // soft blue for tints
-  // Whites
-  white:     '#FFFFFF',
-  bg:        '#F7FAFF',   // off-white background
-  bgSoft:    '#EAF4FF',   // ice tint
-  bgDeeper:  '#DCE9FF',   // shadow tint
+  // Blues (identical in both themes)
+  primary:   'var(--c-primary)',     // iOS systemBlue — primary action
+  primaryHi: 'var(--c-primary-hi)',  // bright lift
+  primaryLo: 'var(--c-primary-lo)',  // deep base for gradients
+  accent:    'var(--c-accent)',      // cyan accent
+  soft:      'var(--c-soft)',        // soft blue for tints
+  // Surfaces
+  white:     'var(--surface-2)',     // solid card/input surface (was #FFFFFF; only ever used as background)
+  bg:        'var(--c-bg)',          // app background
+  bgSoft:    'var(--c-bg-soft)',     // ice tint
+  bgDeeper:  'var(--c-bg-deeper)',   // shadow tint
   // Text greys
-  text:      '#0F1217',   // near-black (slightly cool)
-  textSoft:  '#5F6773',   // secondary text
-  textMute:  '#8E96A3',   // tertiary / metadata
-  border:    'rgba(15,18,23,0.08)',
+  text:      'var(--c-text)',        // near-black (slightly cool) / near-white in dark
+  textSoft:  'var(--c-text-soft)',   // secondary text
+  textMute:  'var(--c-text-mute)',   // tertiary / metadata
+  border:    'var(--c-border)',
   // Status — sparingly
-  green:     '#28A647',
-  amber:     '#FF9F0A',
-  red:       '#D02323',
+  green:     'var(--c-green)',
+  amber:     'var(--c-amber)',
+  red:       'var(--c-red)',
 };
 
+// ── INK: frozen literal palette for anything that LEAVES the DOM ──
+// (Word .doc builders, the certificate + its print window, html2canvas/PDF.)
+// var() does not resolve in an exported document — always use INK there.
+// INK.navy is also the band/gradient background under white text (kept deep
+// in BOTH themes so `text-white` headers stay readable).
+const INK = Object.freeze({
+  primary:  '#0A84FF',
+  primaryLo:'#0057B8',
+  accent:   '#5AC8FA',
+  navy:     '#0057B8',
+  text:     '#0F1217',
+  textSoft: '#5F6773',
+  textMute: '#8E96A3',
+  border:   'rgba(15,18,23,0.08)',
+  green:    '#28A647',
+  amber:    '#FF9F0A',
+  red:      '#D02323',
+});
+
 // ── Backward-compat aliases (so existing 14k lines keep working) ──
-const NAVY  = C.primaryLo;   // was deep navy; now deep blue
-const ROYAL = C.primary;     // was royal blue; now iOS systemBlue
-const CYAN  = C.accent;      // unchanged spirit, new hex
-const SKY   = C.soft;        // light blue
-const ICE   = C.bgSoft;      // ice surface
-const GOLD  = C.accent;      // legacy alias — keep mapped to cyan
-const SHEEN = `linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(247,250,255,0.88) 100%)`;
+// NAVY/ICE theme via vars (NAVY is mostly deep-blue TEXT — it lightens in dark;
+// band *backgrounds* were repointed to INK.navy). ROYAL/CYAN/SKY/GOLD are brand
+// hues identical in both themes, kept as literals so `${CYAN}40`-style alpha
+// suffixes in legacy code remain valid CSS.
+const NAVY  = 'var(--navy)';
+const ROYAL = '#0A84FF';     // = C.primary (literal on purpose)
+const CYAN  = '#5AC8FA';     // = C.accent (literal on purpose)
+const SKY   = '#6FAAFF';     // = C.soft (literal on purpose)
+const ICE   = C.bgSoft;      // ice surface (themes)
+const GOLD  = CYAN;          // legacy alias — keep mapped to cyan
+const SHEEN = 'var(--sheen)';
 
 // ── Glass surface presets ──
 const GLASS = {
-  card:        'rgba(255,255,255,0.72)',
-  cardElev:    'rgba(255,255,255,0.82)',
-  cardDeep:    'rgba(255,255,255,0.92)',
-  border:      'rgba(255,255,255,0.85)',
-  borderSoft:  'rgba(15,18,23,0.06)',
+  card:        'var(--glass-card)',
+  cardElev:    'var(--glass-card-elev)',
+  cardDeep:    'var(--glass-card-deep)',
+  border:      'var(--glass-border)',
+  borderSoft:  'var(--glass-border-soft)',
 };
 
 // ── Motion easings ──
@@ -1040,7 +1071,7 @@ function PendingConfirm({ email, busy, cooldown, err, notice, onResend, onBack }
         )}
         <button onClick={onResend} disabled={busy || cooldown > 0}
           className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
-          style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+          style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
           {busy && <Loader2 size={15} className="animate-spin" />}
           {cooldown > 0 ? `Resend in ${cooldown}s` : 'Resend confirmation email'}
         </button>
@@ -1158,16 +1189,6 @@ function AuthScreen() {
 
   return (
     <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-        .gh-app-bg { background:
-          radial-gradient(1200px 600px at 70% -10%, rgba(90,200,250,0.12), transparent 60%),
-          radial-gradient(900px 500px at -10% 110%, rgba(10,132,255,0.10), transparent 55%),
-          ${C.bg}; }
-        .auth-in { animation: authIn .5s cubic-bezier(.16,1,.3,1) both; }
-        @keyframes authIn { from { opacity:0; transform: translateY(10px) scale(.985); } to { opacity:1; transform:none; } }
-      `}</style>
-
       <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
         background: GLASS.cardDeep,
         backdropFilter: 'blur(30px) saturate(180%)',
@@ -1250,7 +1271,7 @@ function AuthScreen() {
 
           <button type="submit" disabled={busy}
             className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
-            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
             {busy && <Loader2 size={15} className="animate-spin" />}
             {mode === 'signup' ? 'Create account' : mode === 'reset' ? 'Send reset link' : 'Sign in'}
           </button>
@@ -1299,16 +1320,6 @@ function UpdatePasswordScreen() {
 
   return (
     <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-        .gh-app-bg { background:
-          radial-gradient(1200px 600px at 70% -10%, rgba(90,200,250,0.12), transparent 60%),
-          radial-gradient(900px 500px at -10% 110%, rgba(10,132,255,0.10), transparent 55%),
-          ${C.bg}; }
-        .auth-in { animation: authIn .5s cubic-bezier(.16,1,.3,1) both; }
-        @keyframes authIn { from { opacity:0; transform: translateY(10px) scale(.985); } to { opacity:1; transform:none; } }
-      `}</style>
-
       <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
         background: GLASS.cardDeep,
         backdropFilter: 'blur(30px) saturate(180%)',
@@ -1329,7 +1340,7 @@ function UpdatePasswordScreen() {
             </div>
             <button onClick={() => clearRecovery()}
               className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition"
-              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
               Continue to your toolkit
             </button>
           </div>
@@ -1354,7 +1365,7 @@ function UpdatePasswordScreen() {
 
             <button type="submit" disabled={busy}
               className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
-              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
               {busy && <Loader2 size={15} className="animate-spin" />} Update password
             </button>
           </form>
@@ -1407,7 +1418,7 @@ function WelcomeOverlay({ name, onClose }) {
         <div className="px-8 pb-7">
           <button onClick={onClose}
             className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition"
-            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
             Start exploring <Sparkles size={15} />
           </button>
         </div>
@@ -1476,17 +1487,6 @@ function PendingApprovalScreen({ email, uid, onSignOut, onRefresh }) {
 
   return (
     <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-        .gh-app-bg { background:
-          radial-gradient(1200px 600px at 70% -10%, rgba(90,200,250,0.12), transparent 60%),
-          radial-gradient(900px 500px at -10% 110%, rgba(10,132,255,0.10), transparent 55%),
-          ${C.bg}; }
-        .auth-in { animation: authIn .5s cubic-bezier(.16,1,.3,1) both; }
-        @keyframes authIn { from { opacity:0; transform: translateY(10px) scale(.985); } to { opacity:1; transform:none; } }
-        @keyframes pendPulse { 0%,100% { transform: scale(1); opacity:1 } 50% { transform: scale(1.06); opacity:.85 } }
-      `}</style>
-
       <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
         background: GLASS.cardDeep,
         backdropFilter: 'blur(30px) saturate(180%)',
@@ -1517,7 +1517,7 @@ function PendingApprovalScreen({ email, uid, onSignOut, onRefresh }) {
           </p>
 
           {email && (
-            <div className="mt-4 flex items-center justify-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'rgba(15,18,23,0.035)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <div className="mt-4 flex items-center justify-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
               <Mail size={14} style={{ color: C.textMute }} />
               <span className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{email}</span>
             </div>
@@ -1531,7 +1531,7 @@ function PendingApprovalScreen({ email, uid, onSignOut, onRefresh }) {
 
           <button onClick={check} disabled={checking}
             className="mt-5 w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
-            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
             {checking ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
             {checking ? 'Checking…' : 'Check approval status'}
           </button>
@@ -1555,16 +1555,6 @@ function PendingApprovalScreen({ email, uid, onSignOut, onRefresh }) {
 function RejectedScreen({ email, reason, onSignOut }) {
   return (
     <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-        .gh-app-bg { background:
-          radial-gradient(1200px 600px at 70% -10%, rgba(90,200,250,0.10), transparent 60%),
-          radial-gradient(900px 500px at -10% 110%, rgba(208,35,35,0.06), transparent 55%),
-          ${C.bg}; }
-        .auth-in { animation: authIn .5s cubic-bezier(.16,1,.3,1) both; }
-        @keyframes authIn { from { opacity:0; transform: translateY(10px) scale(.985); } to { opacity:1; transform:none; } }
-      `}</style>
-
       <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
         background: GLASS.cardDeep,
         backdropFilter: 'blur(30px) saturate(180%)',
@@ -1602,7 +1592,7 @@ function RejectedScreen({ email, reason, onSignOut }) {
           )}
 
           {email && (
-            <div className="mt-4 flex items-center justify-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'rgba(15,18,23,0.035)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <div className="mt-4 flex items-center justify-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
               <Mail size={14} style={{ color: C.textMute }} />
               <span className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{email}</span>
             </div>
@@ -1610,7 +1600,7 @@ function RejectedScreen({ email, reason, onSignOut }) {
 
           <a href="mailto:alex.capinding.sagun@gmail.com"
             className="mt-5 w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition"
-            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
             <Mail size={15} /> Contact support
           </a>
 
@@ -1908,16 +1898,6 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
 
   return (
     <div className="h-screen w-full overflow-y-auto gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-        .gh-app-bg { background:
-          radial-gradient(1200px 600px at 70% -10%, rgba(90,200,250,0.12), transparent 60%),
-          radial-gradient(900px 500px at -10% 110%, rgba(10,132,255,0.10), transparent 55%),
-          ${C.bg}; }
-        .auth-in { animation: authIn .5s cubic-bezier(.16,1,.3,1) both; }
-        @keyframes authIn { from { opacity:0; transform: translateY(10px) scale(.985); } to { opacity:1; transform:none; } }
-      `}</style>
-
       <div className="auth-in w-full max-w-5xl mx-auto px-5 md:px-8 py-8 md:py-12">
         {/* Header */}
         <div className="text-center">
@@ -1932,7 +1912,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
           </div>
           <div className="mt-3 flex items-center justify-center gap-2 flex-wrap">
             {user?.email && (
-              <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full" style={{ background: 'rgba(15,18,23,0.035)', border: `1px solid ${GLASS.borderSoft}`, fontSize: 12, color: C.textSoft }}>
+              <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}`, fontSize: 12, color: C.textSoft }}>
                 <Mail size={12} style={{ color: C.textMute }} /> {user.email}
               </span>
             )}
@@ -2010,7 +1990,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
                   </div>
                 </div>
               )}
-              <div className="mt-4 rounded-xl px-3.5 py-3" style={{ background: 'rgba(15,18,23,0.03)', border: `1px solid ${GLASS.borderSoft}` }}>
+              <div className="mt-4 rounded-xl px-3.5 py-3" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
                 {[['Package', priorRequest.plan_name || PLAN_LABELS[priorRequest.plan_key] || priorRequest.plan_key],
                   ['Amount sent', phpFmt(priorRequest.amount_paid)],
                   ['Submitted', fmtEnrollDate(priorRequest.created_at)]].map(([k, v]) => (
@@ -2022,7 +2002,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
               </div>
               <button onClick={() => setStep('plans')}
                 className="mt-5 w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition"
-                style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+                style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
                 <RefreshCw size={15} /> Choose a package & resubmit
               </button>
               <p className="mt-4 text-center" style={{ fontSize: 11, color: C.textMute }}>
@@ -2053,7 +2033,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
                     <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: C.textMute }}>{p.tagline || ' '}</div>
                     {p.badge && (
                       <span className="px-2.5 py-1 rounded-full text-[10px] font-bold text-white inline-flex items-center gap-1"
-                        style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `0 4px 10px -2px ${C.primary}55` }}>
+                        style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `0 4px 10px -2px var(--primary-glow-soft)` }}>
                         <Sparkles size={10} /> {p.badge}
                       </span>
                     )}
@@ -2095,7 +2075,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
                   <button onClick={() => selectPlan(p)}
                     className="mt-5 w-full py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 transition hover:opacity-95"
                     style={featured
-                      ? { color: 'white', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }
+                      ? { color: 'white', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }
                       : { color: C.primary, background: 'rgba(10,132,255,0.07)', border: '1px solid rgba(10,132,255,0.22)' }}>
                     Enroll — {phpFmt(price)} <ArrowRight size={14} />
                   </button>
@@ -2128,7 +2108,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
                   </div>
                   <div>
                     <label className={labelCls} style={labelStyle}>Email</label>
-                    <input className={inputCls} style={{ ...inputStyle, background: 'rgba(15,18,23,0.03)', color: C.textSoft }} value={user?.email || ''} readOnly />
+                    <input className={inputCls} style={{ ...inputStyle, background: 'var(--wash)', color: C.textSoft }} value={user?.email || ''} readOnly />
                   </div>
                   <div>
                     <label className={labelCls} style={labelStyle}>Phone</label>
@@ -2196,7 +2176,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
 
                 <button type="submit" disabled={busy}
                   className="mt-5 w-full py-3 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
-                  style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+                  style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
                   {busy ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
                   {busy ? 'Submitting…' : 'Submit my enrollment'}
                 </button>
@@ -2322,17 +2302,6 @@ function EnrollmentPendingScreen({ request, finalizing, renewal, email, uid, onS
 
   return (
     <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-        .gh-app-bg { background:
-          radial-gradient(1200px 600px at 70% -10%, rgba(90,200,250,0.12), transparent 60%),
-          radial-gradient(900px 500px at -10% 110%, rgba(10,132,255,0.10), transparent 55%),
-          ${C.bg}; }
-        .auth-in { animation: authIn .5s cubic-bezier(.16,1,.3,1) both; }
-        @keyframes authIn { from { opacity:0; transform: translateY(10px) scale(.985); } to { opacity:1; transform:none; } }
-        @keyframes pendPulse { 0%,100% { transform: scale(1); opacity:1 } 50% { transform: scale(1.06); opacity:.85 } }
-      `}</style>
-
       <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
         background: GLASS.cardDeep,
         backdropFilter: 'blur(30px) saturate(180%)',
@@ -2372,7 +2341,7 @@ function EnrollmentPendingScreen({ request, finalizing, renewal, email, uid, onS
           </p>
 
           {request && (
-            <div className="mt-4 rounded-xl px-3.5 py-2.5" style={{ background: 'rgba(15,18,23,0.03)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <div className="mt-4 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
               {[['Package', request.plan_name || PLAN_LABELS[request.plan_key] || request.plan_key],
                 ['Amount sent', phpFmt(request.amount_paid)],
                 ...(request.payment_reference ? [['Reference', request.payment_reference]] : []),
@@ -2395,7 +2364,7 @@ function EnrollmentPendingScreen({ request, finalizing, renewal, email, uid, onS
           )}
 
           {email && (
-            <div className="mt-4 flex items-center justify-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'rgba(15,18,23,0.035)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <div className="mt-4 flex items-center justify-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
               <Mail size={14} style={{ color: C.textMute }} />
               <span className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{email}</span>
             </div>
@@ -2409,7 +2378,7 @@ function EnrollmentPendingScreen({ request, finalizing, renewal, email, uid, onS
 
           <button onClick={check} disabled={checking}
             className="mt-5 w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
-            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
             {checking ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
             {checking ? 'Checking…' : 'Check review status'}
           </button>
@@ -2444,16 +2413,6 @@ function MembershipExpiredScreen({ sub, latestReq, email, onRenew, onSignOut }) 
 
   return (
     <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-        .gh-app-bg { background:
-          radial-gradient(1200px 600px at 70% -10%, rgba(90,200,250,0.12), transparent 60%),
-          radial-gradient(900px 500px at -10% 110%, rgba(10,132,255,0.10), transparent 55%),
-          ${C.bg}; }
-        .auth-in { animation: authIn .5s cubic-bezier(.16,1,.3,1) both; }
-        @keyframes authIn { from { opacity:0; transform: translateY(10px) scale(.985); } to { opacity:1; transform:none; } }
-      `}</style>
-
       <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
         background: GLASS.cardDeep,
         backdropFilter: 'blur(30px) saturate(180%)',
@@ -2497,7 +2456,7 @@ function MembershipExpiredScreen({ sub, latestReq, email, onRenew, onSignOut }) 
           )}
 
           {sub && (
-            <div className="mt-4 rounded-xl px-3.5 py-2.5" style={{ background: 'rgba(15,18,23,0.03)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <div className="mt-4 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
               {[['Plan', planName],
                 ['Started', fmtEnrollDate(sub.started_at)],
                 ['Ended', sub.ends_at ? fmtEnrollDate(sub.ends_at) : '—']].map(([k, v]) => (
@@ -2516,7 +2475,7 @@ function MembershipExpiredScreen({ sub, latestReq, email, onRenew, onSignOut }) 
           )}
 
           {email && (
-            <div className="mt-4 flex items-center justify-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'rgba(15,18,23,0.035)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <div className="mt-4 flex items-center justify-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
               <Mail size={14} style={{ color: C.textMute }} />
               <span className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{email}</span>
             </div>
@@ -2524,7 +2483,7 @@ function MembershipExpiredScreen({ sub, latestReq, email, onRenew, onSignOut }) 
 
           <button onClick={onRenew}
             className="mt-5 w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition hover:opacity-95"
-            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }}>
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
             <RefreshCw size={15} /> Renew your membership
           </button>
 
@@ -3375,322 +3334,11 @@ export default function BookkeeperProToolkit() {
     }
   }
 
+  // Theme (data-theme) lives on <html> — set by the index.html boot script + useTheme.
+  // Global styles/tokens live in src/index.css (moved out of the old in-shell <style>).
   return (
-    <div data-theme="light" style={{ fontFamily: fontBody, color: C.text }} className="h-screen w-full flex overflow-hidden gh-app-bg">
+    <div style={{ fontFamily: fontBody, color: C.text }} className="h-screen w-full flex overflow-hidden gh-app-bg">
       {showWelcome && <WelcomeOverlay name={profile?.full_name || user?.email} onClose={dismissWelcome} />}
-      {/* Font import + global styles */}
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
-
-        /* ──────────────────────────────────────────────────────────
-           GLOBAL TOKENS (CSS custom properties for the design system)
-           ────────────────────────────────────────────────────────── */
-        :root {
-          --c-primary: ${C.primary};
-          --c-primary-hi: ${C.primaryHi};
-          --c-primary-lo: ${C.primaryLo};
-          --c-accent: ${C.accent};
-          --c-text: ${C.text};
-          --c-text-soft: ${C.textSoft};
-          --c-text-mute: ${C.textMute};
-          --c-bg: ${C.bg};
-          --c-bg-soft: ${C.bgSoft};
-          --glass-card: ${GLASS.card};
-          --glass-card-elev: ${GLASS.cardElev};
-          --glass-border: ${GLASS.border};
-          --ease: ${EASE};
-          --ease-out: ${EASE_OUT};
-          --spring: ${SPRING};
-        }
-
-        /* Dark mode (toggled by [data-theme="dark"] on the shell) */
-        [data-theme="dark"] {
-          --c-text: #E8ECF2;
-          --c-text-soft: #A9B2C0;
-          --c-text-mute: #6E7686;
-          --c-bg: #06090F;
-          --c-bg-soft: #0B1322;
-          --glass-card: rgba(22,30,46,0.62);
-          --glass-card-elev: rgba(30,40,58,0.72);
-          --glass-border: rgba(255,255,255,0.08);
-        }
-
-        /* ──────────────────────────────────────────────────────────
-           APP BACKGROUND — soft mesh with subtle paper noise
-           ────────────────────────────────────────────────────────── */
-        .gh-app-bg {
-          background-color: ${C.bg};
-          background-image:
-            radial-gradient(at 18% 12%, ${C.bgSoft} 0%, transparent 42%),
-            radial-gradient(at 82% 8%, #E8F1FF 0%, transparent 48%),
-            radial-gradient(at 70% 88%, ${C.bgDeeper} 0%, transparent 50%),
-            radial-gradient(at 8% 92%, #F0F6FF 0%, transparent 45%),
-            linear-gradient(180deg, ${C.bg} 0%, #F2F7FF 100%);
-          background-attachment: fixed;
-          position: relative;
-        }
-        [data-theme="dark"] .gh-app-bg {
-          background-color: #06090F;
-          background-image:
-            radial-gradient(at 18% 12%, rgba(10,132,255,0.18) 0%, transparent 50%),
-            radial-gradient(at 82% 90%, rgba(90,200,250,0.12) 0%, transparent 55%),
-            linear-gradient(180deg, #06090F 0%, #0B1322 100%);
-        }
-        /* Paper noise overlay */
-        .gh-app-bg::before {
-          content: '';
-          position: fixed; inset: 0;
-          background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='220' height='220'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' seed='5'/><feColorMatrix values='0 0 0 0 0.1 0 0 0 0 0.2 0 0 0 0 0.3 0 0 0 0.5 0'/></filter><rect width='220' height='220' filter='url(%23n)' opacity='0.55'/></svg>");
-          opacity: 0.35;
-          mix-blend-mode: overlay;
-          pointer-events: none;
-          z-index: 0;
-        }
-        /* Ensure app content renders above noise */
-        .gh-app-bg > * { position: relative; z-index: 1; }
-
-        /* ──────────────────────────────────────────────────────────
-           TYPOGRAPHY HELPERS
-           ────────────────────────────────────────────────────────── */
-        .gh-label {
-          font-size: 11px; font-weight: 600;
-          letter-spacing: 0.14em; text-transform: uppercase;
-          color: var(--c-text-mute);
-        }
-        .gh-headline {
-          font-weight: 600; letter-spacing: -0.02em;
-          line-height: 1.1; color: var(--c-text);
-        }
-        .gh-num {
-          font-family: ${fontMono};
-          font-variant-numeric: tabular-nums;
-          letter-spacing: -0.015em;
-        }
-        .gh-bignum {
-          font-weight: 700; letter-spacing: -0.025em;
-          font-variant-numeric: tabular-nums;
-          color: var(--c-text);
-        }
-        .gh-tnum { font-variant-numeric: tabular-nums; }
-
-        /* ──────────────────────────────────────────────────────────
-           SURFACES — glass cards (replaces old .glass-card, .glossy-card)
-           ────────────────────────────────────────────────────────── */
-        .glass-card, .gh-card {
-          background: var(--glass-card);
-          backdrop-filter: blur(28px) saturate(160%);
-          -webkit-backdrop-filter: blur(28px) saturate(160%);
-          border: 1px solid var(--glass-border);
-          border-radius: 22px;
-          box-shadow:
-            inset 0 1px 0 rgba(255,255,255,0.9),
-            0 1px 2px rgba(15,18,23,0.04),
-            0 12px 32px -12px rgba(15,18,23,0.10),
-            0 24px 64px -24px rgba(10,132,255,0.18);
-          transition: transform 220ms var(--ease), box-shadow 220ms var(--ease);
-        }
-        [data-theme="dark"] .glass-card, [data-theme="dark"] .gh-card {
-          box-shadow:
-            inset 0 1px 0 rgba(255,255,255,0.06),
-            0 8px 24px -8px rgba(0,0,0,0.5),
-            0 24px 64px -24px rgba(10,132,255,0.25);
-        }
-        .gh-card-elev {
-          background: var(--glass-card-elev);
-          backdrop-filter: blur(32px) saturate(170%);
-          -webkit-backdrop-filter: blur(32px) saturate(170%);
-          border: 1px solid var(--glass-border);
-          border-radius: 22px;
-          box-shadow:
-            inset 0 1px 0 rgba(255,255,255,0.95),
-            0 2px 4px rgba(15,18,23,0.05),
-            0 20px 48px -16px rgba(15,18,23,0.14),
-            0 32px 80px -28px rgba(10,132,255,0.22);
-        }
-        .gh-card-tier {
-          background: var(--glass-card);
-          backdrop-filter: blur(20px) saturate(150%);
-          -webkit-backdrop-filter: blur(20px) saturate(150%);
-          border: 1px solid var(--glass-border);
-          border-radius: 18px;
-          box-shadow:
-            inset 0 1px 0 rgba(255,255,255,0.85),
-            0 6px 16px -6px rgba(15,18,23,0.08);
-        }
-
-        /* Legacy compat — .glossy-card and .deep-card map to glass */
-        .glossy-card { background: var(--glass-card-elev); backdrop-filter: blur(28px) saturate(160%); border: 1px solid var(--glass-border); border-radius: 22px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.95), 0 12px 32px -12px rgba(15,18,23,0.10); }
-        .deep-card { background: linear-gradient(180deg, ${C.primaryHi} 0%, ${C.primaryLo} 100%); color: white; border-radius: 22px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.25), 0 12px 32px -8px rgba(10,132,255,0.32); }
-
-        /* ──────────────────────────────────────────────────────────
-           BUTTONS
-           ────────────────────────────────────────────────────────── */
-        .sheen-btn, .gh-btn-primary {
-          background: linear-gradient(180deg, ${C.primaryHi} 0%, ${C.primary} 50%, ${C.primaryLo} 100%);
-          color: white; font-weight: 600;
-          border: 0; border-radius: 14px;
-          box-shadow:
-            inset 0 1px 0 rgba(255,255,255,0.35),
-            inset 0 -1px 0 rgba(0,0,0,0.08),
-            0 1px 2px rgba(10,132,255,0.20),
-            0 8px 20px -8px rgba(10,132,255,0.45);
-          transition: transform 200ms var(--ease), box-shadow 200ms var(--ease), filter 200ms var(--ease);
-          letter-spacing: -0.005em;
-          cursor: pointer;
-        }
-        .sheen-btn:hover, .gh-btn-primary:hover {
-          transform: translateY(-2px);
-          box-shadow:
-            inset 0 1px 0 rgba(255,255,255,0.45),
-            inset 0 -1px 0 rgba(0,0,0,0.08),
-            0 2px 4px rgba(10,132,255,0.25),
-            0 14px 28px -10px rgba(10,132,255,0.55);
-          filter: brightness(1.05);
-        }
-        .sheen-btn:active, .gh-btn-primary:active { transform: scale(0.97); transition-duration: 80ms; }
-        .sheen-btn:disabled, .gh-btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-        /* Remove the old animated sweep */
-        .sheen-btn::before { display: none; }
-
-        .gh-btn-ghost {
-          background: rgba(255,255,255,0.6);
-          backdrop-filter: blur(16px) saturate(160%);
-          border: 1px solid var(--glass-border);
-          color: var(--c-text);
-          font-weight: 500;
-          border-radius: 14px;
-          padding: 8px 14px;
-          transition: transform 200ms var(--ease), background 200ms var(--ease);
-          cursor: pointer;
-        }
-        .gh-btn-ghost:hover { background: rgba(255,255,255,0.85); transform: translateY(-1px); }
-        .gh-btn-ghost:active { transform: scale(0.97); }
-
-        /* Glossy pill (for tabs / chips) */
-        .gh-pill {
-          background: rgba(255,255,255,0.65);
-          backdrop-filter: blur(16px) saturate(160%);
-          border: 1px solid var(--glass-border);
-          border-radius: 12px;
-          padding: 6px 12px;
-          font-size: 12px; font-weight: 500;
-          color: var(--c-text-soft);
-          transition: all 200ms var(--ease);
-          cursor: pointer;
-          box-shadow: inset 0 1px 0 rgba(255,255,255,0.55);
-        }
-        .gh-pill:hover { background: rgba(255,255,255,0.9); color: var(--c-text); }
-        .gh-pill.is-active {
-          background: linear-gradient(180deg, ${C.primaryHi}, ${C.primary});
-          color: white;
-          border-color: transparent;
-          box-shadow: inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px rgba(10,132,255,0.4);
-        }
-
-        /* Segmented control frame */
-        .gh-segframe {
-          display: inline-flex; gap: 4px; padding: 4px;
-          background: rgba(15,18,23,0.04);
-          border: 1px solid var(--glass-border);
-          border-radius: 14px;
-          box-shadow: inset 0 1px 2px rgba(15,18,23,0.04);
-        }
-
-        /* ──────────────────────────────────────────────────────────
-           INPUTS
-           ────────────────────────────────────────────────────────── */
-        .gh-input, input[type="text"].gh-input, input[type="number"].gh-input,
-        input[type="date"].gh-input, input[type="email"].gh-input,
-        textarea.gh-input, select.gh-input {
-          background: rgba(255,255,255,0.7);
-          backdrop-filter: blur(12px) saturate(140%);
-          border: 1px solid var(--glass-border);
-          border-radius: 14px;
-          padding: 10px 14px;
-          font-size: 14px;
-          color: var(--c-text);
-          box-shadow: inset 0 1px 2px rgba(15,18,23,0.04);
-          transition: border-color 200ms var(--ease), box-shadow 200ms var(--ease), background 200ms var(--ease);
-          outline: none;
-        }
-        .gh-input:focus, input.gh-input:focus, textarea.gh-input:focus, select.gh-input:focus {
-          border-color: ${C.soft};
-          background: rgba(255,255,255,0.95);
-          box-shadow:
-            inset 0 1px 2px rgba(15,18,23,0.04),
-            0 0 0 4px rgba(10,132,255,0.18);
-        }
-        .gh-input::placeholder { color: var(--c-text-mute); }
-
-        /* ──────────────────────────────────────────────────────────
-           NAVIGATION
-           ────────────────────────────────────────────────────────── */
-        .nav-item-active {
-          background: linear-gradient(90deg, rgba(10,132,255,0.10) 0%, rgba(10,132,255,0) 100%);
-          color: var(--c-primary);
-        }
-        .nav-item-active::before {
-          content: ''; position: absolute; left: 0; top: 8px; bottom: 8px;
-          width: 3px; border-radius: 0 3px 3px 0;
-          background: linear-gradient(180deg, ${C.primaryHi}, ${C.primary});
-          box-shadow: 0 0 12px ${C.primary}66;
-        }
-
-        /* ──────────────────────────────────────────────────────────
-           STATUS DOTS & MISC
-           ────────────────────────────────────────────────────────── */
-        .gh-dot-live {
-          width: 8px; height: 8px; border-radius: 50%;
-          background: ${C.green};
-          box-shadow: 0 0 0 4px ${C.green}22;
-          animation: gh-pulse 2s ease-in-out infinite;
-        }
-        @keyframes gh-pulse { 0%, 100% { box-shadow: 0 0 0 4px ${C.green}22; } 50% { box-shadow: 0 0 0 8px ${C.green}11; } }
-
-        .gh-halo {
-          position: relative;
-        }
-        .gh-halo::after {
-          content: ''; position: absolute; inset: -40px;
-          background: radial-gradient(circle at center, ${C.primary}1A 0%, transparent 60%);
-          z-index: -1; pointer-events: none;
-        }
-
-        /* Animated progress stripes */
-        .gh-progress-stripes {
-          background-image: linear-gradient(45deg,
-            rgba(255,255,255,0.15) 25%, transparent 25%,
-            transparent 50%, rgba(255,255,255,0.15) 50%,
-            rgba(255,255,255,0.15) 75%, transparent 75%, transparent);
-          background-size: 24px 24px;
-          animation: gh-stripes 1.4s linear infinite;
-        }
-        @keyframes gh-stripes { 0% { background-position: 0 0; } 100% { background-position: 24px 0; } }
-
-        /* Fade in (legacy) */
-        .fade-in { animation: gh-fadeIn 0.5s var(--ease) forwards; }
-        @keyframes gh-fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-        .shimmer { background: linear-gradient(90deg, transparent, rgba(10,132,255,0.18), transparent); background-size: 200% 100%; animation: gh-shimmer 3s infinite; }
-        @keyframes gh-shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
-
-        /* gloss-overlay legacy */
-        .gloss-overlay::after { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 50%; background: linear-gradient(180deg, rgba(255,255,255,0.4) 0%, transparent 100%); border-radius: inherit; pointer-events: none; }
-
-        /* ──────────────────────────────────────────────────────────
-           SCROLLBARS
-           ────────────────────────────────────────────────────────── */
-        ::-webkit-scrollbar { width: 10px; height: 10px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: rgba(15,18,23,0.15); border-radius: 12px; border: 2px solid transparent; background-clip: padding-box; }
-        ::-webkit-scrollbar-thumb:hover { background: rgba(15,18,23,0.25); background-clip: padding-box; border: 2px solid transparent; }
-
-        /* ──────────────────────────────────────────────────────────
-           UNIVERSAL TIGHTENING — bring legacy components in line
-           ────────────────────────────────────────────────────────── */
-        /* Convert any leftover slate-* / blue-* shadows toward our new palette via softer overrides */
-        button { font-family: inherit; }
-        ::selection { background: ${C.primary}33; color: var(--c-text); }
-      `}</style>
 
       {/* Mobile drawer backdrop — click to dismiss (hidden on lg+) */}
       {sidebarOpen && (
@@ -3716,7 +3364,7 @@ export default function BookkeeperProToolkit() {
           onClick={() => setSidebarOpen(false)}
           aria-label="Close menu"
           className="lg:hidden absolute top-4 right-4 z-10 flex items-center justify-center rounded-lg"
-          style={{ width: 32, height: 32, background: 'rgba(15,18,23,0.05)', border: `1px solid ${GLASS.borderSoft}` }}
+          style={{ width: 32, height: 32, background: 'var(--wash-strong)', border: `1px solid ${GLASS.borderSoft}` }}
         >
           <X size={18} style={{ color: C.textMute }} />
         </button>
@@ -3761,7 +3409,7 @@ export default function BookkeeperProToolkit() {
               title="Collapse sidebar"
               aria-label="Collapse sidebar"
               className="hidden lg:flex flex-shrink-0 items-center justify-center rounded-lg transition hover:opacity-80"
-              style={{ width: 30, height: 30, background: 'rgba(15,18,23,0.04)', border: `1px solid ${GLASS.borderSoft}`, color: C.textMute }}
+              style={{ width: 30, height: 30, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}`, color: C.textMute }}
             >
               <PanelLeftClose size={16} />
             </button>
@@ -3769,7 +3417,7 @@ export default function BookkeeperProToolkit() {
 
           {/* Signed-in identity + sign out */}
           {user && (
-            <div className="mt-4 flex items-center gap-2.5 px-2.5 py-2 rounded-xl" style={{ background: 'rgba(15,18,23,0.035)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <div className="mt-4 flex items-center gap-2.5 px-2.5 py-2 rounded-xl" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
               <div className="flex items-center justify-center flex-shrink-0 rounded-full text-white text-[11px] font-bold"
                 style={{ width: 30, height: 30, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
                 {(((profile?.full_name || user.email || '?').trim()[0]) || '?').toUpperCase()}
@@ -3794,7 +3442,7 @@ export default function BookkeeperProToolkit() {
               onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('accessrequests'); } }}
               className="mt-4 w-full px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5"
               style={tab === 'accessrequests'
-                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px ${C.primary}55` }
+                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)` }
                 : { background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
               <ShieldCheck size={11} />
               Access Requests
@@ -3814,7 +3462,7 @@ export default function BookkeeperProToolkit() {
               onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('enrollments'); } }}
               className="mt-2 w-full px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5"
               style={tab === 'enrollments'
-                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px ${C.primary}55` }
+                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)` }
                 : { background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
               <Receipt size={11} />
               Enrollments
@@ -3833,7 +3481,7 @@ export default function BookkeeperProToolkit() {
               {!editMode ? (
                 <button onClick={enterCustomize}
                   className="w-full px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5"
-                  style={{ background: 'rgba(15,18,23,0.04)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}` }}>
+                  style={{ background: 'var(--wash)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}` }}>
                   <Edit3 size={11} />
                   Customize
                 </button>
@@ -3842,14 +3490,14 @@ export default function BookkeeperProToolkit() {
                   <div className="flex items-center gap-2">
                     <button onClick={saveSidebarLabels} disabled={savingLabels}
                       className="flex-1 px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5 text-white"
-                      style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px ${C.primary}55`, opacity: savingLabels ? 0.65 : 1, cursor: savingLabels ? 'default' : 'pointer' }}>
+                      style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)`, opacity: savingLabels ? 0.65 : 1, cursor: savingLabels ? 'default' : 'pointer' }}>
                       {savingLabels ? <Loader2 size={11} className="animate-spin" /> : <Check size={11} />}
                       {savingLabels ? 'Saving…' : 'Done'}
                     </button>
                     <button onClick={cancelSidebarEdit} disabled={savingLabels}
                       title="Discard unsaved changes"
                       className="px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition"
-                      style={{ background: 'rgba(15,18,23,0.04)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}`, opacity: savingLabels ? 0.65 : 1 }}>
+                      style={{ background: 'var(--wash)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}`, opacity: savingLabels ? 0.65 : 1 }}>
                       Cancel
                     </button>
                     <button onClick={resetSidebarLabels} disabled={savingLabels}
@@ -3890,7 +3538,7 @@ export default function BookkeeperProToolkit() {
               title="Expand sidebar"
               aria-label="Expand sidebar"
               className="flex items-center justify-center rounded-lg transition hover:opacity-80"
-              style={{ width: 36, height: 36, background: 'rgba(15,18,23,0.04)', border: `1px solid ${GLASS.borderSoft}`, color: C.textMute }}
+              style={{ width: 36, height: 36, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}`, color: C.textMute }}
             >
               <PanelLeftOpen size={18} />
             </button>
@@ -3963,7 +3611,7 @@ export default function BookkeeperProToolkit() {
                         background: containsActive ? `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` : 'rgba(10,132,255,0.10)',
                         color: containsActive ? 'white' : C.primary,
                         fontFamily: fontMono,
-                        boxShadow: containsActive ? `inset 0 1px 0 rgba(255,255,255,0.35), 0 2px 6px -2px ${C.primary}55` : 'none',
+                        boxShadow: containsActive ? `inset 0 1px 0 rgba(255,255,255,0.35), 0 2px 6px -2px var(--primary-glow-soft)` : 'none',
                       }} className="text-[9px] font-bold px-1.5 py-0.5 rounded-md tracking-wider flex-shrink-0">
                         {stage.number}
                       </span>
@@ -3993,7 +3641,7 @@ export default function BookkeeperProToolkit() {
                           boxShadow: active ? `inset 0 0 0 1px rgba(10,132,255,0.18)` : 'none',
                           transition: `background 200ms ${EASE}, color 200ms ${EASE}`,
                         }}
-                        onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'rgba(15,18,23,0.03)'; }}
+                        onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'var(--wash)'; }}
                         onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}>
                         <Icon size={18} />
                       </a>
@@ -4027,8 +3675,8 @@ export default function BookkeeperProToolkit() {
                     )}
                     <button onClick={() => !editingStageId && toggleStage(stage.id)}
                       className="flex items-center gap-2 flex-1 min-w-0 rounded-lg px-2 py-1.5 transition text-left"
-                      style={{ ':hover': { background: 'rgba(15,18,23,0.03)' } }}
-                      onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(15,18,23,0.03)'}
+                      style={{ ':hover': { background: 'var(--wash)' } }}
+                      onMouseEnter={(e) => e.currentTarget.style.background = 'var(--wash)'}
                       onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}>
                       <ChevronDown size={12} style={{ color: C.textMute }} className={`flex-shrink-0 transition-transform ${isCollapsed ? '-rotate-90' : ''}`} />
                       <span style={{
@@ -4037,7 +3685,7 @@ export default function BookkeeperProToolkit() {
                           : 'rgba(10,132,255,0.10)',
                         color: containsActive ? 'white' : C.primary,
                         fontFamily: fontMono,
-                        boxShadow: containsActive ? `inset 0 1px 0 rgba(255,255,255,0.35), 0 2px 6px -2px ${C.primary}55` : 'none',
+                        boxShadow: containsActive ? `inset 0 1px 0 rgba(255,255,255,0.35), 0 2px 6px -2px var(--primary-glow-soft)` : 'none',
                       }} className="text-[10px] font-bold px-2 py-0.5 rounded-md tracking-wider transition-all flex-shrink-0">
                         {stage.number}
                       </span>
@@ -4115,7 +3763,7 @@ export default function BookkeeperProToolkit() {
                               fontWeight: active ? 600 : 500,
                               transition: `background 200ms ${EASE}, color 200ms ${EASE}`,
                             }}
-                            onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'rgba(15,18,23,0.03)'; }}
+                            onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'var(--wash)'; }}
                             onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}
                             title="Click to rename">
                             <Icon size={15} style={{ color: active ? C.primary : C.textMute, flexShrink: 0 }} />
@@ -4137,7 +3785,7 @@ export default function BookkeeperProToolkit() {
                                 fontWeight: active ? 600 : 500,
                                 transition: `background 200ms ${EASE}, color 200ms ${EASE}`,
                               }}
-                              onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'rgba(15,18,23,0.03)'; }}
+                              onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'var(--wash)'; }}
                               onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}>
                               <Icon size={15} style={{ color: active ? C.primary : C.textMute, flexShrink: 0 }} />
                               <span className="flex-1 truncate">{tLabel}</span>
@@ -4150,7 +3798,7 @@ export default function BookkeeperProToolkit() {
                               title={`Open ${tLabel} in new tab`}
                               className="mr-2 flex-shrink-0 rounded-md p-1.5 opacity-60 transition group-hover:opacity-100 focus:opacity-100"
                               style={{ color: C.textMute }}
-                              onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(15,18,23,0.05)'; }}
+                              onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--wash-strong)'; }}
                               onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}>
                               <ExternalLink size={12} />
                             </a>
@@ -4196,7 +3844,7 @@ export default function BookkeeperProToolkit() {
                               onClick={() => editMode ? setEditingGroupKey(gItemKey) : toggleGroup(stage.id, g.key)}
                               className={`w-full ${hasNumber ? 'pl-9 pr-6' : 'pl-3 pr-3'} ${gi === 0 ? 'mt-1' : 'mt-3'} mb-1 flex items-center gap-2 group rounded-md py-1 transition`}
                               style={{ cursor: 'pointer' }}
-                              onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(15,18,23,0.02)'; }}
+                              onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--wash)'; }}
                               onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
                               title={editMode ? 'Click to rename' : (isGroupExpanded ? 'Hide tools' : `Show ${groupTabs.length} tools`)}>
                               {!editMode && (
@@ -4222,7 +3870,7 @@ export default function BookkeeperProToolkit() {
                                   className="text-[9px] font-bold px-1.5 rounded gh-tnum"
                                   style={{
                                     color: containsActiveTab ? C.primary : C.textMute,
-                                    background: containsActiveTab ? 'rgba(10,132,255,0.08)' : 'rgba(15,18,23,0.04)',
+                                    background: containsActiveTab ? 'rgba(10,132,255,0.08)' : 'var(--wash)',
                                     fontFamily: fontMono,
                                     minWidth: 18,
                                     textAlign: 'center',
@@ -4272,7 +3920,7 @@ export default function BookkeeperProToolkit() {
             onClick={() => setSidebarOpen(true)}
             aria-label="Open menu"
             className="flex items-center justify-center rounded-xl"
-            style={{ width: 40, height: 40, background: 'rgba(15,18,23,0.04)', border: `1px solid ${GLASS.borderSoft}` }}
+            style={{ width: 40, height: 40, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}
           >
             <Menu size={20} style={{ color: C.text }} />
           </button>
@@ -4449,9 +4097,9 @@ function AccessRequests({ onCountChange }) {
   const initialOf = (r) => (((r.full_name || r.email || '?').trim()[0]) || '?').toUpperCase();
 
   const STATUS_STYLE = {
-    pending:  { label: 'Pending',  bg: 'rgba(255,159,10,0.12)', bd: 'rgba(255,159,10,0.30)', fg: '#9A6200' },
-    approved: { label: 'Approved', bg: 'rgba(40,166,71,0.12)',  bd: 'rgba(40,166,71,0.30)',  fg: '#1B7A35' },
-    rejected: { label: 'Rejected', bg: 'rgba(208,35,35,0.10)',  bd: 'rgba(208,35,35,0.26)',  fg: C.red },
+    pending:  { label: 'Pending',  bg: 'var(--status-warn-bg)',   bd: 'var(--status-warn-bd)',   fg: 'var(--status-warn-fg)' },
+    approved: { label: 'Approved', bg: 'var(--status-ok-bg)',     bd: 'var(--status-ok-bd)',     fg: 'var(--status-ok-fg)' },
+    rejected: { label: 'Rejected', bg: 'var(--status-danger-bg)', bd: 'var(--status-danger-bd)', fg: 'var(--status-danger-fg)' },
   };
   const StatusPill = ({ status }) => {
     const s = STATUS_STYLE[status] || STATUS_STYLE.pending;
@@ -4490,7 +4138,7 @@ function AccessRequests({ onCountChange }) {
             <button key={key} onClick={() => setFilter(key)}
               className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition"
               style={active
-                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px ${C.primary}55` }
+                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)` }
                 : { background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
               {label}
               <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold"
@@ -4621,7 +4269,7 @@ function AccessRequests({ onCountChange }) {
                 </button>
                 <button onClick={confirmReject} disabled={busyId != null}
                   className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
-                  style={{ background: `linear-gradient(180deg, #E04545, ${C.red})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.25), 0 4px 12px -2px ${C.red}55` }}>
+                  style={{ background: `linear-gradient(180deg, #E04545, ${C.red})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.25), 0 4px 12px -2px var(--red-glow)` }}>
                   {busyId != null ? <Loader2 size={15} className="animate-spin" /> : <UserX size={15} />} Reject user
                 </button>
               </div>
@@ -5090,15 +4738,15 @@ function AdminEnrollments({ onCountChange }) {
   const initialOf = (r) => (((r.full_name || r.email || '?').trim()[0]) || '?').toUpperCase();
 
   const STATUS_STYLE = {
-    pending_review: { label: 'Pending',  bg: 'rgba(255,159,10,0.12)', bd: 'rgba(255,159,10,0.30)', fg: '#9A6200' },
-    overdue:        { label: 'Overdue',  bg: 'rgba(255,159,10,0.20)', bd: 'rgba(255,159,10,0.50)', fg: '#7A4B00' },
-    renewals:       { label: 'Renewal',  bg: 'rgba(10,132,255,0.10)', bd: 'rgba(10,132,255,0.25)', fg: C.primary },
-    approved:       { label: 'Approved', bg: 'rgba(40,166,71,0.12)',  bd: 'rgba(40,166,71,0.30)',  fg: '#1B7A35' },
-    rejected:       { label: 'Rejected', bg: 'rgba(208,35,35,0.10)',  bd: 'rgba(208,35,35,0.26)',  fg: C.red },
-    expired:        { label: 'Expired',  bg: 'rgba(15,18,23,0.06)',   bd: 'rgba(15,18,23,0.14)',   fg: C.textSoft },
-    active:         { label: 'Active',   bg: 'rgba(40,166,71,0.12)',  bd: 'rgba(40,166,71,0.30)',  fg: '#1B7A35' },
-    expiring:       { label: 'Expiring', bg: 'rgba(255,159,10,0.12)', bd: 'rgba(255,159,10,0.30)', fg: '#9A6200' },
-    ended:          { label: 'Ended',    bg: 'rgba(208,35,35,0.08)',  bd: 'rgba(208,35,35,0.20)',  fg: C.red },
+    pending_review: { label: 'Pending',  bg: 'var(--status-warn-bg)',        bd: 'var(--status-warn-bd)',        fg: 'var(--status-warn-fg)' },
+    overdue:        { label: 'Overdue',  bg: 'var(--status-warn-strong-bg)', bd: 'var(--status-warn-strong-bd)', fg: 'var(--status-warn-strong-fg)' },
+    renewals:       { label: 'Renewal',  bg: 'var(--status-info-bg)',        bd: 'var(--status-info-bd)',        fg: 'var(--status-info-fg)' },
+    approved:       { label: 'Approved', bg: 'var(--status-ok-bg)',          bd: 'var(--status-ok-bd)',          fg: 'var(--status-ok-fg)' },
+    rejected:       { label: 'Rejected', bg: 'var(--status-danger-bg)',      bd: 'var(--status-danger-bd)',      fg: 'var(--status-danger-fg)' },
+    expired:        { label: 'Expired',  bg: 'var(--status-neutral-bg)',     bd: 'var(--status-neutral-bd)',     fg: 'var(--status-neutral-fg)' },
+    active:         { label: 'Active',   bg: 'var(--status-ok-bg)',          bd: 'var(--status-ok-bd)',          fg: 'var(--status-ok-fg)' },
+    expiring:       { label: 'Expiring', bg: 'var(--status-warn-bg)',        bd: 'var(--status-warn-bd)',        fg: 'var(--status-warn-fg)' },
+    ended:          { label: 'Ended',    bg: 'var(--status-danger-bg)',      bd: 'var(--status-danger-bd)',      fg: 'var(--status-danger-fg)' },
   };
   const StatusPill = ({ request }) => {
     const s = STATUS_STYLE[isOverdue(request) ? 'overdue' : request.status] || STATUS_STYLE.pending_review;
@@ -5150,7 +4798,7 @@ function AdminEnrollments({ onCountChange }) {
             <button key={key} onClick={() => setFilter(key)}
               className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition"
               style={active
-                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px ${C.primary}55` }
+                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)` }
                 : { background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
               {label}
               <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold"
@@ -5214,7 +4862,7 @@ function AdminEnrollments({ onCountChange }) {
               </button>
               <button onClick={savePaySettings} disabled={paySaving}
                 className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
-                style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px ${C.primary}55` }}>
+                style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)` }}>
                 {paySaving ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />} {paySaving ? 'Saving…' : 'Save for everyone'}
               </button>
             </div>
@@ -5440,7 +5088,7 @@ function AdminEnrollments({ onCountChange }) {
               </div>
             </div>
             <div className="px-6 py-5">
-              <div className="rounded-xl px-3.5 py-2.5" style={{ background: 'rgba(15,18,23,0.03)', border: `1px solid ${GLASS.borderSoft}` }}>
+              <div className="rounded-xl px-3.5 py-2.5" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
                 {[['Package', approveFor.plan_name || approveFor.plan_key],
                   ['Amount sent', phpFmt(approveFor.amount_paid)],
                   ['Expected', phpFmt(approveFor.amount_expected)],
@@ -5522,7 +5170,7 @@ function AdminEnrollments({ onCountChange }) {
                 </button>
                 <button onClick={confirmReject} disabled={busyId != null}
                   className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
-                  style={{ background: `linear-gradient(180deg, #E04545, ${C.red})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.25), 0 4px 12px -2px ${C.red}55` }}>
+                  style={{ background: `linear-gradient(180deg, #E04545, ${C.red})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.25), 0 4px 12px -2px var(--red-glow)` }}>
                   {busyId != null ? <Loader2 size={15} className="animate-spin" /> : <UserX size={15} />} Reject proof
                 </button>
               </div>
@@ -5550,7 +5198,7 @@ function AdminEnrollments({ onCountChange }) {
                 <X size={16} />
               </button>
             </div>
-            <div className="p-4 flex items-center justify-center" style={{ background: 'rgba(15,18,23,0.03)' }}>
+            <div className="p-4 flex items-center justify-center" style={{ background: 'var(--wash)' }}>
               <img src={receiptView.url} alt="Payment receipt" className="max-w-full rounded-xl" style={{ maxHeight: '70vh', objectFit: 'contain' }} />
             </div>
           </div>
@@ -5673,7 +5321,7 @@ function MembershipPanel() {
   return (
     <div className="glass-card p-6 mb-8 relative overflow-hidden">
       <div className="absolute -top-12 -right-12 w-48 h-48 rounded-full pointer-events-none"
-        style={{ background: `radial-gradient(circle, ${C.primary}14 0%, transparent 60%)` }} />
+        style={{ background: `radial-gradient(circle, var(--primary-tint) 0%, transparent 60%)` }} />
 
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
@@ -5690,7 +5338,7 @@ function MembershipPanel() {
           <button onClick={() => setRenewOpen(true)}
             className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-bold transition hover:opacity-95"
             style={renewPrimary
-              ? { color: 'white', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66` }
+              ? { color: 'white', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }
               : { color: C.primary, background: 'rgba(10,132,255,0.07)', border: '1px solid rgba(10,132,255,0.22)' }}>
             <RefreshCw size={14} /> {acc.valid ? 'Renew early' : 'Renew'}
           </button>
@@ -5699,7 +5347,7 @@ function MembershipPanel() {
 
       <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         {facts.map(([k, v]) => (
-          <div key={k} className="rounded-xl px-3.5 py-2.5" style={{ background: 'rgba(15,18,23,0.03)', border: `1px solid ${GLASS.borderSoft}` }}>
+          <div key={k} className="rounded-xl px-3.5 py-2.5" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
             <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.textMute }}>{k}</div>
             <div className="mt-0.5" style={{ fontSize: 13.5, fontWeight: 600, color: C.text }}>{v}</div>
           </div>
@@ -5888,10 +5536,10 @@ function Dashboard({ goto }) {
       {/* Tip of the day — quieter, more refined */}
       <div className="glass-card p-6 mb-8 flex gap-5 items-start relative overflow-hidden">
         <div className="absolute -top-12 -right-12 w-48 h-48 rounded-full pointer-events-none"
-          style={{ background: `radial-gradient(circle, ${C.primary}14 0%, transparent 60%)` }} />
+          style={{ background: `radial-gradient(circle, var(--primary-tint) 0%, transparent 60%)` }} />
         <div style={{
           background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`,
-          boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px ${C.primary}66`,
+          boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)`,
         }} className="w-11 h-11 rounded-2xl flex items-center justify-center flex-shrink-0">
           <Quote size={18} className="text-white" />
         </div>
@@ -5977,7 +5625,7 @@ function Dashboard({ goto }) {
                   <div className="w-10 h-10 rounded-xl flex items-center justify-center mb-3"
                     style={{
                       background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`,
-                      boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 10px -2px ${C.primary}55`,
+                      boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 10px -2px var(--primary-glow-soft)`,
                     }}>
                     <Icon size={17} className="text-white" />
                   </div>
@@ -6038,7 +5686,7 @@ function StatCard({ label, value, sub, icon: Icon }) {
     <div className="glass-card p-6 flex items-center gap-4">
       <div style={{
         background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`,
-        boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 14px -4px ${C.primary}55`,
+        boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 14px -4px var(--primary-glow-soft)`,
       }} className="w-12 h-12 rounded-2xl flex items-center justify-center flex-shrink-0">
         <Icon size={20} className="text-white" />
       </div>
@@ -6115,7 +5763,7 @@ function CoaGenerator() {
           <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-lg">
             <div className="overflow-x-auto max-h-[500px] overflow-y-auto">
               <table className="w-full text-sm">
-                <thead style={{ background: NAVY }} className="text-white sticky top-0">
+                <thead style={{ background: INK.navy }} className="text-white sticky top-0">
                   <tr>
                     <th className="text-left px-4 py-3 font-semibold text-xs uppercase tracking-wider">#</th>
                     <th className="text-left px-4 py-3 font-semibold text-xs uppercase tracking-wider">Account Name</th>
@@ -7170,37 +6818,40 @@ function CourseProgram({
 
         <div ref={certScaleRef} style={{ width: '100%', maxWidth: 756, margin: '0 auto', padding: 18, boxSizing: 'border-box', height: certBoxH || undefined, overflow: 'hidden' }}>
           <div style={{ width: 900, transform: `scale(${certScale})`, transformOrigin: 'top left' }}>
-          <div ref={certRef} style={{
+          {/* Certificate uses the frozen INK palette (literal hex, never var()) — printCertificate
+              copies this subtree's outerHTML into a bare window with no stylesheet, and the PDF
+              capture must stay light regardless of the app theme. */}
+          <div ref={certRef} data-theme="light" style={{
             width: 900, margin: '0 auto', background: '#ffffff', position: 'relative',
-            padding: 24, boxSizing: 'border-box', fontFamily: fontBody,
-            border: `2px solid ${C.primary}`, borderRadius: 18,
+            padding: 24, boxSizing: 'border-box', fontFamily: fontBody, color: INK.text,
+            border: `2px solid ${INK.primary}`, borderRadius: 18,
             boxShadow: '0 10px 40px rgba(10,132,255,0.12)',
           }}>
-            <div style={{ border: `1px solid ${C.accent}`, borderRadius: 12, padding: '26px 44px', textAlign: 'center', background: 'linear-gradient(180deg,#ffffff,#F7FAFF)' }}>
+            <div style={{ border: `1px solid ${INK.accent}`, borderRadius: 12, padding: '26px 44px', textAlign: 'center', background: 'linear-gradient(180deg,#ffffff,#F7FAFF)' }}>
               <img src={LOGO_DATA_URI} alt="" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto 4px' }} />
-              <div style={{ fontFamily: fontDisplay, fontSize: 13, letterSpacing: '0.32em', textTransform: 'uppercase', color: C.primary, fontWeight: 700 }}>Certificate of Completion</div>
-              <div style={{ height: 2, width: 64, background: `linear-gradient(90deg, ${C.primary}, ${C.accent})`, margin: '10px auto 14px', borderRadius: 2 }} />
-              <div style={{ fontSize: 12, letterSpacing: '0.18em', textTransform: 'uppercase', color: C.textSoft, fontWeight: 600 }}>This certificate is awarded to</div>
-              <div style={{ fontFamily: fontDisplay, fontSize: 38, fontWeight: 800, color: NAVY, margin: '6px 0 4px', maxWidth: 760, marginLeft: 'auto', marginRight: 'auto', overflowWrap: 'break-word' }}>{studentName || 'Your Name'}</div>
-              <div style={{ width: 380, height: 1, background: C.border, margin: '8px auto 14px' }} />
-              <div style={{ fontSize: 12, letterSpacing: '0.18em', textTransform: 'uppercase', color: C.textSoft, fontWeight: 600 }}>For successfully completing the course</div>
-              <div style={{ fontFamily: fontDisplay, fontSize: 24, fontWeight: 700, color: C.primary, margin: '6px auto 2px', maxWidth: 760, overflowWrap: 'break-word' }}>{certificateTitle(course.title)}</div>
-              {course.subtitle && <div style={{ fontSize: 13, color: C.textMute, maxWidth: 520, margin: '6px auto 0' }}>{course.subtitle}</div>}
-              <div style={{ fontSize: 13, lineHeight: 1.6, color: C.textSoft, maxWidth: 620, margin: '12px auto 0' }}>{certDesc}</div>
+              <div style={{ fontFamily: fontDisplay, fontSize: 13, letterSpacing: '0.32em', textTransform: 'uppercase', color: INK.primary, fontWeight: 700 }}>Certificate of Completion</div>
+              <div style={{ height: 2, width: 64, background: `linear-gradient(90deg, ${INK.primary}, ${INK.accent})`, margin: '10px auto 14px', borderRadius: 2 }} />
+              <div style={{ fontSize: 12, letterSpacing: '0.18em', textTransform: 'uppercase', color: INK.textSoft, fontWeight: 600 }}>This certificate is awarded to</div>
+              <div style={{ fontFamily: fontDisplay, fontSize: 38, fontWeight: 800, color: INK.navy, margin: '6px 0 4px', maxWidth: 760, marginLeft: 'auto', marginRight: 'auto', overflowWrap: 'break-word' }}>{studentName || 'Your Name'}</div>
+              <div style={{ width: 380, height: 1, background: INK.border, margin: '8px auto 14px' }} />
+              <div style={{ fontSize: 12, letterSpacing: '0.18em', textTransform: 'uppercase', color: INK.textSoft, fontWeight: 600 }}>For successfully completing the course</div>
+              <div style={{ fontFamily: fontDisplay, fontSize: 24, fontWeight: 700, color: INK.primary, margin: '6px auto 2px', maxWidth: 760, overflowWrap: 'break-word' }}>{certificateTitle(course.title)}</div>
+              {course.subtitle && <div style={{ fontSize: 13, color: INK.textMute, maxWidth: 520, margin: '6px auto 0' }}>{course.subtitle}</div>}
+              <div style={{ fontSize: 13, lineHeight: 1.6, color: INK.textSoft, maxWidth: 620, margin: '12px auto 0' }}>{certDesc}</div>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginTop: 24, padding: '0 12px' }}>
                 <div style={{ textAlign: 'center' }}>
-                  <div style={{ fontFamily: fontDisplay, fontSize: 20, color: NAVY, fontWeight: 700 }}>Alex Sagun</div>
-                  <div style={{ width: 160, height: 1, background: C.border, margin: '4px auto' }} />
-                  <div style={{ fontSize: 11, color: C.textMute, letterSpacing: '0.08em', textTransform: 'uppercase' }}>Instructor · Get Hired With Alex</div>
+                  <div style={{ fontFamily: fontDisplay, fontSize: 20, color: INK.navy, fontWeight: 700 }}>Alex Sagun</div>
+                  <div style={{ width: 160, height: 1, background: INK.border, margin: '4px auto' }} />
+                  <div style={{ fontSize: 11, color: INK.textMute, letterSpacing: '0.08em', textTransform: 'uppercase' }}>Instructor · Get Hired With Alex</div>
                 </div>
-                <Award size={40} style={{ color: C.accent, flexShrink: 0 }} />
+                <Award size={40} style={{ color: INK.accent, flexShrink: 0 }} />
                 <div style={{ textAlign: 'center' }}>
-                  <div style={{ fontFamily: fontDisplay, fontSize: 16, color: NAVY, fontWeight: 700 }}>{dateStr}</div>
-                  <div style={{ width: 160, height: 1, background: C.border, margin: '4px auto' }} />
-                  <div style={{ fontSize: 11, color: C.textMute, letterSpacing: '0.08em', textTransform: 'uppercase' }}>Date Completed</div>
+                  <div style={{ fontFamily: fontDisplay, fontSize: 16, color: INK.navy, fontWeight: 700 }}>{dateStr}</div>
+                  <div style={{ width: 160, height: 1, background: INK.border, margin: '4px auto' }} />
+                  <div style={{ fontSize: 11, color: INK.textMute, letterSpacing: '0.08em', textTransform: 'uppercase' }}>Date Completed</div>
                 </div>
               </div>
-              <div style={{ marginTop: 14, paddingTop: 10, borderTop: `1px solid ${C.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 10.5, letterSpacing: '0.04em', color: C.textMute, textTransform: 'uppercase' }}>
+              <div style={{ marginTop: 14, paddingTop: 10, borderTop: `1px solid ${INK.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 10.5, letterSpacing: '0.04em', color: INK.textMute, textTransform: 'uppercase' }}>
                 <span>Certificate ID:&nbsp;<span style={{ fontFamily: fontMono, letterSpacing: 0 }}>{certId}</span></span>
                 <span>Issued: {dateStr}</span>
               </div>
@@ -8039,7 +7690,7 @@ Confidence (conf) 0.0-1.0: use 0.9+ if vendor is unambiguous, 0.6-0.8 if you're 
           <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-lg">
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
-                <thead style={{ background: NAVY }} className="text-white">
+                <thead style={{ background: INK.navy }} className="text-white">
                   <tr>
                     <th className="text-left px-3 py-3 text-xs uppercase tracking-wider font-semibold">Date</th>
                     <th className="text-left px-3 py-3 text-xs uppercase tracking-wider font-semibold">Bank Memo</th>
@@ -8397,7 +8048,7 @@ Output ONLY this format. No markdown, no explanation.`
           <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-lg">
             <div className="overflow-x-auto max-h-[450px] overflow-y-auto">
               <table className="w-full text-sm">
-                <thead style={{ background: NAVY }} className="text-white sticky top-0">
+                <thead style={{ background: INK.navy }} className="text-white sticky top-0">
                   <tr>
                     <th className="text-left px-4 py-3 text-xs uppercase tracking-wider font-semibold">Date</th>
                     <th className="text-left px-4 py-3 text-xs uppercase tracking-wider font-semibold">Description</th>
@@ -8492,7 +8143,7 @@ function ProChat() {
 
       <div style={{ background: SHEEN }} className="glass-card rounded-2xl mt-6 overflow-hidden">
         {/* Header */}
-        <div style={{ background: `linear-gradient(135deg, ${NAVY} 0%, #0F2A5A 100%)` }} className="px-6 py-4 text-white flex items-center gap-3">
+        <div style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, #0F2A5A 100%)` }} className="px-6 py-4 text-white flex items-center gap-3">
           <div style={{ background: `linear-gradient(135deg, ${ROYAL} 0%, ${CYAN} 100%)`, fontFamily: fontDisplay }} className="w-10 h-10 rounded-full flex items-center justify-center font-bold shadow-lg">
             <Crown size={18} className="text-white" />
           </div>
@@ -8735,7 +8386,7 @@ function Onboarding() {
       <div className="mt-6 space-y-6">
         {ONBOARDING_CHECKLIST.map((sec, si) => (
           <div key={si} className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-            <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
+            <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
               <div className="text-xs uppercase tracking-[0.2em] font-bold" style={{ color: GOLD }}>Section {si + 1}</div>
               <div style={{ fontFamily: fontDisplay }} className="text-lg font-bold">{sec.section}</div>
             </div>
@@ -8948,7 +8599,7 @@ function Depreciation() {
 
           <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-lg">
             <table className="w-full text-sm">
-              <thead style={{ background: NAVY }} className="text-white">
+              <thead style={{ background: INK.navy }} className="text-white">
                 <tr>
                   <th className="text-left px-4 py-3 text-xs uppercase tracking-wider font-semibold">Year</th>
                   <th className="text-right px-4 py-3 text-xs uppercase tracking-wider font-semibold">Beginning Book Value</th>
@@ -9138,7 +8789,7 @@ function LoanAmortization() {
           <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-lg">
             <div className="overflow-y-auto max-h-[500px]">
               <table className="w-full text-sm">
-                <thead style={{ background: NAVY }} className="text-white sticky top-0">
+                <thead style={{ background: INK.navy }} className="text-white sticky top-0">
                   <tr>
                     <th className="text-left px-4 py-3 text-xs uppercase tracking-wider font-semibold">#</th>
                     <th className="text-left px-4 py-3 text-xs uppercase tracking-wider font-semibold">Date</th>
@@ -9616,7 +9267,7 @@ function BodyLanguage() {
       <div className="space-y-4">
         {BODY_LANGUAGE_TIPS.map((section, si) => (
           <div key={si} className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-            <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white flex items-center gap-3">
+            <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white flex items-center gap-3">
               <div className="text-2xl">{section.icon}</div>
               <div style={{ fontFamily: fontDisplay, letterSpacing: '-0.01em' }} className="text-lg font-bold">{section.category}</div>
             </div>
@@ -9739,7 +9390,7 @@ Generate 3-5 questions per category. Make them realistic — what a US hiring ma
           {/* Question categories */}
           {questions.categories.map((cat, ci) => (
             <div key={ci} className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-              <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
+              <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
                 <div style={{ fontFamily: fontDisplay, letterSpacing: '-0.01em' }} className="text-base font-bold">{cat.name}</div>
                 <div className="text-xs text-blue-100 mt-0.5">{cat.questions.length} predicted questions</div>
               </div>
@@ -10035,7 +9686,7 @@ ${(profile.authenticWeaknesses || []).map(w => `
         </div>
 
         {/* Archetype + UVP — hero */}
-        <div className="p-8 rounded-2xl text-white shadow-2xl text-center" style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 50%, ${CYAN} 100%)` }}>
+        <div className="p-8 rounded-2xl text-white shadow-2xl text-center" style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 50%, ${CYAN} 100%)` }}>
           <div className="text-[10px] uppercase tracking-[0.3em] font-bold text-blue-200 mb-2">Your Brand Archetype</div>
           <div style={{ fontFamily: fontDisplay, letterSpacing: '-0.02em' }} className="text-3xl md:text-4xl font-bold leading-tight">{profile.brandArchetype}</div>
           <div className="mt-5 max-w-2xl mx-auto text-base text-blue-100 italic leading-relaxed">"{profile.uniqueValueProposition}"</div>
@@ -10076,7 +9727,7 @@ ${(profile.authenticWeaknesses || []).map(w => `
 
         {/* Strengths */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-          <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
+          <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
             <div style={{ fontFamily: fontDisplay }} className="text-lg font-bold">Your Top Strengths</div>
             <div className="text-xs text-blue-100 mt-0.5">With evidence from YOUR own life and exact interview phrases</div>
           </div>
@@ -10104,7 +9755,7 @@ ${(profile.authenticWeaknesses || []).map(w => `
 
         {/* Weaknesses */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-          <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
+          <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
             <div style={{ fontFamily: fontDisplay }} className="text-lg font-bold">Your Authentic Weaknesses</div>
             <div className="text-xs text-blue-100 mt-0.5">Honest, with root cause and growth path</div>
           </div>
@@ -10128,7 +9779,7 @@ ${(profile.authenticWeaknesses || []).map(w => `
 
         {/* Personalized interview answers */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-          <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
+          <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
             <div style={{ fontFamily: fontDisplay }} className="text-lg font-bold">Your Personalized Interview Answers</div>
             <div className="text-xs text-blue-100 mt-0.5">Drawn 100% from YOUR own stories, not generic templates</div>
           </div>
@@ -10196,7 +9847,7 @@ ${(profile.authenticWeaknesses || []).map(w => `
       <div className="space-y-4">
         {BRANDING_QUESTIONS.map((sec, si) => (
           <div key={si} className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-            <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white flex items-center gap-3">
+            <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white flex items-center gap-3">
               <div className="text-2xl">{sec.icon}</div>
               <div style={{ fontFamily: fontDisplay, letterSpacing: '-0.01em' }} className="text-lg font-bold">{sec.section}</div>
             </div>
@@ -11401,7 +11052,7 @@ function SalaryNegotiation() {
       </div>
 
       {/* Rate benchmarks */}
-      <div className="mb-6 p-6 rounded-2xl text-white shadow-2xl" style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 50%, ${CYAN} 100%)` }}>
+      <div className="mb-6 p-6 rounded-2xl text-white shadow-2xl" style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 50%, ${CYAN} 100%)` }}>
         <div className="text-[10px] uppercase tracking-[0.3em] font-bold text-blue-200 mb-3">Market Rate Benchmarks · 2026</div>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="p-4 rounded-xl" style={{ background: 'rgba(255,255,255,0.1)', backdropFilter: 'blur(10px)' }}>
@@ -11427,7 +11078,7 @@ function SalaryNegotiation() {
       <div className="space-y-4">
         {SALARY_TACTICS.map((phase, pi) => (
           <div key={pi} className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-            <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white flex items-center gap-3">
+            <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white flex items-center gap-3">
               <div className="text-2xl">{phase.icon}</div>
               <div style={{ fontFamily: fontDisplay, letterSpacing: '-0.01em' }} className="text-lg font-bold">{phase.phase}</div>
             </div>
@@ -11748,7 +11399,7 @@ Generated by Get Hired With Alex · US Bookkeeper Ultimate Tool Kits
       {result && (
         <div className="mt-8 fade-in space-y-5">
           {/* Industry hero */}
-          <div className="p-7 rounded-2xl text-white shadow-2xl text-center" style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 50%, ${CYAN} 100%)` }}>
+          <div className="p-7 rounded-2xl text-white shadow-2xl text-center" style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 50%, ${CYAN} 100%)` }}>
             <div className="text-[10px] uppercase tracking-[0.3em] font-bold text-blue-200 mb-2">Industry</div>
             <div style={{ fontFamily: fontDisplay, letterSpacing: '-0.02em' }} className="text-3xl font-bold">{industry}</div>
             <div className="max-w-2xl mx-auto text-sm text-blue-100 italic mt-3 leading-relaxed">{result.industrySummary}</div>
@@ -11808,7 +11459,7 @@ Generated by Get Hired With Alex · US Bookkeeper Ultimate Tool Kits
 
           {/* Discovery Questions */}
           <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-            <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
+            <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
               <div style={{ fontFamily: fontDisplay }} className="text-lg font-bold">🎤 Discovery Questions to Ask</div>
               <div className="text-xs text-blue-100 mt-0.5">Use these in your first sales call to surface their real pain</div>
             </div>
@@ -11826,7 +11477,7 @@ Generated by Get Hired With Alex · US Bookkeeper Ultimate Tool Kits
 
           {/* Red Flags */}
           <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-            <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
+            <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
               <div style={{ fontFamily: fontDisplay }} className="text-lg font-bold">🚩 Red Flags · They Need Help YESTERDAY</div>
               <div className="text-xs text-blue-100 mt-0.5">Hearing any of these in a sales call = high-urgency prospect</div>
             </div>
@@ -11870,7 +11521,7 @@ function ClientPortalDemo() {
       {/* Mock client portal — the deliverable */}
       <div className="rounded-2xl overflow-hidden shadow-2xl border border-slate-200" style={{ background: '#F8FAFF' }}>
         {/* Portal header */}
-        <div style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-6 py-4 text-white">
+        <div style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-6 py-4 text-white">
           <div className="flex items-center justify-between">
             <div>
               <div className="flex items-center gap-2.5">
@@ -12091,7 +11742,7 @@ function PortalBalanceSheet() {
       <div className="space-y-4">
         {sections.map((s, i) => (
           <div key={i}>
-            <div className="flex items-center justify-between py-2 px-3 rounded-lg" style={{ background: NAVY }}>
+            <div className="flex items-center justify-between py-2 px-3 rounded-lg" style={{ background: INK.navy }}>
               <div className="text-white font-bold text-sm tracking-wider">{s.title}</div>
               <div className="text-white font-bold text-sm font-mono">${s.total.toLocaleString()}</div>
             </div>
@@ -12179,7 +11830,7 @@ function PortalAging() {
       <div>
         <div className="text-[10px] uppercase tracking-[0.2em] font-bold mb-3" style={{ color: ROYAL }}>Accounts Receivable Aging</div>
         <table className="w-full text-sm bg-white rounded-lg border border-slate-200 overflow-hidden">
-          <thead style={{ background: NAVY }} className="text-white">
+          <thead style={{ background: INK.navy }} className="text-white">
             <tr>
               <th className="text-left py-2 px-3 text-xs font-bold">Customer</th>
               <th className="text-right py-2 px-3 text-xs font-bold">Current</th>
@@ -12215,7 +11866,7 @@ function PortalAging() {
       <div>
         <div className="text-[10px] uppercase tracking-[0.2em] font-bold mb-3" style={{ color: ROYAL }}>Accounts Payable Aging</div>
         <table className="w-full text-sm bg-white rounded-lg border border-slate-200 overflow-hidden">
-          <thead style={{ background: NAVY }} className="text-white">
+          <thead style={{ background: INK.navy }} className="text-white">
             <tr>
               <th className="text-left py-2 px-3 text-xs font-bold">Vendor</th>
               <th className="text-right py-2 px-3 text-xs font-bold">Current</th>
@@ -12554,7 +12205,7 @@ function IndustryAccounting() {
         })}
       </div>
 
-      <div className="p-7 rounded-2xl text-white shadow-2xl mb-5" style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 50%, ${CYAN} 100%)` }}>
+      <div className="p-7 rounded-2xl text-white shadow-2xl mb-5" style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 50%, ${CYAN} 100%)` }}>
         <div className="flex items-center gap-4">
           <div className="text-5xl">{ind.icon}</div>
           <div>
@@ -12566,7 +12217,7 @@ function IndustryAccounting() {
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden mb-4">
-        <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
+        <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
           <div style={{ fontFamily: fontDisplay }} className="text-lg font-bold">Critical Nuances You Must Know</div>
           <div className="text-xs text-blue-100 mt-0.5">If you can speak fluently to these, you sound like a 10-year veteran</div>
         </div>
@@ -12855,7 +12506,7 @@ function USTax101() {
         })}
       </div>
 
-      <div className="p-7 rounded-2xl text-white shadow-2xl mb-5" style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 50%, ${CYAN} 100%)` }}>
+      <div className="p-7 rounded-2xl text-white shadow-2xl mb-5" style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 50%, ${CYAN} 100%)` }}>
         <div className="flex items-center gap-4">
           <div className="text-5xl">{topic.icon}</div>
           <div>
@@ -12867,7 +12518,7 @@ function USTax101() {
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden mb-4">
-        <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
+        <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, #1A3568 100%)` }} className="px-6 py-3 text-white">
           <div style={{ fontFamily: fontDisplay }} className="text-lg font-bold">Core Concepts</div>
         </div>
         <div className="p-4 space-y-2">
@@ -13245,7 +12896,7 @@ function MonthEndChecklist() {
           const sectionComplete = sectionChecked === sectionTotal;
           return (
             <div key={si} className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-              <div style={{ background: sectionComplete ? `linear-gradient(90deg, ${ROYAL} 0%, ${CYAN} 100%)` : `linear-gradient(90deg, ${NAVY} 0%, #1A3568 100%)` }}
+              <div style={{ background: sectionComplete ? `linear-gradient(90deg, ${ROYAL} 0%, ${CYAN} 100%)` : `linear-gradient(90deg, ${INK.navy} 0%, #1A3568 100%)` }}
                 className="px-5 py-3 text-white flex items-center justify-between">
                 <div className="flex items-center gap-3">
                   <div className="text-2xl">{sec.icon}</div>
@@ -13443,7 +13094,7 @@ function YearEndChecklist() {
           const sectionComplete = sectionChecked === sectionTotal;
           return (
             <div key={si} className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-              <div style={{ background: sectionComplete ? `linear-gradient(90deg, ${ROYAL} 0%, ${CYAN} 100%)` : `linear-gradient(90deg, ${NAVY} 0%, #1A3568 100%)` }}
+              <div style={{ background: sectionComplete ? `linear-gradient(90deg, ${ROYAL} 0%, ${CYAN} 100%)` : `linear-gradient(90deg, ${INK.navy} 0%, #1A3568 100%)` }}
                 className="px-5 py-3 text-white flex items-center justify-between">
                 <div className="flex items-center gap-3">
                   <div className="text-2xl">{sec.icon}</div>
@@ -13754,7 +13405,7 @@ ${showTimesheet && timesheet.length > 0 && timesheetSubtotal > 0 ? `
 
       {/* Fixed-fee services */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden mb-4">
-        <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white flex items-center justify-between">
+        <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white flex items-center justify-between">
           <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">💼 Fixed-Fee Services / Retainer</div>
           <button onClick={addService} className="text-xs font-bold px-3 py-1.5 rounded-lg bg-white/20 hover:bg-white/30 transition">+ Add Line</button>
         </div>
@@ -13817,7 +13468,7 @@ ${showTimesheet && timesheet.length > 0 && timesheetSubtotal > 0 ? `
 
       {/* Live preview / totals */}
       <div className="bg-white rounded-2xl border-2 shadow-lg overflow-hidden mb-5" style={{ borderColor: CYAN }}>
-        <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-6 py-3 text-white">
+        <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-6 py-3 text-white">
           <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">📄 Invoice Preview</div>
         </div>
         <div className="p-6">
@@ -13851,7 +13502,7 @@ ${showTimesheet && timesheet.length > 0 && timesheetSubtotal > 0 ? `
             <div className="flex justify-between"><span className="text-slate-600">Subtotal</span><span className="font-semibold">{formatCurrency(subtotal)}</span></div>
             {taxRate > 0 && <div className="flex justify-between"><span className="text-slate-600">Tax ({taxRate}%)</span><span className="font-semibold">{formatCurrency(taxAmount)}</span></div>}
           </div>
-          <div className="flex justify-between items-center p-3 rounded-lg text-white" style={{ background: NAVY }}>
+          <div className="flex justify-between items-center p-3 rounded-lg text-white" style={{ background: INK.navy }}>
             <span className="text-sm font-bold tracking-wider uppercase">Total Due</span>
             <span style={{ fontFamily: fontDisplay }} className="text-2xl font-bold">{formatCurrency(total)}</span>
           </div>
@@ -13920,10 +13571,10 @@ function BookingPage({ eyebrow, title, intro, Icon, headline, message, benefits,
       {/* Hero booking card */}
       <div style={{ background: SHEEN }} className="glass-card p-6 md:p-8 mt-6 mb-6 relative overflow-hidden">
         <div className="absolute -top-16 -right-16 w-56 h-56 rounded-full pointer-events-none"
-          style={{ background: `radial-gradient(circle, ${C.primary}14 0%, transparent 60%)` }} />
+          style={{ background: `radial-gradient(circle, var(--primary-tint) 0%, transparent 60%)` }} />
         <div className="relative flex flex-col sm:flex-row items-start gap-5">
           <div className="w-14 h-14 rounded-2xl flex items-center justify-center flex-shrink-0"
-            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 8px 20px -6px ${C.primary}66` }}>
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 8px 20px -6px var(--primary-glow)` }}>
             <Icon size={26} className="text-white" />
           </div>
           <div className="flex-1">
@@ -14204,7 +13855,7 @@ function PrepaidAmortization() {
 
       {/* Input grid */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden mb-5">
-        <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
+        <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
           <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">📝 Inputs</div>
         </div>
         <div className="p-5 grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -14304,7 +13955,7 @@ function PrepaidAmortization() {
 
       {/* Schedule table */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden mb-4">
-        <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, #1A3568 100%)` }} className="px-5 py-3 text-white flex items-center justify-between">
+        <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, #1A3568 100%)` }} className="px-5 py-3 text-white flex items-center justify-between">
           <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">📊 Amortization Schedule</div>
           <button onClick={downloadCSV}
             className="text-xs font-bold px-3 py-1.5 rounded-lg bg-white/20 hover:bg-white/30 transition flex items-center gap-1.5">
@@ -14498,7 +14149,7 @@ function MarkupMarginCalculator() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
         {/* From cost + price → markup/margin */}
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-          <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
+          <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
             <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">From Cost + Price → Markup & Margin</div>
           </div>
           <div className="p-5 space-y-3">
@@ -14646,7 +14297,7 @@ function BreakEvenCalculator() {
 
       {tp > 0 && (
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-          <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
+          <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
             <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">🎯 To Hit Target Profit of {fmt(tp)}</div>
           </div>
           <div className="p-5 grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -14787,7 +14438,7 @@ function MileageCalculator() {
             </div>
           ) : null
         ))}
-        <div className="p-5 rounded-2xl text-white shadow-lg col-span-2 md:col-span-1" style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 100%)` }}>
+        <div className="p-5 rounded-2xl text-white shadow-lg col-span-2 md:col-span-1" style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 100%)` }}>
           <div className="text-[10px] uppercase tracking-wider font-bold opacity-80">Total Deduction</div>
           <div style={{ fontFamily: fontDisplay }} className="text-2xl font-bold mt-1">{fmt(totals.totalAmount)}</div>
         </div>
@@ -14837,7 +14488,7 @@ function AccountingCalculators() {
       </div>
 
       {/* Active calculator hero */}
-      <div className="p-5 rounded-2xl text-white shadow-lg mb-5" style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 60%, ${CYAN} 100%)` }}>
+      <div className="p-5 rounded-2xl text-white shadow-lg mb-5" style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 60%, ${CYAN} 100%)` }}>
         <div className="flex items-center gap-3">
           <div className="text-3xl">{active.icon}</div>
           <div>
@@ -14990,7 +14641,7 @@ function NicheSelectorQuiz({ goto }) {
           <div className="space-y-4">
             {NICHE_QUESTIONS.map((q, qIdx) => (
               <div key={qIdx} className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-                <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
+                <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
                   <div className="text-[10px] uppercase tracking-wider opacity-80">Question {qIdx + 1} of {NICHE_QUESTIONS.length}</div>
                   <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">{q.q}</div>
                 </div>
@@ -15028,7 +14679,7 @@ function NicheSelectorQuiz({ goto }) {
         </div>
       ) : (
         <div>
-          <div className="p-7 rounded-2xl text-white shadow-2xl mt-6 mb-5" style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 50%, ${CYAN} 100%)` }}>
+          <div className="p-7 rounded-2xl text-white shadow-2xl mt-6 mb-5" style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 50%, ${CYAN} 100%)` }}>
             <div className="text-[10px] uppercase tracking-[0.3em] font-bold text-blue-200 mb-1">Your Match</div>
             <div style={{ fontFamily: fontDisplay, letterSpacing: '-0.02em' }} className="text-3xl font-bold">Top 3 Niches for You</div>
             <div className="text-sm text-blue-100 mt-2">Based on your answers, these industries best fit your skills and preferences. Start with #1 — go deep, build expertise, then expand.</div>
@@ -15772,7 +15423,7 @@ Focus on: did they ask discovery questions, did they hold their pricing, did the
           <div className="p-5 bg-red-50 border border-red-200 rounded-xl text-red-800 mt-6">{scoreReport.error}</div>
         ) : (
           <div className="space-y-5 mt-6">
-            <div className="p-7 rounded-2xl text-white shadow-2xl" style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 50%, ${CYAN} 100%)` }}>
+            <div className="p-7 rounded-2xl text-white shadow-2xl" style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 50%, ${CYAN} 100%)` }}>
               <div className="text-[10px] uppercase tracking-[0.3em] font-bold text-blue-200 mb-1">Outcome</div>
               <div style={{ fontFamily: fontDisplay }} className="text-2xl font-bold">{scoreReport.outcome}</div>
               <div className="text-6xl font-bold mt-2" style={{ fontFamily: fontDisplay }}>{scoreReport.overallScore}/10</div>
@@ -15805,7 +15456,7 @@ Focus on: did they ask discovery questions, did they hold their pricing, did the
 
             {scoreReport.betterResponses && scoreReport.betterResponses.length > 0 && (
               <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-                <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
+                <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
                   <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">🔧 Response Upgrades</div>
                 </div>
                 <div className="p-5 space-y-4">
@@ -15876,7 +15527,7 @@ Focus on: did they ask discovery questions, did they hold their pricing, did the
       <SectionHead eyebrow="Job Application · Tool" title="Discovery Call · In Progress" desc={`Pitching to ${personas[persona].label}`} />
 
       <div style={{ background: SHEEN }} className="glass-card rounded-2xl mt-6 overflow-hidden">
-        <div style={{ background: `linear-gradient(135deg, ${NAVY} 0%, #0F2A5A 100%)` }} className="px-6 py-4 text-white flex items-center gap-3">
+        <div style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, #0F2A5A 100%)` }} className="px-6 py-4 text-white flex items-center gap-3">
           <div className="text-2xl">{personas[persona].icon}</div>
           <div className="flex-1">
             <div className="font-bold">{personas[persona].label}</div>
@@ -16358,7 +16009,7 @@ ${output.referenceTable.rows.map(row => `<tr>${row.map(c => `<td>${esc(c)}</td>`
 
           {output && !output.error && !loomMode && (
             <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-              <div style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-6 py-4 text-white flex items-center justify-between">
+              <div style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-6 py-4 text-white flex items-center justify-between">
                 <div>
                   <div className="text-[10px] uppercase tracking-wider opacity-80">{output.version}</div>
                   <div style={{ fontFamily: fontDisplay }} className="text-xl font-bold">{output.title}</div>
@@ -16420,7 +16071,7 @@ ${output.referenceTable.rows.map(row => `<tr>${row.map(c => `<td>${esc(c)}</td>`
                     <div className="text-xs uppercase tracking-wider font-bold mb-2 flex items-center gap-1.5" style={{ color: ROYAL }}>
                       <TrendingUp size={12} /> Key Metrics This SOP Drives
                     </div>
-                    <div className="rounded-xl overflow-hidden border" style={{ borderColor: 'rgba(15,18,23,0.08)' }}>
+                    <div className="rounded-xl overflow-hidden border" style={{ borderColor: 'var(--c-border)' }}>
                       <table className="w-full text-sm">
                         <thead style={{ background: 'linear-gradient(180deg, #0A1E3F 0%, #0F2A5A 100%)' }}>
                           <tr>
@@ -16449,12 +16100,12 @@ ${output.referenceTable.rows.map(row => `<tr>${row.map(c => `<td>${esc(c)}</td>`
                   </div>
                   <div className="space-y-3">
                     {output.steps && output.steps.map((s, i) => (
-                      <div key={i} className="p-4 rounded-xl border bg-white" style={{ borderColor: 'rgba(15,18,23,0.08)', boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.9), 0 2px 4px rgba(15,18,23,0.03)' }}>
+                      <div key={i} className="p-4 rounded-xl border bg-white" style={{ borderColor: 'var(--c-border)', boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.9), 0 2px 4px rgba(15,18,23,0.03)' }}>
                         <div className="flex items-start gap-3">
                           <div className="w-9 h-9 rounded-xl flex items-center justify-center text-white font-bold text-sm flex-shrink-0"
                             style={{
                               background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`,
-                              boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 10px -2px ${C.primary}66`,
+                              boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 10px -2px var(--primary-glow)`,
                               fontFamily: fontMono,
                             }}>{s.number}</div>
                           <div className="flex-1 min-w-0">
@@ -16491,7 +16142,7 @@ ${output.referenceTable.rows.map(row => `<tr>${row.map(c => `<td>${esc(c)}</td>`
                             )}
 
                             {/* QC check */}
-                            <div className="text-xs flex gap-1.5 items-start pt-2 border-t" style={{ borderColor: 'rgba(15,18,23,0.06)' }}>
+                            <div className="text-xs flex gap-1.5 items-start pt-2 border-t" style={{ borderColor: 'var(--glass-border-soft)' }}>
                               <CheckCircle2 size={12} className="flex-shrink-0 mt-0.5" style={{ color: C.primary }} />
                               <span style={{ color: C.textSoft }}><strong style={{ color: NAVY }}>QC Check:</strong> {s.qcCheck}</span>
                             </div>
@@ -16508,7 +16159,7 @@ ${output.referenceTable.rows.map(row => `<tr>${row.map(c => `<td>${esc(c)}</td>`
                     <div className="text-xs uppercase tracking-wider font-bold mb-2 flex items-center gap-1.5" style={{ color: ROYAL }}>
                       <FileSpreadsheet size={12} /> {output.referenceTable.title || 'Reference Table'}
                     </div>
-                    <div className="rounded-xl overflow-x-auto border" style={{ borderColor: 'rgba(15,18,23,0.08)' }}>
+                    <div className="rounded-xl overflow-x-auto border" style={{ borderColor: 'var(--c-border)' }}>
                       <table className="w-full text-sm">
                         <thead style={{ background: 'linear-gradient(180deg, #0A1E3F 0%, #0F2A5A 100%)' }}>
                           <tr>
@@ -16563,7 +16214,7 @@ ${output.referenceTable.rows.map(row => `<tr>${row.map(c => `<td>${esc(c)}</td>`
 
           {output && !output.error && loomMode && (
             <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-              <div style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-6 py-4 text-white flex items-center justify-between">
+              <div style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-6 py-4 text-white flex items-center justify-between">
                 <div>
                   <div className="text-[10px] uppercase tracking-wider opacity-80">Loom Script · {output.duration}</div>
                   <div style={{ fontFamily: fontDisplay }} className="text-xl font-bold">{output.title}</div>
@@ -16922,7 +16573,7 @@ Watch items / concerns: ${watchItems || '(none flagged)'}`;
 
       {script && !script.error && mode === 'script' && (
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-          <div style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-6 py-4 text-white">
+          <div style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-6 py-4 text-white">
             <div style={{ fontFamily: fontDisplay }} className="text-xl font-bold">{script.title}</div>
             <div className="text-xs text-blue-200">Duration: {script.duration}</div>
           </div>
@@ -16984,7 +16635,7 @@ Watch items / concerns: ${watchItems || '(none flagged)'}`;
 
       {script && !script.error && mode === 'loom' && (
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-          <div style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-6 py-4 text-white">
+          <div style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-6 py-4 text-white">
             <div style={{ fontFamily: fontDisplay }} className="text-xl font-bold">{script.title}</div>
             <div className="text-xs text-blue-200">📹 Loom Video · {script.duration}</div>
           </div>
@@ -17129,7 +16780,7 @@ Reason for raise: ${reasonLabels[reason]}`;
 
       {output && !output.error && (
         <div className="space-y-5">
-          <div className="p-5 rounded-2xl text-white shadow-lg" style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 100%)` }}>
+          <div className="p-5 rounded-2xl text-white shadow-lg" style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 100%)` }}>
             <div className="text-[10px] uppercase tracking-[0.2em] font-bold text-blue-200">Recommendation</div>
             <div style={{ fontFamily: fontDisplay }} className="text-2xl font-bold mt-1">{output.shouldYouRaise}</div>
             <div className="text-sm text-blue-100 mt-2">{output.shouldYouRaiseReasoning}</div>
@@ -17144,7 +16795,7 @@ Reason for raise: ${reasonLabels[reason]}`;
           </div>
 
           <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-            <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
+            <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
               <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">🛡️ Pushback Responses</div>
             </div>
             <div className="p-5 space-y-4">
@@ -17322,7 +16973,7 @@ Current monthly fee: $${monthlyFee}`;
 
           {output.secondTierUpsell && (
             <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-              <div style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-6 py-4 text-white">
+              <div style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-6 py-4 text-white">
                 <div className="text-[10px] uppercase tracking-wider opacity-80">Second Tier (longer-term goal)</div>
                 <div style={{ fontFamily: fontDisplay }} className="text-2xl font-bold">{output.secondTierUpsell.name}</div>
                 <div className="text-sm text-blue-100 mt-1">{output.secondTierUpsell.description}</div>
@@ -17347,7 +16998,7 @@ Current monthly fee: $${monthlyFee}`;
 
           {output.addOnsToOffer && output.addOnsToOffer.length > 0 && (
             <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-              <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
+              <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
                 <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">🎁 Add-On Services (project-based)</div>
               </div>
               <div className="p-5 space-y-3">
@@ -17552,7 +17203,7 @@ function DifficultClientPlaybook() {
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-        <div style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-6 py-4 text-white flex items-center gap-3">
+        <div style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-6 py-4 text-white flex items-center gap-3">
           <div className="text-3xl">{scenario.icon}</div>
           <div>
             <div style={{ fontFamily: fontDisplay }} className="text-xl font-bold">{scenario.title}</div>
@@ -17734,7 +17385,7 @@ function TimeTrackerByClient() {
 
       {/* Per-client breakdown */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden mb-5">
-        <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white flex items-center justify-between">
+        <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white flex items-center justify-between">
           <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">📊 Per-Client Profitability (This Month)</div>
           <div className="text-[10px] opacity-80">Sorted by hours · ⚠️ flags below $40/hr effective</div>
         </div>
@@ -18384,7 +18035,7 @@ function PHUSMoneyGuide() {
 
       {/* Payment Net Calculator */}
       <div className="mt-3 mb-5 bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-        <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
+        <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
           <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">💱 What You'd Actually Receive — Net Comparison</div>
           <div className="text-xs opacity-80">Plug in an invoice amount and see what hits your PH bank account via each platform</div>
         </div>
@@ -19427,7 +19078,7 @@ ${(report.strategicInsights || []).map(s => `
         <div className="space-y-5">
           {/* Bookkeeper branding */}
           <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-            <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
+            <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
               <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">👤 Your Brand (appears on the report)</div>
               <div className="text-xs opacity-80">Fill this once — it's remembered for next time</div>
             </div>
@@ -19527,7 +19178,7 @@ ${(report.strategicInsights || []).map(s => `
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             {/* P&L Card */}
             <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-              <div style={{ background: `linear-gradient(90deg, ${NAVY} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white flex items-center justify-between">
+              <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white flex items-center justify-between">
                 <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">📊 Profit & Loss Statement</div>
                 <div className="text-xs opacity-80">
                   {plFile ? `📎 ${plFile.kind === 'pdf' ? 'PDF attached' : 'File loaded'}` : `${plText.length.toLocaleString()} chars`}
@@ -19702,7 +19353,7 @@ ${(report.strategicInsights || []).map(s => `
           {/* THE REPORT */}
           <div className="bg-white rounded-2xl shadow-lg border border-slate-200 overflow-hidden">
             {/* Header */}
-            <div style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 60%, ${CYAN} 100%)` }} className="p-8 text-white">
+            <div style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 60%, ${CYAN} 100%)` }} className="p-8 text-white">
               <div className="text-[10px] uppercase tracking-[0.3em] font-bold opacity-80 mb-2">Confidential · QuickBooks Health Diagnostic</div>
               <h1 style={{ fontFamily: fontDisplay, letterSpacing: '-0.02em' }} className="text-4xl font-bold leading-tight">{companyName}</h1>
               <div className="text-sm opacity-90 mt-1">{industry}{periodLabel ? ' · ' + periodLabel : ''}</div>
@@ -19811,7 +19462,7 @@ ${(report.strategicInsights || []).map(s => `
                 {report.industryBenchmark.comparisons && report.industryBenchmark.comparisons.length > 0 && (
                   <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
                     <table className="w-full text-sm">
-                      <thead style={{ background: NAVY }} className="text-white">
+                      <thead style={{ background: INK.navy }} className="text-white">
                         <tr>
                           <th className="text-left px-4 py-2 text-[10px] uppercase font-bold tracking-wider">Metric</th>
                           <th className="text-center px-4 py-2 text-[10px] uppercase font-bold tracking-wider">Your Value</th>
@@ -19898,7 +19549,7 @@ ${(report.strategicInsights || []).map(s => `
 
             {/* Closing Pitch */}
             {report.closingPitch && (
-              <div className="p-8" style={{ background: `linear-gradient(135deg, ${NAVY} 0%, ${ROYAL} 100%)` }}>
+              <div className="p-8" style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 100%)` }}>
                 <div className="text-[10px] uppercase tracking-[0.3em] font-bold text-blue-200 mb-2">My Recommendation</div>
                 <div className="text-white text-base leading-relaxed whitespace-pre-wrap">{report.closingPitch}</div>
                 <div className="mt-6 pt-6 border-t border-white/20 text-blue-100 text-sm">
@@ -20951,7 +20602,7 @@ function SectionHead({ eyebrow, title, desc, gold }) {
           {eyebrow}
         </div>
         {gold && (
-          <span style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `0 0 0 1px ${C.primary}33` }}
+          <span style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `0 0 0 1px var(--primary-selection)` }}
             className="inline-flex items-center gap-1 text-[9px] font-semibold tracking-[0.12em] uppercase text-white px-1.5 py-0.5 rounded-md">
             <Sparkles size={9} /> Featured
           </span>
