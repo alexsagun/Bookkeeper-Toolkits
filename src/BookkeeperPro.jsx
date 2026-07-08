@@ -8346,7 +8346,7 @@ Output ONLY this format. No markdown, no explanation.`
 
   const exportCSV = () => {
     if (!parsed || parsed.length === 0) {
-      alert('No transactions to export. Process a statement first.');
+      setErr('No transactions to export. Process a statement first.');
       return;
     }
     try {
@@ -8370,7 +8370,7 @@ Output ONLY this format. No markdown, no explanation.`
       }, 100);
     } catch (err) {
       console.error('CSV export error:', err);
-      alert('CSV export failed: ' + (err.message || 'unknown error'));
+      setErr('CSV export failed: ' + (err.message || 'unknown error'));
     }
   };
 
@@ -18524,7 +18524,7 @@ function BudgetingTool() {
   // AI: suggest industry-specific categories
   const suggestCategories = async () => {
     if (!industry.trim()) {
-      alert('Enter an industry first (e.g., "SaaS startup", "Restaurant", "E-commerce").');
+      setAiNote({ kind: 'error', text: 'Enter an industry first (e.g., "SaaS startup", "Restaurant", "E-commerce").' });
       return;
     }
     setAiBusy(true);
@@ -18572,7 +18572,7 @@ growth is monthly % growth (0-5). Most expense lines should be 0% growth. Revenu
   // AI: review the budget for realism
   const reviewBudget = async () => {
     if (totalRevenue === 0) {
-      alert('Enter at least some revenue amounts first.');
+      setAiNote({ kind: 'error', text: 'Enter at least some revenue amounts first.' });
       return;
     }
     setAiBusy(true);
