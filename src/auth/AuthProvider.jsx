@@ -36,6 +36,8 @@ const LEGACY_KEYS = [
   'sidebar:stages', 'sidebar:collapsed', 'sidebar:expandedGroups', 'sidebar:version', 'sidebar:railCollapsed',
   'certs:completed', 'certs:inProgress',
   'health:clients',
+  'monthend:checked', 'yearend:checked',
+  'onboarding:welcomed',
   'timetrack:entries', 'timetrack:clients', 'timetrack:rates',
   'capacity:clients', 'capacity:targets',
   'payments:invoices',

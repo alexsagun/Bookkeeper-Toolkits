@@ -2007,9 +2007,18 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
       // An overdue pending request blocks the one-pending-per-user index — the student is
       // allowed (RLS enroll_req_own_expire) to expire their own overdue row and resubmit.
       if (priorRequest && priorRequest.status === 'pending_review' && overdue) {
-        await supabase.from('enrollment_requests')
+        // Must actually clear the overdue row, else the insert below hits the one-pending-per-user
+        // unique index (23505), the new receipt is discarded, and the student loops silently. If the
+        // self-expire fails or matches 0 rows (RLS denied / already changed), stop and surface it.
+        const { data: expired, error: expErr } = await supabase.from('enrollment_requests')
           .update({ status: 'expired', updated_at: new Date().toISOString() })
-          .eq('id', priorRequest.id).eq('status', 'pending_review');
+          .eq('id', priorRequest.id).eq('status', 'pending_review')
+          .select('id');
+        if (expErr || !expired || expired.length === 0) {
+          setErr('We couldn’t clear your previous pending request. Please refresh the page and try submitting again.');
+          setBusy(false);
+          return;
+        }
       }
 
       const safe = file.name.replace(/[^\w.\-]+/g, '_');
@@ -8209,6 +8218,13 @@ function StatementConverter() {
       // PDF or image — use Claude vision/document
       if (ext === 'pdf' || ext === 'png' || ext === 'jpg' || ext === 'jpeg' ||
           mime === 'application/pdf' || mime.startsWith('image/')) {
+        // base64 inflates ~33% and the AI proxy caps the request body at 5 MB, so guard the
+        // raw file at 3.5 MB (→ ~4.7 MB encoded) with a clear message instead of a generic 413.
+        if (file.size > 3.5 * 1024 * 1024) {
+          setErr(`This file is ${(file.size / 1024 / 1024).toFixed(1)} MB. Please keep statement uploads under 3.5 MB — split a long PDF into fewer pages so it fits the AI extraction limit.`);
+          setProcessing(false);
+          return;
+        }
         setUploadStatus(`Extracting transactions from ${ext.toUpperCase()} with AI...`);
         const b64 = await fileToBase64(file);
 
@@ -8253,7 +8269,18 @@ Output ONLY this format. No markdown, no explanation.`
           }
         ];
 
-        const extracted = (await callClaude({ max_tokens: 4000, messages: [{ role: 'user', content }] })).trim();
+        const { text: rawExtract, data: exData } = await callClaude(
+          { max_tokens: 4000, messages: [{ role: 'user', content }] },
+          { returnData: true }
+        );
+        // If the model ran out of output budget the transaction list is cut off mid-way — don't
+        // present a partial extraction as complete (matches the guard in PainPoints/QBDiagnostic/etc.).
+        if (exData?.stop_reason === 'max_tokens') {
+          setErr('This statement is too long to extract in one pass — split it into fewer pages (or upload a shorter date range) and try again.');
+          setProcessing(false);
+          return;
+        }
+        const extracted = rawExtract.trim();
 
         // Parse the structured output
         const beginMatch = extracted.match(/BEGIN_BALANCE:\s*(-?[\d,]+\.\d{2})/i);
@@ -12321,6 +12348,27 @@ function MonthEndChecklist(props) {
 function MonthEndChecklistInner({ data }) {
   const { MONTH_END_CHECKLIST } = data;
   const [checked, setChecked] = useState(new Set());
+  const [loaded, setLoaded] = useState(false);
+  // Persist per-user so a multi-day close survives a refresh (keep-alive only covers tab switches).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        if (typeof window !== 'undefined' && window.storage) {
+          const { value } = await window.storage.get('monthend:checked');
+          if (!cancelled && value) { const arr = JSON.parse(value); if (Array.isArray(arr)) setChecked(new Set(arr)); }
+        }
+      } catch { /* ignore */ }
+      if (!cancelled) setLoaded(true);
+    })();
+    return () => { cancelled = true; };
+  }, []);
+  useEffect(() => {
+    if (!loaded) return;
+    if (typeof window !== 'undefined' && window.storage) {
+      window.storage.set('monthend:checked', JSON.stringify(Array.from(checked))).catch(() => {});
+    }
+  }, [checked, loaded]);
   const totalItems = MONTH_END_CHECKLIST.reduce((sum, s) => sum + s.items.length, 0);
   const progress = Math.round((checked.size / totalItems) * 100);
 
@@ -12411,6 +12459,27 @@ function YearEndChecklist(props) {
 function YearEndChecklistInner({ data }) {
   const { YEAR_END_CHECKLIST } = data;
   const [checked, setChecked] = useState(new Set());
+  const [loaded, setLoaded] = useState(false);
+  // Persist per-user so year-end progress survives a refresh (keep-alive only covers tab switches).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        if (typeof window !== 'undefined' && window.storage) {
+          const { value } = await window.storage.get('yearend:checked');
+          if (!cancelled && value) { const arr = JSON.parse(value); if (Array.isArray(arr)) setChecked(new Set(arr)); }
+        }
+      } catch { /* ignore */ }
+      if (!cancelled) setLoaded(true);
+    })();
+    return () => { cancelled = true; };
+  }, []);
+  useEffect(() => {
+    if (!loaded) return;
+    if (typeof window !== 'undefined' && window.storage) {
+      window.storage.set('yearend:checked', JSON.stringify(Array.from(checked))).catch(() => {});
+    }
+  }, [checked, loaded]);
   const totalItems = YEAR_END_CHECKLIST.reduce((sum, s) => sum + s.items.length, 0);
   const progress = Math.round((checked.size / totalItems) * 100);
 
