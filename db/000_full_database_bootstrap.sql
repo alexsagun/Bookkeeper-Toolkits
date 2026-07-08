@@ -437,6 +437,9 @@ create table if not exists public.enrollment_requests (
   admin_notes       text,
   reviewed_at       timestamptz,
   reviewed_by       uuid references auth.users(id) on delete set null,
+  notify_status     text,          -- admin-alert email outcome (record_enrollment_notification)
+  notified_at       timestamptz,
+  notify_detail     text,          -- short, non-secret provider detail slice
   created_at        timestamptz not null default now(),
   updated_at        timestamptz not null default now()
 );
@@ -606,6 +609,30 @@ end;
 $$;
 revoke all on function public.approve_subscription(uuid, text, uuid) from public;
 grant execute on function public.approve_subscription(uuid, text, uuid) to authenticated;
+
+-- record_enrollment_notification() — the ONLY write path for the enrollment_requests
+-- notify_* audit columns. SECURITY DEFINER + internal owner-or-admin guard so the
+-- notify-enrollment function (running as the student's JWT on a 'submitted' action)
+-- can stamp the send outcome without a broad student UPDATE policy or a service-role key.
+create or replace function public.record_enrollment_notification(
+  p_request_id uuid,
+  p_status     text,
+  p_detail     text default null
+)
+returns void
+language plpgsql security definer set search_path = public
+as $$
+begin
+  update public.enrollment_requests
+     set notify_status = left(coalesce(p_status, ''), 40),
+         notified_at   = now(),
+         notify_detail = nullif(left(coalesce(p_detail, ''), 300), '')
+   where id = p_request_id
+     and (user_id = auth.uid() or public.is_admin());
+end;
+$$;
+revoke all on function public.record_enrollment_notification(uuid, text, text) from public;
+grant execute on function public.record_enrollment_notification(uuid, text, text) to authenticated;
 
 -- Cosmetic status sweep (the date check in is_enrolled() is the real authority).
 create or replace function public.expire_overdue_subscriptions()

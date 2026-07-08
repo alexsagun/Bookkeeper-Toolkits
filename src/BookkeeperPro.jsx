@@ -5101,6 +5101,33 @@ function AdminEnrollments({ onCountChange }) {
     );
   };
 
+  // Admin-alert email outcome, stamped on the row by api/notify-enrollment.js via the
+  // record_enrollment_notification RPC. Turns a silently-failed/unconfigured admin email
+  // into a visible per-submission badge. null (legacy rows / not yet attempted) → hidden.
+  const NOTIFY_META = {
+    sent:                      { label: 'Admin emailed',              tone: 'ok'     },
+    email_not_configured:      { label: 'Email not sent — no key',    tone: 'warn'   },
+    email_from_not_configured: { label: 'Email not sent — no sender', tone: 'warn'   },
+    admin_email_invalid:       { label: 'Email not sent — no recipient', tone: 'warn' },
+    provider_error:            { label: 'Email not sent — provider',  tone: 'danger' },
+  };
+  const NotifyBadge = ({ request }) => {
+    const meta = NOTIFY_META[request.notify_status];
+    if (!meta) return null;
+    const tip = [
+      meta.tone === 'ok' ? 'Admin alert email sent' : 'Admin alert email did not send',
+      request.notified_at ? new Date(request.notified_at).toLocaleString() : null,
+      request.notify_detail || null,
+    ].filter(Boolean).join(' · ');
+    return (
+      <span title={tip}
+        className="px-2 py-0.5 rounded-full text-[10px] font-bold inline-flex items-center gap-1"
+        style={{ background: `var(--status-${meta.tone}-bg)`, color: `var(--status-${meta.tone}-fg)`, border: `1px solid var(--status-${meta.tone}-bd)` }}>
+        {meta.tone === 'ok' ? <Mail size={9} /> : <AlertCircle size={9} />} {meta.label}
+      </span>
+    );
+  };
+
   const PAY_FIELDS = [
     ['account_name', 'Account name'],
     ['bpi', 'BPI account'],
@@ -5302,6 +5329,7 @@ function AdminEnrollments({ onCountChange }) {
                           <RefreshCw size={9} /> Renewal
                         </span>
                       )}
+                      <NotifyBadge request={r} />
                     </div>
                     <div className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{r.email}</div>
                     <div className="mt-1 flex items-center gap-3 flex-wrap" style={{ fontSize: 11, color: C.textMute }}>

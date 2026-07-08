@@ -64,9 +64,10 @@ user-approval adds). Anything already applied no-ops. Hard ordering dependencies
 | 13 | [`2026-07-04-subscription-lifecycle.sql`](2026-07-04-subscription-lifecycle.sql) | plan `access_days`/`support_days`/`entitlement_summary`; subscription `ends_at`/`grace_ends_at`/lineage; **date-aware `is_enrolled()`**; `approve_subscription()` + `expire_overdue_subscriptions()` + grants; realtime on `subscriptions` | #12 — **stops with an exception if #12 not run** |
 | 14 | [`2026-07-08-receipt-integrity.sql`](2026-07-08-receipt-integrity.sql) | receipt delete → **admin-only** (students can't destroy payment evidence after submitting) | #12 (`enrollment-receipts` bucket) |
 | 15 | [`2026-07-08-course-videos-private.sql`](2026-07-08-course-videos-private.sql) | **private `course-videos` bucket** + policies for PAID lesson videos (public bucket can't protect a subset; covers/guides stay public) | #12 (`is_enrolled()`) |
+| 16 | [`2026-07-08-enrollment-notify-status.sql`](2026-07-08-enrollment-notify-status.sql) | `enrollment_requests.notify_status`/`notified_at`/`notify_detail` + `record_enrollment_notification()` RPC (SECURITY DEFINER, owner-or-admin) — makes the admin-alert email outcome auditable in the Enrollments tab | #12 (`enrollment_requests`, `is_admin()`) |
 
-**Migration order in one line:** `#1 → #2 → #3 → #4 → #5 → #6 → #7 → #8 → #9 → #10 → #11 → #12 → #13 → #14 → #15`
-(feature-guides before user-approval; user-approval before enrollment; enrollment before subscription-lifecycle; the two 2026-07-08 files need enrollment/`is_enrolled()`).
+**Migration order in one line:** `#1 → #2 → #3 → #4 → #5 → #6 → #7 → #8 → #9 → #10 → #11 → #12 → #13 → #14 → #15 → #16`
+(feature-guides before user-approval; user-approval before enrollment; enrollment before subscription-lifecycle; the three 2026-07-08 files need enrollment/`is_enrolled()`).
 
 ---
 

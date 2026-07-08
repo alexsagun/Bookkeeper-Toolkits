@@ -242,6 +242,16 @@ best-effort and logs any skip/error to the browser console (`[enroll] admin emai
 vars are set, the panel shows "email not configured" (harmless). **Note:** `npm run dev` doesn't
 run serverless functions — email only works on a Vercel deploy.
 
+**Audit trail (visible in the Enrollments tab).** The `submitted` handler stamps the send outcome
+onto the request row via the `record_enrollment_notification()` RPC (added by
+[`db/2026-07-08-enrollment-notify-status.sql`](db/2026-07-08-enrollment-notify-status.sql) — run it
+on existing installs; the fresh-install bootstrap already includes it). Each request card then shows
+a small badge: a green **"Admin emailed"** when the alert sent, or an amber/red **"Email not
+sent — …"** (no key / no sender / no recipient / provider error) when it didn't — so a
+silently-misconfigured admin email is no longer invisible (it doesn't rely on the student's browser
+console). The badge only appears once an alert has been attempted; older rows and installs without
+the migration simply show no badge (the RPC call is best-effort and never blocks the email).
+
 **Not on Vercel?** Reimplement the same `submitted` / `decision` / `test` workflow as a **Supabase
 Edge Function** and store `RESEND_API_KEY` / `RESEND_FROM` / `NOTIFY_ADMIN_EMAIL` / `APP_URL` as
 **Supabase function secrets** (`supabase secrets set …`). The auth checks and recipient resolution

@@ -144,6 +144,26 @@ async function callerHasSubscription(userId, token) {
   }
 }
 
+// Best-effort audit stamp of the admin-alert outcome onto the request row, via the
+// SECURITY DEFINER RPC record_enrollment_notification (owner-or-admin guard — the caller
+// is the row's owner on a 'submitted' action). NEVER throws: recording the outcome must
+// not block or fail the email response, exactly like the alert itself is best-effort.
+// See db/2026-07-08-enrollment-notify-status.sql.
+async function recordNotify(requestId, token, status, detail) {
+  if (!requestId || !token || !SUPABASE_URL || !SUPABASE_ANON) return;
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/rpc/record_enrollment_notification`, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_ANON,
+        Authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ p_request_id: requestId, p_status: status, p_detail: detail ?? null }),
+    });
+  } catch { /* best-effort — the audit stamp is non-fatal */ }
+}
+
 // Extract the bare address out of a RESEND_FROM value ("Name <a@b.com>" → "a@b.com").
 const fromAddress = (from) => (from ? (from.match(/<([^>]+)>/)?.[1] ?? from).trim() : '');
 
@@ -274,11 +294,21 @@ export default async function handler(req, res) {
     }
 
     // Env-gated: not configured → non-fatal skip (submission already succeeded client-side).
-    if (!apiKey) return res.status(200).json({ ok: false, skipped: 'email_not_configured' });
-    if (!from) return res.status(200).json({ ok: false, skipped: 'email_from_not_configured' });
+    // Each skip is stamped onto the row so the Enrollments tab shows WHY no email went out.
+    if (!apiKey) {
+      await recordNotify(requestId, u.token, 'email_not_configured');
+      return res.status(200).json({ ok: false, skipped: 'email_not_configured' });
+    }
+    if (!from) {
+      await recordNotify(requestId, u.token, 'email_from_not_configured');
+      return res.status(200).json({ ok: false, skipped: 'email_from_not_configured' });
+    }
     // Recipient: NOTIFY_ADMIN_EMAIL → payment_settings.notify_email → address in RESEND_FROM.
     const { to: adminTo } = await resolveAdminRecipient(u.token);
-    if (!isEmail(adminTo)) return res.status(200).json({ ok: false, skipped: 'admin_email_invalid' });
+    if (!isEmail(adminTo)) {
+      await recordNotify(requestId, u.token, 'admin_email_invalid');
+      return res.status(200).json({ ok: false, skipped: 'admin_email_invalid' });
+    }
 
     // Direct review link: APP_URL env wins; otherwise the host that served this request.
     const appUrl = (process.env.APP_URL || '').replace(/\/+$/, '') ||
@@ -307,9 +337,15 @@ export default async function handler(req, res) {
     };
     try {
       const out = await sendResend(apiKey, from, adminTo, subject, html);
-      return res.status(out.ok ? 200 : 502).json(out.ok ? out : { ok: false, error: 'Email provider rejected the request.' });
+      if (out.ok) {
+        await recordNotify(requestId, u.token, 'sent', out.id ? `resend:${out.id}` : null);
+        return res.status(200).json(out);
+      }
+      await recordNotify(requestId, u.token, 'provider_error', out.detail || `status ${out.status}`);
+      return res.status(502).json({ ok: false, error: 'Email provider rejected the request.' });
     } catch (err) {
       console.error('[notify-enrollment] send failed:', String(err));
+      await recordNotify(requestId, u.token, 'provider_error', 'send failed');
       return res.status(502).json({ ok: false, error: 'Email send failed.' });
     }
   }

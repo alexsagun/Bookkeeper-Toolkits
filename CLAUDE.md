@@ -327,6 +327,14 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   (env-only, no address). **Supabase Auth's SMTP/Resend settings do NOT power this** — it needs its
   own Vercel env vars (or a Supabase Edge Function + function secrets off-Vercel). Receipts are
   never attached; the client submit fires the alert best-effort (never blocks the student).
+  **Notify audit trail:** the `submitted` handler stamps the send outcome onto the request row
+  (`enrollment_requests.notify_status`/`notified_at`/`notify_detail`) via the SECURITY DEFINER
+  `record_enrollment_notification()` RPC (owner-or-admin guard — mirrors `approve_subscription`, so
+  the function's student JWT can write without a broad UPDATE policy or a service-role key); each
+  Enrollments card shows a green **"Admin emailed"** or amber/red **"Email not sent — …"** badge
+  (`AdminEnrollments`' `NotifyBadge`) so a misconfigured admin email isn't invisible. All best-effort
+  (never blocks the response); older rows/installs without the migration just show no badge.
+  See [db/2026-07-08-enrollment-notify-status.sql](db/2026-07-08-enrollment-notify-status.sql).
   Toggle with `REQUIRE_ENROLLMENT` (module const, default on;
   off via `VITE_REQUIRE_ENROLLMENT=false`). Enrollment state is server-side — **not** in
   `LEGACY_KEYS` (the one exception: the admin sound-alert pref `enroll:soundAlert`, which IS a
@@ -358,7 +366,8 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   renewal keeps full access. `AdminEnrollments` adds membership filters (Renewals / Active /
   Expiring soon / Ended), a per-card membership strip, and an "access until {date}" projection
   in the approve modal. Docs: [ENROLLMENT_SETUP.md](ENROLLMENT_SETUP.md) ("Membership lifecycle
-  & renewal"). Migration order: user-approval → enrollment → subscription-lifecycle.
+  & renewal"). Migration order: user-approval → enrollment → subscription-lifecycle →
+  enrollment-notify-status.
 - **Sign-out + identity** render in the sidebar header (just below the "built by Alex Sagun" line).
 - **Per-user data:** all `window.storage` keys are auto-namespaced per user (see the main.jsx shim
   note). Tools need no changes. A one-time migration in `AuthProvider` adopts any pre-auth global
