@@ -28,6 +28,10 @@ are **CSS custom-property references**, with the actual per-theme values in
 **Do:** `style={{ color: C.text, fontFamily: fontDisplay }}` and the `glass-card` class for panels.
 **Do:** use the semantic status tokens for pills/banners — `var(--status-warn-bg/-bd/-fg)`,
 `--status-ok-*`, `--status-danger-*`, `--status-info-*`, `--status-neutral-*`, `--status-warn-strong-*`.
+**Do:** use the shell tokens for app chrome — `--sidebar-bg/-border/-edge` (the sidebar `<aside>`),
+`--topbar-bg` (mobile sticky bar), `--section-head-bg` (`SectionHead`), `--table-sticky-bg` +
+`--table-sticky-{soft,deeper,ok,danger}-bg` (sticky table columns, plain + tinted summary rows).
+Inline styles bypass the dark compat layer, so shell surfaces MUST use these vars.
 **Don't:** hardcode hex colors, and **never** concat an alpha suffix onto a token
 (`` `${C.primary}66` `` is broken CSS against a var) — use the alpha tokens: `var(--primary-glow)`
 (≈66), `--primary-glow-soft` (55), `--primary-selection` (33), `--primary-halo` (1A),

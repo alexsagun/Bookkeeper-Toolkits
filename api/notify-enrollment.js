@@ -3,25 +3,33 @@
 // not set, it responds { ok:false, skipped:'…' } and the in-app flow still works
 // (the client treats email as best-effort). Secrets stay server-side — never the bundle.
 //
-// Two directions, selected by body.action:
+// Three actions, selected by body.action:
 //   'submitted' — a STUDENT just submitted payment proof → notify the admin.
 //                 Auth: the caller's own JWT must be able to read the request row
 //                 (RLS enroll_req_own_select proves ownership); the email content is
 //                 built from the DB row, never from the request body.
 //   'decision'  — an ADMIN approved / rejected / expired a request → notify the student.
 //                 Auth: same admin check as notify-access.js.
+//   'test'      — an ADMIN sends a sample admin alert to confirm config end-to-end.
+//                 Auth: admin JWT (same gate as 'decision'). Returns { to, source }.
+//
+// Admin-recipient resolution ('submitted' + 'test'), first valid email wins:
+//   NOTIFY_ADMIN_EMAIL → payment_settings.notify_email → address inside RESEND_FROM.
 //
 // Env (Vercel → Settings → Environment Variables, Production + Preview):
 //   RESEND_API_KEY        re_…  (server-only; do NOT VITE_-prefix)
 //   RESEND_FROM           e.g. "Toolkits by Alex <noreply@yourdomain.com>"
-//   NOTIFY_ADMIN_EMAIL    optional — where 'submitted' alerts go; falls back to the
+//   NOTIFY_ADMIN_EMAIL    optional — where admin alerts go; if unset, falls back to the
+//                         admin-editable payment_settings.notify_email, then to the
 //                         address inside RESEND_FROM.
 //   APP_URL               optional — absolute origin for the "Review in Enrollments"
 //                         button in admin alerts (e.g. https://toolkits.alexsagun.com);
 //                         falls back to the request's own host header.
 //   VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY  reused for auth checks (already set).
 //
-// NOTE: `npm run dev` (Vite) does NOT run this function — email is exercised on Vercel only.
+// NOTE: Supabase Auth's SMTP/Resend settings power ONLY Supabase Auth emails (confirm,
+//   reset) — NOT this function. These custom alerts need their own env vars above.
+//   `npm run dev` (Vite) does NOT run this function — email is exercised on Vercel only.
 
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
 const SUPABASE_ANON = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
@@ -136,6 +144,41 @@ async function callerHasSubscription(userId, token) {
   }
 }
 
+// Extract the bare address out of a RESEND_FROM value ("Name <a@b.com>" → "a@b.com").
+const fromAddress = (from) => (from ? (from.match(/<([^>]+)>/)?.[1] ?? from).trim() : '');
+
+// Where should the 'submitted'/'test' admin alert go? Resolution order, first valid wins:
+//   1. NOTIFY_ADMIN_EMAIL env         → source 'env'
+//   2. payment_settings.notify_email  → source 'payment_settings'  (admin-editable in-app,
+//      read with the CALLER'S JWT — student token for 'submitted', admin token for 'test';
+//      both are `authenticated`, so RLS payment_settings_read `to authenticated using(true)`
+//      passes. Best-effort: any failure/missing table just falls through.)
+//   3. address inside RESEND_FROM      → source 'from'
+// Returns { to, source }; { to:null, source:null } if nothing resolves to a valid email.
+async function resolveAdminRecipient(token) {
+  const envTo = process.env.NOTIFY_ADMIN_EMAIL;
+  if (isEmail(envTo)) return { to: envTo, source: 'env' };
+
+  if (token && SUPABASE_URL && SUPABASE_ANON) {
+    try {
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/payment_settings?key=eq.notify_email&select=value`,
+        { headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}` } }
+      );
+      if (r.ok) {
+        const rows = await r.json();
+        const val = Array.isArray(rows) && rows[0]?.value;
+        if (isEmail(val)) return { to: val, source: 'payment_settings' };
+      }
+    } catch { /* best-effort — fall through to RESEND_FROM */ }
+  }
+
+  const fromTo = fromAddress(process.env.RESEND_FROM);
+  if (isEmail(fromTo)) return { to: fromTo, source: 'from' };
+
+  return { to: null, source: null };
+}
+
 function decisionEmail(status, fullName, planName, reason) {
   const hi = fullName ? `Hello ${fullName},` : 'Hello,';
   const plan = planName || 'your selected package';
@@ -168,6 +211,9 @@ function decisionEmail(status, fullName, planName, reason) {
   };
 }
 
+// Sends via Resend and NEVER attaches receipts (financial docs stay private — email only
+// links the admin to the dashboard). On failure returns a short, non-secret `detail` slice of
+// the provider response for diagnostics; only the admin-gated 'test' action surfaces it.
 async function sendResend(apiKey, from, to, subject, html) {
   const r = await fetch('https://api.resend.com/emails', {
     method: 'POST',
@@ -177,7 +223,7 @@ async function sendResend(apiKey, from, to, subject, html) {
   const text = await r.text();
   if (!r.ok) {
     console.error(`[notify-enrollment] resend ${r.status}: ${text.slice(0, 500)}`);
-    return { ok: false };
+    return { ok: false, status: r.status, detail: text.slice(0, 300) };
   }
   let data = {};
   try { data = JSON.parse(text); } catch { /* non-JSON success body — fine */ }
@@ -188,8 +234,19 @@ export default async function handler(req, res) {
   const hasKey = Boolean(process.env.RESEND_API_KEY);
 
   // Health check (no email, no auth) — visit /api/notify-enrollment in a browser.
+  // `adminRecipient` is ENV-ONLY: the anon GET can't read payment_settings (RLS is
+  // `to authenticated`), so a 'none' here can STILL resolve at send time via
+  // payment_settings.notify_email. Reports the source string only — never the address.
   if (req.method === 'GET') {
-    return res.status(200).json({ ok: true, hasKey, hasFrom: Boolean(process.env.RESEND_FROM) });
+    const adminRecipient = isEmail(process.env.NOTIFY_ADMIN_EMAIL)
+      ? 'env'
+      : (isEmail(fromAddress(process.env.RESEND_FROM)) ? 'from' : 'none');
+    return res.status(200).json({
+      ok: true,
+      hasKey,
+      hasFrom: Boolean(process.env.RESEND_FROM),
+      adminRecipient,
+    });
   }
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed. Use POST.' });
@@ -214,7 +271,8 @@ export default async function handler(req, res) {
     // Env-gated: not configured → non-fatal skip (submission already succeeded client-side).
     if (!apiKey) return res.status(200).json({ ok: false, skipped: 'email_not_configured' });
     if (!from) return res.status(200).json({ ok: false, skipped: 'email_from_not_configured' });
-    const adminTo = process.env.NOTIFY_ADMIN_EMAIL || (from.match(/<([^>]+)>/)?.[1] ?? from);
+    // Recipient: NOTIFY_ADMIN_EMAIL → payment_settings.notify_email → address in RESEND_FROM.
+    const { to: adminTo } = await resolveAdminRecipient(u.token);
     if (!isEmail(adminTo)) return res.status(200).json({ ok: false, skipped: 'admin_email_invalid' });
 
     // Direct review link: APP_URL env wins; otherwise the host that served this request.
@@ -274,5 +332,41 @@ export default async function handler(req, res) {
     }
   }
 
-  return res.status(400).json({ error: "action must be 'submitted' or 'decision'." });
+  if (action === 'test') {
+    // Admin-only diagnostic — sends a sample admin alert to the resolved recipient so an
+    // admin can confirm email works end-to-end. Strictly admin-gated: a non-admin can't
+    // even discover the recipient address. Returns { to, source } so the UI can show where
+    // the alert would land, plus a provider `detail` on failure to aid diagnosis.
+    if (!(await callerIsAdmin(req.headers?.authorization))) {
+      return res.status(403).json({ error: 'Admin authorization required.' });
+    }
+    if (!apiKey) return res.status(200).json({ ok: false, skipped: 'email_not_configured' });
+    if (!from) return res.status(200).json({ ok: false, skipped: 'email_from_not_configured' });
+
+    const u = await callerUser(req.headers?.authorization);
+    const { to: adminTo, source } = await resolveAdminRecipient(u?.token);
+    if (!isEmail(adminTo)) return res.status(200).json({ ok: false, skipped: 'admin_email_invalid' });
+
+    const { subject, html } = {
+      subject: `Test alert — ${BRAND} enrollment notifications are working ✅`,
+      html: emailHtml({
+        heading: 'Enrollment email is configured 🎉',
+        intro: `This is a test of the ${BRAND} admin notification email. If you received this, "new enrollment submitted" alerts will reach this inbox. This message was triggered by an admin from the Enrollments tab — no student action occurred.`,
+        rows: [
+          ['Recipient', adminTo],
+          ['Resolved from', source === 'env' ? 'NOTIFY_ADMIN_EMAIL' : source === 'payment_settings' ? 'payment_settings.notify_email' : 'RESEND_FROM'],
+        ],
+      }),
+    };
+    try {
+      const out = await sendResend(apiKey, from, adminTo, subject, html);
+      if (out.ok) return res.status(200).json({ ok: true, id: out.id, to: adminTo, source });
+      return res.status(502).json({ ok: false, error: 'Email provider rejected the request.', status: out.status, detail: out.detail });
+    } catch (err) {
+      console.error('[notify-enrollment] test send failed:', String(err));
+      return res.status(502).json({ ok: false, error: 'Email send failed.' });
+    }
+  }
+
+  return res.status(400).json({ error: "action must be 'submitted', 'decision' or 'test'." });
 }

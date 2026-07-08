@@ -212,9 +212,18 @@ function shouldHandleInAppClick(e) {
 // an HTML error page from a misrouted request) throws a *descriptive* error
 // that gets logged — instead of silently collapsing into a generic fallback.
 async function callClaude({ model = 'claude-sonnet-4-6', max_tokens = 1024, system, messages }, opts = {}) {
+  // Attach the Supabase session token so the serverless proxy (api/anthropic/v1/messages.js)
+  // can authenticate the caller and gate token spend on admin-or-enrolled — the control that
+  // replaces the previously open proxy. Anthropic ignores this header; the proxy consumes it.
+  let authHeader = {};
+  try {
+    const { data } = await supabase.auth.getSession();
+    const token = data?.session?.access_token;
+    if (token) authHeader = { Authorization: `Bearer ${token}` };
+  } catch { /* no session — the proxy will reject with 401 */ }
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeader },
     body: JSON.stringify({ model, max_tokens, system, messages }),
   });
 
@@ -824,7 +833,7 @@ const C = {
   accent:    'var(--c-accent)',      // cyan accent
   soft:      'var(--c-soft)',        // soft blue for tints
   // Surfaces
-  white:     'var(--surface-2)',     // solid card/input surface (was #FFFFFF; only ever used as background)
+  white:     'var(--surface-2)',     // solid card/input surface (was #FFFFFF; backgrounds + the rail badge rings)
   bg:        'var(--c-bg)',          // app background
   bgSoft:    'var(--c-bg-soft)',     // ice tint
   bgDeeper:  'var(--c-bg-deeper)',   // shadow tint
@@ -2040,11 +2049,16 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
       try {
         const { data: s } = await supabase.auth.getSession();
         const token = s?.session?.access_token;
+        // Non-awaited + non-fatal, but surface the outcome in devtools so a silently
+        // unconfigured/failing admin email isn't invisible (the student is never blocked).
         fetch('/api/notify-enrollment', {
           method: 'POST',
           headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
           body: JSON.stringify({ action: 'submitted', requestId: row.id }),
-        }).catch(() => {});
+        })
+          .then(r => r.json().catch(() => ({})))
+          .then(j => { if (!j?.ok) console.warn('[enroll] admin email:', j?.skipped || j?.error || 'not sent'); })
+          .catch(() => {});
       } catch { /* best-effort */ }
 
       onSubmitted?.(row);   // gate re-renders straight into the pending-review screen
@@ -2315,7 +2329,10 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
                 <div className="mt-4">
                   <label className={labelCls} style={labelStyle}>Screenshot of payment *</label>
                   <div
+                    role="button" tabIndex={0}
+                    aria-label="Upload payment screenshot or PDF"
                     onClick={() => fileInputRef.current?.click()}
+                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInputRef.current?.click(); } }}
                     onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
                     onDrop={(e) => { e.preventDefault(); e.stopPropagation(); handleFile(e.dataTransfer.files?.[0]); }}
                     className="rounded-2xl p-6 text-center cursor-pointer transition"
@@ -3183,8 +3200,13 @@ export default function BookkeeperProToolkit() {
     }),
   }));
 
-  // Load persisted state on mount
+  // Load persisted per-user sidebar layout. Gated on user?.id (NOT []): the storage shim
+  // namespaces keys as u:<uid>:* only after AuthProvider calls __setStorageUser(uid). A
+  // []-deps mount read ran in the BARE namespace while later writes went namespaced, so
+  // customization silently reverted every reload. Keying on the uid guarantees the namespace
+  // is set before we read, and re-loads the correct layout on account switch.
   useEffect(() => {
+    if (!user?.id) return;
     let cancelled = false;
     (async () => {
       try {
@@ -3228,7 +3250,7 @@ export default function BookkeeperProToolkit() {
       if (!cancelled) setStorageReady(true);
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [user?.id]);
 
   // Persist stages on change (after initial load)
   useEffect(() => {
@@ -3620,13 +3642,13 @@ export default function BookkeeperProToolkit() {
 
       {/* SIDEBAR — static column on lg+, off-canvas drawer below it */}
       <aside style={{
-        background: 'linear-gradient(180deg, rgba(255,255,255,0.78) 0%, rgba(247,250,255,0.72) 100%)',
+        background: 'var(--sidebar-bg)',
         backdropFilter: 'blur(40px) saturate(180%)',
         WebkitBackdropFilter: 'blur(40px) saturate(180%)',
-        borderRight: `1px solid ${GLASS.borderSoft}`,
+        borderRight: '1px solid var(--sidebar-border)',
       }} className={`w-72 ${railCollapsed ? 'lg:w-[76px]' : 'lg:w-72'} flex-shrink-0 flex flex-col h-screen z-50 fixed inset-y-0 left-0 transform transition-transform duration-300 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:relative lg:inset-auto lg:translate-x-0 lg:transition-[width] lg:duration-300 lg:ease-in-out`}>
         {/* Subtle right-edge highlight */}
-        <div className="absolute top-0 right-0 bottom-0 w-px" style={{ background: 'linear-gradient(180deg, transparent 0%, rgba(10,132,255,0.08) 50%, transparent 100%)' }} />
+        <div className="absolute top-0 right-0 bottom-0 w-px" style={{ background: 'var(--sidebar-edge)' }} />
 
         {/* Close control — drawer only (hidden on lg+) */}
         <button
@@ -3845,7 +3867,7 @@ export default function BookkeeperProToolkit() {
                 <ShieldCheck size={18} />
                 {pendingCount > 0 && (
                   <span className="absolute -top-1 -right-1 px-1 rounded-full text-[9px] font-bold flex items-center justify-center"
-                    style={{ minWidth: 16, height: 16, background: C.amber, color: 'white', border: '2px solid white' }}>
+                    style={{ minWidth: 16, height: 16, background: C.amber, color: 'white', border: `2px solid ${C.white}` }}>
                     {pendingCount}
                   </span>
                 )}
@@ -3864,7 +3886,7 @@ export default function BookkeeperProToolkit() {
                 <Receipt size={18} />
                 {enrollPendingCount > 0 && (
                   <span className="absolute -top-1 -right-1 px-1 rounded-full text-[9px] font-bold flex items-center justify-center"
-                    style={{ minWidth: 16, height: 16, background: C.amber, color: 'white', border: '2px solid white' }}>
+                    style={{ minWidth: 16, height: 16, background: C.amber, color: 'white', border: `2px solid ${C.white}` }}>
                     {enrollPendingCount}
                   </span>
                 )}
@@ -3903,17 +3925,15 @@ export default function BookkeeperProToolkit() {
                         }}
                         title={tLabel}
                         aria-label={tLabel}
-                        className="flex items-center justify-center rounded-xl flex-shrink-0"
+                        className="flex items-center justify-center rounded-xl flex-shrink-0 nav-hover"
                         style={{
                           width: 44,
                           height: 44,
-                          background: active ? 'rgba(10,132,255,0.12)' : 'transparent',
+                          background: active ? 'rgba(10,132,255,0.12)' : undefined,
                           color: active ? C.primary : C.textMute,
                           boxShadow: active ? `inset 0 0 0 1px rgba(10,132,255,0.18)` : 'none',
                           transition: `background 200ms ${EASE}, color 200ms ${EASE}`,
-                        }}
-                        onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'var(--wash)'; }}
-                        onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}>
+                        }}>
                         <Icon size={18} />
                       </a>
                     );
@@ -3945,10 +3965,7 @@ export default function BookkeeperProToolkit() {
                       <span className="cursor-grab active:cursor-grabbing select-none px-1 text-xs" style={{ color: C.textMute }} title="Drag to reorder stage">⋮⋮</span>
                     )}
                     <button onClick={() => !editingStageId && toggleStage(stage.id)}
-                      className="flex items-center gap-2 flex-1 min-w-0 rounded-lg px-2 py-1.5 transition text-left"
-                      style={{ ':hover': { background: 'var(--wash)' } }}
-                      onMouseEnter={(e) => e.currentTarget.style.background = 'var(--wash)'}
-                      onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}>
+                      className="flex items-center gap-2 flex-1 min-w-0 rounded-lg px-2 py-1.5 transition text-left nav-hover">
                       <ChevronDown size={12} style={{ color: C.textMute }} className={`flex-shrink-0 transition-transform ${isCollapsed ? '-rotate-90' : ''}`} />
                       <span style={{
                         background: containsActive
@@ -4028,14 +4045,12 @@ export default function BookkeeperProToolkit() {
                         ) : editMode ? (
                           <button
                             onClick={() => setEditingTabId(t.id)}
-                            className={`flex-1 text-left ${hasNumber ? 'pl-6' : 'pl-3'} pr-3 py-2 flex items-center gap-3 text-[13px] rounded-lg`}
+                            className={`flex-1 text-left ${hasNumber ? 'pl-6' : 'pl-3'} pr-3 py-2 flex items-center gap-3 text-[13px] rounded-lg ${active ? '' : 'nav-hover'}`}
                             style={{
                               color: active ? C.primary : C.textSoft,
                               fontWeight: active ? 600 : 500,
                               transition: `background 200ms ${EASE}, color 200ms ${EASE}`,
                             }}
-                            onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'var(--wash)'; }}
-                            onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}
                             title="Click to rename">
                             <Icon size={15} style={{ color: active ? C.primary : C.textMute, flexShrink: 0 }} />
                             <span className="flex-1 truncate">{tLabel}</span>
@@ -4050,14 +4065,12 @@ export default function BookkeeperProToolkit() {
                                 e.preventDefault();
                                 setTab(t.id);
                               }}
-                              className={`flex-1 text-left ${hasNumber ? 'pl-6' : 'pl-3'} pr-3 py-2 flex items-center gap-3 text-[13px] rounded-lg ${active ? 'nav-item-active' : ''}`}
+                              className={`flex-1 text-left ${hasNumber ? 'pl-6' : 'pl-3'} pr-3 py-2 flex items-center gap-3 text-[13px] rounded-lg nav-hover ${active ? 'nav-item-active' : ''}`}
                               style={{
                                 color: active ? C.primary : C.textSoft,
                                 fontWeight: active ? 600 : 500,
                                 transition: `background 200ms ${EASE}, color 200ms ${EASE}`,
-                              }}
-                              onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'var(--wash)'; }}
-                              onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}>
+                              }}>
                               <Icon size={15} style={{ color: active ? C.primary : C.textMute, flexShrink: 0 }} />
                               <span className="flex-1 truncate">{tLabel}</span>
                             </a>
@@ -4067,10 +4080,8 @@ export default function BookkeeperProToolkit() {
                               rel="noopener noreferrer"
                               aria-label={`Open ${tLabel} in new tab`}
                               title={`Open ${tLabel} in new tab`}
-                              className="mr-2 flex-shrink-0 rounded-md p-1.5 opacity-60 transition group-hover:opacity-100 focus:opacity-100"
-                              style={{ color: C.textMute }}
-                              onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--wash-strong)'; }}
-                              onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}>
+                              className="mr-2 flex-shrink-0 rounded-md p-1.5 opacity-60 transition group-hover:opacity-100 focus:opacity-100 nav-hover-strong"
+                              style={{ color: C.textMute }}>
                               <ExternalLink size={12} />
                             </a>
                           </>
@@ -4113,10 +4124,8 @@ export default function BookkeeperProToolkit() {
                           ) : (
                             <button
                               onClick={() => editMode ? setEditingGroupKey(gItemKey) : toggleGroup(stage.id, g.key)}
-                              className={`w-full ${hasNumber ? 'pl-9 pr-6' : 'pl-3 pr-3'} ${gi === 0 ? 'mt-1' : 'mt-3'} mb-1 flex items-center gap-2 group rounded-md py-1 transition`}
+                              className={`w-full ${hasNumber ? 'pl-9 pr-6' : 'pl-3 pr-3'} ${gi === 0 ? 'mt-1' : 'mt-3'} mb-1 flex items-center gap-2 group rounded-md py-1 transition nav-hover`}
                               style={{ cursor: 'pointer' }}
-                              onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--wash)'; }}
-                              onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
                               title={editMode ? 'Click to rename' : (isGroupExpanded ? 'Hide tools' : `Show ${groupTabs.length} tools`)}>
                               {!editMode && (
                                 <ChevronDown
@@ -4185,7 +4194,7 @@ export default function BookkeeperProToolkit() {
         {/* Mobile top bar — hamburger opens the drawer (hidden on lg+) */}
         <div
           className="lg:hidden sticky top-0 z-30 flex items-center gap-3 px-4 py-3"
-          style={{ background: 'rgba(255,255,255,0.85)', backdropFilter: 'blur(20px) saturate(180%)', WebkitBackdropFilter: 'blur(20px) saturate(180%)', borderBottom: `1px solid ${GLASS.borderSoft}` }}
+          style={{ background: 'var(--topbar-bg)', backdropFilter: 'blur(20px) saturate(180%)', WebkitBackdropFilter: 'blur(20px) saturate(180%)', borderBottom: `1px solid ${GLASS.borderSoft}` }}
         >
           <button
             onClick={() => setSidebarOpen(true)}
@@ -4591,6 +4600,7 @@ function AdminEnrollments({ onCountChange }) {
   const [soundOn, setSoundOn] = useState(false);
   const soundOnRef = useRef(false);
   const audioCtxRef = useRef(null);
+  const [testingEmail, setTestingEmail] = useState(false);   // "Test email" diagnostic busy state
 
   // Close any open modal on Escape (matches AccessRequests). Not mid-request.
   useEffect(() => {
@@ -4772,6 +4782,36 @@ function AdminEnrollments({ onCountChange }) {
   };
   const emailSuffix = (mail) =>
     mail?.ok ? ' · email sent' : mail?.skipped ? ' · email not configured' : ' · email not sent';
+
+  // Admin-only diagnostic: fire a test admin alert through /api/notify-enrollment so an
+  // admin can confirm outside-the-app email works end-to-end (verifies the admin JWT
+  // server-side, resolves the recipient, and reports sent / not-configured / provider error).
+  const skipMessage = (skipped) => ({
+    email_not_configured: 'Email is not configured — set RESEND_API_KEY in Vercel.',
+    email_from_not_configured: 'Sender is not configured — set RESEND_FROM in Vercel.',
+    admin_email_invalid: 'No valid admin recipient — set NOTIFY_ADMIN_EMAIL or the “Proof / support email” below.',
+  }[skipped] || `Email skipped (${skipped}).`);
+  const sendTestEmail = async () => {
+    if (testingEmail) return;
+    setTestingEmail(true); setErr(''); setNotice('');
+    try {
+      const { data: s } = await supabase.auth.getSession();
+      const token = s?.session?.access_token;
+      const res = await fetch('/api/notify-enrollment', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ action: 'test' }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (j?.ok) setNotice(`Test email sent to ${j.to} — check that inbox to confirm delivery.`);
+      else if (j?.skipped) setErr(skipMessage(j.skipped));
+      else setErr(j?.error ? `Test email failed: ${j.error}${j.detail ? ` (${j.detail})` : ''}` : 'Test email failed. Confirm the app is deployed on Vercel with email env vars set.');
+    } catch {
+      setErr('Could not reach the email service. (It only runs on a Vercel deploy, not npm run dev.)');
+    } finally {
+      setTestingEmail(false);
+    }
+  };
 
   // Approve = the ONE admin action that unlocks a student. Post-lifecycle the DATED
   // SUBSCRIPTION is the real access grant (is_enrolled() checks it; profiles.is_paid is
@@ -5116,6 +5156,12 @@ function AdminEnrollments({ onCountChange }) {
             <Volume2 size={14} /> Test
           </button>
         )}
+        <button onClick={sendTestEmail} disabled={testingEmail}
+          title="Send a test admin alert to confirm outside-the-app email is configured (only works on a Vercel deploy)"
+          className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition disabled:opacity-60"
+          style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+          {testingEmail ? <Loader2 size={14} className="animate-spin" /> : <Mail size={14} />} Test email
+        </button>
         <button onClick={() => load()} disabled={loading}
           className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition disabled:opacity-60"
           style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
@@ -6254,6 +6300,41 @@ const COURSE_LESSON_SELECT = 'id,module_id,course_id,title,type,video_url,video_
 const COURSE_COMPLETION_SELECT = 'user_id,course_id,completed_at';
 const FEATURE_GUIDE_SELECT = 'feature_key,title,description,video_url,video_path,video_provider,external_url,is_active,updated_by,created_at,updated_at';
 
+// PAID lesson videos live in a PRIVATE bucket (course-videos) and are served via short-lived
+// signed URLs gated by is_enrolled() RLS. Course covers + feature-guide videos stay in the
+// PUBLIC course-media bucket. See db/2026-07-08-course-videos-private.sql.
+const LESSON_VIDEO_BUCKET = 'course-videos';
+
+// Renders an uploaded lesson video from the private bucket via a signed URL. Falls back to the
+// course-media public URL for legacy videos uploaded before the bucket split, so nothing breaks
+// during the transition. Re-signs when the lesson changes.
+function SignedLessonVideo({ lesson }) {
+  const [src, setSrc] = useState(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    setSrc(null); setFailed(false);
+    (async () => {
+      const path = lesson?.storage_path;
+      if (!path) return;
+      const { data, error } = await supabase.storage.from(LESSON_VIDEO_BUCKET).createSignedUrl(path, 3600);
+      if (cancelled) return;
+      if (data?.signedUrl) { setSrc(data.signedUrl); return; }
+      // Legacy object still in the public bucket (pre-split upload) — fall back to its public URL.
+      const pub = supabase.storage.from('course-media').getPublicUrl(path)?.data?.publicUrl;
+      if (pub) setSrc(pub); else { setFailed(true); if (error) console.error('[course-videos] sign failed', error); }
+    })();
+    return () => { cancelled = true; };
+  }, [lesson?.id, lesson?.storage_path]);
+  if (failed) {
+    return <div className="rounded-xl border-2 border-dashed border-slate-200 p-10 text-center text-slate-400">This video isn’t available. Refresh, or contact support if it persists.</div>;
+  }
+  if (!src) {
+    return <div className="rounded-xl bg-black/80 flex items-center justify-center text-white/70 text-sm" style={{ height: 240 }}>Loading video…</div>;
+  }
+  return <video key={lesson.id} controls className="w-full rounded-xl bg-black" style={{ maxHeight: 460 }} src={src} />;
+}
+
 function CourseProgram({
   slug = 'qbo-mastery',
   courseId = null,                                       // catalog mode: load by id instead of slug
@@ -6681,7 +6762,8 @@ function CourseProgram({
     try {
       const safe = file.name.replace(/[^\w.\-]+/g, '_');
       const path = `lessons/${course.id}/${crypto.randomUUID()}-${safe}`;
-      const { error } = await supabase.storage.from('course-media')
+      // Paid lesson videos go to the PRIVATE course-videos bucket (served via signed URLs).
+      const { error } = await supabase.storage.from(LESSON_VIDEO_BUCKET)
         .upload(path, file, { upsert: false, contentType: file.type || 'video/mp4' });
       if (error) throw error;
       setEditingLesson(d => ({ ...d, storage_path: path, video_provider: 'upload', video_url: '' }));
@@ -6775,8 +6857,8 @@ function CourseProgram({
         : <div className="rounded-xl border-2 border-dashed border-slate-200 p-10 text-center text-slate-400">No content yet.</div>;
     }
     if (lesson.video_provider === 'upload' && lesson.storage_path) {
-      const { data } = supabase.storage.from('course-media').getPublicUrl(lesson.storage_path);
-      return <video key={lesson.id} controls className="w-full rounded-xl bg-black" style={{ maxHeight: 460 }} src={data.publicUrl} />;
+      // Private bucket → signed URL (with legacy public-bucket fallback) via SignedLessonVideo.
+      return <SignedLessonVideo key={lesson.id} lesson={lesson} />;
     }
     if (lesson.video_provider === 'mp4' && lesson.video_url) {
       return <video key={lesson.id} controls className="w-full rounded-xl bg-black" style={{ maxHeight: 460 }} src={lesson.video_url} />;
@@ -7305,10 +7387,14 @@ async function removeMediaIfUnreferenced(rawPaths) {
   const referenced = new Set();
   try {
     for (const part of chunk(paths, 100)) {
-      const [{ data: lh }, { data: ch }] = await Promise.all([
+      const [{ data: lh, error: le }, { data: ch, error: ce }] = await Promise.all([
         supabase.from('course_lessons').select('storage_path').in('storage_path', part),
         supabase.from('courses').select('cover_path').in('cover_path', part),
       ]);
+      // supabase-js returns query errors as { data:null, error } WITHOUT throwing, so an
+      // unchecked failure would leave `referenced` empty and delete every candidate —
+      // including files a duplicated course still uses. On any error, keep the files.
+      if (le || ce) { console.error('[course-media] reference check failed — leaving files in place:', le || ce); return; }
       (lh || []).forEach(r => r.storage_path && referenced.add(r.storage_path));
       (ch || []).forEach(r => r.cover_path && referenced.add(r.cover_path));
     }
@@ -7318,7 +7404,17 @@ async function removeMediaIfUnreferenced(rawPaths) {
     return;
   }
   const orphans = paths.filter(p => !referenced.has(p));
-  for (const part of chunk(orphans, 100)) {
+  // Route each orphan to its bucket: lesson VIDEO files live in the private course-videos
+  // bucket; covers (and any legacy lesson videos) in course-media. We sweep both buckets for
+  // lessons/* paths so a video uploaded before the split is cleaned up too (remove is a no-op
+  // when the object is absent).
+  const videoOrphans = orphans.filter(p => p.startsWith('lessons/'));
+  const mediaOrphans = orphans.filter(p => !p.startsWith('lessons/'));
+  for (const part of chunk(videoOrphans, 100)) {
+    try { await supabase.storage.from(LESSON_VIDEO_BUCKET).remove(part); } catch (_) { /* best-effort */ }
+    try { await supabase.storage.from('course-media').remove(part); } catch (_) { /* legacy sweep */ }
+  }
+  for (const part of chunk(mediaOrphans, 100)) {
     try { await supabase.storage.from('course-media').remove(part); } catch (_) { /* best-effort */ }
   }
 }
@@ -7607,10 +7703,16 @@ function CourseCatalog({
       // under its folders, plus the paths its lesson rows + cover reference (a duplicate may reuse
       // a path that physically lives under the ORIGINAL's folder). We remove only the orphans after.
       const candidates = new Set();
-      for (const folder of [`lessons/${c.id}`, `covers/${c.id}`]) {
+      // Covers live in course-media; lesson videos in the private course-videos bucket (with
+      // possible legacy copies still in course-media). List each from the right bucket(s).
+      try {
+        const { data: objs } = await supabase.storage.from('course-media').list(`covers/${c.id}`, { limit: 1000 });
+        (objs || []).forEach(o => candidates.add(`covers/${c.id}/${o.name}`));
+      } catch (_) { /* ignore — row delete still proceeds */ }
+      for (const bkt of [LESSON_VIDEO_BUCKET, 'course-media']) {
         try {
-          const { data: objs } = await supabase.storage.from('course-media').list(folder, { limit: 1000 });
-          (objs || []).forEach(o => candidates.add(`${folder}/${o.name}`));
+          const { data: objs } = await supabase.storage.from(bkt).list(`lessons/${c.id}`, { limit: 1000 });
+          (objs || []).forEach(o => candidates.add(`lessons/${c.id}/${o.name}`));
         } catch (_) { /* ignore — row delete still proceeds */ }
       }
       try {
@@ -7916,13 +8018,15 @@ Confidence (conf) 0.0-1.0: use 0.9+ if vendor is unambiguous, 0.6-0.8 if you're 
 
       // Merge AI results back
       const merged = [...initialResults];
+      // Precompute each unmatched row's array index BEFORE the loop mutates `merged`. We flip
+      // needsAI=false as we assign, so re-deriving the index from the mutated array (the old
+      // approach) shifted later suggestions onto the wrong transaction and dropped the rest.
+      // The AI returns i = 1..N against the ORIGINAL unmatched order, so map i-1 → saved index.
+      const aiTargetIdx = [];
+      initialResults.forEach((r, i) => { if (r.needsAI) aiTargetIdx.push(i); });
       aiResults.forEach(ai => {
-        const targetIdx = merged.findIndex((m, idx) => {
-          if (!m.needsAI) return false;
-          const unmatchedBefore = merged.slice(0, idx).filter(x => x.needsAI).length;
-          return unmatchedBefore === ai.i - 1;
-        });
-        if (targetIdx >= 0) {
+        const targetIdx = aiTargetIdx[ai.i - 1] ?? -1;
+        if (targetIdx >= 0 && merged[targetIdx]?.needsAI) {
           merged[targetIdx] = {
             ...merged[targetIdx],
             vendor: ai.vendor,
@@ -8248,7 +8352,10 @@ Output ONLY this format. No markdown, no explanation.`
         <div className="mb-5">
           <div className="text-xs uppercase tracking-wider font-bold text-slate-600 block mb-2">Upload Statement</div>
           <div
+            role="button" tabIndex={0}
+            aria-label="Upload bank statement (PDF, image, or text file)"
             onClick={() => fileInputRef.current?.click()}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInputRef.current?.click(); } }}
             onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
             onDrop={(e) => {
               e.preventDefault(); e.stopPropagation();
@@ -17661,6 +17768,12 @@ TOTAL LIABILITIES & EQUITY       $239,700.00`,
 
   // Convert Excel workbook to readable text representation
   const excelToText = async (file) => {
+    // Guard before parsing: xlsx@0.18.5 carries prototype-pollution/ReDoS advisories with no
+    // npm fix. The file is user-selected (self-inflicted risk only), but a size cap bounds the
+    // parse/ReDoS surface and returns a clean error instead of a frozen tab.
+    if (file.size > 5 * 1024 * 1024) {
+      throw new Error('Spreadsheet is over 5 MB — export a smaller range or save it as CSV.');
+    }
     const XLSX = await import('xlsx');
     const arrayBuffer = await file.arrayBuffer();
     const workbook = XLSX.read(arrayBuffer, { type: 'array' });
@@ -19033,7 +19146,7 @@ tr.derived { background: #F0F9FF; font-weight: 700; border-top: 2px solid #0A84F
           <table className="w-full text-xs" style={{ fontFamily: fontMono }}>
             <thead style={{ background: 'rgba(10,132,255,0.06)', borderBottom: `1px solid ${GLASS.borderSoft}` }}>
               <tr>
-                <th className="text-left px-3 py-2 sticky left-0 z-10" style={{ background: 'rgba(247,250,255,0.95)', minWidth: 220, color: C.textSoft, fontWeight: 600 }}>Line Item</th>
+                <th className="text-left px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-bg)', minWidth: 220, color: C.textSoft, fontWeight: 600 }}>Line Item</th>
                 <th className="px-2 py-2" style={{ minWidth: 90, color: C.textSoft, fontWeight: 600 }}>Monthly Base</th>
                 <th className="px-2 py-2" style={{ minWidth: 70, color: C.textSoft, fontWeight: 600 }}>Growth %</th>
                 {Array.from({ length: 12 }, (_, i) => (
@@ -19057,7 +19170,7 @@ tr.derived { background: #F0F9FF; font-weight: 700; border-top: 2px solid #0A84F
                   {/* Row entries */}
                   {groups[group].map((r, idx) => (
                     <tr key={idx} className="hover:bg-blue-50/30">
-                      <td className="px-3 py-1.5 sticky left-0 z-10" style={{ background: 'rgba(247,250,255,0.95)' }}>
+                      <td className="px-3 py-1.5 sticky left-0 z-10" style={{ background: 'var(--table-sticky-bg)' }}>
                         <div className="flex items-center gap-2">
                           <input className="flex-1 bg-transparent outline-none border-b border-transparent focus:border-blue-300 text-xs" style={{ fontFamily: fontBody, color: C.text }}
                             value={r.name} onChange={e => updateRow(group, idx, 'name', e.target.value)} />
@@ -19080,7 +19193,7 @@ tr.derived { background: #F0F9FF; font-weight: 700; border-top: 2px solid #0A84F
                   ))}
                   {/* Group subtotal */}
                   <tr style={{ background: 'rgba(10,132,255,0.04)', fontWeight: 600 }}>
-                    <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'rgba(234,244,255,0.95)', color: C.text }}>Total {group}</td>
+                    <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-soft-bg)', color: C.text }}>Total {group}</td>
                     <td colSpan={2}></td>
                     {Array.from({ length: 12 }, (_, m) => (
                       <td key={m} className="px-2 py-2 text-right gh-tnum" style={{ color: C.text }}>{fmt(groupTotal(group, m))}</td>
@@ -19091,7 +19204,7 @@ tr.derived { background: #F0F9FF; font-weight: 700; border-top: 2px solid #0A84F
               ))}
               {/* Derived: Gross Profit */}
               <tr style={{ background: 'rgba(40,166,71,0.06)', borderTop: `2px solid ${C.primary}` }}>
-                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'rgba(240,253,244,0.95)', color: C.text, fontWeight: 700 }}>Gross Profit</td>
+                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-ok-bg)', color: C.text, fontWeight: 700 }}>Gross Profit</td>
                 <td colSpan={2}></td>
                 {Array.from({ length: 12 }, (_, m) => (
                   <td key={m} className="px-2 py-2 text-right gh-tnum font-semibold" style={{ color: grossProfitMonth(m) >= 0 ? C.green : C.red }}>{fmt(grossProfitMonth(m))}</td>
@@ -19100,7 +19213,7 @@ tr.derived { background: #F0F9FF; font-weight: 700; border-top: 2px solid #0A84F
               </tr>
               {/* Derived: Net Income */}
               <tr style={{ background: 'rgba(10,132,255,0.06)' }}>
-                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'rgba(234,244,255,0.95)', color: C.text, fontWeight: 700 }}>Net Income</td>
+                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-soft-bg)', color: C.text, fontWeight: 700 }}>Net Income</td>
                 <td colSpan={2}></td>
                 {Array.from({ length: 12 }, (_, m) => (
                   <td key={m} className="px-2 py-2 text-right gh-tnum font-semibold" style={{ color: netIncomeMonth(m) >= 0 ? C.green : C.red }}>{fmt(netIncomeMonth(m))}</td>
@@ -19414,7 +19527,7 @@ ${crunchWeeks.length > 0 ? `<div class="alert"><strong>⚠ Cash Crunch Warning:<
     const list = kind === 'inflow' ? inflows : outflows;
     return (
       <tr className="hover:bg-blue-50/30">
-        <td className="px-3 py-1.5 sticky left-0 z-10" style={{ background: 'rgba(247,250,255,0.95)' }}>
+        <td className="px-3 py-1.5 sticky left-0 z-10" style={{ background: 'var(--table-sticky-bg)' }}>
           <div className="flex items-center gap-2">
             <input className="flex-1 bg-transparent outline-none border-b border-transparent focus:border-blue-300 text-xs" style={{ fontFamily: fontBody, color: C.text }}
               value={row.name} onChange={e => updateRow(kind, idx, 'name', e.target.value)} />
@@ -19536,7 +19649,7 @@ ${crunchWeeks.length > 0 ? `<div class="alert"><strong>⚠ Cash Crunch Warning:<
           <table className="w-full text-xs" style={{ fontFamily: fontMono }}>
             <thead style={{ background: 'rgba(10,132,255,0.06)', borderBottom: `1px solid ${GLASS.borderSoft}` }}>
               <tr>
-                <th className="text-left px-3 py-2 sticky left-0 z-10" style={{ background: 'rgba(247,250,255,0.95)', minWidth: 240, color: C.textSoft, fontWeight: 600 }}>Line Item</th>
+                <th className="text-left px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-bg)', minWidth: 240, color: C.textSoft, fontWeight: 600 }}>Line Item</th>
                 <th className="px-2 py-2" style={{ minWidth: 80, color: C.textSoft, fontWeight: 600 }}>Amount</th>
                 <th className="px-2 py-2" style={{ minWidth: 90, color: C.textSoft, fontWeight: 600 }}>Cadence</th>
                 {Array.from({ length: NUM_WEEKS }, (_, w) => (
@@ -19560,7 +19673,7 @@ ${crunchWeeks.length > 0 ? `<div class="alert"><strong>⚠ Cash Crunch Warning:<
               </tr>
               {inflows.map((r, idx) => <RowEditor key={`in-${idx}`} kind="inflow" row={r} idx={idx} />)}
               <tr style={{ background: 'rgba(10,132,255,0.04)', fontWeight: 600 }}>
-                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'rgba(234,244,255,0.95)', color: C.text }}>Total Inflows</td>
+                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-soft-bg)', color: C.text }}>Total Inflows</td>
                 <td colSpan={2}></td>
                 {Array.from({ length: NUM_WEEKS }, (_, w) => (
                   <td key={w} className="px-2 py-2 text-right gh-tnum" style={{ color: C.text }}>{fmt(inflowTotal(w))}</td>
@@ -19579,7 +19692,7 @@ ${crunchWeeks.length > 0 ? `<div class="alert"><strong>⚠ Cash Crunch Warning:<
               </tr>
               {outflows.map((r, idx) => <RowEditor key={`out-${idx}`} kind="outflow" row={r} idx={idx} />)}
               <tr style={{ background: 'rgba(208,35,35,0.04)', fontWeight: 600 }}>
-                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'rgba(254,242,242,0.95)', color: C.text }}>Total Outflows</td>
+                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-danger-bg)', color: C.text }}>Total Outflows</td>
                 <td colSpan={2}></td>
                 {Array.from({ length: NUM_WEEKS }, (_, w) => (
                   <td key={w} className="px-2 py-2 text-right gh-tnum" style={{ color: C.text }}>{fmt(outflowTotal(w))}</td>
@@ -19589,7 +19702,7 @@ ${crunchWeeks.length > 0 ? `<div class="alert"><strong>⚠ Cash Crunch Warning:<
 
               {/* Net cash flow */}
               <tr style={{ borderTop: `2px solid ${C.primary}` }}>
-                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'rgba(247,250,255,0.95)', color: C.text, fontWeight: 700 }}>Net Cash Flow</td>
+                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-bg)', color: C.text, fontWeight: 700 }}>Net Cash Flow</td>
                 <td colSpan={2}></td>
                 {Array.from({ length: NUM_WEEKS }, (_, w) => (
                   <td key={w} className="px-2 py-2 text-right gh-tnum font-semibold" style={{ color: netCash(w) >= 0 ? C.green : C.red }}>{fmt(netCash(w))}</td>
@@ -19599,7 +19712,7 @@ ${crunchWeeks.length > 0 ? `<div class="alert"><strong>⚠ Cash Crunch Warning:<
 
               {/* Ending cash — the punchline */}
               <tr style={{ background: 'rgba(10,132,255,0.08)' }}>
-                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'rgba(220,233,255,0.95)', color: C.text, fontWeight: 700 }}>Ending Cash Balance</td>
+                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-deeper-bg)', color: C.text, fontWeight: 700 }}>Ending Cash Balance</td>
                 <td colSpan={2}></td>
                 {Array.from({ length: NUM_WEEKS }, (_, w) => {
                   const bal = cashAtWeek(w);
@@ -19645,7 +19758,7 @@ function SectionHead({ eyebrow, title, desc, gold }) {
   return (
     <div className="sticky top-0 z-30 -mx-10 -mt-10 px-10 pt-8 pb-6 mb-7"
       style={{
-        background: 'linear-gradient(180deg, rgba(247,250,255,0.92) 0%, rgba(247,250,255,0.78) 70%, rgba(247,250,255,0.50) 100%)',
+        background: 'var(--section-head-bg)',
         backdropFilter: 'blur(24px) saturate(160%)',
         WebkitBackdropFilter: 'blur(24px) saturate(160%)',
         borderBottom: `1px solid ${GLASS.borderSoft}`,

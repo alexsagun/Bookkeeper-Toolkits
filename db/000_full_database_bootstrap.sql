@@ -284,11 +284,13 @@ create policy enrollment_receipts_select on storage.objects
   for select to authenticated
   using (bucket_id = 'enrollment-receipts'
     and ((storage.foldername(name))[1] = auth.uid()::text or public.is_admin()));
+-- Delete: ADMIN ONLY. Students cannot delete their own receipt after submitting (payment
+-- evidence integrity — see db/2026-07-08-receipt-integrity.sql). Receipts are immutable
+-- (no UPDATE policy); a resubmission uploads a brand-new file.
 drop policy if exists enrollment_receipts_delete on storage.objects;
 create policy enrollment_receipts_delete on storage.objects
   for delete to authenticated
-  using (bucket_id = 'enrollment-receipts'
-    and ((storage.foldername(name))[1] = auth.uid()::text or public.is_admin()));
+  using (bucket_id = 'enrollment-receipts' and public.is_admin());
 
 -- ───────────────────────────────────────────────────────────────────
 -- 6) sidebar_settings — global, admin-controlled navigation labels.
@@ -653,6 +655,38 @@ create policy feature_guides_read on public.feature_guides for select to authent
   using (public.is_approved() and public.is_enrolled());
 
 -- ───────────────────────────────────────────────────────────────────
+-- 14b) PRIVATE bucket for PAID lesson videos (course-videos). Created here — AFTER
+--      is_enrolled() (§13) — because course_videos_read calls it. The public course-media
+--      bucket (§5) holds covers + feature-guide videos; a public bucket serves every object
+--      publicly (bypassing RLS on read), so lesson VIDEO files live in this private bucket
+--      and are served via short-lived signed URLs gated by is_enrolled().
+--      See db/2026-07-08-course-videos-private.sql.
+-- ───────────────────────────────────────────────────────────────────
+do $$
+begin
+  insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+  values ('course-videos', 'course-videos', false, 52428800,
+          array['video/mp4', 'video/webm', 'video/ogg', 'video/quicktime', 'video/x-m4v'])
+  on conflict (id) do update set public = false;
+exception
+  when insufficient_privilege then
+    raise notice 'Create the course-videos bucket in Dashboard → Storage (Public = OFF); policies still applied.';
+end $$;
+
+drop policy if exists course_videos_read on storage.objects;
+create policy course_videos_read on storage.objects for select to authenticated
+  using (bucket_id = 'course-videos' and (public.is_admin() or public.is_enrolled()));
+drop policy if exists course_videos_admin_write on storage.objects;
+create policy course_videos_admin_write on storage.objects for insert to authenticated
+  with check (bucket_id = 'course-videos' and public.is_admin());
+drop policy if exists course_videos_admin_update on storage.objects;
+create policy course_videos_admin_update on storage.objects for update to authenticated
+  using (bucket_id = 'course-videos' and public.is_admin());
+drop policy if exists course_videos_admin_delete on storage.objects;
+create policy course_videos_admin_delete on storage.objects for delete to authenticated
+  using (bucket_id = 'course-videos' and public.is_admin());
+
+-- ───────────────────────────────────────────────────────────────────
 -- 15) Supplemental performance indexes (the non-redundant ones; PK/unique
 --     already cover slug, user+course completions, user+feature completions).
 -- ───────────────────────────────────────────────────────────────────
@@ -690,9 +724,9 @@ notify pgrst, 'reload schema';
 
 -- ═════════════════════════════════════════════════════════════════════════════
 -- AFTER RUNNING (fresh install)
---   1. If §5 raised a NOTICE (restricted role), create the two buckets in
---      Dashboard → Storage: course-media (Public ON), enrollment-receipts
---      (Public OFF, 5 MB, png/jpeg/webp/pdf).
+--   1. If §5 / §14b raised a NOTICE (restricted role), create the buckets in
+--      Dashboard → Storage: course-media (Public ON), course-videos (Public OFF,
+--      50 MB, video mimes), enrollment-receipts (Public OFF, 5 MB, png/jpeg/webp/pdf).
 --   2. Sign in once with your owner account so a profiles row exists, then promote
 --      it to admin (admins bypass the approval + enrollment gates):
 --        update public.profiles set is_admin = true where email = 'you@example.com';

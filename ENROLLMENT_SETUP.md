@@ -178,27 +178,74 @@ Sidebar → **Enrollments** (admin-only, with a pending-count badge; also at `/a
 
 ## Step 4 — (Optional) Email notifications
 
-Everything works **without** email. To get notified of new submissions and to email students on a
-decision, set these server-side env vars in **Vercel → Settings → Environment Variables**
+The in-app dashboard alert + sound already notify the admin of a new submission. **Email** is the
+*outside-the-app* layer (so you're notified when the tab isn't open). Everything works **without**
+it. To enable it, set these server-side env vars in **Vercel → Settings → Environment Variables**
 (Production + Preview), then redeploy:
 
-- `RESEND_API_KEY` — your Resend key (`re_…`)
+- `RESEND_API_KEY` — your Resend key (`re_…`) — **server-only; do NOT `VITE_`-prefix it.**
 - `RESEND_FROM` — a verified sender, e.g. `Toolkits by Alex <noreply@yourdomain.com>`
-- `NOTIFY_ADMIN_EMAIL` — *(optional)* where "new enrollment submitted" alerts go; defaults to the
-  address inside `RESEND_FROM`.
+- `NOTIFY_ADMIN_EMAIL` — *(optional)* where "new enrollment submitted" alerts go.
 - `APP_URL` — *(optional)* absolute origin (e.g. `https://toolkits.alexsagun.com`) for the
   **"Review in Enrollments"** button in admin alerts; defaults to the request's own host.
 
-The admin alert includes the student's name, email, phone, package, expected vs paid amounts,
-payment reference, submitted date, a **Type: Renewal / New enrollment** row, and a direct link
-to `/admin/enrollments`.
+> ⚠️ **Supabase Auth's email/SMTP/Resend settings do NOT power this.** Those only send Supabase
+> *Auth* emails (signup confirmation, password reset). This custom admin alert is a separate Vercel
+> serverless function with its **own** secrets — set the vars above in Vercel, not in Supabase.
+
+> ⚠️ **Resend only delivers from an allowed sender** (this is the #1 reason "the key is set but no
+> email arrives"). Either **verify a domain** in Resend and use an address on it in `RESEND_FROM`
+> (e.g. `noreply@yourdomain.com`) — this reaches **admins *and* students** — **or** use Resend's test
+> sender `Toolkits by Alex <onboarding@resend.dev>`, which delivers **only to your own Resend-account
+> email** (fine to test the admin alert, but student decision-emails to other addresses will bounce
+> until a domain is verified). The `RESEND_API_KEY` must belong to the **same** Resend account/team
+> that owns the verified domain.
+
+**Who gets the admin alert** — resolved at send time, first valid email wins:
+1. `NOTIFY_ADMIN_EMAIL` env var, else
+2. **`payment_settings.notify_email`** — the **"Proof / support email"** field in the *Payment
+   details* editor (Enrollments tab). This is admin-editable in-app, so you can change the alert
+   recipient **without a redeploy**, else
+3. the address inside `RESEND_FROM`.
+
+**Test it end-to-end:** on a Vercel deploy, open **Enrollments → "Test email"** (admin-only button
+next to Refresh). It verifies your admin login server-side, sends a sample alert to the resolved
+recipient, and reports **"Test email sent to …"**, **"not configured"**, or the exact provider
+failure. **Health check:** open `/api/notify-enrollment` in a browser → `{ ok, hasKey, hasFrom,
+adminRecipient }` (`adminRecipient` is env-only — `'none'` there can still resolve at send time via
+`payment_settings.notify_email`, which the unauthenticated health check can't read). No secret
+values are ever returned.
+
+**Prove it works (≈2 minutes, after the vars are set + a redeploy):**
+1. Open `https://<your-deploy>/api/notify-enrollment` in a browser → expect
+   `{ ok:true, hasKey:true, hasFrom:true, adminRecipient:"env" }` (or `"from"`).
+2. Sign in as an **admin** → **Enrollments** tab → click **Test email** (next to Refresh) → expect
+   **"Test email sent to …"**; confirm it lands in that inbox.
+3. Open the **Resend dashboard → Emails/Logs** and confirm the event shows **Delivered**.
+4. *(Full end-to-end)* submit a test enrollment as a student → the admin gets a **"New enrollment
+   submitted"** email and the in-app sound/dashboard alert still fires.
+
+If step 2 says *"not configured"* → a var is missing/misnamed in Vercel (or you didn't redeploy). If
+Resend shows the send but it's not **Delivered** → the sender isn't verified (see the Resend-sender
+callout above) or the recipient's mail provider filtered it.
+
+The admin alert includes the student's name, email, phone, location, package, expected vs paid
+amounts, payment reference, submitted date/time, a **Type: Renewal / New enrollment** row, and a
+direct link to `/admin/enrollments`. Receipts are **never** attached (they're private financial
+docs) — the email links the admin to the dashboard to review them.
 
 Emails are sent by [`api/notify-enrollment.js`](api/notify-enrollment.js) (same pattern as
-`api/notify-access.js`): the student-triggered "submitted" alert verifies the caller **owns** the
-request (via their own JWT + RLS) and builds the email from the database row; decision emails
-require an admin caller. Until the vars are set, the panel shows "email not configured"
-(harmless). **Note:** `npm run dev` doesn't run serverless functions — email only works on a
-Vercel deploy (health check: open `/api/notify-enrollment` in a browser).
+`api/notify-access.js`): the student-triggered `submitted` alert verifies the caller **owns** the
+request (via their own JWT + RLS) and builds the email from the database row; `decision` and `test`
+require an admin caller. Enrollment submission is never blocked by email — the client fires it
+best-effort and logs any skip/error to the browser console (`[enroll] admin email: …`). Until the
+vars are set, the panel shows "email not configured" (harmless). **Note:** `npm run dev` doesn't
+run serverless functions — email only works on a Vercel deploy.
+
+**Not on Vercel?** Reimplement the same `submitted` / `decision` / `test` workflow as a **Supabase
+Edge Function** and store `RESEND_API_KEY` / `RESEND_FROM` / `NOTIFY_ADMIN_EMAIL` / `APP_URL` as
+**Supabase function secrets** (`supabase secrets set …`). The auth checks and recipient resolution
+already use the Supabase REST API, so they port directly.
 
 ---
 

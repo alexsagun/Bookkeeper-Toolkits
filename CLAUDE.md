@@ -161,10 +161,15 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
   The same helper guards `uploadCover()` and `CourseProgram`'s `saveLesson()`/`deleteLesson()` (always
   called *after* the row update/delete). This is how dummy/test content is removed — admins delete it
   in-app.
-- **Storage:** a public `course-media` bucket streams uploaded videos (`lessons/{course.id}/…`) and
-  course covers (`covers/{course.id}/…`); write/delete restricted to admins. Videos can also be
-  YouTube/Vimeo/MP4 **links**. Uploads are guarded client-side (video ≤ 50 MB; cover image ≤ 5 MB).
-  The bucket is shared across all courses.
+- **Storage (two buckets):** PAID lesson **videos** live in the **private** `course-videos` bucket
+  (`lessons/{course.id}/…`), served via short-lived **signed URLs** gated by `is_enrolled()` RLS —
+  because a *public* Supabase bucket serves every object publicly and bypasses RLS on read, so a
+  public bucket can't protect paid content. Course **covers** (`covers/{course.id}/…`) and
+  feature-guide videos stay in the **public** `course-media` bucket (they're meant to be visible
+  while browsing). Playback uses the `SignedLessonVideo` component (private signed URL, with a
+  legacy `course-media` public-URL fallback for videos uploaded before the split). Write/delete on
+  both buckets is admin-only. Videos can also be YouTube/Vimeo/MP4 **links**. Uploads are guarded
+  client-side (video ≤ 50 MB; cover image ≤ 5 MB). See `db/2026-07-08-course-videos-private.sql`.
 - **Certificate:** rendered from design tokens + `LOGO_DATA_URI`, downloaded as PDF via **lazy-loaded**
   `jspdf` + `html2canvas` (dynamic `import()` only on download — kept out of the main bundle); the PDF
   filename comes from the `certFileName` prop.
@@ -313,7 +318,16 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   (the app's **first** signed-URL use — everything else is public-bucket `getPublicUrl`). Emails
   via env-gated `api/notify-enrollment.js` (`RESEND_API_KEY`/`RESEND_FROM`, optional
   `NOTIFY_ADMIN_EMAIL` + `APP_URL` for the "Review in Enrollments" button; the submitted alert
-  carries a Type: Renewal/New row). Toggle with `REQUIRE_ENROLLMENT` (module const, default on;
+  carries a Type: Renewal/New row). Three actions: `submitted` (student→admin, JWT-ownership auth),
+  `decision` (admin→student), `test` (admin-only diagnostic → the **"Test email"** button in the
+  Enrollments toolbar; verifies the admin JWT server-side and reports sent/not-configured/provider
+  error). The admin **recipient** resolves `NOTIFY_ADMIN_EMAIL` → the admin-editable
+  `payment_settings.notify_email` ("Proof / support email" field, read with the caller's JWT) →
+  address in `RESEND_FROM`; the GET health check reports `{ ok, hasKey, hasFrom, adminRecipient }`
+  (env-only, no address). **Supabase Auth's SMTP/Resend settings do NOT power this** — it needs its
+  own Vercel env vars (or a Supabase Edge Function + function secrets off-Vercel). Receipts are
+  never attached; the client submit fires the alert best-effort (never blocks the student).
+  Toggle with `REQUIRE_ENROLLMENT` (module const, default on;
   off via `VITE_REQUIRE_ENROLLMENT=false`). Enrollment state is server-side — **not** in
   `LEGACY_KEYS` (the one exception: the admin sound-alert pref `enroll:soundAlert`, which IS a
   client pref and IS in `LEGACY_KEYS`; the alert itself is a WebAudio 3-tone chime with a Test
@@ -392,8 +406,8 @@ const { text, data } = await callClaude({ system, messages }, { returnData: true
   instead of silently collapsing into a generic fallback. Wrap calls in `try/catch` and set an `err`
   state; never assume success. It returns the joined text content, so no manual `.filter/.map` needed.
 - **Never** put the API key, `x-api-key`, or `anthropic-version` in client code. The proxy adds them.
-  - Dev: [vite.config.js](vite.config.js) injects `x-api-key` + `anthropic-version: 2023-06-01`.
-  - Prod: [api/anthropic/v1/messages.js](api/anthropic/v1/messages.js) (Vercel serverless, exact-path) does the same.
+  - Dev: [vite.config.js](vite.config.js) injects `x-api-key` + `anthropic-version: 2023-06-01` (no auth check — local only).
+  - Prod: [api/anthropic/v1/messages.js](api/anthropic/v1/messages.js) (Vercel serverless, exact-path) does the same **and authenticates the caller**: it requires a valid Supabase session (`callClaude` attaches the `Authorization: Bearer <access_token>`) and gates token spend on **admin-or-`is_enrolled()`**, plus a model allowlist / `max_tokens` / body-size cap. This closes the previously-open proxy (anyone could spend the key). `callClaude` fetching the session token is why it's `async`-aware of auth; the GET health check stays unauthenticated (zero-token).
 - For JSON responses, tools strip ```` ```json ```` fences before `JSON.parse` (see `BankFeed`, ~L2214).
 - For vision (PDF/image), tools send base64 `image`/`document` blocks in `messages[].content` (see
   `StatementConverter`, ~L2411).
@@ -428,6 +442,14 @@ const { text, data } = await callClaude({ system, messages }, { returnData: true
   under `text-white` headers, kept deep in both themes).
 - **Status colors** (admin pills, banners, chips) use the semantic families
   `--status-{warn,warn-strong,ok,danger,info,neutral}-{bg,bd,fg}` — never hand-rolled rgba tints.
+- **App-shell surfaces are tokenized too:** `--sidebar-bg` / `--sidebar-border` / `--sidebar-edge`
+  (the sidebar `<aside>` — expanded, collapsed rail, and mobile drawer), `--topbar-bg` (mobile sticky
+  top bar), `--section-head-bg` (the shared `SectionHead` sticky page header), and `--table-sticky-bg`
+  plus its tinted variants `--table-sticky-{soft,deeper,ok,danger}-bg` (sticky first-column table
+  cells in Budgeting/Forecasting — plain rows vs blue subtotal / highlight / green / red summary rows). Defined in both theme blocks (light =
+  the original glass literals; dark = navy glass from the `#101B30`/`#0B1322` family) — reuse these
+  for any new shell chrome instead of hardcoding light rgba values, which the dark compat layer
+  cannot fix on inline styles.
 - **Tailwind neutrals are dark-adapted centrally**: the documented compat layer at the bottom of
   `index.css` remaps the utilities actually in use (`bg-white`, `text-slate-*`, `border-slate-*`,
   red/emerald/amber families…) onto the tokens under `[data-theme="dark"]`. When adding UI, prefer
@@ -456,8 +478,11 @@ const { text, data } = await callClaude({ system, messages }, { returnData: true
   Rebuild after changing either. RLS remains the real boundary in both cases.
 - **Email (server-only, optional):** `RESEND_API_KEY` + `RESEND_FROM` enable the approval + enrollment
   notification emails (`api/notify-access.js` / `api/notify-enrollment.js`); `NOTIFY_ADMIN_EMAIL`
-  optionally overrides where "new enrollment submitted" alerts go. All are non-fatal when unset, and
-  none run under `npm run dev` (serverless functions are Vercel-only).
+  optionally overrides where "new enrollment submitted" alerts go (else the enrollment fn falls back
+  to `payment_settings.notify_email`, then to `RESEND_FROM`); `APP_URL` sets the review-button origin.
+  These are **this app's own** secrets — **Supabase Auth's SMTP/Resend settings are unrelated** and
+  only send Auth emails. All are non-fatal when unset, and none run under `npm run dev` (serverless
+  functions are Vercel-only). Diagnose from **Enrollments → "Test email"** or the GET health check.
 
 ## Deployment
 

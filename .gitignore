@@ -9,6 +9,7 @@ dist-ssr
 
 # Logs
 *.log
+build_output.txt
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

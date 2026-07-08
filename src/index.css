@@ -54,6 +54,18 @@
   --scroll-thumb: rgba(15,18,23,0.15);
   --scroll-thumb-hover: rgba(15,18,23,0.25);
 
+  /* App shell — sidebar + sticky headers (inline styles in BookkeeperPro.jsx read these) */
+  --sidebar-bg: linear-gradient(180deg, rgba(255,255,255,0.78) 0%, rgba(247,250,255,0.72) 100%);
+  --sidebar-border: var(--glass-border-soft); /* alias — resolves per-theme; divergence point if the sidebar border ever needs its own value */
+  --sidebar-edge: linear-gradient(180deg, transparent 0%, rgba(10,132,255,0.08) 50%, transparent 100%);
+  --topbar-bg: rgba(255,255,255,0.85);
+  --section-head-bg: linear-gradient(180deg, rgba(247,250,255,0.92) 0%, rgba(247,250,255,0.78) 70%, rgba(247,250,255,0.50) 100%);
+  --table-sticky-bg: rgba(247,250,255,0.95);
+  --table-sticky-soft-bg: rgba(234,244,255,0.95);   /* blue subtotal rows (= --c-bg-soft at 0.95) */
+  --table-sticky-deeper-bg: rgba(220,233,255,0.95); /* highlight rows, e.g. Ending Cash (= --c-bg-deeper) */
+  --table-sticky-ok-bg: rgba(240,253,244,0.95);     /* green wash (Gross Profit) */
+  --table-sticky-danger-bg: rgba(254,242,242,0.95); /* red wash (Total Outflows) */
+
   /* Text */
   --c-text: #0F1217;
   --c-text-soft: #5F6773;
@@ -117,6 +129,17 @@
   --inset-hi: rgba(255,255,255,0.06);
   --scroll-thumb: rgba(255,255,255,0.14);
   --scroll-thumb-hover: rgba(255,255,255,0.24);
+
+  /* App shell — premium navy glass over the dark gh-app-bg (hues: #101B30 = --c-bg-soft, #0B1322 = app-bg gradient bottom) */
+  --sidebar-bg: linear-gradient(180deg, rgba(16,27,48,0.85) 0%, rgba(11,19,34,0.80) 100%);
+  --sidebar-edge: linear-gradient(180deg, transparent 0%, rgba(10,132,255,0.22) 50%, transparent 100%);
+  --topbar-bg: rgba(16,27,48,0.85);
+  --section-head-bg: linear-gradient(180deg, rgba(11,19,34,0.92) 0%, rgba(11,19,34,0.78) 70%, rgba(11,19,34,0.50) 100%);
+  --table-sticky-bg: rgba(18,26,41,0.96);
+  --table-sticky-soft-bg: rgba(16,27,48,0.96);      /* = --c-bg-soft #101B30 */
+  --table-sticky-deeper-bg: rgba(22,35,61,0.96);    /* = --c-bg-deeper #16233D */
+  --table-sticky-ok-bg: rgba(17,33,30,0.96);        /* green-tinted navy */
+  --table-sticky-danger-bg: rgba(33,21,27,0.96);    /* red-tinted navy */
 
   --c-text: #E8ECF2;
   --c-text-soft: #A9B2C0;
@@ -382,6 +405,11 @@ textarea.gh-input, select.gh-input {
   background: linear-gradient(180deg, var(--c-primary-hi), var(--c-primary));
   box-shadow: 0 0 12px var(--primary-glow);
 }
+/* Sidebar hover fill — CSS-owned so the hover state can never stick to the DOM
+   node (React's `tab` state stays the single source of truth for the active item).
+   Replaces the old imperative onMouseEnter/onMouseLeave background mutations. */
+.nav-hover:not(.nav-item-active):hover { background: var(--wash); }
+.nav-hover-strong:hover { background: var(--wash-strong); }
 
 /* ──────────────────────────────────────────────────────────
    STATUS DOTS & MISC
