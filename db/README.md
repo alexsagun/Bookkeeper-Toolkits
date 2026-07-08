@@ -72,7 +72,7 @@ user-approval adds). Anything already applied no-ops. Hard ordering dependencies
 
 ## How the bootstrap relates to the dated files
 
-`000_full_database_bootstrap.sql` is the **collapsed final state** of files #1–#13. Where an object is
+`000_full_database_bootstrap.sql` is the **collapsed final state** of files #1–#15. Where an object is
 redefined across the dated chain, the bootstrap keeps only the **final** version, defined once:
 
 - **`is_enrolled()`** — the date-aware version from #13 (an active, non-expired subscription), not the
@@ -80,6 +80,8 @@ redefined across the dated chain, the bootstrap keeps only the **final** version
 - **`courses_read` / `modules_read` / `lessons_read`** — `is_admin() OR (published AND is_approved() AND
   is_enrolled())` (the #12 §7 shape), never the intermediate base/`is_approved()`-only shapes.
 - **`feature_guides_read`** — `is_approved() AND is_enrolled()`.
+- **`enrollment_receipts` delete** — admin-only (the #14 shape), not the original owner-or-admin delete.
+- **`course-videos`** — the #15 private bucket + `course_videos_*` policies for paid lesson videos.
 
 So the intermediate policy versions in `2026-06-16-course-platform-base.sql`, `2026-06-29-user-approval.sql`,
 and `2026-07-04-enrollment.sql` are **superseded, not re-run** on a fresh install — that's expected.

@@ -117,7 +117,7 @@ async function fetchOwnRequest(requestId, token) {
   try {
     const r = await fetch(
       `${SUPABASE_URL}/rest/v1/enrollment_requests?id=eq.${encodeURIComponent(requestId)}` +
-      `&select=id,user_id,plan_name,full_name,email,phone,city_country,amount_expected,amount_paid,payment_reference,created_at`,
+      `&select=id,user_id,plan_name,full_name,email,phone,city_country,amount_expected,amount_paid,payment_reference,created_at,status`,
       { headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}` } }
     );
     if (!r.ok) return null;
@@ -267,6 +267,11 @@ export default async function handler(req, res) {
     if (!requestId) return res.status(400).json({ error: 'requestId required.' });
     const row = await fetchOwnRequest(requestId, u.token);
     if (!row) return res.status(403).json({ error: 'Request not found or not yours.' });
+    // Only alert for a live submission — refuse to re-fire "new submission" for an already
+    // approved/rejected/expired row (limits replay of the admin alert for a decided request).
+    if (row.status !== 'pending_review') {
+      return res.status(200).json({ ok: false, skipped: 'not_pending_review' });
+    }
 
     // Env-gated: not configured → non-fatal skip (submission already succeeded client-side).
     if (!apiKey) return res.status(200).json({ ok: false, skipped: 'email_not_configured' });
