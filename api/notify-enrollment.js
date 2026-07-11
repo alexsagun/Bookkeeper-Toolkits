@@ -113,19 +113,27 @@ async function callerIsAdmin(authHeader) {
 
 // Fetch the enrollment request WITH THE CALLER'S OWN JWT — RLS enroll_req_own_select
 // returns the row only to its owner (or an admin), which is exactly the proof we need.
+// notify_status rides along as the replay-dedup marker (see the 'submitted' handler);
+// installs without the notify-status migration get a column error → retry without it,
+// so pre-#16 databases keep working (same column-resilience pattern as the client).
+const OWN_REQUEST_COLS =
+  'id,user_id,plan_name,full_name,email,phone,city_country,amount_expected,amount_paid,payment_reference,created_at,status';
 async function fetchOwnRequest(requestId, token) {
-  try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/enrollment_requests?id=eq.${encodeURIComponent(requestId)}` +
-      `&select=id,user_id,plan_name,full_name,email,phone,city_country,amount_expected,amount_paid,payment_reference,created_at,status`,
-      { headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}` } }
-    );
-    if (!r.ok) return null;
-    const rows = await r.json();
-    return Array.isArray(rows) && rows[0] ? rows[0] : null;
-  } catch {
-    return null;
+  for (const cols of [`${OWN_REQUEST_COLS},notify_status`, OWN_REQUEST_COLS]) {
+    try {
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/enrollment_requests?id=eq.${encodeURIComponent(requestId)}` +
+        `&select=${cols}`,
+        { headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}` } }
+      );
+      if (!r.ok) continue; // missing notify_status column → retry with the base list
+      const rows = await r.json();
+      return Array.isArray(rows) && rows[0] ? rows[0] : null;
+    } catch {
+      return null;
+    }
   }
+  return null;
 }
 
 // Best-effort "is this a renewal?" — any prior subscription row (caller's own JWT;
@@ -291,6 +299,15 @@ export default async function handler(req, res) {
     // approved/rejected/expired row (limits replay of the admin alert for a decided request).
     if (row.status !== 'pending_review') {
       return res.status(200).json({ ok: false, skipped: 'not_pending_review' });
+    }
+    // Replay dedup: once the alert for THIS row was delivered, refuse to send it again —
+    // otherwise a caller could re-POST the same requestId and spam the admin inbox / burn
+    // Resend quota. Only the terminal 'sent' stamp skips; failure states (provider_error,
+    // email_not_configured, admin_email_invalid) stay retryable so a transient outage
+    // never permanently silences a request's alert. Resubmits insert NEW rows (null
+    // notify_status), so legitimate flows are unaffected.
+    if (row.notify_status === 'sent') {
+      return res.status(200).json({ ok: false, skipped: 'already_notified' });
     }
 
     // Env-gated: not configured → non-fatal skip (submission already succeeded client-side).

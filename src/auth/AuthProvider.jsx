@@ -214,6 +214,10 @@ export function AuthProvider({ children }) {
   }, []);
 
   // Load the profile row whenever the signed-in user changes.
+  // The root gate waits on profileReady, so this fetch must NEVER hang: each attempt is
+  // raced against an 8s timeout (same fail-open idiom as useEnrollmentGate's 7s race), with
+  // one retry for a transient error/timeout before giving up with profile=null. RLS +
+  // the enrollment gate remain the real boundary when we fail open.
   useEffect(() => {
     const uid = session?.user?.id;
     if (!uid) {
@@ -223,10 +227,19 @@ export function AuthProvider({ children }) {
     }
     let active = true;
     (async () => {
-      const { data, error } = await fetchProfileRow(uid);
+      const TIMEOUT = { data: null, error: new Error('profile fetch timed out (8s)') };
+      let res = TIMEOUT;
+      for (let attempt = 0; attempt < 2 && active; attempt++) {
+        res = await Promise.race([
+          fetchProfileRow(uid),
+          new Promise((resolve) => setTimeout(() => resolve(TIMEOUT), 8000)),
+        ]);
+        if (!res.error) break;
+        console.warn(`[auth] profile fetch attempt ${attempt + 1} failed:`, res.error.message);
+      }
       if (!active) return;
-      if (error) console.error('[auth] profile fetch failed:', error.message);
-      setProfile(data ?? null);
+      if (res.error) console.error('[auth] profile fetch failed — proceeding without profile:', res.error.message);
+      setProfile(res.data ?? null);
       setProfileFetchedFor(uid); // mark "first fetch done" even on error (fail open, don't hang the gate)
     })();
     return () => {

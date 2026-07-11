@@ -22,6 +22,12 @@ import { AuthProvider } from './auth/AuthProvider.jsx';
 //    NOTE: Supabase stores its own session under an `sb-*` localStorage key written
 //    directly by supabase-js (it bypasses window.storage), so it is never namespaced
 //    here and is unaffected.
+// __setStorageUser must ALWAYS exist — AuthProvider calls it on every session change. If
+// window.storage was somehow pre-defined (so the block below is skipped), this no-op keeps
+// that call from throwing; the real implementation right below overwrites it.
+if (typeof window !== 'undefined' && !window.__setStorageUser) {
+  window.__setStorageUser = () => {};
+}
 if (typeof window !== 'undefined' && !window.storage) {
   let storageUid = null;
   const nsKey = (key) => (storageUid ? `u:${storageUid}:${key}` : key);

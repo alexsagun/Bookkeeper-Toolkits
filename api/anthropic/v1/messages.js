@@ -19,6 +19,36 @@ const ALLOWED_MODELS = new Set(['claude-sonnet-4-6']);
 const MAX_TOKENS_CAP = 8192;
 const MAX_BODY_BYTES = 5 * 1024 * 1024; // vision base64 headroom
 
+// Best-effort per-user rate limit. Serverless caveat: this Map lives per warm instance,
+// so it is NOT a hard global cap (cold starts / parallel instances each get their own
+// window) — it exists to stop a runaway client loop or a scripted burst from burning
+// tokens, not to be a billing boundary. Membership gating + MAX_TOKENS_CAP remain the
+// real cost controls. 20/min is far above any legit tool (every AI tool fires one
+// request per user action; StatementConverter sends a whole PDF in a single call).
+const RATE_WINDOW_MS = 60_000;
+const RATE_MAX_PER_WINDOW = 20;
+const RATE_MAX_TRACKED_USERS = 500;
+const rateHits = new Map(); // userId -> [timestamps]
+
+function rateLimited(userId) {
+  const now = Date.now();
+  const cutoff = now - RATE_WINDOW_MS;
+  // Opportunistic prune so a warm instance never grows unbounded.
+  if (rateHits.size > RATE_MAX_TRACKED_USERS) {
+    for (const [uid, hits] of rateHits) {
+      if (!hits.length || hits[hits.length - 1] < cutoff) rateHits.delete(uid);
+    }
+  }
+  const hits = (rateHits.get(userId) || []).filter((t) => t >= cutoff);
+  if (hits.length >= RATE_MAX_PER_WINDOW) {
+    rateHits.set(userId, hits);
+    return true;
+  }
+  hits.push(now);
+  rateHits.set(userId, hits);
+  return false;
+}
+
 // Validate the Supabase JWT against the auth server. Returns { ok, userId }.
 async function verifyCaller(token) {
   if (!token || !SUPABASE_URL || !ANON_KEY) return { ok: false };
@@ -49,10 +79,17 @@ async function callerEnrolled(token) {
       },
       body: '{}',
     });
-    if (!r.ok) return null; // RPC absent / error → indeterminate
+    if (!r.ok) {
+      // RPC absent (pre-enrollment migration) or errored → indeterminate. We fail OPEN
+      // for availability (the valid-JWT check stays the gate), but loudly: a persistent
+      // stream of these warnings in the Vercel logs means membership gating is OFF.
+      console.warn(`[anthropic-proxy] is_enrolled indeterminate (${r.status}) — failing open`);
+      return null;
+    }
     const v = await r.json();
     return v === true;
-  } catch {
+  } catch (err) {
+    console.warn(`[anthropic-proxy] is_enrolled check failed — failing open: ${String(err)}`);
     return null;
   }
 }
@@ -82,6 +119,11 @@ export default async function handler(req, res) {
   const enrolled = await callerEnrolled(token);
   if (enrolled === false) {
     return res.status(403).json({ error: 'An active membership is required to use AI features.' });
+  }
+  // Burst guard (per-instance best-effort — see rateLimited above). callClaude surfaces
+  // this message in each tool's existing error state, so no client change is needed.
+  if (rateLimited(caller.userId)) {
+    return res.status(429).json({ error: 'Too many AI requests — wait a minute and try again.' });
   }
 
   // ── Input caps ──
