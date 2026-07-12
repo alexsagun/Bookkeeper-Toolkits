@@ -32,7 +32,12 @@
 --   • public.is_enrolled()  = the date-aware version (checks an ACTIVE, non-expired
 --     subscription), NOT the early is_admin-or-is_paid version.
 --   • courses_read / modules_read / lessons_read = is_admin() OR (published AND
---     is_approved() AND is_enrolled()).
+--     is_approved() AND is_enrolled() AND per-plan course scope) — the plan conjuncts scope
+--     higher-tier courses (core_self_paced → qbo-* only; sampler → qbo-* AND
+--     access_tier='essentials' only, i.e. QBO Essentials not Mastery; §13b). No-arg helpers
+--     are wrapped in (select …) so each is one InitPlan per query.
+--   • course_videos_read = is_admin() OR (is_enrolled() AND (full-access plan OR
+--     course_object_allowed(name))).
 --   • feature_guides_read = is_approved() AND is_enrolled().
 --
 -- ORDERING NOTE: is_enrolled() and the four gated read policies are created LATE
@@ -150,6 +155,7 @@ create table if not exists public.courses (
   month       text,                                                       -- legacy cohort label (display fallback only)
   course_date date,                                                       -- editable cohort/run date (defaults to today in-app)
   source_course_id uuid references public.courses(id) on delete set null, -- duplication lineage
+  access_tier text not null default 'standard',                          -- 'standard' = premium; 'essentials' = Sampler-accessible (see §13b/§14)
   published   boolean not null default false,
   position    integer not null default 0,
   created_at  timestamptz not null default now(),
@@ -440,6 +446,10 @@ create table if not exists public.enrollment_requests (
   notify_status     text,          -- admin-alert email outcome (record_enrollment_notification)
   notified_at       timestamptz,
   notify_detail     text,          -- short, non-secret provider detail slice
+  request_kind      text not null default 'new'
+                    check (request_kind in ('new', 'renewal', 'upgrade', 'extension')),  -- #20
+  extension_days    int            -- #20: purchased days for a request_kind='extension' row
+                    check (extension_days is null or (extension_days between 60 and 365)),  -- #21 cap
   created_at        timestamptz not null default now(),
   updated_at        timestamptz not null default now()
 );
@@ -559,7 +569,7 @@ returns public.subscriptions
 language plpgsql security definer set search_path = public
 as $$
 declare
-  v_grace_days constant int := 0;   -- grace knob. 0 = access ends exactly at ends_at.
+  v_grace_days constant int := 3;   -- grace knob. 3 = access continues 3 days past ends_at.
   v_days   int;
   v_prev   public.subscriptions%rowtype;
   v_base   timestamptz;
@@ -609,6 +619,77 @@ end;
 $$;
 revoke all on function public.approve_subscription(uuid, text, uuid) from public;
 grant execute on function public.approve_subscription(uuid, text, uuid) to authenticated;
+
+-- approve_extension() (#20, #21 form) — grant EXTRA days on the member's CURRENT plan
+-- (Enrollments → Approve on a request_kind='extension' row). Same-plan; term length = the
+-- request's extension_days; extends from the current expiry while a term still runs, else
+-- from now. #21 caps p_days at 60–365 (the request column is student-declared).
+create or replace function public.approve_extension(
+  p_user_id    uuid,
+  p_request_id uuid,
+  p_days       int
+)
+returns public.subscriptions
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_grace_days constant int := 3;
+  v_prev   public.subscriptions%rowtype;
+  v_base   timestamptz;
+  v_ends   timestamptz;
+  v_grace  timestamptz;
+  v_new    public.subscriptions%rowtype;
+begin
+  if not public.is_admin() then
+    raise exception 'approve_extension: admin only';
+  end if;
+  if p_days is null or p_days < 60 then
+    raise exception 'approve_extension: minimum extension is 60 days (2 months)';
+  end if;
+  if p_days > 365 then
+    raise exception 'approve_extension: maximum extension is 365 days (12 months)';
+  end if;
+
+  select * into v_prev
+    from public.subscriptions
+    where user_id = p_user_id
+    order by created_at desc
+    limit 1
+    for update;
+
+  if v_prev.id is null then
+    raise exception 'approve_extension: no subscription to extend for this user';
+  end if;
+  -- Idempotency + never shorten a legacy no-expiry term.
+  if v_prev.status = 'active' and v_prev.request_id = p_request_id then return v_prev; end if;
+  if v_prev.status = 'active' and v_prev.ends_at is null then return v_prev; end if;
+
+  if v_prev.status = 'active' and v_prev.ends_at is not null and v_prev.ends_at > now() then
+    v_base := v_prev.ends_at;
+  else
+    v_base := now();
+  end if;
+
+  v_ends  := v_base + make_interval(days => p_days);
+  v_grace := case when v_grace_days = 0 then null else v_ends + make_interval(days => v_grace_days) end;
+
+  update public.subscriptions
+     set status = 'expired', updated_at = now()
+   where user_id = p_user_id and status = 'active';
+
+  insert into public.subscriptions
+    (user_id, plan_key, status, started_at, ends_at, grace_ends_at,
+     approved_by, request_id, renewed_from_subscription_id)
+  values
+    (p_user_id, v_prev.plan_key, 'active', now(), v_ends, v_grace,
+     auth.uid(), p_request_id, v_prev.id)
+  returning * into v_new;
+
+  return v_new;
+end;
+$$;
+revoke all on function public.approve_extension(uuid, uuid, int) from public;
+grant execute on function public.approve_extension(uuid, uuid, int) to authenticated;
 
 -- record_enrollment_notification() — the ONLY write path for the enrollment_requests
 -- notify_* audit columns. SECURITY DEFINER + internal owner-or-admin guard so the
@@ -660,22 +741,108 @@ revoke all on function public.expire_overdue_subscriptions() from public;
 grant execute on function public.expire_overdue_subscriptions() to authenticated;
 
 -- ───────────────────────────────────────────────────────────────────
+-- 13b) PLAN-SCOPED course access helpers (server half of the per-plan entitlement model;
+--      client half = PLAN_ENTITLEMENTS in src/BookkeeperPro.jsx). core_self_paced may read
+--      ONLY qbo-* courses (the sole Supabase courses in Training & Skills); admins + every
+--      OTHER/null plan → full. Consumed by the §14/§14b read policies. See
+--      db/2026-07-09-plan-course-access.sql for the full rationale. Placed after
+--      subscriptions (§12) since current_plan_key() selects from it. Keep in sync with the
+--      client PLAN_ENTITLEMENTS map when entitlements change.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.current_plan_key()
+returns text
+language sql stable security definer set search_path = public
+as $$
+  select s.plan_key
+  from public.subscriptions s
+  where s.user_id = auth.uid()
+    and s.status = 'active'
+    and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+  order by s.created_at desc
+  limit 1
+$$;
+
+-- plan_is_qbo_only() — NON-NULL, no-arg boolean → InitPlan-friendly in the §14 policies
+-- and safe inside `not (...)`. core_self_paced → true; admins/other/null plan → false.
+create or replace function public.plan_is_qbo_only()
+returns boolean
+language sql stable security definer set search_path = public
+as $$
+  select coalesce(public.current_plan_key() = 'core_self_paced', false)
+$$;
+
+-- plan_is_sampler() — sampler is scoped even tighter than core: within the qbo catalog it
+-- reads ONLY the `access_tier = 'essentials'` course (QuickBooks Online Essentials), not
+-- Mastery. Same shape/rationale as plan_is_qbo_only(); see db/2026-07-11-sampler-essentials-access.sql.
+create or replace function public.plan_is_sampler()
+returns boolean
+language sql stable security definer set search_path = public
+as $$
+  select coalesce(public.current_plan_key() = 'sampler', false)
+$$;
+
+create or replace function public.course_object_allowed(p_name text)
+returns boolean
+language plpgsql stable security definer set search_path = public
+as $$
+declare
+  v_cid  uuid;
+  v_slug text;
+  v_tier text;
+begin
+  if public.is_admin() then return true; end if;
+  if not public.plan_is_qbo_only() and not public.plan_is_sampler() then
+    return true;                                 -- full-access plans: no restriction
+  end if;
+  begin
+    v_cid := split_part(p_name, '/', 2)::uuid;   -- lessons/<course_id>/...
+  exception when others then
+    return true;
+  end;
+  select slug, access_tier into v_slug, v_tier from public.courses where id = v_cid;
+  if v_slug is null then return true; end if;
+  if public.plan_is_sampler() then
+    return v_slug like 'qbo-%' and v_tier = 'essentials';
+  end if;
+  return v_slug like 'qbo-%';                     -- plan_is_qbo_only (core)
+end;
+$$;
+
+grant execute on function public.current_plan_key()          to authenticated;
+grant execute on function public.plan_is_qbo_only()          to authenticated;
+grant execute on function public.plan_is_sampler()           to authenticated;
+grant execute on function public.course_object_allowed(text) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
 -- 14) FINAL content-gating read policies — defined once, in final form
---     (needs is_approved() §3 + is_enrolled() §13). Approved AND enrolled.
+--     (needs is_approved() §3 + is_enrolled() §13 + plan_is_qbo_only() §13b).
+--     Approved AND enrolled AND the course is in the caller's plan scope.
+--     No-arg helpers are wrapped in `(select …)` so each is a single InitPlan
+--     (evaluated once per query, not per row — the Supabase RLS perf pattern); the
+--     plan check short-circuits so full-access members do zero per-row plan work.
 -- ───────────────────────────────────────────────────────────────────
 drop policy if exists courses_read on public.courses;
 create policy courses_read on public.courses for select to authenticated
-  using (public.is_admin() or (published = true and public.is_approved() and public.is_enrolled()));
+  using ((select public.is_admin())
+    or (published = true and (select public.is_approved()) and (select public.is_enrolled())
+        and (not (select public.plan_is_qbo_only()) or slug like 'qbo-%')
+        and (not (select public.plan_is_sampler()) or (slug like 'qbo-%' and access_tier = 'essentials'))));
 
 drop policy if exists modules_read on public.course_modules;
 create policy modules_read on public.course_modules for select to authenticated
-  using (public.is_admin() or (public.is_approved() and public.is_enrolled() and exists (
-    select 1 from public.courses c where c.id = course_id and c.published = true)));
+  using ((select public.is_admin())
+    or ((select public.is_approved()) and (select public.is_enrolled()) and exists (
+      select 1 from public.courses c where c.id = course_id and c.published = true
+        and (not (select public.plan_is_qbo_only()) or c.slug like 'qbo-%')
+        and (not (select public.plan_is_sampler()) or (c.slug like 'qbo-%' and c.access_tier = 'essentials')))));
 
 drop policy if exists lessons_read on public.course_lessons;
 create policy lessons_read on public.course_lessons for select to authenticated
-  using (public.is_admin() or (public.is_approved() and public.is_enrolled() and exists (
-    select 1 from public.courses c where c.id = course_id and c.published = true)));
+  using ((select public.is_admin())
+    or ((select public.is_approved()) and (select public.is_enrolled()) and exists (
+      select 1 from public.courses c where c.id = course_id and c.published = true
+        and (not (select public.plan_is_qbo_only()) or c.slug like 'qbo-%')
+        and (not (select public.plan_is_sampler()) or (c.slug like 'qbo-%' and c.access_tier = 'essentials')))));
 
 drop policy if exists feature_guides_read on public.feature_guides;
 create policy feature_guides_read on public.feature_guides for select to authenticated
@@ -702,7 +869,11 @@ end $$;
 
 drop policy if exists course_videos_read on storage.objects;
 create policy course_videos_read on storage.objects for select to authenticated
-  using (bucket_id = 'course-videos' and (public.is_admin() or public.is_enrolled()));
+  using (bucket_id = 'course-videos'
+    and ((select public.is_admin())
+         or ((select public.is_enrolled())
+             and ((not (select public.plan_is_qbo_only()) and not (select public.plan_is_sampler()))
+                  or public.course_object_allowed(name)))));
 drop policy if exists course_videos_admin_write on storage.objects;
 create policy course_videos_admin_write on storage.objects for insert to authenticated
   with check (bucket_id = 'course-videos' and public.is_admin());
@@ -712,6 +883,11 @@ create policy course_videos_admin_update on storage.objects for update to authen
 drop policy if exists course_videos_admin_delete on storage.objects;
 create policy course_videos_admin_delete on storage.objects for delete to authenticated
   using (bucket_id = 'course-videos' and public.is_admin());
+
+-- Remove the superseded per-row helper LAST — only after the §14/§14b policies above no
+-- longer reference it (RLS policies hold a pg_depend on functions in their USING clause).
+-- NO CASCADE. Harmless no-op on a genuinely fresh DB (it was never created here).
+drop function if exists public.course_plan_allowed(text);
 
 -- ───────────────────────────────────────────────────────────────────
 -- 15) Supplemental performance indexes (the non-redundant ones; PK/unique

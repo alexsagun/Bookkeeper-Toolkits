@@ -65,24 +65,47 @@ user-approval adds). Anything already applied no-ops. Hard ordering dependencies
 | 14 | [`2026-07-08-receipt-integrity.sql`](2026-07-08-receipt-integrity.sql) | receipt delete → **admin-only** (students can't destroy payment evidence after submitting) | #12 (`enrollment-receipts` bucket) |
 | 15 | [`2026-07-08-course-videos-private.sql`](2026-07-08-course-videos-private.sql) | **private `course-videos` bucket** + policies for PAID lesson videos (public bucket can't protect a subset; covers/guides stay public) | #12 (`is_enrolled()`) |
 | 16 | [`2026-07-08-enrollment-notify-status.sql`](2026-07-08-enrollment-notify-status.sql) | `enrollment_requests.notify_status`/`notified_at`/`notify_detail` + `record_enrollment_notification()` RPC (SECURITY DEFINER, owner-or-admin) — makes the admin-alert email outcome auditable in the Enrollments tab | #12 (`enrollment_requests`, `is_admin()`) |
+| 17 | [`2026-07-09-plan-course-access.sql`](2026-07-09-plan-course-access.sql) | **Plan-scoped course access** — `current_plan_key()` / `plan_is_qbo_only()` / `course_object_allowed()` helpers; **tightens** `courses_read`/`modules_read`/`lessons_read` + the private `course_videos_read` (no-arg helpers wrapped `(select …)` → one InitPlan/query) so a `core_self_paced` member reads only `qbo-*` courses (higher-tier `resume-*`/`interview-*` denied). Server half of the per-plan entitlement model (client half = `PLAN_ENTITLEMENTS` in `src/BookkeeperPro.jsx`) | #13 (`subscriptions.ends_at`, `is_enrolled()`), #15 (`course-videos`) — **needs #13 for `ends_at`; guard aborts with a clear message if #13 not run** |
+| 18 | [`2026-07-10-subscription-grace.sql`](2026-07-10-subscription-grace.sql) | **3-day grace period** — flips `approve_subscription()`'s grace knob `v_grace_days` 0→3 (new/renewed terms stamp `grace_ends_at = ends_at + 3 days`) + backfills currently-running dated terms. `is_enrolled()`/`current_plan_key()`/`expire_overdue_subscriptions()` already honor grace via `coalesce(grace_ends_at, ends_at)` — unchanged | #13 (`subscriptions.grace_ends_at`, `approve_subscription()`) — **guard aborts if #13 not run** |
+| 19 | [`2026-07-11-sampler-essentials-access.sql`](2026-07-11-sampler-essentials-access.sql) | **Sampler course scope** — adds `courses.access_tier` (`'standard'`/`'essentials'`) + `plan_is_sampler()`; rewrites `course_object_allowed()`; **tightens** `courses_read`/`modules_read`/`lessons_read` + `course_videos_read` so a `sampler` member reads only `qbo-*` courses with `access_tier='essentials'` (QBO **Essentials** only, not Mastery). Client half = `PLAN_ENTITLEMENTS.sampler` + `courses.access_tier` in `COURSE_ROW_SELECT` | #17 (`current_plan_key()`), #15 (`course-videos`) — **guard aborts if #17 not run** |
+| 20 | [`2026-07-11-account-membership-requests.sql`](2026-07-11-account-membership-requests.sql) | **Self-serve Extend Access + Upgrade Plan** — adds `enrollment_requests.request_kind` (`new`/`renewal`/`upgrade`/`extension`) + `extension_days`; `approve_extension(user, request_id, days)` RPC (SECURITY DEFINER, admin-guard; adds custom days on the SAME plan, stacked from the current expiry / from now if expired, 3-day grace). Upgrade reuses `approve_subscription()`. No new RLS (existing student-insert / admin-all policies cover the columns). Client half = the sidebar account menu + `ExtendAccessModal` / paywall `mode="upgrade"` in `src/BookkeeperPro.jsx` | #13 (`approve_subscription`), #18 (grace-3), #16 (`enrollment_requests`) — **guard aborts if `enrollment_requests`/`subscriptions`/`approve_subscription` missing** |
+| 21 | [`2026-07-11-hardening.sql`](2026-07-11-hardening.sql) | **Extension-length cap** — replaces `approve_extension()` with a strict superset that rejects `p_days` outside **60–365** (the request's `extension_days` is student-declared; #20 only enforced the minimum) + a guarded range CHECK constraint on `enrollment_requests.extension_days`. No signature/semantics change otherwise | #20 (`approve_extension`) — **guard aborts if #20 not run** |
 
-**Migration order in one line:** `#1 → #2 → #3 → #4 → #5 → #6 → #7 → #8 → #9 → #10 → #11 → #12 → #13 → #14 → #15 → #16`
-(feature-guides before user-approval; user-approval before enrollment; enrollment before subscription-lifecycle; the three 2026-07-08 files need enrollment/`is_enrolled()`).
+**Migration order in one line:** `#1 → #2 → #3 → #4 → #5 → #6 → #7 → #8 → #9 → #10 → #11 → #12 → #13 → #14 → #15 → #16 → #17 → #18 → #19 → #20 → #21`
+(feature-guides before user-approval; user-approval before enrollment; enrollment before subscription-lifecycle; the three 2026-07-08 files need enrollment/`is_enrolled()`; plan-course-access (#17) + subscription-grace (#18) both need subscription-lifecycle; sampler-essentials (#19) needs plan-course-access; account-membership-requests (#20) needs enrollment + `approve_subscription`; hardening (#21) replaces #20's `approve_extension`).
 
 ---
 
 ## How the bootstrap relates to the dated files
 
-`000_full_database_bootstrap.sql` is the **collapsed final state** of files #1–#15. Where an object is
+`000_full_database_bootstrap.sql` is the **collapsed final state** of files #1–#20. Where an object is
 redefined across the dated chain, the bootstrap keeps only the **final** version, defined once:
 
 - **`is_enrolled()`** — the date-aware version from #13 (an active, non-expired subscription), not the
   simple `is_admin or is_paid` version from #12.
-- **`courses_read` / `modules_read` / `lessons_read`** — `is_admin() OR (published AND is_approved() AND
-  is_enrolled())` (the #12 §7 shape), never the intermediate base/`is_approved()`-only shapes.
+- **`approve_subscription()`** — the #18 form with the grace knob `v_grace_days = 3` (every granted term
+  gets `grace_ends_at = ends_at + 3 days`), not the #13 grace-off (`= 0`) version.
+- **`courses_read` / `modules_read` / `lessons_read`** — the #19 shape: `(select is_admin()) OR
+  (published AND (select is_approved()) AND (select is_enrolled()) AND (not (select plan_is_qbo_only())
+  OR slug like 'qbo-%') AND (not (select plan_is_sampler()) OR (slug like 'qbo-%' AND access_tier =
+  'essentials')))` (`(select …)`-wrapped for once-per-query InitPlans), never the intermediate
+  base/`is_approved()`-only/pre-plan-scope shapes.
 - **`feature_guides_read`** — `is_approved() AND is_enrolled()`.
 - **`enrollment_receipts` delete** — admin-only (the #14 shape), not the original owner-or-admin delete.
-- **`course-videos`** — the #15 private bucket + `course_videos_*` policies for paid lesson videos.
+- **`course-videos`** — the #15 private bucket + `course_videos_*` policies, with `course_videos_read`
+  in its #19 plan-scoped form (`(select is_admin()) OR ((select is_enrolled()) AND ((not (select
+  plan_is_qbo_only()) AND not (select plan_is_sampler())) OR course_object_allowed(name)))`).
+- **`courses.access_tier`** — `'standard'` default (premium; incl. the `qbo-mastery` seed) vs
+  `'essentials'` (Sampler-accessible), from #19.
+- **`current_plan_key()` / `plan_is_qbo_only()` / `plan_is_sampler()` / `course_object_allowed()`** — the
+  #17 + #19 plan-scope helpers (server half of per-plan entitlements; core_self_paced → qbo-* courses,
+  sampler → qbo-* Essentials-tier only). The older `course_plan_allowed(text)` is dropped at the end of
+  the bootstrap/#17 (superseded).
+- **`enrollment_requests.request_kind` / `extension_days` + `approve_extension()`** — net-new in #20
+  (self-serve Extend Access / Upgrade Plan); folded into the `enrollment_requests` table and the
+  lifecycle-functions section. `approve_extension()` is kept in its **#21 form** (60–365 day cap on
+  `p_days`), and `extension_days` carries the #21 range CHECK inline in the table definition — never
+  the #20 uncapped version.
 
 So the intermediate policy versions in `2026-06-16-course-platform-base.sql`, `2026-06-29-user-approval.sql`,
 and `2026-07-04-enrollment.sql` are **superseded, not re-run** on a fresh install — that's expected.

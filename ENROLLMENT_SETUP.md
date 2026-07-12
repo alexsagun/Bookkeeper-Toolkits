@@ -3,7 +3,9 @@
 > **Fresh Supabase project?** Run **[`db/000_full_database_bootstrap.sql`](db/000_full_database_bootstrap.sql)**
 > once — the enrollment + subscription-lifecycle schema is already included — then see
 > **[`db/README.md`](db/README.md)**. On an **existing** install, run the dated migrations referenced below
-> in order (`db/2026-07-04-enrollment.sql` → `db/2026-07-04-subscription-lifecycle.sql`).
+> in order (`db/2026-07-04-enrollment.sql` → `db/2026-07-04-subscription-lifecycle.sql` →
+> `db/2026-07-09-plan-course-access.sql` → `db/2026-07-10-subscription-grace.sql` →
+> `db/2026-07-11-sampler-essentials-access.sql`).
 
 Students now enroll **inside the app**: a signed-in user who hasn't paid is held on an
 **Enrollment Paywall** (pricing cards → manual payment instructions → payment-proof upload)
@@ -17,9 +19,10 @@ Since the **subscription lifecycle** upgrade ([`db/2026-07-04-subscription-lifec
 approval grants a **dated term**: each plan carries an `access_days` duration (60 for
 Core / Sampler / Silver, 180 for Gold / VIP), the subscription gets a real `ends_at`, the
 student sees a **membership panel on the Dashboard** (plan, status, days remaining, renew
-button, warnings at 14 / 7 / 3 days), and when the term ends they're locked on a
-**Membership Expired** screen until an admin approves their **renewal** — same pricing +
-receipt-upload + review flow. See "Membership lifecycle & renewal" below.
+button, warnings at 5 / 3 days + a **3-day grace period**), and when the term (plus grace)
+ends they're locked on a **Membership Expired** screen until an admin approves their
+**renewal** — same pricing + receipt-upload + review flow. See "Membership lifecycle &
+renewal" below.
 
 Builds on the `profiles` table (AUTH_SETUP.md), `public.is_admin()` (COURSE_SETUP.md), and —
 recommended — the admin-approval migration
@@ -105,12 +108,90 @@ to `subscriptions`, rewrites **`public.is_enrolled()` to be date-aware**, create
 > as "no expiry"; missing functions → the legacy approve path). And running the SQL before the
 > deploy is also fine — old clients simply don't read the new columns.
 
+## Step 1c — Run the plan-course-access migration (required for per-plan scope)
+
+Same SQL Editor → paste **all** of
+[`db/2026-07-09-plan-course-access.sql`](db/2026-07-09-plan-course-access.sql) → **Run**. Idempotent;
+safe to re-run. **Order:** run it **after** enrollment + subscription-lifecycle **and** the private
+`course-videos` bucket ([`db/2026-07-08-course-videos-private.sql`](db/2026-07-08-course-videos-private.sql)).
+It **requires the `subscriptions.ends_at` column** from the subscription-lifecycle migration (#13) — if
+#13 hasn't run it stops with a clear exception naming that file (rather than a raw `column does not exist`).
+
+It adds the `current_plan_key()` / `plan_is_qbo_only()` / `course_object_allowed()` helpers and
+re-applies `courses_read` / `modules_read` / `lessons_read` + the private `course_videos_read` policy
+with a plan predicate — so a `core_self_paced` member reads only `qbo-*` courses. For performance the
+no-arg helpers are wrapped in `(select …)` so each is evaluated **once per query** (an InitPlan), and
+the plan check short-circuits so full-access members do zero per-row plan work. It only **adds** a
+conjunct; it never loosens the existing `is_approved()` / `is_enrolled()` / `published` checks, so
+full-access members, admins, grandfathered users, and expired members are unaffected. See
+"Plan access scope (per-plan entitlements)" below.
+
+> **Deploy order doesn't matter** here either: the client's plan gating is independent of the SQL, and
+> the migration only tightens reads for `core_self_paced` members. Verify as a core member that a direct
+> `select` on a `resume-%` course (and a `course-videos` signed URL) is denied, while `qbo-%` still reads.
+
+## Step 1d — Run the grace-period migration (turns the 3-day grace ON)
+
+Same SQL Editor → paste **all** of
+[`db/2026-07-10-subscription-grace.sql`](db/2026-07-10-subscription-grace.sql) → **Run**. Idempotent;
+safe to re-run. **Order:** run it **after** subscription-lifecycle (#13) — it stops with a clear
+exception if `subscriptions.grace_ends_at` is missing. It flips `approve_subscription()`'s grace knob
+`v_grace_days` to **3** (new/renewed terms stamp `grace_ends_at = ends_at + 3 days`) and backfills the
+`grace_ends_at` of currently-running dated terms, so existing members get the grace window too. Nothing
+else changes — `is_enrolled()` / `current_plan_key()` / `expire_overdue_subscriptions()` and the client
+already honor `grace_ends_at`. See "Membership lifecycle & renewal" → "Grace period" below.
+
+## Step 1e — Run the Sampler course-scope migration (Essentials vs Mastery)
+
+Same SQL Editor → paste **all** of
+[`db/2026-07-11-sampler-essentials-access.sql`](db/2026-07-11-sampler-essentials-access.sql) → **Run**.
+Idempotent; safe to re-run. **Order:** run it **after** plan-course-access (#17) — it stops with a clear
+exception if `public.current_plan_key()` is missing. It adds the `courses.access_tier` column
+(`'standard'`/`'essentials'`) + the `plan_is_sampler()` helper, rewrites `course_object_allowed()`, and
+re-applies `courses_read`/`modules_read`/`lessons_read` + `course_videos_read` so a **`sampler`** member
+reads only `qbo-*` courses tagged `access_tier='essentials'` (QuickBooks **Essentials**, not Mastery).
+Every other plan/admin is unaffected. **Then set up the Essentials course in-app:** as an admin, open
+**QuickBooks US Bookkeeping Program → New course** ("QuickBooks Online Essentials"), add its 2–4
+modules, open the card **⋮ menu → "Sampler tier (Essentials)"**, and **Publish**. Until an Essentials
+course is marked + published, a Sampler member sees an empty QuickBooks catalog (fails **closed**). See
+"Plan access scope (per-plan entitlements)" below.
+
+## Step 1f — Run the account-membership-requests migration (Extend Access + Upgrade Plan)
+
+Same SQL Editor → paste **all** of
+[`db/2026-07-11-account-membership-requests.sql`](db/2026-07-11-account-membership-requests.sql) → **Run**.
+Idempotent; safe to re-run. **Order:** run it **after** subscription-lifecycle (#13) and grace (#18) — it
+stops with a clear exception if `enrollment_requests` / `subscriptions` / `approve_subscription` are
+missing. It adds `enrollment_requests.request_kind` (`new`/`renewal`/`upgrade`/`extension`) +
+`extension_days`, and the `approve_extension(user, request_id, days)` RPC. This powers the sidebar **⋮
+account menu** (Profile & Settings · Membership Plan · Upgrade Plan · Extend Access · Log out) and the
+self-serve **Extend Access** / **Upgrade Plan** flows. Until it's run the client degrades gracefully —
+new/renewal enrollment still works, and an extension submitted meanwhile is approved as a normal plan
+grant. See "Extend access & upgrade" below.
+
+## Step 1g — Run the hardening migration (extension-length cap)
+
+Same SQL Editor → paste **all** of [`db/2026-07-11-hardening.sql`](db/2026-07-11-hardening.sql) →
+**Run**. Idempotent; safe to re-run. **Order:** after account-membership-requests (#20) — it stops with
+a clear exception if `approve_extension` is missing. It replaces `approve_extension()` with a strict
+superset that rejects any extension outside **60–365 days** (the request's `extension_days` is
+student-declared — #20 only enforced the minimum) and adds a matching range CHECK constraint on
+`enrollment_requests.extension_days`. The client already offers only 2–12 months, so legitimate
+requests are unaffected.
+
 ## Membership lifecycle & renewal
 
 - **Durations:** approval stamps `ends_at = start + access_days` (Core/Sampler/Silver **60
   days**, Gold/VIP **180 days**; Sampler also records `support_days = 30`, shown to the student
   but not RLS-enforced). A plan with `access_days = NULL` never expires. Edit durations in the
   `enrollment_plans` table (no redeploy needed).
+- **Plan access scope:** a term's plan also decides *which* tools it unlocks (client
+  `PLAN_ENTITLEMENTS` + `db/2026-07-09-plan-course-access.sql` + `db/2026-07-11-sampler-essentials-access.sql`):
+  **`core_self_paced`** (QBO Mastery Only) unlocks Home + Training & Skills (both `qbo-*` courses);
+  **`sampler`** (Sampler Session) unlocks Home + the QuickBooks catalog's **Essentials** course only +
+  both 1-on-1 booking pages (₱1,499 buys coaching, not more courses — *more* restricted than core);
+  **`silver_self_paced`** (QBO + Resume Combo) and every other plan grant **full non-admin toolkit
+  access**. Silver is premium/full — not to be confused with the limited QBO-only plan.
 - **Renewal stacking:** approving a renewal **extends from the current expiry** when the term is
   still running (`ends_at = greatest(now, current ends_at) + access_days`) — renewing early
   never loses days. After expiry, the new term starts at approval time. The old row is marked
@@ -125,17 +206,104 @@ to `subscriptions`, rewrites **`public.is_enrolled()` to be date-aware**, create
   restored instantly (Realtime) or within ~30s. Students with a **running** term renew early
   from the Dashboard panel's Renew button (a full-screen overlay) and keep access while the
   renewal is pending.
-- **Warnings:** the Dashboard membership panel warns at **14 / 7 / 3** days remaining
-  (escalating amber → red; the Renew button is promoted at ≤7 days).
-- **Grace period:** off by default. To add one, edit `v_grace_days` in `approve_subscription()`
-  (e.g. `:= 3`) — the column, RLS check, and client math already honor it. You can also hand-set
-  `grace_ends_at` on a single row as a one-off extension.
+- **Warnings:** the Dashboard membership panel is **calm above 5 days** (shows the expiry date +
+  days remaining, no banner), turns to an **amber warning at ≤ 5 days** ("Your membership expires
+  soon. Renew or upgrade now to keep access."), a **red urgent warning at ≤ 3 days**, and a **red
+  grace-period warning** once the term has ended but access continues ("Grace period: renew now to
+  avoid losing access." + the exact grace-end date). The Renew button is promoted at ≤ 5 days and
+  during grace.
+- **Grace period (ON — 3 days):** since [`db/2026-07-10-subscription-grace.sql`](db/2026-07-10-subscription-grace.sql)
+  (#18) `approve_subscription()` uses `v_grace_days = 3`, so every granted/renewed term stamps
+  `grace_ends_at = ends_at + 3 days` and existing still-running terms were backfilled. During grace
+  the member keeps full access (with the urgent warning above); after grace they're locked on the
+  Membership Expired screen. `is_enrolled()` / `current_plan_key()` / `expire_overdue_subscriptions()`
+  and the client `subAccess()` already honor `grace_ends_at`, so no other change was needed. Change
+  the window by editing `v_grace_days` and re-running #18; hand-set `grace_ends_at` on a single row
+  for a one-off extension.
 - **Grandfathering:** rows created before the lifecycle migration keep `ends_at = NULL` = **no
   expiry** (nobody is locked out by running it); paid profiles with no subscription rows at all
   also stay enrolled. Their **next renewal** converts them to a dated term. To put legacy
   members on the clock instead, use the commented backfill in section 7 of the migration.
 - **Legacy no-expiry member renews:** their new term is dated (starts at approval) — renewing
   converts unlimited → dated by design.
+
+### Extend access & upgrade (self-serve, from the account menu)
+
+Members manage their own membership from the **⋮ account menu** on the sidebar (Profile & Settings ·
+Membership Plan · Upgrade Plan · Extend Access · Log out). Both billing actions require payment proof +
+admin approval, exactly like a renewal — they're just tagged `request_kind` on the `enrollment_requests`
+row so they show up in the **Enrollments** tab with **Upgrade** / **Extension** badges (and their own
+filter chips).
+
+- **Extend Access** — buy more time on the **same** plan without changing it. Minimum **2 months (60
+  days)**, maximum **12 months (365 days — enforced by `approve_extension()` after Step 1g; for longer
+  access, renew or upgrade instead)**; options 2 / 3 / 6 months + a custom stepper (clamped 2–12). Price is pro-rated from the plan's
+  own `price_php` / `access_days` (`dailyRate × months×30`), so a 60-day plan's 2-month top-up equals its
+  full price (₱999 / ₱1,499 / ₱1,999). On **Approve**, `approve_extension()` adds `extension_days` **from
+  the current expiry** while the term is still running, or **from the approval date** if it had already
+  expired (a 3-day grace follows). The member keeps full access while an extension is pending. An
+  **expired** member (no sidebar) can still extend via **"Extend the same plan"** on the Membership
+  Expired screen.
+- **Upgrade Plan** — move to a higher/different plan. Opens the same pricing cards (current plan marked)
+  in **upgrade mode**; on **Approve** it reuses `approve_subscription()` with the new `plan_key` → the new
+  plan's **full term**, stacked from the current expiry (early upgrades never lose remaining days), and
+  the toolkit widens instantly via Realtime.
+
+The **one-pending-per-user** rule still applies across all kinds, so a member can't stack duplicate
+requests — the Extend/Upgrade modals show a "request under review" notice instead of the form when one is
+already pending.
+
+## Plan access scope (per-plan entitlements)
+
+Membership is **not all-or-nothing**. Each plan unlocks a scope of the app:
+
+- **`core_self_paced` (QBO Mastery Only, ₱999 / 60 days)** → **Home + Training & Skills only**
+  (Accounting 101, QuickBooks Online Mastery, Industry Accounting, US Tax 101, ProAdvisor Chat,
+  Niche Selector Quiz) — and reads **both** `qbo-*` courses (Essentials + Mastery). Job Application and
+  Client Management & Delivery tools are **not** accessible.
+- **`sampler` (Sampler Session, ₱1,499 / 60 days)** → **Home + the QuickBooks catalog (Essentials
+  course only) + both 1-on-1 booking pages** (Book 1-on-1 with Alex, Personalized Coaching With Alex).
+  Inside the QuickBooks catalog the Sampler sees **only** the **QuickBooks Online Essentials** course
+  (`access_tier='essentials'`) — the premium **Mastery** course is hidden. ⚠️ The ₱1,499 buys the
+  coaching session, **not** more course content, so Sampler is *more* restricted than the ₱999 core
+  plan — don't assume higher price ⇒ wider scope.
+- **All other plans** (`silver_self_paced`, `gold_live`, `vip`), unknown/legacy plans, and **admins**
+  → the **full toolkit** (no restrictions — we don't gate plans Alex hasn't defined finer entitlements
+  for yet).
+
+How it's enforced (two halves that must stay in sync):
+
+- **Client (UI + deep links):** `PLAN_ENTITLEMENTS` in `src/BookkeeperPro.jsx` lists the tabs each
+  scoped plan may open (and, via `courseTier`, which course tier inside a catalog). The sidebar and
+  Dashboard tiles are filtered to that scope, and the render chokepoint shows a polished **"This tool
+  isn't part of your plan"** screen (with an Upgrade → Dashboard CTA) for any restricted tab reached by
+  deep-link, back/forward, or a stale last-tab — so a core member can't reach `/proposal-generator`,
+  `/invoice-creator`, `/budgeting`, `/courses/resume-winning-strategy`, etc. The **CourseCatalog** hides
+  course cards the plan can't open, and **CourseProgram** shows an upgrade panel on a restricted
+  deep-link. The student sees their **access scope** on the Dashboard membership panel and in the
+  sidebar ("Access until {date}"); admins see it on each Enrollments card + the approve modal.
+- **Server (RLS):** [`db/2026-07-09-plan-course-access.sql`](db/2026-07-09-plan-course-access.sql)
+  scopes a `core_self_paced` member to **`qbo-*` courses**, and
+  [`db/2026-07-11-sampler-essentials-access.sql`](db/2026-07-11-sampler-essentials-access.sql) adds
+  `courses.access_tier` + `plan_is_sampler()` to scope a `sampler` member to **`qbo-*` courses that are
+  `access_tier='essentials'`** (Essentials only). Both cover course/lesson reads + the private
+  `course-videos` bucket, so the Mastery course, the Resume (`resume-*`)/Interview (`interview-*`)
+  courses, and their private lesson videos are denied even via direct Supabase query.
+- **Admin sets a course's tier in-app:** open the course card **⋮ menu → "Sampler tier (Essentials)"**.
+  New courses default to `'standard'` (premium); mark the Essentials course `'essentials'` and publish.
+
+**Changing entitlements:** edit both `PLAN_ENTITLEMENTS`/`courseTier` (client) *and* the
+`plan_is_qbo_only()` / `plan_is_sampler()` / `course_object_allowed()` rules + the policy slug/tier
+predicates in the migrations (server) together — they encode the same policy at two layers.
+
+**Upgrading:** a member picks a higher plan from the same renewal paywall — via the Dashboard Renew
+button **or the sidebar ⋮ account menu → Upgrade Plan** — uploads proof, and the admin approves it;
+`approve_subscription()` switches their `plan_key`, and the new scope applies live (the gate refetches on
+the subscription change / window focus). See "Extend access & upgrade" above.
+
+**Not scoped (documented residuals):** the MockInterviewSimulator `feature_guides` explainer video and
+the AI proxy stay `is_enrolled()`-gated (a core/sampler member could spend AI tokens via a hand-crafted
+proxy call, but that reveals no stored higher-tier content). Tighten later if needed.
 
 ## Step 2 — Verify the receipts bucket is private
 
@@ -251,6 +419,13 @@ sent — …"** (no key / no sender / no recipient / provider error) when it did
 silently-misconfigured admin email is no longer invisible (it doesn't rely on the student's browser
 console). The badge only appears once an alert has been attempted; older rows and installs without
 the migration simply show no badge (the RPC call is best-effort and never blocks the email).
+
+The `sent` stamp doubles as a **replay guard**: once a request row is marked `notify_status='sent'`,
+re-POSTing `action:'submitted'` for the same `requestId` returns `{ ok:false, skipped:
+'already_notified' }` instead of sending again — so the alert can't be replayed into the admin inbox
+or burn Resend quota. Failure states (`provider_error`, `email_not_configured`, `admin_email_invalid`)
+stay retryable, and every **new** row (resubmit / renewal / upgrade / extension) starts with a null
+`notify_status`, so legitimate flows always alert.
 
 **Not on Vercel?** Reimplement the same `submitted` / `decision` / `test` workflow as a **Supabase
 Edge Function** and store `RESEND_API_KEY` / `RESEND_FROM` / `NOTIFY_ADMIN_EMAIL` / `APP_URL` as

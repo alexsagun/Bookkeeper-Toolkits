@@ -2,7 +2,7 @@
 
 **Get Hired With Alex** — an all-in-one web app for aspiring and working **remote bookkeepers / accountants serving US clients**. It bundles 40+ tools across three career stages:
 
-- **Training & Skills** — Accounting 101 course, Industry Accounting playbooks, US Tax 101, ProAdvisor chat, client-portal demo.
+- **Training & Skills** — Accounting 101 course, Industry Accounting playbooks, US Tax 101, ProAdvisor chat.
 - **Job Application** — authentic branding, resume & LinkedIn optimizers, interview prep, mock-interview simulator, free QuickBooks diagnostic, pain-points & proposal generators.
 - **Client Management & Delivery** — engagement letters, onboarding, Chart of Accounts generator, invoice creator, bank-feed AI, statement → CSV converter, email templates, accounting calculators, monthly/year-end checklists, SOP generator, sales tax, budgeting & forecasting.
 

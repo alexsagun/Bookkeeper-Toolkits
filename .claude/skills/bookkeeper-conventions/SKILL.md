@@ -35,7 +35,15 @@ Inline styles bypass the dark compat layer, so shell surfaces MUST use these var
 **Don't:** hardcode hex colors, and **never** concat an alpha suffix onto a token
 (`` `${C.primary}66` `` is broken CSS against a var) — use the alpha tokens: `var(--primary-glow)`
 (≈66), `--primary-glow-soft` (55), `--primary-selection` (33), `--primary-halo` (1A),
-`--primary-tint` (14), `--green-ring(-faint)`, `--red-glow`, `--focus-ring`, `--wash`, `--wash-strong`.
+`--primary-tint` (14), `--green-ring(-faint)`, `--red-glow`, `--green-glow`, `--focus-ring`,
+`--wash`, `--wash-strong`. Solid green/red action buttons use the gradient-endpoint tokens
+`--green-hi`/`--red-hi` — reuse the shared `ADMIN_BTN_OK`/`ADMIN_BTN_DANGER` style consts
+(module scope above `AccessRequests`) instead of hand-writing the gradient.
+**Modals:** never hand-roll a `fixed inset-0` + `bg-white` overlay — use the shared `AccountModal`
+(dialog roles, Escape, backdrop-close, focus trap/restore; props `tone` 'primary'|'ok'|'danger',
+`canClose` to block closing mid-request, `headerAction`, `bodyClass`/`bodyStyle`, `maxW`). Admin
+lists reuse `AdminNotice`/`AdminFilterChip`/`AdminFilterCaption`/`AdminListSkeleton`/`AdminUserCell`
+so both admin screens stay one visual surface.
 **Tailwind:** layout utilities freely; for *color* utilities prefer ones already covered by the dark
 compat layer at the bottom of `index.css` (`bg-white`, `text-slate-*`, `border-slate-*`,
 red/emerald/amber families) — a new color utility needs a compat rule or a `dark:` variant.

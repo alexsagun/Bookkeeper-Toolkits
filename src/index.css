@@ -89,6 +89,11 @@
   --green-ring: rgba(40,166,71,0.13);          /* was `${C.green}22` */
   --green-ring-faint: rgba(40,166,71,0.07);    /* was `${C.green}11` */
   --red-glow: rgba(208,35,35,0.33);            /* was `${C.red}55` */
+  --green-glow: rgba(40,166,71,0.40);          /* drop shadow under solid green buttons */
+  /* Gradient endpoints for the solid green/red action buttons (admin approve/reject) —
+     linear-gradient(180deg, var(--green-hi), var(--c-green)) etc. */
+  --green-hi: #34C759;
+  --red-hi: #E04545;
 
   /* Status-pill families (admin badges, banners, filter chips) */
   --status-warn-bg: rgba(255,159,10,0.12);  --status-warn-bd: rgba(255,159,10,0.30);  --status-warn-fg: #9A6200;
@@ -161,6 +166,9 @@
   --green-ring: rgba(48,209,88,0.18);
   --green-ring-faint: rgba(48,209,88,0.10);
   --red-glow: rgba(255,105,97,0.40);
+  --green-glow: rgba(48,209,88,0.45);
+  --green-hi: #3BD86A;
+  --red-hi: #FF7B73;
 
   --status-warn-bg: rgba(255,179,64,0.14);  --status-warn-bd: rgba(255,179,64,0.35);  --status-warn-fg: #FFC66E;
   --status-warn-strong-bg: rgba(255,179,64,0.22); --status-warn-strong-bd: rgba(255,179,64,0.55); --status-warn-strong-fg: #FFD28A;

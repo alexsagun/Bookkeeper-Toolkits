@@ -8,7 +8,7 @@ Guidance for Claude Code (and any developer) working in this repository. Read th
 aspiring and working **remote bookkeepers serving US clients**. It bundles ~60 fully-functional
 tools across three career stages:
 
-1. **Training & Skills** — Accounting 101 course, Industry Accounting playbooks, US Tax 101, ProAdvisor chat, client-portal demo.
+1. **Training & Skills** — Accounting 101 course, Industry Accounting playbooks, US Tax 101, ProAdvisor chat.
 2. **Job Application** — authentic branding, resume/LinkedIn optimizers, interview prep, mock-interview & discovery-call simulators, QuickBooks diagnostic, pain-points & proposal generators.
 3. **Client Management & Delivery** — engagement letters, onboarding, Chart of Accounts generator, invoice creator, bank-feed AI, statement→CSV converter, email templates, accounting calculators, monthly/year-end checklists, SOP generator, sales tax, budgeting & forecasting, plus growth tools (pricing, upsell, capacity, payment tracking).
 
@@ -136,7 +136,7 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
 `<CourseCatalog prefix="…" …/>` with its own prefix + copy and wire the nav sync points. To add a
 *single-course* tab, write a `CourseProgram` wrapper with its own `slug` + labels.
 
-- **Tables:** `courses` (incl. `course_date` editable cohort date + legacy `month` label fallback + `source_course_id` lineage for duplicates) →
+- **Tables:** `courses` (incl. `course_date` editable cohort date + legacy `month` label fallback + `source_course_id` lineage for duplicates + `access_tier` `'standard'`/`'essentials'` — the per-plan tier the Sampler gate reads; admin-set via the card ⋮ menu) →
   `course_modules` → `course_lessons` (`type` video/text, link or uploaded video), `lesson_progress`
   (per-user completion), `course_completions` (stamps the certificate date). All keyed by `course_id`,
   so one schema serves every course.
@@ -195,7 +195,7 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
 `InterviewStrategyCatalog` (`interview-`, the `winstrat` subtab) / `ResumeStrategy` (`resume-`) wrappers right after it,
 `BankFeed` 2214, `StatementConverter` 2411, `ProChat` 2764,
 `AuthenticBranding` 4944, `ProposalGenerator` 5379, `EngagementLetter` 5658, `EmailTemplates` 6304,
-`PainPointsGenerator` 6629, `ClientPortalDemo` 6987, `IndustryAccounting` 7661, `USTax101` 7962,
+`PainPointsGenerator` 6629, `IndustryAccounting` 7661, `USTax101` 7962,
 `MonthlyWorkflow` 8135, `MonthEndChecklist` 8336, `InvoiceCreator` 8618, `CoachAlexChat` 9025,
 `CPAAIChat` 9178, `AccountingCalculators` 10181, `NicheSelectorQuiz` 10328, `CertificationTracker` 10583,
 `LinkedInOptimizer` 10732, `MockInterviewSimulator` (a **guided-video + external-link page** —
@@ -242,7 +242,10 @@ keep-alive** (see below). Four pieces must stay in sync when adding/removing a t
   re-renders, and a tab switch reconciles exactly two panels. Don't pass a TabPanel a prop that changes
   identity per render or you silently re-enable app-wide re-renders. `visitedTabs` is deliberately
   **never pruned** (unmounting a hidden tab would kill in-flight AI work — accepted memory trade-off).
-  Per-tab scroll is saved/restored via `sessionStorage` (`nav:scroll:<tab>`).
+  Per-tab scroll is saved/restored via `sessionStorage` (`nav:scroll:<tab>`). **Plan gating rides
+  here:** this same `visitedTabs.map` is the entitlement chokepoint — a tab the user's plan can't open
+  renders `RestrictedTab` instead of its `TabPanel` (see the "Plan-based access" bullet in
+  Authentication). The sidebar/tiles are filtered cosmetically; this render is the real boundary.
 
 **Sidebar customization is split by concern:**
 - **Labels are global + admin-controlled** via the Supabase `sidebar_settings` table (admin-write,
@@ -352,7 +355,10 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   cache. Terms are granted solely by `approve_subscription(p_user_id, p_plan_key, p_request_id)`
   (SECURITY DEFINER, internal `is_admin()` guard; one transaction: supersede active row → insert
   new term; renewal stacking = `greatest(now, current ends_at) + access_days`, so early renewal
-  never loses days; grace knob `v_grace_days`, default 0). `expire_overdue_subscriptions()`
+  never loses days; grace knob `v_grace_days` = **3** — every term gets a 3-day `grace_ends_at`
+  cushion, turned on by `db/2026-07-10-subscription-grace.sql` (#18), which also backfilled existing
+  running terms; during grace `is_enrolled()` still passes via `coalesce(grace_ends_at, ends_at)`).
+  `expire_overdue_subscriptions()`
   lazily flips overdue rows' `status` (cosmetic — called on Enrollments-tab load). Client side:
   `useEnrollmentGate` fetches the latest request + latest subscription for every non-admin
   (paid users too) and reduces to a named state via `enrollGateState()`/`subAccess()` (pure
@@ -361,14 +367,95 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   **`MembershipExpiredScreen`** (expired member → Renew → paywall in `renewal` mode with
   `currentSub`/`onClose`), or the paywall. The Dashboard renders **`MembershipPanel`**
   (self-contained useAuth/fetch/realtime; fail-silent null on any error): plan, status pill,
-  start/expiry dates, days remaining, amount paid, entitlement chips, warnings at 14/7/3 days,
-  and a Renew button that opens the paywall as a fixed overlay — a member with a pending
-  renewal keeps full access. `AdminEnrollments` adds membership filters (Renewals / Active /
-  Expiring soon / Ended), a per-card membership strip, and an "access until {date}" projection
-  in the approve modal. Docs: [ENROLLMENT_SETUP.md](ENROLLMENT_SETUP.md) ("Membership lifecycle
-  & renewal"). Migration order: user-approval → enrollment → subscription-lifecycle →
-  enrollment-notify-status.
-- **Sign-out + identity** render in the sidebar header (just below the "built by Alex Sagun" line).
+  start/expiry dates, days remaining, amount paid, entitlement chips, **calm > 5 days / amber
+  warning ≤ 5 / red urgent ≤ 3 / red grace-period state** (grace end date + days) once the term has
+  ended but access continues, and a Renew button that opens the paywall as a fixed overlay — a
+  member with a pending renewal keeps full access. `AdminEnrollments` adds membership filters
+  (Renewals / Active / Expiring soon / In grace / Ended), a per-card membership strip (with an
+  "In grace" pill + grace-end date and the plan's access-scope chip), and an "access until {date}
+  (+ 3-day grace)" projection in the approve modal. Docs:
+  [ENROLLMENT_SETUP.md](ENROLLMENT_SETUP.md) ("Membership lifecycle & renewal"). Migration order:
+  user-approval → enrollment → subscription-lifecycle → enrollment-notify-status →
+  plan-course-access → subscription-grace (#18) → sampler-essentials-access (#19) →
+  account-membership-requests (#20) → hardening (#21, caps `approve_extension` at 60–365 days +
+  a range CHECK on `extension_days` — the request column is student-declared, so the RPC is the
+  bound that matters; the client mirrors it with a 2–12 month selector).
+  **Expiry-warning policy:** student-facing surfaces (menu pill, Dashboard `MembershipPanel`, the
+  sidebar "Access until" line) turn amber ≤ 5 days / red ≤ 3 (+ the grace state); admin views
+  (Enrollments membership strip + the "Expiring ≤ 14d" filter) intentionally use a 14-day lead
+  time, labeled as such — don't "unify" them.
+- **Account menu + self-serve Extend / Upgrade (`db/2026-07-11-account-membership-requests.sql`, #20):**
+  a SaaS-style **⋮ account menu** on the sidebar identity card (`AccountMenu`, both the expanded card and
+  the collapsed rail; house dropdown a11y — Escape + `fixed inset-0` outside-click catcher +
+  `role=menu`/`menuitem` + focus restore) opens **Profile & Settings** (`ProfileSettingsModal`, read-only
+  — `profiles` has no user-update RLS), **Membership Plan** (`MembershipPlanModal`), **Upgrade Plan**,
+  **Extend Access** (`ExtendAccessModal`), and **Log out**; billing items hidden for admins
+  (`showBilling`). The root holds one `accountView` state and renders the modals off the already-loaded
+  `enroll.sub`/`enroll.latestReq`/`entitlement` (no refetch). Both new actions are just new **kinds** of
+  the enrollment flow, reusing receipt upload + admin review: **Extend Access** buys more time on the
+  SAME plan (min 2 months / 60 days; priced by `extensionPrice()` = `price_php/access_days × months*30`,
+  so a 60-day plan's 2-month top-up == its full price), submitting an `enrollment_requests` row with
+  `request_kind='extension'` + `extension_days`; **Upgrade Plan** reuses `EnrollmentPaywall` in a new
+  `mode="upgrade"` overlay (renewal-mode variant that marks the current plan) and is tagged
+  `request_kind='upgrade'` when a different plan is chosen. The shared `submitSubscriptionRequest()`
+  helper (extracted from the paywall submit; column-resilient so it degrades before #20) does the
+  upload + insert for all paths. **Admin** `AdminEnrollments.doApprove` branches: an `extension` row →
+  `approve_extension(user, request_id, extension_days)` RPC (same plan, days stacked from the current
+  expiry / from now if expired, 3-day grace; client fallback mirrors it), everything else →
+  `approve_subscription` (upgrade = a different `p_plan_key` = full fresh term). New **Upgrade/Extension**
+  card badges + filter chips + an extension-aware approve-modal projection. Expired (past-grace) members
+  have no sidebar, so **`MembershipExpiredScreen`** also surfaces **Extend the same plan** (opens
+  `ExtendAccessModal`) alongside Renew/Upgrade/Sign out; the pending screen copy is `request_kind`-aware.
+  Add `request_kind`/`extension_days` to the docs when the request shape changes; **keep the two columns
+  + `approve_extension` in sync with `submitSubscriptionRequest`/`doApprove`**.
+- **Shared dialog + admin UI kit (2026-07 stabilization pass):** `AccountModal` is the ONE modal shell
+  for the whole app — the account-menu modals AND the admin approve/reject/receipt modals all use it.
+  It centralizes dialog a11y (role/aria-modal, Escape, backdrop-close, a Tab focus-trap + focus
+  restore) and takes `tone` ('primary'|'ok'|'danger' icon tile), `canClose` (gate closing while a
+  request is in flight — replaces hand-rolled `busyId` guards), `headerAction`, `bodyClass`/`bodyStyle`,
+  `maxW`. Never hand-roll a `fixed inset-0` + `bg-white` modal again. Both admin screens
+  (`AccessRequests` + `AdminEnrollments`) are built from the shared module-scope kit right above them:
+  `AdminNotice` (status-token banners), `AdminFilterChip`/`AdminFilterCaption` (labeled filter rows),
+  `AdminListSkeleton` (first-load skeleton; refresh keeps the list), `AdminUserCell`
+  (avatar/name/badges/email/meta identity block), `ADMIN_BTN_OK`/`ADMIN_BTN_DANGER` (token-gradient
+  action buttons). New admin surfaces must reuse these. `ProfileSettingsModal` takes `showBilling`
+  (false for admins → "Role: Administrator", no plan/status), and the root short-circuits the
+  membership/extend/upgrade `accountView`s for admins.
+- **Plan-based access (per-plan entitlements):** membership is no longer all-or-nothing. The
+  `core_self_paced` plan (QBO Mastery Only) unlocks **only Home + the Training & Skills stage** (and
+  reads **both** `qbo-*` courses); the `sampler` plan (Sampler Session, ₱1,499 / 60 days) is scoped
+  **tighter still** — Home + the QuickBooks catalog (`qbomastery`) but only its **Essentials** course
+  (`access_tier='essentials'`, NOT Mastery) + both 1-on-1 booking tabs (`linkedinopt`, `coachalex`).
+  ₱1,499 buys the coaching session, not more course content, so sampler is MORE restricted than the
+  ₱999 core plan — never assume price ⇒ scope. `silver_self_paced` (QBO + Resume Combo, ₱1,999 / 60
+  days) is listed **explicitly as full access** (`{ full: true }`) — premium/full non-admin toolkit,
+  NOT to be confused with the limited QBO-only plan — and every other/unknown/grandfathered plan and
+  admins also get the full toolkit. **Client model** (module scope in BookkeeperPro.jsx, next to
+  `subAccess`): `PLAN_ENTITLEMENTS` map (core = Training tabs; sampler = Training-QBO + coaching +
+  `courseTier:'essentials'`; silver = explicit `full:true`) → `planEntitlement(key)` (returns FULL for
+  any key not in the map OR an entry flagged `full:true`) → `{ full, label, scopeLabel, allowsStage(id),
+  allowsTab(id), allowsCourse(course) }` (`allowsCourse` gates individual courses **within** a catalog
+  by `course.access_tier` — the QBO Essentials/Mastery split); `FULL_ENTITLEMENT` is the default;
+  `filterStagesForEntitlement()` drops disallowed stages/tabs; `EntitlementContext` shares it with
+  Dashboard/RestrictedTab **and CourseCatalog/CourseProgram** (the catalog hides cards the plan can't
+  open; CourseProgram has a deep-link guard). The root resolves `entitlement` once (memoized on
+  `enroll.sub?.plan_key || profile.plan`; admins/flag-off → FULL) and wraps the app shell in the
+  provider. **Enforcement is a single chokepoint** — the `visitedTabs.map` render (the old "Phase 2
+  paywall hooks" seam): a disallowed active tab reached ANY way (deep-link, popstate, stale
+  `nav:lastTab`, programmatic `goto`) renders **`RestrictedTab`** (a polished upsell → Dashboard)
+  instead of the tool. The sidebar (`visibleStages`, both passes) and Dashboard tiles are filtered
+  cosmetically; the aspirational Career Roadmap strip stays full. **Server half** =
+  `db/2026-07-09-plan-course-access.sql` (`current_plan_key()` + `plan_is_qbo_only()` → core reads only
+  `qbo-*`) **+ `db/2026-07-11-sampler-essentials-access.sql`** (`courses.access_tier` +
+  `plan_is_sampler()` → sampler reads only `qbo-*` **AND** `access_tier='essentials'`), all wrapped
+  `(select …)` for once-per-query InitPlans; both scope course/lesson reads + the private
+  `course-videos` bucket via direct Supabase query. Admins set a course's tier in-app via the course
+  card **⋮ menu → "Sampler tier (Essentials)"**. **Keep the client tab-allowlist + `courseTier` and the
+  SQL `qbo-%` / `access_tier` rules in sync** when entitlements change. An admin's plan change (upgrade
+  approval) applies live via `useEnrollmentGate`'s realtime/focus refetch. Residuals (documented, not
+  enforced): `feature_guides` + the AI proxy stay `is_enrolled()`-gated.
+- **Sign-out + identity** render in the sidebar header (just below the "built by Alex Sagun" line);
+  a compact "Access until {date}" line sits below it for non-admin members with a dated term.
 - **Per-user data:** all `window.storage` keys are auto-namespaced per user (see the main.jsx shim
   note). Tools need no changes. A one-time migration in `AuthProvider` adopts any pre-auth global
   keys into the first signed-in account (guarded by `auth:legacyMigratedTo`). The canonical legacy-key
@@ -387,9 +474,10 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   setup steps for the exact SQL.
 - **Phase 2 status:** the paid gate shipped as the **manual enrollment workflow** above (full-app
   gate keyed on `is_paid`, flipped only by an admin — RLS has no user-update policy on `profiles`).
-  The old seam comments (`FREE_TABS` allowlist + `// Phase 2 paywall hooks here` at the render
-  switch) remain unused — they're the hook for a future *partial* free-preview mode and/or a
-  Stripe/Gumroad webhook that flips `is_paid` server-side without manual review.
+  The old `FREE_TABS`/`// Phase 2 paywall hooks here` seam is now **realized as the plan-entitlement
+  chokepoint** (see the "Plan-based access" bullet) — the `visitedTabs.map` render gates each tab by
+  `entitlement.allowsTab(tabId)`. A future Stripe/Gumroad webhook could still flip `is_paid` +
+  grant a subscription term server-side without manual review.
 
 ## AI / proxy pattern
 
@@ -416,7 +504,7 @@ const { text, data } = await callClaude({ system, messages }, { returnData: true
   state; never assume success. It returns the joined text content, so no manual `.filter/.map` needed.
 - **Never** put the API key, `x-api-key`, or `anthropic-version` in client code. The proxy adds them.
   - Dev: [vite.config.js](vite.config.js) injects `x-api-key` + `anthropic-version: 2023-06-01` (no auth check — local only).
-  - Prod: [api/anthropic/v1/messages.js](api/anthropic/v1/messages.js) (Vercel serverless, exact-path) does the same **and authenticates the caller**: it requires a valid Supabase session (`callClaude` attaches the `Authorization: Bearer <access_token>`) and gates token spend on **admin-or-`is_enrolled()`**, plus a model allowlist / `max_tokens` / body-size cap. This closes the previously-open proxy (anyone could spend the key). `callClaude` fetching the session token is why it's `async`-aware of auth; the GET health check stays unauthenticated (zero-token).
+  - Prod: [api/anthropic/v1/messages.js](api/anthropic/v1/messages.js) (Vercel serverless, exact-path) does the same **and authenticates the caller**: it requires a valid Supabase session (`callClaude` attaches the `Authorization: Bearer <access_token>`) and gates token spend on **admin-or-`is_enrolled()`**, plus a model allowlist / `max_tokens` / body-size cap **and a per-user burst limit (20 req/min per warm instance — best-effort, not a billing boundary; 429 surfaces through `callClaude`'s normal error path)**. The membership check fails OPEN on RPC errors (availability) but logs a `[anthropic-proxy] is_enrolled indeterminate` warning — a stream of those in the Vercel logs means the gate is off. This closes the previously-open proxy (anyone could spend the key). `callClaude` fetching the session token is why it's `async`-aware of auth; the GET health check stays unauthenticated (zero-token).
 - For JSON responses, tools strip ```` ```json ```` fences before `JSON.parse` (see `BankFeed`, ~L2214).
 - For vision (PDF/image), tools send base64 `image`/`document` blocks in `messages[].content` (see
   `StatementConverter`, ~L2411).
@@ -442,7 +530,10 @@ const { text, data } = await callClaude({ system, messages }, { returnData: true
 - **Never string-concat an alpha onto a token** — `` `${C.primary}66` `` is broken CSS against a var.
   Use the alpha tokens instead: `var(--primary-glow)` (was `66`), `--primary-glow-soft` (`55`),
   `--primary-selection` (`33`), `--primary-halo` (`1A`), `--primary-tint` (`14`), `--green-ring`,
-  `--green-ring-faint`, `--red-glow`, `--focus-ring`, and the neutral washes `--wash`/`--wash-strong`.
+  `--green-ring-faint`, `--red-glow`, `--green-glow`, `--focus-ring`, the solid-button gradient
+  endpoints `--green-hi`/`--red-hi` (used by the shared `ADMIN_BTN_OK`/`ADMIN_BTN_DANGER` styles —
+  `linear-gradient(180deg, var(--green-hi), var(--c-green))`), and the neutral washes
+  `--wash`/`--wash-strong`.
   (`ROYAL`/`CYAN`/`SKY`/`GOLD` stay literal hex on purpose — identical in both themes — so legacy
   `${CYAN}40` suffixes still work.)
 - **`INK` is the frozen literal palette for anything that LEAVES the DOM** — Word `.doc` builders,

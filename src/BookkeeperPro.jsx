@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useContext } from 'react';
 import {
   LayoutDashboard, BookOpen, FileSpreadsheet, Receipt, FileText,
   MessageCircle, FileCheck2, Percent, ClipboardList, Sparkles,
@@ -14,7 +14,7 @@ import {
   LogOut, Lock, Mail, KeyRound, Menu,
   Plus, Trash2, Save, Play, Video, ArrowRight, ArrowLeft, ChevronUp, MoreVertical,
   PanelLeftClose, PanelLeftOpen, RefreshCw, UserCheck, UserX, ShieldCheck, Hourglass, Bell, BellOff, Volume2,
-  Sun, Moon, Monitor
+  Sun, Moon, Monitor, MoreHorizontal, CreditCard, ArrowUpCircle, CalendarPlus
 } from 'lucide-react';
 import { useAuth } from './auth/AuthProvider.jsx';
 import { supabase } from './lib/supabase';
@@ -124,6 +124,11 @@ const ROUTE_TO_TAB = Object.entries(TAB_ROUTES).reduce((acc, [tab, href]) => {
 });
 
 const VALID_APP_TABS = new Set(Object.keys(TAB_ROUTES));
+// Real tool count for the Dashboard stat strip — every routed tab except Home, the two
+// admin-only screens, and the legacy mockinterview alias (a redirect, not a tool). Derived
+// so the number can never drift from the actual toolkit again.
+const NON_TOOL_TAB_IDS = new Set(['dashboard', 'accessrequests', 'enrollments', 'mockinterview']);
+const TOOL_COUNT = Object.keys(TAB_ROUTES).filter((id) => !NON_TOOL_TAB_IDS.has(id)).length;
 const INTERVIEW_SUBTAB_IDS = new Set(['winstrat', 'mock', 'common', 'accounting', 'body', 'jdgen', 'salary']);
 
 function normalizePath(pathname = '/') {
@@ -1811,19 +1816,22 @@ const fmtEnrollDate = (s) => {
 // ends_at === null (legacy pre-lifecycle row) both mean "no expiry" — so a deploy
 // ahead of db/2026-07-04-subscription-lifecycle.sql can never lock a member out.
 function subAccess(sub) {
-  if (!sub) return { has: false, valid: false, legacy: false, ends: null, daysLeft: null, inGrace: false, expired: false };
+  if (!sub) return { has: false, valid: false, legacy: false, ends: null, graceEnds: null, daysLeft: null, graceDaysLeft: null, inGrace: false, expired: false };
   const legacy = sub.ends_at === undefined || sub.ends_at === null;
   const ends = legacy ? null : new Date(sub.ends_at);
-  const graceEnd = !legacy && sub.grace_ends_at ? new Date(sub.grace_ends_at) : null;
+  const graceEnds = !legacy && sub.grace_ends_at ? new Date(sub.grace_ends_at) : null;
   const now = Date.now();
   const active = sub.status === 'active';
-  const inGrace = active && !legacy && ends <= now && !!graceEnd && graceEnd > now;
+  const inGrace = active && !legacy && ends <= now && !!graceEnds && graceEnds > now;
   const valid = active && (legacy || ends > now || inGrace);
-  // Days remaining until the term ends. Inside a grace window the term has already
-  // passed, so measure to the grace end (never show a negative "N days left").
+  // Days remaining until the access boundary. Inside a grace window the term has
+  // already passed, so measure to the grace end (never show a negative "N days left").
   const daysLeft = legacy ? null
-    : Math.max(0, Math.ceil(((inGrace ? graceEnd.getTime() : ends.getTime()) - now) / 86400000));
-  return { has: true, valid, legacy, ends, daysLeft, inGrace, expired: !valid };
+    : Math.max(0, Math.ceil(((inGrace ? graceEnds.getTime() : ends.getTime()) - now) / 86400000));
+  // Days left in the grace window specifically (null unless currently in grace) — lets
+  // the UI show "grace: N days" distinctly from the pre-expiry days-remaining count.
+  const graceDaysLeft = inGrace ? Math.max(0, Math.ceil((graceEnds.getTime() - now) / 86400000)) : null;
+  return { has: true, valid, legacy, ends, graceEnds, daysLeft, graceDaysLeft, inGrace, expired: !valid };
 }
 
 // The gate decision, as one named state (root gate switches on it):
@@ -1851,6 +1859,125 @@ function enrollGateState({ profile, latestReq: r, sub }) {
   if (r) return 'paywall_notice';
   return 'paywall';
 }
+
+// Compact membership status for the account menu badge (single source, reusable). Pending
+// precedence mirrors MembershipPanel's pills: a live request under review outranks the
+// day-math, then grace, then the ≤3 / ≤5 day warnings, then active/expired.
+function membershipStatus(sub, latestReq) {
+  const pendingLive = latestReq?.status === 'pending_review'
+    && !(latestReq?.expires_at && new Date(latestReq.expires_at) < new Date());
+  if (pendingLive) return { label: 'Pending review', tone: C.amber };
+  const a = subAccess(sub);
+  if (!a.has) return { label: 'No plan', tone: C.textMute };
+  if (a.inGrace) return { label: 'Grace period', tone: C.red };
+  if (!a.valid) return { label: 'Expired', tone: C.red };
+  if (a.legacy) return { label: 'Active', tone: C.green };
+  if (a.daysLeft != null && a.daysLeft <= 3) return { label: `Expires in ${a.daysLeft}d`, tone: C.red };
+  if (a.daysLeft != null && a.daysLeft <= 5) return { label: 'Expiring soon', tone: C.amber };
+  return { label: 'Active', tone: C.green };
+}
+
+// Extend-access pricing — pro-rate the plan's OWN price over its OWN duration so a member
+// buys time at the same daily rate. days = months × 30 (never below the 2-month / 60-day
+// minimum). For a 60-day plan, 2 months == the full plan price (₱999/₱1,499/₱1,999).
+function extensionPrice(plan, months) {
+  const price = Number(plan?.price_php) || 0;
+  const planDays = Number(plan?.access_days) || 60;
+  const days = Math.max(60, Math.round((Number(months) || 0) * 30));
+  const amount = Math.round((price / planDays) * days);
+  return { days, amount };
+}
+
+// ── Plan entitlements ────────────────────────────────────────────────────────
+// Which stages/tabs (and, for `sampler`, which COURSES within a catalog) each plan
+// unlocks. Two plans are SCOPED today:
+//   • `core_self_paced` (QBO Mastery Only, ₱999 / 60 days) — Home + the Training &
+//     Skills stage only; reads BOTH qbo-* courses (Essentials + Mastery).
+//   • `sampler` (Sampler Session, ₱1,499 / 60 days) — Home + the QuickBooks catalog
+//     (`qbomastery`, but only its `access_tier='essentials'` course, i.e. QuickBooks
+//     Online Essentials — NOT Mastery) + the two 1-on-1 booking tabs (`linkedinopt`,
+//     `coachalex`). The ₱1,499 buys the coaching session, not more course content, so
+//     sampler is MORE restricted than the ₱999 core plan — never assume price ⇒ scope.
+// `silver_self_paced` (QBO + Resume Combo, ₱1,999 / 60 days) is the premium self-paced
+// tier — it gets FULL non-admin toolkit access, listed explicitly (`full: true`) so a
+// future edit never mistakes it for a limited plan. Every OTHER known plan (gold_live /
+// vip), every UNKNOWN key, and null/grandfathered users also get FULL access via the
+// default branch below. Admins are handled at the call site (they always resolve to FULL).
+//
+// This is the CLIENT half of the plan-access model. The SERVER half lives in
+// db/2026-07-09-plan-course-access.sql (core → qbo-* courses) + db/2026-07-11-sampler-
+// essentials-access.sql (sampler → qbo-* AND access_tier='essentials'). Keep the client
+// tab-allowlist + `courseTier` and the SQL slug/tier predicates in sync when entitlements
+// change.
+const TRAINING_ONLY_TAB_IDS = ['dashboard', 'course', 'qbomastery', 'industryacc', 'ustax', 'chat', 'niche'];
+const PLAN_ENTITLEMENTS = {
+  // Limited: Home + Training & Skills only (matches the SQL `qbo-%` course rule).
+  core_self_paced: {
+    scopeLabel: 'Training & Skills only',
+    stageIds: ['home', 'training'],
+    tabIds: TRAINING_ONLY_TAB_IDS,
+  },
+  // Essentials + 1-on-1 coaching: Home, the QuickBooks catalog (Essentials course only),
+  // and both Alex booking pages. `courseTier` scopes courses WITHIN an allowed catalog
+  // (matches courses.access_tier + the SQL sampler rule).
+  sampler: {
+    scopeLabel: 'Essentials + 1-on-1 coaching',
+    stageIds: ['home', 'training', 'jobsearch'],
+    tabIds: ['dashboard', 'qbomastery', 'linkedinopt', 'coachalex'],
+    courseTier: 'essentials',
+  },
+  // Premium self-paced: full non-admin toolkit (explicit — NOT QBO-only limited).
+  silver_self_paced: { full: true, scopeLabel: 'Full toolkit access' },
+};
+// planEntitlement(key) → { full, planKey, label, scopeLabel, allowsStage(id), allowsTab(id), allowsCourse(course) }.
+function planEntitlement(planKey) {
+  const cfg = planKey ? PLAN_ENTITLEMENTS[planKey] : null;
+  const label = PLAN_LABELS[planKey] || planKey || null;
+  // No config, or an explicitly-full plan (e.g. silver_self_paced) → full access.
+  if (!cfg || cfg.full) {
+    return {
+      full: true, planKey: planKey || null, label,
+      scopeLabel: cfg?.scopeLabel || 'Full toolkit access',
+      allowsStage: () => true, allowsTab: () => true, allowsCourse: () => true,
+    };
+  }
+  const stageSet = new Set(cfg.stageIds);
+  const tabSet = new Set(cfg.tabIds);
+  return {
+    full: false, planKey, label: label || 'Your plan', scopeLabel: cfg.scopeLabel,
+    allowsStage: (id) => stageSet.has(id),
+    allowsTab: (id) => tabSet.has(id),
+    // Course-level scope within an allowed catalog. No `courseTier` (e.g. core) → all
+    // courses the tab allows. `sampler` → only `access_tier='essentials'` courses.
+    // RLS is the real boundary; this drives the catalog card list + a deep-link guard.
+    allowsCourse: (course) => !cfg.courseTier || (course?.access_tier || 'standard') === cfg.courseTier,
+  };
+}
+const FULL_ENTITLEMENT = planEntitlement(null);
+
+// Drop stages/tabs a plan can't access. Keeps stable stage/tab ids + group keys, so
+// per-user collapse state and admin `effLabel` overrides are unaffected. Empty groups
+// and empty stages are removed so the sidebar never renders a bare header.
+function filterStagesForEntitlement(stages, ent) {
+  if (!ent || ent.full) return stages;
+  return stages
+    .map((s) => {
+      const tabs = s.tabs.filter((t) => ent.allowsTab(t.id));
+      if (tabs.length === 0) return null;
+      const groups = s.groups
+        ? s.groups
+            .map((g) => ({ ...g, tabIds: g.tabIds.filter((id) => ent.allowsTab(id)) }))
+            .filter((g) => g.tabIds.length > 0)
+        : undefined;
+      return { ...s, tabs, ...(groups ? { groups } : {}) };
+    })
+    .filter(Boolean);
+}
+
+// Shared so Dashboard tiles + RestrictedTab read the SAME entitlement the root resolves
+// (root wraps the app shell in the provider). Defaults to FULL so any consumer rendered
+// outside the provider degrades open, never restricted.
+const EntitlementContext = React.createContext(FULL_ENTITLEMENT);
 
 // Gate data hook — fetches the signed-in user's LATEST enrollment request and LATEST
 // subscription. The fetch starts as soon as a uid exists (in parallel with the
@@ -1923,10 +2050,95 @@ function useEnrollmentGate(user, profile, profileReady) {
   }, [uid, reloadKey]);
 
   // refresh(row?) — pass the freshly-inserted request for an instant transition to the
-  // pending screen; a refetch still follows to stay truthful to the DB.
-  const refresh = (row) => { if (row && row.id) setLatestReq(row); setReloadKey(k => k + 1); };
+  // pending screen; a refetch still follows to stay truthful to the DB. useCallback so
+  // its identity is stable (the realtime effect + RestrictedTab depend on it).
+  const refresh = useCallback((row) => { if (row && row.id) setLatestReq(row); setReloadKey(k => k + 1); }, []);
+
+  // Live updates so an admin's approval (esp. a plan UPGRADE) widens access WITHOUT a
+  // manual reload — the root recomputes `entitlement` off the fresh sub.plan_key. Inert
+  // without the realtime publication; a focus/visibility refetch is the fallback. Non-
+  // admins only (admins fire no gate queries). Same channel shape as MembershipPanel.
+  useEffect(() => {
+    if (!REQUIRE_ENROLLMENT || !uid || profile?.is_admin) return;
+    const chSub = supabase.channel(`gate-sub-${uid}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'subscriptions', filter: `user_id=eq.${uid}` }, () => refresh())
+      .subscribe();
+    const chReq = supabase.channel(`gate-req-${uid}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'enrollment_requests', filter: `user_id=eq.${uid}` }, () => refresh())
+      .subscribe();
+    const onFocus = () => refresh();
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onFocus);
+    return () => {
+      supabase.removeChannel(chSub); supabase.removeChannel(chReq);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onFocus);
+    };
+  }, [uid, profile?.is_admin, refresh]);
+
   const state = enrollGateState({ profile, latestReq, sub });
   return { active, ready: active ? ready : true, configured, latestReq, sub, state, refresh };
+}
+
+// Shared receipt-upload + enrollment_requests insert + best-effort admin alert. Used by
+// the paywall (new / renewal / upgrade) AND the Extend Access modal (extension) so the two
+// paths never drift on the request_kind / extension_days columns. Throws on failure (the
+// caller maps 23505 "already pending" / not-configured and shows the error); returns the
+// inserted row. The insert is column-resilient: if the #20 columns aren't present yet it
+// retries WITHOUT them, so the existing paywall never regresses before the migration runs.
+async function submitSubscriptionRequest({
+  user, planKey, planName, kind = 'new', extensionDays = null,
+  amountExpected, amountPaid, fields = {}, file,
+}) {
+  const safe = file.name.replace(/[^\w.\-]+/g, '_');
+  const path = `${user.id}/${crypto.randomUUID()}-${safe}`;
+  const { error: upErr } = await supabase.storage.from('enrollment-receipts')
+    .upload(path, file, { upsert: false, contentType: file.type || 'application/octet-stream' });
+  if (upErr) throw upErr;
+
+  const baseRow = {
+    user_id: user.id,
+    plan_key: planKey,
+    plan_name: planName,
+    full_name: (fields.fullName || '').trim() || (user.email || ''),
+    email: user.email,
+    phone: fields.phone?.trim() || null,
+    city_country: fields.cityCountry?.trim() || null,
+    background: fields.background?.trim() || null,
+    amount_expected: Number(amountExpected || 0),
+    amount_paid: Number(amountPaid || 0),
+    payment_reference: fields.reference?.trim() || null,
+    receipt_path: path,
+  };
+  const withKind = { ...baseRow, request_kind: kind, extension_days: kind === 'extension' ? extensionDays : null };
+
+  let res = await supabase.from('enrollment_requests').insert(withKind).select().single();
+  // The request_kind / extension_days columns (db #20) may not exist yet — retry without
+  // them (undefined_column 42703 / PGRST204) so new/renewal/upgrade still submit pre-migration.
+  if (res.error && (res.error.code === '42703' || res.error.code === 'PGRST204')) {
+    res = await supabase.from('enrollment_requests').insert(baseRow).select().single();
+  }
+  const { data: row, error } = res;
+  if (error) {
+    try { await supabase.storage.from('enrollment-receipts').remove([path]); } catch { /* best-effort */ }
+    throw error;
+  }
+
+  // Best-effort admin alert (fire-and-forget; env-gated server-side; never blocks the student).
+  try {
+    const { data: s } = await supabase.auth.getSession();
+    const token = s?.session?.access_token;
+    fetch('/api/notify-enrollment', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify({ action: 'submitted', requestId: row.id }),
+    })
+      .then(r => r.json().catch(() => ({})))
+      .then(j => { if (!j?.ok) console.warn('[enroll] admin email:', j?.skipped || j?.error || 'not sent'); })
+      .catch(() => {});
+  } catch { /* best-effort */ }
+
+  return row;
 }
 
 // The paywall: pricing cards → manual payment instructions + proof-upload form.
@@ -1934,7 +2146,8 @@ function useEnrollmentGate(user, profile, profileReady) {
 // Renewal mode (renewal + currentSub): same flow reused for membership renewals —
 // a banner shows the current/previous term, cards mark the current plan, and an
 // optional onClose renders a Back pill (expired screen / in-app renew overlay).
-function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, onSignOut, renewal, currentSub, onClose }) {
+function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, onSignOut, renewal, currentSub, onClose, mode }) {
+  const isUpgrade = mode === 'upgrade';   // renewal-mode variant: "Upgrade your plan" copy + current-plan lock
   const showNotice = !!priorRequest;   // rejected, expired, or overdue-pending
   const [step, setStep] = useState(showNotice ? 'notice' : 'plans');   // notice | plans | form
   const [plans, setPlans] = useState(ENROLLMENT_PLANS_FALLBACK);
@@ -2004,7 +2217,6 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
     if (!agree) { setErr('Please confirm the checkbox before submitting.'); return; }
 
     setBusy(true);
-    let uploadedPath = null;
     try {
       // An overdue pending request blocks the one-pending-per-user index — the student is
       // allowed (RLS enroll_req_own_expire) to expire their own overdue row and resubmit.
@@ -2023,61 +2235,28 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
         }
       }
 
-      const safe = file.name.replace(/[^\w.\-]+/g, '_');
-      const path = `${user.id}/${crypto.randomUUID()}-${safe}`;
-      const { error: upErr } = await supabase.storage.from('enrollment-receipts')
-        .upload(path, file, { upsert: false, contentType: file.type || 'application/octet-stream' });
-      if (upErr) throw upErr;
-      uploadedPath = path;
+      // In renewal mode, tag the request by the plan the member actually chose: the same
+      // plan is a renewal, a different plan is an upgrade. Fresh signups are always 'new'.
+      const kind = !renewal ? 'new'
+        : (currentSub?.plan_key && selected.key !== currentSub.plan_key) ? 'upgrade' : 'renewal';
 
-      const { data: row, error } = await supabase.from('enrollment_requests').insert({
-        user_id: user.id,
-        plan_key: selected.key,
-        plan_name: selected.name,
-        full_name: fullName.trim(),
-        email: user.email,
-        phone: phone.trim() || null,
-        city_country: cityCountry.trim() || null,
-        background: background.trim() || null,
-        amount_expected: Number(selected.price_php || 0),
-        amount_paid: amt,
-        payment_reference: reference.trim() || null,
-        receipt_path: path,
-      }).select().single();
-      if (error) {
-        // Best-effort cleanup of the orphaned upload (delete-own storage policy covers it).
-        try { await supabase.storage.from('enrollment-receipts').remove([path]); } catch { /* best-effort */ }
-        if (error.code === '23505') {
-          // Double-submit (e.g. two tabs): a pending request already exists — just show it.
-          onSubmitted?.();
-          return;
-        }
-        if (isEnrollmentNotConfiguredErr(error)) throw new Error(ENROLLMENT_SETUP_HINT);
-        throw error;
-      }
-
-      // Best-effort admin alert (fire-and-forget; env-gated server-side).
+      let row;
       try {
-        const { data: s } = await supabase.auth.getSession();
-        const token = s?.session?.access_token;
-        // Non-awaited + non-fatal, but surface the outcome in devtools so a silently
-        // unconfigured/failing admin email isn't invisible (the student is never blocked).
-        fetch('/api/notify-enrollment', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-          body: JSON.stringify({ action: 'submitted', requestId: row.id }),
-        })
-          .then(r => r.json().catch(() => ({})))
-          .then(j => { if (!j?.ok) console.warn('[enroll] admin email:', j?.skipped || j?.error || 'not sent'); })
-          .catch(() => {});
-      } catch { /* best-effort */ }
+        row = await submitSubscriptionRequest({
+          user, planKey: selected.key, planName: selected.name, kind,
+          amountExpected: Number(selected.price_php || 0), amountPaid: amt,
+          fields: { fullName, phone, cityCountry, background, reference }, file,
+        });
+      } catch (insErr) {
+        // Double-submit (e.g. two tabs): a pending request already exists — just show it.
+        if (insErr?.code === '23505') { onSubmitted?.(); return; }
+        if (isEnrollmentNotConfiguredErr(insErr)) throw new Error(ENROLLMENT_SETUP_HINT);
+        throw insErr;   // helper already removed the orphaned upload
+      }
 
       onSubmitted?.(row);   // gate re-renders straight into the pending-review screen
     } catch (e2) {
       console.error('[enroll] submit failed', e2);
-      // If the row insert never happened but the file uploaded, it was already removed above;
-      // any earlier failure leaves nothing behind.
-      if (uploadedPath === null) { /* upload failed — nothing to clean */ }
       setErr(e2?.message || 'Could not submit your enrollment. Please try again.');
     } finally {
       setBusy(false);
@@ -2105,10 +2284,12 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
         <div className="text-center">
           <img src={LOGO_DATA_URI} alt="Toolkits by Alex" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
           <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 24, letterSpacing: '-0.02em', color: C.text }}>
-            {renewal ? 'Renew your membership' : 'Enroll in Toolkits by Alex'}
+            {isUpgrade ? 'Upgrade your plan' : renewal ? 'Renew your membership' : 'Enroll in Toolkits by Alex'}
           </div>
           <div className="mt-1.5 mx-auto" style={{ fontSize: 13.5, color: C.textSoft, maxWidth: 520, lineHeight: 1.55 }}>
-            {renewal
+            {isUpgrade
+              ? 'Pick a higher package, send your payment, and upload the proof — Coach Alex’s team will manually review your upgrade (usually within 24 hours). Any days left on your current plan carry over.'
+              : renewal
               ? 'Pick your next package, send your payment, and upload the proof — Coach Alex’s team will manually review your renewal (usually within 24 hours).'
               : 'Pick your package, send your payment, and upload the proof — Coach Alex’s team will manually review your enrollment (usually within 24 hours).'}
           </div>
@@ -2214,9 +2395,10 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
           </div>
         )}
 
-        {/* Pricing cards */}
+        {/* Pricing cards — flex-wrap (not a grid) so an orphan last row (5 cards in 3
+            columns) centers instead of hugging the left edge. */}
         {step === 'plans' && (
-          <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-3 items-stretch">
+          <div className="mt-8 flex flex-wrap justify-center gap-4 items-stretch">
             {plans.map((p) => {
               const compare = Number(p.compare_at_php || 0);
               const price = Number(p.price_php || 0);
@@ -2224,7 +2406,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
               const pct = save ? Math.round((save / compare) * 100) : 0;
               const featured = !!p.badge;
               return (
-                <div key={p.key} className="rounded-3xl overflow-hidden flex flex-col p-6" style={{
+                <div key={p.key} className="rounded-3xl overflow-hidden flex flex-col p-6 w-full sm:w-[calc(50%-0.5rem)] lg:w-[calc(33.333%-0.67rem)]" style={{
                   ...cardStyle,
                   border: featured ? '1.5px solid rgba(10,132,255,0.40)' : `1px solid ${GLASS.border}`,
                   boxShadow: featured
@@ -2274,13 +2456,21 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
                       </li>
                     ))}
                   </ul>
-                  <button onClick={() => selectPlan(p)}
-                    className="mt-5 w-full py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 transition hover:opacity-95"
-                    style={featured
-                      ? { color: 'white', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }
-                      : { color: C.primary, background: 'rgba(10,132,255,0.07)', border: '1px solid rgba(10,132,255,0.22)' }}>
-                    Enroll — {phpFmt(price)} <ArrowRight size={14} />
-                  </button>
+                  {isUpgrade && currentSub?.plan_key === p.key ? (
+                    <button disabled
+                      className="mt-5 w-full py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2"
+                      style={{ color: C.textMute, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}`, cursor: 'default' }}>
+                      <Check size={14} /> Your current plan
+                    </button>
+                  ) : (
+                    <button onClick={() => selectPlan(p)}
+                      className="mt-5 w-full py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 transition hover:opacity-95"
+                      style={featured
+                        ? { color: 'white', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }
+                        : { color: C.primary, background: 'rgba(10,132,255,0.07)', border: '1px solid rgba(10,132,255,0.22)' }}>
+                      {renewal ? 'Choose' : 'Enroll'} — {phpFmt(price)} <ArrowRight size={14} />
+                    </button>
+                  )}
                 </div>
               );
             })}
@@ -2437,6 +2627,564 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
   );
 }
 
+// ── Account menu + membership modals ─────────────────────────────────────────
+// A SaaS-style account control center for the sidebar identity card. The ⋮ menu opens
+// Profile & Settings / Membership Plan / Upgrade Plan / Extend Access / Log out; each
+// billing action reuses the enrollment request → receipt → admin-approval machinery.
+
+// Small status pill (theme-safe: tone drives text colour, neutral wash background — never
+// string-concats an alpha onto a var token, which the styling conventions forbid).
+function MembershipPill({ label, tone, size = 11 }) {
+  return (
+    <span className="inline-flex items-center px-2 py-0.5 rounded-full font-bold whitespace-nowrap"
+      style={{ fontSize: size, color: tone, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+      {label}
+    </span>
+  );
+}
+
+// Shared centered-dialog shell (backdrop closes · panel stops propagation · Escape closes ·
+// SHEEN header). z-[70] so it sits above the sidebar (z-50) and the account menu (z-50).
+// Shared modal shell — the ONE dialog surface for the whole app (account menu AND the
+// admin approve/reject/receipt modals). Additive props, all defaulted so the original
+// account-menu call sites render unchanged:
+//   tone         'primary' | 'ok' | 'danger' — colors the icon tile (status tokens).
+//   canClose     gates Escape / backdrop / X while an action is in flight.
+//   headerAction extra node rendered between the title block and the X (e.g. a link).
+//   bodyClass / bodyStyle  override the scrollable body's padding/background.
+// Focus management is centralized here: initial focus moves to the panel, Tab is trapped
+// inside it, and focus returns to the opener on unmount.
+const MODAL_TONE_TILE = {
+  primary: { background: 'rgba(10,132,255,0.09)', border: '1px solid rgba(10,132,255,0.20)', color: C.primary },
+  ok: { background: 'var(--status-ok-bg)', border: '1px solid var(--status-ok-bd)', color: 'var(--status-ok-fg)' },
+  danger: { background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)', color: 'var(--status-danger-fg)' },
+};
+function AccountModal({ title, subtitle, icon: Icon, onClose, children, maxW = 'max-w-md',
+  tone = 'primary', canClose = true, headerAction = null, bodyClass = 'px-6 py-5', bodyStyle }) {
+  const panelRef = useRef(null);
+  const close = () => { if (canClose) onClose?.(); };
+  useEffect(() => {
+    const opener = document.activeElement;
+    panelRef.current?.focus();
+    return () => { if (opener && typeof opener.focus === 'function') opener.focus(); };
+  }, []);
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape') { close(); return; }
+      if (e.key !== 'Tab' || !panelRef.current) return;
+      // Minimal focus trap: wrap Tab / Shift+Tab at the panel's ends.
+      const focusables = panelRef.current.querySelectorAll(
+        'button:not([disabled]), [href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      );
+      if (!focusables.length) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (e.shiftKey && (document.activeElement === first || document.activeElement === panelRef.current)) {
+        e.preventDefault(); last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault(); first.focus();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [canClose, onClose]);
+  const tile = MODAL_TONE_TILE[tone] || MODAL_TONE_TILE.primary;
+  return (
+    <div className="fixed inset-0 z-[70] flex items-center justify-center p-4"
+      style={{ background: 'rgba(15,18,23,0.45)', fontFamily: fontBody }} onClick={close}>
+      <div ref={panelRef} tabIndex={-1}
+        className={`w-full ${maxW} rounded-2xl shadow-2xl overflow-hidden max-h-[92vh] flex flex-col outline-none`}
+        style={{ background: C.white, border: `1px solid ${GLASS.border}` }}
+        role="dialog" aria-modal="true" aria-label={title} onClick={e => e.stopPropagation()}>
+        <div className="px-6 pt-5 pb-4 flex items-start gap-3" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+          {Icon && (
+            <div className="flex items-center justify-center rounded-xl flex-shrink-0" style={{ width: 38, height: 38, background: tile.background, border: tile.border }}>
+              <Icon size={18} style={{ color: tile.color }} />
+            </div>
+          )}
+          <div className="flex-1 min-w-0">
+            <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 16, color: C.text }}>{title}</div>
+            {subtitle && <div className="mt-0.5" style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.45 }}>{subtitle}</div>}
+          </div>
+          {headerAction}
+          <button onClick={close} aria-label="Close" disabled={!canClose}
+            className="flex-shrink-0 p-1 rounded-lg transition hover:opacity-70 disabled:opacity-40" style={{ color: C.textMute }}>
+            <X size={18} />
+          </button>
+        </div>
+        <div className={`${bodyClass} overflow-y-auto`} style={bodyStyle}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+// Key/value fact rows used by the profile + membership modals.
+function FactRow({ k, v, mono }) {
+  return (
+    <div className="flex items-center justify-between gap-3 py-1.5" style={{ fontSize: 12.5, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+      <span style={{ color: C.textMute }}>{k}</span>
+      <span className="text-right" style={{ color: C.text, fontWeight: 600, fontFamily: mono ? fontMono : fontBody }}>{v}</span>
+    </div>
+  );
+}
+
+// The sidebar ⋮ account menu. Reuses the house dropdown a11y idiom (Escape + fixed-inset
+// outside-click catcher + role=menu/menuitem + aria-haspopup/expanded + focus restore).
+// placement: 'card' (downward, right-aligned) or 'rail' (flyout to the right of the rail).
+function AccountMenu({ user, profile, sub, latestReq, entitlement, onOpen, onSignOut, placement = 'card', showBilling = true }) {
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => { if (e.key === 'Escape') { setOpen(false); triggerRef.current?.focus(); } };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open]);
+
+  const close = () => { setOpen(false); triggerRef.current?.focus(); };
+  const pick = (view) => { setOpen(false); onOpen?.(view); };
+  const status = membershipStatus(sub, latestReq);
+  const planLabel = entitlement?.label || PLAN_LABELS[sub?.plan_key || profile?.plan] || (sub?.plan_key || profile?.plan) || 'Member';
+  const initial = (((profile?.full_name || user?.email || '?').trim()[0]) || '?').toUpperCase();
+
+  const items = [
+    { view: 'profile', label: 'Profile & Settings', Icon: User },
+    ...(showBilling ? [
+      { view: 'membership', label: 'Membership Plan', Icon: CreditCard },
+      { view: 'upgrade', label: 'Upgrade Plan', Icon: ArrowUpCircle },
+      { view: 'extend', label: 'Extend Access', Icon: CalendarPlus },
+    ] : []),
+  ];
+
+  const panelPos = placement === 'rail'
+    ? 'left-full bottom-0 ml-2'
+    : 'right-0 top-[calc(100%+8px)]';
+
+  return (
+    <div className={`relative ${open ? 'z-[55]' : ''}`}>
+      <button ref={triggerRef} onClick={() => setOpen(o => !o)}
+        aria-haspopup="menu" aria-expanded={open} title="Account"
+        className="flex-shrink-0 p-1.5 rounded-lg transition hover:opacity-80"
+        style={{ color: C.textMute, background: open ? 'var(--wash)' : 'transparent' }}>
+        <MoreHorizontal size={16} />
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-40" aria-hidden="true" onClick={close} />
+          <div role="menu" aria-label="Account menu"
+            className={`absolute ${panelPos} z-50 w-60 rounded-2xl shadow-xl overflow-hidden`}
+            style={{ background: C.white, border: `1px solid ${GLASS.border}`, boxShadow: '0 18px 44px -12px rgba(15,23,42,0.30)' }}>
+            {/* Identity header */}
+            <div className="px-3.5 py-3 flex items-center gap-2.5" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+              <div className="flex items-center justify-center flex-shrink-0 rounded-full text-white text-[12px] font-bold"
+                style={{ width: 34, height: 34, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>{initial}</div>
+              <div className="flex-1 min-w-0">
+                <div className="truncate" style={{ fontSize: 12.5, fontWeight: 700, color: C.text, lineHeight: 1.2 }}>{profile?.full_name || user?.email?.split('@')[0]}</div>
+                <div className="truncate" style={{ fontSize: 10.5, color: C.textMute }}>{user?.email}</div>
+              </div>
+            </div>
+            {showBilling && (
+              <div className="px-3.5 py-2 flex items-center justify-between gap-2" style={{ borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+                <span className="inline-flex items-center gap-1.5 truncate" style={{ fontSize: 11.5, color: C.textSoft }}>
+                  <ShieldCheck size={12} style={{ color: C.textMute }} /> {planLabel}
+                </span>
+                <MembershipPill label={status.label} tone={status.tone} size={10} />
+              </div>
+            )}
+            {/* Items */}
+            <div className="py-1">
+              {items.map(({ view, label, Icon }) => (
+                <button key={view} role="menuitem" onClick={() => pick(view)}
+                  className="w-full flex items-center gap-2.5 px-3.5 py-2 text-left transition hover:bg-[color:var(--wash)]"
+                  style={{ fontSize: 12.5, fontWeight: 600, color: C.text }}>
+                  <Icon size={15} style={{ color: C.textMute }} /> {label}
+                </button>
+              ))}
+              <div className="h-px my-1" style={{ background: GLASS.borderSoft }} />
+              <button role="menuitem" onClick={() => { setOpen(false); onSignOut?.(); }}
+                className="w-full flex items-center gap-2.5 px-3.5 py-2 text-left transition hover:bg-[color:var(--wash)]"
+                style={{ fontSize: 12.5, fontWeight: 600, color: C.red }}>
+                <LogOut size={15} /> Log out
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// Read-only profile / settings (profiles has no user-update RLS policy, so no in-app edit).
+function ProfileSettingsModal({ user, profile, sub, latestReq, entitlement, onOpen, onClose, showBilling = true }) {
+  const a = subAccess(sub);
+  const status = membershipStatus(sub, latestReq);
+  const planLabel = entitlement?.label || PLAN_LABELS[sub?.plan_key || profile?.plan] || (sub?.plan_key || profile?.plan) || '—';
+  return (
+    <AccountModal title="Profile & Settings" subtitle="Your account and membership at a glance" icon={User} onClose={onClose}>
+      <div className="rounded-xl px-3.5 py-1" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+        <FactRow k="Name" v={profile?.full_name || '—'} />
+        <FactRow k="Email" v={user?.email || '—'} />
+        {/* Billing facts are meaningless for admins (no subscription — full access by role),
+            so mirror AccountMenu's showBilling gate and show the role instead. */}
+        {!showBilling && <FactRow k="Role" v="Administrator" />}
+        {showBilling && <FactRow k="Plan" v={planLabel} />}
+        {showBilling && <FactRow k="Status" v={<MembershipPill label={status.label} tone={status.tone} />} />}
+        {showBilling && a.has && <FactRow k="Started" v={fmtEnrollDate(sub?.started_at)} />}
+        {showBilling && a.has && <FactRow k="Expires" v={a.legacy ? 'No expiry' : fmtEnrollDate(a.ends)} />}
+        {showBilling && a.has && !a.legacy && <FactRow k={a.inGrace ? 'Grace ends in' : 'Days remaining'} v={a.daysLeft != null ? `${a.daysLeft} day${a.daysLeft === 1 ? '' : 's'}` : '—'} />}
+        {showBilling && a.inGrace && <FactRow k="Grace ends" v={fmtEnrollDate(a.graceEnds)} />}
+      </div>
+      <p className="mt-4" style={{ fontSize: 11.5, color: C.textMute, lineHeight: 1.5 }}>
+        Need to change your name or email? Contact Coach Alex’s team — profile details are updated by support.
+      </p>
+      {showBilling && (
+        <div className="mt-4 flex items-center justify-end gap-2.5">
+          <button onClick={() => onOpen?.('membership')}
+            className="px-4 py-2 rounded-xl text-sm font-bold text-white transition hover:opacity-95"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -3px var(--primary-glow)` }}>
+            View membership
+          </button>
+        </div>
+      )}
+    </AccountModal>
+  );
+}
+
+// The "Current Membership" center — plan, price, dates, days left, scope + billing CTAs.
+function MembershipPlanModal({ user, profile, sub, latestReq, entitlement, onOpen, onClose }) {
+  const [plan, setPlan] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    const key = sub?.plan_key || profile?.plan;
+    const fb = ENROLLMENT_PLANS_FALLBACK.find(p => p.key === key) || null;
+    setPlan(fb);
+    if (!key) return;
+    (async () => {
+      try {
+        const { data } = await supabase.from('enrollment_plans').select('*').eq('key', key).maybeSingle();
+        if (!cancelled && data) setPlan({ ...data, features: Array.isArray(data.features) ? data.features : [] });
+      } catch { /* fallback already set */ }
+    })();
+    return () => { cancelled = true; };
+  }, [sub?.plan_key, profile?.plan]);
+
+  const a = subAccess(sub);
+  const status = membershipStatus(sub, latestReq);
+  const planLabel = plan?.name || entitlement?.label || PLAN_LABELS[sub?.plan_key || profile?.plan] || (sub?.plan_key || profile?.plan);
+  const chips = Array.isArray(plan?.entitlement_summary) ? plan.entitlement_summary : [];
+  const showRenew = a.has && !a.legacy && (a.inGrace || (a.daysLeft != null && a.daysLeft <= 5));
+
+  return (
+    <AccountModal title="Current Membership" subtitle="Your plan, access period and billing options" icon={CreditCard} onClose={onClose}>
+      {!a.has ? (
+        <div className="text-center py-4">
+          <div className="mx-auto flex items-center justify-center rounded-2xl" style={{ width: 52, height: 52, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <CreditCard size={22} style={{ color: C.textMute }} />
+          </div>
+          <div className="mt-3" style={{ fontSize: 14, fontWeight: 700, color: C.text }}>No active membership</div>
+          <p className="mt-1" style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.5 }}>Choose a plan to unlock the toolkits.</p>
+          <button onClick={() => onOpen?.('upgrade')}
+            className="mt-4 px-4 py-2.5 rounded-xl text-sm font-bold text-white transition hover:opacity-95"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -3px var(--primary-glow)` }}>
+            Choose a plan
+          </button>
+        </div>
+      ) : (
+        <>
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div style={{ fontFamily: fontDisplay, fontWeight: 800, fontSize: 18, color: C.text }}>{planLabel}</div>
+              <div className="mt-0.5" style={{ fontSize: 12, color: C.textSoft }}>{entitlement?.scopeLabel || 'Full toolkit access'}</div>
+            </div>
+            <MembershipPill label={status.label} tone={status.tone} size={11} />
+          </div>
+
+          <div className="mt-4 rounded-xl px-3.5 py-1" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+            {plan?.price_php != null && <FactRow k="Price" v={phpFmt(plan.price_php)} />}
+            {Number(plan?.access_days) > 0 && <FactRow k="Duration" v={`${plan.access_days} days`} />}
+            <FactRow k="Started" v={fmtEnrollDate(sub?.started_at)} />
+            <FactRow k="Expires" v={a.legacy ? 'No expiry' : fmtEnrollDate(a.ends)} />
+            {!a.legacy && <FactRow k={a.inGrace ? 'Grace ends in' : 'Days remaining'} v={a.daysLeft != null ? `${a.daysLeft} day${a.daysLeft === 1 ? '' : 's'}` : '—'} />}
+            {a.inGrace && <FactRow k="Grace ends" v={fmtEnrollDate(a.graceEnds)} />}
+          </div>
+
+          {chips.length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-1.5">
+              {chips.map((c, i) => (
+                <span key={i} className="inline-flex items-center gap-1 px-2 py-1 rounded-lg" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+                  <Check size={10} style={{ color: C.primary }} /> {c}
+                </span>
+              ))}
+            </div>
+          )}
+
+          <div className="mt-5 grid grid-cols-2 gap-2.5">
+            <button onClick={() => onOpen?.('upgrade')}
+              className="px-3 py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-1.5 transition hover:opacity-95"
+              style={{ color: 'white', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -3px var(--primary-glow)` }}>
+              <ArrowUpCircle size={15} /> Upgrade
+            </button>
+            <button onClick={() => onOpen?.('extend')}
+              className="px-3 py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-1.5 transition hover:opacity-90"
+              style={{ color: C.primary, background: 'rgba(10,132,255,0.07)', border: '1px solid rgba(10,132,255,0.22)' }}>
+              <CalendarPlus size={15} /> Extend
+            </button>
+          </div>
+          {showRenew && (
+            <button onClick={() => onOpen?.('upgrade')}
+              className="mt-2.5 w-full px-3 py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-1.5 transition hover:opacity-90"
+              style={{ color: C.textSoft, background: C.white, border: `1px solid ${C.border}` }}>
+              <RefreshCw size={14} /> Renew now
+            </button>
+          )}
+        </>
+      )}
+    </AccountModal>
+  );
+}
+
+// Extend Access — buy more time on the CURRENT plan (min 2 months / 60 days), priced from
+// the plan's own price_php/access_days, with payment proof + admin approval (kind='extension').
+function ExtendAccessModal({ user, profile, sub, latestReq, onClose, onSubmitted }) {
+  const [plan, setPlan] = useState(null);
+  const [pay, setPay] = useState(PAYMENT_SETTINGS_FALLBACK);
+  const [months, setMonths] = useState(2);
+  const [fullName, setFullName] = useState(profile?.full_name || '');
+  const [amountPaid, setAmountPaid] = useState('');
+  const [reference, setReference] = useState('');
+  const [file, setFile] = useState(null);
+  const [agree, setAgree] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const fileRef = useRef(null);
+
+  const planKey = sub?.plan_key || profile?.plan;
+  const pendingLive = latestReq?.status === 'pending_review'
+    && !(latestReq?.expires_at && new Date(latestReq.expires_at) < new Date());
+
+  useEffect(() => {
+    let cancelled = false;
+    setPlan(ENROLLMENT_PLANS_FALLBACK.find(p => p.key === planKey) || null);
+    (async () => {
+      if (planKey) {
+        try {
+          const { data } = await supabase.from('enrollment_plans').select('*').eq('key', planKey).maybeSingle();
+          if (!cancelled && data) setPlan(data);
+        } catch { /* fallback set */ }
+      }
+      try {
+        const { data } = await supabase.from('payment_settings').select('key,value');
+        if (!cancelled && data?.length) setPay(s => ({ ...s, ...Object.fromEntries(data.map(r => [r.key, r.value])) }));
+      } catch { /* fallback set */ }
+    })();
+    return () => { cancelled = true; };
+  }, [planKey]);
+
+  const price = extensionPrice(plan, months);
+  // Auto-fill the "amount paid" with the computed price whenever the duration changes.
+  useEffect(() => { setAmountPaid(String(price.amount || '')); }, [price.amount]);
+
+  const a = subAccess(sub);
+  const nowMs = Date.now();
+  // Match approve_extension(): stack from the current expiry only while it is still in the
+  // future; otherwise (expired / in grace / no term) start from approval time (now).
+  const baseMs = (a.ends && a.ends.getTime() > nowMs) ? a.ends.getTime() : nowMs;
+  const projectedEnd = new Date(baseMs + price.days * 86400000);
+
+  const handleFile = (f) => {
+    setErr('');
+    if (!f) return;
+    if (!/^image\/(png|jpe?g|webp)$|^application\/pdf$/i.test(f.type)) { setErr('Please upload your receipt as a PNG, JPG, WEBP or PDF file.'); return; }
+    if (f.size > 5 * 1024 * 1024) { setErr(`That file is ${(f.size / 1024 / 1024).toFixed(1)} MB — the receipt upload limit is 5 MB.`); return; }
+    setFile(f);
+  };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (busy) return;
+    setErr('');
+    if (!planKey || !plan) { setErr('We couldn’t read your current plan. Please refresh and try again.'); return; }
+    if (!a.has || a.legacy) { setErr('There’s no dated term to extend on this account. Choose or renew a plan instead.'); return; }
+    if (months < 2) { setErr('The minimum extension is 2 months.'); return; }
+    if (months > 12) { setErr('The maximum extension is 12 months — for longer access, renew or upgrade your plan instead.'); return; }
+    if (!fullName.trim()) { setErr('Please enter your full name.'); return; }
+    if (!file) { setErr('Please upload a screenshot or PDF of your payment.'); return; }
+    const amt = Number(amountPaid);
+    if (!amt || amt <= 0) { setErr('Please enter the amount you sent.'); return; }
+    if (!agree) { setErr('Please confirm the checkbox before submitting.'); return; }
+
+    setBusy(true);
+    try {
+      let row;
+      try {
+        row = await submitSubscriptionRequest({
+          user, planKey, planName: plan.name || PLAN_LABELS[planKey] || planKey,
+          kind: 'extension', extensionDays: price.days,
+          amountExpected: price.amount, amountPaid: amt,
+          fields: { fullName, reference }, file,
+        });
+      } catch (insErr) {
+        if (insErr?.code === '23505') { setErr('You already have a request under review. Please wait for it to be reviewed before submitting another.'); setBusy(false); return; }
+        if (isEnrollmentNotConfiguredErr(insErr)) throw new Error(ENROLLMENT_SETUP_HINT);
+        throw insErr;
+      }
+      onSubmitted?.(row);
+    } catch (e2) {
+      console.error('[extend] submit failed', e2);
+      setErr(e2?.message || 'Could not submit your extension. Please try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const inputCls = 'w-full px-3.5 py-2.5 rounded-xl text-sm outline-none transition';
+  const inputStyle = { background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody };
+  const planLabel = plan?.name || PLAN_LABELS[planKey] || planKey || 'your plan';
+
+  return (
+    <AccountModal title="Extend Access" subtitle={`Buy more time on ${planLabel} — no plan change`} icon={CalendarPlus} onClose={onClose} maxW="max-w-lg">
+      {!planKey || !a.has ? (
+        <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+          You don’t have an active plan to extend yet. Choose a plan first — then you can top up more time here.
+        </p>
+      ) : a.legacy ? (
+        <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+          Your membership has no expiry date, so there’s nothing to extend — you already have open-ended access.
+        </p>
+      ) : pendingLive ? (
+        <div className="flex items-start gap-2.5 px-3.5 py-3 rounded-xl" style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)' }}>
+          <Clock size={16} className="flex-shrink-0 mt-px" style={{ color: 'var(--status-warn-strong-fg)' }} />
+          <div style={{ fontSize: 12.5, color: C.text, lineHeight: 1.5 }}>
+            <span style={{ fontWeight: 700 }}>You already have a request under review.</span> Please wait for Coach Alex’s team to review it before submitting another — this keeps your requests from clashing.
+          </div>
+        </div>
+      ) : (
+        <form onSubmit={submit}>
+          {/* Current term */}
+          <div className="rounded-xl px-3.5 py-1" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <FactRow k="Current plan" v={planLabel} />
+            <FactRow k="Current expiry" v={a.legacy ? 'No expiry' : fmtEnrollDate(a.ends)} />
+          </div>
+
+          {/* Duration */}
+          <div className="mt-4">
+            <label className="block mb-1.5" style={{ fontSize: 12, fontWeight: 600, color: C.textSoft }}>How much time to add?</label>
+            <div className="flex items-center gap-2 flex-wrap">
+              {[2, 3, 6].map(m => (
+                <button key={m} type="button" onClick={() => setMonths(m)}
+                  className="px-3.5 py-2 rounded-xl text-sm font-bold transition"
+                  style={months === m
+                    ? { color: 'white', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35)` }
+                    : { color: C.textSoft, background: C.white, border: `1px solid ${C.border}` }}>
+                  {m} months
+                </button>
+              ))}
+              <div className="inline-flex items-center gap-1.5 px-2 py-1 rounded-xl" style={{ background: C.white, border: `1px solid ${C.border}` }}>
+                <span style={{ fontSize: 11.5, color: C.textMute }}>Custom</span>
+                <input type="number" min="2" max="12" step="1" value={months}
+                  onChange={e => setMonths(Math.min(12, Math.max(2, Math.round(Number(e.target.value) || 2))))}
+                  className="w-14 px-2 py-1 rounded-lg text-sm outline-none" style={{ ...inputStyle, fontFamily: fontMono }} />
+                <span style={{ fontSize: 11.5, color: C.textMute }}>mo</span>
+              </div>
+            </div>
+            <div className="mt-1.5" style={{ fontSize: 11, color: C.textMute }}>Minimum 2 months (60 days).</div>
+          </div>
+
+          {/* Price + projection */}
+          <div className="mt-4 rounded-xl px-4 py-3.5" style={{ background: 'rgba(10,132,255,0.05)', border: '1px solid rgba(10,132,255,0.16)' }}>
+            <div className="flex items-baseline justify-between gap-3">
+              <span style={{ fontSize: 12.5, color: C.textSoft }}>Amount to send</span>
+              <span style={{ fontFamily: fontDisplay, fontWeight: 800, fontSize: 24, color: C.text }}>{phpFmt(price.amount)}</span>
+            </div>
+            <div className="mt-1.5 flex items-center gap-1.5" style={{ fontSize: 12, color: C.textSoft }}>
+              <CalendarClock size={13} style={{ color: C.primary }} />
+              Adds <b style={{ color: C.text }}>{price.days} days</b> · access until <b style={{ color: C.text }}>{fmtEnrollDate(projectedEnd)}</b> <span style={{ color: C.textMute }}>(+ 3-day grace)</span>
+            </div>
+          </div>
+
+          {/* Payment instructions */}
+          <div className="mt-4 rounded-xl overflow-hidden" style={{ border: `1px solid ${GLASS.borderSoft}` }}>
+            <div className="px-3.5 py-2" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}`, fontSize: 12.5, fontWeight: 700, color: C.text }}>How to pay</div>
+            <div className="px-3.5 py-1">
+              {[['BPI', pay.bpi, Landmark], ['Security Bank', pay.security_bank, Landmark], ['GCash', pay.gcash, Phone], ['Account name', pay.account_name, Wallet]]
+                .filter(([, v]) => v).map(([k, v, Icon]) => (
+                  <div key={k} className="flex items-center justify-between gap-3 py-2" style={{ borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+                    <span className="inline-flex items-center gap-2" style={{ fontSize: 12, color: C.textSoft }}><Icon size={13} style={{ color: C.textMute }} /> {k}</span>
+                    <span style={{ fontFamily: fontMono, fontSize: 12.5, fontWeight: 600, color: C.text }}>{v}</span>
+                  </div>
+                ))}
+            </div>
+          </div>
+
+          {/* Details + receipt */}
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <div>
+              <label className="block mb-1.5" style={{ fontSize: 12, fontWeight: 600, color: C.textSoft }}>Full name *</label>
+              <input className={inputCls} style={inputStyle} value={fullName} onChange={e => setFullName(e.target.value)} placeholder="Juan dela Cruz" required />
+            </div>
+            <div>
+              <label className="block mb-1.5" style={{ fontSize: 12, fontWeight: 600, color: C.textSoft }}>Amount paid (₱) *</label>
+              <input className={inputCls} style={{ ...inputStyle, fontFamily: fontMono }} type="number" min="1" step="any" value={amountPaid} onChange={e => setAmountPaid(e.target.value)} required />
+            </div>
+            <div className="sm:col-span-2">
+              <label className="block mb-1.5" style={{ fontSize: 12, fontWeight: 600, color: C.textSoft }}>Payment reference no.</label>
+              <input className={inputCls} style={{ ...inputStyle, fontFamily: fontMono }} value={reference} onChange={e => setReference(e.target.value)} placeholder="e.g. GCash ref. 9001234567" />
+            </div>
+          </div>
+
+          <div className="mt-3">
+            <label className="block mb-1.5" style={{ fontSize: 12, fontWeight: 600, color: C.textSoft }}>Screenshot of payment *</label>
+            <div role="button" tabIndex={0} aria-label="Upload payment screenshot or PDF"
+              onClick={() => fileRef.current?.click()}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileRef.current?.click(); } }}
+              onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
+              onDrop={(e) => { e.preventDefault(); e.stopPropagation(); handleFile(e.dataTransfer.files?.[0]); }}
+              className="rounded-2xl p-5 text-center cursor-pointer transition"
+              style={{ border: `2px dashed ${file ? 'rgba(40,166,71,0.45)' : 'rgba(10,132,255,0.30)'}`, background: file ? 'rgba(40,166,71,0.05)' : 'rgba(10,132,255,0.03)' }}>
+              <input ref={fileRef} type="file" className="hidden" accept=".pdf,.png,.jpg,.jpeg,.webp,application/pdf,image/png,image/jpeg,image/webp"
+                onChange={(e) => { handleFile(e.target.files?.[0]); e.target.value = ''; }} />
+              {file ? (
+                <div className="flex items-center justify-center gap-2" style={{ fontSize: 13, fontWeight: 600, color: 'var(--status-ok-fg)' }}>
+                  <CheckCircle2 size={16} /> {file.name} <span style={{ color: C.textMute, fontWeight: 500 }}>· {(file.size / 1024 / 1024).toFixed(1)} MB</span>
+                </div>
+              ) : (
+                <>
+                  <Upload size={20} className="mx-auto" style={{ color: C.primary }} />
+                  <div className="mt-1.5" style={{ fontSize: 12.5, fontWeight: 600, color: C.text }}>Click to upload or drag & drop</div>
+                  <div className="mt-0.5" style={{ fontSize: 11, color: C.textMute }}>PDF, PNG, JPG or WEBP · up to 5 MB</div>
+                </>
+              )}
+            </div>
+          </div>
+
+          <label className="mt-3 flex items-start gap-2.5 cursor-pointer select-none">
+            <input type="checkbox" checked={agree} onChange={e => setAgree(e.target.checked)} className="mt-0.5" />
+            <span style={{ fontSize: 12, color: C.textSoft, lineHeight: 1.5 }}>
+              I confirm I sent <span style={{ fontWeight: 700, color: C.text }}>{phpFmt(Number(amountPaid) || price.amount)}</span> to one of the accounts above, and I understand my extra time is added after Coach Alex’s team verifies my payment.
+            </span>
+          </label>
+
+          {err && (
+            <div className="mt-3 flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs" style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: '1px solid rgba(208,35,35,0.18)' }}>
+              <AlertTriangle size={14} className="flex-shrink-0 mt-px" /> <span>{err}</span>
+            </div>
+          )}
+
+          <button type="submit" disabled={busy}
+            className="mt-4 w-full py-3 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
+            {busy ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
+            {busy ? 'Submitting…' : `Submit — ${phpFmt(price.amount)}`}
+          </button>
+          <p className="mt-2 text-center" style={{ fontSize: 11, color: C.textMute }}>
+            Manual review — your access keeps running while we verify (usually within 24 hours).
+          </p>
+        </form>
+      )}
+    </AccountModal>
+  );
+}
+
 // "Payment under review" screen — shown after submitting (and, with finalizing=true,
 // during the brief window where the request is approved but the profile flip hasn't
 // landed yet). renewal=true swaps the copy for a membership renewal (an expired member
@@ -2520,7 +3268,10 @@ function EnrollmentPendingScreen({ request, finalizing, renewal, email, uid, onS
         <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
           <img src={LOGO_DATA_URI} alt="Toolkits by Alex" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
           <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>
-            {finalizing ? 'Approved — finalizing your access…' : renewal ? 'Renewal Under Review' : 'Payment Under Review'}
+            {finalizing ? 'Approved — finalizing your access…'
+              : request?.request_kind === 'extension' ? 'Extension Under Review'
+              : request?.request_kind === 'upgrade' ? 'Upgrade Under Review'
+              : renewal ? 'Renewal Under Review' : 'Payment Under Review'}
           </div>
           <div className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>Toolkits by Alex</div>
         </div>
@@ -2610,10 +3361,14 @@ function EnrollmentPendingScreen({ request, finalizing, renewal, email, uid, onS
 // no live renewal under review. Full-screen block (same pattern as the pending screen)
 // with a Renew CTA that hands off to the paywall in renewal mode. Prior history stays
 // visible: the ended term's details render here; past requests remain in the DB.
-function MembershipExpiredScreen({ sub, latestReq, email, uid, onRenew, onSignOut, onRefreshProfile, onRefreshRequest }) {
+function MembershipExpiredScreen({ user, profile, sub, latestReq, email, uid, onRenew, onSignOut, onRefreshProfile, onRefreshRequest }) {
+  const [extendOpen, setExtendOpen] = useState(false);
   const acc = subAccess(sub);
   const planName = sub ? (PLAN_LABELS[sub.plan_key] || sub.plan_key) : null;
-  const endedDaysAgo = acc.ends ? Math.max(0, Math.floor((Date.now() - acc.ends.getTime()) / 86400000)) : null;
+  // Access actually stops at the grace end when a grace window was granted, else at the
+  // term end — measure "N days ago" from whichever locked the account.
+  const lockedAt = acc.graceEnds || acc.ends;
+  const endedDaysAgo = lockedAt ? Math.max(0, Math.floor((Date.now() - lockedAt.getTime()) / 86400000)) : null;
   // Only a REJECTED renewal attempt (newer than the ended term) is worth surfacing here.
   const rejectedRenewal = latestReq?.status === 'rejected' && sub?.started_at &&
     new Date(latestReq.created_at) > new Date(sub.started_at) ? latestReq : null;
@@ -2682,7 +3437,7 @@ function MembershipExpiredScreen({ sub, latestReq, email, uid, onRenew, onSignOu
         <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
           <img src={LOGO_DATA_URI} alt="Toolkits by Alex" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
           <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>
-            Your membership has ended
+            Membership limit reached
           </div>
           <div className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>Toolkits by Alex</div>
         </div>
@@ -2699,9 +3454,9 @@ function MembershipExpiredScreen({ sub, latestReq, email, uid, onRenew, onSignOu
 
           <p className="mt-5 text-center" style={{ fontSize: 13.5, color: C.textSoft, lineHeight: 1.6 }}>
             {planName
-              ? <>Your <span style={{ fontWeight: 600, color: C.text }}>{planName}</span> access{acc.ends ? <> ended on <span style={{ fontWeight: 600, color: C.text }}>{fmtEnrollDate(sub.ends_at)}</span>{endedDaysAgo != null && endedDaysAgo > 0 ? ` (${endedDaysAgo} day${endedDaysAgo === 1 ? '' : 's'} ago)` : ' (today)'}</> : ' has ended'}.</>
+              ? <>Your <span style={{ fontWeight: 600, color: C.text }}>{planName}</span> access{acc.ends ? <> ended on <span style={{ fontWeight: 600, color: C.text }}>{fmtEnrollDate(sub.ends_at)}</span></> : ' has ended'}{acc.graceEnds ? <>, and the 3-day grace period ended on <span style={{ fontWeight: 600, color: C.text }}>{fmtEnrollDate(sub.grace_ends_at)}</span></> : ''}{endedDaysAgo != null && endedDaysAgo > 0 ? ` (${endedDaysAgo} day${endedDaysAgo === 1 ? '' : 's'} ago)` : ''}.</>
               : 'Your membership access has ended.'}
-            {' '}Renew to pick up right where you left off — all your progress and data are safe.
+            {' '}Renew or upgrade your subscription to continue — all your progress and data are safe.
           </p>
 
           {rejectedRenewal && (
@@ -2718,7 +3473,8 @@ function MembershipExpiredScreen({ sub, latestReq, email, uid, onRenew, onSignOu
             <div className="mt-4 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
               {[['Plan', planName],
                 ['Started', fmtEnrollDate(sub.started_at)],
-                ['Ended', sub.ends_at ? fmtEnrollDate(sub.ends_at) : '—']].map(([k, v]) => (
+                ['Ended', sub.ends_at ? fmtEnrollDate(sub.ends_at) : '—'],
+                ...(acc.graceEnds ? [['Grace ended', fmtEnrollDate(sub.grace_ends_at)]] : [])].map(([k, v]) => (
                 <div key={k} className="flex items-center justify-between gap-3 py-1" style={{ fontSize: 12.5 }}>
                   <span style={{ color: C.textMute }}>{k}</span>
                   <span className="text-right" style={{ color: C.text, fontWeight: 600 }}>{v}</span>
@@ -2743,8 +3499,16 @@ function MembershipExpiredScreen({ sub, latestReq, email, uid, onRenew, onSignOu
           <button onClick={onRenew}
             className="mt-5 w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition hover:opacity-95"
             style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
-            <RefreshCw size={15} /> Renew your membership
+            <RefreshCw size={15} /> Renew or upgrade
           </button>
+
+          {sub?.plan_key && (
+            <button onClick={() => setExtendOpen(true)}
+              className="mt-2.5 w-full py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 transition hover:opacity-90"
+              style={{ background: 'rgba(10,132,255,0.07)', border: '1px solid rgba(10,132,255,0.22)', color: C.primary }}>
+              <CalendarPlus size={15} /> Extend the same plan
+            </button>
+          )}
 
           <button onClick={check} disabled={checking}
             className="mt-2.5 w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition hover:opacity-90 disabled:opacity-60"
@@ -2764,6 +3528,12 @@ function MembershipExpiredScreen({ sub, latestReq, email, uid, onRenew, onSignOu
           </p>
         </div>
       </div>
+
+      {extendOpen && (
+        <ExtendAccessModal user={user} profile={profile} sub={sub} latestReq={latestReq}
+          onClose={() => setExtendOpen(false)}
+          onSubmitted={(row) => { setExtendOpen(false); onRefreshRequest?.(row); }} />
+      )}
     </div>
   );
 }
@@ -2842,6 +3612,21 @@ export default function BookkeeperProToolkit() {
   // paywall handoff; reset on submit).
   const enroll = useEnrollmentGate(user, profile, profileReady);
   const [renewNow, setRenewNow] = useState(false);
+  // Sidebar account menu → which membership modal/overlay is open (null when closed).
+  // 'profile' | 'membership' | 'extend' | 'upgrade'. Kept at the shell so the modals read
+  // the already-loaded enroll.sub / enroll.latestReq / entitlement without refetching.
+  const [accountView, setAccountView] = useState(null);
+  // Plan-based entitlement (which stages/tabs this user may open). Non-admins under an
+  // enforced enrollment resolve to their plan's scope; admins + flag-off dev mode get
+  // FULL. Keyed on primitives so the object identity is stable across unrelated
+  // re-renders (does not break the memoized TabPanel perf contract). `sub.plan_key`
+  // wins over `profile.plan` — the dated subscription is the authoritative term.
+  // The gate holds AuthSplash until enroll.ready and only 'pass' reaches the shell, so
+  // enroll.sub is already loaded here — the sidebar never flashes the full nav.
+  const entitlement = useMemo(
+    () => (enroll.active ? planEntitlement(enroll.sub?.plan_key || profile?.plan || null) : FULL_ENTITLEMENT),
+    [enroll.active, enroll.sub?.plan_key, profile?.plan]
+  );
   const initialRouteRef = useRef(null);
   if (!initialRouteRef.current) initialRouteRef.current = readAppRoute();
 
@@ -2903,7 +3688,9 @@ export default function BookkeeperProToolkit() {
     window.storage.get('nav:lastTab')
       .then(r => {
         const saved = r?.value;
-        if (active && saved && VALID_APP_TABS.has(saved) && saved !== tab) setTab(saved, { replace: true });
+        // Skip a stale last-tab their plan can't open (the chokepoint would show the
+        // upsell) — leave them on the Dashboard instead. Chokepoint is the real guard.
+        if (active && saved && VALID_APP_TABS.has(saved) && saved !== tab && entitlement.allowsTab(saved)) setTab(saved, { replace: true });
       })
       .catch(() => {});
     return () => { active = false; };
@@ -3065,6 +3852,10 @@ export default function BookkeeperProToolkit() {
   // admin-controlled via Supabase `sidebar_settings` (see labelByKey/draftLabels below).
   // ─────────────────────────────────────────────────────────────
   const [stages, setStages] = useState(DEFAULT_STAGES);
+  // Sidebar as this user may see it — drops stages/tabs their plan can't open. Admins &
+  // full-access plans get `stages` unchanged (so Customize/drag-reorder — admin-only — is
+  // unaffected). Both sidebar passes (rail + expanded) render this.
+  const visibleStages = useMemo(() => filterStagesForEntitlement(stages, entitlement), [stages, entitlement]);
   const [collapsedStages, setCollapsedStages] = useState(new Set());
   const [expandedGroups, setExpandedGroups] = useState(new Set());
   const [editMode, setEditMode] = useState(false);
@@ -3607,7 +4398,7 @@ export default function BookkeeperProToolkit() {
           // one-pending unique index before the renewal insert.
           const prior = r && (r.status === 'rejected' || r.status === 'expired' || overdue) ? r : null;
           if (!renewNow) {
-            return <MembershipExpiredScreen sub={enroll.sub} latestReq={r} email={user?.email}
+            return <MembershipExpiredScreen user={user} profile={profile} sub={enroll.sub} latestReq={r} email={user?.email}
               uid={user?.id} onRenew={() => setRenewNow(true)} onSignOut={signOut}
               onRefreshProfile={refreshProfile} onRefreshRequest={enroll.refresh} />;
           }
@@ -3641,6 +4432,7 @@ export default function BookkeeperProToolkit() {
   // Theme (data-theme) lives on <html> — set by the index.html boot script + useTheme.
   // Global styles/tokens live in src/index.css (moved out of the old in-shell <style>).
   return (
+    <EntitlementContext.Provider value={entitlement}>
     <div style={{ fontFamily: fontBody, color: C.text }} className="h-screen w-full flex overflow-hidden gh-app-bg">
       {showWelcome && <WelcomeOverlay name={profile?.full_name || user?.email} onClose={dismissWelcome} />}
 
@@ -3733,12 +4525,28 @@ export default function BookkeeperProToolkit() {
                 <div className="truncate" style={{ fontSize: 10, color: C.textMute, lineHeight: 1.3 }}>{user.email}</div>
               </div>
               <ThemeToggle pref={themePref} onCycle={cycleTheme} />
-              <button onClick={() => signOut()} title="Sign out"
-                className="flex-shrink-0 p-1.5 rounded-lg transition hover:opacity-80" style={{ color: C.textMute }}>
-                <LogOut size={15} />
-              </button>
+              <AccountMenu placement="card" user={user} profile={profile} sub={enroll.sub}
+                latestReq={enroll.latestReq} entitlement={entitlement}
+                showBilling={!profile?.is_admin}
+                onOpen={setAccountView} onSignOut={signOut} />
             </div>
           )}
+
+          {/* Compact membership expiry — non-admin members with a dated term. Exact date, no
+              vague "2 months". Amber ≤5d / red ≤3d — matches membershipStatus + MembershipPanel
+              (the student-facing 5/3 policy; the admin Enrollments strip keeps its own 14-day
+              lead-time view). Hidden for admins + legacy/no-expiry. */}
+          {user && !profile?.is_admin && (() => {
+            const a = subAccess(enroll.sub);
+            if (!a.has || a.legacy || !a.valid) return null;
+            const tone = a.daysLeft != null && a.daysLeft <= 3 ? C.red : a.daysLeft != null && a.daysLeft <= 5 ? C.amber : C.textMute;
+            return (
+              <div className="mt-2 flex items-center gap-1.5 px-2.5" style={{ fontSize: 10.5, color: C.textMute }}>
+                <CalendarClock size={12} style={{ color: tone, flexShrink: 0 }} />
+                <span className="truncate">Access until <span style={{ fontWeight: 600, color: C.textSoft }}>{fmtEnrollDate(a.ends)}</span>{a.daysLeft != null ? <span style={{ color: tone }}> · {a.daysLeft}d left</span> : ''}</span>
+              </div>
+            );
+          })()}
 
           {/* Access Requests — admin only (temporary approval workflow). Badge = pending count. */}
           {isAdmin && (
@@ -3855,10 +4663,10 @@ export default function BookkeeperProToolkit() {
                   {(((profile?.full_name || user.email || '?').trim()[0]) || '?').toUpperCase()}
                 </div>
                 <ThemeToggle pref={themePref} onCycle={cycleTheme} />
-                <button onClick={() => signOut()} title="Sign out" aria-label="Sign out"
-                  className="flex-shrink-0 p-1.5 rounded-lg transition hover:opacity-80" style={{ color: C.textMute }}>
-                  <LogOut size={15} />
-                </button>
+                <AccountMenu placement="rail" user={user} profile={profile} sub={enroll.sub}
+                  latestReq={enroll.latestReq} entitlement={entitlement}
+                  showBilling={!profile?.is_admin}
+                  onOpen={setAccountView} onSignOut={signOut} />
               </div>
             )}
           </div>
@@ -3905,7 +4713,7 @@ export default function BookkeeperProToolkit() {
                 )}
               </a>
             )}
-            {stages.map((stage, sIdx) => {
+            {visibleStages.map((stage, sIdx) => {
               const hasNumber = !!stage.number;
               const containsActive = stage.tabs.some(t => t.id === tab);
               return (
@@ -3958,7 +4766,7 @@ export default function BookkeeperProToolkit() {
         )}
 
         <nav className={`flex-1 py-2 overflow-y-auto ${railCollapsed ? 'lg:hidden' : ''}`}>
-          {stages.map((stage, sIdx) => {
+          {visibleStages.map((stage, sIdx) => {
             const containsActive = stage.tabs.some(t => t.id === tab);
             const isCollapsed = collapsedStages.has(stage.id);
             const hasNumber = !!stage.number;
@@ -4222,22 +5030,58 @@ export default function BookkeeperProToolkit() {
             Bookkeeper Toolkits
           </div>
         </div>
-        {/* Phase 2 paywall hooks here — to restrict to paid students, wrap the
-            <TabPanel> so that `!profile?.is_paid && !FREE_TABS.has(tabId)` renders a
-            <PaywallOverlay/> instead of the tool. profile.is_paid comes from useAuth(). */}
+        {/* Entitlement chokepoint — the SINGLE enforcement point for plan-based access.
+            A disallowed tab reached ANY way (deep-link seed, popstate, stale nav:lastTab,
+            programmatic goto, the mockinterview alias) renders RestrictedTab instead of the
+            tool, so the sidebar/tile hiding above is pure UX. Admins & full-access plans
+            allow every tab (entitlement.full → allowsTab always true). RestrictedTab is kept
+            OUT of TabPanel's memoized prop set, so hidden panels still skip root re-renders. */}
         {Array.from(visitedTabs).map(tabId => (
-          <TabPanel
-            key={tabId}
-            tabId={tabId}
-            active={tabId === tab}
-            goto={setTab}
-            onAccessCount={refreshPendingCount}
-            onEnrollCount={refreshEnrollPendingCount}
-            interviewSub={tabId === 'interview' ? (interviewSubRoute || undefined) : undefined}
-          />
+          entitlement.allowsTab(tabId) ? (
+            <TabPanel
+              key={tabId}
+              tabId={tabId}
+              active={tabId === tab}
+              goto={setTab}
+              onAccessCount={refreshPendingCount}
+              onEnrollCount={refreshEnrollPendingCount}
+              interviewSub={tabId === 'interview' ? (interviewSubRoute || undefined) : undefined}
+            />
+          ) : (
+            <RestrictedTab key={tabId} active={tabId === tab} goto={setTab} />
+          )
         ))}
       </main>
+
+      {/* Account menu surfaces — read the already-loaded gate state (no refetch). Extend/
+          upgrade route through the enrollment request → admin-approval flow; a member keeps
+          full access while a request is pending. Billing views (membership/extend/upgrade)
+          are short-circuited for admins — same rule as AccountMenu's showBilling — so no
+          future menu regression can reopen billing UI for an account with no subscription. */}
+      {accountView === 'profile' && (
+        <ProfileSettingsModal user={user} profile={profile} sub={enroll.sub} latestReq={enroll.latestReq}
+          entitlement={entitlement} onOpen={setAccountView} onClose={() => setAccountView(null)}
+          showBilling={!profile?.is_admin} />
+      )}
+      {accountView === 'membership' && !profile?.is_admin && (
+        <MembershipPlanModal user={user} profile={profile} sub={enroll.sub} latestReq={enroll.latestReq}
+          entitlement={entitlement} onOpen={setAccountView} onClose={() => setAccountView(null)} />
+      )}
+      {accountView === 'extend' && !profile?.is_admin && (
+        <ExtendAccessModal user={user} profile={profile} sub={enroll.sub} latestReq={enroll.latestReq}
+          onClose={() => setAccountView(null)}
+          onSubmitted={(row) => { setAccountView(null); enroll.refresh(row); }} />
+      )}
+      {accountView === 'upgrade' && !profile?.is_admin && (
+        <div className="fixed inset-0 z-[70] gh-app-bg" style={{ background: C.bg }}>
+          <EnrollmentPaywall user={user} profile={profile} renewal mode="upgrade" currentSub={enroll.sub}
+            onClose={() => setAccountView(null)}
+            onSubmitted={(row) => { setAccountView(null); enroll.refresh(row); }}
+            onSignOut={signOut} />
+        </div>
+      )}
     </div>
+    </EntitlementContext.Provider>
   );
 }
 
@@ -4259,6 +5103,117 @@ function isApprovalNotConfiguredErr(e) {
     /approval_status|does not exist|schema cache|could not find|relation/i.test(e?.message || '');
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// SHARED ADMIN UI — building blocks used by BOTH admin screens
+// (AccessRequests + AdminEnrollments) so they read as one surface:
+// same chips, banners, skeletons, identity cells, and action buttons.
+// All colors come from theme tokens — nothing here breaks in dark mode.
+// ═══════════════════════════════════════════════════════════════════
+
+// Solid approve/reject button styles — gradient endpoints + glows are tokens
+// (--green-hi/--c-green/--green-glow, --red-hi/--c-red/--red-glow), never literal hex.
+const ADMIN_BTN_OK = {
+  background: 'linear-gradient(180deg, var(--green-hi), var(--c-green))',
+  boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--green-glow)',
+};
+const ADMIN_BTN_DANGER = {
+  background: 'linear-gradient(180deg, var(--red-hi), var(--c-red))',
+  boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.25), 0 4px 12px -2px var(--red-glow)',
+};
+
+// Success / error banner with a dismiss control (status-token colors end to end).
+function AdminNotice({ kind = 'ok', children, onDismiss }) {
+  const ok = kind === 'ok';
+  const fg = ok ? 'var(--status-ok-fg)' : 'var(--status-danger-fg)';
+  const Icon = ok ? CheckCircle2 : AlertTriangle;
+  return (
+    <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border"
+      style={{ background: ok ? 'var(--status-ok-bg)' : 'var(--status-danger-bg)', borderColor: ok ? 'var(--status-ok-bd)' : 'var(--status-danger-bd)' }}>
+      <Icon size={18} className="mt-0.5 flex-shrink-0" style={{ color: fg }} />
+      <div className="text-sm flex-1" style={{ color: C.text }}>{children}</div>
+      {onDismiss && (
+        <button onClick={onDismiss} aria-label="Dismiss" className="flex-shrink-0 transition hover:opacity-70" style={{ color: fg }}>
+          <X size={16} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+// Filter chip with a count badge — the one chip style for every admin filter row.
+function AdminFilterChip({ active, label, count, countStyle, title, onClick }) {
+  return (
+    <button onClick={onClick} title={title}
+      className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition"
+      style={active
+        ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)' }
+        : { background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+      {label}
+      {count != null && (
+        <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold"
+          style={active ? { background: 'rgba(255,255,255,0.25)', color: 'white' } : countStyle}>
+          {count}
+        </span>
+      )}
+    </button>
+  );
+}
+
+// Small uppercase caption above a chip group ("Requests" / "Memberships").
+function AdminFilterCaption({ children }) {
+  return (
+    <span className="flex-shrink-0" style={{ fontSize: 10.5, fontWeight: 700, color: C.textMute, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+      {children}
+    </span>
+  );
+}
+
+// First-load skeleton — shaped like the real cards so the list doesn't jump when data lands.
+// Used ONLY while loading with nothing to show; a refresh keeps the existing list on screen.
+function AdminListSkeleton({ rows = 4 }) {
+  return (
+    <div className="mt-5 space-y-2.5 animate-pulse" aria-hidden="true">
+      {Array.from({ length: rows }, (_, i) => (
+        <div key={i} className="glass-card p-4 flex items-center gap-4">
+          <div className="rounded-full flex-shrink-0" style={{ width: 40, height: 40, background: 'var(--wash-strong)' }} />
+          <div className="flex-1 min-w-0">
+            <div className="rounded" style={{ height: 12, width: '38%', maxWidth: 220, background: 'var(--wash-strong)' }} />
+            <div className="mt-2 rounded" style={{ height: 10, width: '55%', maxWidth: 320, background: 'var(--wash)' }} />
+          </div>
+          <div className="rounded-full flex-shrink-0" style={{ height: 22, width: 76, background: 'var(--wash)' }} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Avatar-initial + name (+ optional badges) + email + meta line — the shared identity
+// block at the head of every admin row. Rendered as TWO grid/flex items (avatar, text)
+// via a fragment.
+function AdminUserCell({ name, email, meta, badges }) {
+  const initial = (((name || email || '?').trim()[0]) || '?').toUpperCase();
+  return (
+    <>
+      <div className="flex items-center justify-center flex-shrink-0 rounded-full text-white text-sm font-bold"
+        style={{ width: 40, height: 40, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+        {initial}
+      </div>
+      <div className="min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="truncate" style={{ fontWeight: 700, fontSize: 14, color: C.text }}>
+            {name || email?.split('@')[0] || 'Unknown'}
+          </span>
+          {badges}
+        </div>
+        <div className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{email}</div>
+        {meta && (
+          <div className="mt-1 flex items-center gap-3 flex-wrap" style={{ fontSize: 11, color: C.textMute }}>{meta}</div>
+        )}
+      </div>
+    </>
+  );
+}
+
 function AccessRequests({ onCountChange }) {
   const { user, profile } = useAuth();
   const isAdmin = !!profile?.is_admin;
@@ -4272,15 +5227,6 @@ function AccessRequests({ onCountChange }) {
   const [notice, setNotice] = useState('');
   const [rejectFor, setRejectFor] = useState(null);       // row pending rejection (modal)
   const [rejectReason, setRejectReason] = useState('');
-
-  // Close the reject modal on Escape (matches the other modals/menus in the app). Don't close
-  // mid-request — wait until the approve/reject call settles (busyId cleared).
-  useEffect(() => {
-    if (!rejectFor) return;
-    const onKey = (e) => { if (e.key === 'Escape' && busyId == null) { setRejectFor(null); setRejectReason(''); } };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [rejectFor, busyId]);
 
   const load = async () => {
     setLoading(true); setErr(''); setNotConfigured(false);
@@ -4386,7 +5332,6 @@ function AccessRequests({ onCountChange }) {
     return isNaN(d) ? '—' : d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
   };
   const signupMethod = (r) => (r.avatar_url ? 'Google' : 'Email');
-  const initialOf = (r) => (((r.full_name || r.email || '?').trim()[0]) || '?').toUpperCase();
 
   const STATUS_STYLE = {
     pending:  { label: 'Pending',  bg: 'var(--status-warn-bg)',   bd: 'var(--status-warn-bd)',   fg: 'var(--status-warn-fg)' },
@@ -4423,23 +5368,11 @@ function AccessRequests({ onCountChange }) {
 
       {/* Filter tabs */}
       <div className="mt-6 flex flex-wrap items-center gap-2">
-        {[['pending', 'Pending'], ['approved', 'Approved'], ['rejected', 'Rejected']].map(([key, label]) => {
-          const active = filter === key;
-          const s = STATUS_STYLE[key];
-          return (
-            <button key={key} onClick={() => setFilter(key)}
-              className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition"
-              style={active
-                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)` }
-                : { background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
-              {label}
-              <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold"
-                style={active ? { background: 'rgba(255,255,255,0.25)', color: 'white' } : { background: s.bg, color: s.fg }}>
-                {counts[key]}
-              </span>
-            </button>
-          );
-        })}
+        {[['pending', 'Pending'], ['approved', 'Approved'], ['rejected', 'Rejected']].map(([key, label]) => (
+          <AdminFilterChip key={key} active={filter === key} label={label} count={counts[key]}
+            countStyle={{ background: STATUS_STYLE[key].bg, color: STATUS_STYLE[key].fg }}
+            onClick={() => setFilter(key)} />
+        ))}
         <div className="flex-1" />
         <button onClick={load} disabled={loading}
           className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition disabled:opacity-60"
@@ -4449,20 +5382,8 @@ function AccessRequests({ onCountChange }) {
       </div>
 
       {/* Notices */}
-      {notice && (
-        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: 'var(--status-ok-bg)', borderColor: 'var(--status-ok-bd)' }}>
-          <CheckCircle2 size={18} className="text-emerald-600 mt-0.5 flex-shrink-0" />
-          <div className="text-sm text-emerald-800 flex-1">{notice}</div>
-          <button onClick={() => setNotice('')} className="text-emerald-500 hover:text-emerald-700"><X size={16} /></button>
-        </div>
-      )}
-      {err && (
-        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: 'var(--status-danger-bg)', borderColor: 'var(--status-danger-bd)' }}>
-          <AlertTriangle size={18} className="text-red-500 mt-0.5 flex-shrink-0" />
-          <div className="text-sm text-red-700 flex-1">{err}</div>
-          <button onClick={() => setErr('')} className="text-red-400 hover:text-red-600"><X size={16} /></button>
-        </div>
-      )}
+      {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
+      {err && <AdminNotice kind="error" onDismiss={() => setErr('')}>{err}</AdminNotice>}
 
       {/* Body */}
       {notConfigured ? (
@@ -4471,11 +5392,8 @@ function AccessRequests({ onCountChange }) {
           <div className="mt-3" style={{ fontWeight: 700, fontSize: 15, color: C.text }}>Finish backend setup</div>
           <div className="mt-1.5" style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>{APPROVAL_SETUP_HINT}</div>
         </div>
-      ) : loading ? (
-        <div className="mt-10 flex flex-col items-center justify-center" style={{ color: C.textMute }}>
-          <Loader2 size={24} className="animate-spin" style={{ color: C.primary }} />
-          <div className="mt-3 text-sm">Loading users…</div>
-        </div>
+      ) : loading && rows.length === 0 ? (
+        <AdminListSkeleton />
       ) : visible.length === 0 ? (
         <div className="mt-6 rounded-2xl border-2 border-dashed p-12 text-center" style={{ borderColor: C.border, color: C.textMute }}>
           <Hourglass size={26} className="mx-auto" style={{ color: C.textMute }} />
@@ -4488,34 +5406,26 @@ function AccessRequests({ onCountChange }) {
             const status = r.approval_status || 'pending';
             const rowBusy = busyId === r.id;
             return (
-              <div key={r.id} className="glass-card p-4 flex flex-wrap items-center gap-4">
-                <div className="flex items-center justify-center flex-shrink-0 rounded-full text-white text-sm font-bold"
-                  style={{ width: 40, height: 40, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
-                  {initialOf(r)}
+              <div key={r.id} className="glass-card p-4 grid grid-cols-[auto,minmax(0,1fr)] md:grid-cols-[auto,minmax(0,1fr),auto,auto] gap-x-4 gap-y-2.5 items-center">
+                <AdminUserCell name={r.full_name} email={r.email} meta={<>
+                  <span className="inline-flex items-center gap-1"><Mail size={11} /> {signupMethod(r)}</span>
+                  <span className="inline-flex items-center gap-1"><Clock size={11} /> {fmtDate(r.created_at)}</span>
+                </>} />
+                <div className="col-start-2 md:col-start-3 justify-self-start md:justify-self-end">
+                  <StatusPill status={status} />
                 </div>
-                <div className="flex-1 min-w-[180px]">
-                  <div className="truncate" style={{ fontWeight: 700, fontSize: 14, color: C.text }}>
-                    {r.full_name || r.email?.split('@')[0] || 'Unknown'}
-                  </div>
-                  <div className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{r.email}</div>
-                  <div className="mt-1 flex items-center gap-3 flex-wrap" style={{ fontSize: 11, color: C.textMute }}>
-                    <span className="inline-flex items-center gap-1"><Mail size={11} /> {signupMethod(r)}</span>
-                    <span className="inline-flex items-center gap-1"><Clock size={11} /> {fmtDate(r.created_at)}</span>
-                  </div>
-                </div>
-                <StatusPill status={status} />
-                <div className="flex items-center gap-2">
+                <div className="col-start-2 md:col-start-4 flex items-center gap-2">
                   {status !== 'approved' && (
                     <button onClick={() => approve(r)} disabled={rowBusy}
                       className="px-3.5 py-2 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 transition disabled:opacity-60"
-                      style={{ background: `linear-gradient(180deg, #34C759, #28A647)`, boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px rgba(40,166,71,0.4)' }}>
+                      style={ADMIN_BTN_OK}>
                       {rowBusy ? <Loader2 size={14} className="animate-spin" /> : <UserCheck size={14} />} Approve
                     </button>
                   )}
                   {status !== 'rejected' && (
                     <button onClick={() => openReject(r)} disabled={rowBusy}
                       className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
-                      style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: '1px solid rgba(208,35,35,0.20)' }}>
+                      style={{ background: 'var(--status-danger-bg)', color: 'var(--status-danger-fg)', border: '1px solid var(--status-danger-bd)' }}>
                       <UserX size={14} /> Reject
                     </button>
                   )}
@@ -4526,48 +5436,34 @@ function AccessRequests({ onCountChange }) {
         </div>
       )}
 
-      {/* Reject confirmation modal */}
+      {/* Reject confirmation modal — shared AccountModal shell (dialog a11y, focus trap,
+          Escape/backdrop gated on busyId via canClose, dark-mode surface). */}
       {rejectFor && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(15,18,23,0.45)' }}
-          onClick={() => { if (busyId == null) { setRejectFor(null); setRejectReason(''); } }}>
-          <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
-            <div className="px-6 pt-6 pb-4" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
-              <div className="flex items-center gap-2.5">
-                <div className="flex items-center justify-center rounded-xl flex-shrink-0" style={{ width: 38, height: 38, background: 'rgba(208,35,35,0.10)', border: '1px solid rgba(208,35,35,0.22)' }}>
-                  <UserX size={18} style={{ color: C.red }} />
-                </div>
-                <div>
-                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 16, color: C.text }}>Reject this user?</div>
-                  <div className="truncate" style={{ fontSize: 12.5, color: C.textSoft, maxWidth: 300 }}>{rejectFor.email}</div>
-                </div>
-              </div>
-            </div>
-            <div className="px-6 py-5">
-              <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
-                They’ll be blocked from the dashboard and shown the “Access Request Not Approved” screen. You can approve them again later.
-              </p>
-              <label className="block mt-4 mb-1.5" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
-                Reason (optional — shown to the user)
-              </label>
-              <textarea value={rejectReason} onChange={e => setRejectReason(e.target.value)} rows={3}
-                placeholder="e.g. We couldn’t verify your details. Please reach out to re-apply."
-                className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
-                style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
-              <div className="mt-5 flex items-center justify-end gap-2.5">
-                <button onClick={() => { setRejectFor(null); setRejectReason(''); }} disabled={busyId != null}
-                  className="px-4 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-60"
-                  style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
-                  Cancel
-                </button>
-                <button onClick={confirmReject} disabled={busyId != null}
-                  className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
-                  style={{ background: `linear-gradient(180deg, #E04545, ${C.red})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.25), 0 4px 12px -2px var(--red-glow)` }}>
-                  {busyId != null ? <Loader2 size={15} className="animate-spin" /> : <UserX size={15} />} Reject user
-                </button>
-              </div>
-            </div>
+        <AccountModal title="Reject this user?" subtitle={rejectFor.email} icon={UserX} tone="danger"
+          canClose={busyId == null} onClose={() => { setRejectFor(null); setRejectReason(''); }}>
+          <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+            They’ll be blocked from the dashboard and shown the “Access Request Not Approved” screen. You can approve them again later.
+          </p>
+          <label className="block mt-4 mb-1.5" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+            Reason (optional — shown to the user)
+          </label>
+          <textarea value={rejectReason} onChange={e => setRejectReason(e.target.value)} rows={3}
+            placeholder="e.g. We couldn’t verify your details. Please reach out to re-apply."
+            className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
+            style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button onClick={() => { setRejectFor(null); setRejectReason(''); }} disabled={busyId != null}
+              className="px-4 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-60"
+              style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+              Cancel
+            </button>
+            <button onClick={confirmReject} disabled={busyId != null}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
+              style={ADMIN_BTN_DANGER}>
+              {busyId != null ? <Loader2 size={15} className="animate-spin" /> : <UserX size={15} />} Reject user
+            </button>
           </div>
-        </div>
+        </AccountModal>
       )}
     </div>
   );
@@ -4595,7 +5491,7 @@ function AdminEnrollments({ onCountChange }) {
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState('');
   const [notConfigured, setNotConfigured] = useState(false);
-  const [filter, setFilter] = useState('pending');   // pending | overdue | renewals | approved | rejected | expired | active | expiring | ended
+  const [filter, setFilter] = useState('pending');   // pending | overdue | renewals | approved | rejected | expired | active | expiring | grace | ended
   const [busyId, setBusyId] = useState(null);
   const [notice, setNotice] = useState('');
   const [approveFor, setApproveFor] = useState(null);   // row pending approval (confirm modal)
@@ -4614,18 +5510,6 @@ function AdminEnrollments({ onCountChange }) {
   const soundOnRef = useRef(false);
   const audioCtxRef = useRef(null);
   const [testingEmail, setTestingEmail] = useState(false);   // "Test email" diagnostic busy state
-
-  // Close any open modal on Escape (matches AccessRequests). Not mid-request.
-  useEffect(() => {
-    if (!rejectFor && !approveFor && !receiptView) return;
-    const onKey = (e) => {
-      if (e.key === 'Escape' && busyId == null) {
-        setRejectFor(null); setRejectReason(''); setApproveFor(null); setReceiptView(null);
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [rejectFor, approveFor, receiptView, busyId]);
 
   const load = async (silent = false) => {
     if (!silent) { setLoading(true); }
@@ -4837,28 +5721,35 @@ function AdminEnrollments({ onCountChange }) {
     setBusyId(r.id); setErr(''); setNotice('');
     const nowIso = new Date().toISOString();
     try {
-      // ① Subscription term — the lifecycle RPC grants a DATED term in one transaction
-      //    (extends from the current expiry on early renewals, supersedes the old active
-      //    row, stamps ends_at from the plan's access_days; idempotent per request_id).
+      // ① Subscription term. An EXTENSION adds extra days on the member's SAME plan via
+      //    approve_extension(); every other kind (new / renewal / upgrade) grants the
+      //    plan's full term via approve_subscription(). Both run in ONE transaction server-
+      //    side (extend from the current expiry, supersede the old active row, stamp a
+      //    3-day grace, idempotent per request_id). A client-side fallback replicates each
+      //    when the RPC/migration is absent so the fallback still grants a proper DATED term.
+      const isExtension = r.request_kind === 'extension' && Number(r.extension_days) > 0;
       let subNote = '', grantedEndsAt;
-      const rpc = await supabase.rpc('approve_subscription', {
-        p_user_id: r.user_id, p_plan_key: r.plan_key, p_request_id: r.id,
-      });
+      const rpc = isExtension
+        ? await supabase.rpc('approve_extension', { p_user_id: r.user_id, p_request_id: r.id, p_days: Number(r.extension_days) })
+        : await supabase.rpc('approve_subscription', { p_user_id: r.user_id, p_plan_key: r.plan_key, p_request_id: r.id });
       if (rpc.error) {
         if (!isEnrollmentNotConfiguredErr(rpc.error)) throw rpc.error;
-        // Lifecycle migration not run (or a transient schema-cache miss) — replicate the
-        // RPC client-side so even the fallback grants a proper DATED term, never a
-        // no-expiry lifetime row or a zero-day renewal. Extend from the current valid
-        // term; skip if this exact request already granted the active row (retry-safe).
         const prev = subsByUser[r.user_id] || null;
         if (prev?.status === 'active' && prev.request_id === r.id) {
           grantedEndsAt = prev.ends_at ?? undefined;
         } else {
-          const accessDays = Number(plansByKey[r.plan_key]?.access_days) || null;
+          // Extension keeps the current plan + adds extension_days; others use the plan's
+          // access_days. Both extend from the current valid expiry (else from now).
+          const planForTerm = isExtension ? (prev?.plan_key || r.plan_key) : r.plan_key;
+          // Clamp to approve_extension()'s 60–365 bound (#21) so the fallback never grants
+          // more (or less) than the RPC would accept from a tampered extension_days.
+          const termDays = isExtension
+            ? Math.min(365, Math.max(60, Number(r.extension_days)))
+            : (Number(plansByKey[r.plan_key]?.access_days) || null);
           const prevAcc = subAccess(prev);
           const baseMs = (prev?.status === 'active' && prevAcc.valid && prev.ends_at)
             ? new Date(prev.ends_at).getTime() : Date.now();
-          grantedEndsAt = accessDays ? new Date(baseMs + accessDays * 86400000).toISOString() : null;
+          grantedEndsAt = termDays ? new Date(baseMs + termDays * 86400000).toISOString() : null;
           if (prev?.status === 'active') {
             const sup = await supabase.from('subscriptions')
               .update({ status: 'expired', updated_at: nowIso })
@@ -4866,15 +5757,18 @@ function AdminEnrollments({ onCountChange }) {
             if (sup.error) throw sup.error;
           }
           const fullRow = {
-            user_id: r.user_id, plan_key: r.plan_key, status: 'active',
-            started_at: nowIso, ends_at: grantedEndsAt, approved_by: user?.id || null,
+            user_id: r.user_id, plan_key: planForTerm, status: 'active',
+            started_at: nowIso, ends_at: grantedEndsAt,
+            // Mirror approve_subscription()'s 3-day grace so the fallback matches the RPC.
+            grace_ends_at: grantedEndsAt ? new Date(new Date(grantedEndsAt).getTime() + 3 * 86400000).toISOString() : null,
+            approved_by: user?.id || null,
             request_id: r.id, renewed_from_subscription_id: prev?.id || null, updated_at: nowIso,
           };
           let ins = await supabase.from('subscriptions').insert(fullRow).select('ends_at');
           if (ins.error && isEnrollmentNotConfiguredErr(ins.error)) {
             // Pre-lifecycle subscriptions table lacks ends_at/etc — minimal legacy insert.
             ins = await supabase.from('subscriptions').insert({
-              user_id: r.user_id, plan_key: r.plan_key, status: 'active',
+              user_id: r.user_id, plan_key: planForTerm, status: 'active',
               started_at: nowIso, approved_by: user?.id || null, request_id: r.id,
             }).select('id');
             grantedEndsAt = undefined;
@@ -5040,22 +5934,35 @@ function AdminEnrollments({ onCountChange }) {
   const latestReqIdByUser = {};
   for (const row of rows) if (!latestReqIdByUser[row.user_id]) latestReqIdByUser[row.user_id] = row.id;
   const isLatestOf = (r) => latestReqIdByUser[r.user_id] === r.id;
-  const memberActive = (r) => isLatestOf(r) && subAccess(subOf(r)).valid;
+  // The request's kind for the card badge. Explicit request_kind (db #20) wins; legacy rows
+  // without the column fall back to the renewal-by-lineage inference.
+  const kindOf = (r) => {
+    if (r.request_kind && r.request_kind !== 'new') return r.request_kind;   // renewal | upgrade | extension
+    return isRenewalReq(r) ? 'renewal' : 'new';
+  };
+  // Grace is an EXCLUSIVE bucket: an in-grace member is technically still valid/active,
+  // so it's carved out of both memberActive and memberExpiring to avoid double-counting.
+  const memberInGrace = (r) => isLatestOf(r) && subAccess(subOf(r)).inGrace;
+  const memberActive = (r) => { const a = subAccess(subOf(r)); return isLatestOf(r) && a.valid && !a.inGrace; };
   const memberExpiring = (r) => {
     const a = subAccess(subOf(r));
-    return isLatestOf(r) && a.valid && !a.legacy && a.daysLeft != null && a.daysLeft <= 14;
+    return isLatestOf(r) && a.valid && !a.legacy && !a.inGrace && a.daysLeft != null && a.daysLeft <= 14;
   };
   const memberEnded = (r) => {
     const a = subAccess(subOf(r));
     return isLatestOf(r) && a.has && a.expired;
   };
-  // "Approve will grant access until…" — mirrors approve_subscription(): extend from a
-  // still-running dated term, otherwise start from now. null = plan has no duration.
+  // "Approve will grant access until…" — mirrors approve_subscription()/approve_extension():
+  // extend from a still-running dated term, otherwise start from now. An extension request
+  // adds its OWN extension_days; every other kind adds the plan's access_days. null = no
+  // duration (a lifetime plan).
+  const extDaysOf = (r) => (r.request_kind === 'extension' && Number(r.extension_days) > 0 ? Number(r.extension_days) : 0);
   const projectedEnd = (r) => {
-    const days = Number(plansByKey[r.plan_key]?.access_days);
+    const days = extDaysOf(r) || Number(plansByKey[r.plan_key]?.access_days);
     if (!days) return null;
     const a = subAccess(subOf(r));
-    const base = a.valid && !a.legacy && a.ends ? a.ends.getTime() : Date.now();
+    const endsMs = a.ends ? a.ends.getTime() : 0;
+    const base = endsMs > Date.now() ? endsMs : Date.now();
     return new Date(base + days * 86400000);
   };
 
@@ -5063,33 +5970,40 @@ function AdminEnrollments({ onCountChange }) {
     pending: rows.filter(r => r.status === 'pending_review').length,
     overdue: rows.filter(isOverdue).length,
     renewals: rows.filter(isRenewalReq).length,
+    upgrades: rows.filter(r => r.status === 'pending_review' && kindOf(r) === 'upgrade').length,
+    extensions: rows.filter(r => r.status === 'pending_review' && kindOf(r) === 'extension').length,
     approved: rows.filter(r => r.status === 'approved').length,
     rejected: rows.filter(r => r.status === 'rejected').length,
     expired: rows.filter(r => r.status === 'expired').length,
     active: rows.filter(memberActive).length,
     expiring: rows.filter(memberExpiring).length,
+    grace: rows.filter(memberInGrace).length,
     ended: rows.filter(memberEnded).length,
   };
   const visible = rows.filter(r =>
     filter === 'pending' ? r.status === 'pending_review'
     : filter === 'overdue' ? isOverdue(r)
     : filter === 'renewals' ? isRenewalReq(r)
+    : filter === 'upgrades' ? (r.status === 'pending_review' && kindOf(r) === 'upgrade')
+    : filter === 'extensions' ? (r.status === 'pending_review' && kindOf(r) === 'extension')
     : filter === 'active' ? memberActive(r)
     : filter === 'expiring' ? memberExpiring(r)
+    : filter === 'grace' ? memberInGrace(r)
     : filter === 'ended' ? memberEnded(r)
     : r.status === filter);
-
-  const initialOf = (r) => (((r.full_name || r.email || '?').trim()[0]) || '?').toUpperCase();
 
   const STATUS_STYLE = {
     pending_review: { label: 'Pending',  bg: 'var(--status-warn-bg)',        bd: 'var(--status-warn-bd)',        fg: 'var(--status-warn-fg)' },
     overdue:        { label: 'Overdue',  bg: 'var(--status-warn-strong-bg)', bd: 'var(--status-warn-strong-bd)', fg: 'var(--status-warn-strong-fg)' },
     renewals:       { label: 'Renewal',  bg: 'var(--status-info-bg)',        bd: 'var(--status-info-bd)',        fg: 'var(--status-info-fg)' },
+    upgrades:       { label: 'Upgrade',  bg: 'var(--status-info-bg)',        bd: 'var(--status-info-bd)',        fg: 'var(--status-info-fg)' },
+    extensions:     { label: 'Extension',bg: 'var(--status-ok-bg)',          bd: 'var(--status-ok-bd)',          fg: 'var(--status-ok-fg)' },
     approved:       { label: 'Approved', bg: 'var(--status-ok-bg)',          bd: 'var(--status-ok-bd)',          fg: 'var(--status-ok-fg)' },
     rejected:       { label: 'Rejected', bg: 'var(--status-danger-bg)',      bd: 'var(--status-danger-bd)',      fg: 'var(--status-danger-fg)' },
     expired:        { label: 'Expired',  bg: 'var(--status-neutral-bg)',     bd: 'var(--status-neutral-bd)',     fg: 'var(--status-neutral-fg)' },
     active:         { label: 'Active',   bg: 'var(--status-ok-bg)',          bd: 'var(--status-ok-bd)',          fg: 'var(--status-ok-fg)' },
     expiring:       { label: 'Expiring', bg: 'var(--status-warn-bg)',        bd: 'var(--status-warn-bd)',        fg: 'var(--status-warn-fg)' },
+    grace:          { label: 'In grace', bg: 'var(--status-warn-strong-bg)', bd: 'var(--status-warn-strong-bd)', fg: 'var(--status-warn-strong-fg)' },
     ended:          { label: 'Ended',    bg: 'var(--status-danger-bg)',      bd: 'var(--status-danger-bd)',      fg: 'var(--status-danger-fg)' },
   };
   const StatusPill = ({ request }) => {
@@ -5156,27 +6070,25 @@ function AdminEnrollments({ onCountChange }) {
     <div>
       <SectionHead eyebrow="Admin" title="Enrollments" desc="Manual payment review — verify a student’s payment proof, then approve to unlock their toolkit, or reject with a reason so they can resubmit." gold />
 
-      {/* Filter tabs (payment requests · memberships) + sound toggle/test + refresh */}
+      {/* Toolbar — two labeled rows so twelve filters stay scannable: payment REQUESTS
+          on the first line, MEMBERSHIP lifecycle + utilities on the second. */}
       <div className="mt-6 flex flex-wrap items-center gap-2">
-        {[['pending', 'Pending'], ['overdue', 'Overdue'], ['renewals', 'Renewals'], ['approved', 'Approved'], ['rejected', 'Rejected'], ['expired', 'Expired'],
-          null,   // divider: requests | memberships
-          ['active', 'Active'], ['expiring', 'Expiring soon'], ['ended', 'Ended']].map((entry, i) => {
-          if (!entry) return <span key={`div-${i}`} className="mx-1 self-stretch" style={{ width: 1, background: C.border }} />;
-          const [key, label] = entry;
-          const active = filter === key;
+        <AdminFilterCaption>Requests</AdminFilterCaption>
+        {[['pending', 'Pending'], ['overdue', 'Overdue'], ['renewals', 'Renewals'], ['upgrades', 'Upgrades'], ['extensions', 'Extensions'], ['approved', 'Approved'], ['rejected', 'Rejected'], ['expired', 'Expired']].map(([key, label]) => {
           const s = STATUS_STYLE[key === 'pending' ? 'pending_review' : key];
           return (
-            <button key={key} onClick={() => setFilter(key)}
-              className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition"
-              style={active
-                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)` }
-                : { background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
-              {label}
-              <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold"
-                style={active ? { background: 'rgba(255,255,255,0.25)', color: 'white' } : { background: s.bg, color: s.fg }}>
-                {counts[key]}
-              </span>
-            </button>
+            <AdminFilterChip key={key} active={filter === key} label={label} count={counts[key]}
+              countStyle={{ background: s.bg, color: s.fg }} onClick={() => setFilter(key)} />
+          );
+        })}
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <AdminFilterCaption>Memberships</AdminFilterCaption>
+        {[['active', 'Active', null], ['expiring', 'Expiring ≤ 14d', 'Memberships ending within 14 days — admin lead time (students see warnings at 5 and 3 days)'], ['grace', 'In grace', null], ['ended', 'Ended', null]].map(([key, label, title]) => {
+          const s = STATUS_STYLE[key];
+          return (
+            <AdminFilterChip key={key} active={filter === key} label={label} count={counts[key]} title={title || undefined}
+              countStyle={{ background: s.bg, color: s.fg }} onClick={() => setFilter(key)} />
           );
         })}
         <div className="flex-1" />
@@ -5184,7 +6096,7 @@ function AdminEnrollments({ onCountChange }) {
           title={soundOn ? 'Sound alert on new submissions: ON' : 'Sound alert on new submissions: OFF'}
           className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition"
           style={soundOn
-            ? { background: 'rgba(10,132,255,0.08)', color: C.primary, border: '1px solid rgba(10,132,255,0.22)' }
+            ? { background: 'var(--primary-tint)', color: C.primary, border: '1px solid var(--primary-selection)' }
             : { background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
           {soundOn ? <Bell size={14} /> : <BellOff size={14} />} {soundOn ? 'Sound on' : 'Sound off'}
         </button>
@@ -5248,20 +6160,8 @@ function AdminEnrollments({ onCountChange }) {
       </div>
 
       {/* Notices */}
-      {notice && (
-        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: 'var(--status-ok-bg)', borderColor: 'var(--status-ok-bd)' }}>
-          <CheckCircle2 size={18} className="text-emerald-600 mt-0.5 flex-shrink-0" />
-          <div className="text-sm text-emerald-800 flex-1">{notice}</div>
-          <button onClick={() => setNotice('')} className="text-emerald-500 hover:text-emerald-700"><X size={16} /></button>
-        </div>
-      )}
-      {err && (
-        <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border" style={{ background: 'var(--status-danger-bg)', borderColor: 'var(--status-danger-bd)' }}>
-          <AlertTriangle size={18} className="text-red-500 mt-0.5 flex-shrink-0" />
-          <div className="text-sm text-red-700 flex-1">{err}</div>
-          <button onClick={() => setErr('')} className="text-red-400 hover:text-red-600"><X size={16} /></button>
-        </div>
-      )}
+      {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
+      {err && <AdminNotice kind="error" onDismiss={() => setErr('')}>{err}</AdminNotice>}
 
       {/* Body */}
       {notConfigured ? (
@@ -5270,11 +6170,8 @@ function AdminEnrollments({ onCountChange }) {
           <div className="mt-3" style={{ fontWeight: 700, fontSize: 15, color: C.text }}>Finish backend setup</div>
           <div className="mt-1.5" style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>{ENROLLMENT_SETUP_HINT}</div>
         </div>
-      ) : loading ? (
-        <div className="mt-10 flex flex-col items-center justify-center" style={{ color: C.textMute }}>
-          <Loader2 size={24} className="animate-spin" style={{ color: C.primary }} />
-          <div className="mt-3 text-sm">Loading enrollment requests…</div>
-        </div>
+      ) : loading && rows.length === 0 ? (
+        <AdminListSkeleton />
       ) : visible.length === 0 ? (
         <div className="mt-6 rounded-2xl border-2 border-dashed p-12 text-center" style={{ borderColor: C.border, color: C.textMute }}>
           <Receipt size={26} className="mx-auto" style={{ color: C.textMute }} />
@@ -5283,6 +6180,7 @@ function AdminEnrollments({ onCountChange }) {
                 renewals: 'No renewal requests waiting for review.', approved: 'No approved enrollment requests.',
                 rejected: 'No rejected enrollment requests.', expired: 'No expired enrollment requests.',
                 active: 'No active memberships.', expiring: 'No memberships expiring in the next 14 days.',
+                grace: 'No memberships in their grace period.',
                 ended: 'No ended memberships.' })[filter]}
           </div>
           {filter === 'pending' && <div className="mt-1 text-xs">New payment-proof submissions will appear here for review.</div>}
@@ -5309,30 +6207,36 @@ function AdminEnrollments({ onCountChange }) {
             const expanded = expandedId === r.id;
             return (
               <div key={r.id} className="glass-card p-4">
-                <div className="flex flex-wrap items-center gap-4">
-                  <div className="flex items-center justify-center flex-shrink-0 rounded-full text-white text-sm font-bold"
-                    style={{ width: 40, height: 40, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
-                    {initialOf(r)}
-                  </div>
-                  <div className="flex-1 min-w-[200px]">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="truncate" style={{ fontWeight: 700, fontSize: 14, color: C.text }}>
-                        {r.full_name || r.email?.split('@')[0] || 'Unknown'}
-                      </span>
+                <div className="grid grid-cols-[auto,minmax(0,1fr)] lg:grid-cols-[auto,minmax(0,1fr),auto,auto,auto] gap-x-4 gap-y-2.5 items-center">
+                  <AdminUserCell name={r.full_name} email={r.email}
+                    badges={<>
                       {grantIncomplete && (
-                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold" style={{ background: 'rgba(208,35,35,0.10)', color: C.red, border: '1px solid rgba(208,35,35,0.26)' }}>
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold" style={{ background: 'var(--status-danger-bg)', color: 'var(--status-danger-fg)', border: '1px solid var(--status-danger-bd)' }}>
                           grant incomplete — Approve again
                         </span>
                       )}
-                      {isRenewalReq(r) && (
-                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold inline-flex items-center gap-1" style={{ background: 'rgba(10,132,255,0.10)', color: C.primary, border: '1px solid rgba(10,132,255,0.25)' }}>
-                          <RefreshCw size={9} /> Renewal
-                        </span>
-                      )}
+                      {(() => {
+                        const kind = kindOf(r);
+                        if (kind === 'upgrade') return (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold inline-flex items-center gap-1" style={{ background: 'var(--status-info-bg)', color: 'var(--status-info-fg)', border: '1px solid var(--status-info-bd)' }}>
+                            <ArrowUpCircle size={9} /> Upgrade
+                          </span>
+                        );
+                        if (kind === 'extension') return (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold inline-flex items-center gap-1" style={{ background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)', border: '1px solid var(--status-ok-bd)' }}>
+                            <CalendarPlus size={9} /> Extension{Number(r.extension_days) > 0 ? ` · ${Math.round(r.extension_days / 30)} mo` : ''}
+                          </span>
+                        );
+                        if (kind === 'renewal') return (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold inline-flex items-center gap-1" style={{ background: 'var(--status-info-bg)', color: 'var(--status-info-fg)', border: '1px solid var(--status-info-bd)' }}>
+                            <RefreshCw size={9} /> Renewal
+                          </span>
+                        );
+                        return null;
+                      })()}
                       <NotifyBadge request={r} />
-                    </div>
-                    <div className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{r.email}</div>
-                    <div className="mt-1 flex items-center gap-3 flex-wrap" style={{ fontSize: 11, color: C.textMute }}>
+                    </>}
+                    meta={<>
                       {r.phone && <span className="inline-flex items-center gap-1"><Phone size={11} /> {r.phone}</span>}
                       {r.city_country && <span className="inline-flex items-center gap-1"><Globe size={11} /> {r.city_country}</span>}
                       <span className="inline-flex items-center gap-1"><Clock size={11} /> {fmtEnrollDate(r.created_at)}</span>
@@ -5341,10 +6245,14 @@ function AdminEnrollments({ onCountChange }) {
                           <Hourglass size={11} /> {daysInfo(r)}
                         </span>
                       )}
-                    </div>
-                  </div>
-                  <div className="min-w-[150px]">
+                    </>} />
+                  <div className="col-start-2 lg:col-start-3 min-w-[150px]">
                     <div style={{ fontSize: 12, fontWeight: 700, color: C.text }}>{r.plan_name || PLAN_LABELS[r.plan_key] || r.plan_key}</div>
+                    {!planEntitlement(r.plan_key).full && (
+                      <div className="inline-flex items-center gap-1 mt-0.5 mb-0.5 px-1.5 py-0.5 rounded-md" style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', fontSize: 10, fontWeight: 600, color: 'var(--status-warn-fg)' }}>
+                        <Lock size={10} /> {planEntitlement(r.plan_key).scopeLabel}
+                      </div>
+                    )}
                     <div style={{ fontFamily: fontMono, fontSize: 13, fontWeight: 700, color: C.text }}>{phpFmt(r.amount_paid)}</div>
                     {amountMismatch && (
                       <div style={{ fontSize: 10.5, fontWeight: 600, color: 'var(--status-warn-fg)' }}>expected {phpFmt(r.amount_expected)}</div>
@@ -5355,26 +6263,28 @@ function AdminEnrollments({ onCountChange }) {
                       </div>
                     )}
                   </div>
-                  <StatusPill request={r} />
-                  <div className="flex items-center gap-2 flex-wrap">
+                  <div className="col-start-2 lg:col-start-4 justify-self-start lg:justify-self-end">
+                    <StatusPill request={r} />
+                  </div>
+                  <div className="col-start-2 lg:col-start-5 flex items-center gap-2 flex-wrap">
                     {r.receipt_path && (
                       <button onClick={() => viewReceipt(r)} disabled={rowBusy}
                         className="px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
-                        style={{ background: 'rgba(10,132,255,0.07)', color: C.primary, border: '1px solid rgba(10,132,255,0.20)' }}>
+                        style={{ background: 'var(--primary-tint)', color: C.primary, border: '1px solid var(--primary-selection)' }}>
                         <Eye size={14} /> Receipt
                       </button>
                     )}
                     {(r.status !== 'approved' || grantIncomplete) && (
                       <button onClick={() => setApproveFor(r)} disabled={rowBusy}
                         className="px-3.5 py-2 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 transition disabled:opacity-60"
-                        style={{ background: `linear-gradient(180deg, #34C759, #28A647)`, boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px rgba(40,166,71,0.4)' }}>
+                        style={ADMIN_BTN_OK}>
                         {rowBusy ? <Loader2 size={14} className="animate-spin" /> : <UserCheck size={14} />} Approve
                       </button>
                     )}
                     {r.status === 'pending_review' && (
                       <button onClick={() => { setRejectFor(r); setRejectReason(''); }} disabled={rowBusy}
                         className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
-                        style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: '1px solid rgba(208,35,35,0.20)' }}>
+                        style={{ background: 'var(--status-danger-bg)', color: 'var(--status-danger-fg)', border: '1px solid var(--status-danger-bd)' }}>
                         <UserX size={14} /> Reject
                       </button>
                     )}
@@ -5400,21 +6310,31 @@ function AdminEnrollments({ onCountChange }) {
                   if (!s) return null;
                   const a = subAccess(s);
                   const mPlan = plansByKey[s.plan_key];
-                  const daysPast = !a.legacy && a.ends ? Math.max(0, Math.floor((Date.now() - a.ends.getTime()) / 86400000)) : null;
-                  const mStyle = a.valid
-                    ? (!a.legacy && a.daysLeft != null && a.daysLeft <= 14 ? STATUS_STYLE.expiring : STATUS_STYLE.active)
+                  const ent = planEntitlement(s.plan_key);
+                  // Access stops at the grace end when granted, else the term end.
+                  const lockedAt = a.graceEnds || a.ends;
+                  const daysPast = !a.legacy && lockedAt ? Math.max(0, Math.floor((Date.now() - lockedAt.getTime()) / 86400000)) : null;
+                  const mStyle = a.inGrace ? STATUS_STYLE.grace
+                    : a.valid ? (!a.legacy && a.daysLeft != null && a.daysLeft <= 14 ? STATUS_STYLE.expiring : STATUS_STYLE.active)
                     : STATUS_STYLE.ended;
+                  const mLabel = a.inGrace ? 'In grace'
+                    : a.valid ? (a.legacy ? 'Active · no expiry' : (a.daysLeft != null && a.daysLeft <= 14 ? 'Expiring soon' : 'Active'))
+                    : 'Ended';
                   return (
                     <div className="mt-3 pt-3 flex items-center gap-x-3 gap-y-1.5 flex-wrap" style={{ borderTop: `1px dashed ${GLASS.borderSoft}`, fontSize: 11.5, color: C.textMute }}>
                       <span style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase' }}>Membership</span>
                       <span className="px-2 py-0.5 rounded-full text-[10px] font-bold" style={{ background: mStyle.bg, color: mStyle.fg, border: `1px solid ${mStyle.bd}` }}>
-                        {a.valid ? (a.legacy ? 'Active · no expiry' : (a.daysLeft != null && a.daysLeft <= 14 ? 'Expiring soon' : 'Active')) : 'Ended'}
+                        {mLabel}
                       </span>
                       <span style={{ fontWeight: 600, color: C.textSoft }}>{mPlan?.name || PLAN_LABELS[s.plan_key] || s.plan_key}</span>
-                      <span>{fmtEnrollDate(s.started_at)} → {a.legacy ? 'no expiry' : fmtEnrollDate(s.ends_at)}</span>
+                      {/* Access scope — Lock highlights a LIMITED plan; ShieldCheck marks full access. */}
+                      <span className="inline-flex items-center gap-1" style={{ color: ent.full ? C.textMute : 'var(--status-warn-fg)', fontWeight: 600 }}>
+                        {ent.full ? <ShieldCheck size={10} /> : <Lock size={10} />} {ent.scopeLabel}
+                      </span>
+                      <span>{fmtEnrollDate(s.started_at)} → {a.legacy ? 'no expiry' : fmtEnrollDate(s.ends_at)}{a.graceEnds ? ` · grace ${fmtEnrollDate(s.grace_ends_at)}` : ''}</span>
                       {!a.legacy && (
-                        <span className="inline-flex items-center gap-1 font-semibold" style={{ fontFamily: fontMono, color: a.valid ? (a.daysLeft <= 3 ? C.red : a.daysLeft <= 14 ? 'var(--status-warn-fg)' : C.textSoft) : C.red }}>
-                          <CalendarClock size={11} /> {a.valid ? `${a.daysLeft}d left` : `ended ${daysPast}d ago`}
+                        <span className="inline-flex items-center gap-1 font-semibold" style={{ fontFamily: fontMono, color: a.inGrace ? C.red : a.valid ? (a.daysLeft <= 3 ? C.red : a.daysLeft <= 14 ? 'var(--status-warn-fg)' : C.textSoft) : C.red }}>
+                          <CalendarClock size={11} /> {a.inGrace ? `grace: ${a.graceDaysLeft}d left` : a.valid ? `${a.daysLeft}d left` : `ended ${daysPast}d ago`}
                         </span>
                       )}
                     </div>
@@ -5429,7 +6349,7 @@ function AdminEnrollments({ onCountChange }) {
                         {r.background || '—'}
                       </div>
                       {r.rejection_reason && r.status === 'rejected' && (
-                        <div className="mt-3 px-3 py-2.5 rounded-xl" style={{ background: 'rgba(208,35,35,0.06)', border: '1px solid rgba(208,35,35,0.16)', fontSize: 12, color: C.text }}>
+                        <div className="mt-3 px-3 py-2.5 rounded-xl" style={{ background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)', fontSize: 12, color: C.text }}>
                           <span style={{ fontWeight: 600 }}>Rejection reason: </span>{r.rejection_reason}
                         </div>
                       )}
@@ -5460,139 +6380,191 @@ function AdminEnrollments({ onCountChange }) {
         </div>
       )}
 
-      {/* Approve confirmation modal */}
+      {/* Approve confirmation modal — shared AccountModal shell (dialog a11y, focus trap,
+          Escape/backdrop gated on busyId, dark-mode surface). */}
       {approveFor && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(15,18,23,0.45)' }}
-          onClick={() => { if (busyId == null) setApproveFor(null); }}>
-          <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
-            <div className="px-6 pt-6 pb-4" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
-              <div className="flex items-center gap-2.5">
-                <div className="flex items-center justify-center rounded-xl flex-shrink-0" style={{ width: 38, height: 38, background: 'rgba(40,166,71,0.12)', border: '1px solid rgba(40,166,71,0.30)' }}>
-                  <UserCheck size={18} style={{ color: C.green }} />
-                </div>
-                <div>
-                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 16, color: C.text }}>Approve this enrollment?</div>
-                  <div className="truncate" style={{ fontSize: 12.5, color: C.textSoft, maxWidth: 300 }}>{approveFor.email}</div>
-                </div>
+        <AccountModal icon={UserCheck} tone="ok" subtitle={approveFor.email}
+          title={kindOf(approveFor) === 'extension' ? 'Approve this extension?' : kindOf(approveFor) === 'upgrade' ? 'Approve this upgrade?' : 'Approve this enrollment?'}
+          canClose={busyId == null} onClose={() => setApproveFor(null)}>
+          <div className="rounded-xl px-3.5 py-2.5" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+            {[['Package', approveFor.plan_name || approveFor.plan_key],
+              ['Access scope', planEntitlement(approveFor.plan_key).scopeLabel],
+              ['Amount sent', phpFmt(approveFor.amount_paid)],
+              ['Expected', phpFmt(approveFor.amount_expected)],
+              ...(approveFor.payment_reference ? [['Reference', approveFor.payment_reference]] : []),
+              ...(extDaysOf(approveFor) > 0
+                ? [['Extends by', `${extDaysOf(approveFor)} days (${Math.round(extDaysOf(approveFor) / 30)} months)`]]
+                : Number(plansByKey[approveFor.plan_key]?.access_days) > 0
+                ? [['Access period', `${plansByKey[approveFor.plan_key].access_days} days`]] : [])].map(([k, v]) => (
+              <div key={k} className="flex items-center justify-between gap-3 py-1" style={{ fontSize: 12.5 }}>
+                <span style={{ color: C.textMute }}>{k}</span>
+                <span style={{ color: C.text, fontWeight: 600 }}>{v}</span>
               </div>
-            </div>
-            <div className="px-6 py-5">
-              <div className="rounded-xl px-3.5 py-2.5" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
-                {[['Package', approveFor.plan_name || approveFor.plan_key],
-                  ['Amount sent', phpFmt(approveFor.amount_paid)],
-                  ['Expected', phpFmt(approveFor.amount_expected)],
-                  ...(approveFor.payment_reference ? [['Reference', approveFor.payment_reference]] : []),
-                  ...(Number(plansByKey[approveFor.plan_key]?.access_days) > 0
-                    ? [['Access period', `${plansByKey[approveFor.plan_key].access_days} days`]] : [])].map(([k, v]) => (
-                  <div key={k} className="flex items-center justify-between gap-3 py-1" style={{ fontSize: 12.5 }}>
-                    <span style={{ color: C.textMute }}>{k}</span>
-                    <span style={{ color: C.text, fontWeight: 600 }}>{v}</span>
-                  </div>
-                ))}
-              </div>
-              {(() => {
-                const end = projectedEnd(approveFor);
-                const a = subAccess(subOf(approveFor));
-                if (!end) return null;
-                return (
-                  <div className="mt-3 flex items-start gap-2.5 px-3.5 py-2.5 rounded-xl" style={{ background: 'rgba(10,132,255,0.06)', border: '1px solid rgba(10,132,255,0.18)' }}>
-                    <CalendarClock size={15} className="flex-shrink-0 mt-px" style={{ color: C.primary }} />
-                    <div style={{ fontSize: 12.5, color: C.text, lineHeight: 1.5 }}>
-                      Will grant access until <span style={{ fontWeight: 700 }}>{fmtEnrollDate(end)}</span>
-                      {a.valid && !a.legacy ? <> — extends from their current expiry ({fmtEnrollDate(subOf(approveFor).ends_at)}), so unused days carry over.</> : '.'}
-                    </div>
-                  </div>
-                );
-              })()}
-              <p className="mt-3.5" style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
-                This marks their payment verified and <span style={{ fontWeight: 600, color: C.text }}>unlocks the full toolkit</span> for their account immediately (plan: {approveFor.plan_key}).
-              </p>
-              <div className="mt-5 flex items-center justify-end gap-2.5">
-                <button onClick={() => setApproveFor(null)} disabled={busyId != null}
-                  className="px-4 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-60"
-                  style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
-                  Cancel
-                </button>
-                <button onClick={async () => { const row = approveFor; setApproveFor(null); await doApprove(row); }} disabled={busyId != null}
-                  className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
-                  style={{ background: `linear-gradient(180deg, #34C759, #28A647)`, boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px rgba(40,166,71,0.4)' }}>
-                  {busyId != null ? <Loader2 size={15} className="animate-spin" /> : <UserCheck size={15} />} Approve & unlock
-                </button>
-              </div>
-            </div>
+            ))}
           </div>
-        </div>
+          {(() => {
+            const end = projectedEnd(approveFor);
+            const a = subAccess(subOf(approveFor));
+            if (!end) return null;
+            return (
+              <div className="mt-3 flex items-start gap-2.5 px-3.5 py-2.5 rounded-xl" style={{ background: 'var(--primary-tint)', border: '1px solid var(--primary-selection)' }}>
+                <CalendarClock size={15} className="flex-shrink-0 mt-px" style={{ color: C.primary }} />
+                <div style={{ fontSize: 12.5, color: C.text, lineHeight: 1.5 }}>
+                  {extDaysOf(approveFor) > 0
+                    ? <>Adds <span style={{ fontWeight: 700 }}>{extDaysOf(approveFor)} days</span> — access until <span style={{ fontWeight: 700 }}>{fmtEnrollDate(end)}</span>{a.valid && !a.legacy ? <> (from their current expiry {fmtEnrollDate(subOf(approveFor).ends_at)}, so unused days carry over).</> : ' (from today, since their term has ended).'}</>
+                    : <>Will grant access until <span style={{ fontWeight: 700 }}>{fmtEnrollDate(end)}</span>{a.valid && !a.legacy ? <> — extends from their current expiry ({fmtEnrollDate(subOf(approveFor).ends_at)}), so unused days carry over.</> : '.'}</>}
+                  {' '}A 3-day grace period follows (account locks {fmtEnrollDate(new Date(end.getTime() + 3 * 86400000))}).
+                </div>
+              </div>
+            );
+          })()}
+          <p className="mt-3.5" style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+            {kindOf(approveFor) === 'extension'
+              ? <>This marks their payment verified and <span style={{ fontWeight: 600, color: C.text }}>adds the purchased time</span> to their current plan ({approveFor.plan_key}).</>
+              : <>This marks their payment verified and <span style={{ fontWeight: 600, color: C.text }}>unlocks the toolkit</span> for their account immediately (plan: {approveFor.plan_key}).</>}
+          </p>
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button onClick={() => setApproveFor(null)} disabled={busyId != null}
+              className="px-4 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-60"
+              style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+              Cancel
+            </button>
+            <button onClick={async () => { const row = approveFor; setApproveFor(null); await doApprove(row); }} disabled={busyId != null}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
+              style={ADMIN_BTN_OK}>
+              {busyId != null ? <Loader2 size={15} className="animate-spin" /> : <UserCheck size={15} />} Approve & unlock
+            </button>
+          </div>
+        </AccountModal>
       )}
 
-      {/* Reject confirmation modal */}
+      {/* Reject confirmation modal — shared AccountModal shell. */}
       {rejectFor && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(15,18,23,0.45)' }}
-          onClick={() => { if (busyId == null) { setRejectFor(null); setRejectReason(''); } }}>
-          <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
-            <div className="px-6 pt-6 pb-4" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
-              <div className="flex items-center gap-2.5">
-                <div className="flex items-center justify-center rounded-xl flex-shrink-0" style={{ width: 38, height: 38, background: 'rgba(208,35,35,0.10)', border: '1px solid rgba(208,35,35,0.22)' }}>
-                  <UserX size={18} style={{ color: C.red }} />
-                </div>
-                <div>
-                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 16, color: C.text }}>Reject this payment proof?</div>
-                  <div className="truncate" style={{ fontSize: 12.5, color: C.textSoft, maxWidth: 300 }}>{rejectFor.email} · {rejectFor.plan_name}</div>
-                </div>
-              </div>
-            </div>
-            <div className="px-6 py-5">
-              <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
-                They stay locked out of the toolkit, see your reason on the enrollment screen, and can resubmit new payment proof anytime.
-              </p>
-              <label className="block mt-4 mb-1.5" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
-                Reason (shown to the student)
-              </label>
-              <textarea value={rejectReason} onChange={e => setRejectReason(e.target.value)} rows={3}
-                placeholder="e.g. We couldn’t find this reference number in our account — please double-check and resubmit."
-                className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
-                style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
-              <div className="mt-5 flex items-center justify-end gap-2.5">
-                <button onClick={() => { setRejectFor(null); setRejectReason(''); }} disabled={busyId != null}
-                  className="px-4 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-60"
-                  style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
-                  Cancel
-                </button>
-                <button onClick={confirmReject} disabled={busyId != null}
-                  className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
-                  style={{ background: `linear-gradient(180deg, #E04545, ${C.red})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.25), 0 4px 12px -2px var(--red-glow)` }}>
-                  {busyId != null ? <Loader2 size={15} className="animate-spin" /> : <UserX size={15} />} Reject proof
-                </button>
-              </div>
-            </div>
+        <AccountModal title="Reject this payment proof?" subtitle={`${rejectFor.email} · ${rejectFor.plan_name}`}
+          icon={UserX} tone="danger" canClose={busyId == null}
+          onClose={() => { setRejectFor(null); setRejectReason(''); }}>
+          <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+            They stay locked out of the toolkit, see your reason on the enrollment screen, and can resubmit new payment proof anytime.
+          </p>
+          <label className="block mt-4 mb-1.5" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+            Reason (shown to the student)
+          </label>
+          <textarea value={rejectReason} onChange={e => setRejectReason(e.target.value)} rows={3}
+            placeholder="e.g. We couldn’t find this reference number in our account — please double-check and resubmit."
+            className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
+            style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button onClick={() => { setRejectFor(null); setRejectReason(''); }} disabled={busyId != null}
+              className="px-4 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-60"
+              style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+              Cancel
+            </button>
+            <button onClick={confirmReject} disabled={busyId != null}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
+              style={ADMIN_BTN_DANGER}>
+              {busyId != null ? <Loader2 size={15} className="animate-spin" /> : <UserX size={15} />} Reject proof
+            </button>
           </div>
-        </div>
+        </AccountModal>
       )}
 
-      {/* Receipt image preview modal (signed URL — private bucket) */}
+      {/* Receipt image preview modal (signed URL — private bucket), on the shared shell. */}
       {receiptView && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(15,18,23,0.60)' }}
-          onClick={() => setReceiptView(null)}>
-          <div className="bg-white rounded-2xl shadow-2xl overflow-hidden max-w-3xl w-full" onClick={e => e.stopPropagation()}>
-            <div className="px-5 py-3.5 flex items-center gap-3" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
-              <Receipt size={16} style={{ color: C.primary }} />
-              <div className="flex-1 truncate" style={{ fontWeight: 700, fontSize: 13.5, color: C.text }}>
-                Payment receipt — {receiptView.name}
-              </div>
-              <a href={receiptView.url} target="_blank" rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition"
-                style={{ background: 'rgba(10,132,255,0.07)', color: C.primary, border: '1px solid rgba(10,132,255,0.20)' }}>
-                <ExternalLink size={12} /> Open full size
-              </a>
-              <button onClick={() => setReceiptView(null)} className="p-1.5 rounded-lg transition hover:opacity-70" style={{ color: C.textMute }}>
-                <X size={16} />
-              </button>
-            </div>
-            <div className="p-4 flex items-center justify-center" style={{ background: 'var(--wash)' }}>
-              <img src={receiptView.url} alt="Payment receipt" className="max-w-full rounded-xl" style={{ maxHeight: '70vh', objectFit: 'contain' }} />
+        <AccountModal title={`Payment receipt — ${receiptView.name}`} icon={Receipt} maxW="max-w-3xl"
+          bodyClass="p-4 flex items-center justify-center" bodyStyle={{ background: 'var(--wash)' }}
+          headerAction={
+            <a href={receiptView.url} target="_blank" rel="noopener noreferrer"
+              className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition"
+              style={{ background: 'var(--primary-tint)', color: C.primary, border: '1px solid var(--primary-selection)' }}>
+              <ExternalLink size={12} /> Open full size
+            </a>
+          }
+          onClose={() => setReceiptView(null)}>
+          <img src={receiptView.url} alt="Payment receipt" className="max-w-full rounded-xl" style={{ maxHeight: '70vh', objectFit: 'contain' }} />
+        </AccountModal>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// COMPONENT: RESTRICTED TAB — plan-gated upsell shown at the render chokepoint
+// ═══════════════════════════════════════════════════════════════════
+// Rendered in place of a tool when the active tab isn't in the user's plan (reached via
+// deep-link, popstate, stale lastTab, etc.). Polished upsell — never a blank screen:
+// current plan + access scope, quick links to what they CAN open, and an Upgrade/Renew
+// CTA that routes to the Dashboard (where MembershipPanel hosts the renew/upgrade flow).
+// Reads the shared entitlement from context. Themed via tokens; light + dark safe.
+function RestrictedTab({ active, goto }) {
+  const ent = useContext(EntitlementContext);
+  const QUICK = [
+    { id: 'qbomastery', label: 'QuickBooks Online Mastery', icon: GraduationCap },
+    { id: 'course', label: 'Accounting 101', icon: BookOpen },
+    { id: 'industryacc', label: 'Industry Accounting', icon: Building2 },
+    { id: 'ustax', label: 'US Tax 101', icon: Landmark },
+    { id: 'chat', label: 'ProAdvisor Chat', icon: MessageCircle },
+    { id: 'niche', label: 'Niche Selector Quiz', icon: Target },
+  ].filter(t => ent.allowsTab(t.id));
+
+  return (
+    <div hidden={!active} aria-hidden={!active} className={`${active ? 'fade-in ' : ''}p-4 sm:p-6 lg:p-10 max-w-3xl mx-auto`}>
+      <div className="glass-card p-7 sm:p-9 relative overflow-hidden">
+        <div className="absolute -top-16 -right-16 w-56 h-56 rounded-full pointer-events-none"
+          style={{ background: 'radial-gradient(circle, var(--primary-tint) 0%, transparent 62%)' }} />
+
+        <div className="inline-flex items-center justify-center rounded-2xl mb-5"
+          style={{ width: 52, height: 52, background: 'rgba(10,132,255,0.10)', border: '1px solid rgba(10,132,255,0.20)' }}>
+          <Lock size={24} style={{ color: C.primary }} />
+        </div>
+
+        <div className="gh-label mb-1.5" style={{ color: C.primary }}>{ent.scopeLabel}</div>
+        <h2 style={{ fontFamily: fontDisplay, fontWeight: 800, fontSize: 24, letterSpacing: '-0.02em', color: C.text, lineHeight: 1.15 }}>
+          This tool isn’t part of your plan yet
+        </h2>
+        <p className="mt-3" style={{ fontSize: 14.5, color: C.textSoft, lineHeight: 1.6 }}>
+          Your current plan{ent.label ? <> — <span style={{ fontWeight: 700, color: C.text }}>{ent.label}</span></> : ''} includes{' '}
+          <span style={{ fontWeight: 700, color: C.text }}>{ent.scopeLabel}</span>. Upgrade or renew to unlock the full toolkit.
+        </p>
+
+        {QUICK.length > 0 && (
+          <div className="mt-6">
+            <div className="gh-label mb-2.5" style={{ color: C.textMute }}>Continue learning</div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {QUICK.map(t => {
+                const Icon = t.icon;
+                return (
+                  <button key={t.id} onClick={() => goto(t.id)}
+                    className="flex items-center gap-2.5 px-3.5 py-2.5 rounded-xl text-left transition hover:opacity-90 nav-hover"
+                    style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}`, color: C.text }}>
+                    <Icon size={17} style={{ color: C.primary, flexShrink: 0 }} />
+                    <span style={{ fontSize: 13, fontWeight: 600 }}>{t.label}</span>
+                  </button>
+                );
+              })}
             </div>
           </div>
+        )}
+
+        <div className="mt-7 flex flex-wrap items-center gap-2.5">
+          <button onClick={() => goto('dashboard')}
+            className="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl text-sm font-bold text-white transition hover:opacity-95"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
+            <Crown size={15} /> Upgrade or renew
+          </button>
+          <button onClick={() => goto('dashboard')}
+            className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-semibold transition hover:opacity-80"
+            style={{ color: C.textSoft, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <ArrowLeft size={15} /> Back to Dashboard
+          </button>
         </div>
-      )}
+
+        <div className="mt-4" style={{ fontSize: 12, color: C.textMute }}>
+          Manage your plan and payment from the{' '}
+          <button onClick={() => goto('dashboard')} className="underline-offset-2 hover:underline" style={{ color: C.primary, fontWeight: 600 }}>
+            Dashboard membership panel
+          </button>.
+        </div>
+      </div>
     </div>
   );
 }
@@ -5614,6 +6586,7 @@ function MembershipPanel() {
   const [reqs, setReqs] = useState([]);
   const [plan, setPlan] = useState(null);
   const [loaded, setLoaded] = useState(false);
+  const [failed, setFailed] = useState(false);   // fail-silent: error → no panel, no skeleton
   const [renewOpen, setRenewOpen] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
   const reload = () => setReloadKey(k => k + 1);
@@ -5647,7 +6620,7 @@ function MembershipPanel() {
         if (!cancelled) setLoaded(true);
       } catch (e) {
         console.error('[membership] panel load failed', e);
-        if (!cancelled) setLoaded(false);   // fail-silent: panel just doesn't render
+        if (!cancelled) { setLoaded(false); setFailed(true); }   // fail-silent: panel just doesn't render
       }
     })();
     return () => { cancelled = true; };
@@ -5672,7 +6645,22 @@ function MembershipPanel() {
     };
   }, [uid, isAdmin]);
 
-  if (!REQUIRE_ENROLLMENT || !uid || isAdmin || !loaded) return null;
+  if (!REQUIRE_ENROLLMENT || !uid || isAdmin) return null;
+  // First load in flight → fixed-height skeleton so the Dashboard doesn't reflow/flash
+  // when the real panel lands. Errors stay fail-silent (no panel, no skeleton).
+  if (!loaded) {
+    if (failed) return null;
+    return (
+      <div className="glass-card p-6 mb-8 animate-pulse" aria-hidden="true" style={{ minHeight: 110 }}>
+        <div className="rounded" style={{ height: 10, width: 110, background: 'var(--wash-strong)' }} />
+        <div className="mt-3 rounded" style={{ height: 16, width: 220, maxWidth: '60%', background: 'var(--wash-strong)' }} />
+        <div className="mt-3 flex items-center gap-2">
+          <div className="rounded-full" style={{ height: 20, width: 84, background: 'var(--wash)' }} />
+          <div className="rounded-full" style={{ height: 20, width: 120, background: 'var(--wash)' }} />
+        </div>
+      </div>
+    );
+  }
   const latest = reqs[0] || null;
   const latestApproved = reqs.find(r => r.status === 'approved') || null;
   if (!sub && !latest) return null;   // nothing to show (e.g. paywall off for this account)
@@ -5681,29 +6669,43 @@ function MembershipPanel() {
   const newerThanTerm = latest && sub?.started_at && new Date(latest.created_at) > new Date(sub.started_at);
   const renewalPending = latest?.status === 'pending_review' && !!newerThanTerm;
   const renewalRejected = latest?.status === 'rejected' && !!newerThanTerm;
-  const daysLeft = acc.valid && !acc.legacy ? acc.daysLeft : null;
+  // During a grace window the term has already ended (acc.inGrace) — the pre-expiry
+  // day-count tiers must NOT read acc.daysLeft (which then counts to the grace end).
+  // Grace is handled by its own tier so the two never collide.
+  const inGrace = acc.inGrace;
+  const graceDaysLeft = acc.graceDaysLeft;
+  const daysLeft = acc.valid && !acc.legacy && !inGrace ? acc.daysLeft : null;
   const planName = plan?.name || PLAN_LABELS[sub?.plan_key || latestApproved?.plan_key] || sub?.plan_key || latestApproved?.plan_key || 'Membership';
   const entitlements = Array.isArray(plan?.entitlement_summary) ? plan.entitlement_summary : [];
+  // What the plan unlocks ("Training & Skills only" / "Full toolkit access") — same helper the
+  // nav gate uses, so the student sees exactly what their sidebar reflects.
+  const scopeLabel = planEntitlement(sub?.plan_key || latestApproved?.plan_key || profile?.plan).scopeLabel;
 
+  // Warning tiers (strict 5/3 per spec): calm > 5 days (no banner), warning ≤ 5,
+  // urgent ≤ 3, plus a grace state once the term has ended but access continues.
   const pill = renewalPending
     ? { label: 'Renewal under review', bg: 'var(--status-info-bg)', bd: 'var(--status-info-bd)', fg: 'var(--status-info-fg)' }
+    : inGrace
+    ? { label: 'Grace period', bg: 'var(--status-danger-bg)', bd: 'var(--status-danger-bd)', fg: 'var(--status-danger-fg)' }
     : daysLeft != null && daysLeft <= 3
     ? { label: `Expires in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`, bg: 'var(--status-danger-bg)', bd: 'var(--status-danger-bd)', fg: 'var(--status-danger-fg)' }
-    : daysLeft != null && daysLeft <= 14
+    : daysLeft != null && daysLeft <= 5
     ? { label: 'Expiring soon', bg: 'var(--status-warn-bg)', bd: 'var(--status-warn-bd)', fg: 'var(--status-warn-fg)' }
     : acc.valid || !acc.has
     ? { label: 'Active', bg: 'var(--status-ok-bg)', bd: 'var(--status-ok-bd)', fg: 'var(--status-ok-fg)' }
     : { label: 'Expired', bg: 'var(--status-danger-bg)', bd: 'var(--status-danger-bd)', fg: 'var(--status-danger-fg)' };
 
-  const warnTier = daysLeft == null || renewalPending ? null : daysLeft <= 3 ? 'red' : daysLeft <= 7 ? 'amber7' : daysLeft <= 14 ? 'amber14' : null;
-  const renewPrimary = warnTier === 'red' || warnTier === 'amber7';
+  const warnTier = renewalPending ? null : inGrace ? 'grace' : daysLeft == null ? null : daysLeft <= 3 ? 'red' : daysLeft <= 5 ? 'amber' : null;
+  const renewPrimary = warnTier === 'red' || warnTier === 'amber' || warnTier === 'grace';
   const showRenew = !renewalPending && (acc.has ? !acc.legacy : false);
   const supportEmail = PAYMENT_SETTINGS_FALLBACK.notify_email;
 
   const facts = [
     ['Plan', planName],
+    ['Access', scopeLabel],
     ['Started', sub?.started_at ? fmtEnrollDate(sub.started_at) : latestApproved ? fmtEnrollDate(latestApproved.reviewed_at || latestApproved.created_at) : '—'],
     ['Expires', acc.has ? (acc.legacy ? 'No expiry' : fmtEnrollDate(sub.ends_at)) : 'No expiry'],
+    ...(inGrace ? [['Grace ends', fmtEnrollDate(sub.grace_ends_at)]] : []),
     ['Amount paid', latestApproved ? phpFmt(latestApproved.amount_paid) : '—'],
   ];
 
@@ -5729,7 +6731,7 @@ function MembershipPanel() {
             style={renewPrimary
               ? { color: 'white', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }
               : { color: C.primary, background: 'rgba(10,132,255,0.07)', border: '1px solid rgba(10,132,255,0.22)' }}>
-            <RefreshCw size={14} /> {acc.valid ? 'Renew early' : 'Renew'}
+            <RefreshCw size={14} /> {inGrace ? 'Renew now' : acc.valid ? 'Renew early' : 'Renew'}
           </button>
         )}
       </div>
@@ -5742,6 +6744,16 @@ function MembershipPanel() {
           </div>
         ))}
       </div>
+
+      {inGrace && !renewalPending && graceDaysLeft != null && (
+        <div className="mt-3 flex items-center gap-2" style={{ fontSize: 12.5, color: C.textSoft }}>
+          <CalendarClock size={14} style={{ color: C.red }} />
+          <span className="gh-tnum" style={{ fontFamily: fontMono, fontWeight: 600, color: C.red }}>
+            {graceDaysLeft} day{graceDaysLeft === 1 ? '' : 's'}
+          </span>
+          <span>of grace remaining</span>
+        </div>
+      )}
 
       {daysLeft != null && daysLeft > 0 && (
         <div className="mt-3 flex items-center gap-2" style={{ fontSize: 12.5, color: C.textSoft }}>
@@ -5764,16 +6776,16 @@ function MembershipPanel() {
       )}
 
       {warnTier && (
-        <div className="mt-4 flex items-start gap-2.5 px-3.5 py-3 rounded-xl" style={warnTier === 'red'
-          ? { background: 'rgba(208,35,35,0.06)', border: '1px solid rgba(208,35,35,0.18)' }
-          : { background: 'rgba(255,159,10,0.08)', border: '1px solid rgba(255,159,10,0.25)' }}>
-          <AlertTriangle size={15} className="flex-shrink-0 mt-px" style={{ color: warnTier === 'red' ? C.red : C.amber }} />
+        <div className="mt-4 flex items-start gap-2.5 px-3.5 py-3 rounded-xl" style={warnTier === 'amber'
+          ? { background: 'rgba(255,159,10,0.08)', border: '1px solid rgba(255,159,10,0.25)' }
+          : { background: 'rgba(208,35,35,0.06)', border: '1px solid rgba(208,35,35,0.18)' }}>
+          <AlertTriangle size={15} className="flex-shrink-0 mt-px" style={{ color: warnTier === 'amber' ? C.amber : C.red }} />
           <div style={{ fontSize: 12.5, color: C.text, lineHeight: 1.5 }}>
-            {warnTier === 'red'
-              ? <><span style={{ fontWeight: 700 }}>Your access ends {daysLeft === 1 ? 'tomorrow' : `in ${daysLeft} days`}.</span> Renew now to keep your courses and tools — renewing early extends from your current expiry, so you never lose days.</>
-              : warnTier === 'amber7'
-              ? <><span style={{ fontWeight: 700 }}>{daysLeft} days of access left.</span> Renew early to extend from your current expiry date.</>
-              : <>Your membership expires on <span style={{ fontWeight: 600 }}>{fmtEnrollDate(sub.ends_at)}</span> ({daysLeft} days). You can renew any time — early renewals extend from that date.</>}
+            {warnTier === 'grace'
+              ? <><span style={{ fontWeight: 700 }}>Grace period: renew now to avoid losing access.</span> Your access ended{acc.ends ? <> on <span style={{ fontWeight: 600 }}>{fmtEnrollDate(sub.ends_at)}</span></> : ''}. You have until <span style={{ fontWeight: 600 }}>{fmtEnrollDate(sub.grace_ends_at)}</span>{graceDaysLeft != null ? <> ({graceDaysLeft} day{graceDaysLeft === 1 ? '' : 's'})</> : ''} before your account locks.</>
+              : warnTier === 'red'
+              ? <><span style={{ fontWeight: 700 }}>Your membership expires soon.</span> Your access ends {daysLeft === 1 ? 'tomorrow' : `in ${daysLeft} days`} — renew or upgrade now to keep access. Renewing early extends from your current expiry, so you never lose days.</>
+              : <><span style={{ fontWeight: 700 }}>Your membership expires soon.</span> Renew or upgrade now to keep access — early renewals extend from your current expiry date ({daysLeft} day{daysLeft === 1 ? '' : 's'} left).</>}
           </div>
         </div>
       )}
@@ -5838,8 +6850,6 @@ function Dashboard({ goto }) {
         { id: 'industryacc', label: 'Industry Accounting', desc: '12 industries · QBO workflows',   icon: Building2,       color: '#3B82F6' },
         { id: 'ustax',       label: 'US Tax 101',          desc: 'Forms, deadlines, IRS links',     icon: Landmark,        color: '#0A1E3F' },
         { id: 'chat',        label: 'ProAdvisor Chat',     desc: 'Live mentor for clean-ups',       icon: MessageCircle,   color: '#0EA5E9' },
-        // hidden: Client Portal Demo (removed from toolkit) — uncomment to restore
-        // { id: 'portal',      label: 'Client Portal Demo',  desc: 'See what you deliver to clients', icon: LayoutDashboard, color: '#1E40AF' },
       ],
     },
     {
@@ -5902,6 +6912,19 @@ function Dashboard({ goto }) {
       ],
     },
   ];
+
+  // The actionable tile grid is gated by plan — a restricted user gets no clickable tiles
+  // into tools they can't open (which would just dead-end on RestrictedTab). The aspirational
+  // "Career Roadmap" strip above stays full (non-interactive — it shows the whole journey and
+  // reinforces what upgrading unlocks). Admins/full plans → unchanged (ent.full).
+  const ent = useContext(EntitlementContext);
+  const visibleStageTiles = ent.full ? stageTiles : stageTiles
+    .map((stage) => {
+      const tiles = stage.tiles.filter((t) => ent.allowsTab(t.id));
+      if (tiles.length === 0) return null;
+      return { ...stage, tiles };
+    })
+    .filter(Boolean);
 
   return (
     <div>
@@ -5971,7 +6994,7 @@ function Dashboard({ goto }) {
       </div>
 
       {/* Tile grid grouped by career stage */}
-      {stageTiles.map((stage) => (
+      {visibleStageTiles.map((stage) => (
         <div key={stage.number} className="mb-10">
           <div className="flex items-center gap-3 mb-4">
             <div className="px-2.5 py-1 rounded-lg" style={{
@@ -6062,9 +7085,9 @@ function Dashboard({ goto }) {
 
       {/* Stats strip */}
       <div className="mt-10 grid grid-cols-1 md:grid-cols-3 gap-4">
-        <StatCard label="Pro Tools" value="42" sub="Built-in modules" icon={TrendingUp} />
-        <StatCard label="Industries Covered" value="17" sub="Specialized CoAs" icon={Zap} />
-        <StatCard label="Vendor Patterns" value="60+" sub="Bank Feed AI" icon={Shield} />
+        <StatCard label="Pro Tools" value={TOOL_COUNT} sub="Built-in modules" icon={TrendingUp} />
+        <StatCard label="Industries Covered" value={Object.keys(COA_INDUSTRY).length} sub="Specialized CoAs" icon={Zap} />
+        <StatCard label="Vendor Patterns" value={`${VENDOR_PATTERNS.length}+`} sub="Bank Feed AI" icon={Shield} />
       </div>
     </div>
   );
@@ -6332,7 +7355,7 @@ function certificateTitle(rawTitle = '') {
   return base ? `${base} Program` : 'Program';
 }
 
-const COURSE_ROW_SELECT = 'id,slug,title,subtitle,description,month,course_date,published,position,cover_path,source_course_id,created_at,updated_at';
+const COURSE_ROW_SELECT = 'id,slug,title,subtitle,description,month,course_date,published,position,cover_path,source_course_id,access_tier,created_at,updated_at';
 const COURSE_MODULE_SELECT = 'id,course_id,title,position';
 const COURSE_LESSON_SELECT = 'id,module_id,course_id,title,type,video_url,video_provider,storage_path,text_content,duration_label,position';
 // course_completions has only (user_id, course_id, completed_at) — composite PK, no id/created_at
@@ -6390,6 +7413,7 @@ function CourseProgram({
 } = {}) {
   const { user, profile } = useAuth();
   const isAdmin = !!profile?.is_admin;
+  const ent = useContext(EntitlementContext);            // plan scope — a deep-link guard for restricted courses
   const showHead = !embedded && !onBack;                 // the catalog/suite supplies its own header instead
 
   const [course, setCourse] = useState(null);
@@ -7368,6 +8392,25 @@ function CourseProgram({
     );
   }
 
+  // Plan deep-link guard (defense-in-depth). RLS is the real boundary — a restricted
+  // course normally returns no row (→ the "coming soon" state above). This only fires if
+  // a course the plan can't open still reaches the client; it never blocks admins.
+  if (!ent.allowsCourse(course)) {
+    return (
+      <div>
+        {showHead && <SectionHead eyebrow={eyebrow} title={courseTitle} desc="" gold />}
+        {backBar}
+        <div className="mt-6 glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
+          <Lock size={38} className="mx-auto mb-3" style={{ color: C.primary }} />
+          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">This course isn’t part of your plan</div>
+          <div className="text-slate-500 mt-2 text-sm max-w-md mx-auto">
+            Your plan ({ent.scopeLabel}) includes the Essentials course. Upgrade or renew from the Dashboard membership panel to unlock the full QuickBooks program.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div>
       {showHead && <SectionHead eyebrow={eyebrow} title={courseTitle}
@@ -7529,6 +8572,7 @@ function CourseCatalog({
 } = {}) {
   const { user, profile } = useAuth();
   const isAdmin = !!profile?.is_admin;
+  const ent = useContext(EntitlementContext);   // plan scope — drives which course cards a student sees
   const catalogTabId = prefix === 'resume-' ? 'resumestrategy' : prefix === 'interview-' ? 'interview' : 'qbomastery';
   const catalogInterviewSub = prefix === 'interview-' ? 'winstrat' : null;
   const initialCatalogRouteRef = useRef(null);
@@ -7665,6 +8709,7 @@ function CourseCatalog({
         slug, title: newTitle,
         subtitle: src.subtitle ?? '', description: src.description ?? null,
         course_date: todayISODate(), cover_path: src.cover_path ?? null,  // default the cohort date to today, not the source's (avoids a June re-run inheriting May)
+        access_tier: src.access_tier ?? 'standard',  // a re-run of an Essentials course stays Sampler-accessible
         source_course_id: src.id, published: false, position,
       };
       let res = await supabase.from('courses').insert(coursePayload).select(COURSE_ROW_SELECT).single();
@@ -7790,6 +8835,22 @@ function CourseCatalog({
     finally { setBusy(false); }
   }
 
+  // Toggle a course's plan tier. `essentials` = unlocked for the Sampler plan; `standard`
+  // (the default) = premium (Sampler can't open it). Mirrors the SQL courses.access_tier
+  // rule in db/2026-07-11-sampler-essentials-access.sql. Admin-only (RLS also enforces it).
+  async function setCourseTier(c, next) {
+    setMenuOpenId(null);
+    setBusy(true); setErr('');
+    try {
+      const { error } = await supabase.from('courses').update({ access_tier: next, updated_at: new Date().toISOString() }).eq('id', c.id);
+      if (error) throw error;
+      await loadCatalog();
+    } catch (e) {
+      logDbError('[CourseCatalog] set tier', e, { module: prefix, courseId: c.id });
+      setErr(describeDbError(e, 'Could not update the course tier.'));
+    } finally { setBusy(false); }
+  }
+
   // ── Open one course in the shared engine (key forces clean state per course) ──
   if (selectedId) {
     return <CourseProgram key={selectedId} courseId={selectedId}
@@ -7807,6 +8868,10 @@ function CourseCatalog({
       <button onClick={() => setErr('')} className="text-red-400 hover:text-red-600"><X size={16} /></button>
     </div>
   ) : null;
+
+  // Students only see courses their plan can open (e.g. a Sampler sees Essentials, not
+  // Mastery); admins always see all. RLS is the real boundary — this drives card display.
+  const visibleCourses = isAdmin ? courses : courses.filter(c => ent.allowsCourse(c));
 
   return (
     <div>
@@ -7842,7 +8907,7 @@ function CourseCatalog({
             </div>
           )}
         </div>
-      ) : courses.length === 0 ? (
+      ) : visibleCourses.length === 0 ? (
         <div className="mt-6 glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
           <GraduationCap size={40} className="mx-auto mb-3" style={{ color: ROYAL }} />
           <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">{isAdmin ? 'No courses yet' : 'Courses coming soon'}</div>
@@ -7859,7 +8924,7 @@ function CourseCatalog({
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
-          {courses.map((c, idx) => {
+          {visibleCourses.map((c, idx) => {
             const total = counts[c.id] || 0;
             const dn = Math.min(done[c.id] || 0, total);
             const pct = total ? Math.round((dn / total) * 100) : 0;
@@ -7897,6 +8962,12 @@ function CourseCatalog({
                               onChange={e => { const f = e.target.files?.[0]; setMenuOpenId(null); if (f) uploadCover(c, f); e.target.value = ''; }} />
                           </label>
                           <div className="h-px bg-slate-100 my-1" />
+                          <button role="menuitemcheckbox" aria-checked={c.access_tier === 'essentials'} disabled={busy}
+                            onClick={() => setCourseTier(c, c.access_tier === 'essentials' ? 'standard' : 'essentials')}
+                            className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2 disabled:opacity-50">
+                            {c.access_tier === 'essentials' ? <CheckCircle2 size={14} style={{ color: C.primary }} /> : <Circle size={14} />} Sampler tier (Essentials)
+                          </button>
+                          <div className="h-px bg-slate-100 my-1" />
                           <button role="menuitem" disabled={idx === 0 || busy} onClick={() => reorderCourse(idx, -1)} className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2 disabled:opacity-30"><ChevronUp size={14} /> Move up</button>
                           <button role="menuitem" disabled={idx === courses.length - 1 || busy} onClick={() => reorderCourse(idx, 1)} className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2 disabled:opacity-30"><ChevronDown size={14} /> Move down</button>
                           <div className="h-px bg-slate-100 my-1" />
@@ -7909,7 +8980,10 @@ function CourseCatalog({
 
                 <div className="p-4 flex-1 flex flex-col">
                   <button onClick={() => openCourse(c.id)} className="text-left flex-1">
-                    {(c.course_date || c.month) && <div className="mb-1.5 inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full" style={{ background: 'var(--status-info-bg)', color: 'var(--status-info-fg)' }}><CalendarClock size={11} /> {c.course_date ? cohortLabel(c.course_date) : c.month}</div>}
+                    <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
+                      {(c.course_date || c.month) && <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full" style={{ background: 'var(--status-info-bg)', color: 'var(--status-info-fg)' }}><CalendarClock size={11} /> {c.course_date ? cohortLabel(c.course_date) : c.month}</span>}
+                      {isAdmin && c.access_tier === 'essentials' && <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full" style={{ background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)' }}><Sparkles size={11} /> Essentials · Sampler</span>}
+                    </div>
                     <div style={{ fontFamily: fontDisplay, color: NAVY }} className="font-bold text-[15px] leading-tight">{c.title}</div>
                     {c.subtitle && <div className="text-xs text-slate-500 mt-1 line-clamp-2">{c.subtitle}</div>}
                   </button>
