@@ -409,7 +409,9 @@ create index if not exists batch_entitlements_source_request_idx
   on public.batch_entitlements (source_request_id);
 
 -- CORRECTNESS: a member can never hold two outstanding seats in one cohort.
--- Also the invariant the concurrency suite asserts.
+-- NOTE: this index protects BOUND seats only — a queued seat has batch_id NULL
+-- and is therefore outside it, which is why admin_grant_batch_run needs its own
+-- ALREADY_ENTITLED check (#37) to stay idempotent.
 create unique index if not exists batch_entitlements_one_seat_per_cohort
   on public.batch_entitlements (user_id, batch_id)
   where status in ('queued', 'active') and batch_id is not null;

@@ -28,10 +28,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * The catalog. Kept in lockstep with public.app_error_catalog() in
- * db/2026-07-30-batch-entitlements.sql — test/appErrors.test.mjs asserts every
- * code here has user-facing copy, and the DB suite diffs this list against the
- * function's rows so the two cannot drift silently.
+ * The catalog. Kept in lockstep BY HAND with public.app_error_catalog() in
+ * db/2026-07-30-batch-entitlements.sql. test/appErrors.test.mjs asserts every
+ * code here has user-facing copy and matches the wire shape, but nothing yet
+ * diffs this list against the function's rows — so a code added on one side
+ * only is currently caught by review, not by a test. Adding that check is the
+ * obvious next test when the DB suite next has a target.
  */
 export const APP_ERROR_CODES = [
   // ── Batch / entitlement RPCs ──

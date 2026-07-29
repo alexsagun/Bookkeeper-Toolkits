@@ -197,11 +197,28 @@ the own-update gap on posts/comments that #25 had left). The
 Sampler Session's **60-day group chat support** == its 60-day `access_days` window.
 
 **Spaces & batches (#32, [db/2026-07-28-community-spaces-batches.sql](db/2026-07-28-community-spaces-batches.sql)):**
-the forum is segmented into **community_spaces** — one **General** space (every active plan;
-`member_comments = false` → members post + react but replies are off, historical replies stay
-readable; flip the flag to re-enable, no migration) plus one PRIVATE full-forum **Gold** and
+the forum is segmented into **community_spaces** — one **General** space (every active plan) plus
+one PRIVATE full-forum **Gold** and
 **VIP** space per **batch** (cohort registry, code `YYYY-MM`; `batches_create_spaces()` trigger
-auto-creates both spaces + a `batch_events` audit row). Access is **DERIVED, never stored**:
+auto-creates both spaces + a `batch_events` audit row).
+
+**★ D2 (#36) — General is ANNOUNCEMENT-ONLY.** `member_posting = false` AND
+`member_comments = false`: **no member may post or comment there — not Core, not Sampler, not
+Silver, and NOT Gold or VIP.** Reactions stay ON for every plan, historical content stays readable,
+and an author can still WITHDRAW their own post (the read policies carry an author-owns-`deleted`
+branch, without which Postgres refuses the soft-delete outright — an UPDATE whose resulting row
+would be invisible to the writer fails 42501, which is why member soft-delete never actually worked
+before #36). Admins post the announcements. Gold/VIP discussion happens only in their own per-batch
+space. The flags are pinned by the `community_spaces_general_announcement_only` CHECK — reversing
+D2 means dropping a named constraint, flipping the plan capability columns, and recording it in
+db/README.md. **Do not "temporarily" flip the flag**: that instruction used to live in
+COMMUNITY_SETUP.md, it was followed, it was never reverted, and prod ran for a week with every plan
+able to reply in General.
+
+Per-plan rights come from **seven fail-closed capability columns on `enrollment_plans`** fused with
+the space flags by `user_community_capabilities()` (#36) — the ONE resolver every write policy
+reads, consumed as an uncorrelated subquery so it InitPlans once per statement. Access is
+**DERIVED, never stored**:
 `user_community_space_ids(p_user)` / `my_community_space_ids()` (SECDEF) map the current valid
 subscription → `enrollment_plans.community_segment` (`gold_live`→gold, `vip`→vip, else general)
 + `subscriptions.batch_id` → spaces; unknown plans and batch-less premium subs fail closed to
