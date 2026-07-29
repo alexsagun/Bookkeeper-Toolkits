@@ -15,7 +15,11 @@
     "ai:knowledge:check": "node scripts/generate-voice-agent-knowledge.mjs --check",
     "ai:knowledge:push": "node scripts/generate-voice-agent-knowledge.mjs && node scripts/push-voice-agent-knowledge.mjs",
     "ai:provision": "node scripts/generate-voice-agent-knowledge.mjs && node scripts/provision-voice-agent.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "test:db": "node --test-concurrency=1 --test \"test-db/*.dbtest.mjs\"",
+    "test:all": "npm test && npm run test:db",
+    "db:shadow:apply": "node scripts/apply-db-files.mjs",
+    "db:shadow:verify": "node scripts/apply-db-files.mjs --verify"
   },
   "dependencies": {
     "@elevenlabs/client": "^1.15.1",

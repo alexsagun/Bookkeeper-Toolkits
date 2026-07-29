@@ -381,6 +381,48 @@ grant execute on function public.community_write_denial(uuid, text) to authentic
 --    flag to the fused plan × space answer. is_approved()/is_enrolled() stay
 --    (the #28 write-gate), and the admin-only-tag rule stays.
 -- ───────────────────────────────────────────────────────────────────
+-- ★ READ must admit an author's OWN withdrawn rows, or withdrawal is impossible.
+--
+--   Postgres refuses an UPDATE whose resulting row would not be visible to the
+--   writer under the table's SELECT policies. `community_posts_read` (from #24)
+--   admits only status = 'active', so an author setting status = 'deleted'
+--   produces a row they can no longer see, and the statement fails with 42501 —
+--   "new row violates row-level security policy".
+--
+--   Consequence: the member soft-delete that CLAUDE.md and #24/#28 describe
+--   ("members edit and soft-delete their own rows") could never actually have
+--   succeeded. It was never covered by a test, because until now nothing
+--   executed these policies as a real member. Adding the author branch below
+--   makes withdrawal work, and is strictly narrower than it looks: it lets an
+--   author see only their OWN non-active rows, which they wrote.
+--
+--   Hiding stays admin-only and stays invisible to the author: the branch is
+--   deliberately limited to 'deleted', so an admin-hidden post does not become
+--   readable by the person who wrote it.
+drop policy if exists community_posts_read on public.community_posts;
+create policy community_posts_read on public.community_posts
+  for select to authenticated
+  using (
+    (select public.is_admin())
+    or (status = 'active'
+        and (select public.is_approved()) and (select public.is_enrolled())
+        and space_id in (select public.my_community_space_ids()))
+    or (author_id = (select auth.uid()) and status = 'deleted')
+  );
+
+drop policy if exists community_comments_read on public.community_comments;
+create policy community_comments_read on public.community_comments
+  for select to authenticated
+  using (
+    (select public.is_admin())
+    or (status = 'active'
+        and (select public.is_approved()) and (select public.is_enrolled())
+        and space_id in (select public.my_community_space_ids())
+        and exists (select 1 from public.community_posts p
+                     where p.id = post_id and p.status = 'active'))
+    or (author_id = (select auth.uid()) and status = 'deleted')
+  );
+
 drop policy if exists community_posts_own_insert on public.community_posts;
 create policy community_posts_own_insert on public.community_posts
   for insert to authenticated

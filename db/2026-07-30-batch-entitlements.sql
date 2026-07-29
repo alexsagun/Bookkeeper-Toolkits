@@ -1244,6 +1244,19 @@ begin
        order by e.granted_at, e.batch_index
        for update skip locked
     loop
+      -- ★ The cursor's `not exists` guard was evaluated against the snapshot
+      -- taken when the cursor opened, so it cannot see seats allocated by
+      -- EARLIER ITERATIONS OF THIS LOOP. A member holding three queued seats
+      -- would therefore have all three bound to this one cohort, violating
+      -- batch_entitlements_one_seat_per_cohort. Re-check inside the loop, where
+      -- our own uncommitted writes are visible: one member, one seat, per cohort.
+      if exists (select 1 from public.batch_entitlements e2
+                  where e2.user_id = v_e.user_id
+                    and e2.batch_id = v_b.id
+                    and e2.status in ('queued', 'active')) then
+        continue;
+      end if;
+
       update public.batch_entitlements
          set batch_id = v_b.id, status = 'active',
              activates_at = v_act, allocated_at = now(), updated_at = now()
