@@ -13,7 +13,9 @@ tools across three career stages:
 3. **Client Management & Delivery** — engagement letters, onboarding, Chart of Accounts generator, invoice creator, bank-feed AI, statement→CSV converter, email templates, accounting calculators, monthly/year-end checklists, SOP generator, sales tax, budgeting & forecasting, plus growth tools (pricing, upsell, capacity, payment tracking).
 
 Many tools are **AI-assisted** (call Claude); the rest (calculators, checklists, Chart of Accounts,
-templates) run fully offline with no API key.
+templates) run fully offline with no API key. Alongside the tools sits the in-app **Community**
+(member feed — the Discord replacement; see the Community section below), included with every
+active paid plan.
 
 ## Tech stack
 
@@ -45,10 +47,16 @@ npm install        # install dependencies
 npm run dev        # Vite dev server + local Anthropic proxy (vite.config.js)
 npm run build      # production build -> dist/
 npm run preview    # preview the production build locally
+npm run ai:knowledge       # regenerate docs/ai/toolkits-voice-agent-knowledge.md (voice assistant)
+npm run ai:knowledge:check # rebuild the knowledge doc in memory + diff vs disk; exit 1 on drift (writes nothing)
+npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge base
+npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
+npm test                   # node --test — the pure-lib suites in test/ (studentImport, trainerToken, trainerContent, trainerAccess)
 ```
 
-There is **no test suite and no linter** — verify changes by running `npm run dev` and exercising
-the affected tool in the browser.
+There is **no linter** — verify UI changes by running `npm run dev` and exercising the affected
+tool in the browser. The only automated tests are the `node --test` suites over the pure
+`src/lib/*.js` modules (`npm test`).
 
 ## Architecture map
 
@@ -176,29 +184,206 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
 - **Setup:** all SQL + bucket steps live in **[COURSE_SETUP.md](COURSE_SETUP.md)**. Progress is in
   Supabase, **not** `window.storage` — do **not** add course keys to `LEGACY_KEYS`.
 
-### [src/BookkeeperPro.jsx](src/BookkeeperPro.jsx) — the entire app (~19.6k lines)
+### Community (Supabase-backed member forum) — `CommunityHub`
+
+The in-app replacement for the Discord group chat, grown into a full forum: tab id
+`community`, route `/community` (+ **`?post=<id>` deep links** to a discussion — the
+CourseCatalog `?course=` idiom), sidebar Home → Community. **Every active paid plan includes
+it** (all plans advertise group chat) — the tab id is in `TRAINING_ONLY_TAB_IDS` + the
+sampler `tabIds` (full plans pass by default), and the **server gate is `is_approved()` +
+`is_enrolled()` RLS** (term + 3-day grace, mirroring course reads), so access ends with the
+membership automatically — **expired members are fully blocked — reads _and writes_** (#28 closed
+the own-update gap on posts/comments that #25 had left). The
+Sampler Session's **60-day group chat support** == its 60-day `access_days` window.
+
+**Spaces & batches (#32, [db/2026-07-28-community-spaces-batches.sql](db/2026-07-28-community-spaces-batches.sql)):**
+the forum is segmented into **community_spaces** — one **General** space (every active plan;
+`member_comments = false` → members post + react but replies are off, historical replies stay
+readable; flip the flag to re-enable, no migration) plus one PRIVATE full-forum **Gold** and
+**VIP** space per **batch** (cohort registry, code `YYYY-MM`; `batches_create_spaces()` trigger
+auto-creates both spaces + a `batch_events` audit row). Access is **DERIVED, never stored**:
+`user_community_space_ids(p_user)` / `my_community_space_ids()` (SECDEF) map the current valid
+subscription → `enrollment_plans.community_segment` (`gold_live`→gold, `vip`→vip, else general)
++ `subscriptions.batch_id` → spaces; unknown plans and batch-less premium subs fail closed to
+General (they surface in Admin → Batches → "Needs batch assignment"). Every community policy +
+the community-media storage read is scoped `space_id in (select my_community_space_ids())`;
+posts/comments carry a trigger-stamped frozen `space_id` (comments denormalized so the realtime
+channel can filter `space_id=eq.<id>`); notify triggers drop cross-space mention uuids;
+`search_community_members(p_query, p_space_id)` + `community_category_counts(p_space_id)`
+replaced their old signatures (default params keep old clients resolving). New media paths are
+`<space_id>/<uid>/<uuid>-<name>` (legacy `<uid>/…` reads keep working — authorization is
+attachment-join based). Client: `CommunityHub` gains a space engine (`my_community_spaces()`
+RPC → switcher pills + member counts, `?space=<slug>` beside `?post=`, gold/vip land in their
+private space by default, last selection in `window.storage` `community:lastSpace` — in
+`LEGACY_KEYS`); a pre-#32 DB degrades to legacy single-space mode + an admin notice — but that
+degrade is confirmed by **probing `community_spaces` for a missing-table code**, never by the RPC
+error alone: legacy mode leaves `spaceId` null, the composer then omits `space_id`, and
+`community_posts_guard()` defaults it to **General**, so a false "pre-#32" verdict would publish a
+private cohort post to every plan. Any other failure sets `spacesReady='error'`, which blocks the
+feed load, the realtime subscription, the detail fetch, and every write.
+**Lockstep set when segment/batch rules change:** the `community_segment` seed ↔
+`PLAN_SEGMENT_FALLBACK`/`planSegment()` in [src/lib/communitySpaces.js](src/lib/communitySpaces.js)
+↔ `user_community_space_ids()` ↔ `approvalBatchPreselect()` (the pure mirror of
+`admin_finalize_enrollment()`'s batch precedence) ↔ `batchGapForProcess()` (the import path's
+process-time re-validation) — all pinned by `test/communitySpaces.test.mjs`.
+Batch UI: paywall open-batch selector (gold/vip), approve-modal picker, `AdminBatches` tab
+(`batches` route `/admin/batches`), import `batch_code` column. **Two batch facts that surprise
+people:** per-segment **capacity is enforced only on the two admin RPC paths** (approval +
+`admin_assign_batch`) — imports and direct SQL grants do not consume seats; and **archiving a batch
+blocks its existing members' renewals and extensions** (the RPC refuses `archived` before the
+existing-member carve-out), whereas **closing** it only stops new assignments.
+
+- **Tables** ([db/2026-07-20-community.sql](db/2026-07-20-community.sql) #23 + the forum
+  upgrade [db/2026-07-21-community-forum.sql](db/2026-07-21-community-forum.sql) #24, both
+  folded into the bootstrap §15b): `community_tags` (10 seeded categories; `admin_only` =
+  Announcements, enforced **in the insert/update policies**, and the tags read policy
+  deliberately does NOT filter on `active` — the policy subquery depends on members seeing
+  admin-only rows; the client filters `active` for pickers) → `community_posts` /
+  `community_comments` (status `active|hidden|deleted`; **`author_name` +
+  `author_avatar_url` denormalized** because non-admins can't read other profiles rows —
+  the `enrollment_requests` precedent — but **stamped server-side by the SECURITY DEFINER
+  `community_stamp_author()` trigger**, never trusted from the client) +
+  `community_reactions` (`like|celebrate|helpful`; targets a post **or** a comment — XOR
+  check + partial unique index; toggle = insert/delete own row). Forum columns on posts:
+  `pinned` / `comments_locked` / `comment_count` / `last_activity_at` — **server-controlled**
+  via `community_posts_guard()` (zeroes counters, blocks member pin/lock; admin-only tags
+  are born locked) + `community_comment_rollup()` (recomputes active reply count, advances
+  activity — powers the Unanswered filter + activity sort with no PostgREST embeds). New
+  tables: `community_attachments` (image|video|link; files in the **private
+  community-media** bucket, `<uid>/…` paths, batch-signed URLs), `community_post_tags`
+  (free-form normalized slugs, ≤5/post), `community_notifications` (**no insert policy** —
+  written only by the SECURITY DEFINER notify triggers that parse `@[Name](uuid)` mention
+  markup out of stored bodies + fan out reply notifications; unforgeable; targets must be
+  *mentionable* — named + approved — and repeats collapse into one unread row per
+  actor/post/kind, which also caps bell spam),
+  `community_announcement_reads` (per-member read markers; announcements are **react +
+  mark-as-read only**, born `comments_locked`).
+- **Avatars / mentions RPCs:** `set_my_avatar(p_path)` — the ONE sanctioned user-facing
+  `profiles` write (SECURITY DEFINER; own `avatars/<uid>/…` path only; also back-fills the
+  caller's denormalized `author_avatar_url`); `search_community_members(p_query)` — the
+  mention-autocomplete directory (name + avatar, **never email**; nameless profiles are
+  unmentionable). Avatars live in the **public `avatars` bucket** (getPublicUrl; legacy
+  Google-OAuth full URLs still render via `resolveAvatarUrl`'s prefix branch).
+- **Moderation:** members edit (through the composer modal) + **soft-delete** their own rows
+  (no member DELETE policy; an author can never un-hide an admin-hidden post); admins
+  pin/unpin, lock/unlock replies, hide/restore, **hard-delete** inline (hard-deleting a post
+  also removes its community-media files — attachment files are never shared across posts,
+  so no `removeMediaIfUnreferenced`-style refcheck). Member comment reads/inserts also
+  require the **parent post to be active**, so hiding a post hides its whole thread and
+  freezes replies; inserts on `comments_locked` posts are refused (reactions stay allowed).
+  Keep `COMMUNITY_REACTIONS` (client) in sync with the SQL CHECK when the reaction set
+  changes, and the client mention regex (`COMMUNITY_MENTION_SRC`) in sync with the SQL one.
+- **Client:** `CommunityHub` (module scope, above `ProChat`) with the forum suite beside it:
+  `MemberAvatar` + `resolveAvatarUrl` (THE shared avatar primitive — sidebar/rail/
+  AccountMenu/settings/community all render through it), `renderCommunityBody` (mention
+  chips + safe `https?://` auto-links — **no dangerouslySetInnerHTML anywhere**),
+  `MentionTextarea`, `AttachmentGallery`, `CommunityTopicRow`, `CommunityCategoryRail`,
+  `CommunityFilterTabs`, `CommunityRightRail`, `CommunityComposer` (AccountModal shell),
+  `CommunityPostCard` (the detail view), and `useCommunityBell` + `NotificationBell`.
+  `CommunityHub` keeps **zero props** (self-contained via `useAuth`) so the memoized
+  `TabPanel` keep-alive is untouched; loads once on mount, then realtime INSERTs (new posts
+  → a "new discussions" pill, not auto-prepend) + throttled focus refetch. Meta counts use
+  the CourseCatalog client-reduce idiom. Missing tables → the "Finish backend setup" /
+  "coming soon" card, with a **separate "#24 not applied" variant** on a missing-column
+  error (42703/PGRST204) — a #23-only DB degrades to guidance, never a red error.
+- **Notification bell:** `useCommunityBell(uid, enabled)` runs in the **root** component
+  (same render gate as the voice assistant: admins + enrolled members) — bell state never
+  threads through TabPanel; `NotificationBell` mounts in the sidebar identity card, the
+  collapsed rail, and the mobile topbar, portals its dropdown through `OverlayPortal`
+  (z-[65]) with the AccountMenu outside-click/Escape idiom, and navigates via module-scope
+  `writeAppRoute('community', { postId })` (the `setPanelParam` no-prop-threading
+  precedent). CommunityHub pokes it after read/mark actions via the `COMMUNITY_BELL_POKE`
+  window event. Unread = own `community_notifications` + announcements minus own read rows
+  (no per-member fan-out). Pre-#24 DB → the bell silently self-disables.
+- **Profile pictures:** `AvatarSection` (self-contained, top of `ProfileSettingsBody`) —
+  upload to `avatars/<uid>/<uuid>.<ext>` → `set_my_avatar()` RPC → best-effort cleanup of
+  older files → `refreshProfile()`. `PROFILE_SELECT` already carries `avatar_url`.
+  Delete confirms use `AccountModal`; the ⋮ menus use the house document-level
+  `pointerdown` outside-click idiom. Setup + troubleshooting:
+  **[COMMUNITY_SETUP.md](COMMUNITY_SETUP.md)**. Community data is in Supabase — nothing
+  goes in `LEGACY_KEYS`.
+
+### Student Imports (admin — Thinkific → Toolkit migration) — `StudentImports`
+
+The admin-only migration system for moving legacy Thinkific students into the Toolkit's own
+membership. Tab id `studentimports`, route `/admin/student-imports`, an `isAdmin`-gated sidebar link
+beside Access Requests + Enrollments (**not** in `DEFAULT_STAGES` — the same standalone-link pattern
+as the other admin tabs). Migration **#26**
+([db/2026-07-23-student-imports.sql](db/2026-07-23-student-imports.sql), folded into the bootstrap
+§16). Full runbook: **[STUDENT_IMPORT_SETUP.md](STUDENT_IMPORT_SETUP.md)**.
+
+- **Core principle:** imports create **real** Supabase Auth accounts (students set their OWN password)
+  and grant **real dated `subscriptions` rows** that flow through `public.is_enrolled()` exactly like a
+  paid enrollment — **never** fake `enrollment_requests`/receipts/payments. Imported terms are marked
+  `subscriptions.grant_source='import'` + `source_import_row_id` (a **partial** `unique` index =
+  one grant per import row) so they're distinguishable + idempotent, and this is **additive** — the
+  existing `approve_subscription()`/`approve_extension()` signatures/bodies are untouched (their
+  inserts leave the new columns at defaults, which the partial index never covers).
+- **Non-negotiable data rule:** never infer paid access/plan/payment/start/expiry from a course title,
+  account-created date, last-sign-in, or amount-spent. Plan comes from the admin's explicit
+  course-combo mapping (read live from `enrollment_plans`); term dates come from a trustworthy source
+  (Orders/ledger/manual template). A bare Thinkific **User** export (blank emails) **stages** but
+  grants nothing — all new-account rows are **blocked** until email + exact expiry are supplied.
+- **Tables** (all RLS admin-only; `student_external_accounts` also self-read):
+  `student_import_jobs` (staged upload + `settings` combo→plan map + resumable `cursor`) →
+  `student_import_rows` (per-row `mapped` raw/normalized payload — purgeable — + `proposed_*` /
+  `match_result` / `intended_action` / `processing_status` / idempotency flags), `student_external_
+  accounts` (durable `unique(source, external_user_id)` link), `student_import_events` (immutable
+  audit — admin select+insert, **no** update/delete; IDs + safe codes only, never PII/links).
+  Plus `profiles.account_origin`/`onboarding_status`/`invited_at`/`onboarding_completed_at` +
+  the narrow `complete_import_onboarding()` SECURITY DEFINER RPC (the student's own onboarding write).
+- **Server** — [api/admin/student-imports.js](api/admin/student-imports.js) (Vercel + `npm run dev`
+  via the `studentImportDevApi` middleware in vite.config.js). Holds the **service-role** key
+  (`SUPABASE_SECRET_KEY`, legacy fallback `SUPABASE_SERVICE_ROLE_KEY`; never `VITE_`-prefixed / never
+  returned/logged). **Every action verifies the caller JWT + independently confirms
+  `profiles.is_admin` BEFORE the service client is constructed** (same `verifyCaller`/`callerIsAdmin`
+  idiom as the notify/proxy endpoints). Actions: `dry-run` (bulk-match staged rows by source link →
+  normalized email via `profiles.email`; **never by name**; write proposals back — no mutations),
+  `process` (bounded resumable batch from the cursor; per-row idempotent + partial-failure recoverable
+  — three idempotency keys: auth-email uniqueness + external-link unique + `source_import_row_id`
+  unique; never auto-deletes an Auth user), `resend-invite`, and a `GET` health check. Invites use
+  `admin.generateLink` (invite/recovery) → emailed via Resend → **link discarded**.
+- **Pure logic** — [src/lib/studentImport.js](src/lib/studentImport.js): dependency-free ESM shared by
+  the wizard, the endpoint, and `node --test` ([test/studentImport.test.mjs](test/studentImport.test.mjs)).
+  `normalizeEmail`/`parseExternalId`/`parseStrictDate` (strict UTC; rejects ambiguous),
+  `sanitizeCsvCell`/`toCsv` (formula-injection-safe exports), `parseCsv` (BOM/quoted commas),
+  `parseEnrollmentsList`/`comboKeyOf`/`suggestPlanForCombo` (advisory only — never auto-confirms;
+  never suggests sampler/gold/vip), `resolveMatchDecision`, and `computeImportTerm` (the
+  preserve/expired_history/fresh/lifetime + never-shorten-a-longer-active-term decision table).
+- **Onboarding gate:** an imported user (`profiles.account_origin='import'` + `onboarding_status !=
+  'completed'`) is forced onto `SetPasswordScreen` (reuses `updatePassword` +
+  `complete_import_onboarding()` RPC) via a new early-return in the auth gate **after** `profileReady`
+  and **before** the enrollment block. `PROFILE_SELECT` (AuthProvider.jsx) carries the two onboarding
+  columns; a pre-#26 DB drops them via the column fallback → the gate simply never triggers (safe
+  degrade). After completion the imported subscription flows through `useEnrollmentGate → is_enrolled`
+  with zero special-casing. Import state is server-side — nothing goes in `LEGACY_KEYS`.
+
+### [src/BookkeeperPro.jsx](src/BookkeeperPro.jsx) — the entire app (~24.2k lines)
 
 > Note: lines are long; prefer `Grep` over reading the whole file. Line numbers below are anchors,
 > approximate as the file evolves.
 
 | Region | Lines (approx) | Contents |
 |---|---|---|
-| Shared AI helper | 16–62 | `callClaude()` (L27) — the single entry point every AI tool uses (see AI/proxy pattern) |
-| Imports + domain data | 1–620 | `COA_BASE` (L68), `COA_INDUSTRY` (L121), `INDUSTRY_NOTES` (L341), `VENDOR_PATTERNS` (L367), `COURSE_MODULES` (L463), checklists, `TIPS` (L603) |
-| Design system + helpers | 620–770 | colors `C` (L624), `SHEEN` (L654), `GLASS` (L657), fonts `fontDisplay` (L671) / `fontMono` (L673), `downloadFile()` (L679), `useCurrency()` (L712), `CurrencyToggle()` (L748) |
-| Root component | 774–~1700 | `BookkeeperProToolkit` (L774): `tab` state, sidebar `DEFAULT_STAGES` config (~L779–864), drag-drop reorder, rename/persist to `window.storage` (`sidebar:*` keys, ~L940–988), and the **keep-alive render** (`renderTabContent(tabId)` switch + `visitedTabs` map). URL-routing helpers (`TAB_ROUTES`, `readAppRoute`, `writeAppRoute`, `tabHref`, `shouldHandleInAppClick`) sit at the **top of the file** (module scope). |
-| Tool components | ~1740–end | ~60 self-contained functional components |
+| Routing + shared AI helper | 20–610 | URL/panel routing helpers (`TAB_ROUTES` L79, `readAppRoute` L219, `setPanelParam` L263), the voice-assistant literals (`VOICE_TAB_INFO`…), `callClaude()` (L563) — the single entry point every AI tool uses (see AI/proxy pattern) |
+| Domain data | 610–1175 | `COA_BASE` (L613), `COA_INDUSTRY` (L666), `INDUSTRY_NOTES` (L886), `VENDOR_PATTERNS` (L912), `COURSE_MODULES` (L1008), checklists, `TIPS` (L1148) |
+| Design system + helpers | 1175–1510 | colors `C` (L1177), `SHEEN` (L1230), `GLASS` (L1233), fonts `fontDisplay` (L1247) / `fontMono`, `downloadFile()` (L1257), `useCurrency()` (L1309), `CurrencyToggle()` (L1497) |
+| Auth / enrollment / account infra | ~1510–4880 | gate screens, `useEnrollmentGate` (L2336), `submitSubscriptionRequest` (L2435), `OverlayPortal` + `AccountModal`/`SidePanel` shells (~L3000), `AccountMenu` + the Account-Center components (`ProfileSettingsBody`/`AccountSettingsPanel`/`MembershipPlanModal`/`ExtendAccessModal`, ~L3174–3760), `VoiceAssistant` (L4367), `renderToolContent` switch (L4834) + `TabPanel` |
+| Root component | 4887–~6600 | `BookkeeperProToolkit` (L4887): `tab` + `accountPanel` state, sidebar `DEFAULT_STAGES` config (L5080), drag-drop reorder, rename/persist to `window.storage` (`sidebar:*` keys), and the **keep-alive render** (`visitedTabs` map). |
+| Tool components | ~8200–end | ~60 self-contained functional components |
 
-**Notable tools → approximate line:** `Dashboard` 1749, `CoaGenerator` 2017, `Course` 2120,
-`CourseProgram` ~2782 (single-course Supabase video engine — builder + PDF certificate),
-`CourseCatalog` ~3630 (prefix-parameterized multi-course catalog) + the `QBOMastery` (`qbo-`) /
+**Notable tools → approximate line:** `Dashboard` 8236, `CoaGenerator` 8521, `Course` 8624,
+`CourseProgram` ~8805 (single-course Supabase video engine — builder + PDF certificate),
+`CourseCatalog` ~9966 (prefix-parameterized multi-course catalog) + the `QBOMastery` (`qbo-`) /
 `InterviewStrategyCatalog` (`interview-`, the `winstrat` subtab) / `ResumeStrategy` (`resume-`) wrappers right after it,
-`BankFeed` 2214, `StatementConverter` 2411, `ProChat` 2764,
-`AuthenticBranding` 4944, `ProposalGenerator` 5379, `EngagementLetter` 5658, `EmailTemplates` 6304,
-`PainPointsGenerator` 6629, `IndustryAccounting` 7661, `USTax101` 7962,
-`MonthlyWorkflow` 8135, `MonthEndChecklist` 8336, `InvoiceCreator` 8618, `CoachAlexChat` 9025,
-`CPAAIChat` 9178, `AccountingCalculators` 10181, `NicheSelectorQuiz` 10328, `CertificationTracker` 10583,
-`LinkedInOptimizer` 10732, `MockInterviewSimulator` (a **guided-video + external-link page** —
+`BankFeed` 10466, `StatementConverter` 10665, `CommunityHub` ~12359 (the community forum — see the
+Community section above; the forum suite `MemberAvatar` 11151 → `useCommunityBell` 11848 →
+`CommunityPostCard` 12102 sits just above it), `ProChat` 13281,
+`AuthenticBranding` 14445, `ProposalGenerator` 14889, `EngagementLetter` 15168, `EmailTemplates` 15717,
+`PainPointsGenerator` 15970, `IndustryAccounting` 16330, `USTax101` 16466,
+`MonthlyWorkflow` 16560, `MonthEndChecklist` 16650, `InvoiceCreator` 16881, `CoachAlexChat` 17369,
+`CPAAIChat` 17399, `AccountingCalculators` 18201, `NicheSelectorQuiz` 18267,
+`LinkedInOptimizer` 18405, `MockInterviewSimulator` 18561 (a **guided-video + external-link page** —
 admin-uploaded explainer video + a "Open Mock Interview Simulator" button to the external
 `https://app.sesame.com/`; Supabase-backed via the `feature_guides` table — **not** the old internal
 AI simulator. The CTA is **gated behind watching the guide video** — grey/disabled until the video ends
@@ -207,9 +392,11 @@ completion persists in `feature_video_completions` and re-locks when the admin r
 takes an **`embedded`** prop and now renders as the **2nd sub-tab inside `InterviewPrep`** (Job Interview
 Mastery), not a standalone sidebar item; when `embedded` it drops its own `SectionHead`. The legacy
 `mockinterview` tab id is kept only as a defensive render-switch redirect → `<InterviewPrep initialSub="mock" />`),
-`DiscoveryCallSimulator` 11164,
-`SOPGenerator` 11471, `ClientHealthScore` 12136, `CapacityPlanner` 13358, `PaymentTracker` 13542,
-`QBDiagnostic` 14293, `BudgetingTool` 15483, `ForecastingTool` 15958.
+`DiscoveryCallSimulator` 18973,
+`SOPGenerator` 19280, `ClientHealthScore` 19945, `CapacityPlanner` 21029, `PaymentTracker` 21213,
+`QBDiagnostic` 21965, `BudgetingTool` 23162, `ForecastingTool` 23653. (Note: `ClientHealthScore`,
+`CapacityPlanner`, and `PaymentTracker` are among ~10 components currently defined but wired to no
+route/sidebar entry — see the 2026-07-14 cleanup audit; pending a product call to delete or restore.)
 
 ### Navigation model
 
@@ -223,10 +410,23 @@ keep-alive** (see below). Four pieces must stay in sync when adding/removing a t
 
 **Navigation is URL-routed and state-preserving:**
 - `readAppRoute()` / `writeAppRoute()` / `tabHref()` (module scope) sync the active tab — and a few
-  inner states (`?sub=` for `InterviewPrep`, `?course=<id>` for a catalog) — to the URL via the
-  History API. `vercel.json` rewrites all non-`/api` paths to `/`, so pretty-path deep links never
-  404. The root restores the tab from the URL **after** the auth gate, persists the last tab to
-  `window.storage` (`nav:lastTab`), and handles Back/Forward via a `popstate` listener.
+  inner states (`?sub=` for `InterviewPrep`, `?course=<id>` + `?lesson=<id>` for a catalog (the
+  lesson deep-link the voice trainer's `open_course_lesson`/citation chips use), `?panel=` for the account
+  surfaces) — to the URL via the History API. `?panel=` has **five canonical values**
+  (`settings | membership | upgrade | extend | renew`), normalized from aliases by
+  `ACCOUNT_PANEL_ALIASES`/`normalizeAccountPanel()` (`profile`→settings, `plan`/`billing`→membership,
+  `renewal`→renew, …). It is orthogonal to tab routing, so it has its **own** writer
+  `setPanelParam()` (mutates only the `panel` key on the live URL, preserving path + all other
+  params; open = pushState so Back closes, close/switch = replaceState; fires the
+  `bookkeeper:route-change` event so the root re-syncs) rather than the tab-centric
+  `tabHref`/`writeAppRoute` (which rebuild the query from the tab base and would drop it).
+  A root strip-effect clears a deep-linked **billing** panel the account can never render
+  (admin, or enrollment flag off) so the param never strands in the URL — deliberately not keyed
+  on gate state, so a pending student's `?panel=settings` still opens after approval.
+  `vercel.json` rewrites all non-`/api` paths to `/`, so pretty-path deep links never 404. The
+  root restores the tab from the URL **after** the auth gate, persists the last tab to
+  `window.storage` (`nav:lastTab`), and handles Back/Forward via a `popstate` listener (which also
+  re-syncs `accountPanel`).
 - **Sidebar items are real `<a href={tabHref(id)}>` links.** Plain left-click navigates in-app
   (`shouldHandleInAppClick(e)` then `preventDefault` + `setTab`); Ctrl/Cmd/middle-click opens the
   section in a new browser tab natively; a hover `ExternalLink` icon opens it in a new tab explicitly.
@@ -314,9 +514,14 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   `AdminEnrollments`; own sidebar badge = pending_review HEAD-count). Requests are append-only for
   students (statuses `pending_review/approved/rejected/expired`; unique partial index = one
   pending per user; resubmit inserts a new row; the only student UPDATE is self-expiring an
-  overdue row); **Approve** writes request → profile (`is_paid`,`plan`,`approval_status`) →
-  a **dated subscription term** via the admin-guarded `approve_subscription()` RPC (falls back to
-  the legacy no-expiry update-else-insert when the lifecycle migration is missing); **Reject/
+  overdue row); **Approve** (since #32) is ONE transactional admin-guarded RPC —
+  `admin_finalize_enrollment(p_request_id, p_batch_id)` — that validates request status + plan +
+  batch (gold/vip need an open batch; capacity checked under a batch lock) and atomically grants
+  the **dated subscription term** (wrapping `approve_subscription()`/`approve_extension()`),
+  stamps `subscriptions.batch_id`, patches the profile cache, and marks the request approved.
+  **The old client-side 3-step approve + its local-grant fallback are GONE** — a missing #32
+  surfaces setup guidance and grants nothing (never re-add a client fallback: it would bypass
+  batch/capacity validation); **Reject/
   expire** keeps the student blocked with a resubmit path. Receipt preview uses `createSignedUrl`
   (the app's **first** signed-URL use — everything else is public-bucket `getPublicUrl`). Emails
   via env-gated `api/notify-enrollment.js` (`RESEND_API_KEY`/`RESEND_FROM`, optional
@@ -366,11 +571,14 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   switches over that state → `EnrollmentPendingScreen` (`renewal`/`finalizing` props),
   **`MembershipExpiredScreen`** (expired member → Renew → paywall in `renewal` mode with
   `currentSub`/`onClose`), or the paywall. The Dashboard renders **`MembershipPanel`**
-  (self-contained useAuth/fetch/realtime; fail-silent null on any error): plan, status pill,
+  (self-contained useAuth/fetch/realtime; admins/flag-off/no-data render null, a query **error
+  shows a compact retry card** — never a silently missing panel): plan, status pill,
   start/expiry dates, days remaining, amount paid, entitlement chips, **calm > 5 days / amber
   warning ≤ 5 / red urgent ≤ 3 / red grace-period state** (grace end date + days) once the term has
-  ended but access continues, and a Renew button that opens the paywall as a fixed overlay — a
-  member with a pending renewal keeps full access. `AdminEnrollments` adds membership filters
+  ended but access continues, and a Renew button that opens the **URL-driven `?panel=renew`**
+  renewal paywall (module-scope `setPanelParam('renew')` — no prop threading; the card reloads
+  itself when a billing panel closes, via the route-change event) — a member with a pending
+  renewal keeps full access. `AdminEnrollments` adds membership filters
   (Renewals / Active / Expiring soon / In grace / Ended), a per-card membership strip (with an
   "In grace" pill + grace-end date and the plan's access-scope chip), and an "access until {date}
   (+ 3-day grace)" projection in the approve modal. Docs:
@@ -379,19 +587,72 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   plan-course-access → subscription-grace (#18) → sampler-essentials-access (#19) →
   account-membership-requests (#20) → hardening (#21, caps `approve_extension` at 60–365 days +
   a range CHECK on `extension_days` — the request column is student-declared, so the RPC is the
-  bound that matters; the client mirrors it with a 2–12 month selector).
+  bound that matters; the client mirrors it with a 2–12 month selector) →
+  sampler-support-60-days (#22, data fix: the live sampler row's `support_days`/chips 30 → 60) →
+  community (#23, the base `community_*` tables) →
+  community-forum (#24, the forum upgrade: pin/lock/counter columns + guard/rollup/notify
+  triggers, attachments/tags/notifications/announcement-reads tables, comment reactions,
+  `set_my_avatar()` + `search_community_members()` RPCs, the avatars + community-media
+  buckets — see the Community section) → community-hardening (#25) → student-imports (#26) →
+  course-ai-trainer (#27, the AI voice trainer's knowledge/checkpoint tables + service-role
+  entitlement mirrors — see the AI course trainer section) → community-write-gate (#28, adds the
+  `is_approved()`+`is_enrolled()` gate to the two community own-update policies, closing the
+  expired-member edit/soft-delete gap #25 left on posts/comments) → rls-initplan-and-indexes (#29,
+  wraps every zero-arg auth/gate call in RLS policies `(select …)` for once-per-statement InitPlans +
+  the FK/hot-path index pass) → backend-hardening (#30, `subscriptions.plan_key` FK + CHECK
+  constraints + anon-EXECUTE revokes + avatars/course-media read-policy scoping + course-media bucket
+  limits) → schema-migrations-log (#31, the `public.schema_migrations` apply-log — **after running any
+  dated db/*.sql file, insert its row in the same session**; this table exists because #20/#21 sat
+  silently unapplied in prod for two weeks while the deployed Extend Access UI depended on them) →
+  community-spaces-batches (#32, batches + community_spaces + space-aware community RLS + the
+  `admin_finalize_enrollment()` single-RPC approve — see the Community section; needs #12 + #13 +
+  #20 + #23/#24 + #30, run after #29/#31; folded into the bootstrap **verbatim as §19 at the tail**,
+  after §18, so its space-aware policies win on a fresh install — re-fold on change) →
+  community-batch-hardening (#33, patches #32 after review: capacity/closed-batch checks now key on
+  whether the member currently **occupies a seat** rather than on the batch id changing — an expired
+  member renewing used to skip both while being excluded from the seat count; plus attachment
+  `storage_path` binding, a set-based `search_community_members()`, `grant update (read_at)` on
+  notifications, space-scoped own-DELETE policies, and a real-month `batches.code` CHECK; folded
+  **verbatim as §20**, after §19) → batch-hardening-followup (#34, corrects #33's
+  `admin_finalize_enrollment`: that rewrite reconstructed the tail instead of copying #32's and
+  dropped `updated_at`, the `rejected_at`/`rejected_by` clearing and `rejection_reason = null`, and
+  changed `approved_at` to first-approval — #34 restores #32's body verbatim keeping only the
+  `v_holds_seat` change, and gates `community_media_delete` to match
+  `community_attachments_own_delete`; folded **verbatim as §21**. **Always run #34 with #33.**).
   **Expiry-warning policy:** student-facing surfaces (menu pill, Dashboard `MembershipPanel`, the
   sidebar "Access until" line) turn amber ≤ 5 days / red ≤ 3 (+ the grace state); admin views
   (Enrollments membership strip + the "Expiring ≤ 14d" filter) intentionally use a 14-day lead
   time, labeled as such — don't "unify" them.
 - **Account menu + self-serve Extend / Upgrade (`db/2026-07-11-account-membership-requests.sql`, #20):**
   a SaaS-style **⋮ account menu** on the sidebar identity card (`AccountMenu`, both the expanded card and
-  the collapsed rail; house dropdown a11y — Escape + `fixed inset-0` outside-click catcher +
-  `role=menu`/`menuitem` + focus restore) opens **Profile & Settings** (`ProfileSettingsModal`, read-only
-  — `profiles` has no user-update RLS), **Membership Plan** (`MembershipPlanModal`), **Upgrade Plan**,
-  **Extend Access** (`ExtendAccessModal`), and **Log out**; billing items hidden for admins
-  (`showBilling`). The root holds one `accountView` state and renders the modals off the already-loaded
-  `enroll.sub`/`enroll.latestReq`/`entitlement` (no refetch). Both new actions are just new **kinds** of
+  the collapsed rail; house dropdown a11y — Escape + a document-level `pointerdown` outside-click
+  listener (NOT a `fixed inset-0` catcher — the sidebar's CSS transform would trap it) +
+  `role=menu`/`menuitem` + focus restore; the trigger is a **vertical** `MoreVertical` kebab with
+  `aria-label="Open account menu"`) opens **Profile & Settings**, **Membership Plan**
+  (`MembershipPlanModal`), **Upgrade Plan**, **Extend Access** (`ExtendAccessModal`), and **Log out**;
+  billing items gated by `showBillingControls` (`!is_admin && REQUIRE_ENROLLMENT`). **Every account
+  surface is an overlay group, not a layout column, and ALL of them are URL-driven** from the root
+  `accountPanel` state (`?panel=settings|membership|upgrade|extend|renew`, read in `readAppRoute()`,
+  written by the module-scope `setPanelParam()` — see the Navigation section for push/replace,
+  aliases, and the strip-effect that clears disallowed billing panels). Profile & Settings is the
+  **Account Center**: a widened (`sm:max-w-lg`) **right-side drawer** (`AccountSettingsPanel` → the
+  reusable `SidePanel` shell) whose `ProfileSettingsBody` is sectioned — Account overview (name /
+  email / role / copyable account id), Membership facts (shimmer rows while the gate is fetching,
+  via the `enrollReady` prop — never blank), Subscription actions (Upgrade / Extend / conditional
+  Renew), **Payments & requests** (`RequestHistorySection`: lazy last-5 `enrollment_requests`
+  fetch on drawer open with skeleton → error+retry → empty states; `select('*')` so pre-#20
+  schemas degrade), Course access (entitlement scope + plan chips), and a Support note
+  (`profiles` has no user-update RLS — name/email changes go through support). The admin variant
+  drops all billing sections for a role/capabilities card. Membership/extend are centered modals;
+  upgrade/renew are full-screen paywall overlays. All render from one block after
+  `</main>` off the already-loaded `enroll.sub`/`enroll.latestReq`/`entitlement` (no refetch
+  beyond the drawer's own plan-row + history lookups); billing sites are guarded by
+  `showBillingControls`. `MembershipPanel`'s Renew and
+  `RestrictedTab`'s "Upgrade or renew" open `?panel=renew`/`?panel=upgrade` via `setPanelParam`
+  directly (module scope + the route-change event — no prop threading through the memoized
+  TabPanel tree). Gate screens (`MembershipExpiredScreen` etc.) keep their **local** extend/renew
+  overlays — they render before the shell, where the `?panel=` block is unreachable. Both new
+  actions are just new **kinds** of
   the enrollment flow, reusing receipt upload + admin review: **Extend Access** buys more time on the
   SAME plan (min 2 months / 60 days; priced by `extensionPrice()` = `price_php/access_days × months*30`,
   so a 60-day plan's 2-month top-up == its full price), submitting an `enrollment_requests` row with
@@ -399,28 +660,54 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   `mode="upgrade"` overlay (renewal-mode variant that marks the current plan) and is tagged
   `request_kind='upgrade'` when a different plan is chosen. The shared `submitSubscriptionRequest()`
   helper (extracted from the paywall submit; column-resilient so it degrades before #20) does the
-  upload + insert for all paths. **Admin** `AdminEnrollments.doApprove` branches: an `extension` row →
-  `approve_extension(user, request_id, extension_days)` RPC (same plan, days stacked from the current
-  expiry / from now if expired, 3-day grace; client fallback mirrors it), everything else →
-  `approve_subscription` (upgrade = a different `p_plan_key` = full fresh term). New **Upgrade/Extension**
+  upload + insert for all paths. **Admin approval no longer branches in the client** — since #32,
+  `AdminEnrollments.doApprove` is ONE call to `admin_finalize_enrollment(p_request_id, p_batch_id)`,
+  which wraps `approve_extension()` for an `extension` row (same plan, days stacked from the current
+  expiry / from now if expired, 3-day grace) and `approve_subscription()` for everything else
+  (upgrade = a different `p_plan_key` = full fresh term). The old 3-step client sequence **and its
+  local-grant fallback were deleted on purpose — never re-add them** (they bypass batch/capacity
+  validation); a missing #32 must surface setup guidance and grant nothing. The client also sends
+  `p_batch_id` **only when an admin explicitly picks a batch**, so the RPC's own precedence chain
+  stays the authority. New **Upgrade/Extension**
   card badges + filter chips + an extension-aware approve-modal projection. Expired (past-grace) members
   have no sidebar, so **`MembershipExpiredScreen`** also surfaces **Extend the same plan** (opens
   `ExtendAccessModal`) alongside Renew/Upgrade/Sign out; the pending screen copy is `request_kind`-aware.
   Add `request_kind`/`extension_days` to the docs when the request shape changes; **keep the two columns
-  + `approve_extension` in sync with `submitSubscriptionRequest`/`doApprove`**.
+  + `approve_extension` in sync with `submitSubscriptionRequest` and `admin_finalize_enrollment()`**.
 - **Shared dialog + admin UI kit (2026-07 stabilization pass):** `AccountModal` is the ONE modal shell
   for the whole app — the account-menu modals AND the admin approve/reject/receipt modals all use it.
   It centralizes dialog a11y (role/aria-modal, Escape, backdrop-close, a Tab focus-trap + focus
   restore) and takes `tone` ('primary'|'ok'|'danger' icon tile), `canClose` (gate closing while a
   request is in flight — replaces hand-rolled `busyId` guards), `headerAction`, `bodyClass`/`bodyStyle`,
-  `maxW`. Never hand-roll a `fixed inset-0` + `bg-white` modal again. Both admin screens
+  `maxW`. **Both shells render through the module-scope `OverlayPortal`** (`createPortal` →
+  `document.body`), so no ancestor CSS — the `.gh-app-bg > *` stacking rule, the sidebar's
+  transform/backdrop-filter containing block, the app-shell flex row — can demote or squeeze a
+  dialog; an in-tree anchor + dep-less layout effect suppresses the portal while a `[hidden]`
+  ancestor exists, so a modal left open inside a hidden keep-alive `TabPanel` stays hidden with
+  its tab (state intact, reappears on return). `WelcomeOverlay` and the upgrade/renew paywall
+  wrappers portal the same way. Never hand-roll a `fixed inset-0` + `bg-white` modal again — and
+  for a **right-side drawer** use the sibling `SidePanel` shell (same a11y idiom + portal:
+  focus move-in/restore, Escape, Tab focus-trap, role/aria-modal, backdrop-close;
+  `absolute inset-y-0 right-0 w-full` + a `maxW` prop, default `sm:max-w-md`, full-width sheet on
+  mobile), e.g. `AccountSettingsPanel` (`sm:max-w-lg`). Both admin screens
   (`AccessRequests` + `AdminEnrollments`) are built from the shared module-scope kit right above them:
   `AdminNotice` (status-token banners), `AdminFilterChip`/`AdminFilterCaption` (labeled filter rows),
   `AdminListSkeleton` (first-load skeleton; refresh keeps the list), `AdminUserCell`
   (avatar/name/badges/email/meta identity block), `ADMIN_BTN_OK`/`ADMIN_BTN_DANGER` (token-gradient
-  action buttons). New admin surfaces must reuse these. `ProfileSettingsModal` takes `showBilling`
-  (false for admins → "Role: Administrator", no plan/status), and the root short-circuits the
-  membership/extend/upgrade `accountView`s for admins.
+  action buttons). New admin surfaces must reuse these. `ProfileSettingsBody` (rendered in the
+  `AccountSettingsPanel` drawer) takes `showBilling` (false → billing sections drop out; admins get
+  a role/capabilities card) — see the Account-Center section list in the account-menu bullet — and
+  the root gates the billing panel render sites with
+  `showBillingControls` + strips a disallowed deep-linked billing `?panel=` (see Navigation).
+  `ProfileSettingsBody` now opens with the **`AvatarSection`** profile-picture uploader
+  (self-contained via `useAuth`): upload to the public `avatars` bucket
+  (`<uid>/<uuid>.<ext>`, ≤5 MB image) → the **`set_my_avatar()` SECURITY DEFINER RPC** (the
+  ONE sanctioned user-facing `profiles` write — there is still NO user-update RLS policy on
+  `profiles`; the RPC touches only `avatar_url` + the community denorms) →
+  `refreshProfile()`. Every identity surface (sidebar card + rail, AccountMenu, community
+  posts/replies/mentions) renders through the shared **`MemberAvatar`** primitive
+  (`<img>` with initials fallback; `resolveAvatarUrl` maps storage paths vs legacy OAuth
+  URLs) — never hand-roll the initials circle again.
 - **Plan-based access (per-plan entitlements):** membership is no longer all-or-nothing. The
   `core_self_paced` plan (QBO Mastery Only) unlocks **only Home + the Training & Skills stage** (and
   reads **both** `qbo-*` courses); the `sampler` plan (Sampler Session, ₱1,499 / 60 days) is scoped
@@ -430,9 +717,12 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   ₱999 core plan — never assume price ⇒ scope. `silver_self_paced` (QBO + Resume Combo, ₱1,999 / 60
   days) is listed **explicitly as full access** (`{ full: true }`) — premium/full non-admin toolkit,
   NOT to be confused with the limited QBO-only plan — and every other/unknown/grandfathered plan and
-  admins also get the full toolkit. **Client model** (module scope in BookkeeperPro.jsx, next to
-  `subAccess`): `PLAN_ENTITLEMENTS` map (core = Training tabs; sampler = Training-QBO + coaching +
-  `courseTier:'essentials'`; silver = explicit `full:true`) → `planEntitlement(key)` (returns FULL for
+  admins also get the full toolkit. **The `community` tab is in EVERY plan's allowlist** (it's in
+  `TRAINING_ONLY_TAB_IDS` and the sampler `tabIds`; full plans pass by default) — all plans include
+  group chat, and its real gate is the `is_enrolled()` RLS on the `community_*` tables (see the
+  Community section). **Client model** (module scope in BookkeeperPro.jsx, next to
+  `subAccess`): `PLAN_ENTITLEMENTS` map (core = Training tabs + community; sampler = Training-QBO +
+  coaching + community + `courseTier:'essentials'`; silver = explicit `full:true`) → `planEntitlement(key)` (returns FULL for
   any key not in the map OR an entry flagged `full:true`) → `{ full, label, scopeLabel, allowsStage(id),
   allowsTab(id), allowsCourse(course) }` (`allowsCourse` gates individual courses **within** a catalog
   by `course.access_tier` — the QBO Essentials/Mastery split); `FULL_ENTITLEMENT` is the default;
@@ -463,10 +753,14 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   persisted key.** One special case: `ui:theme` is per-user via `window.storage` *and* mirrored to a
   bare `localStorage` key on every change (the `index.html` boot script + signed-out screens read the
   bare copy; `useTheme` adopts it into a fresh account on first sign-in).
-- **Startup is parallelized:** `AuthProvider` applies the cached session optimistically after
-  `getSession()`, so the profile fetch and the enrollment-gate queries run **concurrently** with the
-  server-side revoke check (`getUser()`); `loading` still holds the splash until the revoke verdict,
-  so a revoked account never renders anything. `useEnrollmentGate` fires its two own-row queries as
+- **Startup is parallelized (and can't hang):** `AuthProvider` applies the cached session
+  optimistically after `getSession()`, so the profile fetch and the enrollment-gate queries run
+  **concurrently** with the server-side revoke check (`getUser()`); `loading` still holds the
+  splash until the revoke verdict, so a revoked account never renders anything. Both `getSession()`
+  and the revoke check are raced against an **8s fail-open timeout** (`withTimeout`, same idiom as
+  the profile fetch's 8s and the enrollment gate's 7s) — a *stalled* auth endpoint lands on
+  AuthScreen / keeps the session instead of stranding the app on AuthSplash forever; a
+  normal-speed 401/403 still signs out. `useEnrollmentGate` fires its two own-row queries as
   soon as a uid exists (its returned `active`/`ready` still key off `profileReady` — gate semantics
   unchanged). Don't re-serialize these when editing the provider.
 - **Backend setup:** a `profiles` table + RLS + a signup trigger must exist in Supabase. Email
@@ -511,6 +805,130 @@ const { text, data } = await callClaude({ system, messages }, { returnData: true
 - Under the hood `callClaude` is still a `fetch('https://api.anthropic.com/v1/messages', …)` with only
   `Content-Type: application/json` — that's what the `main.jsx` fetch shim rewrites to `/api/anthropic`.
 
+## Voice assistant (ElevenLabs) — "Toolkits Guide"
+
+A floating mic FAB (bottom-right) that lets **enrolled members + admins** talk to the app: ask
+about tools/plans/membership and have the agent navigate tabs or open account panels. Full
+setup/ops guide: [docs/ai/voice-agent-setup.md](docs/ai/voice-agent-setup.md).
+
+- **Client** — the `VoiceAssistant` component in BookkeeperPro.jsx (just above the keep-alive
+  section), mounted ONCE in the root shell after the `?panel=` overlay block, gated by
+  `is_admin || !REQUIRE_ENROLLMENT || enroll.state==='pass'`. It renders through `OverlayPortal`
+  at `z-[60]` (above sidebar z-50, below the z-[70] account modals) and never passes props
+  through `TabPanel` (keep-alive memoization untouched). The FAB only appears when the GET
+  health check reports `configured:true` (cached on `window.__voiceCfgPromise`) — unset env
+  vars are a soft off switch. The **`@elevenlabs/client` SDK is lazy-loaded via dynamic
+  `import()`** (own chunk, XLSX idiom — do not add it to `manualChunks`).
+- **Server** — [api/elevenlabs/signed-url.js](api/elevenlabs/signed-url.js): GET = unauthenticated
+  health check `{ ok, configured }`; POST mints an ElevenLabs signed URL after the same gate as
+  the Anthropic proxy (valid Supabase JWT → 401, `is_enrolled()` admin-or-member → 403,
+  fail-open on RPC-indeterminate with a `[elevenlabs]` warning, 8 mints/min/user burst limit).
+  Env: `ELEVENLABS_API_KEY` + `ELEVENLABS_AGENT_ID` (server-only), optional
+  `ELEVENLABS_SERVER_LOCATION`. **Unlike the notify fns, this DOES run under `npm run dev`** —
+  the `elevenlabsDevApi` plugin in vite.config.js imports the real handler, so dev exercises
+  the real auth gate.
+- **Client tools** (built in `VoiceAssistant.buildClientTools()`; names must match the agent's
+  dashboard config exactly): `navigate_to_tool` (fuzzy `resolveVoiceTool` → `writeAppRoute`;
+  navigates even into a plan-restricted tab — RestrictedTab's upsell is the chokepoint — and
+  tells the agent so; refuses admin tabs for members), `open_account_panel` (`setPanelParam`,
+  billing panels blocked when `!showBillingControls`), `explain_current_page` (`readAppRoute` +
+  `VOICE_TAB_INFO`), `show_feature_help` (`VOICE_FEATURE_HELP`), `get_user_membership_summary`
+  (composes `subAccess`/`planEntitlement`/`membershipStatus` from root-loaded gate state — no
+  refetch, only the user's own data), **`open_course_lesson`** (deep-links an authorized course +
+  lesson via `openCourseLessonRoute()`/`trainerCourseTab()` — the catalog/CourseProgram plan
+  guard stays the chokepoint), and **`show_lesson_sources`** (pushes a course-citation chip into
+  the transcript UI — needed because webhook tool results never reach the browser; the agent
+  relays citations through it). Tool closures are created once at `startSession`, so they
+  read live state via `liveRef` — never render-scope captures. `buildClientTools()` **assembles
+  its returned tool set from the `VOICE_CLIENT_TOOL_SPECS` names** (a spec/handler mismatch logs
+  a loud `[voice] client tool spec/handler drift` console error) — so the browser-registered
+  tools and the ElevenLabs-declared tools share one source of truth.
+- **`VOICE_TAB_INFO` / `VOICE_CLIENT_TOOL_SPECS` / `VOICE_SERVER_TOOL_SPECS` purity contract:**
+  the module-scope literals `VOICE_TAB_INFO`, `VOICE_TOOL_ALIASES`, `VOICE_FEATURE_HELP`,
+  `VOICE_CLIENT_TOOL_SPECS`, and `VOICE_SERVER_TOOL_SPECS`
+  (next to the route helpers) drive the runtime tools AND are parsed out of this file —
+  `VOICE_TAB_INFO` by `scripts/generate-voice-agent-knowledge.mjs`, and both TOOL_SPECS arrays
+  (names/descriptions/JSON-Schema params, mirroring
+  [docs/ai/voice-agent-setup.md](docs/ai/voice-agent-setup.md) §4/§4b) by
+  `scripts/provision-voice-agent.mjs`. All must stay **pure literals** (strings/booleans/plain
+  objects, no refs or calls); `VOICE_TAB_INFO` needs one entry per `TAB_ROUTES` id — the
+  generator/provisioner exit 1 with an actionable message otherwise.
+- **Knowledge pipeline:** `npm run ai:knowledge` regenerates
+  [docs/ai/toolkits-voice-agent-knowledge.md](docs/ai/toolkits-voice-agent-knowledge.md)
+  (deterministic — extracts `TAB_ROUTES`/`VOICE_TAB_INFO`/`ENROLLMENT_PLANS_FALLBACK`/
+  `PLAN_ENTITLEMENTS`/`TIPS` and fills a hand-authored template); `npm run ai:knowledge:push`
+  additionally uploads it to the ElevenLabs knowledge base by name (idempotent, replaces the
+  old copy, other KB docs untouched). There is **no auto-sync** — regenerate + push whenever
+  tools/plans change (see Keeping docs current), and **`npm run ai:knowledge:check`** rebuilds
+  the doc in memory + diffs it against disk (Generated-date ignored; exit 1 on drift) so a
+  feature change can't silently leave the static product guide stale.
+- **Provisioning pipeline:** `npm run ai:provision` builds the whole ElevenLabs side from the
+  repo so the only manual step is the API key — it regenerates the KB, then
+  `scripts/provision-voice-agent.mjs` creates/updates the client tools from
+  `VOICE_CLIENT_TOOL_SPECS` **and the four AI-trainer webhook tools from
+  `VOICE_SERVER_TOOL_SPECS`** (`webhookToolConfigFor()` — URL =
+  `${APP_URL}/api/elevenlabs/trainer?action=…`, header `Authorization: Bearer
+  {{secret__trainer_token}}`; `APP_URL` unset → webhook tools skipped with a loud WARN), the
+  agent (system prompt + first message read from voice-agent-setup.md §3, signed-URL auth ON,
+  max-duration cap), and attaches the KB. Idempotent
+  by name; set `ELEVENLABS_AGENT_ID` to update an existing agent in place, else it creates one and
+  prints the id. `--dry-run` previews every call with no key. The KB-reconcile + REST helpers are
+  shared between push and provision in `scripts/_elevenlabs.mjs` (the generator keeps its own copy
+  of the literal extractor to stay side-effect-free).
+
+### AI course trainer (entitlement-aware course teaching) — migration #27
+
+The voice assistant doubles as an **AI course trainer**: enrolled learners ask it to teach/
+explain/quiz/practice/recap the Supabase-hosted courses. Full setup:
+[COURSE_AI_TRAINER_SETUP.md](COURSE_AI_TRAINER_SETUP.md). Architecture rules:
+
+- **Two knowledge systems, kept separate:** the static ElevenLabs KB doc carries ONLY public
+  product/nav/plan info (regenerated via `ai:knowledge`); **paid course content lives in
+  Supabase** (`course_ai_sources` → `course_ai_chunks`, pgvector 384 + generated-tsvector FTS
+  fallback) and is retrieved per-request through four **webhook tools** served by
+  [api/elevenlabs/trainer.js](api/elevenlabs/trainer.js) (`get_my_training_catalog`,
+  `get_authorized_training_context`, `get_my_training_checkpoint`, `save_training_checkpoint`).
+  Never attach course content to the KB doc.
+- **Authorization is server-side and FAIL-CLOSED** (unlike the fail-open signed-url/anthropic
+  gates, which are deliberately unchanged): every trainer request verifies a short-lived HMAC
+  **trainer token** (minted by signed-url.js when `TRAINER_TOKEN_SECRET` is set; identity-only
+  claims; codec in [src/lib/trainerToken.js](src/lib/trainerToken.js)), then re-queries
+  `trainer_visible_courses(p_user)` under the service role — a SECURITY DEFINER function that
+  **mirrors the `courses_read` RLS policy exactly** (published + approved + enrolled + plan
+  scope + `courses.ai_trainer_enabled`), revoked from anon/authenticated. An unavailable check
+  returns a temporary-error envelope, never content. Retrieval-time joins (published +
+  enabled + source `ready`/`included` + version match) make unpublished/stale content
+  unretrievable on the very next call. When plan-scope rules change, `courses_read`, the
+  parameterized mirrors in #27, `PLAN_ENTITLEMENTS`, AND `planScopeAllows()` in
+  [src/lib/trainerContent.js](src/lib/trainerContent.js) must all change together (the
+  `test/trainerAccess.test.mjs` truth table pins it).
+- **The token rides the `secret__trainer_token` dynamic variable** (headers-only — ElevenLabs
+  never shows `secret__` vars to the LLM). The ordinary dynamic variables
+  (`plan_label`/`plan_scope`/…) are informational ONLY — never authorization inputs.
+- **Response contract:** every trainer reply is a bounded envelope built by
+  `buildTrainerEnvelope()` (≤6 chunks × ≤1,200 chars, ≤6,500 total; statuses
+  `ok/denied/error` + safe speakable `message`); denials name the learner's plan + allowed
+  course titles only. Chunk/lesson content is never logged. Durable per-user daily caps live
+  in `ai_training_usage` (`trainer_bump_usage` RPC — fail closed if it errors).
+- **Checkpoints ≠ progress:** `ai_training_checkpoints` (own-read RLS, service-written) is
+  deliberately separate from `lesson_progress` — a conversation never marks lessons complete.
+- **Indexing (admin):** [api/admin/course-trainer.js](api/admin/course-trainer.js)
+  (student-imports auth skeleton; actions `status/sync/transcribe/save-transcript/
+  set-source-included/retry-source/preview`) chunks lesson `text_content`
+  (`chunkText()` in trainerContent.js, sha256 idempotency, `source_version` bumps) and embeds
+  via the **`trainer-embed` Supabase Edge Function** (gte-small; auth = service-role key;
+  unreachable → automatic keyword fallback + amber pill). **Scribe v2 transcription is
+  admin-triggered only** (upload/mp4 lessons; YouTube/Vimeo = manual transcript, never
+  scraped) and lands as a **pending draft** an admin must "Approve & index". Editing a lesson
+  fires the pure-SQL stale trigger + a fire-and-forget `kickTrainerSync()` from `saveLesson`.
+  Admin UI = the **`CourseAiTrainerPanel`** glass-card in `renderBuilder()` (enable toggle,
+  status pills, transcript editor, Sync, **Preview as plan**; pre-#27 → a "finish backend
+  setup" card). `vercel.json` now has a `functions` block (trainer 60s, course-trainer 300s
+  for Scribe). Trainer state is server-side — nothing goes in `LEGACY_KEYS`.
+- **Voice deep-links:** `?lesson=<id>` joins `?course=` in `tabHref`/`readAppRoute`;
+  `CourseCatalog` syncs it on popstate + the route-change event and hands `initialLessonId`
+  to `CourseProgram`. Citation chips in the widget transcript navigate through the same path.
+
 ## Styling conventions
 
 - **Layout:** Tailwind utility classes (`flex`, `grid`, `gap-*`, `rounded-*`, `px-*`…).
@@ -550,6 +968,20 @@ const { text, data } = await callClaude({ system, messages }, { returnData: true
   the original glass literals; dark = navy glass from the `#101B30`/`#0B1322` family) — reuse these
   for any new shell chrome instead of hardcoding light rgba values, which the dark compat layer
   cannot fix on inline styles.
+- **`.gh-app-bg` children vs overlays:** the app-bg mesh has a `position: fixed` `::before` noise
+  layer, and `index.css` lifts content above it with `.gh-app-bg > *:not(.fixed) { position:
+  relative; z-index: 1; }`. The `:not(.fixed)` guard is load-bearing — a bare `> *` out-cascades
+  Tailwind's `.fixed` (this file is emitted after `@tailwind utilities` at equal specificity) and
+  demotes any fixed overlay that is a *direct child* of a `gh-app-bg` element into an in-flow flex
+  column (this was the root cause of the 2026-07 account-panel "squeezed side card / invisible
+  drawer" bugs). Don't widen the rule back, and don't render hand-rolled fixed overlays as direct
+  `gh-app-bg` children — use `AccountModal`/`SidePanel`, which portal to `document.body` anyway
+  (see the shared-dialog bullet in Authentication). **Same-element hazard:** `.gh-app-bg` itself
+  sets `position: relative`, which equally out-cascades `.fixed` when both classes sit on ONE
+  element — this dropped the portaled upgrade/renew paywall overlays into body flow (rendered
+  *below* the app, pushing the page down). A `.gh-app-bg.fixed { position: fixed }` carve-out now
+  guards the combo, but prefer layering: fixed wrapper > `gh-app-bg` (or self-painting) child —
+  the upgrade/renew wrappers no longer carry the class (`EnrollmentPaywall` paints its own mesh).
 - **Tailwind neutrals are dark-adapted centrally**: the documented compat layer at the bottom of
   `index.css` remaps the utilities actually in use (`bg-white`, `text-slate-*`, `border-slate-*`,
   red/emerald/amber families…) onto the tokens under `[data-theme="dark"]`. When adding UI, prefer
@@ -583,6 +1015,14 @@ const { text, data } = await callClaude({ system, messages }, { returnData: true
   These are **this app's own** secrets — **Supabase Auth's SMTP/Resend settings are unrelated** and
   only send Auth emails. All are non-fatal when unset, and none run under `npm run dev` (serverless
   functions are Vercel-only). Diagnose from **Enrollments → "Test email"** or the GET health check.
+- **Voice assistant (server-only, optional):** `ELEVENLABS_API_KEY` + `ELEVENLABS_AGENT_ID` enable
+  the in-app voice widget (`api/elevenlabs/signed-url.js` + the `ai:knowledge:push` / `ai:provision`
+  scripts); optional `ELEVENLABS_SERVER_LOCATION` picks the ElevenLabs region, and `ELEVENLABS_VOICE_ID`
+  / `ELEVENLABS_AGENT_LLM` let `ai:provision` set the agent's voice + LLM. Never `VITE_`-prefixed.
+  Unset = the mic FAB simply never renders. These DO work under `npm run dev` (Vite middleware).
+  Fastest path to live: put `ELEVENLABS_API_KEY` in `.env`, run `npm run ai:provision` (creates the
+  agent + tools + KB and prints the agent id), then set both vars in Vercel.
+  See [docs/ai/voice-agent-setup.md](docs/ai/voice-agent-setup.md).
 
 ## Deployment
 
@@ -623,6 +1063,17 @@ docs **in the same change**:
 - **Auth** (the `useAuth()` shape, the gate, the storage-namespacing, the `profiles` schema, or the
   `LEGACY_KEYS` inventory) → update the "Authentication" section here **and** the persistence notes in
   **bookkeeper-conventions**.
+- **Adding/renaming a tool, or changing plans/entitlements/pricing** → also update `VOICE_TAB_INFO`
+  (+ aliases) in BookkeeperPro.jsx and rerun `npm run ai:knowledge` (and `ai:knowledge:push` when
+  deployed) **in the same change**, so the voice assistant's knowledge never drifts from the app.
+  `npm run ai:knowledge:check` must pass (it exits 1 when the committed doc no longer matches the
+  code — run it before calling any tools/plans change done).
+- **Changing plan-scope rules** (which plan reads which courses) → four places move together:
+  the `courses_read` RLS policy, the #27 parameterized mirrors (`trainer_visible_courses` /
+  `trainer_courses_for_plan`), `PLAN_ENTITLEMENTS`, and `planScopeAllows()` in
+  `src/lib/trainerContent.js` (pinned by `test/trainerAccess.test.mjs`).
+- **The trainer tool set or teaching-prompt behavior** → update `VOICE_SERVER_TOOL_SPECS`, the
+  §3 system-prompt block + §4b in docs/ai/voice-agent-setup.md, and re-run `npm run ai:provision`.
 
 Line anchors are approximate and drift as the file grows — confirm with `Grep` before relying on them,
 and re-baseline the table when they've moved substantially.

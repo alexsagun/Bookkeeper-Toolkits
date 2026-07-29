@@ -41,9 +41,23 @@ Inline styles bypass the dark compat layer, so shell surfaces MUST use these var
 (module scope above `AccessRequests`) instead of hand-writing the gradient.
 **Modals:** never hand-roll a `fixed inset-0` + `bg-white` overlay — use the shared `AccountModal`
 (dialog roles, Escape, backdrop-close, focus trap/restore; props `tone` 'primary'|'ok'|'danger',
-`canClose` to block closing mid-request, `headerAction`, `bodyClass`/`bodyStyle`, `maxW`). Admin
+`canClose` to block closing mid-request, `headerAction`, `bodyClass`/`bodyStyle`, `maxW`), or the
+sibling `SidePanel` for a right-side drawer (`maxW` prop, default `sm:max-w-md`). Both shells
+already render through `OverlayPortal` (`createPortal` → `document.body`, with a `[hidden]`-ancestor
+guard so a modal inside a hidden keep-alive tab stays hidden) — don't re-wrap them in a portal, and
+never render a hand-rolled fixed overlay as a *direct child* of a `gh-app-bg` element: the
+`.gh-app-bg > *:not(.fixed)` rule in `index.css` exists because a bare `> *` version used to demote
+fixed overlays into in-flow flex columns. Never combine `fixed` + `gh-app-bg` on the SAME element
+either — `.gh-app-bg` sets `position: relative`, which out-cascades `.fixed` (a
+`.gh-app-bg.fixed` carve-out guards it, but layer them: fixed wrapper > mesh-painting child). Admin
 lists reuse `AdminNotice`/`AdminFilterChip`/`AdminFilterCaption`/`AdminListSkeleton`/`AdminUserCell`
 so both admin screens stay one visual surface.
+**Avatars:** every member/user avatar renders through the shared `MemberAvatar` primitive
+(beside the community block) with `resolveAvatarUrl(profile.avatar_url)` — an `<img>` from the
+public `avatars` bucket (or a legacy OAuth URL) with the initials-in-a-gradient-circle fallback.
+Never hand-roll an initials circle or a raw avatar `<img>` again. The only sanctioned write to
+`profiles.avatar_url` is the `set_my_avatar()` RPC (see `AvatarSection`); `profiles` still has
+no user-update RLS policy.
 **Tailwind:** layout utilities freely; for *color* utilities prefer ones already covered by the dark
 compat layer at the bottom of `index.css` (`bg-white`, `text-slate-*`, `border-slate-*`,
 red/emerald/amber families) — a new color utility needs a compat rule or a `dark:` variant.
@@ -116,6 +130,16 @@ See the **add-bookkeeper-tool** skill for the full copy-paste snippet, and `Bank
   See `EmailTemplates` / `IndustryAccounting` as references. Small constants (< a few kB) can stay
   in the main file.
 
+- **Pure shared logic goes in `src/lib/*.js`** (the second sanctioned carve-out, alongside
+  `src/data/*.js`): dependency-free ESM — NO imports, NO side effects, NO DOM/Node/Supabase — so
+  the same rules run identically in the browser, the `api/` serverless endpoints, and the
+  `node --test` suites in `test/*.test.mjs` (`npm test`). Existing examples:
+  `src/lib/studentImport.js` (import matching/term math), `src/lib/trainerToken.js` (the
+  AI-trainer HMAC token codec — crypto is *injected* by callers, never imported), and
+  `src/lib/trainerContent.js` (chunking, course resolution, the trainer response envelope,
+  `planScopeAllows()` — the pure mirror of the SQL plan-scope truth table). When server + client
+  must agree on a rule, put the rule here and test it; keep the api handler a thin I/O shell.
+
 ## Auth context (`useAuth()`)
 
 Auth is available app-wide via `import { useAuth } from './auth/AuthProvider.jsx'`:
@@ -167,3 +191,9 @@ them. Navigation is URL-routed + keep-alive — see CLAUDE.md → "Navigation mo
   default (`src/data/*.js` pure-data modules are the one sanctioned carve-out).
 - Don't expose the API key client-side in any form.
 - Don't ship UI checked in only one theme — dark and light are both first-class.
+- Don't inline community space/batch logic in a policy or client query — access always derives
+  through `my_community_space_ids()` (SQL) / `planSegment()`+`approvalBatchPreselect()`
+  (`src/lib/communitySpaces.js`, the pure mirror pinned by `test/communitySpaces.test.mjs`),
+  and a batch is never inferred from dates, titles, or amounts. Never re-add a client-side
+  approval fallback — `admin_finalize_enrollment()` is the ONE grant path (it validates
+  batch + capacity; a local grant would bypass both).

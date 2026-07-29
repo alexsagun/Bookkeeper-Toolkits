@@ -194,6 +194,11 @@
   background-attachment: fixed;
   position: relative;
 }
+/* The position: relative above out-cascades Tailwind's .fixed when both classes sit on
+   the SAME element (equal specificity, this file is emitted later) — that demoted the
+   portaled upgrade/renew overlays into body flow. Prefer separate layers (fixed wrapper
+   > gh-app-bg child), but keep the combo safe: */
+.gh-app-bg.fixed { position: fixed; }
 [data-theme="dark"] .gh-app-bg {
   background-color: #06090F;
   background-image:
@@ -212,8 +217,15 @@
   z-index: 0;
 }
 [data-theme="dark"] .gh-app-bg::before { opacity: 0.22; }
-/* Ensure app content renders above noise */
-.gh-app-bg > * { position: relative; z-index: 1; }
+/* Ensure app content renders above the fixed noise ::before (z-index: 0) — but never
+   demote a fixed overlay. This file is emitted after @tailwind utilities, so at equal
+   specificity a bare `> *` would override Tailwind's `.fixed` (and its z-index) on every
+   DIRECT child of a .gh-app-bg element — turning viewport overlays (account panels z-[70],
+   the mobile drawer backdrop z-40, the off-canvas sidebar and WelcomeOverlay z-50) into
+   in-flow flex columns that squeeze the layout. `:not(.fixed)` matches the literal Tailwind
+   `fixed` class only (no responsive-only `lg:fixed` children exist); static children keep
+   the exact old behavior. */
+.gh-app-bg > *:not(.fixed) { position: relative; z-index: 1; }
 
 /* ──────────────────────────────────────────────────────────
    TYPOGRAPHY HELPERS

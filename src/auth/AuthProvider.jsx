@@ -46,6 +46,7 @@ const LEGACY_KEYS = [
   'budget:state', 'forecast:state',
   'nav:lastTab', 'nav:interviewSub',
   'enroll:soundAlert',
+  'community:lastSpace',
   // Theme pref. Note: useTheme also keeps a BARE localStorage mirror of this key
   // on every change (for the index.html no-flash boot script + signed-out screens),
   // and adopts the bare value into a signed-in account with no saved pref itself —
@@ -62,7 +63,14 @@ const LEGACY_MARKER = 'auth:legacyMigratedTo';
 // (added by COURSE_SETUP.md). This ordering means a project missing ONLY the approval columns
 // still keeps is_admin — so the admin never loses their controls in the window between deploy
 // and running the migration, and the approval gate simply stays inert (no approval_status).
-const PROFILE_SELECT = 'id,email,full_name,avatar_url,is_paid,plan,is_admin,approval_status,rejection_reason';
+// account_origin/onboarding_status drive the imported-student forced set-password gate
+// (db #26). They're only in the PRIMARY select — on a pre-#26 project the missing-column
+// fallback drops to PROFILE_SELECT_NO_APPROVAL (which lacks them), so the gate simply never
+// triggers (profile.account_origin is undefined → treated as a normal signup). Safe degrade.
+const PROFILE_SELECT = 'id,email,full_name,avatar_url,is_paid,plan,is_admin,approval_status,rejection_reason,account_origin,onboarding_status';
+// Approval columns present but the #26 onboarding columns absent (the deploy-before-migrate
+// window on an already-approval/enrollment DB) — keep approval_status, drop only onboarding.
+const PROFILE_SELECT_NO_ONBOARDING = 'id,email,full_name,avatar_url,is_paid,plan,is_admin,approval_status,rejection_reason';
 const PROFILE_SELECT_NO_APPROVAL = 'id,email,full_name,avatar_url,is_paid,plan,is_admin';
 const PROFILE_SELECT_LEGACY = 'id,email,full_name,avatar_url,is_paid,plan';
 
@@ -72,14 +80,14 @@ function isMissingColumnError(error) {
   return Boolean(
     error &&
       (error.code === 'PGRST204' ||
-        /approval_status|rejection_reason|is_admin|avatar_url|schema cache|column/i.test(error.message || ''))
+        /approval_status|rejection_reason|is_admin|avatar_url|account_origin|onboarding_status|schema cache|column/i.test(error.message || ''))
   );
 }
 
 // Fetch the profile row, narrowing the column list on each missing-column error so a
 // partially-migrated `profiles` table degrades instead of failing outright.
 async function fetchProfileRow(uid) {
-  for (const cols of [PROFILE_SELECT, PROFILE_SELECT_NO_APPROVAL, PROFILE_SELECT_LEGACY]) {
+  for (const cols of [PROFILE_SELECT, PROFILE_SELECT_NO_ONBOARDING, PROFILE_SELECT_NO_APPROVAL, PROFILE_SELECT_LEGACY]) {
     const { data, error } = await supabase.from('profiles').select(cols).eq('id', uid).single();
     if (!error) return { data, error: null };
     if (!isMissingColumnError(error)) return { data: null, error }; // genuine failure — stop retrying
@@ -116,14 +124,24 @@ function applyStorageUser(uid) {
   if (uid) migrateLegacyData(uid);
 }
 
+// Race a promise against a fail-open timeout. supabase-js calls reject on network
+// errors but can also simply never settle when the endpoint stalls — and `loading`
+// (the full-app splash) waits on the session + revoke verdict, so an unsettled auth
+// call would strand the whole app on AuthSplash. Mirrors the profile-fetch (8s) and
+// enrollment-gate (7s) fail-open idiom.
+const AUTH_CALL_TIMEOUT_MS = 8000;
+const withTimeout = (promise, ms, fallback) =>
+  Promise.race([promise, new Promise((res) => setTimeout(() => res(fallback), ms))]);
+
 // Ask the auth server whether the cached session's account still exists/valid.
 // getUser() hits the server (unlike getSession(), which only reads localStorage),
 // so it detects a deleted/disabled account. Returns true ONLY on a definitive auth
-// rejection (401/403); network/other failures return false so we fail open and
+// rejection (401/403); network/other failures — including a stalled endpoint (the
+// timeout resolves to a no-error fallback) — return false so we fail open and
 // don't sign out an offline user who is actually still valid.
 async function accountRevoked() {
   try {
-    const { error } = await supabase.auth.getUser();
+    const { error } = await withTimeout(supabase.auth.getUser(), AUTH_CALL_TIMEOUT_MS, { error: null });
     return Boolean(error && (error.status === 401 || error.status === 403));
   } catch {
     return false;
@@ -152,8 +170,12 @@ export function AuthProvider({ children }) {
     let mounted = true;
 
     (async () => {
-      const { data } = await supabase.auth.getSession();
-      const cached = data.session ?? null;
+      // getSession() reads localStorage but can stall behind an in-flight token refresh;
+      // fail open to "no session" after the timeout — if the real session settles later,
+      // onAuthStateChange (INITIAL_SESSION/SIGNED_IN below) still delivers it.
+      const res = await withTimeout(supabase.auth.getSession(), AUTH_CALL_TIMEOUT_MS, null);
+      if (!res) console.warn('[auth] getSession timed out — failing open to signed-out');
+      const cached = res?.data?.session ?? null;
       if (!cached) {
         if (!mounted) return;
         applyStorageUser(null);
@@ -206,8 +228,8 @@ export function AuthProvider({ children }) {
       if (document.visibilityState !== 'visible') return;
       if (Date.now() - lastCheck < 60_000) return;
       lastCheck = Date.now();
-      const { data } = await supabase.auth.getSession();
-      if (data.session && (await accountRevoked())) await supabase.auth.signOut();
+      const res = await withTimeout(supabase.auth.getSession(), AUTH_CALL_TIMEOUT_MS, null);
+      if (res?.data?.session && (await accountRevoked())) await supabase.auth.signOut();
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);

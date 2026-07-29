@@ -10,9 +10,15 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "ai:knowledge": "node scripts/generate-voice-agent-knowledge.mjs",
+    "ai:knowledge:check": "node scripts/generate-voice-agent-knowledge.mjs --check",
+    "ai:knowledge:push": "node scripts/generate-voice-agent-knowledge.mjs && node scripts/push-voice-agent-knowledge.mjs",
+    "ai:provision": "node scripts/generate-voice-agent-knowledge.mjs && node scripts/provision-voice-agent.mjs",
+    "test": "node --test"
   },
   "dependencies": {
+    "@elevenlabs/client": "^1.15.1",
     "@supabase/supabase-js": "^2.108.1",
     "html2canvas": "^1.4.1",
     "jspdf": "^2.5.2",

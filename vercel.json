@@ -2,5 +2,9 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
     { "source": "/((?!api/).*)", "destination": "/" }
-  ]
+  ],
+  "functions": {
+    "api/elevenlabs/trainer.js": { "maxDuration": 60 },
+    "api/admin/course-trainer.js": { "maxDuration": 300 }
+  }
 }

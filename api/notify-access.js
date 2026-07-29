@@ -65,28 +65,49 @@ function buildEmail(status, fullName, reason) {
 }
 
 // Confirm the bearer token belongs to an admin (anon key + the caller's JWT; RLS own_profile_select
-// lets a user read their own is_admin). Returns true/false; false also on any verification failure.
-async function callerIsAdmin(authHeader) {
-  if (!authHeader || !SUPABASE_URL || !SUPABASE_ANON) return false;
+// lets a user read their own is_admin). Returns the admin's user id, or null on any failure.
+async function callerAdminId(authHeader) {
+  if (!authHeader || !SUPABASE_URL || !SUPABASE_ANON) return null;
   const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-  if (!token) return false;
+  if (!token) return null;
   try {
     const userRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
       headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}` },
     });
-    if (!userRes.ok) return false;
+    if (!userRes.ok) return null;
     const u = await userRes.json();
-    if (!u?.id) return false;
+    if (!u?.id) return null;
     const profRes = await fetch(
       `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(u.id)}&select=is_admin`,
       { headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}` } }
     );
-    if (!profRes.ok) return false;
+    if (!profRes.ok) return null;
     const rows = await profRes.json();
-    return Array.isArray(rows) && rows[0]?.is_admin === true;
+    return Array.isArray(rows) && rows[0]?.is_admin === true ? u.id : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+// Best-effort per-caller burst guard (per warm instance — the anthropic-proxy idiom).
+// 10 emails/min is far above any legit review pace; it stops a runaway loop or a
+// scripted burst from draining the Resend quota.
+const RATE_WINDOW_MS = 60_000;
+const RATE_MAX_PER_WINDOW = 10;
+const rateHits = new Map(); // userId -> [timestamps]
+function rateLimited(userId) {
+  const now = Date.now();
+  const cutoff = now - RATE_WINDOW_MS;
+  if (rateHits.size > 200) {
+    for (const [uid, hits] of rateHits) {
+      if (!hits.length || hits[hits.length - 1] < cutoff) rateHits.delete(uid);
+    }
+  }
+  const hits = (rateHits.get(userId) || []).filter((t) => t >= cutoff);
+  if (hits.length >= RATE_MAX_PER_WINDOW) { rateHits.set(userId, hits); return true; }
+  hits.push(now);
+  rateHits.set(userId, hits);
+  return false;
 }
 
 export default async function handler(req, res) {
@@ -101,8 +122,12 @@ export default async function handler(req, res) {
   }
 
   // Only admins may trigger an email (prevents abuse of the endpoint).
-  if (!(await callerIsAdmin(req.headers?.authorization))) {
+  const adminId = await callerAdminId(req.headers?.authorization);
+  if (!adminId) {
     return res.status(403).json({ error: 'Admin authorization required.' });
+  }
+  if (rateLimited(adminId)) {
+    return res.status(429).json({ ok: false, error: 'Too many emails — wait a minute and try again.' });
   }
 
   let body = req.body;

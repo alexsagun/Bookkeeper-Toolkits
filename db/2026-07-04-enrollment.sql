@@ -87,7 +87,7 @@ insert into public.enrollment_plans (key, name, tagline, price_php, compare_at_p
    '["Simulated annual bookkeeping project for an NY-based construction company","60-day QBO Mastery course access","Weekly Discord chat (Thu)"]'::jsonb,
    null, 1),
   ('sampler', 'Sampler Session', 'Essentials', 1499, null, null,
-   '["1 Live Zoom Session (3 hours)","60-day course access","30-day group chat support"]'::jsonb,
+   '["1 Live Zoom Session (3 hours)","60-day course access","60-day group chat support"]'::jsonb,
    'Limited offer', 2),
   ('silver_self_paced', 'QBO + Resume Combo', 'Silver · Self-Paced', 1999, null, null,
    '["Simulated annual bookkeeping project for an NY-based construction company","60-day QBO Mastery course access","60-day Resume & Interview course access","Weekly Discord chat (Thu)"]'::jsonb,

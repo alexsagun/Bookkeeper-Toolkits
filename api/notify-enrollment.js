@@ -95,20 +95,42 @@ async function callerUser(authHeader) {
 }
 
 // Same admin check as api/notify-access.js (RLS own_profile_select reads own is_admin).
-async function callerIsAdmin(authHeader) {
+// Returns the admin's user id (for the burst guard), or null.
+async function callerAdminId(authHeader) {
   const u = await callerUser(authHeader);
-  if (!u) return false;
+  if (!u) return null;
   try {
     const profRes = await fetch(
       `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(u.id)}&select=is_admin`,
       { headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${u.token}` } }
     );
-    if (!profRes.ok) return false;
+    if (!profRes.ok) return null;
     const rows = await profRes.json();
-    return Array.isArray(rows) && rows[0]?.is_admin === true;
+    return Array.isArray(rows) && rows[0]?.is_admin === true ? u.id : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+// Best-effort per-caller burst guard (per warm instance — the anthropic-proxy idiom).
+// Legit traffic is ~1 email per human action, so 10/min stops a runaway loop or a
+// scripted burst from draining the Resend quota without touching real usage.
+const RATE_WINDOW_MS = 60_000;
+const RATE_MAX_PER_WINDOW = 10;
+const rateHits = new Map(); // userId -> [timestamps]
+function rateLimited(userId) {
+  const now = Date.now();
+  const cutoff = now - RATE_WINDOW_MS;
+  if (rateHits.size > 500) {
+    for (const [uid, hits] of rateHits) {
+      if (!hits.length || hits[hits.length - 1] < cutoff) rateHits.delete(uid);
+    }
+  }
+  const hits = (rateHits.get(userId) || []).filter((t) => t >= cutoff);
+  if (hits.length >= RATE_MAX_PER_WINDOW) { rateHits.set(userId, hits); return true; }
+  hits.push(now);
+  rateHits.set(userId, hits);
+  return false;
 }
 
 // Fetch the enrollment request WITH THE CALLER'S OWN JWT — RLS enroll_req_own_select
@@ -119,7 +141,8 @@ async function callerIsAdmin(authHeader) {
 const OWN_REQUEST_COLS =
   'id,user_id,plan_name,full_name,email,phone,city_country,amount_expected,amount_paid,payment_reference,created_at,status';
 async function fetchOwnRequest(requestId, token) {
-  for (const cols of [`${OWN_REQUEST_COLS},notify_status`, OWN_REQUEST_COLS]) {
+  // batch_id (#32) rides the same resilience ladder as notify_status (#16).
+  for (const cols of [`${OWN_REQUEST_COLS},notify_status,batch_id`, `${OWN_REQUEST_COLS},notify_status`, OWN_REQUEST_COLS]) {
     try {
       const r = await fetch(
         `${SUPABASE_URL}/rest/v1/enrollment_requests?id=eq.${encodeURIComponent(requestId)}` +
@@ -291,6 +314,9 @@ export default async function handler(req, res) {
     // Student → admin alert. Ownership proven by fetching the row with the caller's JWT.
     const u = await callerUser(req.headers?.authorization);
     if (!u) return res.status(403).json({ error: 'Authorization required.' });
+    if (rateLimited(u.id)) {
+      return res.status(429).json({ ok: false, error: 'Too many requests — wait a minute and try again.' });
+    }
     const requestId = body?.requestId;
     if (!requestId) return res.status(400).json({ error: 'requestId required.' });
     const row = await fetchOwnRequest(requestId, u.token);
@@ -369,8 +395,12 @@ export default async function handler(req, res) {
 
   if (action === 'decision') {
     // Admin → student. Same gate as notify-access.js.
-    if (!(await callerIsAdmin(req.headers?.authorization))) {
+    const adminId = await callerAdminId(req.headers?.authorization);
+    if (!adminId) {
       return res.status(403).json({ error: 'Admin authorization required.' });
+    }
+    if (rateLimited(adminId)) {
+      return res.status(429).json({ ok: false, error: 'Too many emails — wait a minute and try again.' });
     }
     const { email, fullName, status, reason, planName } = body || {};
     if (!isEmail(email)) return res.status(400).json({ error: 'Valid recipient email required.' });
@@ -395,8 +425,12 @@ export default async function handler(req, res) {
     // admin can confirm email works end-to-end. Strictly admin-gated: a non-admin can't
     // even discover the recipient address. Returns { to, source } so the UI can show where
     // the alert would land, plus a provider `detail` on failure to aid diagnosis.
-    if (!(await callerIsAdmin(req.headers?.authorization))) {
+    const adminId = await callerAdminId(req.headers?.authorization);
+    if (!adminId) {
       return res.status(403).json({ error: 'Admin authorization required.' });
+    }
+    if (rateLimited(adminId)) {
+      return res.status(429).json({ ok: false, error: 'Too many emails — wait a minute and try again.' });
     }
     if (!apiKey) return res.status(200).json({ ok: false, skipped: 'email_not_configured' });
     if (!from) return res.status(200).json({ ok: false, skipped: 'email_from_not_configured' });

@@ -71,13 +71,13 @@ begin
 
   if v_fresh then
     update public.enrollment_plans set access_days = 60                    where key = 'core_self_paced';
-    update public.enrollment_plans set access_days = 60, support_days = 30 where key = 'sampler';
+    update public.enrollment_plans set access_days = 60, support_days = 60 where key = 'sampler';
     update public.enrollment_plans set access_days = 60                    where key = 'silver_self_paced';
     update public.enrollment_plans set access_days = 180                   where key = 'gold_live';
     update public.enrollment_plans set access_days = 180                   where key = 'vip';
 
     update public.enrollment_plans set entitlement_summary = '["60-day QBO Mastery access","Weekly Discord chat"]'::jsonb                  where key = 'core_self_paced';
-    update public.enrollment_plans set entitlement_summary = '["60-day course access","30-day group chat support","1 live Zoom session"]'::jsonb where key = 'sampler';
+    update public.enrollment_plans set entitlement_summary = '["60-day course access","60-day group chat support","1 live Zoom session"]'::jsonb where key = 'sampler';
     update public.enrollment_plans set entitlement_summary = '["60-day QBO Mastery access","60-day Resume & Interview access"]'::jsonb      where key = 'silver_self_paced';
     update public.enrollment_plans set entitlement_summary = '["180-day full access","12 live group trainings","Weekly consult until hired"]'::jsonb where key = 'gold_live';
     update public.enrollment_plans set entitlement_summary = '["180-day full access","1-on-1 coaching","Weekly consult until hired"]'::jsonb where key = 'vip';

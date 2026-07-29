@@ -5,8 +5,10 @@
 -- WHAT: one self-contained script that stands up the ENTIRE schema from zero —
 -- profiles + signup trigger, admin/approval/enrollment helpers, the course
 -- platform, sidebar/feature-guide tables, the manual enrollment + subscription
--- lifecycle, both storage buckets + policies, all indexes, and the realtime
--- publication. It expresses the FINAL, fully-gated state (both feature flags
+-- lifecycle, the community feed (posts/comments/reactions/tags), the community
+-- spaces + batches segmentation (§19, #32: General + per-batch Gold/VIP private
+-- communities derived from the member's subscription), both storage
+-- buckets + policies, all indexes, and the realtime publication. It expresses the FINAL, fully-gated state (both feature flags
 -- VITE_REQUIRE_ADMIN_APPROVAL and VITE_REQUIRE_ENROLLMENT default ON), so the
 -- read policies below already require approved AND enrolled.
 --
@@ -50,8 +52,12 @@
 
 -- ───────────────────────────────────────────────────────────────────
 -- 0) Extensions (defensive — Supabase already provides gen_random_uuid()).
+--    pgvector (extensions schema, Supabase idiom) powers the AI course trainer's
+--    384-dim gte-small embeddings (§16b); pg_trgm is created with the community
+--    section (§15b) that uses it.
 -- ───────────────────────────────────────────────────────────────────
 create extension if not exists pgcrypto;
+create extension if not exists vector with schema extensions;
 
 -- ───────────────────────────────────────────────────────────────────
 -- 1) profiles — one row per auth user, full final shape (base + approval columns
@@ -156,6 +162,7 @@ create table if not exists public.courses (
   course_date date,                                                       -- editable cohort/run date (defaults to today in-app)
   source_course_id uuid references public.courses(id) on delete set null, -- duplication lineage
   access_tier text not null default 'standard',                          -- 'standard' = premium; 'essentials' = Sampler-accessible (see §13b/§14)
+  ai_trainer_enabled boolean not null default false,                     -- per-course opt-in for the AI voice trainer (§16b)
   published   boolean not null default false,
   position    integer not null default 0,
   created_at  timestamptz not null default now(),
@@ -240,6 +247,8 @@ on conflict (slug) do nothing;
 -- 5) Storage buckets + object policies.
 --    course-media   = PUBLIC  (course/cover/feature-guide media, getPublicUrl)
 --    enrollment-receipts = PRIVATE (financial receipts, createSignedUrl)
+--    avatars        = PUBLIC  (member profile pictures, getPublicUrl; #24)
+--    (community-media is created in §14b — its read policy needs is_enrolled().)
 --    Bucket inserts degrade to a NOTICE under a restricted SQL role → then create
 --    them in Dashboard → Storage; the object policies below still apply.
 -- ───────────────────────────────────────────────────────────────────
@@ -297,6 +306,28 @@ drop policy if exists enrollment_receipts_delete on storage.objects;
 create policy enrollment_receipts_delete on storage.objects
   for delete to authenticated
   using (bucket_id = 'enrollment-receipts' and public.is_admin());
+
+-- avatars (#24): public read; members write only inside their own <uid>/ folder.
+do $$
+begin
+  insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+  values ('avatars', 'avatars', true, 5242880,
+          array['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
+  on conflict (id) do update set
+    public = true,
+    file_size_limit = excluded.file_size_limit,
+    allowed_mime_types = excluded.allowed_mime_types;
+exception when insufficient_privilege then
+  raise notice 'Create the avatars bucket in Dashboard → Storage (Public = ON, 5 MB, image mimes); policies still applied.';
+end $$;
+
+drop policy if exists avatars_read on storage.objects;
+create policy avatars_read on storage.objects
+  for select to public
+  using (bucket_id = 'avatars');
+-- The avatars WRITE policies (own folder + active membership) are created at
+-- the end of §15b — they reference is_approved()/is_enrolled(), which are not
+-- defined until §13.
 
 -- ───────────────────────────────────────────────────────────────────
 -- 6) sidebar_settings — global, admin-controlled navigation labels.
@@ -392,9 +423,9 @@ insert into public.enrollment_plans
    null, 1, 60, null,
    '["60-day QBO Mastery access","Weekly Discord chat"]'::jsonb),
   ('sampler', 'Sampler Session', 'Essentials', 1499, null, null,
-   '["1 Live Zoom Session (3 hours)","60-day course access","30-day group chat support"]'::jsonb,
-   'Limited offer', 2, 60, 30,
-   '["60-day course access","30-day group chat support","1 live Zoom session"]'::jsonb),
+   '["1 Live Zoom Session (3 hours)","60-day course access","60-day group chat support"]'::jsonb,
+   'Limited offer', 2, 60, 60,
+   '["60-day course access","60-day group chat support","1 live Zoom session"]'::jsonb),
   ('silver_self_paced', 'QBO + Resume Combo', 'Silver · Self-Paced', 1999, null, null,
    '["Simulated annual bookkeeping project for an NY-based construction company","60-day QBO Mastery course access","60-day Resume & Interview course access","Weekly Discord chat (Thu)"]'::jsonb,
    null, 3, 60, null,
@@ -884,6 +915,42 @@ drop policy if exists course_videos_admin_delete on storage.objects;
 create policy course_videos_admin_delete on storage.objects for delete to authenticated
   using (bucket_id = 'course-videos' and public.is_admin());
 
+-- community-media (#24): PRIVATE bucket for community post attachments (images +
+-- videos) — member-only content, served via short-lived signed URLs, so it lives
+-- here beside course-videos (same reasoning: a public bucket bypasses RLS on
+-- read). Members upload only inside their own <uid>/ folder; enrolled members
+-- read; delete own-or-admin.
+do $$
+begin
+  insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+  values ('community-media', 'community-media', false, 52428800,
+          array['image/jpeg', 'image/png', 'image/webp', 'image/gif',
+                'video/mp4', 'video/webm', 'video/quicktime'])
+  on conflict (id) do update set
+    public = false,
+    file_size_limit = excluded.file_size_limit,
+    allowed_mime_types = excluded.allowed_mime_types;
+exception
+  when insufficient_privilege then
+    raise notice 'Create the community-media bucket in Dashboard → Storage (Public = OFF, 50 MB, image + video mimes); policies still applied.';
+end $$;
+
+-- community_media_read (member read scoped to active-post attachments) is
+-- created at the END of §15b — CREATE POLICY validates its USING references
+-- immediately, and community_attachments/community_posts don't exist yet here.
+drop policy if exists community_media_own_insert on storage.objects;
+create policy community_media_own_insert on storage.objects
+  for insert to authenticated
+  with check (bucket_id = 'community-media'
+    and (storage.foldername(name))[1] = (select auth.uid())::text
+    and (select public.is_approved()) and (select public.is_enrolled()));
+drop policy if exists community_media_delete on storage.objects;
+create policy community_media_delete on storage.objects
+  for delete to authenticated
+  using (bucket_id = 'community-media'
+    and ((storage.foldername(name))[1] = (select auth.uid())::text
+      or (select public.is_admin())));
+
 -- Remove the superseded per-row helper LAST — only after the §14/§14b policies above no
 -- longer reference it (RLS policies hold a pg_depend on functions in their USING clause).
 -- NO CASCADE. Harmless no-op on a genuinely fresh DB (it was never created here).
@@ -897,6 +964,840 @@ create index if not exists profiles_approval_status_idx        on public.profile
 create index if not exists courses_position_created_idx        on public.courses (position, created_at);
 create index if not exists course_lessons_course_position_idx  on public.course_lessons (course_id, position);
 create index if not exists lesson_progress_course_user_idx     on public.lesson_progress (course_id, user_id);
+
+-- ───────────────────────────────────────────────────────────────────
+-- 15b) Community forum (db/2026-07-20-community.sql #23 + the forum upgrade
+--      db/2026-07-21-community-forum.sql #24). EVERY active paid plan includes
+--      it, so the gate is is_approved() + is_enrolled() (term + grace — mirrors
+--      courses; expired members are FULLY blocked, reads included).
+--      author_name / author_avatar_url are DENORMALIZED at insert (non-admins
+--      can't read other profiles rows) and server-stamped. status: 'active' |
+--      'hidden' (admin) | 'deleted' (author soft-delete; members never
+--      hard-DELETE posts/comments). admin_only tags (Announcements) are
+--      enforced in the insert/update policies via a subquery — which is why
+--      community_tags_read does NOT filter on `active` (the client filters
+--      `active` for its pickers; hiding inactive rows here would let a
+--      deactivated admin-only tag slip past the guard). Forum extras:
+--      pinned/comments_locked/comment_count/last_activity_at are SERVER-
+--      CONTROLLED (community_posts_guard() + community_comment_rollup());
+--      announcements are born comments_locked; notifications are written ONLY
+--      by SECURITY DEFINER triggers (no insert policy — unforgeable);
+--      set_my_avatar() is the ONE sanctioned user-facing profiles write;
+--      search_community_members() is the mention directory (name + avatar,
+--      never email). Buckets: avatars (public) + community-media (private) in §5.
+-- ───────────────────────────────────────────────────────────────────
+create table if not exists public.community_tags (
+  slug        text primary key,
+  label       text not null,
+  admin_only  boolean not null default false,
+  active      boolean not null default true,
+  position    int not null default 0,
+  created_at  timestamptz not null default now()
+);
+
+insert into public.community_tags (slug, label, admin_only, position) values
+  ('announcements',     'Announcements',      true,  1),
+  ('introductions',     'Introductions',      false, 2),
+  ('quickbooks-help',   'QuickBooks Help',    false, 3),
+  ('us-bookkeeping',    'US Bookkeeping',     false, 4),
+  ('course-questions',  'Course Questions',   false, 5),
+  ('job-applications',  'Job Applications',   false, 6),
+  ('resume-interview',  'Resume & Interview', false, 7),
+  ('client-management', 'Client Management',  false, 8),
+  ('wins',              'Wins',               false, 9),
+  ('questions',         'General Questions',  false, 10)
+on conflict (slug) do nothing;
+
+-- Converge a #23-era database (its 9 rows survive the on-conflict seed with
+-- the OLD labels/positions) on the forum taxonomy. No-op on a fresh install.
+update public.community_tags as t
+   set label = v.label, position = v.pos
+  from (values
+    ('announcements',     'Announcements',      1),
+    ('introductions',     'Introductions',      2),
+    ('quickbooks-help',   'QuickBooks Help',    3),
+    ('us-bookkeeping',    'US Bookkeeping',     4),
+    ('course-questions',  'Course Questions',   5),
+    ('job-applications',  'Job Applications',   6),
+    ('resume-interview',  'Resume & Interview', 7),
+    ('client-management', 'Client Management',  8),
+    ('wins',              'Wins',               9),
+    ('questions',         'General Questions', 10)
+  ) as v(slug, label, pos)
+ where t.slug = v.slug
+   and (t.label <> v.label or t.position <> v.pos);
+
+create table if not exists public.community_posts (
+  id                uuid primary key default gen_random_uuid(),
+  author_id         uuid not null references public.profiles(id) on delete cascade,
+  author_name       text not null,
+  author_avatar_url text,
+  title             text check (title is null or char_length(title) <= 120),
+  body              text not null check (char_length(body) between 1 and 5000),
+  tag_slug          text not null references public.community_tags(slug),
+  status            text not null default 'active' check (status in ('active','hidden','deleted')),
+  pinned            boolean not null default false,
+  comments_locked   boolean not null default false,
+  comment_count     int not null default 0,
+  last_activity_at  timestamptz not null default now(),
+  created_at        timestamptz not null default now(),
+  updated_at        timestamptz not null default now()
+);
+
+-- Forum columns (#24) — add-if-missing so a #23-era database that re-runs this
+-- bootstrap converges on the same shape as a fresh install.
+alter table public.community_posts add column if not exists author_avatar_url text;
+alter table public.community_posts add column if not exists pinned           boolean not null default false;
+alter table public.community_posts add column if not exists comments_locked  boolean not null default false;
+alter table public.community_posts add column if not exists comment_count    int not null default 0;
+alter table public.community_posts add column if not exists last_activity_at timestamptz not null default now();
+
+create table if not exists public.community_comments (
+  id                uuid primary key default gen_random_uuid(),
+  post_id           uuid not null references public.community_posts(id) on delete cascade,
+  author_id         uuid not null references public.profiles(id) on delete cascade,
+  author_name       text not null,
+  author_avatar_url text,
+  body              text not null check (char_length(body) between 1 and 2000),
+  status            text not null default 'active' check (status in ('active','hidden','deleted')),
+  created_at        timestamptz not null default now(),
+  updated_at        timestamptz not null default now()
+);
+
+alter table public.community_comments add column if not exists author_avatar_url text;
+
+-- Backfills — converge #23-era data (fresh installs have no rows; safe to
+-- re-run: on a re-run the posts guard already exists but its freeze exempts
+-- no-JWT SQL like this script, so the counter writes land).
+update public.community_posts p
+   set comment_count = (select count(*) from public.community_comments c
+                         where c.post_id = p.id and c.status = 'active'),
+       last_activity_at = greatest(
+         p.created_at,
+         coalesce((select max(c.created_at) from public.community_comments c
+                    where c.post_id = p.id and c.status = 'active'), p.created_at));
+
+update public.community_posts set comments_locked = true
+ where tag_slug in (select slug from public.community_tags where admin_only)
+   and comments_locked = false;
+
+update public.community_posts p
+   set author_avatar_url = pr.avatar_url
+  from public.profiles pr
+ where pr.id = p.author_id and p.author_avatar_url is null and pr.avatar_url is not null;
+
+update public.community_comments c
+   set author_avatar_url = pr.avatar_url
+  from public.profiles pr
+ where pr.id = c.author_id and c.author_avatar_url is null and pr.avatar_url is not null;
+
+-- Reactions target EITHER a post OR a comment (XOR check). The UNIQUE on
+-- (post_id, user_id, reaction_type) guards post reactions (NULLs are distinct);
+-- the partial unique index guards comment reactions and serves their lookups.
+create table if not exists public.community_reactions (
+  id            uuid primary key default gen_random_uuid(),
+  post_id       uuid references public.community_posts(id) on delete cascade,
+  comment_id    uuid references public.community_comments(id) on delete cascade,
+  user_id       uuid not null references public.profiles(id) on delete cascade,
+  reaction_type text not null check (reaction_type in ('like','celebrate','helpful')),
+  created_at    timestamptz not null default now(),
+  unique (post_id, user_id, reaction_type),
+  constraint community_reactions_target_xor check ((post_id is null) <> (comment_id is null))
+);
+
+alter table public.community_reactions alter column post_id drop not null;
+alter table public.community_reactions add column if not exists comment_id uuid references public.community_comments(id) on delete cascade;
+
+do $$
+begin
+  alter table public.community_reactions
+    add constraint community_reactions_target_xor check ((post_id is null) <> (comment_id is null));
+exception when duplicate_object then null;
+end $$;
+
+create unique index if not exists community_reactions_comment_uniq
+  on public.community_reactions (comment_id, user_id, reaction_type)
+  where comment_id is not null;
+
+-- Server-stamped author identity: author_name + author_avatar_url are
+-- overwritten from the author's own profiles row on INSERT (SECURITY DEFINER —
+-- profiles RLS is closed to members). On UPDATE the name is frozen but the
+-- avatar is RE-STAMPED from profiles (freezing it would silently revert
+-- set_my_avatar()'s denorm backfill; re-stamping also means a forged client
+-- value never sticks), so a direct API call can't impersonate anyone.
+create or replace function public.community_stamp_author()
+returns trigger
+language plpgsql security definer set search_path = public
+as $$
+begin
+  if tg_op = 'INSERT' then
+    -- created_at is server time for members (comments feed the parent's
+    -- last_activity_at rollup — a forged date would top the feed forever).
+    if not public.is_admin() then
+      new.created_at := now();
+    end if;
+    select coalesce(nullif(trim(p.full_name), ''), p.email, 'Member'), p.avatar_url
+      into new.author_name, new.author_avatar_url
+      from public.profiles p where p.id = new.author_id;
+    new.author_name := coalesce(new.author_name, 'Member');
+  else
+    new.created_at  := old.created_at;   -- immutable after insert
+    new.author_name := old.author_name;  -- immutable after insert
+    -- Re-stamp (never freeze) the avatar: profiles.avatar_url is the source
+    -- of truth and its only user-facing writer is set_my_avatar().
+    select p.avatar_url into new.author_avatar_url
+      from public.profiles p where p.id = old.author_id;
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function public.community_stamp_author() from public;
+
+drop trigger if exists community_posts_stamp_author on public.community_posts;
+create trigger community_posts_stamp_author
+  before insert or update on public.community_posts
+  for each row execute function public.community_stamp_author();
+
+drop trigger if exists community_comments_stamp_author on public.community_comments;
+create trigger community_comments_stamp_author
+  before insert or update on public.community_comments
+  for each row execute function public.community_stamp_author();
+
+-- community_posts_guard(): column-level protection RLS can't give. On INSERT
+-- counters start clean, non-admins can't pin, and admin-only categories
+-- (Announcements) are born comments_locked. On UPDATE the freeze applies only
+-- to CLIENT-originated writes — trigger-originated ones (the comment rollup
+-- runs at pg_trigger_depth() 2) and no-JWT SQL (SQL editor / service role →
+-- auth.uid() is null) must pass, or counter maintenance and the backfills
+-- below would be silently reverted. Within the frozen path a non-admin can't
+-- flip pinned/comments_locked, and counters stay trigger-owned even for admins.
+create or replace function public.community_posts_guard()
+returns trigger
+language plpgsql security definer set search_path = public
+as $$
+begin
+  if tg_op = 'INSERT' then
+    -- created_at is server time for members: a client-forged future date
+    -- would launder into last_activity_at below and self-pin the post
+    -- above the whole activity-sorted feed.
+    if not public.is_admin() then
+      new.created_at := now();
+    end if;
+    new.comment_count    := 0;
+    new.last_activity_at := coalesce(new.created_at, now());
+    if not public.is_admin() then
+      new.pinned := false;
+    end if;
+    if exists (select 1 from public.community_tags t
+                where t.slug = new.tag_slug and t.admin_only) then
+      new.comments_locked := true;
+    elsif not public.is_admin() then
+      new.comments_locked := false;
+    end if;
+  else
+    -- Freeze only client-originated updates (see comment above).
+    if pg_trigger_depth() <= 1 and auth.uid() is not null then
+      if not public.is_admin() then
+        new.pinned           := old.pinned;
+        new.comments_locked  := old.comments_locked;
+      end if;
+      new.comment_count    := old.comment_count;
+      new.last_activity_at := old.last_activity_at;
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function public.community_posts_guard() from public;
+
+drop trigger if exists community_posts_guard on public.community_posts;
+create trigger community_posts_guard
+  before insert or update on public.community_posts
+  for each row execute function public.community_posts_guard();
+
+-- community_comment_rollup(): recomputes the parent post's active
+-- comment_count (self-healing across hide/restore/soft-delete/hard-delete)
+-- and advances last_activity_at when a new comment lands. SECURITY DEFINER:
+-- the commenting member has no UPDATE policy on someone else's post row.
+create or replace function public.community_comment_rollup()
+returns trigger
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_post uuid := coalesce(new.post_id, old.post_id);
+begin
+  update public.community_posts p
+     set comment_count = (select count(*) from public.community_comments c
+                           where c.post_id = v_post and c.status = 'active'),
+         last_activity_at = greatest(
+           p.last_activity_at,
+           coalesce((select max(c.created_at) from public.community_comments c
+                      where c.post_id = v_post and c.status = 'active'), p.created_at))
+   where p.id = v_post;
+  return coalesce(new, old);
+end;
+$$;
+
+revoke all on function public.community_comment_rollup() from public;
+
+drop trigger if exists community_comments_rollup on public.community_comments;
+create trigger community_comments_rollup
+  after insert or update of status or delete on public.community_comments
+  for each row execute function public.community_comment_rollup();
+
+-- community_notifications — reply/mention fan-out. Rows are written ONLY by
+-- the SECURITY DEFINER notify triggers (table owner bypasses RLS; there is no
+-- insert policy — a client can never forge a notification for another member).
+-- actor_* / post_title are denormalized so the bell renders with zero joins.
+create table if not exists public.community_notifications (
+  id               uuid primary key default gen_random_uuid(),
+  user_id          uuid not null references public.profiles(id) on delete cascade,  -- recipient
+  kind             text not null check (kind in ('mention','reply')),
+  actor_id         uuid references public.profiles(id) on delete set null,
+  actor_name       text not null,
+  actor_avatar_url text,
+  post_id          uuid references public.community_posts(id) on delete cascade,
+  comment_id       uuid references public.community_comments(id) on delete cascade,
+  post_title       text,
+  read_at          timestamptz,
+  created_at       timestamptz not null default now()
+);
+
+create index if not exists community_notifications_user_idx
+  on public.community_notifications (user_id, read_at, created_at desc);
+
+-- community_announcement_reads — per-user "seen it" marker for announcement
+-- posts (unread = announcements minus these rows; no per-member fan-out).
+create table if not exists public.community_announcement_reads (
+  user_id  uuid not null references public.profiles(id) on delete cascade,
+  post_id  uuid not null references public.community_posts(id) on delete cascade,
+  read_at  timestamptz not null default now(),
+  primary key (user_id, post_id)
+);
+
+-- community_attachments — images/videos (private community-media bucket) and
+-- external links, per post. Metadata only; the file itself is guarded by the
+-- bucket policies in §5. Members attach only to their OWN posts.
+create table if not exists public.community_attachments (
+  id           uuid primary key default gen_random_uuid(),
+  post_id      uuid not null references public.community_posts(id) on delete cascade,
+  uploader_id  uuid not null references public.profiles(id) on delete cascade,
+  kind         text not null check (kind in ('image','video','link')),
+  storage_path text,
+  url          text,
+  file_name    text,
+  mime_type    text,
+  file_size    bigint,
+  position     int not null default 0,
+  created_at   timestamptz not null default now(),
+  check ((kind = 'link') = (url is not null)),
+  check ((kind = 'link') = (storage_path is null))
+);
+
+create index if not exists community_attachments_post_idx
+  on public.community_attachments (post_id);
+
+-- community_post_tags — free-form tags beside the fixed category. Normalized
+-- slugs, no lookup table; ≤5 per post enforced client-side, shape enforced here.
+create table if not exists public.community_post_tags (
+  post_id uuid not null references public.community_posts(id) on delete cascade,
+  tag     text not null check (char_length(tag) between 1 and 24 and tag ~ '^[a-z0-9][a-z0-9-]*$'),
+  primary key (post_id, tag)
+);
+
+create index if not exists community_post_tags_tag_idx
+  on public.community_post_tags (tag);
+
+-- Mention parsing + notification fan-out. Mentions travel in the body as
+-- @[Display Name](uuid) markup; parsing happens HERE, server-side, so a client
+-- can only ever notify members whose uuids genuinely appear in its own stored
+-- content. Cap 10 per row; self-mentions and unknown uuids are skipped.
+create or replace function public.community_notify_on_comment()
+returns trigger
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_actor_name   text;
+  v_actor_avatar text;
+  v_post         record;
+  v_title        text;
+  v_done         uuid[] := array[]::uuid[];
+  v_uid          uuid;
+  m              text;
+begin
+  if new.status <> 'active' then return new; end if;
+  select p.author_id, p.title, p.body into v_post
+    from public.community_posts p where p.id = new.post_id;
+  if v_post.author_id is null then return new; end if;
+  select coalesce(nullif(trim(pr.full_name), ''), pr.email, 'Member'), pr.avatar_url
+    into v_actor_name, v_actor_avatar
+    from public.profiles pr where pr.id = new.author_id;
+  v_title := left(coalesce(nullif(trim(v_post.title), ''), v_post.body), 120);
+
+  for m in select (regexp_matches(new.body, '@\[[^\]]{1,80}\]\(([0-9a-fA-F-]{36})\)', 'g'))[1] loop
+    exit when coalesce(array_length(v_done, 1), 0) >= 10;
+    begin
+      v_uid := m::uuid;
+    exception when others then
+      continue;
+    end;
+    if v_uid <> new.author_id
+       and not (v_uid = any(v_done))
+       -- Target must be MENTIONABLE (the search_community_members bar:
+       -- named + approved-or-admin) — never an arbitrary/blocked uuid.
+       and exists (select 1 from public.profiles pr2
+                    where pr2.id = v_uid
+                      and coalesce(nullif(trim(pr2.full_name), ''), '') <> ''
+                      and (pr2.is_admin or pr2.approval_status = 'approved'))
+       -- Collapse repeats: at most one UNREAD entry per actor/post/kind —
+       -- this also caps the flood a scripted commenter could generate.
+       and not exists (select 1 from public.community_notifications n
+                        where n.user_id = v_uid and n.actor_id = new.author_id
+                          and n.post_id = new.post_id and n.kind = 'mention'
+                          and n.read_at is null) then
+      v_done := v_done || v_uid;
+      insert into public.community_notifications
+        (user_id, kind, actor_id, actor_name, actor_avatar_url, post_id, comment_id, post_title)
+      values (v_uid, 'mention', new.author_id, v_actor_name, v_actor_avatar, new.post_id, new.id, v_title);
+    end if;
+  end loop;
+
+  if v_post.author_id <> new.author_id and not (v_post.author_id = any(v_done))
+     and not exists (select 1 from public.community_notifications n
+                      where n.user_id = v_post.author_id and n.actor_id = new.author_id
+                        and n.post_id = new.post_id and n.kind = 'reply'
+                        and n.read_at is null) then
+    insert into public.community_notifications
+      (user_id, kind, actor_id, actor_name, actor_avatar_url, post_id, comment_id, post_title)
+    values (v_post.author_id, 'reply', new.author_id, v_actor_name, v_actor_avatar, new.post_id, new.id, v_title);
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function public.community_notify_on_comment() from public;
+
+drop trigger if exists community_comments_notify on public.community_comments;
+create trigger community_comments_notify
+  after insert on public.community_comments
+  for each row execute function public.community_notify_on_comment();
+
+create or replace function public.community_notify_on_post()
+returns trigger
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_actor_name   text;
+  v_actor_avatar text;
+  v_title        text;
+  v_done         uuid[] := array[]::uuid[];
+  v_uid          uuid;
+  m              text;
+begin
+  if new.status <> 'active' then return new; end if;
+  select coalesce(nullif(trim(pr.full_name), ''), pr.email, 'Member'), pr.avatar_url
+    into v_actor_name, v_actor_avatar
+    from public.profiles pr where pr.id = new.author_id;
+  v_title := left(coalesce(nullif(trim(new.title), ''), new.body), 120);
+
+  for m in select (regexp_matches(new.body, '@\[[^\]]{1,80}\]\(([0-9a-fA-F-]{36})\)', 'g'))[1] loop
+    exit when coalesce(array_length(v_done, 1), 0) >= 10;
+    begin
+      v_uid := m::uuid;
+    exception when others then
+      continue;
+    end;
+    if v_uid <> new.author_id
+       and not (v_uid = any(v_done))
+       -- Same mentionable-target + unread-collapse rules as the comment
+       -- trigger above.
+       and exists (select 1 from public.profiles pr2
+                    where pr2.id = v_uid
+                      and coalesce(nullif(trim(pr2.full_name), ''), '') <> ''
+                      and (pr2.is_admin or pr2.approval_status = 'approved'))
+       and not exists (select 1 from public.community_notifications n
+                        where n.user_id = v_uid and n.actor_id = new.author_id
+                          and n.post_id = new.id and n.kind = 'mention'
+                          and n.read_at is null) then
+      v_done := v_done || v_uid;
+      insert into public.community_notifications
+        (user_id, kind, actor_id, actor_name, actor_avatar_url, post_id, post_title)
+      values (v_uid, 'mention', new.author_id, v_actor_name, v_actor_avatar, new.id, v_title);
+    end if;
+  end loop;
+  return new;
+end;
+$$;
+
+revoke all on function public.community_notify_on_post() from public;
+
+drop trigger if exists community_posts_notify on public.community_posts;
+create trigger community_posts_notify
+  after insert on public.community_posts
+  for each row execute function public.community_notify_on_post();
+
+-- set_my_avatar(): the ONE sanctioned user-facing profiles write (profiles has
+-- NO user UPDATE policy — an open row policy would expose is_paid/plan). Own
+-- row, avatar_url only, path pinned to the caller's own avatars/<uid>/ folder;
+-- also refreshes the caller's denormalized author_avatar_url.
+create or replace function public.set_my_avatar(p_path text)
+returns void
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_uid uuid := auth.uid();
+begin
+  if v_uid is null then
+    raise exception 'Not signed in.';
+  end if;
+  -- Same eligibility as every community write: a rejected/expired account
+  -- keeps no write path into profiles or the public avatars denorms.
+  if not (public.is_admin() or (public.is_approved() and public.is_enrolled())) then
+    raise exception 'Not allowed.';
+  end if;
+  if p_path is not null and p_path !~ ('^' || v_uid::text || '/[A-Za-z0-9._-]{1,120}$') then
+    raise exception 'Invalid avatar path.';
+  end if;
+  update public.profiles set avatar_url = p_path where id = v_uid;
+  update public.community_posts    set author_avatar_url = p_path where author_id = v_uid;
+  update public.community_comments set author_avatar_url = p_path where author_id = v_uid;
+end;
+$$;
+
+revoke all on function public.set_my_avatar(text) from public;
+grant execute on function public.set_my_avatar(text) to authenticated;
+
+-- search_community_members(): mention-autocomplete directory. SECURITY DEFINER
+-- because members can't read other profiles rows. Returns display name +
+-- avatar ONLY — never email (nameless profiles simply aren't mentionable).
+create or replace function public.search_community_members(p_query text)
+returns table (id uuid, display_name text, avatar_url text)
+language sql stable security definer set search_path = public
+as $$
+  select p.id, trim(p.full_name) as display_name, p.avatar_url
+    from public.profiles p
+   where ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled())))
+     and nullif(trim(p.full_name), '') is not null
+     and (p.approval_status = 'approved' or p.is_admin)
+     and p.full_name ilike '%' || coalesce(p_query, '') || '%'
+   order by trim(p.full_name)
+   limit 8;
+$$;
+
+revoke all on function public.search_community_members(text) from public;
+grant execute on function public.search_community_members(text) to authenticated;
+
+-- community_category_counts() (#25): server-side GROUP BY for the sidebar counts
+-- (SECURITY INVOKER — community_posts_read RLS scopes the caller) instead of the
+-- client streaming every active post's tag_slug.
+create or replace function public.community_category_counts()
+returns table (tag_slug text, n bigint)
+language sql stable set search_path = public
+as $$
+  select p.tag_slug, count(*)::bigint
+    from public.community_posts p
+   where p.status = 'active'
+   group by p.tag_slug;
+$$;
+
+revoke all on function public.community_category_counts() from public;
+grant execute on function public.community_category_counts() to authenticated;
+
+-- Trigram index (#25) so search_community_members()'s full_name ILIKE '%q%'
+-- (leading wildcard) is index-assisted instead of a full profiles scan per keystroke.
+create extension if not exists pg_trgm;
+create index if not exists profiles_full_name_trgm
+  on public.profiles using gin (full_name gin_trgm_ops);
+
+create index if not exists community_posts_feed_idx    on public.community_posts (status, created_at desc);
+create index if not exists community_posts_tag_idx     on public.community_posts (tag_slug, created_at desc);
+create index if not exists community_posts_forum_idx   on public.community_posts (status, pinned desc, last_activity_at desc);
+create index if not exists community_comments_post_idx on public.community_comments (post_id, created_at);
+
+alter table public.community_tags               enable row level security;
+alter table public.community_posts              enable row level security;
+alter table public.community_comments           enable row level security;
+alter table public.community_reactions          enable row level security;
+alter table public.community_notifications      enable row level security;
+alter table public.community_announcement_reads enable row level security;
+alter table public.community_attachments        enable row level security;
+alter table public.community_post_tags          enable row level security;
+
+drop policy if exists community_tags_read on public.community_tags;
+create policy community_tags_read on public.community_tags
+  for select to authenticated
+  using ((select public.is_admin())
+      or ((select public.is_approved()) and (select public.is_enrolled())));
+
+drop policy if exists community_tags_admin_all on public.community_tags;
+create policy community_tags_admin_all on public.community_tags
+  for all to authenticated
+  using ((select public.is_admin())) with check ((select public.is_admin()));
+
+drop policy if exists community_posts_read on public.community_posts;
+create policy community_posts_read on public.community_posts
+  for select to authenticated
+  using ((select public.is_admin())
+      or (status = 'active'
+          and (select public.is_approved()) and (select public.is_enrolled())));
+
+drop policy if exists community_posts_own_insert on public.community_posts;
+create policy community_posts_own_insert on public.community_posts
+  for insert to authenticated
+  with check (
+    author_id = (select auth.uid())
+    and status = 'active'
+    and (select public.is_approved()) and (select public.is_enrolled())
+    and not exists (select 1 from public.community_tags t
+                    where t.slug = tag_slug and t.admin_only)
+  );
+
+drop policy if exists community_posts_own_update on public.community_posts;
+create policy community_posts_own_update on public.community_posts
+  for update to authenticated
+  using (author_id = (select auth.uid()) and status <> 'hidden'
+     and ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled()))))
+  with check (
+    author_id = (select auth.uid())
+    and status in ('active','deleted')
+    and ((select public.is_admin())
+      or ((select public.is_approved()) and (select public.is_enrolled())))
+    and not exists (select 1 from public.community_tags t
+                    where t.slug = tag_slug and t.admin_only)
+  );
+
+drop policy if exists community_posts_admin_all on public.community_posts;
+create policy community_posts_admin_all on public.community_posts
+  for all to authenticated
+  using ((select public.is_admin())) with check ((select public.is_admin()));
+
+-- Member comment reads/inserts also require the PARENT POST to be active, so
+-- hiding a post hides its whole thread and freezes new replies.
+drop policy if exists community_comments_read on public.community_comments;
+create policy community_comments_read on public.community_comments
+  for select to authenticated
+  using ((select public.is_admin())
+      or (status = 'active'
+          and (select public.is_approved()) and (select public.is_enrolled())
+          and exists (select 1 from public.community_posts p
+                      where p.id = post_id and p.status = 'active')));
+
+-- Member comment INSERTs refuse comments_locked parents server-side (the
+-- client only hides the composer): announcements and admin-locked threads
+-- can't be replied to via direct REST. Admins pass via admin_all below.
+drop policy if exists community_comments_own_insert on public.community_comments;
+create policy community_comments_own_insert on public.community_comments
+  for insert to authenticated
+  with check (author_id = (select auth.uid())
+          and status = 'active'
+          and (select public.is_approved()) and (select public.is_enrolled())
+          and exists (select 1 from public.community_posts p
+                      where p.id = post_id and p.status = 'active'
+                        and not p.comments_locked));
+
+drop policy if exists community_comments_own_update on public.community_comments;
+create policy community_comments_own_update on public.community_comments
+  for update to authenticated
+  using (author_id = (select auth.uid()) and status <> 'hidden'
+     and ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled()))))
+  with check (author_id = (select auth.uid()) and status in ('active','deleted')
+    and ((select public.is_admin())
+      or ((select public.is_approved()) and (select public.is_enrolled()))));
+
+drop policy if exists community_comments_admin_all on public.community_comments;
+create policy community_comments_admin_all on public.community_comments
+  for all to authenticated
+  using ((select public.is_admin())) with check ((select public.is_admin()));
+
+-- Read carries the same parent-active guard as its sibling read policies (#25), so
+-- hiding a post also hides who reacted to it + its comments. Admins read everything.
+drop policy if exists community_reactions_read on public.community_reactions;
+create policy community_reactions_read on public.community_reactions
+  for select to authenticated
+  using ((select public.is_admin())
+      or ((select public.is_approved()) and (select public.is_enrolled())
+          and ((post_id is not null
+                and exists (select 1 from public.community_posts p
+                            where p.id = post_id and p.status = 'active'))
+            or (comment_id is not null
+                and exists (select 1 from public.community_comments c
+                            join public.community_posts p on p.id = c.post_id
+                            where c.id = comment_id and c.status = 'active'
+                              and p.status = 'active')))));
+
+-- Reactions may target a post OR a comment; either way the target (and, for a
+-- comment, its parent post) must be active. Reactions stay allowed on
+-- comments_locked posts — announcements are react-only by design.
+drop policy if exists community_reactions_own_insert on public.community_reactions;
+create policy community_reactions_own_insert on public.community_reactions
+  for insert to authenticated
+  with check (user_id = (select auth.uid())
+          and (select public.is_approved()) and (select public.is_enrolled())
+          and ((post_id is not null
+                and exists (select 1 from public.community_posts p
+                            where p.id = post_id and p.status = 'active'))
+            or (comment_id is not null
+                and exists (select 1 from public.community_comments c
+                            join public.community_posts p on p.id = c.post_id
+                            where c.id = comment_id and c.status = 'active'
+                              and p.status = 'active'))));
+
+drop policy if exists community_reactions_own_delete on public.community_reactions;
+create policy community_reactions_own_delete on public.community_reactions
+  for delete to authenticated
+  using (user_id = (select auth.uid())
+     and ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled()))));
+
+drop policy if exists community_reactions_admin_all on public.community_reactions;
+create policy community_reactions_admin_all on public.community_reactions
+  for all to authenticated
+  using ((select public.is_admin())) with check ((select public.is_admin()));
+
+-- Notifications: recipients read + mark-read their own rows. No insert/delete
+-- policies — rows are written only by the SECURITY DEFINER notify triggers.
+-- Own rows AND an active membership — expired members are fully blocked,
+-- notification titles/actors included (the house "reads included" rule).
+drop policy if exists community_notifications_own_select on public.community_notifications;
+create policy community_notifications_own_select on public.community_notifications
+  for select to authenticated
+  using (user_id = (select auth.uid())
+     and ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled()))));
+
+drop policy if exists community_notifications_own_update on public.community_notifications;
+create policy community_notifications_own_update on public.community_notifications
+  for update to authenticated
+  using (user_id = (select auth.uid())
+     and ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled()))))
+  with check (user_id = (select auth.uid()));
+
+-- Announcement reads: insert-only own rows.
+drop policy if exists community_announcement_reads_own_select on public.community_announcement_reads;
+create policy community_announcement_reads_own_select on public.community_announcement_reads
+  for select to authenticated
+  using (user_id = (select auth.uid())
+     and ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled()))));
+
+drop policy if exists community_announcement_reads_own_insert on public.community_announcement_reads;
+create policy community_announcement_reads_own_insert on public.community_announcement_reads
+  for insert to authenticated
+  with check (user_id = (select auth.uid())
+          and ((select public.is_admin())
+            or ((select public.is_approved()) and (select public.is_enrolled()))));
+
+-- Attachments: visible with the parent post; members attach only to their own
+-- posts; delete own-or-admin.
+drop policy if exists community_attachments_read on public.community_attachments;
+create policy community_attachments_read on public.community_attachments
+  for select to authenticated
+  using ((select public.is_admin())
+      or ((select public.is_approved()) and (select public.is_enrolled())
+          and exists (select 1 from public.community_posts p
+                      where p.id = post_id and p.status = 'active')));
+
+drop policy if exists community_attachments_own_insert on public.community_attachments;
+create policy community_attachments_own_insert on public.community_attachments
+  for insert to authenticated
+  with check (uploader_id = (select auth.uid())
+          and (select public.is_approved()) and (select public.is_enrolled())
+          and exists (select 1 from public.community_posts p
+                      where p.id = post_id and p.author_id = (select auth.uid())));
+
+drop policy if exists community_attachments_own_delete on public.community_attachments;
+create policy community_attachments_own_delete on public.community_attachments
+  for delete to authenticated
+  using (uploader_id = (select auth.uid())
+     and ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled()))));
+
+drop policy if exists community_attachments_admin_all on public.community_attachments;
+create policy community_attachments_admin_all on public.community_attachments
+  for all to authenticated
+  using ((select public.is_admin())) with check ((select public.is_admin()));
+
+-- Free-form post tags: visible with the parent post; managed by the post author.
+drop policy if exists community_post_tags_read on public.community_post_tags;
+create policy community_post_tags_read on public.community_post_tags
+  for select to authenticated
+  using ((select public.is_admin())
+      or ((select public.is_approved()) and (select public.is_enrolled())
+          and exists (select 1 from public.community_posts p
+                      where p.id = post_id and p.status = 'active')));
+
+drop policy if exists community_post_tags_own_insert on public.community_post_tags;
+create policy community_post_tags_own_insert on public.community_post_tags
+  for insert to authenticated
+  with check ((select public.is_approved()) and (select public.is_enrolled())
+          and exists (select 1 from public.community_posts p
+                      where p.id = post_id and p.author_id = (select auth.uid())));
+
+drop policy if exists community_post_tags_own_delete on public.community_post_tags;
+create policy community_post_tags_own_delete on public.community_post_tags
+  for delete to authenticated
+  using (((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled())))
+     and exists (select 1 from public.community_posts p
+                 where p.id = post_id and p.author_id = (select auth.uid())));
+
+drop policy if exists community_post_tags_admin_all on public.community_post_tags;
+create policy community_post_tags_admin_all on public.community_post_tags
+  for all to authenticated
+  using ((select public.is_admin())) with check ((select public.is_admin()));
+
+-- Storage policies deferred from §5/§14b (they need is_approved()/is_enrolled()
+-- from §13 and the community tables above).
+
+-- avatars bucket writes: own folder + an ACTIVE membership — a rejected/
+-- expired account must not keep free public-bucket hosting. (Read stays
+-- public in §5 — the bucket is public by design.)
+drop policy if exists avatars_own_insert on storage.objects;
+create policy avatars_own_insert on storage.objects
+  for insert to authenticated
+  with check (bucket_id = 'avatars'
+          and ((select public.is_admin())
+            or ((storage.foldername(name))[1] = (select auth.uid())::text
+                and (select public.is_approved()) and (select public.is_enrolled()))));
+
+drop policy if exists avatars_own_update on storage.objects;
+create policy avatars_own_update on storage.objects
+  for update to authenticated
+  using (bucket_id = 'avatars'
+     and ((select public.is_admin())
+       or ((storage.foldername(name))[1] = (select auth.uid())::text
+           and (select public.is_approved()) and (select public.is_enrolled()))));
+
+drop policy if exists avatars_own_delete on storage.objects;
+create policy avatars_own_delete on storage.objects
+  for delete to authenticated
+  using (bucket_id = 'avatars'
+     and ((select public.is_admin())
+       or ((storage.foldername(name))[1] = (select auth.uid())::text
+           and (select public.is_approved()) and (select public.is_enrolled()))));
+
+-- Serves the storage read policy's path lookup below.
+create index if not exists community_attachments_path_idx
+  on public.community_attachments (storage_path);
+
+-- community-media read: member access is scoped to files attached to an
+-- ACTIVE post — hiding a post also revokes signed-URL access to its media
+-- (moderation must bite on image/video content, not just the row).
+drop policy if exists community_media_read on storage.objects;
+create policy community_media_read on storage.objects
+  for select to authenticated
+  using (bucket_id = 'community-media'
+    and ((select public.is_admin())
+      or ((select public.is_approved()) and (select public.is_enrolled())
+          and exists (select 1 from public.community_attachments a
+                      join public.community_posts p on p.id = a.post_id
+                      where a.storage_path = name and p.status = 'active'))));
 
 -- ───────────────────────────────────────────────────────────────────
 -- 16) Realtime — publish the tables the app subscribes to. Guarded so re-runs
@@ -917,19 +1818,3440 @@ begin
       where pubname='supabase_realtime' and schemaname='public' and tablename='subscriptions') then
       alter publication supabase_realtime add table public.subscriptions;
     end if;
+    if not exists (select 1 from pg_publication_tables
+      where pubname='supabase_realtime' and schemaname='public' and tablename='community_posts') then
+      alter publication supabase_realtime add table public.community_posts;
+    end if;
+    if not exists (select 1 from pg_publication_tables
+      where pubname='supabase_realtime' and schemaname='public' and tablename='community_comments') then
+      alter publication supabase_realtime add table public.community_comments;
+    end if;
+    if not exists (select 1 from pg_publication_tables
+      where pubname='supabase_realtime' and schemaname='public' and tablename='community_notifications') then
+      alter publication supabase_realtime add table public.community_notifications;
+    end if;
   end if;
 end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- §16) STUDENT IMPORT (Thinkific migration, #26). Admin-only staging + provenance.
+--   subscriptions.grant_source/source_import_row_id (+ partial unique index) and the
+--   profiles onboarding columns are folded in here (add-if-not-exists over the base
+--   tables defined earlier). Import terms are granted by the admin-verified service-
+--   role endpoint api/admin/student-imports.js — NOT a SECURITY DEFINER RPC.
+-- ───────────────────────────────────────────────────────────────────
+
+-- subscriptions provenance + one-grant-per-import-row idempotency (non-breaking:
+-- approve_subscription()/approve_extension() leave these at defaults, so the PARTIAL
+-- index never covers a payment/extension grant).
+alter table public.subscriptions add column if not exists grant_source text not null default 'payment';
+alter table public.subscriptions add column if not exists source_import_row_id uuid;
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'subscriptions_grant_source_check') then
+    alter table public.subscriptions add constraint subscriptions_grant_source_check
+      check (grant_source in ('payment', 'import', 'extension'));
+  end if;
+end $$;
+create unique index if not exists subscriptions_one_import_grant
+  on public.subscriptions (source_import_row_id) where source_import_row_id is not null;
+
+-- profiles onboarding fields (read by the forced set-password gate).
+alter table public.profiles add column if not exists account_origin text not null default 'signup';
+alter table public.profiles add column if not exists onboarding_status text not null default 'none';
+alter table public.profiles add column if not exists invited_at timestamptz;
+alter table public.profiles add column if not exists onboarding_completed_at timestamptz;
+
+create table if not exists public.student_import_jobs (
+  id uuid primary key default gen_random_uuid(),
+  source text not null default 'thinkific_users'
+    check (source in ('thinkific_users','thinkific_orders','ledger','manual')),
+  filename text, file_sha256 text,
+  mapping jsonb not null default '{}'::jsonb, settings jsonb not null default '{}'::jsonb,
+  status text not null default 'draft'
+    check (status in ('draft','validating','dry_run','ready','processing','paused','completed','failed')),
+  total_rows int not null default 0, counts jsonb not null default '{}'::jsonb, cursor int not null default 0,
+  created_by uuid references public.profiles(id) on delete set null,
+  created_at timestamptz not null default now(), updated_at timestamptz not null default now(), purged_at timestamptz
+);
+create index if not exists student_import_jobs_creator on public.student_import_jobs (created_by, created_at desc);
+alter table public.student_import_jobs enable row level security;
+drop policy if exists student_import_jobs_admin_all on public.student_import_jobs;
+create policy student_import_jobs_admin_all on public.student_import_jobs
+  for all to authenticated using (public.is_admin()) with check (public.is_admin());
+
+create table if not exists public.student_import_rows (
+  id uuid primary key default gen_random_uuid(),
+  job_id uuid not null references public.student_import_jobs(id) on delete cascade,
+  source_row_number int not null, mapped jsonb not null default '{}'::jsonb,
+  external_user_id text, email_normalized text, email_display text,
+  proposed_plan_key text, proposed_started_at timestamptz, proposed_ends_at timestamptz,
+  proposed_term_mode text check (proposed_term_mode is null or proposed_term_mode in
+    ('preserve','fresh','expired_history','lifetime','profile_only')),
+  match_result text check (match_result is null or match_result in
+    ('new','existing_by_source','existing_by_email','conflict','ambiguous')),
+  intended_action text check (intended_action is null or intended_action in
+    ('create_invite','merge_grant','profile_only','skip','manual_review')),
+  target_user_id uuid references public.profiles(id) on delete set null,
+  warnings jsonb not null default '[]'::jsonb, errors jsonb not null default '[]'::jsonb,
+  processing_status text not null default 'pending'
+    check (processing_status in ('blocked','ready','pending','processing','done','failed','skipped')),
+  invite_status text not null default 'not_sent' check (invite_status in ('not_sent','sent','failed','resent')),
+  attempts int not null default 0, auth_user_created boolean not null default false,
+  subscription_granted boolean not null default false,
+  created_at timestamptz not null default now(), updated_at timestamptz not null default now(),
+  unique (job_id, source_row_number)
+);
+create index if not exists student_import_rows_job_status on public.student_import_rows (job_id, processing_status);
+create index if not exists student_import_rows_job_extid on public.student_import_rows (job_id, external_user_id);
+alter table public.student_import_rows enable row level security;
+drop policy if exists student_import_rows_admin_all on public.student_import_rows;
+create policy student_import_rows_admin_all on public.student_import_rows
+  for all to authenticated using (public.is_admin()) with check (public.is_admin());
+
+create table if not exists public.student_external_accounts (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  source text not null default 'thinkific', external_user_id text not null,
+  source_created_at timestamptz, last_sign_in_at timestamptz, sign_in_count int,
+  legacy_enrollments jsonb not null default '[]'::jsonb,
+  import_job_id uuid references public.student_import_jobs(id) on delete set null,
+  import_row_id uuid references public.student_import_rows(id) on delete set null,
+  created_at timestamptz not null default now(),
+  unique (source, external_user_id)
+);
+create index if not exists student_external_accounts_user on public.student_external_accounts (user_id);
+alter table public.student_external_accounts enable row level security;
+drop policy if exists student_external_accounts_admin_all on public.student_external_accounts;
+create policy student_external_accounts_admin_all on public.student_external_accounts
+  for all to authenticated using (public.is_admin()) with check (public.is_admin());
+drop policy if exists student_external_accounts_own_select on public.student_external_accounts;
+create policy student_external_accounts_own_select on public.student_external_accounts
+  for select to authenticated using (user_id = auth.uid());
+
+create table if not exists public.student_import_events (
+  id uuid primary key default gen_random_uuid(),
+  job_id uuid references public.student_import_jobs(id) on delete cascade,
+  row_id uuid references public.student_import_rows(id) on delete set null,
+  kind text not null, status text, detail jsonb not null default '{}'::jsonb,
+  actor uuid references public.profiles(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+create index if not exists student_import_events_job on public.student_import_events (job_id, created_at desc);
+alter table public.student_import_events enable row level security;
+-- Immutable audit: admin select + insert only; NO update/delete policy.
+drop policy if exists student_import_events_admin_select on public.student_import_events;
+create policy student_import_events_admin_select on public.student_import_events
+  for select to authenticated using (public.is_admin());
+drop policy if exists student_import_events_admin_insert on public.student_import_events;
+create policy student_import_events_admin_insert on public.student_import_events
+  for insert to authenticated with check (public.is_admin());
+
+-- The ONE narrow user-facing profiles write for imported students (own row, onboarding
+-- fields only) — mirrors set_my_avatar(); there is still no broad user-update RLS.
+create or replace function public.complete_import_onboarding()
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  update public.profiles
+     set onboarding_status = 'completed', onboarding_completed_at = now()
+   where id = auth.uid() and account_origin = 'import' and onboarding_status <> 'completed';
+end;
+$$;
+revoke all on function public.complete_import_onboarding() from public;
+grant execute on function public.complete_import_onboarding() to authenticated;
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- 16b) AI COURSE TRAINER (#27) — entitlement-aware voice-trainer knowledge base.
+-- Derived teaching sources → bounded chunks (pgvector 384 + FTS fallback), the
+-- async index-job queue, per-user AI checkpoints + durable usage counters, and
+-- the SERVICE-ROLE-ONLY parameterized entitlement/retrieval functions consumed
+-- by api/elevenlabs/trainer.js / api/admin/course-trainer.js. The functions
+-- MIRROR the §14 courses_read policy — keep them in lockstep. Learners have NO
+-- RLS path to sources/chunks/jobs; retrieval happens server-side AFTER
+-- authorization. See db/2026-07-24-course-ai-trainer.sql + COURSE_AI_TRAINER_SETUP.md.
+-- ═════════════════════════════════════════════════════════════════════════════
+create table if not exists public.course_ai_sources (
+  id                uuid primary key default gen_random_uuid(),
+  course_id         uuid not null references public.courses(id) on delete cascade,
+  lesson_id         uuid references public.course_lessons(id) on delete cascade,
+  kind              text not null check (kind in ('lesson_text','transcript','trainer_notes')),
+  status            text not null default 'pending'
+                    check (status in ('pending','processing','ready','failed','stale')),
+  included          boolean not null default true,
+  title             text,
+  content           text,
+  content_hash      text,
+  source_version    integer not null default 1,
+  transcript_origin text check (transcript_origin in ('scribe','manual')),
+  language_code     text,
+  error_detail      text,          -- safe codes/messages only — NEVER lesson content
+  transcribed_at    timestamptz,
+  indexed_at        timestamptz,
+  created_at        timestamptz not null default now(),
+  updated_at        timestamptz not null default now()
+);
+create unique index if not exists course_ai_sources_lesson_kind
+  on public.course_ai_sources (lesson_id, kind) where lesson_id is not null;
+create unique index if not exists course_ai_sources_course_notes
+  on public.course_ai_sources (course_id, kind) where lesson_id is null;
+create index if not exists course_ai_sources_course_idx
+  on public.course_ai_sources (course_id, status);
+
+create table if not exists public.course_ai_chunks (
+  id             uuid primary key default gen_random_uuid(),
+  source_id      uuid not null references public.course_ai_sources(id) on delete cascade,
+  course_id      uuid not null references public.courses(id) on delete cascade,
+  lesson_id      uuid,
+  module_title   text,
+  lesson_title   text,
+  chunk_index    integer not null,
+  content        text not null,
+  content_hash   text not null,
+  source_version integer not null,
+  embedding      extensions.vector(384),
+  fts            tsvector generated always as (to_tsvector('english', coalesce(content, ''))) stored,
+  created_at     timestamptz not null default now(),
+  unique (source_id, source_version, chunk_index)
+);
+create index if not exists course_ai_chunks_embedding_idx
+  on public.course_ai_chunks using hnsw (embedding extensions.vector_ip_ops);
+create index if not exists course_ai_chunks_fts_idx
+  on public.course_ai_chunks using gin (fts);
+create index if not exists course_ai_chunks_course_idx
+  on public.course_ai_chunks (course_id);
+create index if not exists course_ai_chunks_source_idx
+  on public.course_ai_chunks (source_id);
+create index if not exists course_ai_chunks_lesson_idx
+  on public.course_ai_chunks (lesson_id);
+
+create table if not exists public.course_ai_index_jobs (
+  id           uuid primary key default gen_random_uuid(),
+  course_id    uuid not null references public.courses(id) on delete cascade,
+  source_id    uuid references public.course_ai_sources(id) on delete cascade,
+  kind         text not null check (kind in ('index','transcribe')),
+  status       text not null default 'queued'
+               check (status in ('queued','processing','done','failed')),
+  attempts     integer not null default 0,
+  max_attempts integer not null default 3,
+  error_detail text,
+  created_at   timestamptz not null default now(),
+  started_at   timestamptz,
+  finished_at  timestamptz
+);
+create index if not exists course_ai_index_jobs_course_idx
+  on public.course_ai_index_jobs (course_id, status);
+
+create table if not exists public.ai_training_checkpoints (
+  id            uuid primary key default gen_random_uuid(),
+  user_id       uuid not null references auth.users(id) on delete cascade,
+  course_id     uuid not null references public.courses(id) on delete cascade,
+  lesson_id     uuid references public.course_lessons(id) on delete set null,
+  topic         text check (char_length(topic) <= 200),
+  mode          text check (mode in ('explain','guided','quiz','practice','recap')),
+  understanding text check (char_length(understanding) <= 400),
+  next_step     text check (char_length(next_step) <= 400),
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now(),
+  unique (user_id, course_id)
+);
+create index if not exists ai_training_checkpoints_user_idx
+  on public.ai_training_checkpoints (user_id, updated_at desc);
+
+create table if not exists public.ai_training_usage (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  day     date not null,
+  tool    text not null,
+  calls   integer not null default 0,
+  primary key (user_id, day, tool)
+);
+
+alter table public.course_ai_sources       enable row level security;
+alter table public.course_ai_chunks        enable row level security;
+alter table public.course_ai_index_jobs    enable row level security;
+alter table public.ai_training_checkpoints enable row level security;
+alter table public.ai_training_usage       enable row level security;
+
+drop policy if exists course_ai_sources_admin_all on public.course_ai_sources;
+create policy course_ai_sources_admin_all on public.course_ai_sources
+  for all to authenticated using (public.is_admin()) with check (public.is_admin());
+
+drop policy if exists course_ai_chunks_admin_read on public.course_ai_chunks;
+create policy course_ai_chunks_admin_read on public.course_ai_chunks
+  for select to authenticated using (public.is_admin());
+-- (no insert/update/delete policies on chunks — service role only)
+
+drop policy if exists course_ai_index_jobs_admin_all on public.course_ai_index_jobs;
+create policy course_ai_index_jobs_admin_all on public.course_ai_index_jobs
+  for all to authenticated using (public.is_admin()) with check (public.is_admin());
+
+drop policy if exists ai_training_checkpoints_own_read on public.ai_training_checkpoints;
+create policy ai_training_checkpoints_own_read on public.ai_training_checkpoints
+  for select to authenticated using (user_id = auth.uid());
+-- (writes go through the service path only — no authenticated write policy)
+
+drop policy if exists ai_training_usage_admin_read on public.ai_training_usage;
+create policy ai_training_usage_admin_read on public.ai_training_usage
+  for select to authenticated using (public.is_admin());
+
+-- Parameterized entitlement helpers (the auth.uid() helpers can't serve the
+-- webhook — the service role has auth.uid() = NULL). MIRROR is_enrolled()/
+-- is_approved()/current_plan_key() EXACTLY. SERVICE-ROLE-ONLY (revoked below).
+create or replace function public.user_is_enrolled(p_user uuid)
+returns boolean
+language sql stable security definer set search_path = public
+as $$
+  select coalesce((
+    select p.is_admin
+        or exists (
+             select 1 from public.subscriptions s
+             where s.user_id = p.id
+               and s.status = 'active'
+               and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now()))
+        or (p.is_paid and not exists (
+             select 1 from public.subscriptions s2 where s2.user_id = p.id))
+    from public.profiles p where p.id = p_user), false)
+$$;
+
+create or replace function public.user_is_approved(p_user uuid)
+returns boolean
+language sql stable security definer set search_path = public
+as $$
+  select coalesce((
+    select approval_status = 'approved' or is_admin
+    from public.profiles where id = p_user), false)
+$$;
+
+create or replace function public.user_plan_key(p_user uuid)
+returns text
+language sql stable security definer set search_path = public
+as $$
+  select s.plan_key
+  from public.subscriptions s
+  where s.user_id = p_user
+    and s.status = 'active'
+    and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+  order by s.created_at desc
+  limit 1
+$$;
+
+-- THE course-authorization source of truth for the trainer. MIRRORS the §14
+-- courses_read policy PLUS ai_trainer_enabled. Drift here is a security bug.
+create or replace function public.trainer_visible_courses(p_user uuid)
+returns table (id uuid, slug text, title text, access_tier text)
+language sql stable security definer set search_path = public
+as $$
+  select c.id, c.slug, c.title, c.access_tier
+  from public.courses c
+  where c.ai_trainer_enabled = true
+    and (
+      coalesce((select p.is_admin from public.profiles p where p.id = p_user), false)
+      or (c.published = true
+          and public.user_is_approved(p_user)
+          and public.user_is_enrolled(p_user)
+          and (not coalesce(public.user_plan_key(p_user) = 'core_self_paced', false) or c.slug like 'qbo-%')
+          and (not coalesce(public.user_plan_key(p_user) = 'sampler', false)
+               or (c.slug like 'qbo-%' and c.access_tier = 'essentials')))
+    )
+$$;
+
+create or replace function public.trainer_courses_for_plan(p_plan_key text)
+returns table (id uuid, slug text, title text, access_tier text)
+language sql stable security definer set search_path = public
+as $$
+  select c.id, c.slug, c.title, c.access_tier
+  from public.courses c
+  where c.ai_trainer_enabled = true and c.published = true
+    and (not coalesce(p_plan_key = 'core_self_paced', false) or c.slug like 'qbo-%')
+    and (not coalesce(p_plan_key = 'sampler', false)
+         or (c.slug like 'qbo-%' and c.access_tier = 'essentials'))
+$$;
+
+-- Retrieval functions. The join conditions ARE the immediate-unretrievability
+-- guarantee: published + ai_trainer_enabled + ready + included + version match
+-- + plan scope, re-evaluated on every call.
+create or replace function public.trainer_match_chunks(
+  p_user       uuid,
+  p_course_ids uuid[],
+  p_query      extensions.vector(384),
+  p_limit      integer default 6,
+  p_min_score  double precision default 0.30
+)
+returns table (chunk_id uuid, course_id uuid, lesson_id uuid, course_title text,
+               module_title text, lesson_title text, content text, score double precision)
+language sql stable security definer set search_path = public
+as $$
+  select ch.id, ch.course_id, ch.lesson_id, c.title, ch.module_title, ch.lesson_title,
+         ch.content, -(ch.embedding operator(extensions.<#>) p_query) as score
+  from public.course_ai_chunks ch
+  join public.course_ai_sources s
+    on s.id = ch.source_id
+   and s.status = 'ready' and s.included = true
+   and ch.source_version = s.source_version
+  join public.courses c
+    on c.id = ch.course_id and c.published = true and c.ai_trainer_enabled = true
+  where ch.course_id = any (p_course_ids)
+    and ch.course_id in (select tv.id from public.trainer_visible_courses(p_user) tv)
+    and ch.embedding is not null
+    and -(ch.embedding operator(extensions.<#>) p_query) >= p_min_score
+  order by ch.embedding operator(extensions.<#>) p_query
+  limit least(greatest(coalesce(p_limit, 6), 1), 12)
+$$;
+
+create or replace function public.trainer_match_chunks_fts(
+  p_user       uuid,
+  p_course_ids uuid[],
+  p_query      text,
+  p_limit      integer default 6
+)
+returns table (chunk_id uuid, course_id uuid, lesson_id uuid, course_title text,
+               module_title text, lesson_title text, content text, score double precision)
+language sql stable security definer set search_path = public
+as $$
+  select ch.id, ch.course_id, ch.lesson_id, c.title, ch.module_title, ch.lesson_title,
+         ch.content, ts_rank(ch.fts, websearch_to_tsquery('english', p_query))::double precision
+  from public.course_ai_chunks ch
+  join public.course_ai_sources s
+    on s.id = ch.source_id
+   and s.status = 'ready' and s.included = true
+   and ch.source_version = s.source_version
+  join public.courses c
+    on c.id = ch.course_id and c.published = true and c.ai_trainer_enabled = true
+  where ch.course_id = any (p_course_ids)
+    and ch.course_id in (select tv.id from public.trainer_visible_courses(p_user) tv)
+    and ch.fts @@ websearch_to_tsquery('english', p_query)
+  order by ts_rank(ch.fts, websearch_to_tsquery('english', p_query)) desc
+  limit least(greatest(coalesce(p_limit, 6), 1), 12)
+$$;
+
+create or replace function public.trainer_lesson_chunks(
+  p_user      uuid,
+  p_course_id uuid,
+  p_lesson_id uuid,
+  p_limit     integer default 8
+)
+returns table (chunk_id uuid, course_id uuid, lesson_id uuid, course_title text,
+               module_title text, lesson_title text, content text, chunk_index integer)
+language sql stable security definer set search_path = public
+as $$
+  select ch.id, ch.course_id, ch.lesson_id, c.title, ch.module_title, ch.lesson_title,
+         ch.content, ch.chunk_index
+  from public.course_ai_chunks ch
+  join public.course_ai_sources s
+    on s.id = ch.source_id
+   and s.status = 'ready' and s.included = true
+   and ch.source_version = s.source_version
+  join public.courses c
+    on c.id = ch.course_id and c.published = true and c.ai_trainer_enabled = true
+  where ch.course_id = p_course_id
+    and ch.lesson_id = p_lesson_id
+    and ch.course_id in (select tv.id from public.trainer_visible_courses(p_user) tv)
+  order by (s.kind = 'lesson_text') desc, ch.chunk_index
+  limit least(greatest(coalesce(p_limit, 8), 1), 12)
+$$;
+
+create or replace function public.trainer_preview_chunks(
+  p_plan_key text,
+  p_query    text,
+  p_query_embedding extensions.vector(384) default null,
+  p_limit    integer default 6
+)
+returns table (chunk_id uuid, course_id uuid, lesson_id uuid, course_title text,
+               module_title text, lesson_title text, content text, score double precision)
+language plpgsql stable security definer set search_path = public
+as $$
+begin
+  if p_query_embedding is not null then
+    return query
+      select ch.id, ch.course_id, ch.lesson_id, c.title, ch.module_title, ch.lesson_title,
+             ch.content, -(ch.embedding operator(extensions.<#>) p_query_embedding)
+      from public.course_ai_chunks ch
+      join public.course_ai_sources s
+        on s.id = ch.source_id
+       and s.status = 'ready' and s.included = true
+       and ch.source_version = s.source_version
+      join public.courses c
+        on c.id = ch.course_id and c.published = true and c.ai_trainer_enabled = true
+      where ch.course_id in (select pv.id from public.trainer_courses_for_plan(p_plan_key) pv)
+        and ch.embedding is not null
+      order by ch.embedding operator(extensions.<#>) p_query_embedding
+      limit least(greatest(coalesce(p_limit, 6), 1), 12);
+  else
+    return query
+      select ch.id, ch.course_id, ch.lesson_id, c.title, ch.module_title, ch.lesson_title,
+             ch.content, ts_rank(ch.fts, websearch_to_tsquery('english', p_query))::double precision
+      from public.course_ai_chunks ch
+      join public.course_ai_sources s
+        on s.id = ch.source_id
+       and s.status = 'ready' and s.included = true
+       and ch.source_version = s.source_version
+      join public.courses c
+        on c.id = ch.course_id and c.published = true and c.ai_trainer_enabled = true
+      where ch.course_id in (select pv.id from public.trainer_courses_for_plan(p_plan_key) pv)
+        and ch.fts @@ websearch_to_tsquery('english', p_query)
+      order by ts_rank(ch.fts, websearch_to_tsquery('english', p_query)) desc
+      limit least(greatest(coalesce(p_limit, 6), 1), 12);
+  end if;
+end;
+$$;
+
+create or replace function public.trainer_bump_usage(p_user uuid, p_tool text)
+returns integer
+language sql volatile security definer set search_path = public
+as $$
+  insert into public.ai_training_usage (user_id, day, tool, calls)
+  values (p_user, (now() at time zone 'utc')::date, p_tool, 1)
+  on conflict (user_id, day, tool)
+  do update set calls = public.ai_training_usage.calls + 1
+  returning calls
+$$;
+
+-- Lockdown — EXECUTE defaults to PUBLIC; these revokes are load-bearing.
+revoke all on function public.user_is_enrolled(uuid) from public, anon, authenticated;
+revoke all on function public.user_is_approved(uuid) from public, anon, authenticated;
+revoke all on function public.user_plan_key(uuid) from public, anon, authenticated;
+revoke all on function public.trainer_visible_courses(uuid) from public, anon, authenticated;
+revoke all on function public.trainer_courses_for_plan(text) from public, anon, authenticated;
+revoke all on function public.trainer_match_chunks(uuid, uuid[], extensions.vector, integer, double precision) from public, anon, authenticated;
+revoke all on function public.trainer_match_chunks_fts(uuid, uuid[], text, integer) from public, anon, authenticated;
+revoke all on function public.trainer_lesson_chunks(uuid, uuid, uuid, integer) from public, anon, authenticated;
+revoke all on function public.trainer_preview_chunks(text, text, extensions.vector, integer) from public, anon, authenticated;
+revoke all on function public.trainer_bump_usage(uuid, text) from public, anon, authenticated;
+
+grant execute on function public.user_is_enrolled(uuid) to service_role;
+grant execute on function public.user_is_approved(uuid) to service_role;
+grant execute on function public.user_plan_key(uuid) to service_role;
+grant execute on function public.trainer_visible_courses(uuid) to service_role;
+grant execute on function public.trainer_courses_for_plan(text) to service_role;
+grant execute on function public.trainer_match_chunks(uuid, uuid[], extensions.vector, integer, double precision) to service_role;
+grant execute on function public.trainer_match_chunks_fts(uuid, uuid[], text, integer) to service_role;
+grant execute on function public.trainer_lesson_chunks(uuid, uuid, uuid, integer) to service_role;
+grant execute on function public.trainer_preview_chunks(text, text, extensions.vector, integer) to service_role;
+grant execute on function public.trainer_bump_usage(uuid, text) to service_role;
+
+-- Stale-marking trigger — pure SQL, no network inside the write transaction.
+create or replace function public.course_ai_mark_lesson_stale()
+returns trigger
+language plpgsql security definer set search_path = public
+as $$
+begin
+  if new.text_content is distinct from old.text_content
+     or new.title is distinct from old.title
+     or new.video_url is distinct from old.video_url
+     or new.storage_path is distinct from old.storage_path then
+    update public.course_ai_sources
+       set status = 'stale', updated_at = now()
+     where lesson_id = new.id and kind = 'lesson_text' and status in ('ready','failed');
+    if new.video_url is distinct from old.video_url
+       or new.storage_path is distinct from old.storage_path then
+      update public.course_ai_sources
+         set status = 'stale', updated_at = now()
+       where lesson_id = new.id and kind = 'transcript' and status = 'ready';
+    end if;
+    insert into public.course_ai_index_jobs (course_id, source_id, kind)
+    select s.course_id, s.id, 'index'
+    from public.course_ai_sources s
+    where s.lesson_id = new.id and s.status = 'stale'
+      and not exists (
+        select 1 from public.course_ai_index_jobs j
+        where j.source_id = s.id and j.kind = 'index' and j.status = 'queued');
+  end if;
+  return new;
+end;
+$$;
+revoke all on function public.course_ai_mark_lesson_stale() from public;
+
+drop trigger if exists course_ai_lessons_stale on public.course_lessons;
+create trigger course_ai_lessons_stale
+  after update on public.course_lessons
+  for each row execute function public.course_ai_mark_lesson_stale();
 
 -- ───────────────────────────────────────────────────────────────────
 -- 17) Refresh PostgREST's schema cache.
 -- ───────────────────────────────────────────────────────────────────
 notify pgrst, 'reload schema';
 
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- 18) 2026-07-26 BACKEND PASS (#29 + #30 + #31) — folded verbatim.
+--     The three files below are appended rather than woven into the sections
+--     above so this bootstrap provably produces the same end state as the live
+--     project (which ran them as increments). Each is idempotent and self-
+--     guarded, so running them at the tail of a fresh install is safe:
+--       • #29 db/2026-07-26-rls-initplan-and-indexes.sql — wraps the bare
+--         auth/gate calls the earlier sections create, adds FK/hot-path
+--         indexes, drops duplicate indexes.
+--       • #30 db/2026-07-26-backend-hardening.sql — subscriptions.plan_key FK,
+--         CHECK constraints, function EXECUTE hygiene, storage read-policy
+--         scoping, course-media bucket limits.
+--       • #31 db/2026-07-26-schema-migrations-log.sql — the apply-log table.
+--     When you edit one of those files, re-fold it here (keep them identical).
+-- ═════════════════════════════════════════════════════════════════════════════
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Backend performance — RLS initplan wraps + FK/hot-path indexes (#29)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHY (from the 2026-07-26 full backend audit against the live project):
+--   • 42 RLS policies called auth.uid()/auth.jwt()/is_admin()/is_approved()/
+--     is_enrolled()/plan_is_*() BARE in USING/WITH CHECK. Postgres re-evaluates a
+--     bare call PER CANDIDATE ROW; wrapped in a scalar subquery `(select fn())` it
+--     becomes a one-per-statement InitPlan. Semantics are identical (all wrapped
+--     helpers are zero-arg + STABLE); only the plan changes. (The community
+--     #23/#24 policies were already authored wrapped — this brings the older
+--     course/enrollment/import/storage-era policies up to the same idiom.
+--     `course_object_allowed(name)` is deliberately NOT wrapped: it takes a
+--     per-row argument, so a subselect stays correlated and wins nothing.)
+--   • 29 foreign keys had no covering index — every cascade delete (course, post,
+--     profile) seq-scans the child table, and the hottest authenticated query
+--     (useEnrollmentGate's latest-request read: WHERE user_id ORDER BY created_at
+--     DESC LIMIT 1) had no usable index at all.
+--   • 5 indexes were exact duplicates / redundant with a PK or unique constraint.
+--
+-- Deliberately SKIPPED indexes (documented decision, revisit at real scale):
+--   • auth.users audit columns (reviewed_by/approved_by/rejected_by/updated_by):
+--     admin rows are essentially never deleted; write cost isn't worth it yet.
+--   • enrollment_requests.plan_key → enrollment_plans: ~5-row parent, never
+--     bulk-deleted.
+--   • storage.s3_multipart_* / vector tables: Supabase-managed schema.
+--
+-- Plain CREATE INDEX (not CONCURRENTLY) is intentional: current tables are tiny
+-- (< a few hundred rows) so the lock is milliseconds, and CONCURRENTLY cannot run
+-- inside a transaction (the SQL editor / Management API wraps this file in one).
+-- If you ever re-run this on a LARGE table, split the index section out and use
+-- CREATE INDEX CONCURRENTLY statement-by-statement.
+--
+-- ORDER: run AFTER #20/#21 (it re-asserts policies from earlier migrations;
+-- missing policies are skipped with a NOTICE, so partial installs are safe).
+-- IDEMPOTENT — safe to re-run.
+-- HOW TO RUN: paste into Supabase SQL Editor → Run (or apply via the CLI/API).
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- ───────────────────────────────────────────────────────────────────
+-- 1) Wrap bare zero-arg auth/gate calls in scalar subqueries (InitPlan).
+--    Generated from the live pg_policies definitions; each statement is guarded
+--    so a DB missing a policy (older install) skips it with a NOTICE.
+-- ───────────────────────────────────────────────────────────────────
+do $wrap$
+begin
+  begin
+    alter policy ai_training_checkpoints_own_read on public.ai_training_checkpoints
+          using ((user_id = (select auth.uid())));
+  exception when undefined_object then
+    raise notice 'policy ai_training_checkpoints_own_read on public.ai_training_checkpoints not found - skipped';
+  end;
+  begin
+    alter policy ai_training_usage_admin_read on public.ai_training_usage
+          using ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy ai_training_usage_admin_read on public.ai_training_usage not found - skipped';
+  end;
+  begin
+    alter policy course_ai_chunks_admin_read on public.course_ai_chunks
+          using ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy course_ai_chunks_admin_read on public.course_ai_chunks not found - skipped';
+  end;
+  begin
+    alter policy course_ai_index_jobs_admin_all on public.course_ai_index_jobs
+          using ((select is_admin()))
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy course_ai_index_jobs_admin_all on public.course_ai_index_jobs not found - skipped';
+  end;
+  begin
+    alter policy course_ai_sources_admin_all on public.course_ai_sources
+          using ((select is_admin()))
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy course_ai_sources_admin_all on public.course_ai_sources not found - skipped';
+  end;
+  begin
+    alter policy completions_own on public.course_completions
+          using ((user_id = (select auth.uid())))
+          with check ((user_id = (select auth.uid())));
+  exception when undefined_object then
+    raise notice 'policy completions_own on public.course_completions not found - skipped';
+  end;
+  begin
+    alter policy lessons_admin_write on public.course_lessons
+          using ((select is_admin()))
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy lessons_admin_write on public.course_lessons not found - skipped';
+  end;
+  begin
+    alter policy modules_admin_write on public.course_modules
+          using ((select is_admin()))
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy modules_admin_write on public.course_modules not found - skipped';
+  end;
+  begin
+    alter policy courses_admin_write on public.courses
+          using ((select is_admin()))
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy courses_admin_write on public.courses not found - skipped';
+  end;
+  begin
+    alter policy enrollment_plans_admin_write on public.enrollment_plans
+          using ((select is_admin()))
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy enrollment_plans_admin_write on public.enrollment_plans not found - skipped';
+  end;
+  begin
+    alter policy enroll_req_admin_all on public.enrollment_requests
+          using ((select is_admin()))
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy enroll_req_admin_all on public.enrollment_requests not found - skipped';
+  end;
+  begin
+    alter policy enroll_req_own_expire on public.enrollment_requests
+          using (((user_id = (select auth.uid())) AND (status = 'pending_review'::text) AND (expires_at < now())))
+          with check (((user_id = (select auth.uid())) AND (status = 'expired'::text)));
+  exception when undefined_object then
+    raise notice 'policy enroll_req_own_expire on public.enrollment_requests not found - skipped';
+  end;
+  begin
+    alter policy enroll_req_own_insert on public.enrollment_requests
+          with check (((user_id = (select auth.uid())) AND (status = 'pending_review'::text)));
+  exception when undefined_object then
+    raise notice 'policy enroll_req_own_insert on public.enrollment_requests not found - skipped';
+  end;
+  begin
+    alter policy enroll_req_own_select on public.enrollment_requests
+          using ((user_id = (select auth.uid())));
+  exception when undefined_object then
+    raise notice 'policy enroll_req_own_select on public.enrollment_requests not found - skipped';
+  end;
+  begin
+    alter policy feature_guides_admin_write on public.feature_guides
+          using ((select is_admin()))
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy feature_guides_admin_write on public.feature_guides not found - skipped';
+  end;
+  begin
+    alter policy feature_guides_read on public.feature_guides
+          using (((select is_approved()) AND (select is_enrolled())));
+  exception when undefined_object then
+    raise notice 'policy feature_guides_read on public.feature_guides not found - skipped';
+  end;
+  begin
+    alter policy fvc_insert_own on public.feature_video_completions
+          with check ((user_id = (select auth.uid())));
+  exception when undefined_object then
+    raise notice 'policy fvc_insert_own on public.feature_video_completions not found - skipped';
+  end;
+  begin
+    alter policy fvc_select_own on public.feature_video_completions
+          using ((user_id = (select auth.uid())));
+  exception when undefined_object then
+    raise notice 'policy fvc_select_own on public.feature_video_completions not found - skipped';
+  end;
+  begin
+    alter policy fvc_update_own on public.feature_video_completions
+          using ((user_id = (select auth.uid())))
+          with check ((user_id = (select auth.uid())));
+  exception when undefined_object then
+    raise notice 'policy fvc_update_own on public.feature_video_completions not found - skipped';
+  end;
+  begin
+    alter policy progress_own on public.lesson_progress
+          using ((user_id = (select auth.uid())))
+          with check ((user_id = (select auth.uid())));
+  exception when undefined_object then
+    raise notice 'policy progress_own on public.lesson_progress not found - skipped';
+  end;
+  begin
+    alter policy payment_settings_admin_write on public.payment_settings
+          using ((select is_admin()))
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy payment_settings_admin_write on public.payment_settings not found - skipped';
+  end;
+  begin
+    alter policy own_profile_select on public.profiles
+          using (((select auth.uid()) = id));
+  exception when undefined_object then
+    raise notice 'policy own_profile_select on public.profiles not found - skipped';
+  end;
+  begin
+    alter policy profiles_admin_select on public.profiles
+          using ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy profiles_admin_select on public.profiles not found - skipped';
+  end;
+  begin
+    alter policy profiles_admin_update on public.profiles
+          using ((select is_admin()))
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy profiles_admin_update on public.profiles not found - skipped';
+  end;
+  begin
+    alter policy sidebar_settings_admin_write on public.sidebar_settings
+          using ((select is_admin()))
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy sidebar_settings_admin_write on public.sidebar_settings not found - skipped';
+  end;
+  begin
+    alter policy student_external_accounts_admin_all on public.student_external_accounts
+          using ((select is_admin()))
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy student_external_accounts_admin_all on public.student_external_accounts not found - skipped';
+  end;
+  begin
+    alter policy student_external_accounts_own_select on public.student_external_accounts
+          using ((user_id = (select auth.uid())));
+  exception when undefined_object then
+    raise notice 'policy student_external_accounts_own_select on public.student_external_accounts not found - skipped';
+  end;
+  begin
+    alter policy student_import_events_admin_insert on public.student_import_events
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy student_import_events_admin_insert on public.student_import_events not found - skipped';
+  end;
+  begin
+    alter policy student_import_events_admin_select on public.student_import_events
+          using ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy student_import_events_admin_select on public.student_import_events not found - skipped';
+  end;
+  begin
+    alter policy student_import_jobs_admin_all on public.student_import_jobs
+          using ((select is_admin()))
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy student_import_jobs_admin_all on public.student_import_jobs not found - skipped';
+  end;
+  begin
+    alter policy student_import_rows_admin_all on public.student_import_rows
+          using ((select is_admin()))
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy student_import_rows_admin_all on public.student_import_rows not found - skipped';
+  end;
+  begin
+    alter policy subscriptions_admin_all on public.subscriptions
+          using ((select is_admin()))
+          with check ((select is_admin()));
+  exception when undefined_object then
+    raise notice 'policy subscriptions_admin_all on public.subscriptions not found - skipped';
+  end;
+  begin
+    alter policy subscriptions_own_select on public.subscriptions
+          using ((user_id = (select auth.uid())));
+  exception when undefined_object then
+    raise notice 'policy subscriptions_own_select on public.subscriptions not found - skipped';
+  end;
+  begin
+    alter policy course_media_admin_delete on storage.objects
+          using (((bucket_id = 'course-media'::text) AND (select is_admin())));
+  exception when undefined_object then
+    raise notice 'policy course_media_admin_delete on storage.objects not found - skipped';
+  end;
+  begin
+    alter policy course_media_admin_update on storage.objects
+          using (((bucket_id = 'course-media'::text) AND (select is_admin())));
+  exception when undefined_object then
+    raise notice 'policy course_media_admin_update on storage.objects not found - skipped';
+  end;
+  begin
+    alter policy course_media_admin_write on storage.objects
+          with check (((bucket_id = 'course-media'::text) AND (select is_admin())));
+  exception when undefined_object then
+    raise notice 'policy course_media_admin_write on storage.objects not found - skipped';
+  end;
+  begin
+    alter policy course_videos_admin_delete on storage.objects
+          using (((bucket_id = 'course-videos'::text) AND (select is_admin())));
+  exception when undefined_object then
+    raise notice 'policy course_videos_admin_delete on storage.objects not found - skipped';
+  end;
+  begin
+    alter policy course_videos_admin_update on storage.objects
+          using (((bucket_id = 'course-videos'::text) AND (select is_admin())));
+  exception when undefined_object then
+    raise notice 'policy course_videos_admin_update on storage.objects not found - skipped';
+  end;
+  begin
+    alter policy course_videos_admin_write on storage.objects
+          with check (((bucket_id = 'course-videos'::text) AND (select is_admin())));
+  exception when undefined_object then
+    raise notice 'policy course_videos_admin_write on storage.objects not found - skipped';
+  end;
+  begin
+    alter policy enrollment_receipts_delete on storage.objects
+          using (((bucket_id = 'enrollment-receipts'::text) AND (select is_admin())));
+  exception when undefined_object then
+    raise notice 'policy enrollment_receipts_delete on storage.objects not found - skipped';
+  end;
+  begin
+    alter policy enrollment_receipts_insert_own on storage.objects
+          with check (((bucket_id = 'enrollment-receipts'::text) AND ((storage.foldername(name))[1] = ((select auth.uid()))::text)));
+  exception when undefined_object then
+    raise notice 'policy enrollment_receipts_insert_own on storage.objects not found - skipped';
+  end;
+  begin
+    alter policy enrollment_receipts_select on storage.objects
+          using (((bucket_id = 'enrollment-receipts'::text) AND (((storage.foldername(name))[1] = ((select auth.uid()))::text) OR (select is_admin()))));
+  exception when undefined_object then
+    raise notice 'policy enrollment_receipts_select on storage.objects not found - skipped';
+  end;
+end $wrap$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 2) Drop exact-duplicate / PK-redundant indexes (each duplicated by the index
+--    named in the trailing comment; none backs a constraint).
+-- ───────────────────────────────────────────────────────────────────
+drop index if exists public.idx_lessons_module;                 -- = course_lessons_module_position_idx (module_id, position)
+drop index if exists public.idx_modules_course;                 -- = course_modules_course_position_idx (course_id, position)
+drop index if exists public.idx_progress_user_course;           -- = lesson_progress_user_course_idx (user_id, course_id)
+drop index if exists public.course_completions_user_course_idx; -- = course_completions_pkey (user_id, course_id)
+drop index if exists public.courses_slug_idx;                   -- = courses_slug_key unique index (slug)
+
+-- ───────────────────────────────────────────────────────────────────
+-- 3) Hot-path index: the enrollment gate's own-latest-request read
+--    (WHERE user_id = $uid ORDER BY created_at DESC LIMIT 1) — the single most
+--    frequent authenticated query. Also serves the drawer's last-5 history read.
+-- ───────────────────────────────────────────────────────────────────
+create index if not exists enrollment_requests_user_created_idx
+  on public.enrollment_requests (user_id, created_at desc);
+
+-- ───────────────────────────────────────────────────────────────────
+-- 4) FK covering indexes — cascade-delete + join paths.
+--    Course platform (course/lesson deletes cascade into these):
+-- ───────────────────────────────────────────────────────────────────
+create index if not exists lesson_progress_lesson_idx
+  on public.lesson_progress (lesson_id);
+create index if not exists course_completions_course_idx
+  on public.course_completions (course_id);
+create index if not exists courses_source_course_idx
+  on public.courses (source_course_id) where source_course_id is not null;
+create index if not exists ai_training_checkpoints_course_idx
+  on public.ai_training_checkpoints (course_id);
+create index if not exists ai_training_checkpoints_lesson_idx
+  on public.ai_training_checkpoints (lesson_id);
+create index if not exists course_ai_index_jobs_source_idx
+  on public.course_ai_index_jobs (source_id);
+
+--    Community (post hard-deletes cascade into these; author columns are hit
+--    when a profile is deleted and by author-scoped reads):
+create index if not exists community_notifications_post_idx
+  on public.community_notifications (post_id);
+create index if not exists community_notifications_comment_idx
+  on public.community_notifications (comment_id) where comment_id is not null;
+create index if not exists community_notifications_actor_idx
+  on public.community_notifications (actor_id);
+create index if not exists community_announcement_reads_post_idx
+  on public.community_announcement_reads (post_id);
+create index if not exists community_posts_author_idx
+  on public.community_posts (author_id);
+create index if not exists community_comments_author_idx
+  on public.community_comments (author_id);
+create index if not exists community_reactions_user_idx
+  on public.community_reactions (user_id);
+create index if not exists community_attachments_uploader_idx
+  on public.community_attachments (uploader_id);
+
+--    Subscriptions lineage + request linkage (renewal chains, approve lookups):
+create index if not exists subscriptions_renewed_from_idx
+  on public.subscriptions (renewed_from_subscription_id) where renewed_from_subscription_id is not null;
+create index if not exists subscriptions_request_idx
+  on public.subscriptions (request_id) where request_id is not null;
+
+--    Student imports (job purges + audit lookups):
+create index if not exists student_external_accounts_job_idx
+  on public.student_external_accounts (import_job_id);
+create index if not exists student_external_accounts_row_idx
+  on public.student_external_accounts (import_row_id);
+create index if not exists student_import_events_row_idx
+  on public.student_import_events (row_id);
+create index if not exists student_import_events_actor_idx
+  on public.student_import_events (actor);
+create index if not exists student_import_rows_target_user_idx
+  on public.student_import_rows (target_user_id) where target_user_id is not null;
+
+-- 5) Refresh PostgREST's schema cache.
+notify pgrst, 'reload schema';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- AFTER RUNNING
+--   • The performance advisor's auth_rls_initplan warnings drop to zero; every
+--     policy evaluates auth/gate helpers once per statement.
+--   • Cascade deletes (courses, posts, profiles) and the enrollment-gate read use
+--     index scans instead of sequential scans as the tables grow.
+--   • 5 duplicate/redundant indexes no longer tax every write.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Backend hardening — integrity constraints, function grants, storage scoping (#30)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHY (from the 2026-07-26 full backend audit against the live project):
+--   • subscriptions.plan_key had NO foreign key to enrollment_plans. A typo'd key
+--     in an approve_subscription() call would grant a NO-EXPIRY term (NULL
+--     access_days lookup) that BOTH plan-scope gates treat as full access — a
+--     silent permanent full-access grant. enrollment_requests.plan_key already
+--     has this FK; this brings subscriptions (the authoritative access record)
+--     in line.
+--   • Several enum-ish / money / duration columns had no CHECK constraints, so a
+--     bad admin write (courses.access_tier typo, negative price, NULL/zero
+--     access_days) silently corrupted entitlement logic instead of erroring.
+--   • student_import_events is the IMMUTABLE audit trail, but its job_id FK was
+--     ON DELETE CASCADE — purging a staged import job deleted its audit history.
+--     (actor and row_id were already ON DELETE SET NULL.)
+--   • Supabase's default privileges grant EXECUTE to anon on every new function.
+--     The internal guards hold (verified — no privilege boundary holes), but
+--     anonymous visitors have no business invoking admin/member RPCs, and
+--     trigger-only functions should be invocable by nobody. The pure gate
+--     helpers (is_admin/is_approved/is_enrolled/current_plan_key/plan_is_*)
+--     deliberately KEEP anon EXECUTE — they run inside RLS policy evaluation
+--     for whatever role issues the query, and they leak nothing (no JWT → false).
+--   • The avatars + course-media buckets had a bucket-wide SELECT policy for the
+--     public role, letting ANY visitor enumerate every object (and thus every
+--     member's UID) via the list API. Public-bucket URL serving does NOT go
+--     through RLS, so listing can be scoped without affecting <img> playback:
+--     the app only lists avatars/<own uid>/ (upload cleanup) and course-media
+--     as admin (cover/legacy sweeps).
+--   • course-media had no size/MIME limits (the other buckets' client guards are
+--     50 MB video / 5 MB image; the bucket itself must enforce a ceiling too).
+--
+-- Deliberately DEFERRED (documented, revisit at real scale):
+--   • Consolidating multiple permissive policies per (table, action) — real but
+--     latent perf cost; an OR-merge mistake changes access, so it needs its own
+--     carefully-validated pass.
+--   • Moving pg_trgm out of the public schema — SECDEF functions are pinned to
+--     search_path=public, so relocating the extension risks breaking trigram
+--     operator lookups for near-zero benefit.
+--
+-- ORDER: run AFTER #29. IDEMPOTENT — safe to re-run.
+-- HOW TO RUN: paste into Supabase SQL Editor → Run (or apply via the CLI/API).
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- ───────────────────────────────────────────────────────────────────
+-- 1) Referential integrity: subscriptions.plan_key → enrollment_plans(key).
+--    ON UPDATE CASCADE keeps a key rename consistent; ON DELETE RESTRICT stops
+--    a plan delete from stranding live terms. Orphans (none in prod as of
+--    2026-07-26) would make the ADD fail — surfaced as a NOTICE, not an abort.
+-- ───────────────────────────────────────────────────────────────────
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'subscriptions_plan_key_fkey'
+  ) then
+    begin
+      alter table public.subscriptions
+        add constraint subscriptions_plan_key_fkey
+        foreign key (plan_key) references public.enrollment_plans(key)
+        on update cascade on delete restrict;
+    exception when foreign_key_violation then
+      raise notice 'subscriptions has plan_key values missing from enrollment_plans — FK NOT added; repair the orphans and re-run.';
+    end;
+  end if;
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 2) CHECK constraints — enforce the enums/ranges the app logic assumes.
+--    Each is guarded so a re-run (or a legacy out-of-range row) never aborts.
+-- ───────────────────────────────────────────────────────────────────
+do $$
+begin
+  -- courses.access_tier is the Essentials/Standard entitlement enum (#19); it was
+  -- enforced only in client code + the plan_is_sampler() SQL predicate.
+  if not exists (select 1 from pg_constraint where conname = 'courses_access_tier_check') then
+    begin
+      alter table public.courses
+        add constraint courses_access_tier_check
+        check (access_tier in ('standard', 'essentials'));
+    exception when check_violation then
+      raise notice 'courses has unexpected access_tier values — constraint NOT added; clean up and re-run.';
+    end;
+  end if;
+
+  -- A NULL/zero/negative access_days on a plan silently grants a no-expiry term
+  -- via approve_subscription()'s NULL branch. Every live plan has a positive
+  -- value; make that the rule.
+  if not exists (select 1 from pg_constraint where conname = 'enrollment_plans_access_days_positive') then
+    begin
+      alter table public.enrollment_plans
+        add constraint enrollment_plans_access_days_positive
+        check (access_days > 0);
+    exception when check_violation then
+      raise notice 'enrollment_plans has non-positive access_days rows — constraint NOT added; clean up and re-run.';
+    end;
+  end if;
+  begin
+    alter table public.enrollment_plans alter column access_days set not null;
+  exception when not_null_violation then
+    raise notice 'enrollment_plans has NULL access_days rows — NOT NULL not set; clean up and re-run.';
+  end;
+
+  -- Money columns: negative values are always a data error.
+  if not exists (select 1 from pg_constraint where conname = 'enrollment_plans_price_nonneg') then
+    begin
+      alter table public.enrollment_plans
+        add constraint enrollment_plans_price_nonneg
+        check (price_php >= 0 and (compare_at_php is null or compare_at_php >= 0));
+    exception when check_violation then
+      raise notice 'enrollment_plans has negative price rows — constraint NOT added; clean up and re-run.';
+    end;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'enrollment_requests_amounts_nonneg') then
+    begin
+      alter table public.enrollment_requests
+        add constraint enrollment_requests_amounts_nonneg
+        check (amount_expected >= 0 and amount_paid >= 0);
+    exception when check_violation then
+      raise notice 'enrollment_requests has negative amount rows — constraint NOT added; clean up and re-run.';
+    end;
+  end if;
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 3) Audit immutability: student_import_events must SURVIVE a job purge.
+--    job_id is already nullable; only the FK action changes (CASCADE → SET NULL,
+--    matching the actor/row_id FKs). Events keep IDs + safe codes only, so a
+--    NULL job_id row remains a valid, meaningful audit record.
+-- ───────────────────────────────────────────────────────────────────
+do $$
+declare
+  v_def text;
+begin
+  select pg_get_constraintdef(oid) into v_def
+    from pg_constraint where conname = 'student_import_events_job_id_fkey';
+  if v_def is not null and v_def like '%ON DELETE CASCADE%' then
+    alter table public.student_import_events
+      drop constraint student_import_events_job_id_fkey;
+    alter table public.student_import_events
+      add constraint student_import_events_job_id_fkey
+      foreign key (job_id) references public.student_import_jobs(id) on delete set null;
+  end if;
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 4) Function EXECUTE hygiene.
+--    4a) Member/admin RPCs: callable by signed-in users only (their internal
+--        guards do the real authorization) — strip the default anon grant.
+--    4b) Trigger-only functions: invocable by NOBODY via RPC (triggers fire
+--        regardless of the caller's EXECUTE privilege).
+--    trainer_* functions already have the correct service-role-only grants (#27).
+-- ───────────────────────────────────────────────────────────────────
+do $$
+begin
+  -- 4a) anon has no business calling these; authenticated keeps EXECUTE.
+  begin revoke execute on function public.approve_subscription(uuid, text, uuid) from public, anon;
+  exception when undefined_function then null; end;
+  begin revoke execute on function public.approve_extension(uuid, uuid, int) from public, anon;
+  exception when undefined_function then null; end;
+  begin revoke execute on function public.expire_overdue_subscriptions() from public, anon;
+  exception when undefined_function then null; end;
+  begin revoke execute on function public.record_enrollment_notification(uuid, text, text) from public, anon;
+  exception when undefined_function then null; end;
+  begin revoke execute on function public.set_my_avatar(text) from public, anon;
+  exception when undefined_function then null; end;
+  begin revoke execute on function public.search_community_members(text) from public, anon;
+  exception when undefined_function then null; end;
+  begin revoke execute on function public.complete_import_onboarding() from public, anon;
+  exception when undefined_function then null; end;
+
+  -- 4b) trigger-only — nobody calls these directly.
+  begin revoke execute on function public.handle_new_user() from public, anon, authenticated;
+  exception when undefined_function then null; end;
+  begin revoke execute on function public.community_stamp_author() from public, anon, authenticated;
+  exception when undefined_function then null; end;
+  begin revoke execute on function public.community_posts_guard() from public, anon, authenticated;
+  exception when undefined_function then null; end;
+  begin revoke execute on function public.community_comment_rollup() from public, anon, authenticated;
+  exception when undefined_function then null; end;
+  begin revoke execute on function public.community_notify_on_post() from public, anon, authenticated;
+  exception when undefined_function then null; end;
+  begin revoke execute on function public.community_notify_on_comment() from public, anon, authenticated;
+  exception when undefined_function then null; end;
+  begin revoke execute on function public.course_ai_mark_lesson_stale() from public, anon, authenticated;
+  exception when undefined_function then null; end;
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 5) Storage read-policy scoping (public-bucket URL serving is unaffected —
+--    it never consults RLS; only the list/copy/move APIs check SELECT).
+--    • avatars: a member lists ONLY their own folder (AvatarSection's upload
+--      cleanup); admins may list all. Anonymous listing (UID enumeration) ends.
+--    • course-media: only admins list (cover upload cleanup + the legacy media
+--      sweep in removeMediaIfUnreferenced). Students play covers/guide videos
+--      via public URLs, which need no SELECT.
+-- ───────────────────────────────────────────────────────────────────
+drop policy if exists avatars_read on storage.objects;
+create policy avatars_read on storage.objects
+  for select to authenticated
+  using (
+    bucket_id = 'avatars'
+    and (
+      (storage.foldername(name))[1] = ((select auth.uid()))::text
+      or (select is_admin())
+    )
+  );
+
+drop policy if exists course_media_read on storage.objects;
+create policy course_media_read on storage.objects
+  for select to authenticated
+  using (bucket_id = 'course-media' and (select is_admin()));
+
+-- ───────────────────────────────────────────────────────────────────
+-- 6) course-media bucket limits — 50 MB ceiling (matches the client's video
+--    guard; covers are client-capped at 5 MB) + an image/video MIME allowlist.
+--    Existing objects are untouched (only image/png lives there today).
+-- ───────────────────────────────────────────────────────────────────
+update storage.buckets
+   set file_size_limit = 52428800,
+       allowed_mime_types = array[
+         'image/jpeg','image/png','image/webp','image/gif',
+         'video/mp4','video/webm','video/ogg','video/quicktime','video/x-m4v'
+       ]
+ where id = 'course-media';
+
+-- 7) Refresh PostgREST's schema cache.
+notify pgrst, 'reload schema';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- AFTER RUNNING
+--   • A typo'd plan key in approve_subscription() now errors instead of granting
+--     permanent full access; bad tier/price/duration writes error at the table.
+--   • Purging a student-import job keeps its audit events (job_id goes NULL).
+--   • anon can no longer invoke any member/admin RPC; trigger functions are not
+--     invocable via the API at all.
+--   • Anonymous visitors can no longer enumerate avatars/course-media objects;
+--     members still list exactly what the app needs (own avatar folder; admins
+--     everything). Public URL playback is unchanged.
+--   • course-media uploads are capped at 50 MB and image/video MIME types.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Migration apply-log — public.schema_migrations (#31)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHY: this project applies db/*.sql by hand (SQL editor / CLI), and until
+-- 2026-07-26 nothing recorded WHICH files had run. That is exactly how #20/#21
+-- (account-membership-requests + hardening) were silently skipped for two weeks
+-- while the deployed client depended on them (the Extend Access over-grant bug).
+-- This table is the lightweight fix: one row per applied migration file.
+--
+-- RULE going forward: whenever you run a db/*.sql file against an environment,
+-- insert its row here IN THE SAME SQL editor session (each new migration file
+-- should end by inserting its own row — see the tail of this file for the
+-- pattern). To audit for drift: compare rows against `ls db/*.sql` — any dated
+-- file missing here is unapplied.
+--
+-- RLS: admins can read it (so a future admin UI can show apply state); nobody
+-- can write through the API — inserts happen only via the SQL editor / CLI
+-- (postgres role, which owns the table and bypasses RLS).
+--
+-- ORDER: any time (independent). IDEMPOTENT — safe to re-run.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+create table if not exists public.schema_migrations (
+  filename   text primary key,
+  checksum   text,          -- sha256 of the repo file at apply/backfill time (informational)
+  applied_at timestamptz not null default now(),
+  notes      text
+);
+
+alter table public.schema_migrations enable row level security;
+
+drop policy if exists schema_migrations_admin_select on public.schema_migrations;
+create policy schema_migrations_admin_select on public.schema_migrations
+  for select to authenticated
+  using ((select is_admin()));
+
+-- ───────────────────────────────────────────────────────────────────
+-- Backfill: every dated db/*.sql file confirmed applied to the live project as
+-- of 2026-07-26 (via the full live-schema audit), plus the files applied by the
+-- same day's backend pass. The 000 bootstrap is deliberately absent — it is the
+-- from-scratch equivalent of this series and never ran against this database.
+-- ───────────────────────────────────────────────────────────────────
+insert into public.schema_migrations (filename, checksum, notes)
+values
+    ('2026-06-15-auth-profiles-base.sql', '063cf858c9ad4f4ede891cc06743b10d16e132073555fb0453361b608de560d7', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-06-16-course-platform-base.sql', '2090524fce0c0b654794b572d2f8a466a4a7dab72e72f61d0fc32e2a22bcfb0e', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-06-16-course-platform-storage.sql', 'c77bc6369f2f4578d954d792335fe9e3b36dcce79d22c87e0fbcdb9d0ed56212', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-06-17-course-date-source-id.sql', 'b8536bbf6822212b0d9cea4eb641c84bb331aece59ac527277ab20fbc6542017', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-06-18-sidebar-settings.sql', '2a44049a8487a1d5b308d1e6855decbc08ee3b4c3451a3a09aeff7be212248b0', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-06-22-feature-guides.sql', '48b62c6dd01f2f0f2ac96ba268df78d5ee2c65180bc67ee54c44086248df7884', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-06-22-feature-video-completions.sql', '594c4c42c4840729cc2b0c056f035b15cf6aba7d36905a393caf21f4e6e642f0', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-06-24-navigation-performance-indexes.sql', '965c0e376e34fe28ae3ae01b6b95db351f2f92bac242ffcaebddcf558244a508', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-06-29-approval-status-index.sql', '8de549a725b3448b338dea184e71106972cba6e6106219f34dda58ad367c7c15', 'applied 2026-07-26 by the backend audit pass'),
+    ('2026-06-29-profiles-realtime.sql', '7747dd38deb01de77ba7834a8494e61079f5049ff9c37ac78f8f468802e8fc5b', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-06-29-user-approval.sql', '176947ce1b8b981644746d64fd28caf74789cf83eac41d858659c4527a848295', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-04-enrollment.sql', '3b732e7436197b86516ccf09e70d540982e15c674164b1e6525b42ad244b7b8a', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-04-subscription-lifecycle.sql', '9545e3a17ba400129c6980cca02e73fe868116151c29c7541ce273912ed877b3', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-08-course-videos-private.sql', '98c444a8e7cebc613c61a4cf67ce47f1d9b13d1d766160334f44581dd0b5f177', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-08-enrollment-notify-status.sql', '614000d16a9c512380c7773ecb68652d5b96fa4fcff68e271540db706378eed8', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-08-receipt-integrity.sql', '42ed063015a7c66420b04adfbe3de348cabcf52cce86455955ccc0bdd34ad871', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-09-plan-course-access.sql', '8dfa494b466d4c5f2cc555a1fa764ab0808e530f4a4b6f3cc2e0a87333d4264d', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-10-subscription-grace.sql', 'ef2b42fa69966b0e7a3980eb3ac6d9ba24ebce8a4a93a18a2d195ecd01c51de0', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-11-account-membership-requests.sql', '94f7da53e165ef3fb86a2d8bcc77b80063c499344c9d9c22f1716cee20f8ae69', 'applied 2026-07-26 by the backend audit pass'),
+    ('2026-07-11-hardening.sql', '9e642840f2d4eaa36bc8a30fa4744b93d1f30a795cd3aeecbf88717616d64651', 'applied 2026-07-26 by the backend audit pass'),
+    ('2026-07-11-sampler-essentials-access.sql', 'e66ac9cc4a1e3ad8960ae0975efc8a1b524c55db8658d29fc135b5ab6fa50b31', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-20-community.sql', 'b4a5f67718d3ebde38f3dcc33b8567f0aa52cf18242f1bb3be1c45fed2649e8d', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-20-sampler-support-60-days.sql', 'c6966143bcbdbeb209ceae6b591bab1ae587dc63ba4a370e3e7c2128ef71e53c', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-21-community-forum.sql', '4f761fb33d959618cae38aa4dfb527b3eadf2331b526f81748d2a416ef079a46', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-22-community-hardening.sql', 'f7f7c0cac2ed61086813b25dfd20093238e7dd3f6856cb4fdc004d72cf654094', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-23-student-imports.sql', '249b74ca589f020dfd0b56c762d0ac62e45d2f046f1cc9e46bf786b29e272eff', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-24-course-ai-trainer.sql', 'f7b57a4008548c5ca0a4c40fd125e8f2ce9b05119eef16eb9a8b0570237f98c5', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-26-backend-hardening.sql', '1835fa614c5a9bddb808c48be69ee6e2927317887ca1eb7876747d4f7e1b7164', 'applied 2026-07-26 by the backend audit pass'),
+    ('2026-07-26-community-write-gate.sql', 'd77c723aee8ec4fad4f8db85268dcb07e0e3b74dc1df0e8a24e702a7670cb30b', 'backfilled 2026-07-26 - confirmed applied via live-schema audit'),
+    ('2026-07-26-rls-initplan-and-indexes.sql', '2f18757429346c839505bf07c8e34ca19b7be73e19ce34c40ab5353818117a62', 'applied 2026-07-26 by the backend audit pass'),
+    ('2026-07-26-schema-migrations-log.sql', null, 'self-recorded at creation - checksum is of the repo file, see git')
+on conflict (filename) do nothing;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- PATTERN for future migration files — end each new db/<date>-<name>.sql with:
+--
+--   insert into public.schema_migrations (filename, checksum, notes)
+--   values ('<date>-<name>.sql', '<sha256 of the file>', null)
+--   on conflict (filename) do nothing;
+--
+-- so applying the file records it in the same run.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ───────────────────────────────────────────────────────────────────
+-- 19) COMMUNITY SPACES & BATCHES (#32) — folded VERBATIM from
+--     db/2026-07-28-community-spaces-batches.sql (the §18 idiom: when that
+--     file changes, re-fold it here and keep the two identical). Placed
+--     LAST deliberately: §15b/§18 above create/re-touch the PRE-#32
+--     community policy shapes, and this section's space-aware DROP+CREATE
+--     must win on a fresh install. Every #32 guard passes at this point.
+-- ───────────────────────────────────────────────────────────────────
+-- ════════════════════════════════════════════════════════════════════════════
+-- COMMUNITY SPACES & BATCHES (#32) — automatic student segregation
+-- ════════════════════════════════════════════════════════════════════════════
+--
+-- WHY
+--   The community was ONE flat forum: every predicate was
+--   is_admin() OR (is_approved() AND is_enrolled()) — no plan/batch dimension.
+--   The gold_live and vip packages are cohort-based and need PRIVATE per-batch
+--   communities ("Gold — August 2026", "VIP — August 2026") beside a General
+--   community every active plan keeps. Access must derive automatically from
+--   the member's current dated subscription (plan + batch) and be enforced by
+--   RLS — never by hidden buttons.
+--
+-- WHAT THIS ADDS
+--   • batches            — cohort registry ('2026-08' → August 2026; open/closed/archived,
+--                          optional per-segment capacities). Creating a batch auto-creates
+--                          its Gold + VIP spaces (batches_create_spaces trigger).
+--                          CAPACITY SCOPE: seats are enforced (under a FOR UPDATE batch
+--                          lock) only on the two admin RPC paths below — approval and
+--                          batch assignment. Bulk student imports and direct SQL grants
+--                          deliberately do NOT consume/check seats; verify the counts in
+--                          Admin → Batches after a premium import.
+--   • community_spaces   — one 'general' space + one 'gold' and one 'vip' space per batch.
+--                          Capability flags (member_posting / member_comments /
+--                          member_reactions) are read INSIDE the insert policies —
+--                          General ships with member_comments = false (posts + reactions
+--                          only; historical replies stay readable).
+--   • batch_events       — immutable admin audit trail (student_import_events precedent).
+--   • enrollment_plans.community_segment  ('general'|'gold'|'vip'; gold_live→gold, vip→vip)
+--   • subscriptions.batch_id / enrollment_requests.batch_id / student_import_rows.proposed_batch_id
+--   • community_posts.space_id (NOT NULL, trigger-filled + frozen)
+--     community_comments.space_id (trigger-stamped from parent, frozen)
+--     community_notifications.space_id (trigger-stamped)
+--   • user_community_space_ids(p_user) / my_community_space_ids() — THE derived-membership
+--     predicate (no membership table: current valid sub → plan segment + batch → spaces;
+--     unknown/legacy plans and batch-less premium subs fail closed to General only).
+--   • my_community_spaces() — one call drives the client space switcher.
+--   • admin_finalize_enrollment(p_request_id, p_batch_id) — the ONE transactional approval:
+--     validates request + plan + batch + capacity together, wraps the existing
+--     approve_subscription()/approve_extension() (term math stays in one place), stamps
+--     subscriptions.batch_id, patches the profiles cache, marks the request approved.
+--     Replaces the client's 3-step approve + its local-grant fallback.
+--   • admin_assign_batch(p_user_ids, p_batch_id) — idempotent bulk assignment for the
+--     "needs batch assignment" queue (+ batch_events audit rows).
+--   • admin_batch_overview() — per-batch enrollment counts for the admin batch manager.
+--   • Every community RLS policy rewritten space-aware (minimal-diff: original predicate
+--     text preserved, space/capability predicates ADDED). Storage community-media policies
+--     accept BOTH path shapes: legacy <uid>/… and new <space_id>/<uid>/…
+--   • search_community_members(p_query, p_space_id) — mention directory scoped to the
+--     eligible members of one space. community_category_counts(p_space_id) — stays
+--     SECURITY INVOKER (caller RLS keeps scoping the counts).
+--
+-- ORDER
+--   Requires #13 (subscription lifecycle: subscriptions.ends_at), #23/#24 (community
+--   forum tables incl. comments_locked), and #30 (subscriptions.plan_key FK). Run AFTER
+--   #29/#31. The guard below aborts if a prerequisite is missing.
+--
+-- SAFE FOR THE SQL-FIRST WINDOW
+--   Apply this BEFORE deploying the matching client: old clients keep working — posts
+--   without space_id are trigger-filled into General, and the replaced RPC signatures
+--   keep default params so zero-arg / one-arg calls still resolve.
+--   KNOWN GAP until the new client ships: every existing post now lives in General,
+--   which is reactions-only, so the old client shows a reply composer on EVERY post
+--   and any member reply is refused by RLS (an error toast, nothing lost). Reading,
+--   posting, and reactions are unaffected, and admins can still reply. Deploy the
+--   matching client promptly — or, to keep replies open during a longer window, run
+--   `update public.community_spaces set member_comments = true where slug='general';`
+--   and set it back to false once the client is live.
+--
+-- HOW TO RUN — paste into the Supabase SQL editor and run once. IDEMPOTENT: safe to
+-- re-run (add column if not exists / create or replace / drop policy if exists / on
+-- conflict do nothing throughout).
+-- ════════════════════════════════════════════════════════════════════════════
+
+-- ───────────────────────────────────────────────────────────────────
+-- 0) Guards — refuse to run against a DB missing the prerequisites.
+-- ───────────────────────────────────────────────────────────────────
+do $$
+begin
+  if to_regclass('public.subscriptions') is null then
+    raise exception '#32 requires the enrollment migration (db/2026-07-04-enrollment.sql) first.';
+  end if;
+  if not exists (select 1 from information_schema.columns
+                  where table_schema = 'public' and table_name = 'subscriptions'
+                    and column_name = 'ends_at') then
+    raise exception '#32 requires the subscription lifecycle migration (db/2026-07-04-subscription-lifecycle.sql, #13) first.';
+  end if;
+  if to_regclass('public.community_posts') is null then
+    raise exception '#32 requires the community migration (db/2026-07-20-community.sql, #23) first.';
+  end if;
+  if not exists (select 1 from information_schema.columns
+                  where table_schema = 'public' and table_name = 'community_posts'
+                    and column_name = 'comments_locked') then
+    raise exception '#32 requires the community forum upgrade (db/2026-07-21-community-forum.sql, #24) first.';
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'subscriptions_plan_key_fkey') then
+    raise exception '#32 requires the backend hardening pass (db/2026-07-26-backend-hardening.sql, #30) first.';
+  end if;
+  if to_regproc('public.approve_subscription') is null or to_regproc('public.approve_extension') is null then
+    raise exception '#32 requires approve_subscription/approve_extension (#13/#20) first.';
+  end if;
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 1) batches — the cohort registry. code is the stable business key
+--    ('2026-08'); display name is what members see ("August 2026").
+--    Capacities are OPTIONAL — null = unlimited; enforced transactionally
+--    only through the admin RPC paths below.
+-- ───────────────────────────────────────────────────────────────────
+create table if not exists public.batches (
+  id            uuid primary key default gen_random_uuid(),
+  code          text not null unique check (code ~ '^\d{4}-\d{2}$'),
+  name          text not null,
+  starts_on     date,
+  ends_on       date,
+  timezone      text not null default 'Asia/Manila',
+  status        text not null default 'open'
+                check (status in ('open', 'closed', 'archived')),
+  gold_capacity int check (gold_capacity is null or gold_capacity > 0),
+  vip_capacity  int check (vip_capacity is null or vip_capacity > 0),
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now()
+);
+
+-- ───────────────────────────────────────────────────────────────────
+-- 2) community_spaces — one 'general' row (batch_id NULL) plus exactly one
+--    'gold' and one 'vip' row per batch. Capability flags are the data-driven
+--    switchboard the insert policies read (flip member_comments back on for
+--    General later with a one-row UPDATE — no migration needed).
+-- ───────────────────────────────────────────────────────────────────
+create table if not exists public.community_spaces (
+  id               uuid primary key default gen_random_uuid(),
+  kind             text not null check (kind in ('general', 'gold', 'vip')),
+  batch_id         uuid references public.batches(id) on delete restrict,
+  slug             text not null unique,
+  name             text not null,
+  member_posting   boolean not null default true,
+  member_comments  boolean not null default true,
+  member_reactions boolean not null default true,
+  active           boolean not null default true,
+  created_at       timestamptz not null default now(),
+  updated_at       timestamptz not null default now(),
+  -- 'general' has no batch; premium spaces always belong to one.
+  check ((kind = 'general') = (batch_id is null)),
+  unique (kind, batch_id)
+);
+
+-- Exactly ONE general space, ever.
+create unique index if not exists community_spaces_one_general
+  on public.community_spaces ((true)) where kind = 'general';
+create index if not exists community_spaces_batch_idx
+  on public.community_spaces (batch_id);
+
+-- ───────────────────────────────────────────────────────────────────
+-- 3) batch_events — immutable admin audit (create/status/assign actions).
+--    Admin select + insert only; no update/delete (student_import_events
+--    precedent). detail carries ids + safe codes, never PII.
+-- ───────────────────────────────────────────────────────────────────
+create table if not exists public.batch_events (
+  id         uuid primary key default gen_random_uuid(),
+  batch_id   uuid references public.batches(id) on delete set null,
+  user_id    uuid references public.profiles(id) on delete set null,
+  actor_id   uuid,
+  action     text not null check (action in
+             ('create', 'open', 'close', 'archive', 'assign', 'reassign', 'unassign', 'capacity')),
+  detail     jsonb,
+  created_at timestamptz not null default now()
+);
+create index if not exists batch_events_batch_idx
+  on public.batch_events (batch_id, created_at desc);
+-- FK-covering index (the #29 discipline): batch_events.user_id cascades from
+-- profiles, and the admin queue reads a member's assignment history by user.
+create index if not exists batch_events_user_idx
+  on public.batch_events (user_id);
+
+-- ───────────────────────────────────────────────────────────────────
+-- 4) Auto-create the Gold + VIP spaces whenever a batch is born — covers
+--    admin-UI inserts AND SQL-editor inserts. Also writes the 'create'
+--    audit row.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.batches_create_spaces()
+returns trigger
+language plpgsql security definer set search_path = public
+as $$
+begin
+  insert into public.community_spaces (kind, batch_id, slug, name)
+  values ('gold', new.id, 'gold-' || new.code, 'Gold — ' || new.name),
+         ('vip',  new.id, 'vip-'  || new.code, 'VIP — '  || new.name)
+  on conflict (kind, batch_id) do nothing;
+  insert into public.batch_events (batch_id, actor_id, action, detail)
+  values (new.id, auth.uid(), 'create',
+          jsonb_build_object('code', new.code, 'name', new.name));
+  return new;
+end;
+$$;
+
+revoke all on function public.batches_create_spaces() from public, anon, authenticated;
+
+drop trigger if exists batches_create_spaces on public.batches;
+create trigger batches_create_spaces
+  after insert on public.batches
+  for each row execute function public.batches_create_spaces();
+
+-- ───────────────────────────────────────────────────────────────────
+-- 5) New columns on existing tables.
+-- ───────────────────────────────────────────────────────────────────
+alter table public.enrollment_plans
+  add column if not exists community_segment text not null default 'general'
+  check (community_segment in ('general', 'gold', 'vip'));
+
+-- Seed the segment map. NEVER inferred from price/name — explicit keys only.
+update public.enrollment_plans set community_segment = 'gold' where key = 'gold_live' and community_segment <> 'gold';
+update public.enrollment_plans set community_segment = 'vip'  where key = 'vip'       and community_segment <> 'vip';
+
+alter table public.subscriptions
+  add column if not exists batch_id uuid references public.batches(id) on delete restrict;
+create index if not exists subscriptions_batch_idx on public.subscriptions (batch_id);
+
+alter table public.enrollment_requests
+  add column if not exists batch_id uuid references public.batches(id) on delete set null;
+create index if not exists enrollment_requests_batch_idx on public.enrollment_requests (batch_id);
+
+-- Student imports (#26) may not be installed everywhere — column is conditional.
+do $$
+begin
+  if to_regclass('public.student_import_rows') is not null then
+    alter table public.student_import_rows
+      add column if not exists proposed_batch_id uuid references public.batches(id) on delete set null;
+  end if;
+end $$;
+
+alter table public.community_posts
+  add column if not exists space_id uuid references public.community_spaces(id) on delete restrict;
+alter table public.community_comments
+  add column if not exists space_id uuid references public.community_spaces(id) on delete restrict;
+alter table public.community_notifications
+  add column if not exists space_id uuid references public.community_spaces(id) on delete cascade;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 6) Seeds: the single General space (posts + reactions only — the owner's
+--    call: replies live in the premium batch communities) and the first
+--    cohort. The batch insert fires batches_create_spaces → gold-2026-08 +
+--    vip-2026-08 exist right after.
+-- ───────────────────────────────────────────────────────────────────
+insert into public.community_spaces (kind, batch_id, slug, name, member_comments)
+values ('general', null, 'general', 'General', false)
+on conflict do nothing;
+
+insert into public.batches (code, name, status)
+values ('2026-08', 'August 2026', 'open')
+on conflict (code) do nothing;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 7) Backfill: every existing post/comment/notification belongs to General
+--    (the whole forum WAS General until now). Content is preserved — nothing
+--    is deleted. Then pin NOT NULL on posts/comments.
+-- ───────────────────────────────────────────────────────────────────
+update public.community_posts p
+   set space_id = (select id from public.community_spaces where kind = 'general')
+ where p.space_id is null;
+
+update public.community_comments c
+   set space_id = p.space_id
+  from public.community_posts p
+ where p.id = c.post_id and c.space_id is null;
+
+update public.community_notifications n
+   set space_id = p.space_id
+  from public.community_posts p
+ where p.id = n.post_id and n.space_id is null;
+
+alter table public.community_posts    alter column space_id set not null;
+alter table public.community_comments alter column space_id set not null;
+-- community_notifications.space_id stays nullable: legacy rows with a deleted
+-- post keep null → still visible to their owner (policy treats null as owner-only).
+
+create index if not exists community_posts_space_feed_idx
+  on public.community_posts (space_id, pinned desc, last_activity_at desc);
+create index if not exists community_posts_space_created_idx
+  on public.community_posts (space_id, created_at desc);
+create index if not exists community_posts_space_tag_idx
+  on public.community_posts (space_id, tag_slug) where status = 'active';
+create index if not exists community_comments_space_idx
+  on public.community_comments (space_id);
+create index if not exists community_notifications_space_idx
+  on public.community_notifications (space_id);
+
+-- Superseded by the space-leading feed indexes above (#29 drop precedent).
+-- community_posts_tag_idx is KEPT — the bell's announcements lookup filters by
+-- tag_slug across spaces.
+drop index if exists public.community_posts_feed_idx;
+drop index if exists public.community_posts_forum_idx;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 8) THE membership predicate. No membership table — spaces are DERIVED from
+--    the caller's current valid subscription every time, so approval, renewal,
+--    expiry (+3-day grace), upgrade, and downgrade all take effect on the very
+--    next query with nothing to sync or revoke.
+--
+--    user_community_space_ids(p_user)  — parameterized canonical form
+--      (trainer_visible_courses precedent). NOT API-callable.
+--      · admins → every space (moderation, incl. inactive);
+--      · else: approved + (valid current sub per is_enrolled()'s date math,
+--        OR the is_paid-no-subs grandfather) → General always; PLUS the active
+--        premium space where enrollment_plans.community_segment = space.kind
+--        AND sub.batch_id = space.batch_id.
+--      · Unknown/legacy plan keys → segment 'general' → General only.
+--      · Premium sub with batch_id NULL → General only (fails CLOSED — that
+--        member surfaces in the admin "needs batch assignment" queue).
+--
+--    my_community_space_ids() — the auth.uid() wrapper every policy uses via
+--      `space_id in (select public.my_community_space_ids())` (InitPlan-once,
+--      #29 discipline). SECURITY DEFINER so its own reads bypass RLS — no
+--      policy recursion.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.user_community_space_ids(p_user uuid)
+returns setof uuid
+language sql stable security definer set search_path = public
+as $$
+  with me as (
+    select p.is_admin,
+           (p.approval_status = 'approved' or p.is_admin) as approved,
+           p.is_paid
+      from public.profiles p
+     where p.id = p_user
+  ),
+  cur as (
+    select s.plan_key, s.batch_id
+      from public.subscriptions s
+     where s.user_id = p_user
+       and s.status = 'active'
+       and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+     order by s.created_at desc
+     limit 1
+  ),
+  gate as (
+    select coalesce((select is_admin from me), false) as is_admin,
+           (coalesce((select approved from me), false)
+            and (exists (select 1 from cur)
+                 or (coalesce((select is_paid from me), false)
+                     and not exists (select 1 from public.subscriptions s2
+                                      where s2.user_id = p_user)))) as is_member
+  )
+  select sp.id
+    from public.community_spaces sp, gate g
+   where g.is_admin
+      or (g.is_member and sp.active
+          and (sp.kind = 'general'
+               or exists (select 1
+                            from cur c
+                            join public.enrollment_plans ep on ep.key = c.plan_key
+                           where ep.community_segment = sp.kind
+                             and c.batch_id is not null
+                             and c.batch_id = sp.batch_id)));
+$$;
+
+revoke all on function public.user_community_space_ids(uuid) from public, anon, authenticated;
+
+create or replace function public.my_community_space_ids()
+returns setof uuid
+language sql stable security definer set search_path = public
+as $$
+  select * from public.user_community_space_ids(auth.uid());
+$$;
+
+revoke all on function public.my_community_space_ids() from public, anon;
+grant execute on function public.my_community_space_ids() to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 9) my_community_spaces() — everything the client switcher needs in one call:
+--    accessible spaces, capability flags, an eligible-member count per space
+--    (derived, small scale), and which space is the caller's default (their
+--    premium space if any, else General).
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.my_community_spaces()
+returns table (
+  id uuid, slug text, kind text, name text, batch_code text,
+  member_posting boolean, member_comments boolean, member_reactions boolean,
+  member_count bigint, is_default boolean
+)
+language sql stable security definer set search_path = public
+as $$
+  with mine as (
+    select t.sid from public.user_community_space_ids(auth.uid()) as t(sid)
+  ),
+  valid_subs as (
+    select distinct on (s.user_id) s.user_id, s.plan_key, s.batch_id
+      from public.subscriptions s
+     where s.status = 'active'
+       and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+     order by s.user_id, s.created_at desc
+  ),
+  eligible as (
+    -- non-admin members with a live term…
+    select v.user_id, coalesce(ep.community_segment, 'general') as segment, v.batch_id
+      from valid_subs v
+      join public.profiles p on p.id = v.user_id
+      left join public.enrollment_plans ep on ep.key = v.plan_key
+     where (p.approval_status = 'approved' or p.is_admin)
+    union
+    -- …plus legacy grandfathers (is_paid, zero subscription rows → General).
+    select p.id, 'general', null::uuid
+      from public.profiles p
+     where p.is_paid
+       and (p.approval_status = 'approved' or p.is_admin)
+       and not exists (select 1 from public.subscriptions s2 where s2.user_id = p.id)
+  ),
+  my_default as (
+    select coalesce(
+      (select sp.id
+         from public.community_spaces sp
+         join valid_subs v on v.user_id = auth.uid()
+         join public.enrollment_plans ep on ep.key = v.plan_key
+        where sp.kind = ep.community_segment
+          and sp.kind <> 'general'
+          and sp.batch_id = v.batch_id
+          and sp.active
+        limit 1),
+      (select sp.id from public.community_spaces sp where sp.kind = 'general' limit 1)
+    ) as space_id
+  )
+  select sp.id, sp.slug, sp.kind, sp.name, b.code as batch_code,
+         sp.member_posting, sp.member_comments, sp.member_reactions,
+         (select count(*)
+            from eligible e
+           where case when sp.kind = 'general' then true
+                      else e.segment = sp.kind and e.batch_id = sp.batch_id end)::bigint
+           as member_count,
+         (sp.id = (select space_id from my_default)) as is_default
+    from public.community_spaces sp
+    left join public.batches b on b.id = sp.batch_id
+   where sp.id in (select sid from mine)
+   order by (sp.kind = 'general') desc, b.code desc nulls last, sp.kind;
+$$;
+
+revoke all on function public.my_community_spaces() from public, anon;
+grant execute on function public.my_community_spaces() to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 10) RLS for the new tables. batches_read is deliberately NOT enrollment-
+--     gated: a signed-in student on the paywall must list OPEN batches to pick
+--     one at checkout, and a member of a since-closed batch must still resolve
+--     its name in the membership panel (the own-subscription branch).
+-- ───────────────────────────────────────────────────────────────────
+alter table public.batches          enable row level security;
+alter table public.community_spaces enable row level security;
+alter table public.batch_events     enable row level security;
+
+drop policy if exists batches_read on public.batches;
+create policy batches_read on public.batches
+  for select to authenticated
+  using ((select public.is_admin())
+      or status = 'open'
+      -- batches.id MUST be qualified: unqualified `id` inside this subquery
+      -- would bind to subscriptions.id (innermost scope wins) and the branch
+      -- would silently never match.
+      or exists (select 1 from public.subscriptions s
+                  where s.batch_id = batches.id and s.user_id = (select auth.uid())));
+
+drop policy if exists batches_admin_all on public.batches;
+create policy batches_admin_all on public.batches
+  for all to authenticated
+  using ((select public.is_admin())) with check ((select public.is_admin()));
+
+drop policy if exists community_spaces_read on public.community_spaces;
+create policy community_spaces_read on public.community_spaces
+  for select to authenticated
+  using ((select public.is_admin())
+      or (active and id in (select public.my_community_space_ids())));
+
+drop policy if exists community_spaces_admin_all on public.community_spaces;
+create policy community_spaces_admin_all on public.community_spaces
+  for all to authenticated
+  using ((select public.is_admin())) with check ((select public.is_admin()));
+
+drop policy if exists batch_events_admin_select on public.batch_events;
+create policy batch_events_admin_select on public.batch_events
+  for select to authenticated
+  using ((select public.is_admin()));
+
+drop policy if exists batch_events_admin_insert on public.batch_events;
+create policy batch_events_admin_insert on public.batch_events
+  for insert to authenticated
+  with check ((select public.is_admin()));
+-- No update/delete policies — the audit trail is immutable via the API.
+
+-- Students may reference only an OPEN batch on their own pending request
+-- (still student-declared — admin_finalize_enrollment() is the authority).
+drop policy if exists enroll_req_own_insert on public.enrollment_requests;
+create policy enroll_req_own_insert on public.enrollment_requests
+  for insert to authenticated
+  with check (user_id = (select auth.uid())
+          and status = 'pending_review'
+          and (batch_id is null
+               or exists (select 1 from public.batches b
+                           where b.id = batch_id and b.status = 'open')));
+
+-- ───────────────────────────────────────────────────────────────────
+-- 11) community_posts_guard() — replaced: same freezes as before PLUS
+--     space_id handling. INSERT: a null space_id is filled with General so the
+--     pre-deploy client (which doesn't send it) keeps publishing. UPDATE:
+--     space_id is frozen for EVERYONE inside the client-originated branch —
+--     posts never move between spaces via the API (SQL editor only: the
+--     auth.uid() IS NULL escape hatch, which backfills and the depth-2 rollup
+--     already use, still applies).
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.community_posts_guard()
+returns trigger
+language plpgsql security definer set search_path = public
+as $$
+begin
+  if tg_op = 'INSERT' then
+    -- created_at is server time for members: a client-forged future date
+    -- would launder into last_activity_at below and self-pin the post
+    -- above the whole activity-sorted feed.
+    if not public.is_admin() then
+      new.created_at := now();
+    end if;
+    if new.space_id is null then
+      select id into new.space_id from public.community_spaces where kind = 'general';
+    end if;
+    new.comment_count    := 0;
+    new.last_activity_at := coalesce(new.created_at, now());
+    if not public.is_admin() then
+      new.pinned := false;
+    end if;
+    if exists (select 1 from public.community_tags t
+                where t.slug = new.tag_slug and t.admin_only) then
+      new.comments_locked := true;
+    elsif not public.is_admin() then
+      new.comments_locked := false;
+    end if;
+  else
+    -- Freeze only client-originated updates (see comment above).
+    if pg_trigger_depth() <= 1 and auth.uid() is not null then
+      if not public.is_admin() then
+        new.pinned           := old.pinned;
+        new.comments_locked  := old.comments_locked;
+      end if;
+      new.comment_count    := old.comment_count;
+      new.last_activity_at := old.last_activity_at;
+      new.space_id         := old.space_id;   -- immutable after creation
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function public.community_posts_guard() from public, anon, authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 12) community_comment_space() — comments inherit the parent post's space,
+--     server-side (never trusted from the client) and frozen on update. The
+--     denorm exists so the comments realtime channel can filter by space_id
+--     (postgres_changes filters only see columns of the published table) and
+--     so notification policies stay index-direct.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.community_comment_space()
+returns trigger
+language plpgsql security definer set search_path = public
+as $$
+begin
+  if tg_op = 'INSERT' then
+    select p.space_id into new.space_id
+      from public.community_posts p where p.id = new.post_id;
+  elsif auth.uid() is not null and pg_trigger_depth() <= 1 then
+    new.space_id := old.space_id;                 -- frozen for every client write
+  else
+    -- No-JWT SQL-editor / service-role update: the SAME escape hatch
+    -- community_posts_guard() uses for moving a post between spaces. Re-derive
+    -- from the parent so a moved thread's replies follow it instead of
+    -- desyncing (stale replies would otherwise stay visible to the old space).
+    select p.space_id into new.space_id
+      from public.community_posts p where p.id = new.post_id;
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function public.community_comment_space() from public, anon, authenticated;
+
+drop trigger if exists community_comments_space on public.community_comments;
+create trigger community_comments_space
+  before insert or update on public.community_comments
+  for each row execute function public.community_comment_space();
+
+-- ───────────────────────────────────────────────────────────────────
+-- 13) Notify triggers — replaced: identical mention regex / cap-10 /
+--     mentionable-target / unread-collapse / reply rules (keep the client
+--     COMMUNITY_MENTION_SRC regex in lockstep), PLUS:
+--       • every notification row is stamped with the content's space_id;
+--       • a mentioned member who cannot access that space is silently
+--         DROPPED — cross-space mention markup notifies nobody.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.community_notify_on_comment()
+returns trigger
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_actor_name   text;
+  v_actor_avatar text;
+  v_post         record;
+  v_title        text;
+  v_done         uuid[] := array[]::uuid[];
+  v_uid          uuid;
+  m              text;
+begin
+  if new.status <> 'active' then return new; end if;
+  select p.author_id, p.title, p.body into v_post
+    from public.community_posts p where p.id = new.post_id;
+  if v_post.author_id is null then return new; end if;
+  select coalesce(nullif(trim(pr.full_name), ''), pr.email, 'Member'), pr.avatar_url
+    into v_actor_name, v_actor_avatar
+    from public.profiles pr where pr.id = new.author_id;
+  v_title := left(coalesce(nullif(trim(v_post.title), ''), v_post.body), 120);
+
+  for m in select (regexp_matches(new.body, '@\[[^\]]{1,80}\]\(([0-9a-fA-F-]{36})\)', 'g'))[1] loop
+    exit when coalesce(array_length(v_done, 1), 0) >= 10;
+    begin
+      v_uid := m::uuid;
+    exception when others then
+      continue;
+    end;
+    if v_uid <> new.author_id
+       and not (v_uid = any(v_done))
+       -- Target must be MENTIONABLE (the search_community_members bar:
+       -- named + approved-or-admin) — never an arbitrary/blocked uuid.
+       and exists (select 1 from public.profiles pr2
+                    where pr2.id = v_uid
+                      and coalesce(nullif(trim(pr2.full_name), ''), '') <> ''
+                      and (pr2.is_admin or pr2.approval_status = 'approved'))
+       -- Target must be able to ACCESS this space — a cross-space uuid
+       -- pasted into the body notifies nobody.
+       and new.space_id in (select public.user_community_space_ids(v_uid))
+       -- Collapse repeats: at most one UNREAD entry per actor/post/kind —
+       -- this also caps the flood a scripted commenter could generate.
+       and not exists (select 1 from public.community_notifications n
+                        where n.user_id = v_uid and n.actor_id = new.author_id
+                          and n.post_id = new.post_id and n.kind = 'mention'
+                          and n.read_at is null) then
+      v_done := v_done || v_uid;
+      insert into public.community_notifications
+        (user_id, kind, actor_id, actor_name, actor_avatar_url, post_id, comment_id, post_title, space_id)
+      values (v_uid, 'mention', new.author_id, v_actor_name, v_actor_avatar, new.post_id, new.id, v_title, new.space_id);
+    end if;
+  end loop;
+
+  if v_post.author_id <> new.author_id and not (v_post.author_id = any(v_done))
+     and not exists (select 1 from public.community_notifications n
+                      where n.user_id = v_post.author_id and n.actor_id = new.author_id
+                        and n.post_id = new.post_id and n.kind = 'reply'
+                        and n.read_at is null) then
+    insert into public.community_notifications
+      (user_id, kind, actor_id, actor_name, actor_avatar_url, post_id, comment_id, post_title, space_id)
+    values (v_post.author_id, 'reply', new.author_id, v_actor_name, v_actor_avatar, new.post_id, new.id, v_title, new.space_id);
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function public.community_notify_on_comment() from public, anon, authenticated;
+
+create or replace function public.community_notify_on_post()
+returns trigger
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_actor_name   text;
+  v_actor_avatar text;
+  v_title        text;
+  v_done         uuid[] := array[]::uuid[];
+  v_uid          uuid;
+  m              text;
+begin
+  if new.status <> 'active' then return new; end if;
+  select coalesce(nullif(trim(pr.full_name), ''), pr.email, 'Member'), pr.avatar_url
+    into v_actor_name, v_actor_avatar
+    from public.profiles pr where pr.id = new.author_id;
+  v_title := left(coalesce(nullif(trim(new.title), ''), new.body), 120);
+
+  for m in select (regexp_matches(new.body, '@\[[^\]]{1,80}\]\(([0-9a-fA-F-]{36})\)', 'g'))[1] loop
+    exit when coalesce(array_length(v_done, 1), 0) >= 10;
+    begin
+      v_uid := m::uuid;
+    exception when others then
+      continue;
+    end;
+    if v_uid <> new.author_id
+       and not (v_uid = any(v_done))
+       -- Same mentionable-target + space-access + unread-collapse rules as
+       -- the comment trigger above.
+       and exists (select 1 from public.profiles pr2
+                    where pr2.id = v_uid
+                      and coalesce(nullif(trim(pr2.full_name), ''), '') <> ''
+                      and (pr2.is_admin or pr2.approval_status = 'approved'))
+       and new.space_id in (select public.user_community_space_ids(v_uid))
+       and not exists (select 1 from public.community_notifications n
+                        where n.user_id = v_uid and n.actor_id = new.author_id
+                          and n.post_id = new.id and n.kind = 'mention'
+                          and n.read_at is null) then
+      v_done := v_done || v_uid;
+      insert into public.community_notifications
+        (user_id, kind, actor_id, actor_name, actor_avatar_url, post_id, post_title, space_id)
+      values (v_uid, 'mention', new.author_id, v_actor_name, v_actor_avatar, new.id, v_title, new.space_id);
+    end if;
+  end loop;
+  return new;
+end;
+$$;
+
+revoke all on function public.community_notify_on_post() from public, anon, authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 14) Replaced RPCs.
+--     community_category_counts(p_space_id default null) — STAYS SECURITY
+--     INVOKER: community_posts_read RLS keeps scoping whatever the caller may
+--     see, so the space filter is a narrowing convenience, not the boundary.
+--     search_community_members(p_query, p_space_id default null) — the mention
+--     directory is now per-space: the CALLER must have access to the space,
+--     and every returned member must be currently eligible for that same
+--     space (default = General). Never returns email.
+--     Old signatures are DROPPED (PostgREST would otherwise see ambiguous
+--     overloads); default params keep the old client's calls resolving.
+-- ───────────────────────────────────────────────────────────────────
+drop function if exists public.community_category_counts();
+create or replace function public.community_category_counts(p_space_id uuid default null)
+returns table (tag_slug text, n bigint)
+language sql stable set search_path = public
+as $$
+  select p.tag_slug, count(*)::bigint
+    from public.community_posts p
+   where p.status = 'active'
+     and (p_space_id is null or p.space_id = p_space_id)
+   group by p.tag_slug;
+$$;
+
+revoke all on function public.community_category_counts(uuid) from public, anon;
+grant execute on function public.community_category_counts(uuid) to authenticated;
+
+drop function if exists public.search_community_members(text);
+create or replace function public.search_community_members(p_query text, p_space_id uuid default null)
+returns table (id uuid, display_name text, avatar_url text)
+language sql stable security definer set search_path = public
+as $$
+  with target as (
+    select coalesce(p_space_id,
+                    (select sp.id from public.community_spaces sp
+                      where sp.kind = 'general' limit 1)) as space_id
+  )
+  select p.id, trim(p.full_name) as display_name, p.avatar_url
+    from public.profiles p, target t
+   where ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled())))
+     -- The caller must have access to the requested space…
+     and (p_space_id is null
+          or p_space_id in (select public.my_community_space_ids()))
+     and nullif(trim(p.full_name), '') is not null
+     and (p.approval_status = 'approved' or p.is_admin)
+     -- …and every hit must be a currently-eligible member of that space.
+     and t.space_id in (select public.user_community_space_ids(p.id))
+     and p.full_name ilike '%' || coalesce(p_query, '') || '%'
+   order by trim(p.full_name)
+   limit 8;
+$$;
+
+revoke all on function public.search_community_members(text, uuid) from public, anon;
+grant execute on function public.search_community_members(text, uuid) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 15) Community RLS — space-aware rewrite. Minimal diff: the original
+--     predicate text is preserved and the space/capability predicates are
+--     ADDED (the membership function embeds approved+enrolled+grace, so the
+--     original gates are now belt-and-braces — kept for review clarity).
+-- ───────────────────────────────────────────────────────────────────
+drop policy if exists community_posts_read on public.community_posts;
+create policy community_posts_read on public.community_posts
+  for select to authenticated
+  using ((select public.is_admin())
+      or (status = 'active'
+          and (select public.is_approved()) and (select public.is_enrolled())
+          and space_id in (select public.my_community_space_ids())));
+
+drop policy if exists community_posts_own_insert on public.community_posts;
+create policy community_posts_own_insert on public.community_posts
+  for insert to authenticated
+  with check (
+    author_id = (select auth.uid())
+    and status = 'active'
+    and (select public.is_approved()) and (select public.is_enrolled())
+    and space_id in (select public.my_community_space_ids())
+    and exists (select 1 from public.community_spaces s
+                 where s.id = space_id and s.member_posting)
+    and not exists (select 1 from public.community_tags t
+                    where t.slug = tag_slug and t.admin_only)
+  );
+
+drop policy if exists community_posts_own_update on public.community_posts;
+create policy community_posts_own_update on public.community_posts
+  for update to authenticated
+  using (author_id = (select auth.uid()) and status <> 'hidden'
+     and ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled())
+           and space_id in (select public.my_community_space_ids()))))
+  with check (
+    author_id = (select auth.uid())
+    and status in ('active','deleted')
+    and ((select public.is_admin())
+      or ((select public.is_approved()) and (select public.is_enrolled())
+          and space_id in (select public.my_community_space_ids())))
+    and not exists (select 1 from public.community_tags t
+                    where t.slug = tag_slug and t.admin_only)
+  );
+
+drop policy if exists community_comments_read on public.community_comments;
+create policy community_comments_read on public.community_comments
+  for select to authenticated
+  using ((select public.is_admin())
+      or (status = 'active'
+          and (select public.is_approved()) and (select public.is_enrolled())
+          and space_id in (select public.my_community_space_ids())
+          and exists (select 1 from public.community_posts p
+                      where p.id = post_id and p.status = 'active')));
+
+-- Member comment INSERTs also require the parent SPACE to permit member
+-- replies (General ships with member_comments = false → posts + reactions
+-- only there; historical replies stay readable). Admins pass via admin_all.
+drop policy if exists community_comments_own_insert on public.community_comments;
+create policy community_comments_own_insert on public.community_comments
+  for insert to authenticated
+  with check (author_id = (select auth.uid())
+          and status = 'active'
+          and (select public.is_approved()) and (select public.is_enrolled())
+          and exists (select 1 from public.community_posts p
+                      join public.community_spaces s on s.id = p.space_id
+                      where p.id = post_id and p.status = 'active'
+                        and not p.comments_locked
+                        and s.member_comments
+                        and p.space_id in (select public.my_community_space_ids())));
+
+drop policy if exists community_comments_own_update on public.community_comments;
+create policy community_comments_own_update on public.community_comments
+  for update to authenticated
+  using (author_id = (select auth.uid()) and status <> 'hidden'
+     and ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled())
+           and space_id in (select public.my_community_space_ids()))))
+  with check (author_id = (select auth.uid()) and status in ('active','deleted')
+    and ((select public.is_admin())
+      or ((select public.is_approved()) and (select public.is_enrolled())
+          and space_id in (select public.my_community_space_ids()))));
+
+drop policy if exists community_reactions_read on public.community_reactions;
+create policy community_reactions_read on public.community_reactions
+  for select to authenticated
+  using ((select public.is_admin())
+      or ((select public.is_approved()) and (select public.is_enrolled())
+          and ((post_id is not null
+                and exists (select 1 from public.community_posts p
+                            where p.id = post_id and p.status = 'active'
+                              and p.space_id in (select public.my_community_space_ids())))
+            or (comment_id is not null
+                and exists (select 1 from public.community_comments c
+                            join public.community_posts p on p.id = c.post_id
+                            where c.id = comment_id and c.status = 'active'
+                              and p.status = 'active'
+                              and p.space_id in (select public.my_community_space_ids()))))));
+
+-- Reaction INSERTs check the target is visible IN AN ACCESSIBLE SPACE and the
+-- space has reactions enabled. Reactions stay allowed on comments_locked
+-- posts — announcements are react-only by design.
+drop policy if exists community_reactions_own_insert on public.community_reactions;
+create policy community_reactions_own_insert on public.community_reactions
+  for insert to authenticated
+  with check (user_id = (select auth.uid())
+          and (select public.is_approved()) and (select public.is_enrolled())
+          and ((post_id is not null
+                and exists (select 1 from public.community_posts p
+                            join public.community_spaces s on s.id = p.space_id
+                            where p.id = post_id and p.status = 'active'
+                              and s.member_reactions
+                              and p.space_id in (select public.my_community_space_ids())))
+            or (comment_id is not null
+                and exists (select 1 from public.community_comments c
+                            join public.community_posts p on p.id = c.post_id
+                            join public.community_spaces s on s.id = p.space_id
+                            where c.id = comment_id and c.status = 'active'
+                              and p.status = 'active'
+                              and s.member_reactions
+                              and p.space_id in (select public.my_community_space_ids())))));
+
+drop policy if exists community_notifications_own_select on public.community_notifications;
+create policy community_notifications_own_select on public.community_notifications
+  for select to authenticated
+  using (user_id = (select auth.uid())
+     and ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled())))
+     and (space_id is null or space_id in (select public.my_community_space_ids())));
+
+drop policy if exists community_notifications_own_update on public.community_notifications;
+create policy community_notifications_own_update on public.community_notifications
+  for update to authenticated
+  using (user_id = (select auth.uid())
+     and ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled())))
+     and (space_id is null or space_id in (select public.my_community_space_ids())))
+  with check (user_id = (select auth.uid()));
+
+drop policy if exists community_announcement_reads_own_insert on public.community_announcement_reads;
+create policy community_announcement_reads_own_insert on public.community_announcement_reads
+  for insert to authenticated
+  with check (user_id = (select auth.uid())
+          and ((select public.is_admin())
+            or ((select public.is_approved()) and (select public.is_enrolled())))
+          and exists (select 1 from public.community_posts p
+                       where p.id = post_id and p.status = 'active'
+                         and p.space_id in (select public.my_community_space_ids())));
+
+drop policy if exists community_attachments_read on public.community_attachments;
+create policy community_attachments_read on public.community_attachments
+  for select to authenticated
+  using ((select public.is_admin())
+      or ((select public.is_approved()) and (select public.is_enrolled())
+          and exists (select 1 from public.community_posts p
+                      where p.id = post_id and p.status = 'active'
+                        and p.space_id in (select public.my_community_space_ids()))));
+
+drop policy if exists community_attachments_own_insert on public.community_attachments;
+create policy community_attachments_own_insert on public.community_attachments
+  for insert to authenticated
+  with check (uploader_id = (select auth.uid())
+          and (select public.is_approved()) and (select public.is_enrolled())
+          and exists (select 1 from public.community_posts p
+                      where p.id = post_id and p.author_id = (select auth.uid())
+                        and p.space_id in (select public.my_community_space_ids())));
+
+drop policy if exists community_post_tags_read on public.community_post_tags;
+create policy community_post_tags_read on public.community_post_tags
+  for select to authenticated
+  using ((select public.is_admin())
+      or ((select public.is_approved()) and (select public.is_enrolled())
+          and exists (select 1 from public.community_posts p
+                      where p.id = post_id and p.status = 'active'
+                        and p.space_id in (select public.my_community_space_ids()))));
+
+drop policy if exists community_post_tags_own_insert on public.community_post_tags;
+create policy community_post_tags_own_insert on public.community_post_tags
+  for insert to authenticated
+  with check ((select public.is_approved()) and (select public.is_enrolled())
+          and exists (select 1 from public.community_posts p
+                      where p.id = post_id and p.author_id = (select auth.uid())
+                        and p.space_id in (select public.my_community_space_ids())));
+
+drop policy if exists community_post_tags_own_delete on public.community_post_tags;
+create policy community_post_tags_own_delete on public.community_post_tags
+  for delete to authenticated
+  using (((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled())))
+     and exists (select 1 from public.community_posts p
+                 where p.id = post_id and p.author_id = (select auth.uid())));
+
+-- ───────────────────────────────────────────────────────────────────
+-- 16) Storage — community-media. READ authorization stays attachment-join
+--     based (never path based), so every legacy <uid>/… file keeps working;
+--     the join simply gains the space predicate. WRITE/DELETE accept BOTH
+--     path shapes: legacy <uid>/… and the new <space_id>/<uid>/… (the new
+--     client uploads under the space prefix; the space segment must be one
+--     the uploader can access).
+-- ───────────────────────────────────────────────────────────────────
+drop policy if exists community_media_read on storage.objects;
+create policy community_media_read on storage.objects
+  for select to authenticated
+  using (bucket_id = 'community-media'
+    and ((select public.is_admin())
+      or ((select public.is_approved()) and (select public.is_enrolled())
+          and exists (select 1 from public.community_attachments a
+                      join public.community_posts p on p.id = a.post_id
+                      where a.storage_path = name and p.status = 'active'
+                        and p.space_id in (select public.my_community_space_ids())))));
+
+drop policy if exists community_media_own_insert on storage.objects;
+create policy community_media_own_insert on storage.objects
+  for insert to authenticated
+  with check (bucket_id = 'community-media'
+    and (select public.is_approved()) and (select public.is_enrolled())
+    and ((storage.foldername(name))[1] = (select auth.uid())::text
+      or ((storage.foldername(name))[2] = (select auth.uid())::text
+          and (storage.foldername(name))[1] ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          and ((storage.foldername(name))[1])::uuid in (select public.my_community_space_ids()))));
+
+drop policy if exists community_media_delete on storage.objects;
+create policy community_media_delete on storage.objects
+  for delete to authenticated
+  using (bucket_id = 'community-media'
+    and ((storage.foldername(name))[1] = (select auth.uid())::text
+      or (storage.foldername(name))[2] = (select auth.uid())::text
+      or (select public.is_admin())));
+
+-- ───────────────────────────────────────────────────────────────────
+-- 17) admin_finalize_enrollment() — the ONE transactional approval. Validates
+--     everything TOGETHER (request status, plan, batch, capacity), then wraps
+--     the existing term RPCs so stacking/supersede/grace/clamp math stays in
+--     exactly one place, then stamps batch + profile cache + request row.
+--     All-or-nothing: any raise rolls the whole approval back and the request
+--     stays pending_review (retryable). Replaces the client's 3-step approve
+--     AND its local-grant fallback (which could bypass batch validation).
+--
+--     Batch resolution (premium segments only; 'general' plans always NULL —
+--     an upgrade DOWN to a general plan clears private visibility):
+--       explicit p_batch_id
+--       → renewal/extension: the current subscription's batch
+--       → upgrade: the current batch IF the target segment has an active
+--         space there (gold↔vip same-batch switch), else fall through
+--       → the batch chosen at checkout (request.batch_id)
+--       → error: 'select an open batch'.
+--     Extensions must NOT move batches (p_batch_id ≠ current → error).
+--     A NEW batch assignment requires the batch OPEN; staying in the same
+--     batch is allowed unless the batch is archived. Capacity (if set) is
+--     counted under a FOR UPDATE batch lock — concurrency-safe.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.admin_finalize_enrollment(
+  p_request_id uuid,
+  p_batch_id   uuid default null
+)
+returns jsonb
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_req       public.enrollment_requests%rowtype;
+  v_prev      public.subscriptions%rowtype;
+  v_new       public.subscriptions%rowtype;
+  v_plan      public.enrollment_plans%rowtype;
+  v_kind      text;
+  v_eff_plan  text;
+  v_segment   text;
+  v_prev_segment text;
+  v_batch     uuid;
+  v_batch_row public.batches%rowtype;
+  v_new_assignment boolean;
+  v_cap       int;
+  v_used      int;
+begin
+  if not public.is_admin() then
+    raise exception 'admin_finalize_enrollment: admin only';
+  end if;
+
+  select * into v_req from public.enrollment_requests
+   where id = p_request_id for update;
+  if v_req.id is null then
+    raise exception 'admin_finalize_enrollment: request not found';
+  end if;
+
+  -- Idempotency: re-approving an approved request is a no-op.
+  if v_req.status = 'approved' then
+    return jsonb_build_object('ok', true, 'already', true);
+  end if;
+  if v_req.status <> 'pending_review' then
+    raise exception 'admin_finalize_enrollment: request is % — only pending_review can be approved', v_req.status;
+  end if;
+
+  v_kind := coalesce(v_req.request_kind, 'new');
+
+  select * into v_prev from public.subscriptions
+   where user_id = v_req.user_id
+   order by created_at desc limit 1;
+
+  -- Effective plan: extensions stay on the member's CURRENT plan.
+  v_eff_plan := case when v_kind = 'extension'
+                     then coalesce(v_prev.plan_key, v_req.plan_key)
+                     else v_req.plan_key end;
+
+  select * into v_plan from public.enrollment_plans where key = v_eff_plan;
+  if v_plan.key is null then
+    raise exception 'admin_finalize_enrollment: unknown plan %', v_eff_plan;
+  end if;
+  -- New sales require a sellable plan; extensions may continue a retired one.
+  if v_kind <> 'extension' and not v_plan.active then
+    raise exception 'admin_finalize_enrollment: plan % is inactive', v_eff_plan;
+  end if;
+
+  v_segment := coalesce(v_plan.community_segment, 'general');
+  -- The segment the member is CURRENTLY in — a gold→vip (or vip→gold) move is a
+  -- new seat even when the batch is unchanged (see v_new_assignment below).
+  if v_prev.plan_key is not null then
+    select coalesce(ep.community_segment, 'general') into v_prev_segment
+      from public.enrollment_plans ep where ep.key = v_prev.plan_key;
+  end if;
+
+  if v_segment not in ('gold', 'vip') then
+    v_batch := null;
+  else
+    if v_kind in ('renewal', 'extension') then
+      v_batch := coalesce(p_batch_id, v_prev.batch_id, v_req.batch_id);
+      if v_kind = 'extension' and p_batch_id is not null
+         and v_prev.batch_id is not null and p_batch_id <> v_prev.batch_id then
+        raise exception 'admin_finalize_enrollment: an extension keeps the current batch — use the batch manager to move members';
+      end if;
+    elsif v_kind = 'upgrade' then
+      v_batch := p_batch_id;
+      if v_batch is null and v_prev.batch_id is not null
+         and exists (select 1 from public.community_spaces sp
+                      where sp.kind = v_segment and sp.batch_id = v_prev.batch_id and sp.active) then
+        v_batch := v_prev.batch_id;
+      end if;
+      if v_batch is null then v_batch := v_req.batch_id; end if;
+    else
+      v_batch := coalesce(p_batch_id, v_req.batch_id);
+    end if;
+
+    if v_batch is null then
+      raise exception 'admin_finalize_enrollment: % needs a batch — pick an open batch in the approve dialog', v_eff_plan;
+    end if;
+
+    select * into v_batch_row from public.batches where id = v_batch for update;
+    if v_batch_row.id is null then
+      raise exception 'admin_finalize_enrollment: batch not found';
+    end if;
+
+    -- A NEW assignment = no prior term, a different batch, OR a different
+    -- segment in the same batch (gold→vip takes a VIP seat it never held, so
+    -- it must pass the open-batch + VIP-capacity checks like any new member).
+    v_new_assignment := (v_prev.id is null
+                         or v_prev.batch_id is distinct from v_batch
+                         or v_prev_segment is distinct from v_segment);
+    if v_batch_row.status = 'archived' then
+      raise exception 'admin_finalize_enrollment: batch % is archived', v_batch_row.code;
+    end if;
+    if v_new_assignment and v_batch_row.status <> 'open' then
+      raise exception 'admin_finalize_enrollment: batch % is closed to new assignments', v_batch_row.code;
+    end if;
+    if not exists (select 1 from public.community_spaces sp
+                    where sp.kind = v_segment and sp.batch_id = v_batch and sp.active) then
+      raise exception 'admin_finalize_enrollment: batch % has no active % space', v_batch_row.code, v_segment;
+    end if;
+
+    v_cap := case v_segment when 'gold' then v_batch_row.gold_capacity
+                            else v_batch_row.vip_capacity end;
+    if v_cap is not null and v_new_assignment then
+      select count(*) into v_used
+        from public.subscriptions s
+        join public.enrollment_plans ep on ep.key = s.plan_key
+       where s.status = 'active'
+         and s.batch_id = v_batch
+         and ep.community_segment = v_segment
+         and s.user_id <> v_req.user_id
+         and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now());
+      if v_used >= v_cap then
+        raise exception 'admin_finalize_enrollment: batch % is full for % (% of % seats)', v_batch_row.code, v_segment, v_used, v_cap;
+      end if;
+    end if;
+  end if;
+
+  -- Grant the term through the EXISTING functions (stacking / supersede /
+  -- grace / 60–365 clamp / legacy-lifetime guard all live there).
+  if v_kind = 'extension' then
+    if v_req.extension_days is null or v_req.extension_days <= 0 then
+      raise exception 'admin_finalize_enrollment: extension request has no extension_days';
+    end if;
+    v_new := public.approve_extension(v_req.user_id, v_req.id, v_req.extension_days);
+  else
+    v_new := public.approve_subscription(v_req.user_id, v_req.plan_key, v_req.id);
+  end if;
+
+  update public.subscriptions
+     set batch_id = v_batch, updated_at = now()
+   where id = v_new.id;
+
+  -- Profile cache (mirrors the old client step ②).
+  update public.profiles
+     set is_paid = true,
+         plan = v_eff_plan,
+         approval_status = 'approved',
+         approved_at = now(),
+         approved_by = auth.uid(),
+         rejected_at = null,
+         rejected_by = null,
+         rejection_reason = null,
+         updated_at = now()
+   where id = v_req.user_id;
+
+  -- Request row (mirrors the old client step ③) + the resolved batch.
+  update public.enrollment_requests
+     set status = 'approved',
+         rejection_reason = null,
+         reviewed_at = now(),
+         reviewed_by = auth.uid(),
+         batch_id = v_batch,
+         updated_at = now()
+   where id = v_req.id;
+
+  return jsonb_build_object(
+    'ok', true,
+    'subscription_id', v_new.id,
+    'ends_at', v_new.ends_at,
+    'batch_id', v_batch,
+    'batch_code', (select code from public.batches where id = v_batch)
+  );
+end;
+$$;
+
+revoke all on function public.admin_finalize_enrollment(uuid, uuid) from public, anon;
+grant execute on function public.admin_finalize_enrollment(uuid, uuid) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 18) admin_assign_batch() — the "needs batch assignment" queue action:
+--     idempotent bulk (re)assignment of ACTIVE premium subscriptions into an
+--     OPEN batch, capacity-checked under the batch lock, one audit row per
+--     actual change. Skips (with a reason) rather than fails per member.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.admin_assign_batch(
+  p_user_ids uuid[],
+  p_batch_id uuid
+)
+returns jsonb
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_batch    public.batches%rowtype;
+  v_uid      uuid;
+  v_sub      record;
+  v_segment  text;
+  v_cap      int;
+  v_used     int;
+  v_assigned int := 0;
+  v_skipped  jsonb := '[]'::jsonb;
+begin
+  if not public.is_admin() then
+    raise exception 'admin_assign_batch: admin only';
+  end if;
+
+  select * into v_batch from public.batches where id = p_batch_id for update;
+  if v_batch.id is null then
+    raise exception 'admin_assign_batch: batch not found';
+  end if;
+  if v_batch.status <> 'open' then
+    raise exception 'admin_assign_batch: batch % is % — only open batches accept assignments', v_batch.code, v_batch.status;
+  end if;
+
+  foreach v_uid in array p_user_ids loop
+    select s.id, s.batch_id, s.plan_key, ep.community_segment
+      into v_sub
+      from public.subscriptions s
+      join public.enrollment_plans ep on ep.key = s.plan_key
+     where s.user_id = v_uid and s.status = 'active'
+       and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+     order by s.created_at desc limit 1;
+
+    if v_sub.id is null then
+      v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'no_active_subscription');
+      continue;
+    end if;
+    v_segment := coalesce(v_sub.community_segment, 'general');
+    if v_segment not in ('gold', 'vip') then
+      v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'not_a_premium_plan');
+      continue;
+    end if;
+    if v_sub.batch_id = p_batch_id then
+      v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'already_assigned');
+      continue;
+    end if;
+    if not exists (select 1 from public.community_spaces sp
+                    where sp.kind = v_segment and sp.batch_id = p_batch_id and sp.active) then
+      v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'no_space_for_segment');
+      continue;
+    end if;
+
+    v_cap := case v_segment when 'gold' then v_batch.gold_capacity else v_batch.vip_capacity end;
+    if v_cap is not null then
+      select count(*) into v_used
+        from public.subscriptions s
+        join public.enrollment_plans ep on ep.key = s.plan_key
+       where s.status = 'active' and s.batch_id = p_batch_id
+         and ep.community_segment = v_segment
+         and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now());
+      if v_used >= v_cap then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'batch_full');
+        continue;
+      end if;
+    end if;
+
+    update public.subscriptions
+       set batch_id = p_batch_id, updated_at = now()
+     where id = v_sub.id;
+
+    insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+    values (p_batch_id, v_uid, auth.uid(),
+            case when v_sub.batch_id is null then 'assign' else 'reassign' end,
+            jsonb_build_object('subscription_id', v_sub.id, 'segment', v_segment,
+                               'from_batch_id', v_sub.batch_id, 'to_batch_id', p_batch_id));
+    v_assigned := v_assigned + 1;
+  end loop;
+
+  return jsonb_build_object('ok', true, 'assigned', v_assigned, 'skipped', v_skipped);
+end;
+$$;
+
+revoke all on function public.admin_assign_batch(uuid[], uuid) from public, anon;
+grant execute on function public.admin_assign_batch(uuid[], uuid) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 19) admin_batch_overview() — per-batch active enrollment counts vs
+--     capacity for the batch manager table. (The "needs batch assignment"
+--     queue is a plain admin REST query — premium-segment active subs with
+--     batch_id IS NULL — so it isn't duplicated here.)
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.admin_batch_overview()
+returns table (
+  batch_id uuid, code text, name text, status text,
+  starts_on date, ends_on date,
+  gold_active bigint, vip_active bigint,
+  gold_capacity int, vip_capacity int
+)
+language plpgsql stable security definer set search_path = public
+as $$
+begin
+  if not public.is_admin() then
+    raise exception 'admin_batch_overview: admin only';
+  end if;
+  return query
+  select b.id, b.code, b.name, b.status, b.starts_on, b.ends_on,
+         count(*) filter (where ep.community_segment = 'gold')::bigint as gold_active,
+         count(*) filter (where ep.community_segment = 'vip')::bigint  as vip_active,
+         b.gold_capacity, b.vip_capacity
+    from public.batches b
+    left join public.subscriptions s
+      on s.batch_id = b.id and s.status = 'active'
+     and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+    left join public.enrollment_plans ep on ep.key = s.plan_key
+   group by b.id
+   order by b.code desc;
+end;
+$$;
+
+revoke all on function public.admin_batch_overview() from public, anon;
+grant execute on function public.admin_batch_overview() to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 20) Refresh PostgREST's schema cache so the new tables/columns/RPCs are
+--     visible immediately.
+-- ───────────────────────────────────────────────────────────────────
+notify pgrst, 'reload schema';
+
+-- ═══════════════════════════════════════════════════════════════════
+-- AFTER RUNNING
+--   1. Verify:  select code, status from public.batches;
+--               select slug, kind, member_comments from public.community_spaces order by slug;
+--               select count(*) from public.community_posts where space_id is null;   -- 0
+--   2. Deploy the matching client build (space switcher, batch pickers,
+--      single-RPC approve, admin batch manager).
+--   3. Admin → Batches: confirm "August 2026" (2026-08) + set capacities if
+--      you want seat limits enforced at approval.
+--   4. Existing premium members granted OUTSIDE admin_finalize_enrollment
+--      (SQL editor / imports without batch_code) appear in the "Needs batch
+--      assignment" queue — assign them from the batch manager.
+-- ═══════════════════════════════════════════════════════════════════
+
+-- Record this migration (see db/2026-07-26-schema-migrations-log.sql #31).
+insert into public.schema_migrations (filename, checksum, notes)
+values ('2026-07-28-community-spaces-batches.sql', null,
+        'community spaces + batches (#32); checksum of the repo file — see git')
+on conflict (filename) do nothing;
+
+-- ═══════════════════════════════════════════════════════════════════
+-- #33 — Community batch hardening (follow-up to #32)
+--
+-- WHY
+--   Independent review of #32 (already applied to production) surfaced four
+--   correctness/robustness gaps. All are additive fixes to objects #32 created;
+--   nothing here changes the segmentation model or the access matrix.
+--
+-- WHAT
+--   1. admin_finalize_enrollment(): the capacity + closed-batch checks keyed on
+--      "is the batch/segment CHANGING?" when the real question is "does this
+--      member currently OCCUPY a counted seat?". A member whose term expired
+--      still matched their old batch+segment, so renewing them skipped both the
+--      open-batch check and the seat count — while their expired row was NOT
+--      counted in v_used. A 10-seat batch could reach 11 active members, and a
+--      closed batch silently accepted returning members.
+--   2. community_attachments_own_insert did not constrain storage_path. Because
+--      community_media_read authorizes an object by "some attachment row on a
+--      visible post points at this path", a member could create an attachment on
+--      their OWN General post pointing at a Gold object path and unlock reads on
+--      it. Not exploitable today (paths carry a random uuid and are unlistable),
+--      but it made path secrecy load-bearing for the privacy boundary.
+--   3. search_community_members() called the SECURITY DEFINER SRF
+--      user_community_space_ids(p.id) once per candidate row. p_query = '' matches
+--      every profile, and the RPC is directly callable by any member.
+--   4. Minor hardening: notifications UPDATE narrowed to read_at (a member could
+--      null their own space_id, which the SELECT policy treats as visible);
+--      the three own-DELETE policies brought into the space model; a month-range
+--      CHECK on batches.code; the missing FK index; and a safer uuid cast.
+--
+-- ORDER
+--   Run AFTER db/2026-07-28-community-spaces-batches.sql (#32).
+--   Idempotent and re-runnable. Additive only — no data is modified except the
+--   batches.code CHECK (validated against existing rows before it is added).
+-- ═══════════════════════════════════════════════════════════════════
+
+-- ───────────────────────────────────────────────────────────────────
+-- 0) Guards
+-- ───────────────────────────────────────────────────────────────────
+do $$
+begin
+  if to_regclass('public.batches') is null or to_regclass('public.community_spaces') is null then
+    raise exception '#33 requires db/2026-07-28-community-spaces-batches.sql (#32) first.';
+  end if;
+  if to_regproc('public.admin_finalize_enrollment') is null then
+    raise exception '#33 requires admin_finalize_enrollment (#32) first.';
+  end if;
+  if to_regclass('public.schema_migrations') is null then
+    raise exception '#33 requires db/2026-07-26-schema-migrations-log.sql (#31) first — the tail insert would otherwise abort the whole migration.';
+  end if;
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 1) admin_finalize_enrollment — seat-occupancy semantics.
+--
+--    ⚠ SUPERSEDED BY #34 (db/2026-07-29-batch-hardening-followup.sql).
+--    This version's tail was reconstructed rather than copied from #32 and
+--    silently dropped `updated_at = now()` (×3), `rejected_at`/`rejected_by`
+--    clearing, `rejection_reason = null` on the request, and changed
+--    `approved_at`/`approved_by` to first-approval semantics. #34 restores
+--    #32's body verbatim and re-applies ONLY the v_holds_seat change below.
+--    If you are applying this file fresh, apply #34 immediately after.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.admin_finalize_enrollment(
+  p_request_id uuid,
+  p_batch_id   uuid default null
+)
+returns jsonb
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_req       public.enrollment_requests%rowtype;
+  v_prev      public.subscriptions%rowtype;
+  v_new       public.subscriptions%rowtype;
+  v_plan      public.enrollment_plans%rowtype;
+  v_kind      text;
+  v_eff_plan  text;
+  v_segment   text;
+  v_prev_segment text;
+  v_batch     uuid;
+  v_batch_row public.batches%rowtype;
+  v_holds_seat boolean;
+  v_new_assignment boolean;
+  v_cap       int;
+  v_used      int;
+  v_code      text;
+begin
+  if not public.is_admin() then
+    raise exception 'admin_finalize_enrollment: admin only';
+  end if;
+
+  select * into v_req from public.enrollment_requests
+   where id = p_request_id for update;
+  if v_req.id is null then
+    raise exception 'admin_finalize_enrollment: request not found';
+  end if;
+
+  -- Idempotency: re-approving an approved request is a no-op.
+  if v_req.status = 'approved' then
+    return jsonb_build_object('ok', true, 'already', true);
+  end if;
+  if v_req.status <> 'pending_review' then
+    raise exception 'admin_finalize_enrollment: request is % — only pending_review can be approved', v_req.status;
+  end if;
+
+  v_kind := coalesce(v_req.request_kind, 'new');
+
+  select * into v_prev from public.subscriptions
+   where user_id = v_req.user_id
+   order by created_at desc limit 1;
+
+  -- Effective plan: extensions stay on the member's CURRENT plan.
+  v_eff_plan := case when v_kind = 'extension'
+                     then coalesce(v_prev.plan_key, v_req.plan_key)
+                     else v_req.plan_key end;
+
+  select * into v_plan from public.enrollment_plans where key = v_eff_plan;
+  if v_plan.key is null then
+    raise exception 'admin_finalize_enrollment: unknown plan %', v_eff_plan;
+  end if;
+  -- New sales require a sellable plan; extensions may continue a retired one.
+  if v_kind <> 'extension' and not v_plan.active then
+    raise exception 'admin_finalize_enrollment: plan % is inactive', v_eff_plan;
+  end if;
+
+  v_segment := coalesce(v_plan.community_segment, 'general');
+  if v_prev.plan_key is not null then
+    select coalesce(ep.community_segment, 'general') into v_prev_segment
+      from public.enrollment_plans ep where ep.key = v_prev.plan_key;
+  end if;
+
+  if v_segment not in ('gold', 'vip') then
+    v_batch := null;
+  else
+    if v_kind in ('renewal', 'extension') then
+      v_batch := coalesce(p_batch_id, v_prev.batch_id, v_req.batch_id);
+      if v_kind = 'extension' and p_batch_id is not null
+         and v_prev.batch_id is not null and p_batch_id <> v_prev.batch_id then
+        raise exception 'admin_finalize_enrollment: an extension keeps the current batch — use the batch manager to move members';
+      end if;
+    elsif v_kind = 'upgrade' then
+      v_batch := p_batch_id;
+      if v_batch is null and v_prev.batch_id is not null
+         and exists (select 1 from public.community_spaces sp
+                      where sp.kind = v_segment and sp.batch_id = v_prev.batch_id and sp.active) then
+        v_batch := v_prev.batch_id;
+      end if;
+      if v_batch is null then v_batch := v_req.batch_id; end if;
+    else
+      v_batch := coalesce(p_batch_id, v_req.batch_id);
+    end if;
+
+    if v_batch is null then
+      raise exception 'admin_finalize_enrollment: % needs a batch — pick an open batch in the approve dialog', v_eff_plan;
+    end if;
+
+    select * into v_batch_row from public.batches where id = v_batch for update;
+    if v_batch_row.id is null then
+      raise exception 'admin_finalize_enrollment: batch not found';
+    end if;
+
+    -- #33: does this member CURRENTLY occupy a seat in this batch+segment? The
+    -- predicate deliberately mirrors the v_used count below (status + the
+    -- is_enrolled() date math), because the two answer the same question from
+    -- opposite sides. Keying on "is the batch changing?" instead — as #32 did —
+    -- let an EXPIRED member of this batch renew while being counted by nobody:
+    -- they skipped the open-batch and capacity checks, yet their expired row was
+    -- excluded from v_used, so the batch could exceed its stated capacity.
+    v_holds_seat := (v_prev.id is not null
+                     and v_prev.status = 'active'
+                     and (v_prev.ends_at is null or coalesce(v_prev.grace_ends_at, v_prev.ends_at) > now())
+                     and v_prev.batch_id is not distinct from v_batch
+                     and v_prev_segment is not distinct from v_segment);
+    v_new_assignment := not v_holds_seat;
+
+    if v_batch_row.status = 'archived' then
+      raise exception 'admin_finalize_enrollment: batch % is archived', v_batch_row.code;
+    end if;
+    if v_new_assignment and v_batch_row.status <> 'open' then
+      raise exception 'admin_finalize_enrollment: batch % is closed to new assignments', v_batch_row.code;
+    end if;
+    if not exists (select 1 from public.community_spaces sp
+                    where sp.kind = v_segment and sp.batch_id = v_batch and sp.active) then
+      raise exception 'admin_finalize_enrollment: batch % has no active % space', v_batch_row.code, v_segment;
+    end if;
+
+    v_cap := case v_segment when 'gold' then v_batch_row.gold_capacity
+                            else v_batch_row.vip_capacity end;
+    if v_cap is not null and v_new_assignment then
+      select count(*) into v_used
+        from public.subscriptions s
+        join public.enrollment_plans ep on ep.key = s.plan_key
+       where s.status = 'active'
+         and s.batch_id = v_batch
+         and ep.community_segment = v_segment
+         and s.user_id <> v_req.user_id
+         and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now());
+      if v_used >= v_cap then
+        raise exception 'admin_finalize_enrollment: batch % is full for % (% of % seats)', v_batch_row.code, v_segment, v_used, v_cap;
+      end if;
+    end if;
+  end if;
+
+  -- Grant the term through the EXISTING functions (stacking / supersede /
+  -- grace / 60–365 clamp / legacy-lifetime guard all live there).
+  if v_kind = 'extension' then
+    if v_req.extension_days is null or v_req.extension_days <= 0 then
+      raise exception 'admin_finalize_enrollment: extension request has no extension_days';
+    end if;
+    perform public.approve_extension(v_req.user_id, p_request_id, v_req.extension_days);
+  else
+    perform public.approve_subscription(v_req.user_id, v_eff_plan, p_request_id);
+  end if;
+
+  select * into v_new from public.subscriptions
+   where user_id = v_req.user_id
+   order by created_at desc limit 1;
+
+  -- Stamp the batch on the granted term (no triggers on subscriptions).
+  if v_new.id is not null then
+    update public.subscriptions set batch_id = v_batch where id = v_new.id;
+  end if;
+
+  -- Profile cache (is_paid/plan are caches; is_enrolled() is the authority).
+  update public.profiles
+     set is_paid = true,
+         plan = v_eff_plan,
+         approval_status = 'approved',
+         approved_at = coalesce(approved_at, now()),
+         approved_by = coalesce(approved_by, auth.uid()),
+         rejection_reason = null
+   where id = v_req.user_id;
+
+  update public.enrollment_requests
+     set status = 'approved',
+         reviewed_at = now(),
+         reviewed_by = auth.uid(),
+         batch_id = v_batch
+   where id = p_request_id;
+
+  select code into v_code from public.batches where id = v_batch;
+
+  return jsonb_build_object(
+    'ok', true,
+    'already', false,
+    'subscription_id', v_new.id,
+    'ends_at', v_new.ends_at,
+    'batch_id', v_batch,
+    'batch_code', v_code
+  );
+end $$;
+
+revoke all on function public.admin_finalize_enrollment(uuid, uuid) from public, anon;
+grant execute on function public.admin_finalize_enrollment(uuid, uuid) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 2) community_attachments_own_insert — bind storage_path to the uploader
+--    and (for new-style paths) to the post's space, so an attachment row can
+--    never be pointed at another space's object to unlock reads on it.
+--    Both path shapes stay valid: legacy <uid>/… and #32's <space_id>/<uid>/…
+-- ───────────────────────────────────────────────────────────────────
+drop policy if exists community_attachments_own_insert on public.community_attachments;
+create policy community_attachments_own_insert on public.community_attachments
+  for insert to authenticated
+  with check (uploader_id = (select auth.uid())
+          and (select public.is_approved()) and (select public.is_enrolled())
+          and exists (select 1 from public.community_posts p
+                      where p.id = community_attachments.post_id
+                        and p.author_id = (select auth.uid())
+                        and p.space_id in (select public.my_community_space_ids())
+                        and (community_attachments.storage_path is null
+                             or (storage.foldername(community_attachments.storage_path))[1] = (select auth.uid())::text
+                             or ((storage.foldername(community_attachments.storage_path))[1] = p.space_id::text
+                                 and (storage.foldername(community_attachments.storage_path))[2] = (select auth.uid())::text))));
+
+-- ───────────────────────────────────────────────────────────────────
+-- 3) search_community_members — set-based eligibility instead of a
+--    SECURITY DEFINER SRF invoked once per candidate row.
+--    Same contract: name + avatar only (NEVER email), ≤8 rows, caller must
+--    have access to the space, hits must be currently-eligible members of it.
+--    Admins stay mentionable everywhere (matching #32, where
+--    user_community_space_ids returns every space for an admin).
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.search_community_members(
+  p_query    text,
+  p_space_id uuid default null
+)
+returns table (id uuid, display_name text, avatar_url text)
+language sql stable security definer set search_path = public
+as $$
+  with target as (
+    select coalesce(p_space_id,
+                    (select sp.id from public.community_spaces sp
+                      where sp.kind = 'general' limit 1)) as space_id
+  ),
+  tgt as (
+    select sp.id, sp.kind, sp.batch_id
+      from public.community_spaces sp, target t
+     where sp.id = t.space_id
+  ),
+  valid_subs as (
+    select distinct on (s.user_id) s.user_id, s.plan_key, s.batch_id
+      from public.subscriptions s
+     where s.status = 'active'
+       and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+     order by s.user_id, s.created_at desc
+  ),
+  eligible as (
+    select v.user_id, coalesce(ep.community_segment, 'general') as segment, v.batch_id
+      from valid_subs v
+      join public.profiles p on p.id = v.user_id
+      left join public.enrollment_plans ep on ep.key = v.plan_key
+     where (p.approval_status = 'approved' or p.is_admin)
+    union
+    -- legacy grandfathers (is_paid, zero subscription rows → General)
+    select p.id, 'general', null::uuid
+      from public.profiles p
+     where p.is_paid
+       and (p.approval_status = 'approved' or p.is_admin)
+       and not exists (select 1 from public.subscriptions s2 where s2.user_id = p.id)
+  )
+  select p.id, trim(p.full_name) as display_name, p.avatar_url
+    from public.profiles p
+    left join eligible e on e.user_id = p.id
+    cross join tgt
+   where ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled())))
+     -- The caller must have access to the requested space…
+     and (p_space_id is null
+          or p_space_id in (select public.my_community_space_ids()))
+     and nullif(trim(p.full_name), '') is not null
+     and (p.approval_status = 'approved' or p.is_admin)
+     -- …and every hit must be an admin (mentionable everywhere) or a currently
+     -- eligible member of THIS space.
+     and (p.is_admin
+          or (e.user_id is not null
+              and case when tgt.kind = 'general' then true
+                       else e.segment = tgt.kind and e.batch_id = tgt.batch_id end))
+     and p.full_name ilike '%' || coalesce(p_query, '') || '%'
+   order by trim(p.full_name)
+   limit 8;
+$$;
+
+revoke all on function public.search_community_members(text, uuid) from public, anon;
+grant execute on function public.search_community_members(text, uuid) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 4) Notifications — a member may only mark their own row read.
+--    The #32 UPDATE policy pinned user_id but left every other column writable,
+--    so a member could null their own space_id, which the SELECT policy
+--    (space_id is null or space_id in …) then treats as visible. Column-level
+--    privileges are the right tool; the policy stays as the row-level guard.
+-- ───────────────────────────────────────────────────────────────────
+revoke update on public.community_notifications from authenticated;
+grant update (read_at) on public.community_notifications to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 5) Own-DELETE policies — bring the last three into the space model, so a
+--    member who has left a space cannot keep deleting their rows inside it.
+--    (Own rows only, so this was never a read leak — just an inconsistency
+--    with the SELECT/INSERT/UPDATE policies #32 already scoped.)
+-- ───────────────────────────────────────────────────────────────────
+drop policy if exists community_post_tags_own_delete on public.community_post_tags;
+create policy community_post_tags_own_delete on public.community_post_tags
+  for delete to authenticated
+  using (((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled())))
+     and exists (select 1 from public.community_posts p
+                 where p.id = community_post_tags.post_id
+                   and p.author_id = (select auth.uid())
+                   and p.space_id in (select public.my_community_space_ids())));
+
+drop policy if exists community_reactions_own_delete on public.community_reactions;
+create policy community_reactions_own_delete on public.community_reactions
+  for delete to authenticated
+  using (user_id = (select auth.uid())
+     and ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled())))
+     and (
+       (community_reactions.post_id is not null
+        and exists (select 1 from public.community_posts p
+                    where p.id = community_reactions.post_id
+                      and p.space_id in (select public.my_community_space_ids())))
+       or
+       (community_reactions.comment_id is not null
+        and exists (select 1 from public.community_comments c
+                    join public.community_posts p on p.id = c.post_id
+                    where c.id = community_reactions.comment_id
+                      and p.space_id in (select public.my_community_space_ids())))
+     ));
+
+drop policy if exists community_attachments_own_delete on public.community_attachments;
+create policy community_attachments_own_delete on public.community_attachments
+  for delete to authenticated
+  using (uploader_id = (select auth.uid())
+     and ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled())))
+     and exists (select 1 from public.community_posts p
+                 where p.id = community_attachments.post_id
+                   and p.space_id in (select public.my_community_space_ids())));
+
+-- ───────────────────────────────────────────────────────────────────
+-- 6) community_media_own_insert — evaluate the uuid cast only when the regex
+--    already matched. Postgres does not guarantee left-to-right AND evaluation,
+--    so a plan change could turn a clean policy denial into
+--    "invalid input syntax for type uuid" (a 500 instead of a 403).
+-- ───────────────────────────────────────────────────────────────────
+drop policy if exists community_media_own_insert on storage.objects;
+create policy community_media_own_insert on storage.objects
+  for insert to authenticated
+  with check (bucket_id = 'community-media'
+          and (select public.is_approved()) and (select public.is_enrolled())
+          and (
+            -- legacy <uid>/…
+            (storage.foldername(name))[1] = (select auth.uid())::text
+            or
+            -- #32 <space_id>/<uid>/…
+            ((storage.foldername(name))[2] = (select auth.uid())::text
+             and (case when (storage.foldername(name))[1] ~
+                            '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                       then ((storage.foldername(name))[1])::uuid
+                       else null end) in (select public.my_community_space_ids()))
+          ));
+
+-- ───────────────────────────────────────────────────────────────────
+-- 7) batches.code — reject an impossible month (#32 accepted 2026-13/2026-99,
+--    and batches_create_spaces() would happily mint gold-2026-99).
+--    Validated against existing rows first so the migration cannot fail
+--    mid-way on a database that already holds a bad code.
+-- ───────────────────────────────────────────────────────────────────
+do $$
+declare
+  v_bad int;
+  v_con text;
+begin
+  select count(*) into v_bad from public.batches
+   where code !~ '^\d{4}-(0[1-9]|1[0-2])$';
+  if v_bad > 0 then
+    raise warning '#33: % batch code(s) fail the YYYY-MM month range — leaving the old CHECK in place. Fix them, then re-run this file.', v_bad;
+    return;
+  end if;
+  select conname into v_con from pg_constraint
+   where conrelid = 'public.batches'::regclass and contype = 'c'
+     and pg_get_constraintdef(oid) ilike '%code%~%';
+  if v_con is not null then
+    execute format('alter table public.batches drop constraint %I', v_con);
+  end if;
+  alter table public.batches
+    add constraint batches_code_check check (code ~ '^\d{4}-(0[1-9]|1[0-2])$');
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 8) Missing FK-covering index (#29 discipline — every other #32 FK got one).
+-- ───────────────────────────────────────────────────────────────────
+create index if not exists student_import_rows_batch_idx
+  on public.student_import_rows (proposed_batch_id);
+
+-- ───────────────────────────────────────────────────────────────────
+-- 9) Refresh PostgREST's schema cache.
+-- ───────────────────────────────────────────────────────────────────
+notify pgrst, 'reload schema';
+
+-- ═══════════════════════════════════════════════════════════════════
+-- AFTER RUNNING
+--   1. Verify the seat fix — an expired member renewing into a full batch must
+--      now be refused:
+--        select code, status, gold_capacity, vip_capacity from public.batches;
+--   2. Verify the mention directory still returns members:
+--        select * from public.search_community_members('a');
+--   3. Verify a member can still mark a notification read, and nothing else:
+--        \dp public.community_notifications      -- UPDATE only on (read_at)
+-- ═══════════════════════════════════════════════════════════════════
+
+-- Record this migration (see db/2026-07-26-schema-migrations-log.sql #31).
+insert into public.schema_migrations (filename, checksum, notes)
+values ('2026-07-29-community-batch-hardening.sql', null,
+        'community batch hardening (#33): seat-occupancy capacity fix, attachment path binding, set-based member search, notification column grant, own-delete space scoping')
+on conflict (filename) do nothing;
+
+-- ═══════════════════════════════════════════════════════════════════
+-- #34 — Correct #33's admin_finalize_enrollment rewrite + one missed policy
+--
+-- WHY
+--   Review of #33 found that its `create or replace` of admin_finalize_enrollment
+--   claimed "only the v_new_assignment computation changes" but had in fact
+--   reconstructed the function's tail from memory rather than copying #32's,
+--   silently dropping four things:
+--     • `updated_at = now()` on subscriptions, profiles and enrollment_requests
+--     • `rejected_at = null, rejected_by = null` on profiles
+--     • `rejection_reason = null` on enrollment_requests
+--     • `approved_at`/`approved_by` became first-approval (`coalesce(...)`)
+--       instead of most-recent-approval semantics
+--   Consequence: a user who was rejected in Access Requests and later approved
+--   through Enrollments keeps a stale `rejected_at`/`rejection_reason`, and the
+--   admin screens that read those columns show contradictory state.
+--   It also replaced `v_new := approve_*(…)` with a `perform` + re-select, which
+--   is equivalent today but discards the RPCs' own return value for no reason.
+--
+--   This file restores #32's body VERBATIM and re-applies ONLY the intended
+--   change: v_holds_seat / v_new_assignment (see #33 §1 for the rationale —
+--   capacity and closed-batch checks must key on whether the member currently
+--   OCCUPIES a counted seat, not on whether the batch id is changing).
+--
+--   It also gates `community_media_delete`, which #33's own-DELETE sweep missed:
+--   `community_attachments_own_delete` now requires approved + enrolled + space
+--   access, but the storage half did not, so an expired or departed member could
+--   still delete the object while the row delete was refused — leaving dangling
+--   attachment rows and broken media in a feed other members can still read.
+--   (Not a confidentiality issue: both branches already pin the caller's own uid.)
+--
+-- ORDER
+--   Run AFTER db/2026-07-29-community-batch-hardening.sql (#33).
+--   Idempotent, additive, non-destructive.
+-- ═══════════════════════════════════════════════════════════════════
+
+do $$
+begin
+  if to_regproc('public.admin_finalize_enrollment') is null then
+    raise exception '#34 requires #32/#33 (admin_finalize_enrollment) first.';
+  end if;
+  if to_regclass('public.schema_migrations') is null then
+    raise exception '#34 requires db/2026-07-26-schema-migrations-log.sql (#31) first.';
+  end if;
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 1) admin_finalize_enrollment — #32's body, with ONLY the seat fix applied.
+--    Diff vs #32: the v_new_assignment block (marked #33/#34 below). Nothing else.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.admin_finalize_enrollment(
+  p_request_id uuid,
+  p_batch_id   uuid default null
+)
+returns jsonb
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_req       public.enrollment_requests%rowtype;
+  v_prev      public.subscriptions%rowtype;
+  v_new       public.subscriptions%rowtype;
+  v_plan      public.enrollment_plans%rowtype;
+  v_kind      text;
+  v_eff_plan  text;
+  v_segment   text;
+  v_prev_segment text;
+  v_batch     uuid;
+  v_batch_row public.batches%rowtype;
+  v_holds_seat boolean;
+  v_new_assignment boolean;
+  v_cap       int;
+  v_used      int;
+begin
+  if not public.is_admin() then
+    raise exception 'admin_finalize_enrollment: admin only';
+  end if;
+
+  select * into v_req from public.enrollment_requests
+   where id = p_request_id for update;
+  if v_req.id is null then
+    raise exception 'admin_finalize_enrollment: request not found';
+  end if;
+
+  -- Idempotency: re-approving an approved request is a no-op.
+  if v_req.status = 'approved' then
+    return jsonb_build_object('ok', true, 'already', true);
+  end if;
+  if v_req.status <> 'pending_review' then
+    raise exception 'admin_finalize_enrollment: request is % — only pending_review can be approved', v_req.status;
+  end if;
+
+  v_kind := coalesce(v_req.request_kind, 'new');
+
+  select * into v_prev from public.subscriptions
+   where user_id = v_req.user_id
+   order by created_at desc limit 1;
+
+  -- Effective plan: extensions stay on the member's CURRENT plan.
+  v_eff_plan := case when v_kind = 'extension'
+                     then coalesce(v_prev.plan_key, v_req.plan_key)
+                     else v_req.plan_key end;
+
+  select * into v_plan from public.enrollment_plans where key = v_eff_plan;
+  if v_plan.key is null then
+    raise exception 'admin_finalize_enrollment: unknown plan %', v_eff_plan;
+  end if;
+  -- New sales require a sellable plan; extensions may continue a retired one.
+  if v_kind <> 'extension' and not v_plan.active then
+    raise exception 'admin_finalize_enrollment: plan % is inactive', v_eff_plan;
+  end if;
+
+  v_segment := coalesce(v_plan.community_segment, 'general');
+  -- The segment the member is CURRENTLY in — a gold→vip (or vip→gold) move is a
+  -- new seat even when the batch is unchanged (see v_new_assignment below).
+  if v_prev.plan_key is not null then
+    select coalesce(ep.community_segment, 'general') into v_prev_segment
+      from public.enrollment_plans ep where ep.key = v_prev.plan_key;
+  end if;
+
+  if v_segment not in ('gold', 'vip') then
+    v_batch := null;
+  else
+    if v_kind in ('renewal', 'extension') then
+      v_batch := coalesce(p_batch_id, v_prev.batch_id, v_req.batch_id);
+      if v_kind = 'extension' and p_batch_id is not null
+         and v_prev.batch_id is not null and p_batch_id <> v_prev.batch_id then
+        raise exception 'admin_finalize_enrollment: an extension keeps the current batch — use the batch manager to move members';
+      end if;
+    elsif v_kind = 'upgrade' then
+      v_batch := p_batch_id;
+      if v_batch is null and v_prev.batch_id is not null
+         and exists (select 1 from public.community_spaces sp
+                      where sp.kind = v_segment and sp.batch_id = v_prev.batch_id and sp.active) then
+        v_batch := v_prev.batch_id;
+      end if;
+      if v_batch is null then v_batch := v_req.batch_id; end if;
+    else
+      v_batch := coalesce(p_batch_id, v_req.batch_id);
+    end if;
+
+    if v_batch is null then
+      raise exception 'admin_finalize_enrollment: % needs a batch — pick an open batch in the approve dialog', v_eff_plan;
+    end if;
+
+    select * into v_batch_row from public.batches where id = v_batch for update;
+    if v_batch_row.id is null then
+      raise exception 'admin_finalize_enrollment: batch not found';
+    end if;
+
+    -- ── #33/#34: the ONLY behavioral change vs #32 ──────────────────
+    -- Does this member CURRENTLY occupy a seat in this batch+segment? The
+    -- predicate deliberately mirrors the v_used count below (status + the
+    -- is_enrolled() date math) because the two answer the same question from
+    -- opposite sides. #32 keyed on "is the batch changing?", which let an
+    -- EXPIRED member of this batch renew while being counted by nobody: they
+    -- skipped the open-batch and capacity checks, yet their expired row was
+    -- excluded from v_used, so a capped batch could be oversold.
+    -- `is not distinct from` (not `=`) is load-bearing: a NULL batch/segment
+    -- would otherwise make v_holds_seat NULL and silently skip the checks.
+    v_holds_seat := (v_prev.id is not null
+                     and v_prev.status = 'active'
+                     and (v_prev.ends_at is null or coalesce(v_prev.grace_ends_at, v_prev.ends_at) > now())
+                     and v_prev.batch_id is not distinct from v_batch
+                     and v_prev_segment is not distinct from v_segment);
+    v_new_assignment := not v_holds_seat;
+    -- ────────────────────────────────────────────────────────────────
+
+    if v_batch_row.status = 'archived' then
+      raise exception 'admin_finalize_enrollment: batch % is archived', v_batch_row.code;
+    end if;
+    if v_new_assignment and v_batch_row.status <> 'open' then
+      raise exception 'admin_finalize_enrollment: batch % is closed to new assignments', v_batch_row.code;
+    end if;
+    if not exists (select 1 from public.community_spaces sp
+                    where sp.kind = v_segment and sp.batch_id = v_batch and sp.active) then
+      raise exception 'admin_finalize_enrollment: batch % has no active % space', v_batch_row.code, v_segment;
+    end if;
+
+    v_cap := case v_segment when 'gold' then v_batch_row.gold_capacity
+                            else v_batch_row.vip_capacity end;
+    if v_cap is not null and v_new_assignment then
+      select count(*) into v_used
+        from public.subscriptions s
+        join public.enrollment_plans ep on ep.key = s.plan_key
+       where s.status = 'active'
+         and s.batch_id = v_batch
+         and ep.community_segment = v_segment
+         and s.user_id <> v_req.user_id
+         and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now());
+      if v_used >= v_cap then
+        raise exception 'admin_finalize_enrollment: batch % is full for % (% of % seats)', v_batch_row.code, v_segment, v_used, v_cap;
+      end if;
+    end if;
+  end if;
+
+  -- Grant the term through the EXISTING functions (stacking / supersede /
+  -- grace / 60–365 clamp / legacy-lifetime guard all live there).
+  if v_kind = 'extension' then
+    if v_req.extension_days is null or v_req.extension_days <= 0 then
+      raise exception 'admin_finalize_enrollment: extension request has no extension_days';
+    end if;
+    v_new := public.approve_extension(v_req.user_id, v_req.id, v_req.extension_days);
+  else
+    v_new := public.approve_subscription(v_req.user_id, v_req.plan_key, v_req.id);
+  end if;
+
+  update public.subscriptions
+     set batch_id = v_batch, updated_at = now()
+   where id = v_new.id;
+
+  -- Profile cache (mirrors the old client step ②).
+  update public.profiles
+     set is_paid = true,
+         plan = v_eff_plan,
+         approval_status = 'approved',
+         approved_at = now(),
+         approved_by = auth.uid(),
+         rejected_at = null,
+         rejected_by = null,
+         rejection_reason = null,
+         updated_at = now()
+   where id = v_req.user_id;
+
+  -- Request row (mirrors the old client step ③) + the resolved batch.
+  update public.enrollment_requests
+     set status = 'approved',
+         rejection_reason = null,
+         reviewed_at = now(),
+         reviewed_by = auth.uid(),
+         batch_id = v_batch,
+         updated_at = now()
+   where id = v_req.id;
+
+  return jsonb_build_object(
+    'ok', true,
+    'subscription_id', v_new.id,
+    'ends_at', v_new.ends_at,
+    'batch_id', v_batch,
+    'batch_code', (select code from public.batches where id = v_batch)
+  );
+end;
+$$;
+
+revoke all on function public.admin_finalize_enrollment(uuid, uuid) from public, anon;
+grant execute on function public.admin_finalize_enrollment(uuid, uuid) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 2) community_media_delete — match community_attachments_own_delete, so the
+--    row and its object stay deletable (or not) together.
+-- ───────────────────────────────────────────────────────────────────
+drop policy if exists community_media_delete on storage.objects;
+create policy community_media_delete on storage.objects
+  for delete to authenticated
+  using (bucket_id = 'community-media'
+     and ((select public.is_admin())
+       or ((select public.is_approved()) and (select public.is_enrolled())
+           and (
+             -- legacy <uid>/…
+             (storage.foldername(name))[1] = (select auth.uid())::text
+             or
+             -- #32 <space_id>/<uid>/… — must still be a space the caller can see
+             ((storage.foldername(name))[2] = (select auth.uid())::text
+              and (case when (storage.foldername(name))[1] ~
+                             '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                        then ((storage.foldername(name))[1])::uuid
+                        else null end) in (select public.my_community_space_ids()))
+           ))));
+
+notify pgrst, 'reload schema';
+
+-- ═══════════════════════════════════════════════════════════════════
+-- AFTER RUNNING
+--   1. Confirm the restored assignments are back:
+--        select prosrc like '%rejected_at = null%' as clears_rejection,
+--               prosrc like '%v_holds_seat%'      as has_seat_fix
+--          from pg_proc where proname = 'admin_finalize_enrollment';
+--      Both must be true.
+-- ═══════════════════════════════════════════════════════════════════
+
+insert into public.schema_migrations (filename, checksum, notes)
+values ('2026-07-29-batch-hardening-followup.sql', null,
+        'restores #32 body of admin_finalize_enrollment (updated_at / rejected_* / rejection_reason / approved_at) keeping only the #33 seat fix; gates community_media_delete')
+on conflict (filename) do nothing;
+
 -- ═════════════════════════════════════════════════════════════════════════════
 -- AFTER RUNNING (fresh install)
 --   1. If §5 / §14b raised a NOTICE (restricted role), create the buckets in
 --      Dashboard → Storage: course-media (Public ON), course-videos (Public OFF,
---      50 MB, video mimes), enrollment-receipts (Public OFF, 5 MB, png/jpeg/webp/pdf).
+--      50 MB, video mimes), enrollment-receipts (Public OFF, 5 MB, png/jpeg/webp/pdf),
+--      avatars (Public ON, 5 MB, image mimes), community-media (Public OFF, 50 MB,
+--      image + video mimes).
 --   2. Sign in once with your owner account so a profiles row exists, then promote
 --      it to admin (admins bypass the approval + enrollment gates):
 --        update public.profiles set is_admin = true where email = 'you@example.com';

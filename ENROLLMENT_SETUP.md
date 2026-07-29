@@ -179,10 +179,47 @@ student-declared — #20 only enforced the minimum) and adds a matching range CH
 `enrollment_requests.extension_days`. The client already offers only 2–12 months, so legitimate
 requests are unaffected.
 
+## Step 1h — Run the Sampler 60-day-support migration (data fix)
+
+Same SQL Editor → paste **all** of
+[`db/2026-07-20-sampler-support-60-days.sql`](db/2026-07-20-sampler-support-60-days.sql) → **Run**.
+Idempotent; safe to re-run. **Order:** after subscription-lifecycle (#13) — it stops with a clear
+exception if `support_days` is missing. Data-only UPDATE on the live `enrollment_plans` sampler row:
+`support_days` 30 → 60 plus the "30-day group chat support" bullet in `features` and
+`entitlement_summary` → "60-day group chat support". Needed on **existing** installs because the
+plan seeds are first-run-only; fresh installs get 60 straight from the bootstrap.
+
+## Step 1i — Run the community spaces & batches migration (#32)
+
+Same SQL Editor → paste **all** of
+[`db/2026-07-28-community-spaces-batches.sql`](db/2026-07-28-community-spaces-batches.sql) → **Run**.
+Idempotent; needs #13 + the community migrations (#23/#24) + backend-hardening (#30); run after
+#29/#31. What it changes for **enrollment** (the community half is documented in
+[COMMUNITY_SETUP.md](COMMUNITY_SETUP.md)):
+
+- **Batches** — Gold/VIP are cohort plans now: `enrollment_plans.community_segment` marks
+  `gold_live` → `gold` and `vip` → `vip`; every premium subscription carries a `batch_id`
+  (e.g. the seeded open batch `2026-08` "August 2026"). The paywall requires Gold/VIP students
+  to pick an **open** batch at checkout (`enrollment_requests.batch_id`); the admin approve
+  dialog shows/validates it; Admin → **Batches** manages cohorts + a "Needs batch assignment"
+  queue for premium members granted without one.
+- **One transactional approval RPC** — `admin_finalize_enrollment(p_request_id, p_batch_id)`
+  replaces the client's old three-step approve (term → profile → request) **and its local-grant
+  fallback**. It validates the request status, plan, batch (open/archived/capacity — under a
+  batch lock, concurrency-safe), grants the term by **wrapping** `approve_subscription()` /
+  `approve_extension()` (stacking/supersede/grace/clamps unchanged), stamps
+  `subscriptions.batch_id`, patches the profile cache, and marks the request approved — **all
+  or nothing**. Rules: renewal keeps the current batch by default; an **extension always keeps
+  plan + batch**; a gold↔vip upgrade keeps the batch when the target space exists there, else
+  the admin picks; approving onto a **general** plan clears the batch (downgrade drops private
+  community visibility; posts are preserved). Closed batches reject **new** assignments but
+  never evict existing members. If the migration is missing, Approve fails with explicit setup
+  guidance and **nothing is granted** — there is deliberately no client fallback anymore.
+
 ## Membership lifecycle & renewal
 
 - **Durations:** approval stamps `ends_at = start + access_days` (Core/Sampler/Silver **60
-  days**, Gold/VIP **180 days**; Sampler also records `support_days = 30`, shown to the student
+  days**, Gold/VIP **180 days**; Sampler also records `support_days = 60`, shown to the student
   but not RLS-enforced). A plan with `access_days = NULL` never expires. Edit durations in the
   `enrollment_plans` table (no redeploy needed).
 - **Plan access scope:** a term's plan also decides *which* tools it unlocks (client
@@ -191,7 +228,10 @@ requests are unaffected.
   **`sampler`** (Sampler Session) unlocks Home + the QuickBooks catalog's **Essentials** course only +
   both 1-on-1 booking pages (₱1,499 buys coaching, not more courses — *more* restricted than core);
   **`silver_self_paced`** (QBO + Resume Combo) and every other plan grant **full non-admin toolkit
-  access**. Silver is premium/full — not to be confused with the limited QBO-only plan.
+  access**. Silver is premium/full — not to be confused with the limited QBO-only plan. **Every
+  active plan** (core and sampler included) also unlocks the in-app **Community** feed
+  ([COMMUNITY_SETUP.md](COMMUNITY_SETUP.md)) — group chat is part of all plans, and its access ends
+  with the membership term automatically (the Sampler's 60-day group-chat support == its 60-day term).
 - **Renewal stacking:** approving a renewal **extends from the current expiry** when the term is
   still running (`ends_at = greatest(now, current ends_at) + access_days`) — renewing early
   never loses days. After expiry, the new term starts at approval time. The old row is marked
@@ -328,12 +368,16 @@ Sidebar → **Enrollments** (admin-only, with a pending-count badge; also at `/a
   **membership strip** under the card shows their current term: plan, started → ends dates,
   "Nd left" / "ended Nd ago", and an Active / Expiring / Ended pill. Expand a card for the
   student's background and a private **admin note**.
-- **Approve & unlock** → the request is approved, the student's profile gets
-  `is_paid=true / plan / approval_status='approved'`, and a **dated subscription term** is
-  granted via `approve_subscription()` — the confirm dialog previews **"Will grant access until
-  {date}"** (including carry-over when they renew early). Their "Under Review" screen advances
-  into the toolkit **live** (Realtime) or within ~30s. If a later step fails mid-approve you'll
-  see a "grant incomplete — Approve again" chip; clicking Approve again is safe (idempotent).
+- **Approve & unlock** → one call to the transactional `admin_finalize_enrollment()` RPC (#32):
+  it validates the request + plan + batch (Gold/VIP — the dialog carries a **batch picker**,
+  preselected by the same precedence the RPC applies; extensions show the inherited batch
+  read-only), grants the **dated subscription term** (wrapping `approve_subscription()` /
+  `approve_extension()`), stamps `subscriptions.batch_id`, and updates the profile
+  (`is_paid=true / plan / approval_status='approved'`) + request row **atomically** — the
+  confirm dialog previews **"Will grant access until {date}"** (including carry-over when they
+  renew early). Their "Under Review" screen advances into the toolkit **live** (Realtime) or
+  within ~30s. Any failure rolls the WHOLE approval back (the request stays pending — Approve
+  again is safe/idempotent); a missing #32 migration shows setup guidance instead of granting.
 - **Reject** (with a reason shown to the student) or **Mark expired** → the student stays locked
   out, sees the notice, and can **resubmit** new proof (a fresh request row — history is kept).
 - **Payment details** (collapsible section at the top) edits the account name / BPI /

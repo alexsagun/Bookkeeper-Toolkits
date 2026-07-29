@@ -6,7 +6,7 @@ import {
   Lightbulb, ChevronDown, ChevronRight, Search, Crown, Loader2,
   TrendingUp, Shield, Award, Zap, Quote, TrendingDown, Calculator,
   Image as ImageIcon, FileType2, Printer, Edit3, Briefcase,
-  MessageSquare, Mic, Eye, HelpCircle, User, Target,
+  MessageSquare, Mic, MicOff, Eye, HelpCircle, User, Target,
   Building2, Landmark, CalendarClock, CalendarCheck, ExternalLink,
   Heart, HeartHandshake, DollarSign, Phone, AlertCircle, Activity, Clock, Wallet,
   PieChart, ArrowUp, ArrowDown, X, Copy, Check,
@@ -14,10 +14,23 @@ import {
   LogOut, Lock, Mail, KeyRound, Menu,
   Plus, Trash2, Save, Play, Video, ArrowRight, ArrowLeft, ChevronUp, MoreVertical,
   PanelLeftClose, PanelLeftOpen, RefreshCw, UserCheck, UserX, ShieldCheck, Hourglass, Bell, BellOff, Volume2,
-  Sun, Moon, Monitor, MoreHorizontal, CreditCard, ArrowUpCircle, CalendarPlus
+  Sun, Moon, Monitor, CreditCard, ArrowUpCircle, CalendarPlus,
+  MessagesSquare, ThumbsUp, PartyPopper, EyeOff,
+  Pin, AtSign, Megaphone, Link2, Unlock, CheckCheck, Camera, Paperclip,
+  UploadCloud, Users, Database, Filter, Pause, CircleOff
 } from 'lucide-react';
+import { createPortal } from 'react-dom';
 import { useAuth } from './auth/AuthProvider.jsx';
 import { supabase } from './lib/supabase';
+import {
+  normalizeEmail, parseExternalId, parseStrictDate, toCsv,
+  parseCsv, parseEnrollmentsList, comboKeyOf, suggestPlanForCombo,
+  validateRowFields, IMPORT_TEMPLATE_COLUMNS,
+} from './lib/studentImport';
+import {
+  planSegment, isPremiumSegment, isValidBatchCode, normalizeBatchCode,
+  approvalBatchPreselect, pickInitialSpace,
+} from './lib/communitySpaces';
 
 const DEFAULT_APP_TAB = 'dashboard';
 
@@ -50,13 +63,13 @@ const REQUIRE_ENROLLMENT =
 const ENROLLMENT_PLANS_FALLBACK = [
   { key: 'core_self_paced', name: 'QBO Mastery Only', tagline: 'Core · Self-Paced', price_php: 999, compare_at_php: null, badge: null, limit_note: null, position: 1, access_days: 60, support_days: null,
     features: ['Simulated annual bookkeeping project for an NY-based construction company', '60-day QBO Mastery course access', 'Weekly Discord chat (Thu)'] },
-  { key: 'sampler', name: 'Sampler Session', tagline: 'Essentials', price_php: 1499, compare_at_php: null, badge: null, limit_note: 'Limited offer', position: 2, access_days: 60, support_days: 30,
-    features: ['1 Live Zoom Session (3 hours)', '60-day course access', '30-day group chat support'] },
+  { key: 'sampler', name: 'Sampler Session', tagline: 'Essentials', price_php: 1499, compare_at_php: null, badge: null, limit_note: 'Limited offer', position: 2, access_days: 60, support_days: 60,
+    features: ['1 Live Zoom Session (3 hours)', '60-day course access', '60-day group chat support'] },
   { key: 'silver_self_paced', name: 'QBO + Resume Combo', tagline: 'Silver · Self-Paced', price_php: 1999, compare_at_php: null, badge: null, limit_note: null, position: 3, access_days: 60, support_days: null,
     features: ['Simulated annual bookkeeping project for an NY-based construction company', '60-day QBO Mastery course access', '60-day Resume & Interview course access', 'Weekly Discord chat (Thu)'] },
-  { key: 'gold_live', name: 'Live Group Track', tagline: 'Gold Package', price_php: 9999, compare_at_php: 35000, badge: 'BEST VALUE', limit_note: null, position: 4, access_days: 180, support_days: null,
+  { key: 'gold_live', name: 'Live Group Track', tagline: 'Gold Package', price_php: 9999, compare_at_php: 35000, badge: 'BEST VALUE', limit_note: null, position: 4, access_days: 180, support_days: null, community_segment: 'gold',
     features: ['Simulated annual bookkeeping project for an NY-based construction company', '12 LIVE Group Zoom Trainings (MWF 9am to 11am PH time)', '180-day resume + interview course access', 'Weekly group consult until hired', 'Discord chat support until and after hired'] },
-  { key: 'vip', name: 'Personalized Coaching Program', tagline: 'VIP Package', price_php: 15999, compare_at_php: 35000, badge: 'BEST SELLER', limit_note: 'Limited to 10 slots per month', position: 5, access_days: 180, support_days: null,
+  { key: 'vip', name: 'Personalized Coaching Program', tagline: 'VIP Package', price_php: 15999, compare_at_php: 35000, badge: 'BEST SELLER', limit_note: 'Limited to 10 slots per month', position: 5, access_days: 180, support_days: null, community_segment: 'vip',
     features: ['Simulated annual bookkeeping project for an NY-based construction company', '12 Live Group Zoom Trainings (MWF 9am to 11am PH Time)', '1-on-1 Resume & Interview Coaching (1 session)', 'Weekly group consult until hired', 'Discord chat support until and after hired'] },
 ];
 const PLAN_LABELS = ENROLLMENT_PLANS_FALLBACK.reduce((m, p) => { m[p.key] = p.name; return m; }, {});
@@ -75,8 +88,11 @@ const PAYMENT_SETTINGS_FALLBACK = {
 
 const TAB_ROUTES = {
   dashboard: '/',
+  community: '/community',
   accessrequests: '/admin/access-requests',
   enrollments: '/admin/enrollments',
+  studentimports: '/admin/student-imports',
+  batches: '/admin/batches',
   course: '/courses/accounting-101',
   qbomastery: '/courses/quickbooks-online-mastery',
   industryacc: '/industry-accounting',
@@ -125,11 +141,54 @@ const ROUTE_TO_TAB = Object.entries(TAB_ROUTES).reduce((acc, [tab, href]) => {
 
 const VALID_APP_TABS = new Set(Object.keys(TAB_ROUTES));
 // Real tool count for the Dashboard stat strip — every routed tab except Home, the two
-// admin-only screens, and the legacy mockinterview alias (a redirect, not a tool). Derived
-// so the number can never drift from the actual toolkit again.
-const NON_TOOL_TAB_IDS = new Set(['dashboard', 'accessrequests', 'enrollments', 'mockinterview']);
+// admin-only screens, the member community (a space, not a tool), and the legacy
+// mockinterview alias (a redirect, not a tool). Derived so the number can never drift
+// from the actual toolkit again.
+const NON_TOOL_TAB_IDS = new Set(['dashboard', 'community', 'accessrequests', 'enrollments', 'studentimports', 'batches', 'mockinterview']);
 const TOOL_COUNT = Object.keys(TAB_ROUTES).filter((id) => !NON_TOOL_TAB_IDS.has(id)).length;
 const INTERVIEW_SUBTAB_IDS = new Set(['winstrat', 'mock', 'common', 'accounting', 'body', 'jdgen', 'salary']);
+const APP_ROUTE_CHANGE_EVENT = 'bookkeeper:route-change';
+const ACCOUNT_PANEL_ALIASES = {
+  settings: 'settings',
+  profile: 'settings',
+  account: 'settings',
+  'profile-settings': 'settings',
+  'account-settings': 'settings',
+  membership: 'membership',
+  plan: 'membership',
+  subscription: 'membership',
+  billing: 'membership',
+  'membership-plan': 'membership',
+  upgrade: 'upgrade',
+  'upgrade-plan': 'upgrade',
+  extend: 'extend',
+  extension: 'extend',
+  'extend-access': 'extend',
+  renew: 'renew',
+  renewal: 'renew',
+};
+
+function normalizeAccountPanel(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  return ACCOUNT_PANEL_ALIASES[raw] || null;
+}
+
+function readAccountPanelParam(params) {
+  return normalizeAccountPanel(
+    params.get('panel') ||
+    params.get('accountPanel') ||
+    params.get('account_panel') ||
+    params.get('account') ||
+    // Backward-compat for any old/broken account-menu link that wrote
+    // ?tab=upgrade/settings/etc. instead of the account-panel param.
+    params.get('tab')
+  );
+}
+
+function notifyAppRouteChange(kind = 'route') {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(new CustomEvent(APP_ROUTE_CHANGE_EVENT, { detail: { kind } }));
+}
 
 function normalizePath(pathname = '/') {
   const path = String(pathname || '/').replace(/\/+$/, '');
@@ -164,13 +223,16 @@ function tabHref(tabId, opts = {}) {
   const interviewSub = normalizeInterviewSub(opts.interviewSub || opts.sub);
   if (tabId === 'interview' && interviewSub && interviewSub !== 'winstrat') params.set('sub', interviewSub);
   if (opts.courseId) params.set('course', opts.courseId);
+  if (opts.lessonId) params.set('lesson', opts.lessonId);
+  if (tabId === 'community' && opts.space) params.set('space', opts.space);
+  if (tabId === 'community' && opts.postId) params.set('post', opts.postId);
   const qs = params.toString();
   return `${rawPath || '/'}${qs ? `?${qs}` : ''}`;
 }
 
 function readAppRoute() {
   if (typeof window === 'undefined') {
-    return { tab: DEFAULT_APP_TAB, interviewSub: null, explicit: false, courseId: null };
+    return { tab: DEFAULT_APP_TAB, interviewSub: null, explicit: false, courseId: null, lessonId: null, postId: null, space: null, panel: null };
   }
   const path = normalizePath(window.location.pathname);
   const params = new URLSearchParams(window.location.search);
@@ -191,8 +253,13 @@ function readAppRoute() {
   return {
     tab: VALID_APP_TABS.has(tab) ? tab : DEFAULT_APP_TAB,
     interviewSub,
-    explicit: path !== '/' || params.has('tab') || params.has('sub') || params.has('course'),
+    explicit: path !== '/' || params.has('tab') || params.has('sub') || params.has('course') || params.has('lesson') || params.has('post') ||
+      params.has('space') || params.has('panel') || params.has('accountPanel') || params.has('account_panel') || params.has('account'),
     courseId: params.get('course') || null,
+    lessonId: params.get('lesson') || null,
+    postId: params.get('post') || null,
+    space: params.get('space') || null,
+    panel: readAccountPanelParam(params),
   };
 }
 
@@ -201,10 +268,414 @@ function writeAppRoute(tabId, opts = {}) {
   const href = tabHref(tabId, opts);
   const method = opts.replace ? 'replaceState' : 'pushState';
   window.history[method]({ tab: tabId, interviewSub: opts.interviewSub || null }, '', href);
+  notifyAppRouteChange('route');
+}
+
+// Panel overlays (e.g. ?panel=settings) are orthogonal to tab routing: they must preserve
+// the current path AND every existing query param. tabHref/writeAppRoute rebuild the query
+// from the tab base and would drop `panel`, so panel state gets its own writer that mutates
+// only the `panel` key on the live URL (open = pushState so Back closes; close = replaceState
+// so it works even after a refresh landing and leaves no forward "ghost").
+function setPanelParam(value, opts = {}) {
+  if (typeof window === 'undefined' || !window.history) return;
+  const panel = normalizeAccountPanel(value);
+  const url = new URL(window.location.href);
+  if (panel) url.searchParams.set('panel', panel);
+  else url.searchParams.delete('panel');
+  url.searchParams.delete('accountPanel');
+  url.searchParams.delete('account_panel');
+  url.searchParams.delete('account');
+  if (normalizeAccountPanel(url.searchParams.get('tab'))) url.searchParams.delete('tab');
+  const href = `${url.pathname}${url.search}${url.hash}`;
+  const method = opts.replace ? 'replaceState' : 'pushState';
+  window.history[method]({ ...(window.history.state || {}), panel: panel || null }, '', href);
+  notifyAppRouteChange('panel');
 }
 
 function shouldHandleInAppClick(e) {
   return e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey && !e.defaultPrevented;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// VOICE ASSISTANT — knowledge/navigation data (module scope)
+// ═══════════════════════════════════════════════════════════════════
+// VOICE_TAB_INFO must stay a PURE object literal (strings/booleans only — no component
+// refs, no function calls, no identifier references): it is parsed out of this file by
+// scripts/generate-voice-agent-knowledge.mjs (`npm run ai:knowledge`) AND read at runtime
+// by the VoiceAssistant client tools. One entry per TAB_ROUTES id (the mockinterview
+// alias is resolved to interview+mock by resolveVoiceTool, so it has no entry here).
+// When a tool is added/renamed, update this map and regenerate the knowledge doc in the
+// same change (see "Keeping docs current" in CLAUDE.md).
+const VOICE_TAB_INFO = {
+  dashboard:    { label: 'Dashboard', stage: 'Home', desc: 'Progress overview with career-stage tiles, membership status, and quick links to every tool.' },
+  community:    { label: 'Community', stage: 'Home', desc: 'Member forum split into spaces: a General space for every active member (start discussions and react; replies live in the premium communities) plus private per-batch Gold and VIP spaces with the full forum — search, free-form tags, image/video/link attachments, @mentions, reactions, pinned posts, and admin announcements with read-tracking, plus a notification bell. Gold and VIP members land in their own batch community; access follows the membership automatically.' },
+  course:       { label: 'Accounting 101', stage: 'Training & Skills', desc: 'Self-paced foundational accounting course (8 modules).' },
+  qbomastery:   { label: 'QuickBooks Online Mastery', stage: 'Training & Skills', desc: 'QuickBooks Online video-course catalog (Essentials and Mastery programs) with completion certificates.' },
+  industryacc:  { label: 'Industry Accounting', stage: 'Training & Skills', desc: 'Accounting playbooks for 12 US industries with QuickBooks workflows.' },
+  ustax:        { label: 'US Tax 101', stage: 'Training & Skills', desc: 'US tax basics for bookkeepers: key forms, deadlines, and IRS links.' },
+  chat:         { label: 'ProAdvisor Chat', stage: 'Training & Skills', desc: 'AI mentor chat for QuickBooks cleanups and day-to-day bookkeeping questions.' },
+  niche:        { label: 'Niche Selector Quiz', stage: 'Training & Skills', desc: 'Eight-question quiz that recommends your best-fit bookkeeping industry niche.' },
+  brand:        { label: 'Authentic Branding', stage: 'Job Application', desc: 'Guided questionnaire that builds your authentic personal brand story for applications.' },
+  resumestrategy: { label: 'Resume Winning Strategy', stage: 'Job Application', desc: 'Resume video-course catalog with completion certificates.' },
+  linkedinopt:  { label: 'Book 1-on-1 with Alex', stage: 'Job Application', desc: 'Booking page for a 1-on-1 profile-optimization session with Alex.' },
+  coachalex:    { label: 'Personalized Coaching With Alex', stage: 'Job Application', desc: 'Booking page for personalized coaching sessions with Coach Alex.' },
+  interview:    { label: 'Job Interview Mastery', stage: 'Job Application', desc: 'Interview prep hub: winning-strategy courses, mock interview simulator, common and accounting questions, body language, JD question generator, and salary negotiation.' },
+  qbdiag:       { label: 'Free QB Diagnostic', stage: 'Job Application', desc: 'QuickBooks file diagnostic checklist to offer prospects as a free audit.' },
+  painpoints:   { label: 'Painpoints & Solutions', stage: 'Job Application', desc: 'AI generator for client pain points and how a remote bookkeeper solves them.' },
+  proposal:     { label: 'Proposal Generator', stage: 'Job Application', desc: 'AI proposal and outreach generator tailored to a specific job post.' },
+  discovery:    { label: 'Discovery Call Simulator', stage: 'Job Application', desc: 'AI-simulated discovery-call practice with a prospective US client.' },
+  engagement:   { label: 'Engagement Letter', stage: 'Client Management & Delivery', desc: 'Generates a professional bookkeeping engagement letter.' },
+  onboarding:   { label: 'Client Onboarding', stage: 'Client Management & Delivery', desc: 'New-client onboarding checklist and workflow.' },
+  coa:          { label: 'Chart of Accounts', stage: 'Client Management & Delivery', desc: 'Industry-specific, QuickBooks-import-ready Chart of Accounts generator.' },
+  invoice:      { label: 'Invoice Creator', stage: 'Client Management & Delivery', desc: 'Builds professional downloadable invoices.' },
+  cpaai:        { label: 'US CPA AI', stage: 'Client Management & Delivery', desc: 'Booking page for US CPA-level consultations.' },
+  bankfeed:     { label: 'Bank Feed AI', stage: 'Client Management & Delivery', desc: 'Paste a bank-feed memo; AI suggests the vendor match and QuickBooks account category.' },
+  converter:    { label: 'Statement → CSV', stage: 'Client Management & Delivery', desc: 'Converts PDF or image bank statements into clean CSV files via AI.' },
+  emails:       { label: 'Email Templates', stage: 'Client Management & Delivery', desc: 'Twelve professional client email templates (delivery, collections, W-9 requests, and more).' },
+  calculators:  { label: 'Accounting Calculators', stage: 'Client Management & Delivery', desc: 'Seven-in-one accounting calculator suite.' },
+  workflow:     { label: 'Monthly Workflow', stage: 'Client Management & Delivery', desc: 'Day-by-day monthly bookkeeping workflow.' },
+  monthend:     { label: 'Month-End Checklist', stage: 'Client Management & Delivery', desc: 'Interactive month-end close checklist.' },
+  sopgen:       { label: 'SOP Generator', stage: 'Client Management & Delivery', desc: 'AI generator for client-specific standard operating procedures.' },
+  salestax:     { label: 'Sales Tax', stage: 'Client Management & Delivery', desc: 'US sales-tax reference and calculator.' },
+  budgeting:    { label: 'Budgeting Tool', stage: 'Client Management & Delivery', desc: 'Client budgeting workbook with variance tracking.' },
+  forecasting:  { label: 'Forecasting Tool', stage: 'Client Management & Delivery', desc: 'Cash-flow and revenue forecasting workbook.' },
+  yearendcheck: { label: 'Year-End Checklist', stage: 'Client Management & Delivery', desc: 'Year-end close checklist.' },
+  form1099:     { label: '1099 Prep', stage: 'Client Management & Delivery', desc: '1099 contractor prep tracker for year-end filing.' },
+  accessrequests: { label: 'Access Requests', stage: 'Admin', desc: 'Admin screen: approve or reject new signups.', adminOnly: true },
+  enrollments:  { label: 'Enrollments', stage: 'Admin', desc: 'Admin screen: review payment receipts, approve subscriptions, and manage renewals.', adminOnly: true },
+  studentimports: { label: 'Student Imports', stage: 'Admin', desc: 'Admin screen: migrate legacy Thinkific students — validate, map course-combos to plans, dry-run, and import accounts + memberships.', adminOnly: true },
+  batches: { label: 'Batches', stage: 'Admin', desc: 'Admin screen: manage Gold/VIP cohorts (batches) — create monthly batches, set capacities, close or archive them, and assign members to their private batch communities.', adminOnly: true },
+};
+
+// Spoken-name aliases → navigation targets. Values are either { tab, interviewSub? }
+// or { panel } (when users say "settings"/"billing", the agent sometimes calls
+// navigate_to_tool — we do the right thing instead of failing).
+const VOICE_TOOL_ALIASES = {
+  'home': { tab: 'dashboard' },
+  'community': { tab: 'community' },
+  'community feed': { tab: 'community' },
+  'the feed': { tab: 'community' },
+  'group chat': { tab: 'community' },
+  'discussions': { tab: 'community' },
+  'announcements': { tab: 'community' },
+  'accounting course': { tab: 'course' },
+  'accounting one oh one': { tab: 'course' },
+  'qbo': { tab: 'qbomastery' },
+  'qbo mastery': { tab: 'qbomastery' },
+  'quickbooks': { tab: 'qbomastery' },
+  'quickbooks mastery': { tab: 'qbomastery' },
+  'quickbooks course': { tab: 'qbomastery' },
+  'qbo essentials': { tab: 'qbomastery' },
+  'quickbooks essentials': { tab: 'qbomastery' },
+  'industry playbooks': { tab: 'industryacc' },
+  'us tax': { tab: 'ustax' },
+  'tax 101': { tab: 'ustax' },
+  'proadvisor': { tab: 'chat' },
+  'pro advisor chat': { tab: 'chat' },
+  'niche quiz': { tab: 'niche' },
+  'niche selector': { tab: 'niche' },
+  'branding': { tab: 'brand' },
+  'resume': { tab: 'resumestrategy' },
+  'resume course': { tab: 'resumestrategy' },
+  'resume strategy': { tab: 'resumestrategy' },
+  'book with alex': { tab: 'linkedinopt' },
+  'book a session': { tab: 'linkedinopt' },
+  'one on one': { tab: 'linkedinopt' },
+  '1 on 1': { tab: 'linkedinopt' },
+  'profile optimization': { tab: 'linkedinopt' },
+  'coaching': { tab: 'coachalex' },
+  'coach alex': { tab: 'coachalex' },
+  'interview prep': { tab: 'interview' },
+  'mock interview': { tab: 'interview', interviewSub: 'mock' },
+  'mock interview simulator': { tab: 'interview', interviewSub: 'mock' },
+  'interview questions': { tab: 'interview', interviewSub: 'common' },
+  'accounting questions': { tab: 'interview', interviewSub: 'accounting' },
+  'body language': { tab: 'interview', interviewSub: 'body' },
+  'salary': { tab: 'interview', interviewSub: 'salary' },
+  'salary negotiation': { tab: 'interview', interviewSub: 'salary' },
+  'qb diagnostic': { tab: 'qbdiag' },
+  'quickbooks diagnostic': { tab: 'qbdiag' },
+  'diagnostic': { tab: 'qbdiag' },
+  'pain points': { tab: 'painpoints' },
+  'proposals': { tab: 'proposal' },
+  'cover letter': { tab: 'proposal' },
+  'discovery call': { tab: 'discovery' },
+  'chart of accounts generator': { tab: 'coa' },
+  'coa generator': { tab: 'coa' },
+  'invoices': { tab: 'invoice' },
+  'us cpa': { tab: 'cpaai' },
+  'cpa': { tab: 'cpaai' },
+  'bank feed': { tab: 'bankfeed' },
+  'categorization': { tab: 'bankfeed' },
+  'statement converter': { tab: 'converter' },
+  'statement to csv': { tab: 'converter' },
+  'bank statement to csv': { tab: 'converter' },
+  'csv converter': { tab: 'converter' },
+  'email template': { tab: 'emails' },
+  'monthly checklist': { tab: 'workflow' },
+  'month end': { tab: 'monthend' },
+  'month end checklist': { tab: 'monthend' },
+  'sop': { tab: 'sopgen' },
+  'sops': { tab: 'sopgen' },
+  'budget': { tab: 'budgeting' },
+  'forecast': { tab: 'forecasting' },
+  'year end': { tab: 'yearendcheck' },
+  'year end checklist': { tab: 'yearendcheck' },
+  '1099': { tab: 'form1099' },
+  'ten ninety nine': { tab: 'form1099' },
+  // Account surfaces are panels, not tabs — navigate_to_tool redirects these politely.
+  'settings': { panel: 'settings' },
+  'profile': { panel: 'settings' },
+  'account settings': { panel: 'settings' },
+  'membership': { panel: 'membership' },
+  'membership plan': { panel: 'membership' },
+  'billing': { panel: 'membership' },
+  'my plan': { panel: 'membership' },
+  'upgrade': { panel: 'upgrade' },
+  'upgrade plan': { panel: 'upgrade' },
+  'extend access': { panel: 'extend' },
+  'renew': { panel: 'renew' },
+};
+
+// Fuzzy tool_id/name → navigation target: exact tab id → alias → account-panel alias →
+// exact label → word-boundary partial label match → null. Input may be an id
+// ('bankfeed'), a slug ('mock_interview'), or a spoken name ('open the statement
+// converter'). The exact-match chain runs on the raw phrase FIRST and on the
+// filler-stripped phrase second — stripping first would make alias keys that start
+// with a filler word ('my plan') unreachable for their own literal input.
+function resolveVoiceTool(raw) {
+  const norm = String(raw || '').trim().toLowerCase()
+    .replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!norm) return null;
+  const stripped = norm.replace(/^(?:(?:the|my|open|go to|show me|show)\s+)+/, '').trim();
+  const candidates = stripped && stripped !== norm ? [norm, stripped] : [norm];
+  for (const q of candidates) {
+    const asId = q.replace(/\s+/g, '');
+    if (asId === 'mockinterview') return { tab: 'interview', interviewSub: 'mock' };
+    if (VALID_APP_TABS.has(asId)) return { tab: asId };
+    if (Object.prototype.hasOwnProperty.call(VOICE_TOOL_ALIASES, q)) return VOICE_TOOL_ALIASES[q];
+    // Reuse the app's canonical panel-alias table ('account'/'plan'/'subscription'/
+    // 'renewal'… → panel) so those never fall through to label matching, where e.g.
+    // 'account' would substring-match "Accounting 101".
+    const panel = normalizeAccountPanel(q);
+    if (panel) return { panel };
+    const exact = Object.entries(VOICE_TAB_INFO).find(([, info]) => info.label.toLowerCase() === q);
+    if (exact) return { tab: exact[0] };
+  }
+  // Partial match last, on the stripped phrase only: the query must start a word in the
+  // label (so 'book' hits "Book 1-on-1…" but not quickBOOKs), or the whole label must
+  // appear inside the spoken phrase. Length guard keeps 1-2 letter noise from matching.
+  const q = candidates[candidates.length - 1];
+  if (q.length >= 3) {
+    const esc = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(^|\\s)${esc}`);
+    const partial = Object.entries(VOICE_TAB_INFO).find(([, info]) => {
+      const label = info.label.toLowerCase();
+      return re.test(label) || q.includes(label);
+    });
+    if (partial) return { tab: partial[0] };
+  }
+  return null;
+}
+
+// Curated feature-help map for the show_feature_help client tool: feature id →
+// where it lives + a how-to blurb the agent can speak. (Only mock_interview_simulator
+// has a real feature_guides row today; the rest are tool-level how-tos.)
+const VOICE_FEATURE_HELP = {
+  mock_interview_simulator: { tab: 'interview', interviewSub: 'mock', blurb: 'Voice-based mock interview practice. Watch the guide video on this page first — the launch button unlocks after the video finishes, then it opens the external simulator.' },
+  bank_feed_ai: { tab: 'bankfeed', blurb: 'Paste the raw memo or description from a bank feed; the AI returns the nearest vendor match and the right QuickBooks account category. Review each suggestion before posting.' },
+  statement_converter: { tab: 'converter', blurb: 'Upload a PDF or image bank statement; the AI extracts the transactions into a clean CSV you can import into QuickBooks.' },
+  proposal_generator: { tab: 'proposal', blurb: 'Paste a job post; the AI writes a tailored, direct-response proposal focused on the bookkeeping pain points the client is feeling.' },
+  chart_of_accounts: { tab: 'coa', blurb: 'Pick the client\'s industry to generate a QuickBooks-import-ready Chart of Accounts, then download it as a spreadsheet.' },
+  qbo_mastery: { tab: 'qbomastery', blurb: 'Open a course card to watch lessons in order; completing every lesson unlocks a downloadable PDF certificate.' },
+  invoice_creator: { tab: 'invoice', blurb: 'Fill in the client details and line items to generate a professional invoice you can download.' },
+  discovery_call_simulator: { tab: 'discovery', blurb: 'Practice a simulated discovery call with an AI prospect and get feedback on your answers.' },
+  niche_selector_quiz: { tab: 'niche', blurb: 'Answer eight quick questions to find the bookkeeping industry niche that best fits you.' },
+  sop_generator: { tab: 'sopgen', blurb: 'Describe a recurring task; the AI writes a client-specific standard operating procedure you can refine and save.' },
+};
+
+// Client-tool contract — the SINGLE SOURCE OF TRUTH for the seven voice tools, agreed on by
+// two places that must never diverge: (1) VoiceAssistant.buildClientTools() assembles its
+// handler set from these names (a mismatch logs a loud console error), and (2)
+// scripts/provision-voice-agent.mjs extracts this literal verbatim to declare the tools on
+// the ElevenLabs agent. If the agent's tool names/schemas drift from these, every voice
+// action silently no-ops — so keep this a PURE literal (strings/arrays/objects only, no refs
+// or calls, same contract as VOICE_TAB_INFO) and change tool shapes in ONE place. The
+// descriptions/params mirror docs/ai/voice-agent-setup.md §4.
+const VOICE_CLIENT_TOOL_SPECS = [
+  {
+    name: 'navigate_to_tool',
+    description: 'Navigate the app to a tool. Use whenever the user asks to open/find/see a tool or section.',
+    expects_response: true,
+    parameters: {
+      type: 'object',
+      properties: {
+        tool_id: { type: 'string', description: 'Tab id (e.g. qbomastery, proposal, bankfeed, converter, interview, mockinterview) or the tool\'s spoken name (e.g. "statement converter").' },
+        reason: { type: 'string', description: 'Short reason to mention to the user.' },
+      },
+      required: ['tool_id'],
+    },
+  },
+  {
+    name: 'open_account_panel',
+    description: 'Open one of the user\'s account panels. Members only for billing panels; settings works for everyone.',
+    expects_response: true,
+    parameters: {
+      type: 'object',
+      properties: {
+        panel: { type: 'string', enum: ['settings', 'membership', 'upgrade', 'extend', 'renew'], description: 'Which panel to open.' },
+      },
+      required: ['panel'],
+    },
+  },
+  {
+    name: 'explain_current_page',
+    description: 'Returns which page/panel the user is currently on, what it does, and whether their plan includes it. Call before explaining "this page".',
+    expects_response: true,
+    parameters: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'show_feature_help',
+    description: 'Open a feature and get usage help for it.',
+    expects_response: true,
+    parameters: {
+      type: 'object',
+      properties: {
+        feature_id: { type: 'string', description: 'Feature key, e.g. mock_interview_simulator, bank_feed_ai, statement_converter, proposal_generator, chart_of_accounts, qbo_mastery, invoice_creator, discovery_call_simulator, niche_selector_quiz, sop_generator.' },
+      },
+      required: ['feature_id'],
+    },
+  },
+  {
+    name: 'get_user_membership_summary',
+    description: 'Returns the signed-in user\'s own plan, membership status, expiry/days left, scope, and pending-request state. Use for any question about their plan, access, or expiry.',
+    expects_response: true,
+    parameters: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'open_course_lesson',
+    description: 'Navigate the app to a specific course (and optionally a lesson) the member is studying. Use ONLY the course_id/course_slug/lesson_id values returned by the training tools — never invent ids.',
+    expects_response: true,
+    parameters: {
+      type: 'object',
+      properties: {
+        course_id: { type: 'string', description: 'The course id from a training tool result.' },
+        course_slug: { type: 'string', description: 'The course slug (e.g. qbo-mastery) from a training tool result.' },
+        lesson_id: { type: 'string', description: 'Optional lesson id to open directly.' },
+        reason: { type: 'string', description: 'Short reason to mention to the user.' },
+      },
+      required: ['course_id', 'course_slug'],
+    },
+  },
+  {
+    name: 'show_lesson_sources',
+    description: 'Show a clickable source citation in the chat transcript after answering from course material. Call once per grounded answer with the citation the training tool returned.',
+    expects_response: true,
+    parameters: {
+      type: 'object',
+      properties: {
+        course_id: { type: 'string' },
+        course_slug: { type: 'string' },
+        lesson_id: { type: 'string' },
+        label: { type: 'string', description: 'e.g. "QuickBooks Online Mastery › Module 2 › Bank Feeds"' },
+      },
+      required: ['course_id', 'course_slug', 'label'],
+    },
+  },
+];
+
+// Server (webhook) tools — the AI course trainer's grounded course access. UNLIKE
+// the client tools above, these run SERVER-SIDE (api/elevenlabs/trainer.js) and
+// re-check the learner's live entitlement on every call; the browser never sees
+// their results (the agent relays citations via show_lesson_sources). Same PURE-
+// literal contract as VOICE_CLIENT_TOOL_SPECS: scripts/provision-voice-agent.mjs
+// extracts this verbatim and builds each tool's webhook config (URL = APP_URL +
+// /api/elevenlabs/trainer?action=<action>, Authorization: Bearer {{secret__trainer_token}}).
+// The `action` field is the query-string action; it is NOT sent to the LLM.
+const VOICE_SERVER_TOOL_SPECS = [
+  {
+    name: 'get_my_training_catalog',
+    action: 'get_my_training_catalog',
+    description: 'List the courses THIS member can study with you right now. ALWAYS call this before naming or offering a course — it returns only their plan-allowed, AI-ready courses. Never assume a course exists or is included.',
+    response_timeout_secs: 20,
+    request_body_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'get_authorized_training_context',
+    action: 'get_authorized_training_context',
+    description: 'Fetch approved course material to teach from. REQUIRED before you explain, quiz, practice, or recap ANY course topic — never teach paid course content from memory. Returns grounded excerpts with citations, or a denial/not-ready/not-found message you must relay to the learner.',
+    response_timeout_secs: 25,
+    request_body_schema: {
+      type: 'object',
+      properties: {
+        course_ref: { type: 'string', description: 'The course the learner named (title, nickname, or id).' },
+        mode: { type: 'string', enum: ['explain', 'guided', 'quiz', 'practice', 'recap'], description: 'The teaching mode.' },
+        query: { type: 'string', description: 'The learner\'s question/topic — required for explain and practice.' },
+        lesson_ref: { type: 'string', description: 'Optional lesson name or number for guided, quiz, or recap.' },
+      },
+      required: ['course_ref', 'mode'],
+    },
+  },
+  {
+    name: 'get_my_training_checkpoint',
+    action: 'get_my_training_checkpoint',
+    description: 'Fetch where the learner left off with you last time (topic, lesson, next step). Call when they ask to resume, or at the start of a training conversation to offer to pick up.',
+    response_timeout_secs: 15,
+    request_body_schema: {
+      type: 'object',
+      properties: { course_ref: { type: 'string', description: 'Optional course to scope to.' } },
+      required: [],
+    },
+  },
+  {
+    name: 'save_training_checkpoint',
+    action: 'save_training_checkpoint',
+    description: 'Save the learner\'s AI-training progress at a natural stopping point: topic, source lesson, mode, how well they understood, and the suggested next step. This does NOT mark real course lessons complete.',
+    response_timeout_secs: 15,
+    request_body_schema: {
+      type: 'object',
+      properties: {
+        course_id: { type: 'string', description: 'The course id (from a training tool result).' },
+        lesson_id: { type: 'string', description: 'Optional lesson id.' },
+        topic: { type: 'string', description: 'What the learner worked on.' },
+        mode: { type: 'string', enum: ['explain', 'guided', 'quiz', 'practice', 'recap'] },
+        understanding: { type: 'string', description: 'How well they grasped it.' },
+        next_step: { type: 'string', description: 'The suggested next step.' },
+      },
+      required: ['course_id', 'topic', 'mode'],
+    },
+  },
+];
+
+// Map a course slug → the tab (+ interview sub-tab) whose catalog hosts it, so the
+// voice trainer's open_course_lesson tool can deep-link into the right catalog.
+// Mirrors the CourseCatalog wrappers: interview-* → InterviewPrep › winstrat,
+// resume-* → ResumeStrategy tab, everything else (qbo-*) → QBO Mastery.
+function trainerCourseTab(slug) {
+  const s = String(slug || '');
+  if (s.startsWith('interview-')) return { tab: 'interview', interviewSub: 'winstrat' };
+  if (s.startsWith('resume-')) return { tab: 'resumestrategy' };
+  return { tab: 'qbomastery' };
+}
+// Navigate to an authorized course (+ optional lesson). The catalog/CourseProgram
+// plan guard + RestrictedTab stay the real chokepoint (same philosophy as
+// navigate_to_tool), so this only builds the deep link.
+function openCourseLessonRoute({ course_id, course_slug, lesson_id }) {
+  const { tab, interviewSub } = trainerCourseTab(course_slug);
+  writeAppRoute(tab, { courseId: course_id, lessonId: lesson_id || undefined, ...(interviewSub ? { interviewSub } : {}) });
+}
+
+// One-per-page-load health check for the signed-url endpoint (window-cached promise —
+// same idiom as the YouTube/Vimeo SDK loaders). `configured:false` (or any failure)
+// simply hides the voice FAB; unset env vars are a soft-off switch, not an error.
+function loadVoiceAssistantConfig() {
+  if (typeof window === 'undefined') return Promise.resolve({ configured: false });
+  if (!window.__voiceCfgPromise) {
+    window.__voiceCfgPromise = fetch('/api/elevenlabs/signed-url')
+      .then((r) => (r.ok ? r.json() : { configured: false }))
+      .catch(() => ({ configured: false }));
+  }
+  return window.__voiceCfgPromise;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1547,6 +2018,96 @@ function UpdatePasswordScreen() {
   );
 }
 
+// Forced set-password onboarding for an IMPORTED student (db #26). Shown by the auth
+// gate when profile.account_origin === 'import' && onboarding_status !== 'completed',
+// regardless of how the invite link authenticated them. Reuses updatePassword(), then
+// marks onboarding complete via the narrow complete_import_onboarding() RPC and
+// refreshes the profile — which drops them past this gate into the normal membership
+// flow with their imported plan + exact remaining term. (Separate from the recovery
+// UpdatePasswordScreen: that clears the recovery flag; this clears the onboarding flag.)
+function SetPasswordScreen() {
+  const { updatePassword, refreshProfile, signOut, user, profile } = useAuth();
+  const [password, setPassword] = useState('');
+  const [showPw, setShowPw] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const first = ((profile?.full_name || '').trim().split(/\s+/)[0]) || '';
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setErr('');
+    setBusy(true);
+    try {
+      const { error } = await updatePassword(password);
+      if (error) throw error;
+      // Mark onboarding complete (own-row, onboarding fields only). Non-fatal if it
+      // errors — but on failure we must NOT leave them stranded, so surface it.
+      const { error: rpcErr } = await supabase.rpc('complete_import_onboarding');
+      if (rpcErr) throw rpcErr;
+      await refreshProfile(); // flips onboarding_status → the gate unmounts this screen
+    } catch (e2) {
+      setErr(e2?.message || 'Could not finish setting up your account. Please try again.');
+      setBusy(false);
+    }
+  };
+
+  const inputStyle = { background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody };
+
+  return (
+    <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
+      <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
+        background: GLASS.cardDeep,
+        backdropFilter: 'blur(30px) saturate(180%)',
+        WebkitBackdropFilter: 'blur(30px) saturate(180%)',
+        border: `1px solid ${GLASS.border}`,
+        boxShadow: '0 24px 60px -12px rgba(10,30,80,0.22), inset 0 1px 0 rgba(255,255,255,0.6)',
+      }}>
+        <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+          <img src={LOGO_DATA_URI} alt="Get Hired With Alex" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
+          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>
+            {first ? `Welcome, ${first}!` : 'Welcome!'}
+          </div>
+          <div className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>
+            Your membership has moved into the new toolkit. Set a password to finish setting up your account.
+          </div>
+        </div>
+
+        <form onSubmit={submit} className="px-8 py-7 space-y-3.5">
+          <div className="relative">
+            <Lock size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+            <input className="w-full pl-10 pr-10 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
+              type={showPw ? 'text' : 'password'} autoComplete="new-password" placeholder="Choose a password"
+              value={password} onChange={e => setPassword(e.target.value)} required minLength={8} />
+            <button type="button" onClick={() => setShowPw(s => !s)} tabIndex={-1}
+              className="absolute right-3 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} aria-label="Toggle password visibility">
+              <Eye size={15} />
+            </button>
+          </div>
+          <div style={{ fontSize: 11.5, color: C.textMute }}>Use at least 8 characters.</div>
+
+          {err && (
+            <div className="flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs" style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: `1px solid rgba(208,35,35,0.18)` }}>
+              <AlertTriangle size={14} className="flex-shrink-0 mt-px" /> <span>{err}</span>
+            </div>
+          )}
+
+          <button type="submit" disabled={busy}
+            className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
+            {busy && <Loader2 size={15} className="animate-spin" />} Set password & continue
+          </button>
+
+          <div className="text-center pt-1">
+            <button type="button" onClick={signOut} className="text-xs" style={{ color: C.textMute }}>
+              Signed in as {user?.email} · Sign out
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 // First-login welcome. Shown once per user (gated on the namespaced
 // `onboarding:welcomed` storage flag) so a brand-new account is greeted and
 // oriented to the three career stages instead of landing on a blank dashboard.
@@ -1558,6 +2119,7 @@ function WelcomeOverlay({ name, onClose }) {
     { n: '03', label: 'Client Management', desc: 'Run engagements, deliver the books, and grow your practice.' },
   ];
   return (
+    <OverlayPortal>
     <div className="fixed inset-0 z-50 flex items-center justify-center p-6"
       style={{ background: 'rgba(10,20,40,0.45)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)', fontFamily: fontBody, color: C.text }}>
       <style>{`.welcome-in{animation:welcomeIn .5s cubic-bezier(.16,1,.3,1) both}@keyframes welcomeIn{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:none}}`}</style>
@@ -1596,6 +2158,7 @@ function WelcomeOverlay({ name, onClose }) {
         </div>
       </div>
     </div>
+    </OverlayPortal>
   );
 }
 
@@ -1909,7 +2472,7 @@ function extensionPrice(plan, months) {
 // essentials-access.sql (sampler → qbo-* AND access_tier='essentials'). Keep the client
 // tab-allowlist + `courseTier` and the SQL slug/tier predicates in sync when entitlements
 // change.
-const TRAINING_ONLY_TAB_IDS = ['dashboard', 'course', 'qbomastery', 'industryacc', 'ustax', 'chat', 'niche'];
+const TRAINING_ONLY_TAB_IDS = ['dashboard', 'course', 'qbomastery', 'industryacc', 'ustax', 'chat', 'niche', 'community']; // community: every paid plan includes the member feed (server gate = is_enrolled() RLS)
 const PLAN_ENTITLEMENTS = {
   // Limited: Home + Training & Skills only (matches the SQL `qbo-%` course rule).
   core_self_paced: {
@@ -1923,7 +2486,7 @@ const PLAN_ENTITLEMENTS = {
   sampler: {
     scopeLabel: 'Essentials + 1-on-1 coaching',
     stageIds: ['home', 'training', 'jobsearch'],
-    tabIds: ['dashboard', 'qbomastery', 'linkedinopt', 'coachalex'],
+    tabIds: ['dashboard', 'qbomastery', 'linkedinopt', 'coachalex', 'community'],
     courseTier: 'essentials',
   },
   // Premium self-paced: full non-admin toolkit (explicit — NOT QBO-only limited).
@@ -1946,7 +2509,9 @@ function planEntitlement(planKey) {
   return {
     full: false, planKey, label: label || 'Your plan', scopeLabel: cfg.scopeLabel,
     allowsStage: (id) => stageSet.has(id),
-    allowsTab: (id) => tabSet.has(id),
+    // Home is unconditionally allowed — RestrictedTab's "Back to Dashboard" fallback (and
+    // the stale-lastTab reset) must never dead-end, even if a future plan omits it.
+    allowsTab: (id) => id === 'dashboard' || tabSet.has(id),
     // Course-level scope within an allowed catalog. No `courseTier` (e.g. core) → all
     // courses the tab allows. `sampler` → only `access_tier='essentials'` courses.
     // RLS is the real boundary; this drives the catalog card list + a deep-link guard.
@@ -2087,7 +2652,7 @@ function useEnrollmentGate(user, profile, profileReady) {
 // inserted row. The insert is column-resilient: if the #20 columns aren't present yet it
 // retries WITHOUT them, so the existing paywall never regresses before the migration runs.
 async function submitSubscriptionRequest({
-  user, planKey, planName, kind = 'new', extensionDays = null,
+  user, planKey, planName, kind = 'new', extensionDays = null, batchId = null,
   amountExpected, amountPaid, fields = {}, file,
 }) {
   const safe = file.name.replace(/[^\w.\-]+/g, '_');
@@ -2111,10 +2676,15 @@ async function submitSubscriptionRequest({
     receipt_path: path,
   };
   const withKind = { ...baseRow, request_kind: kind, extension_days: kind === 'extension' ? extensionDays : null };
+  const withBatch = { ...withKind, batch_id: batchId || null };
 
-  let res = await supabase.from('enrollment_requests').insert(withKind).select().single();
-  // The request_kind / extension_days columns (db #20) may not exist yet — retry without
-  // them (undefined_column 42703 / PGRST204) so new/renewal/upgrade still submit pre-migration.
+  // Column-resilience ladder: {base + kind + batch (#32)} → {base + kind (#20)} → {base}.
+  // A 42703/PGRST204 means the newest column isn't migrated yet — drop it and retry so
+  // submissions never regress on a partially-migrated database.
+  let res = await supabase.from('enrollment_requests').insert(withBatch).select().single();
+  if (res.error && (res.error.code === '42703' || res.error.code === 'PGRST204')) {
+    res = await supabase.from('enrollment_requests').insert(withKind).select().single();
+  }
   if (res.error && (res.error.code === '42703' || res.error.code === 'PGRST204')) {
     res = await supabase.from('enrollment_requests').insert(baseRow).select().single();
   }
@@ -2141,6 +2711,50 @@ async function submitSubscriptionRequest({
   return row;
 }
 
+// One-row enrollment_plans lookup with a short module-level cache — five account
+// surfaces (settings drawer, membership modal, extend modal, voice assistant,
+// dashboard panel) previously each refetched the same plan row on every open.
+// 5-min TTL keeps admin edits to a plan visible without a reload.
+const _planRowCache = new Map();   // key -> { at, promise }
+function fetchPlanRow(key) {
+  if (!key) return Promise.resolve(null);
+  const hit = _planRowCache.get(key);
+  if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.promise;
+  const promise = supabase.from('enrollment_plans').select('*').eq('key', key).maybeSingle()
+    .then(({ data }) => data || null)
+    .catch(() => { _planRowCache.delete(key); return null; });
+  _planRowCache.set(key, { at: Date.now(), promise });
+  return promise;
+}
+
+// Same idiom for the member's own batch (#32) — batches_read's own-subscription
+// branch resolves it even after the batch closes. Pre-#32 (no table) → null.
+const _batchRowCache = new Map();   // id -> { at, promise }
+function fetchBatchRow(id) {
+  if (!id) return Promise.resolve(null);
+  const hit = _batchRowCache.get(id);
+  if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.promise;
+  const promise = supabase.from('batches').select('id, code, name, status').eq('id', id).maybeSingle()
+    .then(({ data }) => data || null)
+    .catch(() => { _batchRowCache.delete(id); return null; });
+  _batchRowCache.set(id, { at: Date.now(), promise });
+  return promise;
+}
+
+// Self-contained "Batch" fact row for the account surfaces — renders nothing
+// until (and unless) the batch row resolves, so pre-#32 accounts see no change.
+function BatchFactRow({ batchId, k = 'Batch' }) {
+  const [row, setRow] = useState(null);
+  useEffect(() => {
+    let on = true;
+    if (!batchId) { setRow(null); return; }
+    fetchBatchRow(batchId).then(b => { if (on) setRow(b); });
+    return () => { on = false; };
+  }, [batchId]);
+  if (!row) return null;
+  return <FactRow k={k} v={`${row.name} (${row.code})`} />;
+}
+
 // The paywall: pricing cards → manual payment instructions + proof-upload form.
 // Also hosts the "rejected / expired — resubmit" notice step (priorRequest present).
 // Renewal mode (renewal + currentSub): same flow reused for membership renewals —
@@ -2153,6 +2767,11 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
   const [plans, setPlans] = useState(ENROLLMENT_PLANS_FALLBACK);
   const [pay, setPay] = useState(PAYMENT_SETTINGS_FALLBACK);
   const [selected, setSelected] = useState(null);
+  // #32: gold/vip checkout requires picking an OPEN batch (training month).
+  // null = the batches table isn't reachable (pre-#32) → no selector, the
+  // admin resolves the batch at approval instead.
+  const [openBatches, setOpenBatches] = useState(null);
+  const [batchId, setBatchId] = useState(null);
 
   const [fullName, setFullName] = useState(profile?.full_name || '');
   const [phone, setPhone] = useState('');
@@ -2180,6 +2799,12 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
         const { data } = await supabase.from('payment_settings').select('key,value');
         if (!cancelled && data?.length) setPay(s => ({ ...s, ...Object.fromEntries(data.map(r => [r.key, r.value])) }));
       } catch { /* fallback details already shown */ }
+      try {
+        // batches_read RLS lets any signed-in student list OPEN batches (#32).
+        const { data, error } = await supabase.from('batches')
+          .select('id, code, name, status').eq('status', 'open').order('code', { ascending: false });
+        if (!cancelled && !error) setOpenBatches(data || []);
+      } catch { /* pre-#32 — no batch selector */ }
     })();
     return () => { cancelled = true; };
   }, []);
@@ -2187,9 +2812,16 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
   const selectPlan = (p) => {
     setSelected(p);
     setAmountPaid(String(p.price_php ?? ''));
+    // Gold/VIP enroll into a batch: preselect when exactly one is open.
+    setBatchId(isPremiumSegment(planSegment(p.key, { [p.key]: p })) && openBatches?.length === 1
+      ? openBatches[0].id : null);
     setErr('');
     setStep('form');
   };
+  const selectedSegment = selected ? planSegment(selected.key, { [selected.key]: selected }) : 'general';
+  // Require the picker only when open batches are actually listable — pre-#32
+  // (openBatches null) or zero open batches degrade to admin-resolves-at-approval.
+  const needsBatchPick = isPremiumSegment(selectedSegment) && Array.isArray(openBatches) && openBatches.length > 0;
 
   const handleFile = (f) => {
     setErr('');
@@ -2214,6 +2846,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
     const amt = Number(amountPaid);
     if (!fullName.trim()) { setErr('Please enter your full name.'); return; }
     if (!amt || amt <= 0) { setErr('Please enter the amount you sent.'); return; }
+    if (needsBatchPick && !batchId) { setErr('Please choose your batch (training month).'); return; }
     if (!agree) { setErr('Please confirm the checkbox before submitting.'); return; }
 
     setBusy(true);
@@ -2244,6 +2877,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
       try {
         row = await submitSubscriptionRequest({
           user, planKey: selected.key, planName: selected.name, kind,
+          batchId: isPremiumSegment(selectedSegment) ? batchId : null,
           amountExpected: Number(selected.price_php || 0), amountPaid: amt,
           fields: { fullName, phone, cityCountry, background, reference }, file,
         });
@@ -2510,6 +3144,27 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
                     <label className={labelCls} style={labelStyle}>City & country</label>
                     <input className={inputCls} style={inputStyle} value={cityCountry} onChange={e => setCityCountry(e.target.value)} placeholder="Manila, Philippines" />
                   </div>
+                  {isPremiumSegment(selectedSegment) && (
+                    <div className="sm:col-span-2">
+                      <label className={labelCls} style={labelStyle}>Batch (training month) {needsBatchPick ? '*' : ''}</label>
+                      {needsBatchPick ? (
+                        <select className={inputCls} style={inputStyle} value={batchId || ''} required
+                          onChange={e => setBatchId(e.target.value || null)}>
+                          <option value="">Choose your batch…</option>
+                          {openBatches.map(b => (
+                            <option key={b.id} value={b.id}>{b.name} ({b.code})</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <div className="px-3.5 py-2.5 rounded-xl" style={{ background: 'var(--wash)', fontSize: 12.5, color: C.textSoft }}>
+                          No batch is open for self-enrollment right now — Coach Alex’s team will assign yours when your payment is verified.
+                        </div>
+                      )}
+                      <p className="mt-1.5" style={{ fontSize: 11, color: C.textMute }}>
+                        Your batch is your live-training cohort — it also unlocks that batch’s private {selectedSegment === 'vip' ? 'VIP' : 'Gold'} community.
+                      </p>
+                    </div>
+                  )}
                   <div className="sm:col-span-2">
                     <label className={labelCls} style={labelStyle}>Course / background</label>
                     <textarea className={inputCls + ' resize-none'} style={inputStyle} rows={2} value={background} onChange={e => setBackground(e.target.value)}
@@ -2643,8 +3298,35 @@ function MembershipPill({ label, tone, size = 11 }) {
   );
 }
 
+// Renders overlay chrome into document.body so no ancestor can break a fixed-position
+// dialog — the `.gh-app-bg > *` stacking rule in index.css, the sidebar's transform/
+// backdrop-filter containing block, and the app shell's flex layout all stop mattering.
+// Keep-alive guard: AccountModal/SidePanel consumers deep inside a hidden TabPanel
+// ([hidden] subtree) must not float over the active tab, so an in-tree anchor probes for
+// a [hidden] ancestor after every commit (the dep-less layout effect re-runs whenever the
+// subtree re-renders — which the TabPanel does when it hides/shows) and suppresses the
+// portal while hidden. State stays mounted; the dialog reappears when its tab returns.
+function OverlayPortal({ children }) {
+  const anchorRef = useRef(null);
+  const [hostHidden, setHostHidden] = useState(false);
+  useLayoutEffect(() => { // no dep array — must re-probe on every render
+    const h = !!anchorRef.current?.closest('[hidden]');
+    if (h !== hostHidden) setHostHidden(h);
+  });
+  if (typeof document === 'undefined') return null;
+  return (
+    <>
+      {/* display:none (NOT the hidden attribute — closest('[hidden]') would match itself) */}
+      <span ref={anchorRef} style={{ display: 'none' }} aria-hidden="true" />
+      {!hostHidden && createPortal(children, document.body)}
+    </>
+  );
+}
+
 // Shared centered-dialog shell (backdrop closes · panel stops propagation · Escape closes ·
-// SHEEN header). z-[70] so it sits above the sidebar (z-50) and the account menu (z-50).
+// SHEEN header). z-[70] so it sits above the sidebar (z-50) and the account menu (z-50) —
+// and it renders through OverlayPortal into document.body, so that z-index competes at the
+// top level and no ancestor CSS can demote or squeeze it.
 // Shared modal shell — the ONE dialog surface for the whole app (account menu AND the
 // admin approve/reject/receipt modals). Additive props, all defaulted so the original
 // account-menu call sites render unchanged:
@@ -2690,8 +3372,10 @@ function AccountModal({ title, subtitle, icon: Icon, onClose, children, maxW = '
   }, [canClose, onClose]);
   const tile = MODAL_TONE_TILE[tone] || MODAL_TONE_TILE.primary;
   return (
+    <OverlayPortal>
+    {/* color: C.text — on document.body there is no app-shell div to inherit it from */}
     <div className="fixed inset-0 z-[70] flex items-center justify-center p-4"
-      style={{ background: 'rgba(15,18,23,0.45)', fontFamily: fontBody }} onClick={close}>
+      style={{ background: 'rgba(15,18,23,0.45)', fontFamily: fontBody, color: C.text }} onClick={close}>
       <div ref={panelRef} tabIndex={-1}
         className={`w-full ${maxW} rounded-2xl shadow-2xl overflow-hidden max-h-[92vh] flex flex-col outline-none`}
         style={{ background: C.white, border: `1px solid ${GLASS.border}` }}
@@ -2715,6 +3399,67 @@ function AccountModal({ title, subtitle, icon: Icon, onClose, children, maxW = '
         <div className={`${bodyClass} overflow-y-auto`} style={bodyStyle}>{children}</div>
       </div>
     </div>
+    </OverlayPortal>
+  );
+}
+
+// Right-side floating drawer. Renders through OverlayPortal into document.body (like
+// AccountModal) so it truly overlays the shell — never a layout column, sidebar/main are
+// untouched. Full-width sheet on mobile → right drawer on sm+ (width via the `maxW` prop,
+// a static Tailwind class so the JIT sees it). Same a11y idiom as AccountModal (focus
+// move-in + restore, Escape, Tab focus-trap, role=dialog/aria-modal, backdrop click-to-close).
+function SidePanel({ title, subtitle, icon: Icon, onClose, children, tone = 'primary',
+  closeLabel = 'Close', bodyClass = 'px-6 py-5', maxW = 'sm:max-w-md' }) {
+  const panelRef = useRef(null);
+  useEffect(() => {
+    const opener = document.activeElement;
+    panelRef.current?.focus();
+    return () => { if (opener && typeof opener.focus === 'function') opener.focus(); };
+  }, []);
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape') { onClose?.(); return; }
+      if (e.key !== 'Tab' || !panelRef.current) return;
+      const f = panelRef.current.querySelectorAll(
+        'button:not([disabled]), [href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      );
+      if (!f.length) return;
+      const first = f[0], last = f[f.length - 1];
+      if (e.shiftKey && (document.activeElement === first || document.activeElement === panelRef.current)) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  const tile = MODAL_TONE_TILE[tone] || MODAL_TONE_TILE.primary;
+  return (
+    <OverlayPortal>
+    {/* color: C.text — on document.body there is no app-shell div to inherit it from */}
+    <div className="fixed inset-0 z-[70] flex justify-end"
+      style={{ background: 'rgba(15,18,23,0.45)', fontFamily: fontBody, color: C.text }} onClick={() => onClose?.()}>
+      <div ref={panelRef} tabIndex={-1}
+        className={`absolute inset-y-0 right-0 w-full ${maxW} h-full shadow-2xl overflow-hidden flex flex-col outline-none`}
+        style={{ background: C.white, borderLeft: `1px solid ${GLASS.border}` }}
+        role="dialog" aria-modal="true" aria-label={title} onClick={(e) => e.stopPropagation()}>
+        <div className="px-6 pt-5 pb-4 flex items-start gap-3" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+          {Icon && (
+            <div className="flex items-center justify-center rounded-xl flex-shrink-0" style={{ width: 38, height: 38, background: tile.background, border: tile.border }}>
+              <Icon size={18} style={{ color: tile.color }} />
+            </div>
+          )}
+          <div className="flex-1 min-w-0">
+            <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 16, color: C.text }}>{title}</div>
+            {subtitle && <div className="mt-0.5" style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.45 }}>{subtitle}</div>}
+          </div>
+          <button onClick={() => onClose?.()} aria-label={closeLabel}
+            className="flex-shrink-0 p-1 rounded-lg transition hover:opacity-70" style={{ color: C.textMute }}>
+            <X size={18} />
+          </button>
+        </div>
+        <div className={`${bodyClass} overflow-y-auto flex-1`}>{children}</div>
+      </div>
+    </div>
+    </OverlayPortal>
   );
 }
 
@@ -2728,24 +3473,34 @@ function FactRow({ k, v, mono }) {
   );
 }
 
-// The sidebar ⋮ account menu. Reuses the house dropdown a11y idiom (Escape + fixed-inset
-// outside-click catcher + role=menu/menuitem + aria-haspopup/expanded + focus restore).
+// The sidebar ⋮ account menu. House dropdown a11y idiom (Escape + outside-click close +
+// role=menu/menuitem + aria-haspopup/expanded + focus restore). Outside-click uses a
+// document-level pointerdown listener, NOT a fixed-inset catcher div: this menu lives
+// inside the sidebar <aside>, whose CSS transform makes it the containing block for
+// fixed descendants — a "fixed inset-0" catcher would only cover the sidebar's own box,
+// leaving clicks in <main> unable to close the menu.
 // placement: 'card' (downward, right-aligned) or 'rail' (flyout to the right of the rail).
 function AccountMenu({ user, profile, sub, latestReq, entitlement, onOpen, onSignOut, placement = 'card', showBilling = true }) {
   const [open, setOpen] = useState(false);
   const triggerRef = useRef(null);
+  const wrapRef = useRef(null);
   useEffect(() => {
     if (!open) return;
     const onKey = (e) => { if (e.key === 'Escape') { setOpen(false); triggerRef.current?.focus(); } };
+    const onPointerDown = (e) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
+    };
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    document.addEventListener('pointerdown', onPointerDown, true);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      document.removeEventListener('pointerdown', onPointerDown, true);
+    };
   }, [open]);
 
-  const close = () => { setOpen(false); triggerRef.current?.focus(); };
   const pick = (view) => { setOpen(false); onOpen?.(view); };
   const status = membershipStatus(sub, latestReq);
   const planLabel = entitlement?.label || PLAN_LABELS[sub?.plan_key || profile?.plan] || (sub?.plan_key || profile?.plan) || 'Member';
-  const initial = (((profile?.full_name || user?.email || '?').trim()[0]) || '?').toUpperCase();
 
   const items = [
     { view: 'profile', label: 'Profile & Settings', Icon: User },
@@ -2761,23 +3516,20 @@ function AccountMenu({ user, profile, sub, latestReq, entitlement, onOpen, onSig
     : 'right-0 top-[calc(100%+8px)]';
 
   return (
-    <div className={`relative ${open ? 'z-[55]' : ''}`}>
+    <div ref={wrapRef} className={`relative ${open ? 'z-[55]' : ''}`}>
       <button ref={triggerRef} onClick={() => setOpen(o => !o)}
-        aria-haspopup="menu" aria-expanded={open} title="Account"
+        aria-haspopup="menu" aria-expanded={open} aria-label="Open account menu" title="Account"
         className="flex-shrink-0 p-1.5 rounded-lg transition hover:opacity-80"
         style={{ color: C.textMute, background: open ? 'var(--wash)' : 'transparent' }}>
-        <MoreHorizontal size={16} />
+        <MoreVertical size={16} />
       </button>
       {open && (
-        <>
-          <div className="fixed inset-0 z-40" aria-hidden="true" onClick={close} />
           <div role="menu" aria-label="Account menu"
             className={`absolute ${panelPos} z-50 w-60 rounded-2xl shadow-xl overflow-hidden`}
             style={{ background: C.white, border: `1px solid ${GLASS.border}`, boxShadow: '0 18px 44px -12px rgba(15,23,42,0.30)' }}>
             {/* Identity header */}
             <div className="px-3.5 py-3 flex items-center gap-2.5" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
-              <div className="flex items-center justify-center flex-shrink-0 rounded-full text-white text-[12px] font-bold"
-                style={{ width: 34, height: 34, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>{initial}</div>
+              <MemberAvatar name={profile?.full_name || user?.email} src={resolveAvatarUrl(profile?.avatar_url)} size={34} />
               <div className="flex-1 min-w-0">
                 <div className="truncate" style={{ fontSize: 12.5, fontWeight: 700, color: C.text, lineHeight: 1.2 }}>{profile?.full_name || user?.email?.split('@')[0]}</div>
                 <div className="truncate" style={{ fontSize: 10.5, color: C.textMute }}>{user?.email}</div>
@@ -2808,45 +3560,390 @@ function AccountMenu({ user, profile, sub, latestReq, entitlement, onOpen, onSig
               </button>
             </div>
           </div>
-        </>
       )}
     </div>
   );
 }
 
-// Read-only profile / settings (profiles has no user-update RLS policy, so no in-app edit).
-function ProfileSettingsModal({ user, profile, sub, latestReq, entitlement, onOpen, onClose, showBilling = true }) {
+// Uppercase micro-label heading the settings-drawer sections (house label idiom).
+function SettingsSectionLabel({ children, first = false }) {
+  return (
+    <div className={`${first ? '' : 'mt-5 '}mb-2`} style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+      {children}
+    </div>
+  );
+}
+
+// Copy-to-clipboard chip for the account id. Its 1.5s "copied" flash is the one bit of state
+// the settings body would otherwise need, so it lives here to keep ProfileSettingsBody pure.
+function CopyIdButton({ value }) {
+  const [copied, setCopied] = useState(false);
+  const timerRef = useRef(null);
+  useEffect(() => () => clearTimeout(timerRef.current), []);
+  const copy = async () => {
+    try {
+      if (!navigator.clipboard) throw new Error('clipboard unavailable');
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard unavailable (permission / non-secure context) — id stays selectable */ }
+  };
+  return (
+    <button onClick={copy} aria-label="Copy account ID" title="Copy account ID"
+      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md font-bold transition hover:opacity-75"
+      style={{ fontSize: 10, color: copied ? C.green : C.textMute, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+      {copied ? <Check size={11} /> : <Copy size={11} />} {copied ? 'Copied' : 'Copy'}
+    </button>
+  );
+}
+
+// Payments & requests history for the settings drawer. Lazy by construction — the drawer only
+// mounts while ?panel=settings is open, so the mount effect IS the lazy fetch. select('*')
+// (not a column list) stays resilient to pre-#20 schemas missing request_kind/extension_days.
+// Deliberately no realtime channel: the drawer is short-lived and the enrollment gate already
+// watches these rows for the states that matter.
+const REQ_STATUS_PILL = {
+  pending_review: { label: 'Pending review', tone: C.amber },
+  approved: { label: 'Approved', tone: C.green },
+  rejected: { label: 'Rejected', tone: C.red },
+  expired: { label: 'Expired', tone: C.textMute },
+};
+const REQ_KIND_LABEL = { renewal: 'Renewal', upgrade: 'Upgrade', extension: 'Extension' };
+function RequestHistorySection({ uid }) {
+  const [rows, setRows] = useState(null); // null = loading
+  const [failed, setFailed] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+  useEffect(() => {
+    if (!uid) { setRows([]); return; }
+    let cancelled = false;
+    setRows(null); setFailed(false);
+    (async () => {
+      const { data, error } = await supabase.from('enrollment_requests').select('*')
+        .eq('user_id', uid).order('created_at', { ascending: false }).limit(5);
+      if (cancelled) return;
+      if (error) { setFailed(true); setRows([]); return; }
+      setRows(data || []);
+    })();
+    return () => { cancelled = true; };
+  }, [uid, reloadKey]);
+
+  if (rows === null) {
+    return (
+      <div className="space-y-2" aria-hidden="true">
+        {[0, 1, 2].map(i => <div key={i} className="h-9 rounded-xl shimmer" style={{ background: 'var(--wash)' }} />)}
+      </div>
+    );
+  }
+  if (failed) {
+    return (
+      <div className="rounded-xl px-3.5 py-3 flex items-center justify-between gap-3"
+        style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)' }}>
+        <span style={{ fontSize: 12, color: 'var(--status-warn-fg)' }}>Couldn’t load your payment history.</span>
+        <button onClick={() => setReloadKey(k => k + 1)}
+          className="flex-shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg font-bold transition hover:opacity-80"
+          style={{ fontSize: 11.5, color: 'var(--status-warn-fg)', border: '1px solid var(--status-warn-bd)' }}>
+          <RefreshCw size={12} /> Retry
+        </button>
+      </div>
+    );
+  }
+  if (!rows.length) {
+    return <p style={{ fontSize: 12, color: C.textMute }}>No payment requests yet.</p>;
+  }
+  return (
+    <div className="rounded-xl overflow-hidden" style={{ border: `1px solid ${GLASS.borderSoft}` }}>
+      {rows.map((r, i) => {
+        const pill = REQ_STATUS_PILL[r.status] || { label: r.status || '—', tone: C.textMute };
+        const kind = REQ_KIND_LABEL[r.request_kind] || 'New enrollment';
+        const ext = r.request_kind === 'extension' && Number(r.extension_days) > 0 ? ` · ${r.extension_days} days` : '';
+        return (
+          <div key={r.id} className="px-3.5 py-2.5 flex items-center justify-between gap-3"
+            style={{ background: i % 2 ? 'transparent' : 'var(--wash)', borderTop: i ? `1px solid ${GLASS.borderSoft}` : 'none' }}>
+            <div className="min-w-0">
+              <div className="truncate" style={{ fontSize: 12, fontWeight: 700, color: C.text }}>
+                {kind}{ext} — {r.plan_name || PLAN_LABELS[r.plan_key] || r.plan_key || '—'}
+              </div>
+              <div style={{ fontSize: 10.5, color: C.textMute }}>
+                {fmtEnrollDate(r.created_at)}{Number(r.amount_paid) > 0 ? ` · ${phpFmt(r.amount_paid)}` : ''}
+              </div>
+            </div>
+            <MembershipPill label={pill.label} tone={pill.tone} size={10} />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Profile picture uploader for the Account Center. Self-contained (own useAuth) so
+// ProfileSettingsBody stays presentational. Flow: upload to avatars/<uid>/<uuid>.<ext>
+// (public bucket, own-folder RLS) → set_my_avatar() RPC (the ONE sanctioned user-facing
+// profiles write — it also refreshes the denormalized community author_avatar_url) →
+// best-effort delete of older own files → refreshProfile() so the new picture appears
+// app-wide (sidebar, account menu, community, mentions). Degrades to a friendly notice
+// when the bucket/RPC aren't migrated yet (db #24).
+function AvatarSection() {
+  const { user, profile, refreshProfile } = useAuth();
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const inputRef = useRef(null);
+  const uid = user?.id;
+  const src = resolveAvatarUrl(profile?.avatar_url);
+
+  async function upload(file) {
+    if (!file || !uid || busy) return;
+    setErr('');
+    if (!/^image\//i.test(file.type)) { setErr('Please choose an image file (JPG, PNG, WEBP or GIF).'); return; }
+    if (file.size > 5 * 1024 * 1024) { setErr('Images must be 5 MB or smaller — please resize it.'); return; }
+    setBusy(true);
+    try {
+      const ext = (file.name.split('.').pop() || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
+      const path = `${uid}/${crypto.randomUUID()}.${ext}`;
+      const { error: upErr } = await supabase.storage.from('avatars')
+        .upload(path, file, { upsert: false, contentType: file.type });
+      if (upErr) throw new Error(/bucket/i.test(upErr.message || '') ? 'NOT_SET_UP' : (upErr.message || 'Upload failed.'));
+      const { error: rpcErr } = await supabase.rpc('set_my_avatar', { p_path: path });
+      if (rpcErr) {
+        // Roll the orphan back — the profile row never changed.
+        supabase.storage.from('avatars').remove([path]).catch(() => {});
+        throw new Error(rpcErr.code === 'PGRST202' ? 'NOT_SET_UP' : (rpcErr.message || 'Could not save your picture.'));
+      }
+      // Best-effort: clear previous own uploads (keeps the folder to one file).
+      try {
+        const { data: listed } = await supabase.storage.from('avatars').list(uid, { limit: 20 });
+        const old = (listed || []).map(f => `${uid}/${f.name}`).filter(p => p !== path);
+        if (old.length) await supabase.storage.from('avatars').remove(old);
+      } catch { /* cosmetic */ }
+      await refreshProfile();
+    } catch (e) {
+      setErr(e?.message === 'NOT_SET_UP'
+        ? 'Profile pictures aren’t set up yet — run db/2026-07-21-community-forum.sql (see COMMUNITY_SETUP.md).'
+        : (e?.message || 'Could not update your picture. Please try again.'));
+    } finally { setBusy(false); }
+  }
+
+  async function removeAvatar() {
+    if (!uid || busy || !profile?.avatar_url) return;
+    setBusy(true); setErr('');
+    try {
+      const { error: rpcErr } = await supabase.rpc('set_my_avatar', { p_path: null });
+      if (rpcErr) throw new Error(rpcErr.code === 'PGRST202' ? 'NOT_SET_UP' : (rpcErr.message || 'Could not remove your picture.'));
+      try {
+        const { data: listed } = await supabase.storage.from('avatars').list(uid, { limit: 20 });
+        const paths = (listed || []).map(f => `${uid}/${f.name}`);
+        if (paths.length) await supabase.storage.from('avatars').remove(paths);
+      } catch { /* cosmetic */ }
+      await refreshProfile();
+    } catch (e) {
+      setErr(e?.message === 'NOT_SET_UP'
+        ? 'Profile pictures aren’t set up yet — run db/2026-07-21-community-forum.sql (see COMMUNITY_SETUP.md).'
+        : (e?.message || 'Could not remove your picture. Please try again.'));
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <>
+      <SettingsSectionLabel first>Profile picture</SettingsSectionLabel>
+      <div className="rounded-xl px-3.5 py-3 flex items-center gap-3" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+        <MemberAvatar name={profile?.full_name || user?.email} src={src} size={52} />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <button onClick={() => inputRef.current?.click()} disabled={busy}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold text-white transition disabled:opacity-60"
+              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+              {busy ? <Loader2 size={13} className="animate-spin" /> : <Camera size={13} />} {src ? 'Change photo' : 'Upload photo'}
+            </button>
+            {src && (
+              <button onClick={removeAvatar} disabled={busy}
+                className="gh-btn-ghost px-3 py-1.5 rounded-xl text-xs font-semibold disabled:opacity-60">
+                Remove
+              </button>
+            )}
+          </div>
+          <p className="mt-1.5" style={{ fontSize: 10.5, color: C.textMute, lineHeight: 1.45 }}>
+            Shown beside your posts, replies and mentions in the Community. JPG/PNG/WEBP/GIF, up to 5 MB.
+          </p>
+          {err && <div className="mt-1.5 text-[11px]" style={{ color: 'var(--status-danger-fg)' }}>{err}</div>}
+        </div>
+        <input ref={inputRef} type="file" accept="image/*" className="hidden"
+          onChange={e => { upload(e.target.files && e.target.files[0]); e.target.value = ''; }} />
+      </div>
+    </>
+  );
+}
+
+// Read-only profile / settings body (profiles has no user-update RLS policy, so no in-app edit
+// — except the profile picture, which goes through the set_my_avatar() RPC in AvatarSection).
+// Sectioned Account Center content for the settings drawer — presentational (data via props;
+// the one fetch, request history, lives in RequestHistorySection). Sections: Account overview →
+// Membership → Subscription actions → Payments & requests → Course access → Support. The admin
+// variant (!showBilling && is_admin) swaps the billing sections for a capabilities note; a
+// flag-off member just gets overview + support. `ready=false` (enrollment gate still fetching)
+// renders shimmer rows instead of misreading "no plan" — the drawer is never blank.
+function ProfileSettingsBody({ user, profile, sub, latestReq, entitlement, plan, onOpen, showBilling = true, ready = true }) {
   const a = subAccess(sub);
   const status = membershipStatus(sub, latestReq);
-  const planLabel = entitlement?.label || PLAN_LABELS[sub?.plan_key || profile?.plan] || (sub?.plan_key || profile?.plan) || '—';
+  const planLabel = plan?.name || entitlement?.label || PLAN_LABELS[sub?.plan_key || profile?.plan] || (sub?.plan_key || profile?.plan) || '—';
+  const chips = Array.isArray(plan?.entitlement_summary) ? plan.entitlement_summary : [];
+  const showRenew = a.has && !a.legacy && (a.inGrace || (a.daysLeft != null && a.daysLeft <= 5));
+  // Paid before the subscriptions era: is_paid=true with NO subscriptions row. The gate
+  // passes these users (enrollGateState's `!acc.has` branch) — never tell them to "choose
+  // a plan"; they already have full, non-expiring access.
+  const grandfathered = !a.has && !!profile?.is_paid;
   return (
-    <AccountModal title="Profile & Settings" subtitle="Your account and membership at a glance" icon={User} onClose={onClose}>
+    <>
+      <AvatarSection />
+      <SettingsSectionLabel>Account</SettingsSectionLabel>
       <div className="rounded-xl px-3.5 py-1" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
         <FactRow k="Name" v={profile?.full_name || '—'} />
         <FactRow k="Email" v={user?.email || '—'} />
-        {/* Billing facts are meaningless for admins (no subscription — full access by role),
-            so mirror AccountMenu's showBilling gate and show the role instead. */}
-        {!showBilling && <FactRow k="Role" v="Administrator" />}
-        {showBilling && <FactRow k="Plan" v={planLabel} />}
-        {showBilling && <FactRow k="Status" v={<MembershipPill label={status.label} tone={status.tone} />} />}
-        {showBilling && a.has && <FactRow k="Started" v={fmtEnrollDate(sub?.started_at)} />}
-        {showBilling && a.has && <FactRow k="Expires" v={a.legacy ? 'No expiry' : fmtEnrollDate(a.ends)} />}
-        {showBilling && a.has && !a.legacy && <FactRow k={a.inGrace ? 'Grace ends in' : 'Days remaining'} v={a.daysLeft != null ? `${a.daysLeft} day${a.daysLeft === 1 ? '' : 's'}` : '—'} />}
-        {showBilling && a.inGrace && <FactRow k="Grace ends" v={fmtEnrollDate(a.graceEnds)} />}
+        <FactRow k="Role" v={profile?.is_admin ? 'Administrator' : 'Member'} />
+        {user?.id && (
+          <FactRow k="Account ID" v={
+            <span className="inline-flex items-center gap-1.5">
+              {/* title = full id, so it's recoverable even where the Clipboard API is unavailable */}
+              <span title={user.id} style={{ fontFamily: fontMono, fontSize: 11.5 }}>{String(user.id).slice(0, 8)}…</span>
+              <CopyIdButton value={user.id} />
+            </span>
+          } />
+        )}
       </div>
-      <p className="mt-4" style={{ fontSize: 11.5, color: C.textMute, lineHeight: 1.5 }}>
+
+      {showBilling && (
+        <>
+          <SettingsSectionLabel>Membership</SettingsSectionLabel>
+          {!ready ? (
+            <div className="space-y-2" aria-hidden="true">
+              {[0, 1, 2].map(i => <div key={i} className="h-8 rounded-xl shimmer" style={{ background: 'var(--wash)' }} />)}
+            </div>
+          ) : grandfathered ? (
+            <div className="rounded-xl px-3.5 py-1" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+              <FactRow k="Plan" v={planLabel === '—' ? 'Member' : planLabel} />
+              <FactRow k="Status" v={<MembershipPill label="Active" tone={C.green} />} />
+              <FactRow k="Expires" v="No expiry (legacy membership)" />
+            </div>
+          ) : !a.has ? (
+            <div className="rounded-xl px-3.5 py-3.5" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+              <div style={{ fontSize: 12.5, fontWeight: 700, color: C.text }}>No active membership</div>
+              <p className="mt-0.5" style={{ fontSize: 11.5, color: C.textSoft }}>Choose a plan to unlock the toolkits.</p>
+            </div>
+          ) : (
+            <div className="rounded-xl px-3.5 py-1" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+              <FactRow k="Plan" v={planLabel} />
+              {sub?.batch_id && <BatchFactRow batchId={sub.batch_id} />}
+              <FactRow k="Status" v={<MembershipPill label={status.label} tone={status.tone} />} />
+              {plan?.price_php != null && <FactRow k="Price" v={phpFmt(plan.price_php)} />}
+              <FactRow k="Started" v={fmtEnrollDate(sub?.started_at)} />
+              <FactRow k="Expires" v={a.legacy ? 'No expiry' : fmtEnrollDate(a.ends)} />
+              {!a.legacy && <FactRow k={a.inGrace ? 'Grace ends in' : 'Days remaining'} v={a.daysLeft != null ? `${a.daysLeft} day${a.daysLeft === 1 ? '' : 's'}` : '—'} />}
+              {a.inGrace && <FactRow k="Grace ends" v={fmtEnrollDate(a.graceEnds)} />}
+            </div>
+          )}
+
+          <SettingsSectionLabel>Subscription</SettingsSectionLabel>
+          {ready && grandfathered ? (
+            /* No dated term to extend/renew — upgrading to a current plan is the one action. */
+            <button onClick={() => onOpen?.('upgrade')}
+              className="w-full px-3 py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-1.5 transition hover:opacity-95"
+              style={{ color: 'white', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -3px var(--primary-glow)` }}>
+              <ArrowUpCircle size={15} /> Upgrade to a current plan
+            </button>
+          ) : ready && !a.has ? (
+            <button onClick={() => onOpen?.('upgrade')}
+              className="w-full px-3 py-2.5 rounded-xl text-sm font-bold text-white transition hover:opacity-95"
+              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -3px var(--primary-glow)` }}>
+              Choose a plan
+            </button>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-2.5">
+                <button onClick={() => onOpen?.('upgrade')}
+                  className="px-3 py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-1.5 transition hover:opacity-95"
+                  style={{ color: 'white', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -3px var(--primary-glow)` }}>
+                  <ArrowUpCircle size={15} /> Upgrade
+                </button>
+                <button onClick={() => onOpen?.('extend')}
+                  className="px-3 py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-1.5 transition hover:opacity-90"
+                  style={{ color: C.primary, background: 'rgba(10,132,255,0.07)', border: '1px solid rgba(10,132,255,0.22)' }}>
+                  <CalendarPlus size={15} /> Extend
+                </button>
+              </div>
+              {showRenew && (
+                <button onClick={() => onOpen?.('renew')}
+                  className="mt-2.5 w-full px-3 py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-1.5 transition hover:opacity-90"
+                  style={{ color: C.textSoft, background: C.white, border: `1px solid ${C.border}` }}>
+                  <RefreshCw size={14} /> Renew now
+                </button>
+              )}
+            </>
+          )}
+
+          <SettingsSectionLabel>Payments &amp; requests</SettingsSectionLabel>
+          <RequestHistorySection uid={user?.id} />
+
+          <SettingsSectionLabel>Course access</SettingsSectionLabel>
+          <p style={{ fontSize: 12, color: C.textSoft, lineHeight: 1.5 }}>{entitlement?.scopeLabel || 'Full toolkit access'}</p>
+          {chips.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {chips.map((c, i) => (
+                <span key={i} className="inline-flex items-center gap-1 px-2 py-1 rounded-lg" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+                  <Check size={10} style={{ color: C.primary }} /> {c}
+                </span>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+
+      {!showBilling && profile?.is_admin && (
+        <>
+          <SettingsSectionLabel>Administrator</SettingsSectionLabel>
+          <div className="rounded-xl px-3.5 py-3.5" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <p style={{ fontSize: 12, color: C.textSoft, lineHeight: 1.55 }}>
+              You manage courses, enrollments, access requests and sidebar labels from the admin
+              tabs. Admin accounts have no membership or billing.
+            </p>
+          </div>
+        </>
+      )}
+
+      <SettingsSectionLabel>Support</SettingsSectionLabel>
+      <p style={{ fontSize: 11.5, color: C.textMute, lineHeight: 1.5 }}>
         Need to change your name or email? Contact Coach Alex’s team — profile details are updated by support.
       </p>
-      {showBilling && (
-        <div className="mt-4 flex items-center justify-end gap-2.5">
-          <button onClick={() => onOpen?.('membership')}
-            className="px-4 py-2 rounded-xl text-sm font-bold text-white transition hover:opacity-95"
-            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -3px var(--primary-glow)` }}>
-            View membership
-          </button>
-        </div>
-      )}
-    </AccountModal>
+    </>
+  );
+}
+
+// Profile & Settings as a right-side drawer (URL-driven via ?panel=settings) — the Account
+// Center. Overlay group, never a layout column — see SidePanel. Owns the one plan-row fetch
+// (price/chips for the Membership + Course-access sections; same fallback-first pattern as
+// MembershipPlanModal); everything else arrives via props from the already-loaded enrollment
+// gate, and `enrollReady` tells the body whether that gate has settled.
+function AccountSettingsPanel({ user, profile, sub, latestReq, entitlement, onOpen, onClose, showBilling = true, enrollReady = true }) {
+  const [plan, setPlan] = useState(null);
+  useEffect(() => {
+    if (!showBilling) return;
+    let cancelled = false;
+    const key = sub?.plan_key || profile?.plan;
+    const fb = ENROLLMENT_PLANS_FALLBACK.find(p => p.key === key) || null;
+    setPlan(fb);
+    if (!key) return;
+    (async () => {
+      try {
+        const data = await fetchPlanRow(key);
+        if (!cancelled && data) setPlan({ ...data, features: Array.isArray(data.features) ? data.features : [] });
+      } catch { /* fallback already set */ }
+    })();
+    return () => { cancelled = true; };
+  }, [showBilling, sub?.plan_key, profile?.plan]);
+  return (
+    <SidePanel title="Profile & Settings" subtitle="Your account, membership and billing at a glance"
+      icon={User} onClose={onClose} closeLabel="Close profile settings" maxW="sm:max-w-lg">
+      <ProfileSettingsBody user={user} profile={profile} sub={sub} latestReq={latestReq}
+        entitlement={entitlement} plan={plan} onOpen={onOpen} showBilling={showBilling} ready={enrollReady} />
+    </SidePanel>
   );
 }
 
@@ -2861,7 +3958,7 @@ function MembershipPlanModal({ user, profile, sub, latestReq, entitlement, onOpe
     if (!key) return;
     (async () => {
       try {
-        const { data } = await supabase.from('enrollment_plans').select('*').eq('key', key).maybeSingle();
+        const data = await fetchPlanRow(key);
         if (!cancelled && data) setPlan({ ...data, features: Array.isArray(data.features) ? data.features : [] });
       } catch { /* fallback already set */ }
     })();
@@ -2874,9 +3971,30 @@ function MembershipPlanModal({ user, profile, sub, latestReq, entitlement, onOpe
   const chips = Array.isArray(plan?.entitlement_summary) ? plan.entitlement_summary : [];
   const showRenew = a.has && !a.legacy && (a.inGrace || (a.daysLeft != null && a.daysLeft <= 5));
 
+  // Paid before the subscriptions era (is_paid, no subscriptions row) — the gate passes
+  // these users as grandfathered full access; never tell them to "choose a plan".
+  const grandfathered = !a.has && !!profile?.is_paid;
   return (
     <AccountModal title="Current Membership" subtitle="Your plan, access period and billing options" icon={CreditCard} onClose={onClose}>
-      {!a.has ? (
+      {grandfathered ? (
+        <>
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div style={{ fontFamily: fontDisplay, fontWeight: 800, fontSize: 18, color: C.text }}>{planLabel || 'Member'}</div>
+              <div className="mt-0.5" style={{ fontSize: 12, color: C.textSoft }}>{entitlement?.scopeLabel || 'Full toolkit access'}</div>
+            </div>
+            <MembershipPill label="Active" tone={C.green} size={11} />
+          </div>
+          <div className="mt-4 rounded-xl px-3.5 py-1" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <FactRow k="Expires" v="No expiry (legacy membership)" />
+          </div>
+          <button onClick={() => onOpen?.('upgrade')}
+            className="mt-5 w-full px-3 py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-1.5 transition hover:opacity-95"
+            style={{ color: 'white', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -3px var(--primary-glow)` }}>
+            <ArrowUpCircle size={15} /> Upgrade to a current plan
+          </button>
+        </>
+      ) : !a.has ? (
         <div className="text-center py-4">
           <div className="mx-auto flex items-center justify-center rounded-2xl" style={{ width: 52, height: 52, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
             <CreditCard size={22} style={{ color: C.textMute }} />
@@ -2931,7 +4049,7 @@ function MembershipPlanModal({ user, profile, sub, latestReq, entitlement, onOpe
             </button>
           </div>
           {showRenew && (
-            <button onClick={() => onOpen?.('upgrade')}
+            <button onClick={() => onOpen?.('renew')}
               className="mt-2.5 w-full px-3 py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-1.5 transition hover:opacity-90"
               style={{ color: C.textSoft, background: C.white, border: `1px solid ${C.border}` }}>
               <RefreshCw size={14} /> Renew now
@@ -2968,7 +4086,7 @@ function ExtendAccessModal({ user, profile, sub, latestReq, onClose, onSubmitted
     (async () => {
       if (planKey) {
         try {
-          const { data } = await supabase.from('enrollment_plans').select('*').eq('key', planKey).maybeSingle();
+          const data = await fetchPlanRow(planKey);
           if (!cancelled && data) setPlan(data);
         } catch { /* fallback set */ }
       }
@@ -3539,6 +4657,531 @@ function MembershipExpiredScreen({ user, profile, sub, latestReq, email, uid, on
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// COMPONENT: VOICE ASSISTANT — "Toolkits Guide" (ElevenLabs Conversational AI)
+// ═══════════════════════════════════════════════════════════════════
+// Floating mic FAB + glass panel, portaled to document.body via OverlayPortal at
+// z-[60] — above the sidebar (z-50) and account menu (z-[55]), below the account
+// modals/overlays (z-[70]) so dialogs always win. Mounted ONCE in the root shell,
+// never inside a TabPanel (OverlayPortal suppresses portals under [hidden]
+// ancestors, and the widget must survive tab switches).
+//
+// Voice flow: mic permission → POST /api/elevenlabs/signed-url (Supabase Bearer
+// token; the endpoint re-enforces the member/admin gate server-side) → dynamic
+// import('@elevenlabs/client') → Conversation.startSession({ signedUrl, … }).
+// The ElevenLabs SDK stays out of the main bundle (same idiom as XLSX/jspdf).
+//
+// The clientTools closures are created ONCE at startSession, so they read all
+// account state through `liveRef` (refreshed every render) and the URL through
+// readAppRoute() — never render-scope captures. Tool NAMES must match the agent's
+// dashboard tool config exactly — schemas in docs/ai/voice-agent-setup.md.
+function VoiceAssistant({ user, profile, sub, latestReq, entitlement, showBillingControls }) {
+  const [configured, setConfigured] = useState(false);
+  const [open, setOpen] = useState(false);
+  const [phase, setPhase] = useState('idle');       // idle | connecting | active | error
+  const [mode, setMode] = useState('listening');    // listening | speaking (active only)
+  const [errorMsg, setErrorMsg] = useState('');
+  const [transcript, setTranscript] = useState([]); // { role: 'user' | 'agent', text }
+  // Course-source citations the agent surfaces via show_lesson_sources. atIndex =
+  // transcript length when the tool fired, so chips render under the nearest agent
+  // reply. Capped so a chatty session can't grow it unbounded.
+  const [citations, setCitations] = useState([]);   // { atIndex, course_id, course_slug, lesson_id, label }
+  const [input, setInput] = useState('');
+  const [muted, setMuted] = useState(false);
+  const [canMute, setCanMute] = useState(false);
+  const convRef = useRef(null);
+  const scrollRef = useRef(null);
+  // Live transcript length for the once-created show_lesson_sources closure (it can't
+  // capture the render-scope `transcript`), so a citation anchors to the reply it follows.
+  const transcriptLenRef = useRef(0);
+  transcriptLenRef.current = transcript.length;
+  // Generation counter: stop() bumps it, start() re-checks it after every await — an
+  // in-flight start that loses the race (unmount, sign-out, Retry spam) must END the
+  // session it just opened instead of stranding it with a hot mic.
+  const genRef = useRef(0);
+
+  // Live plan row for the spoken price/duration — DB wins over the in-code fallback,
+  // same rule as the paywall/membership surfaces (admins have no plan; skip).
+  const planKey = sub?.plan_key || profile?.plan || null;
+  const [planRow, setPlanRow] = useState(null);
+  useEffect(() => {
+    if (!planKey || profile?.is_admin) { setPlanRow(null); return; }
+    let on = true;
+    setPlanRow(ENROLLMENT_PLANS_FALLBACK.find((p) => p.key === planKey) || null);
+    fetchPlanRow(planKey)
+      .then((data) => { if (on && data) setPlanRow(data); });
+    return () => { on = false; };
+  }, [planKey, profile?.is_admin]);
+
+  // Live account state for the once-created clientTools closures (see header note).
+  const liveRef = useRef({});
+  liveRef.current = { profile, sub, latestReq, entitlement, showBillingControls, planRow };
+
+  useEffect(() => {
+    let on = true;
+    loadVoiceAssistantConfig().then((c) => { if (on) setConfigured(!!c?.configured); });
+    return () => { on = false; };
+  }, []);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [transcript, phase]);
+
+  const stop = useCallback(async () => {
+    genRef.current++; // invalidate any in-flight start()
+    const c = convRef.current;
+    convRef.current = null;
+    if (c) { try { await c.endSession(); } catch { /* already closed */ } }
+    setPhase('idle');
+    setMode('listening');
+    setMuted(false);
+  }, []);
+  // Unmount + sign-out/account-switch both terminate the session (no lingering audio).
+  useEffect(() => () => { stop(); }, [stop]);
+  useEffect(() => { stop(); }, [user?.id, stop]);
+
+  const fmtVoiceDate = (d) => {
+    if (!d) return null;
+    const dt = d instanceof Date ? d : new Date(d);
+    return isNaN(dt) ? null : dt.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
+  };
+
+  // ── Client tools (names/schemas mirror the ElevenLabs agent dashboard config) ──
+  // Every tool returns a prose string the agent can speak; a throw would surface as a
+  // tool failure mid-conversation, so each body is wrapped and returns "Error: …".
+  const buildClientTools = () => {
+    const wrap = (fn) => (params) => {
+      try { return fn(params || {}); }
+      catch (err) { console.error('[voice] client tool failed', err); return `Error: ${String(err && err.message || err)}`; }
+    };
+    // Shared by navigate_to_tool AND show_feature_help so the adminOnly/entitlement
+    // guards can never drift apart. Opens panels for {panel} targets; for {tab} targets
+    // returns { blocked } (refused, no navigation), { lockNote } (navigated onto the
+    // RestrictedTab upsell), or { info } (navigated normally).
+    const guardAndNavigate = (target) => {
+      const live = liveRef.current;
+      if (target.panel) {
+        if (target.panel !== 'settings' && !live.showBillingControls) {
+          return { blocked: 'Billing panels are not available for this account (admins have no subscription).' };
+        }
+        setPanelParam(target.panel);
+        return { panelOpened: target.panel };
+      }
+      const info = VOICE_TAB_INFO[target.tab] || { label: target.tab, desc: '' };
+      if (info.adminOnly && !live.profile?.is_admin) {
+        return { blocked: `"${info.label}" is an admin-only screen — this account cannot open it.` };
+      }
+      writeAppRoute(target.tab, target.interviewSub ? { interviewSub: target.interviewSub } : {});
+      if (live.entitlement && !live.entitlement.allowsTab(target.tab)) {
+        return { info, lockNote: `Navigated to ${info.label}, but the user's plan (${live.entitlement.label || 'current plan'} — ${live.entitlement.scopeLabel}) does not include it, so the page shows an upgrade prompt. You may suggest opening the upgrade panel.` };
+      }
+      return { info };
+    };
+    const handlers = {
+      navigate_to_tool: ({ tool_id }) => {
+        const hit = resolveVoiceTool(tool_id);
+        if (!hit) {
+          const ids = Object.keys(VOICE_TAB_INFO).filter((id) => !VOICE_TAB_INFO[id].adminOnly);
+          return `Unknown tool "${tool_id}". Valid tool ids: ${ids.join(', ')}.`;
+        }
+        const r = guardAndNavigate(hit);
+        if (r.blocked) return r.blocked;
+        if (r.panelOpened) return `That one is an account panel, not a tool — opened the ${r.panelOpened} panel.`;
+        if (r.lockNote) return r.lockNote;
+        return `Navigated to ${r.info.label}. ${r.info.desc}`;
+      },
+      open_account_panel: ({ panel }) => {
+        const live = liveRef.current;
+        const p = normalizeAccountPanel(panel);
+        if (!p) return `Invalid panel "${panel}". Valid panels: settings, membership, upgrade, extend, renew.`;
+        if (p !== 'settings' && !live.showBillingControls) {
+          return 'Billing panels are not available for this account (admins have no subscription to manage).';
+        }
+        setPanelParam(p);
+        return `Opened the ${p} panel.`;
+      },
+      explain_current_page: () => {
+        const live = liveRef.current;
+        const r = readAppRoute();
+        const role = live.profile?.is_admin ? 'an admin' : 'a member';
+        const info = VOICE_TAB_INFO[r.tab] || { label: r.tab, desc: '' };
+        const subNote = r.tab === 'interview' && r.interviewSub ? ` (sub-section: ${r.interviewSub})` : '';
+        const panelNote = r.panel ? ` The account "${r.panel}" panel is open on top of the page.` : '';
+        const lockNote = live.entitlement && !live.entitlement.allowsTab(r.tab)
+          ? ' Their current plan does not include this tool, so an upgrade prompt is showing instead.' : '';
+        return `The user (${role}) is on: ${info.label}${subNote} — ${info.desc}${lockNote}${panelNote}`;
+      },
+      show_feature_help: ({ feature_id }) => {
+        const key = String(feature_id || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+        const f = VOICE_FEATURE_HELP[key];
+        const target = f ? { tab: f.tab, interviewSub: f.interviewSub } : resolveVoiceTool(feature_id);
+        if (!target) {
+          return `Unknown feature "${feature_id}". Known features: ${Object.keys(VOICE_FEATURE_HELP).join(', ')}.`;
+        }
+        const r = guardAndNavigate(target);
+        if (r.blocked) return r.blocked;
+        if (r.panelOpened) return `That is an account panel — opened the ${r.panelOpened} panel.`;
+        if (r.lockNote) return r.lockNote;
+        return f ? `Opened it. ${f.blurb}` : `Opened ${r.info.label}. ${r.info.desc}`;
+      },
+      get_user_membership_summary: () => {
+        const live = liveRef.current;
+        const p = live.profile;
+        if (p?.is_admin) {
+          return `Role: admin (${p.full_name || p.email || 'admin'}). Admins have full access to every tool plus the Access Requests and Enrollments screens; they have no subscription or billing panels.`;
+        }
+        const acc = subAccess(live.sub);
+        const ent = live.entitlement || planEntitlement(live.sub?.plan_key || p?.plan || null);
+        const st = membershipStatus(live.sub, live.latestReq);
+        const endDate = fmtVoiceDate(acc.graceEnds && acc.inGrace ? acc.graceEnds : acc.ends);
+        const parts = [
+          'Role: member.',
+          `Plan: ${ent.label || 'none yet'} — ${ent.scopeLabel}.`,
+          `Status: ${st.label}.`,
+        ];
+        if (acc.legacy && acc.valid) parts.push('Access has no expiry date (legacy membership).');
+        else if (acc.inGrace) parts.push(`The paid term has ended but access continues in a grace window until ${endDate}${acc.graceDaysLeft != null ? ` (${acc.graceDaysLeft} day(s) left)` : ''} — renewing now avoids losing access.`);
+        else if (acc.valid && acc.ends) parts.push(`Access ends ${endDate}${acc.daysLeft != null ? ` (${acc.daysLeft} day(s) left)` : ''}.`);
+        else if (acc.expired) parts.push('The membership term has expired — renewing restores access.');
+        // live.planRow is DB-backed (fallback-seeded) — same DB-wins rule as the paywall.
+        if (live.planRow) parts.push(`Plan price: ${phpFmt(live.planRow.price_php)} for ${live.planRow.access_days} days of access.`);
+        // Same live-pending predicate as membershipStatus/enrollGateState: an overdue
+        // pending_review row (past expires_at) is NOT under review — it needs a resubmit.
+        const overdue = live.latestReq?.expires_at && new Date(live.latestReq.expires_at) < new Date();
+        if (live.latestReq?.status === 'pending_review') {
+          parts.push(overdue
+            ? 'Their last payment request missed the review window and should be resubmitted from the payment screen.'
+            : 'A payment request is currently pending admin review.');
+        }
+        return parts.join(' ');
+      },
+      // Deep-link into an authorized course/lesson. Ids come from the training
+      // tools; the catalog/CourseProgram plan guard remains the real chokepoint.
+      open_course_lesson: ({ course_id, course_slug, lesson_id }) => {
+        if (!course_id || !course_slug) return 'I need the course id and slug from a training result to open it.';
+        openCourseLessonRoute({ course_id, course_slug, lesson_id });
+        return `Opened ${course_slug}. If the member's plan doesn't include it, they'll see an upgrade screen instead.`;
+      },
+      // Render a clickable source chip in the transcript (webhook tool results
+      // never reach the browser, so the agent relays citations through here).
+      show_lesson_sources: ({ course_id, course_slug, lesson_id, label }) => {
+        if (!course_id || !course_slug || !label) return 'nothing to show';
+        setCitations((cs) => {
+          const next = [...cs, { atIndex: transcriptLenRef.current, course_id, course_slug, lesson_id: lesson_id || null, label }];
+          return next.length > 20 ? next.slice(next.length - 20) : next;
+        });
+        return 'shown';
+      },
+    };
+    // Assemble the returned tool set from VOICE_CLIENT_TOOL_SPECS (the same literal
+    // scripts/provision-voice-agent.mjs reads to declare the agent's tools), so the
+    // registered handlers can never silently drift from the agent-declared tool names.
+    const specNames = VOICE_CLIENT_TOOL_SPECS.map((t) => t.name);
+    const missing = specNames.filter((n) => typeof handlers[n] !== 'function');
+    const extra = Object.keys(handlers).filter((n) => !specNames.includes(n));
+    if (missing.length || extra.length) console.error('[voice] client tool spec/handler drift', { missing, extra });
+    const tools = {};
+    for (const name of specNames) if (typeof handlers[name] === 'function') tools[name] = wrap(handlers[name]);
+    return tools;
+  };
+
+  const start = async () => {
+    // Take a fresh generation: any previously in-flight start() becomes stale, and
+    // stop() (End button / unmount / sign-out) bumps the counter to invalidate THIS
+    // one — a start that loses the race must END the session it opened, never strand
+    // it holding the mic on a dead component.
+    const gen = ++genRef.current;
+    const stale = () => gen !== genRef.current;
+    // Never start on top of a live/zombie session (e.g. Retry after an error while the
+    // old connection is still open) — end it first so the mic is always released.
+    const prev = convRef.current;
+    convRef.current = null;
+    if (prev) { try { await prev.endSession(); } catch { /* already closed */ } }
+    if (stale()) return;
+    setErrorMsg('');
+    setTranscript([]);
+    setCitations([]);
+    setMuted(false); // a fresh Conversation always starts unmuted — keep the UI truthful
+    setPhase('connecting');
+    try {
+      // 1) Mic permission FIRST — a denial must not spend a signed-URL mint.
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((t) => t.stop()); // the SDK acquires its own stream
+      } catch {
+        if (stale()) return;
+        setPhase('error');
+        setErrorMsg('Microphone access was blocked. Allow the microphone for this site in your browser settings, then try again.');
+        return;
+      }
+      if (stale()) return;
+      // 2) Mint a signed URL (server re-checks session + membership).
+      let authHeader = {};
+      try {
+        const { data } = await supabase.auth.getSession();
+        const token = data?.session?.access_token;
+        if (token) authHeader = { Authorization: `Bearer ${token}` };
+      } catch { /* no session — the endpoint answers 401 */ }
+      const res = await fetch('/api/elevenlabs/signed-url', { method: 'POST', headers: authHeader });
+      const body = await res.json().catch(() => ({}));
+      if (stale()) return;
+      if (!res.ok || !body.signedUrl) {
+        setPhase('error');
+        setErrorMsg(body.skipped ? 'The voice assistant is not configured yet — check back soon.'
+          : (body.error || 'Could not start a voice session. Try again shortly.'));
+        return;
+      }
+      // 3) Lazy-load the SDK and connect.
+      const { Conversation } = await import('@elevenlabs/client');
+      if (stale()) return;
+      const live = liveRef.current;
+      const acc = subAccess(live.sub);
+      const st = membershipStatus(live.sub, live.latestReq);
+      const conv = await Conversation.startSession({
+        signedUrl: body.signedUrl,
+        clientTools: buildClientTools(),
+        dynamicVariables: {
+          user_name: live.profile?.full_name || user?.email || 'there',
+          user_role: live.profile?.is_admin ? 'admin' : 'member',
+          plan_label: (live.entitlement && live.entitlement.label) || 'none',
+          plan_scope: (live.entitlement && live.entitlement.scopeLabel) || 'Full toolkit access',
+          membership_status: st.label,
+          days_left: acc.daysLeft == null ? 'n/a' : String(acc.daysLeft),
+          current_tab: (VOICE_TAB_INFO[readAppRoute().tab] || {}).label || 'Dashboard',
+          // Secret dynamic variable — used ONLY in the trainer webhook tools' auth
+          // header, never sent to the LLM. Empty when the trainer isn't configured;
+          // the webhook then answers a safe "not configured" envelope.
+          secret__trainer_token: body.trainerToken || '',
+        },
+        onModeChange: (m) => setMode(m?.mode === 'speaking' ? 'speaking' : 'listening'),
+        onStatusChange: (s) => {
+          if (s?.status === 'disconnected') {
+            convRef.current = null;
+            setPhase((prevPhase) => (prevPhase === 'error' ? prevPhase : 'idle'));
+          }
+        },
+        // Abrupt transport failures (Wi-Fi drop, abnormal socket close) surface as
+        // onDisconnect({reason:'error'}) — the SDK never calls onError for those. It
+        // fires AFTER onStatusChange('disconnected'), so this error phase wins over
+        // that handler's idle. Deliberate ends (reason 'user'/'agent') stay idle.
+        onDisconnect: (details) => {
+          if (details?.reason === 'error') {
+            convRef.current = null;
+            setPhase('error');
+            setErrorMsg('The voice connection dropped — check your internet and try again.');
+          }
+        },
+        onMessage: (msg) => {
+          const text = msg?.message;
+          if (!text) return;
+          const role = msg.role || (msg.source === 'user' ? 'user' : 'agent');
+          setTranscript((t) => [...t, { role, text }]);
+        },
+        onError: (message, context) => {
+          console.error('[voice] session error:', message, context);
+          setPhase('error');
+          setErrorMsg('The voice session hit an error — try again.');
+          // Release the mic: a session that errored must not keep listening in the
+          // background (the error phase is dispatched first, so the disconnect
+          // callback's functional update keeps phase === 'error').
+          const c = convRef.current;
+          convRef.current = null;
+          if (c) { Promise.resolve().then(() => c.endSession()).catch(() => {}); }
+        },
+      });
+      if (stale()) {
+        // stop() ran while we were connecting (sign-out, unmount, End) — this session
+        // must not survive it.
+        try { conv.endSession(); } catch { /* never connected */ }
+        return;
+      }
+      convRef.current = conv;
+      setCanMute(typeof conv.setMicMuted === 'function');
+      setPhase('active');
+    } catch (err) {
+      console.error('[voice] start failed', err);
+      if (stale()) return; // a newer attempt (or stop) owns the UI state now
+      convRef.current = null;
+      setPhase('error');
+      setErrorMsg('Could not start the voice assistant — check your connection and try again.');
+    }
+  };
+
+  const toggleMute = () => {
+    const c = convRef.current;
+    if (!c || typeof c.setMicMuted !== 'function') return;
+    const next = !muted;
+    try { c.setMicMuted(next); setMuted(next); } catch (err) { console.error('[voice] mute failed', err); }
+  };
+
+  const sendText = () => {
+    const t = input.trim();
+    const c = convRef.current;
+    if (!t || !c) return;
+    try {
+      c.sendUserMessage(t);
+      setTranscript((x) => [...x, { role: 'user', text: t }]);
+      setInput('');
+    } catch (err) { console.error('[voice] sendUserMessage failed', err); }
+  };
+
+  if (!configured) return null;
+
+  const active = phase === 'active';
+  const statusLine = phase === 'connecting' ? 'Connecting…'
+    : phase === 'error' ? 'Something went wrong'
+    : active ? (mode === 'speaking' ? 'Speaking…' : 'Listening…')
+    : 'Voice guide · ask me anything';
+
+  return (
+    <OverlayPortal>
+      <div className="fixed bottom-5 right-5 z-[60] flex flex-col items-end gap-3" style={{ fontFamily: fontBody }}>
+        {open && (
+          <div className="glass-card rounded-2xl overflow-hidden w-[min(92vw,380px)] shadow-2xl flex flex-col" style={{ background: SHEEN }}>
+            {/* Header */}
+            <div style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, #0F2A5A 100%)` }} className="px-4 py-3 text-white flex items-center gap-3">
+              <div style={{ background: `linear-gradient(135deg, ${ROYAL} 0%, ${CYAN} 100%)` }} className="w-9 h-9 rounded-full flex items-center justify-center shadow-lg shrink-0">
+                <Mic size={16} className="text-white" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="font-bold text-sm" style={{ fontFamily: fontDisplay }}>Toolkits Guide</div>
+                <div className="text-xs text-blue-200 flex items-center gap-1.5 truncate">
+                  {active && <span className={`w-2 h-2 rounded-full shrink-0 ${mode === 'speaking' ? 'bg-sky-400' : 'bg-emerald-400'} animate-pulse`} />}
+                  {statusLine}
+                </div>
+              </div>
+              {/* Collapse only — the session keeps running (the FAB shows a live dot). */}
+              <button onClick={() => setOpen(false)} aria-label="Minimize voice assistant"
+                className="p-1.5 rounded-lg hover:bg-white/10 transition text-blue-100">
+                <ChevronDown size={16} />
+              </button>
+            </div>
+
+            {/* Body */}
+            {phase === 'idle' && (
+              <div className="p-5 bg-white">
+                <p className="text-sm text-slate-700 leading-relaxed">
+                  Talk to the toolkit — ask where things are, what your plan includes, or how a tool works, and I can take you there.
+                </p>
+                <ul className="mt-3 space-y-1.5 text-xs text-slate-500">
+                  <li>“Where is QuickBooks Online Mastery?”</li>
+                  <li>“When does my access expire?”</li>
+                  <li>“Open the proposal generator.”</li>
+                </ul>
+                <button onClick={start}
+                  className="sheen-btn mt-4 w-full text-white font-bold py-3 rounded-xl shadow-lg flex items-center justify-center gap-2">
+                  <Mic size={16} /> Start voice session
+                </button>
+                <p className="mt-2.5 text-[11px] text-slate-400 text-center">
+                  Your browser will ask for microphone access.
+                </p>
+              </div>
+            )}
+            {phase === 'connecting' && (
+              <div className="p-8 bg-white flex flex-col items-center justify-center gap-3">
+                <Loader2 size={22} className="animate-spin" style={{ color: C.primary }} />
+                <div className="text-sm text-slate-500">Connecting to your guide…</div>
+              </div>
+            )}
+            {phase === 'error' && (
+              <div className="p-5 bg-white">
+                <div className="rounded-xl px-4 py-3 text-sm flex items-start gap-2.5"
+                  style={{ background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)', color: 'var(--status-danger-fg)' }}>
+                  <AlertTriangle size={16} className="shrink-0 mt-0.5" />
+                  <span>{errorMsg}</span>
+                </div>
+                <button onClick={start}
+                  className="sheen-btn mt-4 w-full text-white font-bold py-2.5 rounded-xl shadow-lg flex items-center justify-center gap-2">
+                  <RefreshCw size={15} /> Try again
+                </button>
+              </div>
+            )}
+            {active && (
+              <>
+                <div ref={scrollRef} className="h-[280px] overflow-y-auto p-4 space-y-3 bg-white">
+                  {transcript.length === 0 && (
+                    <div className="h-full flex flex-col items-center justify-center gap-2 text-center px-6">
+                      <span className="gh-dot-live" />
+                      <div className="text-sm text-slate-500">I'm listening — ask me about any tool, your plan, or where to find things.</div>
+                    </div>
+                  )}
+                  {transcript.map((m, i) => {
+                    // Citations fired right after this message anchor here; any that
+                    // fired past the current end anchor under the last message.
+                    const isLast = i === transcript.length - 1;
+                    const chips = citations.filter((c) => c.atIndex === i + 1 || (isLast && c.atIndex > transcript.length));
+                    return (
+                      <div key={i} className="space-y-1.5">
+                        <div className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                          <div className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-sm leading-relaxed whitespace-pre-wrap ${
+                            m.role === 'user' ? 'text-white shadow-md' : 'bg-white border border-blue-200 text-slate-800 shadow-sm'
+                          }`}
+                            style={m.role === 'user' ? { background: `linear-gradient(135deg, ${ROYAL} 0%, ${CYAN} 100%)` } : {}}>
+                            {m.text}
+                          </div>
+                        </div>
+                        {chips.length > 0 && (
+                          <div className="flex flex-wrap gap-1.5 justify-start">
+                            {chips.map((c, ci) => (
+                              <button key={ci} onClick={() => openCourseLessonRoute(c)}
+                                title={`Open ${c.label}`}
+                                className="inline-flex items-center gap-1.5 max-w-full rounded-full px-2.5 py-1 text-[11px] font-medium transition hover:opacity-90"
+                                style={{ background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)', color: 'var(--status-info-fg)' }}>
+                                <BookOpen size={12} className="shrink-0" />
+                                <span className="truncate">{c.label}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="p-3 border-t border-slate-200 bg-white space-y-2">
+                  <div className="flex gap-2">
+                    <input value={input} onChange={(e) => setInput(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && sendText()}
+                      placeholder="Or type instead…"
+                      className="flex-1 min-w-0 px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm focus:border-blue-500 outline-none" />
+                    <button onClick={sendText} disabled={!input.trim()}
+                      className="sheen-btn text-white font-bold px-3.5 rounded-xl shadow disabled:opacity-50 flex items-center">
+                      <Send size={14} />
+                    </button>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    {canMute ? (
+                      <button onClick={toggleMute}
+                        className="text-xs px-3 py-1.5 rounded-full border border-slate-300 bg-white text-slate-600 hover:border-blue-400 font-medium transition flex items-center gap-1.5">
+                        {muted ? <MicOff size={12} /> : <Mic size={12} />} {muted ? 'Unmute' : 'Mute'}
+                      </button>
+                    ) : <span />}
+                    <button onClick={stop}
+                      className="text-xs px-3 py-1.5 rounded-full font-semibold transition"
+                      style={{ background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)', color: 'var(--status-danger-fg)' }}>
+                      End session
+                    </button>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* FAB — toggles the panel; a live dot marks a session running while collapsed. */}
+        <button onClick={() => setOpen((o) => !o)}
+          aria-label={open ? 'Minimize voice assistant' : 'Open the Toolkits voice guide'}
+          className="sheen-btn relative rounded-full shadow-2xl flex items-center justify-center"
+          style={{ width: 56, height: 56 }}>
+          {open ? <ChevronDown size={22} className="text-white" /> : <Mic size={22} className="text-white" />}
+          {active && !open && (
+            <span className="absolute top-0.5 right-0.5 w-3 h-3 rounded-full bg-emerald-400 border-2 border-white animate-pulse" />
+          )}
+        </button>
+      </div>
+    </OverlayPortal>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // KEEP-ALIVE TAB RENDERING
 // renderToolContent + TabPanel live at module scope so TabPanel can be
 // React.memo'd: with stable props (setTab and the badge refreshers are
@@ -3549,11 +5192,14 @@ function MembershipExpiredScreen({ user, profile, sub, latestReq, email, uid, on
 // unmounting would kill in-flight AI work).
 // Adding a tool = a new case here + sidebar config + TAB_ROUTES (CLAUDE.md).
 // ═══════════════════════════════════════════════════════════════════
-function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, interviewSub }) {
+function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImportCount, interviewSub }) {
   switch (tabId) {
     case 'dashboard': return <Dashboard goto={goto} />;
+    case 'community': return <CommunityHub />;
     case 'accessrequests': return <AccessRequests onCountChange={onAccessCount} />;
     case 'enrollments': return <AdminEnrollments onCountChange={onEnrollCount} />;
+    case 'studentimports': return <StudentImports onCountChange={onImportCount} />;
+    case 'batches': return <AdminBatches />;
     case 'coa': return <CoaGenerator />;
     case 'course': return <Course />;
     case 'qbomastery': return <QBOMastery />;
@@ -3590,13 +5236,13 @@ function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, intervie
   }
 }
 
-const TabPanel = React.memo(function TabPanel({ tabId, active, goto, onAccessCount, onEnrollCount, interviewSub }) {
+const TabPanel = React.memo(function TabPanel({ tabId, active, goto, onAccessCount, onEnrollCount, onImportCount, interviewSub }) {
   return (
     <div
       hidden={!active}
       aria-hidden={!active}
       className={`${active ? 'fade-in ' : ''}p-4 sm:p-6 lg:p-10 max-w-7xl mx-auto`}>
-      {renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, interviewSub })}
+      {renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImportCount, interviewSub })}
     </div>
   );
 });
@@ -3612,10 +5258,9 @@ export default function BookkeeperProToolkit() {
   // paywall handoff; reset on submit).
   const enroll = useEnrollmentGate(user, profile, profileReady);
   const [renewNow, setRenewNow] = useState(false);
-  // Sidebar account menu → which membership modal/overlay is open (null when closed).
-  // 'profile' | 'membership' | 'extend' | 'upgrade'. Kept at the shell so the modals read
-  // the already-loaded enroll.sub / enroll.latestReq / entitlement without refetching.
-  const [accountView, setAccountView] = useState(null);
+  // Sidebar account menu -> which account surface is open. The URL is the source of truth:
+  // ?panel=settings | membership | upgrade | extend | renew. This keeps refresh, Back/Forward,
+  // and direct links from becoming "URL changed but nothing displayed" states.
   // Plan-based entitlement (which stages/tabs this user may open). Non-admins under an
   // enforced enrollment resolve to their plan's scope; admins + flag-off dev mode get
   // FULL. Keyed on primitives so the object identity is stable across unrelated
@@ -3627,6 +5272,23 @@ export default function BookkeeperProToolkit() {
     () => (enroll.active ? planEntitlement(enroll.sub?.plan_key || profile?.plan || null) : FULL_ENTITLEMENT),
     [enroll.active, enroll.sub?.plan_key, profile?.plan]
   );
+  // Billing surfaces (membership/upgrade/extend/renew + the menu's billing items) exist only
+  // for non-admins under an enforced enrollment — admins have no subscription, and with the
+  // flag off a submit would insert enrollment_requests rows nobody reviews.
+  const showBillingControls = !profile?.is_admin && REQUIRE_ENROLLMENT;
+  // Community notification bell (mentions/replies + unread announcements). Same render gate
+  // as the voice assistant: enrolled members + admins (RLS re-enforces server-side). The
+  // hook lives HERE — bell state never threads through the memoized TabPanel tree; the
+  // dropdown navigates via module-scope writeAppRoute (the setPanelParam precedent).
+  const communityBell = useCommunityBell(
+    user?.id,
+    !!user && (profile?.is_admin || !REQUIRE_ENROLLMENT || (enroll.ready && enroll.state === 'pass'))
+  );
+  // A rejected renewal newer than the current term → hand the paywall the prior request so
+  // its resubmit notice shows (same rule MembershipPanel used before renew moved to ?panel=).
+  const renewPrior = enroll.latestReq?.status === 'rejected' && enroll.sub?.started_at
+    && new Date(enroll.latestReq.created_at) > new Date(enroll.sub.started_at)
+    ? enroll.latestReq : null;
   const initialRouteRef = useRef(null);
   if (!initialRouteRef.current) initialRouteRef.current = readAppRoute();
 
@@ -3636,6 +5298,36 @@ export default function BookkeeperProToolkit() {
   const mainRef = useRef(null);
   const activeTabRef = useRef(initialRouteRef.current.tab);
   const scrollPositionsRef = useRef({});
+
+  // Account surfaces are driven by ?panel=... and are orthogonal to `tab`, so they overlay
+  // without altering layout. Seeded from the initial URL (deep-link / refresh support) and
+  // kept in sync by the route listener below (Back closes, Forward reopens).
+  const [accountPanel, setAccountPanel] = useState(initialRouteRef.current.panel);
+  const isAccountSettingsPanelOpen = accountPanel === 'settings';
+  const openAccountSurface = useCallback((view, opts = {}) => {
+    const next = normalizeAccountPanel(view);
+    if (!next) return;
+    const replace = opts.replace ?? !!accountPanel;
+    setPanelParam(next, { replace });       // push from page, replace between account surfaces
+    setAccountPanel(next);
+  }, [accountPanel]);
+  const closeAccountSurface = useCallback(() => {
+    setPanelParam(null, { replace: true }); // replaceState -> removes account query only
+    setAccountPanel(null);
+  }, []);
+  const handleAccountAction = useCallback((view) => {
+    openAccountSurface(view);
+  }, [openAccountSurface]);
+
+  // A billing panel (?panel=membership|extend|upgrade|renew) this account can never render
+  // (admin, or enrollment flag off) must not strand in the URL — strip it once the profile
+  // verdict is in. Deliberately NOT keyed on gate state: a pending student's ?panel=settings
+  // deep link still opens after approval. StrictMode-safe (replaceState is idempotent).
+  useEffect(() => {
+    if (!accountPanel || accountPanel === 'settings') return;
+    if (!user || !profileReady) return;   // profileReady is true when signed out — need both
+    if (profile?.is_admin || !REQUIRE_ENROLLMENT) closeAccountSurface();
+  }, [accountPanel, user, profileReady, profile?.is_admin, closeAccountSurface]);
 
   // Stable identity (only refs + setters inside) — setTab depends on it, and setTab
   // must stay referentially stable so memoized TabPanels skip root re-renders.
@@ -3703,16 +5395,23 @@ export default function BookkeeperProToolkit() {
   }, [user?.id, tab]);
 
   useEffect(() => {
-    const onPopState = () => {
-      rememberScroll();
+    const syncRouteState = (event) => {
       const next = readAppRoute();
+      if (event?.type === APP_ROUTE_CHANGE_EVENT && event?.detail?.kind === 'panel') {
+        setAccountPanel(next.panel);
+        return;
+      }
+      rememberScroll();
       setTabState(next.tab);
       setInterviewSubRoute(next.interviewSub);
+      setAccountPanel(next.panel);   // Back closes the drawer / Forward reopens it
     };
-    window.addEventListener('popstate', onPopState);
+    window.addEventListener('popstate', syncRouteState);
+    window.addEventListener(APP_ROUTE_CHANGE_EVENT, syncRouteState);
     window.addEventListener('beforeunload', rememberScroll);
     return () => {
-      window.removeEventListener('popstate', onPopState);
+      window.removeEventListener('popstate', syncRouteState);
+      window.removeEventListener(APP_ROUTE_CHANGE_EVENT, syncRouteState);
       window.removeEventListener('beforeunload', rememberScroll);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3749,6 +5448,7 @@ export default function BookkeeperProToolkit() {
       desc: 'Start here',
       tabs: [
         { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
+        { id: 'community', label: 'Community', icon: MessagesSquare },
       ],
     },
     {
@@ -3904,6 +5604,21 @@ export default function BookkeeperProToolkit() {
     } catch { /* table not migrated — leave at 0 */ }
   }, [isAdmin]);
   useEffect(() => { refreshEnrollPendingCount(); /* eslint-disable-next-line */ }, [isAdmin]);
+  // Active-import count for the admin sidebar badge (Student Imports tab — Thinkific
+  // migration). Same shape: admin-only, inert if the #26 migration hasn't been run.
+  const [importActiveCount, setImportActiveCount] = useState(0);
+  // useCallback: passed to the memoized Student Imports TabPanel (onImportCount).
+  const refreshImportCount = useCallback(async () => {
+    if (!isAdmin) return;
+    try {
+      const { count, error } = await supabase
+        .from('student_import_jobs')
+        .select('id', { count: 'exact', head: true })
+        .in('status', ['draft', 'validating', 'dry_run', 'ready', 'processing', 'paused']);
+      if (!error) setImportActiveCount(count || 0);
+    } catch { /* table not migrated — leave at 0 */ }
+  }, [isAdmin]);
+  useEffect(() => { refreshImportCount(); /* eslint-disable-next-line */ }, [isAdmin]);
   const [labelByKey, setLabelByKey] = useState({});
   const [draftLabels, setDraftLabels] = useState({});
   const [savingLabels, setSavingLabels] = useState(false);
@@ -4364,6 +6079,15 @@ export default function BookkeeperProToolkit() {
   // deploying the code before the SQL never locks anyone out.
   if (!profileReady) return <AuthSplash />;
 
+  // 0) Imported-student onboarding (db #26): a migrated account must set its own password
+  //    BEFORE the membership gate. Flag-driven (account_origin='import' + onboarding not
+  //    completed) so it's robust regardless of how the invite/recovery link authenticated.
+  //    Admins are exempt; a pre-#26 DB has no account_origin → this never triggers.
+  if (!profile?.is_admin && profile?.account_origin === 'import' && profile?.onboarding_status !== 'completed') {
+    console.debug('[gate] holding on Imported onboarding', { uid: user?.id });
+    return <SetPasswordScreen />;
+  }
+
   // 1) Old-flow hard ban outranks the paywall — a rejected account can't pay its way around it.
   if (REQUIRE_ADMIN_APPROVAL && !profile?.is_admin && profile?.approval_status === 'rejected') {
     console.debug('[gate] holding on Rejected', { uid: user?.id, email: user?.email });
@@ -4514,21 +6238,19 @@ export default function BookkeeperProToolkit() {
           {/* Signed-in identity + sign out */}
           {user && (
             <div className="mt-4 flex items-center gap-2.5 px-2.5 py-2 rounded-xl" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
-              <div className="flex items-center justify-center flex-shrink-0 rounded-full text-white text-[11px] font-bold"
-                style={{ width: 30, height: 30, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
-                {(((profile?.full_name || user.email || '?').trim()[0]) || '?').toUpperCase()}
-              </div>
+              <MemberAvatar name={profile?.full_name || user.email} src={resolveAvatarUrl(profile?.avatar_url)} size={30} />
               <div className="flex-1 min-w-0">
                 <div className="truncate" style={{ fontSize: 12, fontWeight: 600, color: C.text, lineHeight: 1.2 }}>
                   {profile?.full_name || user.email?.split('@')[0]}
                 </div>
                 <div className="truncate" style={{ fontSize: 10, color: C.textMute, lineHeight: 1.3 }}>{user.email}</div>
               </div>
+              <NotificationBell bell={communityBell} placement="card" />
               <ThemeToggle pref={themePref} onCycle={cycleTheme} />
               <AccountMenu placement="card" user={user} profile={profile} sub={enroll.sub}
                 latestReq={enroll.latestReq} entitlement={entitlement}
-                showBilling={!profile?.is_admin}
-                onOpen={setAccountView} onSignOut={signOut} />
+                showBilling={showBillingControls}
+                onOpen={handleAccountAction} onSignOut={signOut} />
             </div>
           )}
 
@@ -4585,6 +6307,40 @@ export default function BookkeeperProToolkit() {
                   {enrollPendingCount}
                 </span>
               )}
+            </a>
+          )}
+
+          {/* Student Imports — admin only (Thinkific migration). Badge = active import jobs. */}
+          {isAdmin && (
+            <a
+              href={tabHref('studentimports')}
+              onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('studentimports'); } }}
+              className="mt-2 w-full px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5"
+              style={tab === 'studentimports'
+                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)` }
+                : { background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
+              <UploadCloud size={11} />
+              Student Imports
+              {importActiveCount > 0 && (
+                <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[9px] font-bold"
+                  style={{ background: tab === 'studentimports' ? 'rgba(255,255,255,0.25)' : C.primary, color: 'white' }}>
+                  {importActiveCount}
+                </span>
+              )}
+            </a>
+          )}
+
+          {/* Batches — admin only (#32): Gold/VIP cohorts + their private communities. */}
+          {isAdmin && (
+            <a
+              href={tabHref('batches')}
+              onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('batches'); } }}
+              className="mt-2 w-full px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5"
+              style={tab === 'batches'
+                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)` }
+                : { background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
+              <CalendarCheck size={11} />
+              Batches
             </a>
           )}
 
@@ -4657,16 +6413,14 @@ export default function BookkeeperProToolkit() {
             </button>
             {user && (
               <div className="flex flex-col items-center gap-2 mt-1">
-                <div className="flex items-center justify-center flex-shrink-0 rounded-full text-white text-[11px] font-bold"
-                  title={profile?.full_name || user.email}
-                  style={{ width: 30, height: 30, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
-                  {(((profile?.full_name || user.email || '?').trim()[0]) || '?').toUpperCase()}
-                </div>
+                <MemberAvatar name={profile?.full_name || user.email} src={resolveAvatarUrl(profile?.avatar_url)}
+                  size={30} title={profile?.full_name || user.email} />
+                <NotificationBell bell={communityBell} placement="rail" />
                 <ThemeToggle pref={themePref} onCycle={cycleTheme} />
                 <AccountMenu placement="rail" user={user} profile={profile} sub={enroll.sub}
                   latestReq={enroll.latestReq} entitlement={entitlement}
-                  showBilling={!profile?.is_admin}
-                  onOpen={setAccountView} onSignOut={signOut} />
+                  showBilling={showBillingControls}
+                  onOpen={handleAccountAction} onSignOut={signOut} />
               </div>
             )}
           </div>
@@ -4711,6 +6465,37 @@ export default function BookkeeperProToolkit() {
                     {enrollPendingCount}
                   </span>
                 )}
+              </a>
+            )}
+            {isAdmin && (
+              <a
+                href={tabHref('studentimports')}
+                onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('studentimports'); } }}
+                title={`Student Imports${importActiveCount ? ` (${importActiveCount} active)` : ''}`}
+                aria-label="Student Imports"
+                className="relative flex items-center justify-center rounded-xl transition mb-1"
+                style={tab === 'studentimports'
+                  ? { width: 40, height: 40, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white' }
+                  : { width: 40, height: 40, background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
+                <UploadCloud size={18} />
+                {importActiveCount > 0 && (
+                  <span className="absolute -top-1 -right-1 px-1 rounded-full text-[9px] font-bold flex items-center justify-center"
+                    style={{ minWidth: 16, height: 16, background: C.primary, color: 'white', border: `2px solid ${C.white}` }}>
+                    {importActiveCount}
+                  </span>
+                )}
+              </a>
+            )}
+            {isAdmin && (
+              <a
+                href={tabHref('batches')}
+                onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('batches'); } }}
+                title="Batches" aria-label="Batches"
+                className="relative flex items-center justify-center rounded-xl transition mb-1"
+                style={tab === 'batches'
+                  ? { width: 40, height: 40, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white' }
+                  : { width: 40, height: 40, background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
+                <CalendarCheck size={18} />
               </a>
             )}
             {visibleStages.map((stage, sIdx) => {
@@ -5029,6 +6814,9 @@ export default function BookkeeperProToolkit() {
           <div style={{ fontFamily: fontDisplay, fontSize: 13, fontWeight: 700, color: C.text, lineHeight: 1.1, letterSpacing: '-0.01em' }}>
             Bookkeeper Toolkits
           </div>
+          <div className="ml-auto">
+            <NotificationBell bell={communityBell} placement="topbar" />
+          </div>
         </div>
         {/* Entitlement chokepoint — the SINGLE enforcement point for plan-based access.
             A disallowed tab reached ANY way (deep-link seed, popstate, stale nav:lastTab,
@@ -5045,6 +6833,7 @@ export default function BookkeeperProToolkit() {
               goto={setTab}
               onAccessCount={refreshPendingCount}
               onEnrollCount={refreshEnrollPendingCount}
+              onImportCount={refreshImportCount}
               interviewSub={tabId === 'interview' ? (interviewSubRoute || undefined) : undefined}
             />
           ) : (
@@ -5054,31 +6843,63 @@ export default function BookkeeperProToolkit() {
       </main>
 
       {/* Account menu surfaces — read the already-loaded gate state (no refetch). Extend/
-          upgrade route through the enrollment request → admin-approval flow; a member keeps
-          full access while a request is pending. Billing views (membership/extend/upgrade)
-          are short-circuited for admins — same rule as AccountMenu's showBilling — so no
-          future menu regression can reopen billing UI for an account with no subscription. */}
-      {accountView === 'profile' && (
-        <ProfileSettingsModal user={user} profile={profile} sub={enroll.sub} latestReq={enroll.latestReq}
-          entitlement={entitlement} onOpen={setAccountView} onClose={() => setAccountView(null)}
-          showBilling={!profile?.is_admin} />
+          upgrade/renew route through the enrollment request → admin-approval flow; a member
+          keeps full access while a request is pending. Billing views are gated by
+          showBillingControls (!is_admin && REQUIRE_ENROLLMENT) — same rule as AccountMenu's
+          items — and the root strip-effect clears a deep-linked billing ?panel= these guards
+          would otherwise leave stranded in the URL. */}
+      {isAccountSettingsPanelOpen && (
+        <AccountSettingsPanel user={user} profile={profile} sub={enroll.sub} latestReq={enroll.latestReq}
+          entitlement={entitlement} showBilling={showBillingControls}
+          enrollReady={enroll.ready}
+          onClose={closeAccountSurface}
+          onOpen={openAccountSurface} />
       )}
-      {accountView === 'membership' && !profile?.is_admin && (
+      {accountPanel === 'membership' && showBillingControls && (
         <MembershipPlanModal user={user} profile={profile} sub={enroll.sub} latestReq={enroll.latestReq}
-          entitlement={entitlement} onOpen={setAccountView} onClose={() => setAccountView(null)} />
+          entitlement={entitlement} onOpen={openAccountSurface} onClose={closeAccountSurface} />
       )}
-      {accountView === 'extend' && !profile?.is_admin && (
+      {accountPanel === 'extend' && showBillingControls && (
         <ExtendAccessModal user={user} profile={profile} sub={enroll.sub} latestReq={enroll.latestReq}
-          onClose={() => setAccountView(null)}
-          onSubmitted={(row) => { setAccountView(null); enroll.refresh(row); }} />
+          onClose={closeAccountSurface}
+          onSubmitted={(row) => { closeAccountSurface(); enroll.refresh(row); }} />
       )}
-      {accountView === 'upgrade' && !profile?.is_admin && (
-        <div className="fixed inset-0 z-[70] gh-app-bg" style={{ background: C.bg }}>
-          <EnrollmentPaywall user={user} profile={profile} renewal mode="upgrade" currentSub={enroll.sub}
-            onClose={() => setAccountView(null)}
-            onSubmitted={(row) => { setAccountView(null); enroll.refresh(row); }}
-            onSignOut={signOut} />
-        </div>
+      {accountPanel === 'upgrade' && showBillingControls && (
+        <OverlayPortal>
+          {/* No gh-app-bg here — the class sets position:relative, which out-cascades .fixed on the
+              same element and drops the portaled overlay into body flow (renders BELOW the app).
+              The paywall child paints the mesh itself; C.bg is the opaque fallback behind it. */}
+          <div className="fixed inset-0 z-[70] overflow-y-auto" style={{ background: C.bg }}>
+            <EnrollmentPaywall user={user} profile={profile} renewal mode="upgrade" currentSub={enroll.sub}
+              onClose={closeAccountSurface}
+              onSubmitted={(row) => { closeAccountSurface(); enroll.refresh(row); }}
+              onSignOut={signOut} />
+          </div>
+        </OverlayPortal>
+      )}
+      {accountPanel === 'renew' && showBillingControls && (
+        <OverlayPortal>
+          {/* No gh-app-bg here — the class sets position:relative, which out-cascades .fixed on the
+              same element and drops the portaled overlay into body flow (renders BELOW the app).
+              The paywall child paints the mesh itself; C.bg is the opaque fallback behind it. */}
+          <div className="fixed inset-0 z-[70] overflow-y-auto" style={{ background: C.bg }}>
+            <EnrollmentPaywall user={user} profile={profile} renewal currentSub={enroll.sub}
+              priorRequest={renewPrior}
+              onClose={closeAccountSurface}
+              onSubmitted={(row) => { closeAccountSurface(); enroll.refresh(row); }}
+              onSignOut={signOut} />
+          </div>
+        </OverlayPortal>
+      )}
+
+      {/* Voice assistant — enrolled members + admins only (the signed-url endpoint
+          re-enforces this server-side via is_enrolled(); this render gate is UX).
+          !REQUIRE_ENROLLMENT covers flag-off installs, where members never reach
+          state==='pass'. Portaled internally; no props flow through TabPanel, so the
+          keep-alive memoization contract is untouched. */}
+      {!!user && (profile?.is_admin || !REQUIRE_ENROLLMENT || (enroll.ready && enroll.state === 'pass')) && (
+        <VoiceAssistant user={user} profile={profile} sub={enroll.sub} latestReq={enroll.latestReq}
+          entitlement={entitlement} showBillingControls={showBillingControls} />
       )}
     </div>
     </EntitlementContext.Provider>
@@ -5214,6 +7035,364 @@ function AdminUserCell({ name, email, meta, badges }) {
   );
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// COMPONENT: ADMIN BATCHES (#32) — cohort manager for the gold/vip
+// private communities. Creation auto-spawns the batch's Gold + VIP
+// spaces (SQL trigger); open/close/archive + capacities are plain
+// admin-RLS writes; (re)assignment goes through the transactional
+// admin_assign_batch() RPC and is audited in batch_events. The
+// "Needs batch assignment" queue = ACTIVE premium subscriptions with
+// no batch (imports without batch_code, SQL-editor grants).
+// ═══════════════════════════════════════════════════════════════════
+function AdminBatches() {
+  const { profile } = useAuth();
+  const isAdmin = !!profile?.is_admin;
+
+  const [rows, setRows] = useState([]);            // admin_batch_overview() rows
+  const [queue, setQueue] = useState([]);          // [{ sub, profile, segment, planName }]
+  const [plansByKey, setPlansByKey] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [notReady, setNotReady] = useState(false); // pre-#32 database
+  const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
+  const [busy, setBusy] = useState(false);
+  // Create form
+  const [createOpen, setCreateOpen] = useState(false);
+  const [cCode, setCCode] = useState('');
+  const [cName, setCName] = useState('');
+  const [cGoldCap, setCGoldCap] = useState('');
+  const [cVipCap, setCVipCap] = useState('');
+  // Assignment
+  const [selectedUids, setSelectedUids] = useState(() => new Set());
+  const [assignTarget, setAssignTarget] = useState('');
+  const [confirmAssign, setConfirmAssign] = useState(false);
+  const [archiveFor, setArchiveFor] = useState(null);   // batch pending archive confirmation
+
+  const load = async (silent = false) => {
+    if (!silent) setLoading(true);
+    setErr('');
+    try {
+      const [ovRes, planRes] = await Promise.all([
+        supabase.rpc('admin_batch_overview'),
+        supabase.from('enrollment_plans').select('key,name,community_segment'),
+      ]);
+      if (ovRes.error) {
+        const msg = String(ovRes.error.message || '');
+        if (ovRes.error.code === 'PGRST202' || /could not find the function/i.test(msg)) {
+          setNotReady(true); setRows([]); setQueue([]);
+          return;
+        }
+        throw ovRes.error;
+      }
+      setNotReady(false);
+      setRows(ovRes.data || []);
+      const plans = Object.fromEntries((planRes.data || ENROLLMENT_PLANS_FALLBACK).map(p => [p.key, p]));
+      setPlansByKey(plans);
+      // Needs-batch queue: active premium subs without a batch.
+      const { data: subs } = await supabase.from('subscriptions').select('*')
+        .eq('status', 'active').is('batch_id', null).order('created_at', { ascending: false }).limit(400);
+      const premium = (subs || []).filter(s => isPremiumSegment(planSegment(s.plan_key, plans)) && subAccess(s).valid);
+      const ids = [...new Set(premium.map(s => s.user_id))];
+      let profs = {};
+      if (ids.length) {
+        const { data: p } = await supabase.from('profiles').select('id,email,full_name').in('id', ids);
+        profs = Object.fromEntries((p || []).map(x => [x.id, x]));
+      }
+      setQueue(premium.map(s => ({
+        sub: s,
+        profile: profs[s.user_id] || { id: s.user_id },
+        segment: planSegment(s.plan_key, plans),
+        planName: plans[s.plan_key]?.name || s.plan_key,
+      })));
+      // Drop selections that left the queue (assigned elsewhere / expired).
+      setSelectedUids(prev => new Set([...prev].filter(uid => premium.some(s => s.user_id === uid))));
+    } catch (e) {
+      setErr(e?.message || 'Could not load batches.');
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  };
+  useEffect(() => { if (isAdmin) load(); /* eslint-disable-next-line */ }, [isAdmin]);
+
+  const logBatchEvent = (batch_id, user_id, action, detail) =>
+    supabase.from('batch_events').insert({ batch_id, user_id, action, actor_id: profile?.id || null, detail }).then(() => {}, () => {});
+
+  const createBatch = async () => {
+    const code = normalizeBatchCode(cCode);
+    if (!isValidBatchCode(code)) { setErr('Batch code must be YYYY-MM (e.g. 2026-08).'); return; }
+    if (!cName.trim()) { setErr('Give the batch a display name (e.g. August 2026).'); return; }
+    setBusy(true); setErr(''); setNotice('');
+    try {
+      const row = {
+        code, name: cName.trim(), status: 'open',
+        gold_capacity: cGoldCap ? Number(cGoldCap) : null,
+        vip_capacity: cVipCap ? Number(cVipCap) : null,
+      };
+      const { error } = await supabase.from('batches').insert(row);
+      if (error) throw error;
+      setNotice(`Batch ${cName.trim()} (${code}) created — its Gold and VIP spaces are live.`);
+      setCreateOpen(false); setCCode(''); setCName(''); setCGoldCap(''); setCVipCap('');
+      load(true);
+    } catch (e) {
+      setErr(e?.code === '23505' ? `A batch with code ${code} already exists.` : (e?.message || 'Could not create the batch.'));
+    } finally { setBusy(false); }
+  };
+
+  const setStatus = async (b, status) => {
+    setBusy(true); setErr(''); setNotice('');
+    try {
+      const { error } = await supabase.from('batches').update({ status, updated_at: new Date().toISOString() }).eq('id', b.batch_id);
+      if (error) throw error;
+      logBatchEvent(b.batch_id, null, status === 'open' ? 'open' : status === 'closed' ? 'close' : 'archive', { code: b.code });
+      setNotice(`Batch ${b.code} is now ${status}.`);
+      load(true);
+    } catch (e) { setErr(e?.message || 'Could not update the batch.'); } finally { setBusy(false); }
+  };
+
+  const saveCapacity = async (b, field, raw) => {
+    const v = raw === '' ? null : Math.max(1, Number(raw) || 1);
+    try {
+      const { error } = await supabase.from('batches').update({ [field]: v, updated_at: new Date().toISOString() }).eq('id', b.batch_id);
+      if (error) throw error;
+      logBatchEvent(b.batch_id, null, 'capacity', { code: b.code, [field]: v });
+      load(true);
+    } catch (e) { setErr(e?.message || 'Could not save the capacity.'); }
+  };
+
+  const runAssign = async () => {
+    const uids = [...selectedUids];
+    if (!uids.length || !assignTarget) return;
+    setBusy(true); setErr(''); setNotice(''); setConfirmAssign(false);
+    try {
+      const { data, error } = await supabase.rpc('admin_assign_batch', { p_user_ids: uids, p_batch_id: assignTarget });
+      if (error) throw error;
+      const skipped = Array.isArray(data?.skipped) ? data.skipped : [];
+      setNotice(`Assigned ${data?.assigned ?? 0} member${(data?.assigned ?? 0) === 1 ? '' : 's'}${skipped.length ? ` · ${skipped.length} skipped (${[...new Set(skipped.map(s => s.reason))].join(', ')})` : ''}.`);
+      setSelectedUids(new Set());
+      load(true);
+    } catch (e) { setErr(e?.message || 'Could not assign the batch.'); } finally { setBusy(false); }
+  };
+
+  if (!isAdmin) {
+    return (
+      <div className="max-w-lg mx-auto mt-16 glass-card rounded-2xl p-10 text-center">
+        <Shield size={36} className="mx-auto mb-3" style={{ color: ROYAL }} />
+        <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg font-bold">Admins only</div>
+        <div className="text-slate-500 mt-2 text-sm">Batch management is restricted to the admin team.</div>
+      </div>
+    );
+  }
+
+  const openBatchOptions = rows.filter(b => b.status === 'open');
+  const inputStyle = { background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody };
+
+  return (
+    <div>
+      <SectionHead eyebrow="Admin" title="Batches"
+        desc="Cohorts for the Gold / VIP live tracks — each batch carries its own private Gold and VIP communities. Membership follows the approved subscription automatically." gold />
+
+      {notReady ? (
+        <div className="mt-6 max-w-3xl mx-auto glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
+          <CalendarCheck size={40} className="mx-auto mb-3" style={{ color: ROYAL }} />
+          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">Finish backend setup</div>
+          <div className="text-slate-500 mt-2 text-sm max-w-md mx-auto">
+            Run db/2026-07-28-community-spaces-batches.sql (#32) in the Supabase SQL Editor, then refresh this page.
+          </div>
+        </div>
+      ) : (
+        <div className="max-w-4xl mx-auto">
+          {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+          {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
+
+          <div className="mt-4 flex items-center justify-between gap-3 flex-wrap">
+            <AdminFilterCaption>Cohorts</AdminFilterCaption>
+            <button onClick={() => setCreateOpen(true)}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition"
+              style={ADMIN_BTN_OK}>
+              <Plus size={15} /> New batch
+            </button>
+          </div>
+
+          {loading ? <AdminListSkeleton rows={3} /> : (
+            <div className="mt-3 space-y-2.5">
+              {rows.length === 0 && (
+                <div className="glass-card rounded-2xl p-8 text-center">
+                  <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg font-bold">No batches yet</div>
+                  <div className="text-slate-500 mt-1.5 text-sm">Create the first cohort (e.g. August 2026 · 2026-08) — its Gold and VIP communities are created automatically.</div>
+                </div>
+              )}
+              {rows.map(b => {
+                const stStyle = b.status === 'open' ? { background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)', border: '1px solid var(--status-ok-bd)' }
+                  : b.status === 'closed' ? { background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)', border: '1px solid var(--status-warn-bd)' }
+                  : { background: 'var(--status-neutral-bg)', color: 'var(--status-neutral-fg)', border: '1px solid var(--status-neutral-bd)' };
+                return (
+                  <div key={b.batch_id} className="glass-card rounded-2xl p-4">
+                    <div className="flex items-center gap-3 flex-wrap">
+                      <span style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 15, color: C.text }}>{b.name}</span>
+                      <span style={{ fontFamily: fontMono, fontSize: 12, color: C.textMute }}>{b.code}</span>
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase" style={stStyle}>{b.status}</span>
+                      <div className="ml-auto flex items-center gap-1.5">
+                        {b.status !== 'open' && (
+                          <button onClick={() => setStatus(b, 'open')} disabled={busy} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold disabled:opacity-60">
+                            {b.status === 'archived' ? 'Un-archive' : 'Reopen'}
+                          </button>
+                        )}
+                        {b.status === 'open' && (
+                          <button onClick={() => setStatus(b, 'closed')} disabled={busy} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold disabled:opacity-60">Close</button>
+                        )}
+                        {b.status !== 'archived' && (
+                          <button onClick={() => setArchiveFor(b)} disabled={busy} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold disabled:opacity-60" style={{ color: C.red }}>Archive</button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="mt-3 grid gap-2 sm:grid-cols-2" style={{ fontSize: 12.5, color: C.textSoft }}>
+                      {[['gold', 'Gold', Number(b.gold_active) || 0, b.gold_capacity, 'gold_capacity'],
+                        ['vip', 'VIP', Number(b.vip_active) || 0, b.vip_capacity, 'vip_capacity']].map(([seg, label, active, cap, field]) => (
+                        <div key={seg} className="flex items-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'var(--wash)' }}>
+                          {seg === 'gold' ? <Crown size={13} style={{ color: C.primary }} /> : <Sparkles size={13} style={{ color: C.primary }} />}
+                          <span style={{ fontWeight: 700, color: C.text }}>{label}</span>
+                          <span className="gh-tnum">{active}{cap != null ? ` / ${cap}` : ''} enrolled</span>
+                          {cap != null && active >= cap && (
+                            <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold" style={{ background: 'var(--status-danger-bg)', color: 'var(--status-danger-fg)' }}>FULL</span>
+                          )}
+                          <input type="number" min="1" placeholder="∞" defaultValue={cap ?? ''} aria-label={`${label} capacity`}
+                            onBlur={e => { const v = e.target.value; if (String(cap ?? '') !== v) saveCapacity(b, field, v); }}
+                            className="ml-auto w-16 px-2 py-1 rounded-lg text-xs text-right outline-none" style={inputStyle} />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Needs batch assignment — active premium members with no cohort */}
+          <div className="mt-8 flex items-center gap-2 flex-wrap">
+            <AdminFilterCaption>Needs batch assignment</AdminFilterCaption>
+            {queue.length > 0 && (
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-bold" style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)', border: '1px solid var(--status-warn-bd)' }}>
+                {queue.length}
+              </span>
+            )}
+          </div>
+          {queue.length === 0 ? (
+            !loading && (
+              <div className="mt-3 glass-card rounded-2xl p-5 text-center" style={{ fontSize: 13, color: C.textSoft }}>
+                Every active Gold / VIP member has a batch. New members get theirs at approval; imported members land here until assigned.
+              </div>
+            )
+          ) : (
+            <div className="mt-3 glass-card rounded-2xl p-4">
+              <div className="space-y-2">
+                {queue.map(q => (
+                  <label key={q.sub.id} className="flex items-center gap-3 px-2 py-1.5 rounded-xl cursor-pointer select-none transition hover:bg-[var(--wash)]">
+                    <input type="checkbox" checked={selectedUids.has(q.sub.user_id)}
+                      onChange={e => setSelectedUids(prev => { const n = new Set(prev); if (e.target.checked) n.add(q.sub.user_id); else n.delete(q.sub.user_id); return n; })} />
+                    <div className="grid grid-cols-[40px,1fr] items-center gap-3 min-w-0 flex-1">
+                      <AdminUserCell name={q.profile.full_name} email={q.profile.email}
+                        meta={<><span>{q.planName}</span><span className="uppercase font-bold" style={{ fontSize: 10 }}>{q.segment}</span>
+                          <span>until {q.sub.ends_at ? fmtEnrollDate(q.sub.ends_at) : 'no expiry'}</span></>} />
+                    </div>
+                  </label>
+                ))}
+              </div>
+              <div className="mt-4 pt-3 flex items-center gap-2.5 flex-wrap" style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
+                <select value={assignTarget} onChange={e => setAssignTarget(e.target.value)}
+                  className="px-3 py-2 rounded-xl text-sm outline-none" style={inputStyle}>
+                  <option value="">Assign selected to…</option>
+                  {openBatchOptions.map(b => <option key={b.batch_id} value={b.batch_id}>{b.name} ({b.code})</option>)}
+                </select>
+                <button onClick={() => setConfirmAssign(true)} disabled={busy || !assignTarget || selectedUids.size === 0}
+                  className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
+                  style={ADMIN_BTN_OK}>
+                  {busy ? <Loader2 size={15} className="animate-spin" /> : <UserCheck size={15} />} Assign {selectedUids.size || ''}
+                </button>
+                <span style={{ fontSize: 11.5, color: C.textMute }}>Idempotent — already-assigned members are skipped; every change is audited.</span>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {createOpen && (
+        <AccountModal title="New batch" subtitle="Creates the cohort + its private Gold and VIP communities"
+          icon={CalendarPlus} tone="primary" maxW="max-w-md" canClose={!busy} onClose={() => setCreateOpen(false)}>
+          <div className="grid gap-3">
+            <div>
+              <label className="block mb-1.5" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Code (YYYY-MM) *</label>
+              <input className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={{ ...inputStyle, fontFamily: fontMono }}
+                value={cCode} onChange={e => setCCode(e.target.value)} placeholder="2026-08" />
+            </div>
+            <div>
+              <label className="block mb-1.5" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Display name *</label>
+              <input className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={inputStyle}
+                value={cName} onChange={e => setCName(e.target.value)} placeholder="August 2026" />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block mb-1.5" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Gold seats</label>
+                <input type="number" min="1" className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={inputStyle}
+                  value={cGoldCap} onChange={e => setCGoldCap(e.target.value)} placeholder="Unlimited" />
+              </div>
+              <div>
+                <label className="block mb-1.5" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>VIP seats</label>
+                <input type="number" min="1" className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={inputStyle}
+                  value={cVipCap} onChange={e => setCVipCap(e.target.value)} placeholder="Unlimited" />
+              </div>
+            </div>
+          </div>
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button onClick={() => setCreateOpen(false)} disabled={busy} className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold disabled:opacity-60">Cancel</button>
+            <button onClick={createBatch} disabled={busy}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60" style={ADMIN_BTN_OK}>
+              {busy ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />} Create batch
+            </button>
+          </div>
+        </AccountModal>
+      )}
+
+      {confirmAssign && (
+        <AccountModal title="Assign batch?" subtitle={`${selectedUids.size} member${selectedUids.size === 1 ? '' : 's'} → ${(openBatchOptions.find(b => b.batch_id === assignTarget) || {}).name || 'batch'}`}
+          icon={UserCheck} tone="ok" maxW="max-w-sm" canClose={!busy} onClose={() => setConfirmAssign(false)}>
+          <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+            Each member’s active Gold/VIP subscription joins this batch and unlocks its private community immediately.
+            Members already in the batch are skipped; capacity is enforced server-side.
+          </p>
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button onClick={() => setConfirmAssign(false)} disabled={busy} className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold disabled:opacity-60">Cancel</button>
+            <button onClick={runAssign} disabled={busy}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60" style={ADMIN_BTN_OK}>
+              {busy ? <Loader2 size={15} className="animate-spin" /> : <UserCheck size={15} />} Assign
+            </button>
+          </div>
+        </AccountModal>
+      )}
+
+      {/* Archiving is the one batch action that hits EXISTING members: the approve RPC
+          refuses an archived batch before the new-assignment carve-out, so renewals and
+          extensions stop for the whole cohort. Confirm it like any destructive action. */}
+      {archiveFor && (
+        <AccountModal title="Archive this batch?" subtitle={`${archiveFor.name} (${archiveFor.code})`}
+          icon={AlertTriangle} tone="danger" maxW="max-w-sm" canClose={!busy} onClose={() => setArchiveFor(null)}>
+          <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+            Existing members keep their private community — archiving never revokes access. But this
+            batch stops accepting new assignments <span style={{ fontWeight: 700 }}>and its members can no
+            longer renew or extend</span> until it is un-archived.
+          </p>
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button onClick={() => setArchiveFor(null)} disabled={busy} className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold disabled:opacity-60">Cancel</button>
+            <button onClick={async () => { await setStatus(archiveFor, 'archived'); setArchiveFor(null); }} disabled={busy}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60" style={ADMIN_BTN_DANGER}>
+              {busy ? <Loader2 size={15} className="animate-spin" /> : <AlertTriangle size={15} />} Archive
+            </button>
+          </div>
+        </AccountModal>
+      )}
+    </div>
+  );
+}
+
 function AccessRequests({ onCountChange }) {
   const { user, profile } = useAuth();
   const isAdmin = !!profile?.is_admin;
@@ -5231,16 +7410,24 @@ function AccessRequests({ onCountChange }) {
   const load = async () => {
     setLoading(true); setErr(''); setNotConfigured(false);
     try {
-      const { data, error } = await supabase
-        .from('profiles')
-        .select('id,email,full_name,avatar_url,approval_status,rejection_reason,approved_at,rejected_at,created_at')
-        .order('created_at', { ascending: false });
+      // Two-tier fetch: the actionable pending queue is never capped away, while
+      // decided accounts are limited to the newest 400 — an unbounded select would
+      // hit PostgREST's max_rows=1000 and silently hide older pending signups.
+      const COLS = 'id,email,full_name,avatar_url,approval_status,rejection_reason,approved_at,rejected_at,created_at';
+      const [pendRes, restRes] = await Promise.all([
+        supabase.from('profiles').select(COLS)
+          .eq('approval_status', 'pending').order('created_at', { ascending: false }).limit(500),
+        supabase.from('profiles').select(COLS)
+          .neq('approval_status', 'pending').order('created_at', { ascending: false }).limit(400),
+      ]);
+      const error = pendRes.error || restRes.error;
       if (error) {
         if (isApprovalNotConfiguredErr(error)) setNotConfigured(true);
         else setErr(error.message || 'Could not load users.');
         setRows([]);
       } else {
-        setRows(data || []);
+        setRows([...(pendRes.data || []), ...(restRes.data || [])]
+          .sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
       }
     } catch (e) {
       setErr(String(e?.message || e));
@@ -5487,6 +7674,9 @@ function AdminEnrollments({ onCountChange }) {
   const [rows, setRows] = useState([]);
   const [profilesById, setProfilesById] = useState({});
   const [subsByUser, setSubsByUser] = useState({});   // user_id → LATEST subscription row
+  // false = the subscriptions lookup failed, so an ABSENT entry means "unknown", not
+  // "no prior term". Approve must not demand a batch on the strength of missing data.
+  const [subsKnown, setSubsKnown] = useState(true);
   const [plansByKey, setPlansByKey] = useState({});   // plan key → enrollment_plans row (durations)
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState('');
@@ -5495,6 +7685,18 @@ function AdminEnrollments({ onCountChange }) {
   const [busyId, setBusyId] = useState(null);
   const [notice, setNotice] = useState('');
   const [approveFor, setApproveFor] = useState(null);   // row pending approval (confirm modal)
+  const [approveBatchId, setApproveBatchId] = useState(null);   // #32: batch picked in the approve modal (premium plans)
+  // Did the admin actually CHANGE the batch select? Only then do we send p_batch_id.
+  // Preselection is a convenience mirror of the RPC's precedence; sending it back
+  // unconditionally would let a stale client (e.g. subsByUser empty after a failed
+  // subscriptions fetch) override the member's real current batch, because the RPC
+  // gives p_batch_id precedence over the inherited one.
+  const [approveBatchDirty, setApproveBatchDirty] = useState(false);
+  // #32 batch registry. undefined = not loaded yet, null = genuinely pre-#32 (missing
+  // table), array = loaded. The two must stay distinct: `null` drives the "run migration
+  // #32" card AND disables the batch requirement, so an unloaded state must not read as
+  // pre-#32 or the very first render would invite an approval with no batch.
+  const [batches, setBatches] = useState(undefined);
   const [rejectFor, setRejectFor] = useState(null);     // row pending rejection (modal)
   const [rejectReason, setRejectReason] = useState('');
   const [receiptView, setReceiptView] = useState(null); // { url, name } image preview modal
@@ -5519,41 +7721,82 @@ function AdminEnrollments({ onCountChange }) {
       // (admin-only RPC; missing pre-lifecycle-migration → silently skipped).
       try { await supabase.rpc('expire_overdue_subscriptions'); } catch { /* best-effort */ }
 
-      const [reqRes, subRes, planRes] = await Promise.all([
-        supabase.from('enrollment_requests').select('*').order('created_at', { ascending: false }),
-        supabase.from('subscriptions').select('*').order('created_at', { ascending: false }),
+      // Two-tier fetch instead of the whole table: the actionable pending queue is
+      // NEVER capped away (bounded in practice — the one-pending-per-user unique
+      // index caps it at one row per member), while decided history is limited to
+      // the newest 400. PostgREST caps unbounded selects at max_rows=1000, which
+      // would otherwise silently hide older still-pending requests as history grows.
+      const [pendRes, histRes, planRes] = await Promise.all([
+        supabase.from('enrollment_requests').select('*')
+          .eq('status', 'pending_review').order('created_at', { ascending: false }).limit(500),
+        supabase.from('enrollment_requests').select('*')
+          .neq('status', 'pending_review').order('created_at', { ascending: false }).limit(400),
         supabase.from('enrollment_plans').select('*'),
       ]);
-      const { data, error } = reqRes;
+      const error = pendRes.error || histRes.error;
       if (error) {
         if (isEnrollmentNotConfiguredErr(error)) setNotConfigured(true);
         else setErr(error.message || 'Could not load enrollment requests.');
         setRows([]);
+        setSubsByUser({});
       } else {
-        setRows(data || []);
+        const data = [...(pendRes.data || []), ...(histRes.data || [])]
+          .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        setRows(data);
         // Second query (no FK-embed fragility): the linked profiles, for the
-        // "grant incomplete" check and the Google/Email signup hint.
-        const ids = [...new Set((data || []).map(r => r.user_id).filter(Boolean))];
+        // "grant incomplete" check and the Google/Email signup hint — and the
+        // subscriptions map scoped to the SAME visible users (it powers the
+        // membership strip, the lifecycle filters, and the approve-modal
+        // projection; old-schema tolerant — an error just leaves it empty).
+        const ids = [...new Set(data.map(r => r.user_id).filter(Boolean))];
         if (ids.length) {
-          const { data: profs } = await supabase
-            .from('profiles').select('id,is_paid,avatar_url').in('id', ids);
+          const [{ data: profs }, subRes] = await Promise.all([
+            supabase.from('profiles').select('id,is_paid,avatar_url').in('id', ids),
+            supabase.from('subscriptions').select('*').in('user_id', ids)
+              .order('created_at', { ascending: false }).limit(1000),
+          ]);
           setProfilesById(Object.fromEntries((profs || []).map(p => [p.id, p])));
+          if (!subRes.error && Array.isArray(subRes.data)) {
+            const m = {};
+            for (const s of subRes.data) if (!m[s.user_id]) m[s.user_id] = s;
+            setSubsByUser(m);
+            setSubsKnown(true);
+          } else {
+            // Keep the last known map — "we don't know this member's current term" is a
+            // DIFFERENT state from "they have none", and conflating them makes the approve
+            // modal demand a batch the server would have inherited correctly on its own.
+            console.warn('[enroll] subscriptions fetch failed', subRes.error?.code, subRes.error?.message);
+            setSubsKnown(false);
+          }
         } else {
           setProfilesById({});
+          setSubsByUser({});
+          setSubsKnown(true);      // no users to look up — the empty map IS the truth
         }
-      }
-      // Latest subscription per user (rows come newest-first) — powers the membership
-      // strip, the lifecycle filters, and the approve-modal projection. Old-schema
-      // tolerant: an error just leaves the map empty.
-      if (!subRes.error && Array.isArray(subRes.data)) {
-        const m = {};
-        for (const s of subRes.data) if (!m[s.user_id]) m[s.user_id] = s;
-        setSubsByUser(m);
-      } else {
-        setSubsByUser({});
       }
       const planList = (!planRes.error && planRes.data?.length) ? planRes.data : ENROLLMENT_PLANS_FALLBACK;
       setPlansByKey(Object.fromEntries(planList.map(p => [p.key, p])));
+      // #32: the batch registry for the approve-modal picker + membership chips.
+      // Pre-#32 (missing table) → null, and every batch surface stays hidden.
+      try {
+        const { data: bData, error: bErr } = await supabase.from('batches')
+          .select('id, code, name, status').order('code', { ascending: false });
+        // null is the "pre-#32" sentinel that drives the run-the-migration card, so it
+        // must mean the TABLE is absent — collapsing a transient error into it tells the
+        // admin to run an applied migration AND re-enables Approve, which the RPC then
+        // refuses for an unrelated reason. A transient failure keeps the last known list.
+        if (!bErr) setBatches(bData || []);
+        else if (['42P01', 'PGRST205'].includes(String(bErr.code))) setBatches(null);
+        else {
+          // Leaving `batches` at undefined would strand the approve modal on
+          // "Loading batches…" forever with Approve disabled and no explanation.
+          console.warn('[enroll] batches fetch failed', bErr?.code, bErr?.message);
+          setErr('Could not load the batch registry — click Refresh before approving a Gold/VIP request.');
+        }
+      } catch (e) {
+        console.warn('[enroll] batches fetch failed', e?.message);
+        setErr('Could not load the batch registry — click Refresh before approving a Gold/VIP request.');
+      }
     } catch (e) {
       setErr(String(e?.message || e));
       setRows([]);
@@ -5645,19 +7888,26 @@ function AdminEnrollments({ onCountChange }) {
 
   // Live refresh on new submissions (admins receive all rows via enroll_req_admin_all).
   // Inert if the table isn't in the realtime publication — the Refresh button still works.
+  // The refetch is trailing-debounced so an INSERT burst (e.g. a batch of resubmits)
+  // reloads once, not once per row; the chime stays immediate — that's its whole point.
   useEffect(() => {
     if (!isAdmin) return;
+    let timer = null;
     const ch = supabase
       .channel('enrollment-requests-admin')
       .on('postgres_changes',
         { event: 'INSERT', schema: 'public', table: 'enrollment_requests' },
         () => {
-          load(true);
-          onCountChange?.();
           if (soundOnRef.current) chime();
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(() => {
+            timer = null;
+            load(true);
+            onCountChange?.();
+          }, 800);
         })
       .subscribe();
-    return () => { supabase.removeChannel(ch); };
+    return () => { if (timer) clearTimeout(timer); supabase.removeChannel(ch); };
     /* eslint-disable-next-line */
   }, [isAdmin]);
 
@@ -5710,112 +7960,46 @@ function AdminEnrollments({ onCountChange }) {
     }
   };
 
-  // Approve = the ONE admin action that unlocks a student. Post-lifecycle the DATED
-  // SUBSCRIPTION is the real access grant (is_enrolled() checks it; profiles.is_paid is
-  // only a cache), so ordering is: ① subscription term → ② profiles cache → ③ request row.
-  // The grant goes FIRST and each step is fatal, so a failure leaves the request
-  // pending_review (Approve button intact — retryable) and never strands a member on
-  // "approved" with no active term. Every update uses .select() to catch 0-row RLS
-  // filtering (PostgREST reports no error on a 0-row update).
-  const doApprove = async (r) => {
+  // Approve = the ONE admin action that unlocks a student. Since #32 this is a
+  // SINGLE transactional RPC: admin_finalize_enrollment() validates the request
+  // status + plan + batch + capacity TOGETHER, grants the dated term (wrapping
+  // approve_subscription()/approve_extension() — stacking/supersede/grace/clamp
+  // math stays in one place), stamps subscriptions.batch_id, and updates the
+  // profile cache + request row atomically. All-or-nothing: any raise rolls the
+  // whole approval back and the request stays pending_review (retryable).
+  // The old client-side ①②③ sequence and its LOCAL-GRANT FALLBACK are gone by
+  // design — a fallback could grant premium access while bypassing batch and
+  // capacity validation. A missing migration now surfaces setup guidance and
+  // aborts instead of granting outside the validated path.
+  const doApprove = async (r, pickedBatchId = null) => {
     setBusyId(r.id); setErr(''); setNotice('');
-    const nowIso = new Date().toISOString();
     try {
-      // ① Subscription term. An EXTENSION adds extra days on the member's SAME plan via
-      //    approve_extension(); every other kind (new / renewal / upgrade) grants the
-      //    plan's full term via approve_subscription(). Both run in ONE transaction server-
-      //    side (extend from the current expiry, supersede the old active row, stamp a
-      //    3-day grace, idempotent per request_id). A client-side fallback replicates each
-      //    when the RPC/migration is absent so the fallback still grants a proper DATED term.
-      const isExtension = r.request_kind === 'extension' && Number(r.extension_days) > 0;
-      let subNote = '', grantedEndsAt;
-      const rpc = isExtension
-        ? await supabase.rpc('approve_extension', { p_user_id: r.user_id, p_request_id: r.id, p_days: Number(r.extension_days) })
-        : await supabase.rpc('approve_subscription', { p_user_id: r.user_id, p_plan_key: r.plan_key, p_request_id: r.id });
+      const rpc = await supabase.rpc('admin_finalize_enrollment', {
+        p_request_id: r.id,
+        p_batch_id: pickedBatchId || null,
+      });
       if (rpc.error) {
-        if (!isEnrollmentNotConfiguredErr(rpc.error)) throw rpc.error;
-        const prev = subsByUser[r.user_id] || null;
-        if (prev?.status === 'active' && prev.request_id === r.id) {
-          grantedEndsAt = prev.ends_at ?? undefined;
-        } else {
-          // Extension keeps the current plan + adds extension_days; others use the plan's
-          // access_days. Both extend from the current valid expiry (else from now).
-          const planForTerm = isExtension ? (prev?.plan_key || r.plan_key) : r.plan_key;
-          // Clamp to approve_extension()'s 60–365 bound (#21) so the fallback never grants
-          // more (or less) than the RPC would accept from a tampered extension_days.
-          const termDays = isExtension
-            ? Math.min(365, Math.max(60, Number(r.extension_days)))
-            : (Number(plansByKey[r.plan_key]?.access_days) || null);
-          const prevAcc = subAccess(prev);
-          const baseMs = (prev?.status === 'active' && prevAcc.valid && prev.ends_at)
-            ? new Date(prev.ends_at).getTime() : Date.now();
-          grantedEndsAt = termDays ? new Date(baseMs + termDays * 86400000).toISOString() : null;
-          if (prev?.status === 'active') {
-            const sup = await supabase.from('subscriptions')
-              .update({ status: 'expired', updated_at: nowIso })
-              .eq('user_id', r.user_id).eq('status', 'active');
-            if (sup.error) throw sup.error;
-          }
-          const fullRow = {
-            user_id: r.user_id, plan_key: planForTerm, status: 'active',
-            started_at: nowIso, ends_at: grantedEndsAt,
-            // Mirror approve_subscription()'s 3-day grace so the fallback matches the RPC.
-            grace_ends_at: grantedEndsAt ? new Date(new Date(grantedEndsAt).getTime() + 3 * 86400000).toISOString() : null,
-            approved_by: user?.id || null,
-            request_id: r.id, renewed_from_subscription_id: prev?.id || null, updated_at: nowIso,
-          };
-          let ins = await supabase.from('subscriptions').insert(fullRow).select('ends_at');
-          if (ins.error && isEnrollmentNotConfiguredErr(ins.error)) {
-            // Pre-lifecycle subscriptions table lacks ends_at/etc — minimal legacy insert.
-            ins = await supabase.from('subscriptions').insert({
-              user_id: r.user_id, plan_key: planForTerm, status: 'active',
-              started_at: nowIso, approved_by: user?.id || null, request_id: r.id,
-            }).select('id');
-            grantedEndsAt = undefined;
-          }
-          if (ins.error) throw ins.error;
+        const msg = String(rpc.error.message || '');
+        if (rpc.error.code === 'PGRST202' || /could not find the function/i.test(msg)) {
+          throw new Error('Approvals need migration #32 — run db/2026-07-28-community-spaces-batches.sql in the Supabase SQL Editor, then click Approve again. No changes were made.');
         }
-      } else {
-        grantedEndsAt = rpc.data?.ends_at ?? null;
+        throw rpc.error;
       }
-      if (grantedEndsAt) subNote = ` · access until ${fmtEnrollDate(grantedEndsAt)}`;
-      else if (grantedEndsAt === null) subNote = ' · no expiry';
-
-      // ② Profile cache — is_paid/plan/approval_status (a convenience cache + the legacy
-      //    grandfather signal; NOT the access authority). Full patch first; if the
-      //    approval-migration columns are missing (42703/PGRST204), retry minimal.
-      const fullPatch = {
-        is_paid: true, plan: r.plan_key,
-        approval_status: 'approved', approved_at: nowIso, approved_by: user?.id || null,
-        rejected_at: null, rejected_by: null, rejection_reason: null, updated_at: nowIso,
-      };
-      let profUpd = await supabase.from('profiles').update(fullPatch).eq('id', r.user_id).select('id,is_paid');
-      if (profUpd.error && isEnrollmentNotConfiguredErr(profUpd.error)) {
-        profUpd = await supabase.from('profiles').update({ is_paid: true, plan: r.plan_key }).eq('id', r.user_id).select('id,is_paid');
-      }
-      if (profUpd.error) throw profUpd.error;
-      if (!profUpd.data?.[0]) {
-        throw new Error('The subscription term was granted but the student profile could not be updated (0 rows). Click Approve again to retry; if it persists, re-run db/2026-06-29-user-approval.sql (profiles_admin_update policy).');
-      }
-
-      // ③ Request row → approved (cheap write, done LAST so an earlier failure keeps it
-      //    pending_review and the Approve button available for a retry).
-      const { data: reqUpd, error: reqErr } = await supabase
-        .from('enrollment_requests')
-        .update({ status: 'approved', rejection_reason: null, reviewed_at: nowIso, reviewed_by: user?.id || null, updated_at: nowIso })
-        .eq('id', r.id)
-        .select('id,status');
-      if (reqErr) throw reqErr;
-      if (!reqUpd?.[0]) {
-        throw new Error('Access was granted but the request row could not be marked approved (0 rows) — check is_admin / re-run db/2026-07-04-enrollment.sql. Approve again to retry.');
-      }
-
+      const out = rpc.data || {};
+      const nowIso = new Date().toISOString();
       setRows(prev => prev.map(x => x.id === r.id
-        ? { ...x, status: 'approved', rejection_reason: null, reviewed_at: nowIso, reviewed_by: user?.id || null }
+        ? { ...x, status: 'approved', rejection_reason: null, reviewed_at: nowIso, reviewed_by: user?.id || null, batch_id: out.batch_id ?? x.batch_id ?? null }
         : x));
       setProfilesById(prev => ({ ...prev, [r.user_id]: { ...(prev[r.user_id] || { id: r.user_id }), is_paid: true } }));
       onCountChange?.();
       load(true);   // refresh the membership strip/filters with the new subscription term
+      if (out.already) {
+        setNotice(`${r.email} was already approved — nothing changed.`);
+        return;
+      }
+      const grantedEndsAt = out.ends_at ?? null;
+      let subNote = grantedEndsAt ? ` · access until ${fmtEnrollDate(grantedEndsAt)}` : ' · no expiry';
+      if (out.batch_code) subNote += ` · batch ${out.batch_code}`;
       const mail = await notifyDecision({ email: r.email, fullName: r.full_name, status: 'approved', planName: r.plan_name });
       setNotice(`Approved ${r.email} — ${r.plan_name}${emailSuffix(mail)}${subNote}.`);
     } catch (e) {
@@ -5825,6 +8009,33 @@ function AdminEnrollments({ onCountChange }) {
       setBusyId(null);
     }
   };
+
+  // #32: whenever the approve modal opens for a gold/vip request, preselect its
+  // batch by the SAME precedence the RPC applies (pure mirror in
+  // src/lib/communitySpaces.js — extension inherits+locks, renewal inherits,
+  // upgrade inherits when the target space exists, new uses the checkout choice).
+  useEffect(() => {
+    setApproveBatchDirty(false);
+    if (!approveFor) { setApproveBatchId(null); return; }
+    const prev = subsByUser[approveFor.user_id] || null;
+    const isExt = approveFor.request_kind === 'extension';
+    const effKey = (isExt && prev?.plan_key) ? prev.plan_key : approveFor.plan_key;
+    const pre = approvalBatchPreselect({
+      requestKind: approveFor.request_kind || 'new',
+      segment: planSegment(effKey, plansByKey),
+      prevBatchId: prev?.batch_id || null,
+      requestBatchId: approveFor.batch_id || null,
+      // Every batch gets both a Gold and a VIP space from the #32 trigger, and there is
+      // no UI to deactivate one, so this holds for every batch the app can create. If a
+      // space were deactivated by direct SQL, the RPC's upgrade branch would silently
+      // fall through to the request's batch instead of raising — so this preselect (and
+      // the displayed batch) could then differ from the granted one. Pass the real flag
+      // here if space deactivation ever becomes a supported action.
+      spaceExistsForPrevBatch: true,
+    });
+    setApproveBatchId(pre.batchId);
+    // eslint-disable-next-line
+  }, [approveFor?.id]);
 
   // Reject (with reason) or Mark expired — the student stays blocked and can resubmit.
   const doDecline = async (r, status, reason = null) => {
@@ -6331,6 +8542,18 @@ function AdminEnrollments({ onCountChange }) {
                       <span className="inline-flex items-center gap-1" style={{ color: ent.full ? C.textMute : 'var(--status-warn-fg)', fontWeight: 600 }}>
                         {ent.full ? <ShieldCheck size={10} /> : <Lock size={10} />} {ent.scopeLabel}
                       </span>
+                      {/* #32: batch chip for gold/vip members; amber "no batch" flags the needs-assignment queue */}
+                      {isPremiumSegment(planSegment(s.plan_key, plansByKey)) && (
+                        s.batch_id ? (
+                          <span className="inline-flex items-center gap-1 font-semibold" style={{ color: C.textSoft }}>
+                            <CalendarCheck size={10} /> {(batches || []).find(b => b.id === s.batch_id)?.name || 'Batch'}
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 font-bold" style={{ color: 'var(--status-warn-fg)' }}>
+                            <AlertTriangle size={10} /> No batch — assign in Batches
+                          </span>
+                        )
+                      )}
                       <span>{fmtEnrollDate(s.started_at)} → {a.legacy ? 'no expiry' : fmtEnrollDate(s.ends_at)}{a.graceEnds ? ` · grace ${fmtEnrollDate(s.grace_ends_at)}` : ''}</span>
                       {!a.legacy && (
                         <span className="inline-flex items-center gap-1 font-semibold" style={{ fontFamily: fontMono, color: a.inGrace ? C.red : a.valid ? (a.daysLeft <= 3 ? C.red : a.daysLeft <= 14 ? 'var(--status-warn-fg)' : C.textSoft) : C.red }}>
@@ -6403,6 +8626,91 @@ function AdminEnrollments({ onCountChange }) {
             ))}
           </div>
           {(() => {
+            // #32: batch resolution for premium (gold/vip) requests. Extensions
+            // inherit + lock; everything else is a picker over listable batches
+            // (open ones + the preselected one, so a now-closed inherited batch
+            // still displays — the RPC remains the validator).
+            const prev = subOf(approveFor);
+            const isExt = kindOf(approveFor) === 'extension';
+            const effKey = (isExt && prev?.plan_key) ? prev.plan_key : approveFor.plan_key;
+            const seg = planSegment(effKey, plansByKey);
+            if (!isPremiumSegment(seg)) return null;
+            const segLabel = seg === 'vip' ? 'VIP' : 'Gold';
+            if (batches === undefined) {
+              return (
+                <div className="mt-3 px-3.5 py-2.5 rounded-xl flex items-center gap-2" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}`, fontSize: 12.5, color: C.textMute }}>
+                  <Loader2 size={13} className="animate-spin" /> Loading batches…
+                </div>
+              );
+            }
+            if (batches === null) {
+              return (
+                <div className="mt-3 flex items-start gap-2.5 px-3.5 py-2.5 rounded-xl" style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)' }}>
+                  <AlertTriangle size={15} className="flex-shrink-0 mt-px" style={{ color: 'var(--status-warn-fg)' }} />
+                  <div style={{ fontSize: 12.5, color: 'var(--status-warn-strong-fg)', lineHeight: 1.5 }}>
+                    {approveFor.plan_name || effKey} needs a <span style={{ fontWeight: 700 }}>batch</span>, but migration #32
+                    (db/2026-07-28-community-spaces-batches.sql) isn’t applied yet — run it first, then approve.
+                  </div>
+                </div>
+              );
+            }
+            const locked = isExt && !!prev?.batch_id;
+            const options = batches.filter(b => b.status === 'open' || b.id === approveBatchId);
+            return (
+              <div className="mt-3 px-3.5 py-2.5 rounded-xl" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+                <div className="flex items-center justify-between gap-3" style={{ fontSize: 12.5 }}>
+                  <span style={{ color: C.textMute }}>Batch ({segLabel} community)</span>
+                  {locked ? (
+                    <span style={{ color: C.text, fontWeight: 600 }}>
+                      {(batches.find(b => b.id === approveBatchId) || {}).name || 'Current batch'} · kept (extension)
+                    </span>
+                  ) : (
+                    <select value={approveBatchId || ''} onChange={e => { setApproveBatchId(e.target.value || null); setApproveBatchDirty(true); }}
+                      className="px-2.5 py-1.5 rounded-lg text-xs font-semibold outline-none"
+                      style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text }}>
+                      <option value="">Choose a batch…</option>
+                      {options.map(b => (
+                        <option key={b.id} value={b.id}>{b.name} ({b.code}){b.status !== 'open' ? ` — ${b.status}` : ''}</option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+                {/* The two facts the decision actually turns on. Without them the admin
+                    picks a private community blind — and can't see when the student's
+                    checkout choice differs from the batch they'll actually be put in. */}
+                {(() => {
+                  // An id we can't resolve is exactly when the admin most needs to be told —
+                  // never drop the row just because the batch is missing from the list.
+                  const nameOf = (id) => (batches.find(b => b.id === id) || {}).name || 'unknown batch (not in the loaded list)';
+                  const effective = approveBatchId || prev?.batch_id || approveFor.batch_id || null;
+                  const rows = [];
+                  if (approveFor.batch_id) rows.push(['Requested at checkout', nameOf(approveFor.batch_id), approveFor.batch_id !== effective]);
+                  if (prev?.batch_id) rows.push(['Current batch', nameOf(prev.batch_id), prev.batch_id !== effective]);
+                  if (!rows.length) return null;
+                  return (
+                    <div className="mt-2 space-y-1">
+                      {rows.map(([label, value, diverges]) => (
+                        <div key={label} className="flex items-center justify-between gap-3" style={{ fontSize: 11.5 }}>
+                          <span style={{ color: C.textMute }}>{label}</span>
+                          <span style={{ color: diverges ? 'var(--status-warn-strong-fg)' : C.textMute, fontWeight: diverges ? 700 : 500 }}>
+                            {value}{diverges ? ' · differs from selection' : ''}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
+                {!approveBatchId && !locked && (
+                  <div className="mt-1.5" style={{ fontSize: 11.5, color: 'var(--status-warn-strong-fg)' }}>
+                    {options.length
+                      ? <>A batch is required — it unlocks that cohort’s private {segLabel} community.</>
+                      : <>No open batches exist yet — create one in <span style={{ fontWeight: 700 }}>Admin → Batches</span> first, then approve.</>}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+          {(() => {
             const end = projectedEnd(approveFor);
             const a = subAccess(subOf(approveFor));
             if (!end) return null;
@@ -6429,11 +8737,37 @@ function AdminEnrollments({ onCountChange }) {
               style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
               Cancel
             </button>
-            <button onClick={async () => { const row = approveFor; setApproveFor(null); await doApprove(row); }} disabled={busyId != null}
-              className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
-              style={ADMIN_BTN_OK}>
-              {busyId != null ? <Loader2 size={15} className="animate-spin" /> : <UserCheck size={15} />} Approve & unlock
-            </button>
+            {(() => {
+              // #32: a premium request can't approve without a resolved batch
+              // (unless the batches table isn't reachable — then the RPC error
+              // path explains the missing migration instead of a dead button).
+              const prev = subOf(approveFor);
+              const isExt = kindOf(approveFor) === 'extension';
+              const effKey = (isExt && prev?.plan_key) ? prev.plan_key : approveFor.plan_key;
+              // When the subscriptions lookup failed we can't tell "no prior term" from
+              // "unknown", and the RPC resolves the inherited batch correctly on its own —
+              // so don't block on our own missing data (we send p_batch_id: null anyway).
+              // …but only for kinds that can INHERIT a batch. A `new` request has
+              // nothing to inherit (the RPC resolves coalesce(p_batch_id, v_req.batch_id)),
+              // so relaxing there just enables a button guaranteed to raise.
+              const canInherit = ['renewal', 'extension', 'upgrade'].includes(kindOf(approveFor));
+              const membershipUnknown = !subsKnown && !prev && canInherit;
+              const needsBatch = isPremiumSegment(planSegment(effKey, plansByKey))
+                && batches !== null && !approveBatchId && !membershipUnknown;
+              return (
+                <button onClick={async () => {
+                  const row = approveFor;
+                  // Only an explicit admin choice overrides the RPC's own precedence.
+                  const picked = approveBatchDirty ? approveBatchId : null;
+                  setApproveFor(null); await doApprove(row, picked);
+                }}
+                  disabled={busyId != null || needsBatch}
+                  className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
+                  style={ADMIN_BTN_OK}>
+                  {busyId != null ? <Loader2 size={15} className="animate-spin" /> : <UserCheck size={15} />} Approve & unlock
+                </button>
+              );
+            })()}
           </div>
         </AccountModal>
       )}
@@ -6485,6 +8819,794 @@ function AdminEnrollments({ onCountChange }) {
       )}
     </div>
   );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// COMPONENT: STUDENT IMPORTS — admin Thinkific → Toolkit migration wizard
+// ═══════════════════════════════════════════════════════════════════
+// Stages a legacy roster, maps course-combos → plans, runs a server DRY-RUN
+// (authoritative matching), then processes real accounts + dated subscription
+// grants in resumable batches via api/admin/student-imports.js. Reuses the shared
+// admin kit + design tokens. Server-side is the real boundary (RLS admin-only +
+// admin-verified endpoint); this screen also self-guards on profile.is_admin.
+const IMPORT_LIMITS = { maxBytes: 8 * 1024 * 1024, maxRows: 5000, maxCols: 40 };
+const IMPORT_CANON_FIELDS = [
+  { key: 'thinkific_user_id', label: 'Thinkific user id', hints: ['thinkific_user_id', 'id', 'user id', 'thinkific'] },
+  { key: 'email', label: 'Email', hints: ['email', 'e-mail'] },
+  { key: 'first_name', label: 'First name', hints: ['first_name', 'first name', 'first'] },
+  { key: 'last_name', label: 'Last name', hints: ['last_name', 'last name', 'last'] },
+  { key: 'enrollments_list', label: 'Enrollments (course list)', hints: ['enrollments - list', 'enrollments_list', 'legacy_enrollments', 'courses'] },
+  { key: 'plan_key', label: 'Plan key', hints: ['plan_key', 'plan'] },
+  { key: 'membership_started_at', label: 'Membership start', hints: ['membership_started_at', 'started', 'start date'] },
+  { key: 'membership_ends_at', label: 'Membership expiry', hints: ['membership_ends_at', 'ends', 'expiry', 'expiration', 'expires'] },
+  { key: 'source_created_at', label: 'Account created', hints: ['date created', 'created'] },
+  { key: 'last_sign_in_at', label: 'Last sign in', hints: ['last sign in', 'last_sign_in'] },
+  { key: 'sign_in_count', label: 'Sign-in count', hints: ['sign in count', 'sign_in_count'] },
+  // #32: gold/vip rows must carry an explicit cohort — never inferred from history.
+  { key: 'batch_code', label: 'Batch code (gold/VIP)', hints: ['batch_code', 'batch', 'cohort'] },
+];
+const IMPORT_TERM_MODES = [
+  { key: 'preserve', label: 'Preserve exact expiry (default)', desc: 'Uses membership_ends_at from the source; expired → renewal.' },
+  { key: 'expired_history', label: 'Import as expired history', desc: 'Records a past term; the student lands on the renewal screen.' },
+  { key: 'fresh', label: 'Fresh full term today', desc: 'Ignores source dates; starts a new plan term now.' },
+  { key: 'lifetime', label: 'Lifetime (no expiry)', desc: 'Never expires until you change it (grandfathered).' },
+];
+const IMPORT_PLAN_CHOICES_EXTRA = [
+  { key: 'profile_only', label: 'Profile only (no access)' },
+  { key: 'manual_review', label: 'Manual review' },
+];
+
+async function importApi(action, payload) {
+  const { data: sess } = await supabase.auth.getSession();
+  const token = sess?.session?.access_token;
+  if (!token) throw new Error('Your session expired — sign in again.');
+  const res = await fetch('/api/admin/student-imports', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ action, ...payload }),
+  });
+  const text = await res.text();
+  let json = {};
+  try { json = text ? JSON.parse(text) : {}; } catch { /* non-JSON */ }
+  if (!res.ok) throw new Error(json?.error || `Request failed (${res.status}).`);
+  return json;
+}
+
+// Admin AI-trainer indexing/transcription endpoint (mirrors importApi). Used by the
+// CourseAiTrainerPanel and the saveLesson auto re-index kick.
+async function courseTrainerApi(action, payload = {}) {
+  const { data: sess } = await supabase.auth.getSession();
+  const token = sess?.session?.access_token;
+  if (!token) throw new Error('Your session expired — sign in again.');
+  const res = await fetch('/api/admin/course-trainer', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ action, ...payload }),
+  });
+  const text = await res.text();
+  let json = {};
+  try { json = text ? JSON.parse(text) : {}; } catch { /* non-JSON */ }
+  if (!res.ok) throw new Error(json?.error || `Request failed (${res.status}).`);
+  return json;
+}
+
+// Fire-and-forget re-index kick after an admin edits a trainer-enabled course's
+// lesson. The #27 SQL trigger already marked the source stale, so retrieval stays
+// correct even if this never lands — this just runs the index sooner.
+function kickTrainerSync(courseId) {
+  if (!courseId) return;
+  courseTrainerApi('sync', { course_id: courseId }).catch(() => {});
+}
+
+async function sha256Hex(arrayBuffer) {
+  try {
+    const digest = await crypto.subtle.digest('SHA-256', arrayBuffer);
+    return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  } catch { return ''; }
+}
+
+function autoMapHeaders(headers) {
+  const map = {};
+  const lower = headers.map((h) => (h || '').trim().toLowerCase());
+  for (const field of IMPORT_CANON_FIELDS) {
+    let idx = -1;
+    for (const hint of field.hints) {
+      idx = lower.indexOf(hint);
+      if (idx === -1) idx = lower.findIndex((h) => h.includes(hint));
+      if (idx !== -1) break;
+    }
+    if (idx !== -1) map[field.key] = headers[idx];
+  }
+  return map;
+}
+
+function StudentImports({ onCountChange }) {
+  const { profile } = useAuth();
+  const isAdmin = !!profile?.is_admin;
+
+  const [step, setStep] = useState('upload');            // upload | map | plans | preview | results
+  const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [busyMsg, setBusyMsg] = useState('');
+
+  const [fileMeta, setFileMeta] = useState(null);         // { name, sha256, rows, cols }
+  const [headers, setHeaders] = useState([]);
+  const [rawRows, setRawRows] = useState([]);
+  const [mapping, setMapping] = useState({});
+  const [combos, setCombos] = useState([]);               // [{ key, count, courses, choice }]
+  const [defaultTermMode, setDefaultTermMode] = useState('preserve');
+  const [conflictPolicy, setConflictPolicy] = useState('keep_longer');
+  const [plans, setPlans] = useState([]);                 // live enrollment_plans
+
+  const [jobId, setJobId] = useState(null);
+  const [counts, setCounts] = useState(null);
+  // Latched when a dry-run couldn't persist every proposal — blocks Process until a
+  // clean dry-run replaces the staged rows (see runProcess).
+  const [staleDryRun, setStaleDryRun] = useState(false);
+  const [previewRows, setPreviewRows] = useState([]);
+  const [filter, setFilter] = useState('all');
+  const [search, setSearch] = useState('');
+  const [detailRow, setDetailRow] = useState(null);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  const [proc, setProc] = useState({ running: false, paused: false, done: false, tally: null });
+  const pausedRef = useRef(false);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    supabase.from('enrollment_plans').select('key, name, price_php, access_days, active').order('position', { ascending: true })
+      .then(({ data }) => { if (Array.isArray(data)) setPlans(data.filter((p) => p.active !== false)); })
+      .catch(() => {});
+  }, [isAdmin]);
+
+  if (!isAdmin) {
+    return (
+      <div className="max-w-2xl mx-auto mt-10">
+        <div className="glass-card p-8 text-center" style={{ borderRadius: 20 }}>
+          <ShieldCheck size={30} style={{ color: C.textMute, margin: '0 auto' }} />
+          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Admins only</div>
+          <div className="mt-1 text-sm" style={{ color: C.textSoft }}>The Student Imports tool is restricted to administrators.</div>
+        </div>
+      </div>
+    );
+  }
+
+  const planLabel = (key) => plans.find((p) => p.key === key)?.name || key;
+  const planKeys = plans.map((p) => p.key);
+
+  const downloadTemplate = () => {
+    const csv = toCsv([{
+      thinkific_user_id: '123456', first_name: 'Jane', last_name: 'Doe', email: 'jane@example.com',
+      plan_key: 'core_self_paced', membership_started_at: '2026-01-15', membership_ends_at: '2026-03-16',
+      payment_status: 'paid', amount_paid: '999', currency: 'PHP', legacy_enrollments: 'QuickBooks Online Mastery - Jan 2026',
+      batch_code: '',   // gold/vip only — e.g. 2026-08 (must be an existing OPEN batch)
+    }], IMPORT_TEMPLATE_COLUMNS);
+    downloadFile(csv, 'student-import-template.csv', 'text/csv');
+  };
+
+  const parseFile = async (file) => {
+    if (file.size > IMPORT_LIMITS.maxBytes) throw new Error('File is over 8 MB — export a smaller range.');
+    const buf = await file.arrayBuffer();
+    const sha256 = await sha256Hex(buf);
+    let parsed;
+    if (/\.xlsx?$/i.test(file.name)) {
+      const XLSX = await import('xlsx');
+      const wb = XLSX.read(buf, { type: 'array' });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const arr = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' });
+      const hdr = (arr[0] || []).map((h) => String(h).trim());
+      const rows = arr.slice(1).filter((r) => r.some((c) => String(c).trim() !== '')).map((r) => {
+        const o = {}; hdr.forEach((h, i) => { o[h] = r[i] != null ? String(r[i]) : ''; }); return o;
+      });
+      parsed = { headers: hdr, rows };
+    } else {
+      const text = new TextDecoder('utf-8').decode(buf);
+      parsed = parseCsv(text);
+    }
+    if (!parsed.headers.length) throw new Error('No columns detected — is this a CSV/XLSX with a header row?');
+    if (parsed.headers.length > IMPORT_LIMITS.maxCols) throw new Error(`Too many columns (${parsed.headers.length}).`);
+    if (parsed.rows.length > IMPORT_LIMITS.maxRows) throw new Error(`Too many rows (${parsed.rows.length}). Split the file.`);
+    return { ...parsed, sha256, name: file.name };
+  };
+
+  const onPrimaryFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setErr(''); setBusy(true); setBusyMsg('Parsing file…');
+    try {
+      const p = await parseFile(file);
+      setHeaders(p.headers);
+      setRawRows(p.rows);
+      setFileMeta({ name: p.name, sha256: p.sha256, rows: p.rows.length, cols: p.headers.length });
+      setMapping(autoMapHeaders(p.headers));
+      setStep('map');
+    } catch (e2) { setErr(e2.message || 'Could not parse the file.'); }
+    finally { setBusy(false); setBusyMsg(''); }
+  };
+
+  // Merge a supplementary file (Orders/ledger/manual template) by thinkific id or email.
+  const onSupplementaryFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setErr(''); setBusy(true); setBusyMsg('Reconciling…');
+    try {
+      const p = await parseFile(file);
+      const supMap = autoMapHeaders(p.headers);
+      const idCol = supMap.thinkific_user_id, emailCol = supMap.email;
+      const byId = new Map(), byEmail = new Map();
+      for (const r of p.rows) {
+        const id = idCol ? parseExternalId(r[idCol]) : '';
+        const em = emailCol ? normalizeEmail(r[emailCol]) : '';
+        if (id) byId.set(id, r);
+        if (em) byEmail.set(em, r);
+      }
+      // Enrich the primary rows in place (only fill blanks; the primary keeps precedence for ids).
+      const primaryIdCol = mapping.thinkific_user_id, primaryEmailCol = mapping.email;
+      let enriched = 0;
+      const merged = rawRows.map((row) => {
+        const id = primaryIdCol ? parseExternalId(row[primaryIdCol]) : '';
+        const em = primaryEmailCol ? normalizeEmail(row[primaryEmailCol]) : '';
+        const sup = (id && byId.get(id)) || (em && byEmail.get(em)) || null;
+        if (!sup) return row;
+        enriched++;
+        const out = { ...row };
+        for (const f of ['email', 'plan_key', 'membership_started_at', 'membership_ends_at', 'first_name', 'last_name']) {
+          const supCol = supMap[f];
+          if (supCol && String(sup[supCol] || '').trim() && (!mapping[f] || !String(row[mapping[f]] || '').trim())) {
+            // stash under a synthetic column so mapping can point at it
+            out[`__sup_${f}`] = sup[supCol];
+          }
+        }
+        return out;
+      });
+      // Point the mapping at the supplementary columns for fields the primary lacked.
+      const nextMapping = { ...mapping };
+      for (const f of ['email', 'plan_key', 'membership_started_at', 'membership_ends_at', 'first_name', 'last_name']) {
+        if (!nextMapping[f] && supMap[f]) nextMapping[f] = `__sup_${f}`;
+      }
+      setRawRows(merged);
+      setMapping(nextMapping);
+      setErr('');
+      setNotice(`Reconciled ${enriched} of ${merged.length} rows from the supplementary file.`);
+    } catch (e2) { setErr(e2.message || 'Could not reconcile the file.'); }
+    finally { setBusy(false); setBusyMsg(''); }
+  };
+
+  const buildCombos = () => {
+    const col = mapping.enrollments_list;
+    const grouped = new Map();
+    for (const row of rawRows) {
+      const courses = col ? parseEnrollmentsList(row[col]) : [];
+      const key = comboKeyOf(courses) || '(no courses)';
+      if (!grouped.has(key)) grouped.set(key, { key, count: 0, courses });
+      grouped.get(key).count++;
+    }
+    const list = [...grouped.values()].sort((a, b) => b.count - a.count).map((c) => {
+      const sug = suggestPlanForCombo(c.courses);
+      return { ...c, choice: '', suggested: sug.suggested, suggestReason: sug.reason };
+    });
+    setCombos(list);
+  };
+
+  const goToPlans = () => {
+    if (!mapping.thinkific_user_id) { setErr('Map the Thinkific user id column — it is the match key.'); return; }
+    setErr('');
+    buildCombos();
+    setStep('plans');
+  };
+
+  // Normalize a source row → the staged shape the endpoint expects.
+  const normalizeRow = (row, i) => {
+    const g = (f) => (mapping[f] ? String(row[mapping[f]] ?? '').trim() : '');
+    const externalId = parseExternalId(g('thinkific_user_id'));
+    const emailRaw = g('email');
+    const emailNorm = normalizeEmail(emailRaw);
+    const startD = parseStrictDate(g('membership_started_at'));
+    const endD = parseStrictDate(g('membership_ends_at'));
+    const courses = mapping.enrollments_list ? parseEnrollmentsList(row[mapping.enrollments_list]) : [];
+    const comboKey = comboKeyOf(courses) || '(no courses)';
+    const { warnings, errors } = validateRowFields({
+      hasEmail: !!emailNorm, emailRaw, hasExternalId: !!externalId,
+      startedAt: startD.valid ? startD.epochMs : null, endsAt: endD.valid ? endD.epochMs : null,
+    });
+    if (g('membership_started_at') && !startD.valid) errors.push('Start date is not a valid ISO/UTC date.');
+    if (g('membership_ends_at') && !endD.valid) errors.push('Expiry date is not a valid ISO/UTC date.');
+    return {
+      source_row_number: i + 1,
+      external_user_id: externalId || null,
+      email_normalized: emailNorm || null,
+      email_display: emailRaw || null,
+      proposed_started_at: startD.valid ? startD.iso : null,
+      proposed_ends_at: endD.valid ? endD.iso : null,
+      proposed_term_mode: defaultTermMode,
+      warnings, errors,
+      processing_status: 'pending',
+      mapped: {
+        first_name: g('first_name') || null, last_name: g('last_name') || null,
+        combo_key: comboKey, courses,
+        plan_key: g('plan_key') || null,
+        source_created_at: parseStrictDate(g('source_created_at')).iso || null,
+        last_sign_in_at: parseStrictDate(g('last_sign_in_at')).iso || null,
+        sign_in_count: g('sign_in_count') ? Number(g('sign_in_count')) || null : null,
+        legacy_enrollments: courses,
+        batch_code: g('batch_code') || null,   // #32: explicit cohort for gold/vip rows
+      },
+    };
+  };
+
+  // Stage the job + rows to Supabase (admin RLS), then run the server dry-run.
+  const stageAndDryRun = async () => {
+    setErr(''); setBusy(true); setBusyMsg('Staging rows…');
+    try {
+      const combo_plan_map = {};
+      for (const c of combos) if (c.choice) combo_plan_map[c.key] = c.choice;
+      const settings = { combo_plan_map, default_term_mode: defaultTermMode, conflict_policy: conflictPolicy };
+
+      const { data: job, error: jErr } = await supabase.from('student_import_jobs').insert({
+        source: 'thinkific_users', filename: fileMeta?.name || null, file_sha256: fileMeta?.sha256 || null,
+        mapping, settings, status: 'validating', total_rows: rawRows.length, created_by: profile.id,
+      }).select('id').single();
+      if (jErr) throw jErr;
+      const newJobId = job.id;
+
+      const staged = rawRows.map(normalizeRow).map((r) => ({ ...r, job_id: newJobId }));
+      for (let i = 0; i < staged.length; i += 200) {
+        setBusyMsg(`Staging rows… ${Math.min(i + 200, staged.length)}/${staged.length}`);
+        const { error: rErr } = await supabase.from('student_import_rows').insert(staged.slice(i, i + 200));
+        if (rErr) throw rErr;
+      }
+
+      setBusyMsg('Running dry-run…');
+      const dry = await importApi('dry-run', { jobId: newJobId });
+      setJobId(newJobId);
+      setCounts(dry.counts || null);
+      await loadPreview(newJobId);
+      setStep('preview');
+      // Some proposals never reached the database, so the summary counts describe memory,
+      // not the rows Process will read. Latch it — a warning alone would be wiped by the
+      // next setErr('') and the admin could process against stale proposals.
+      setStaleDryRun(!!dry.persistFailures);
+      if (dry.persistFailures) {
+        setErr(`${dry.persistFailures} row${dry.persistFailures === 1 ? '' : 's'} could not be saved during the dry-run — the counts below may be out of date. Re-run “Stage & dry-run” before processing.`);
+      }
+      onCountChange?.();
+    } catch (e2) { setErr(e2.message || 'Could not stage the import.'); }
+    finally { setBusy(false); setBusyMsg(''); }
+  };
+
+  const loadPreview = async (jid = jobId) => {
+    const { data } = await supabase.from('student_import_rows').select('*').eq('job_id', jid)
+      .order('source_row_number', { ascending: true }).limit(2000);
+    setPreviewRows(Array.isArray(data) ? data : []);
+  };
+
+  const runProcess = async (retryFailed = false) => {
+    if (!jobId) return;
+    // Some proposals never reached the database, so the staged rows may still carry a
+    // PREVIOUS dry-run's plan/term — and processRow re-validates the batch but never the
+    // plan. Refuse until a clean dry-run replaces them.
+    if (staleDryRun) {
+      setErr('The last dry-run could not save every row, so the staged proposals may be out of date. Re-run “Stage & dry-run” before processing.');
+      return;
+    }
+    setErr(''); pausedRef.current = false;
+    setProc((p) => ({ ...p, running: true, paused: false, done: false }));
+    try {
+      let more = true;
+      while (more && !pausedRef.current) {
+        // eslint-disable-next-line no-await-in-loop
+        const r = await importApi('process', { jobId, batchSize: 10, retryFailed });
+        setProc((p) => ({ ...p, tally: r.tally || p.tally }));
+        more = !!r.more && !r.done;
+        // eslint-disable-next-line no-await-in-loop
+        await loadPreview();
+        onCountChange?.();
+        retryFailed = false; // only the first pass retries failed rows
+      }
+      setProc((p) => ({ ...p, running: false, done: !pausedRef.current, paused: pausedRef.current }));
+    } catch (e2) {
+      setErr(e2.message || 'Processing failed — you can resume.');
+      setProc((p) => ({ ...p, running: false }));
+    }
+  };
+
+  const pauseProcess = () => { pausedRef.current = true; setProc((p) => ({ ...p, paused: true, running: false })); };
+
+  const resendInvite = async (rowId) => {
+    try { await importApi('resend-invite', { rowId }); await loadPreview(); }
+    catch (e2) { setErr(e2.message || 'Could not resend the invite.'); }
+  };
+
+  const downloadErrorReport = () => {
+    const rows = previewRows.filter((r) => (r.errors && r.errors.length) || r.processing_status === 'failed' || r.processing_status === 'blocked')
+      .map((r) => ({
+        source_row: r.source_row_number, thinkific_user_id: r.external_user_id || '',
+        email: r.email_display || '', status: r.processing_status,
+        match: r.match_result || '', issues: [...(r.errors || []), ...(r.warnings || [])].join(' | '),
+      }));
+    const csv = toCsv(rows, ['source_row', 'thinkific_user_id', 'email', 'status', 'match', 'issues']);
+    downloadFile(csv, `student-import-issues-${jobId?.slice(0, 8) || 'report'}.csv`, 'text/csv');
+  };
+
+  // ── derived preview counts + filtered view ──
+  const pv = useMemo(() => {
+    const c = { total: previewRows.length, ready: 0, blocked: 0, newAcct: 0, existing: 0, conflicts: 0, done: 0, failed: 0, skipped: 0, invited: 0, expiredHist: 0 };
+    for (const r of previewRows) {
+      if (r.processing_status === 'ready') c.ready++;
+      if (r.processing_status === 'blocked') c.blocked++;
+      if (r.processing_status === 'done') c.done++;
+      if (r.processing_status === 'failed') c.failed++;
+      if (r.processing_status === 'skipped') c.skipped++;
+      if (r.match_result === 'new') c.newAcct++;
+      if (r.match_result === 'existing_by_source' || r.match_result === 'existing_by_email') c.existing++;
+      if (r.match_result === 'conflict' || r.match_result === 'ambiguous') c.conflicts++;
+      if (r.invite_status === 'sent' || r.invite_status === 'resent') c.invited++;
+    }
+    return c;
+  }, [previewRows]);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return previewRows.filter((r) => {
+      if (filter !== 'all' && r.processing_status !== filter) return false;
+      if (!q) return true;
+      return (r.email_display || '').toLowerCase().includes(q) || (r.external_user_id || '').toLowerCase().includes(q)
+        || String(r.mapped?.first_name || '').toLowerCase().includes(q) || String(r.mapped?.last_name || '').toLowerCase().includes(q);
+    });
+  }, [previewRows, filter, search]);
+
+  const readyToProcess = pv.ready;
+
+  // ── stepper ──
+  const STEPS = [
+    { key: 'upload', label: 'Upload' }, { key: 'map', label: 'Map' },
+    { key: 'plans', label: 'Plans' }, { key: 'preview', label: 'Preview & run' }, { key: 'results', label: 'Results' },
+  ];
+  const stepIdx = STEPS.findIndex((s) => s.key === step);
+
+  const STAT = ({ label, value, tone }) => (
+    <div className="rounded-xl px-3 py-2.5" style={{ background: 'var(--wash)', border: `1px solid ${C.border}` }}>
+      <div style={{ fontSize: 18, fontWeight: 800, fontFamily: fontDisplay, color: tone || C.text }}>{value}</div>
+      <div style={{ fontSize: 10.5, color: C.textMute, textTransform: 'uppercase', letterSpacing: '0.04em' }}>{label}</div>
+    </div>
+  );
+
+  return (
+    <div>
+      <SectionHead eyebrow="Admin" gold title="Student Imports"
+        desc="Migrate legacy Thinkific students — validate, map course-combos to plans, dry-run, then import real accounts + dated memberships." />
+
+      <div className="max-w-5xl mx-auto px-1 pb-16">
+        {/* Stepper */}
+        <div className="flex items-center gap-1.5 mb-5 flex-wrap">
+          {STEPS.map((s, i) => (
+            <div key={s.key} className="flex items-center gap-1.5">
+              <div className="px-3 py-1.5 rounded-full text-xs font-semibold flex items-center gap-1.5"
+                style={i <= stepIdx
+                  ? { background: 'var(--primary-tint)', color: C.primary, border: `1px solid var(--primary-glow)` }
+                  : { background: 'var(--wash)', color: C.textMute, border: `1px solid ${C.border}` }}>
+                {i < stepIdx ? <Check size={12} /> : <span style={{ fontWeight: 800 }}>{i + 1}</span>} {s.label}
+              </div>
+              {i < STEPS.length - 1 && <ChevronRight size={13} style={{ color: C.textMute }} />}
+            </div>
+          ))}
+        </div>
+
+        {err && <div className="mb-4"><AdminNotice kind="error" onDismiss={() => setErr('')}>{err}</AdminNotice></div>}
+        {notice && <div className="mb-4"><AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice></div>}
+        {busy && (
+          <div className="mb-4 flex items-center gap-2 text-sm" style={{ color: C.textSoft }}>
+            <Loader2 size={15} className="animate-spin" /> {busyMsg || 'Working…'}
+          </div>
+        )}
+
+        {/* STEP: UPLOAD */}
+        {step === 'upload' && (
+          <div className="space-y-4">
+            <div className="rounded-xl px-4 py-3.5 text-sm flex items-start gap-2.5"
+              style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
+              <AlertTriangle size={16} className="flex-shrink-0 mt-0.5" />
+              <div>
+                <strong>A Thinkific user export alone grants nothing.</strong> Emails are blank and course
+                titles are not proof of a purchased package. Every new-account row stays <em>blocked</em> until
+                you supply an <strong>email</strong> and an <strong>exact expiry</strong> — reconcile an
+                Orders/ledger export or the template below. No access is ever inferred from a course or a date.
+              </div>
+            </div>
+
+            <div className="glass-card p-6" style={{ borderRadius: 18 }}>
+              <div className="flex items-center justify-between flex-wrap gap-3">
+                <div>
+                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Upload the student roster</div>
+                  <div className="text-sm mt-0.5" style={{ color: C.textSoft }}>CSV or XLSX with a header row. Max 8 MB / {IMPORT_LIMITS.maxRows} rows.</div>
+                </div>
+                <button onClick={downloadTemplate} className="text-sm font-semibold flex items-center gap-1.5 px-3 py-2 rounded-lg"
+                  style={{ color: C.primary, background: 'var(--primary-tint)', border: `1px solid var(--primary-glow)` }}>
+                  <Download size={14} /> Import template
+                </button>
+              </div>
+              <label className="mt-4 flex flex-col items-center justify-center gap-2 py-8 rounded-xl cursor-pointer transition"
+                style={{ border: `2px dashed ${C.border}`, background: 'var(--wash)' }}>
+                <UploadCloud size={26} style={{ color: C.primary }} />
+                <div className="text-sm font-semibold" style={{ color: C.text }}>Choose a CSV / XLSX file</div>
+                <input type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={onPrimaryFile} />
+              </label>
+            </div>
+          </div>
+        )}
+
+        {/* STEP: MAP */}
+        {step === 'map' && (
+          <div className="space-y-4">
+            <div className="glass-card p-5" style={{ borderRadius: 16 }}>
+              <div className="flex items-center gap-2 mb-1"><FileSpreadsheet size={16} style={{ color: C.primary }} />
+                <span style={{ fontWeight: 700, color: C.text }}>{fileMeta?.name}</span></div>
+              <div className="text-xs" style={{ color: C.textMute }}>{fileMeta?.rows} rows · {fileMeta?.cols} columns · fingerprint {fileMeta?.sha256?.slice(0, 12)}…</div>
+            </div>
+
+            <div className="glass-card p-5" style={{ borderRadius: 16 }}>
+              <div style={{ fontWeight: 700, color: C.text, marginBottom: 10 }}>Map columns</div>
+              <div className="grid gap-2.5 sm:grid-cols-2">
+                {IMPORT_CANON_FIELDS.map((f) => (
+                  <label key={f.key} className="flex items-center gap-2 text-sm">
+                    <span className="w-40 flex-shrink-0" style={{ color: C.textSoft }}>{f.label}
+                      {f.key === 'thinkific_user_id' && <span style={{ color: C.red }}> *</span>}</span>
+                    <select className="gh-input flex-1" value={mapping[f.key] || ''}
+                      onChange={(e) => setMapping((m) => ({ ...m, [f.key]: e.target.value }))}>
+                      <option value="">— none —</option>
+                      {headers.map((h) => <option key={h} value={h}>{h}</option>)}
+                    </select>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div className="glass-card p-5" style={{ borderRadius: 16 }}>
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div>
+                  <div style={{ fontWeight: 700, color: C.text }}>Reconcile a second file (optional)</div>
+                  <div className="text-xs mt-0.5" style={{ color: C.textSoft }}>Orders/ledger/template — merged by Thinkific id or email to fill in missing emails + dates.</div>
+                </div>
+                <label className="text-sm font-semibold flex items-center gap-1.5 px-3 py-2 rounded-lg cursor-pointer"
+                  style={{ color: C.primary, background: 'var(--primary-tint)', border: `1px solid var(--primary-glow)` }}>
+                  <Upload size={14} /> Add file
+                  <input type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={onSupplementaryFile} />
+                </label>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between">
+              <button onClick={() => setStep('upload')} className="text-sm flex items-center gap-1.5" style={{ color: C.textSoft }}><ArrowLeft size={14} /> Back</button>
+              <button onClick={goToPlans} disabled={busy}
+                className="text-sm font-bold text-white px-4 py-2.5 rounded-xl flex items-center gap-1.5 disabled:opacity-60"
+                style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>Next: map plans <ArrowRight size={14} /></button>
+            </div>
+          </div>
+        )}
+
+        {/* STEP: PLANS */}
+        {step === 'plans' && (
+          <div className="space-y-4">
+            <div className="glass-card p-5" style={{ borderRadius: 16 }}>
+              <div style={{ fontWeight: 700, color: C.text, marginBottom: 4 }}>Map course-combinations to plans</div>
+              <div className="text-xs mb-3" style={{ color: C.textSoft }}>Suggestions are advisory — confirm each. Sampler/Gold/VIP can't be inferred from course history.</div>
+              <div className="space-y-2">
+                {combos.map((c) => (
+                  <div key={c.key} className="rounded-xl px-3 py-2.5 flex items-center gap-3 flex-wrap" style={{ background: 'var(--wash)', border: `1px solid ${C.border}` }}>
+                    <div className="flex-1 min-w-[200px]">
+                      <div className="text-sm" style={{ color: C.text, fontWeight: 600 }}>{c.key}</div>
+                      <div className="text-xs" style={{ color: C.textMute }}>{c.count} student{c.count !== 1 ? 's' : ''}{c.suggested ? ` · suggested: ${planLabel(c.suggested)}` : ''}</div>
+                    </div>
+                    <select className="gh-input" style={{ minWidth: 200 }} value={c.choice}
+                      onChange={(e) => setCombos((list) => list.map((x) => x.key === c.key ? { ...x, choice: e.target.value } : x))}>
+                      <option value="">— choose —</option>
+                      {plans.map((p) => <option key={p.key} value={p.key}>{p.name}</option>)}
+                      {IMPORT_PLAN_CHOICES_EXTRA.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
+                    </select>
+                    {c.suggested && !c.choice && (
+                      <button onClick={() => setCombos((list) => list.map((x) => x.key === c.key ? { ...x, choice: c.suggested } : x))}
+                        className="text-xs px-2 py-1 rounded-lg" style={{ color: C.primary, background: 'var(--primary-tint)' }}>Use suggestion</button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="glass-card p-5 grid gap-4 sm:grid-cols-2" style={{ borderRadius: 16 }}>
+              <label className="text-sm">
+                <div style={{ fontWeight: 700, color: C.text, marginBottom: 6 }}>Default term mode</div>
+                <select className="gh-input w-full" value={defaultTermMode} onChange={(e) => setDefaultTermMode(e.target.value)}>
+                  {IMPORT_TERM_MODES.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}
+                </select>
+                <div className="text-xs mt-1" style={{ color: C.textMute }}>{IMPORT_TERM_MODES.find((m) => m.key === defaultTermMode)?.desc}</div>
+              </label>
+              <label className="text-sm">
+                <div style={{ fontWeight: 700, color: C.text, marginBottom: 6 }}>Plan conflict policy</div>
+                <select className="gh-input w-full" value={conflictPolicy} onChange={(e) => setConflictPolicy(e.target.value)}>
+                  <option value="keep_longer">Keep the longer/active term (safe default)</option>
+                  <option value="overwrite">Overwrite with the imported plan</option>
+                </select>
+                <div className="text-xs mt-1" style={{ color: C.textMute }}>Existing active access is never silently shortened.</div>
+              </label>
+              <div className="sm:col-span-2 flex items-start gap-2 px-3 py-2.5 rounded-xl"
+                style={{ background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)', fontSize: 12, color: 'var(--status-info-fg)', lineHeight: 1.5 }}>
+                <AlertCircle size={14} className="flex-shrink-0 mt-px" />
+                <span>Gold / VIP rows need a confirmed <span style={{ fontFamily: fontMono }}>batch_code</span> (an existing OPEN batch, e.g. 2026-08) — rows without one are blocked for manual review and appear in Admin → Batches. A batch is never inferred from course history.</span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between">
+              <button onClick={() => setStep('map')} className="text-sm flex items-center gap-1.5" style={{ color: C.textSoft }}><ArrowLeft size={14} /> Back</button>
+              <button onClick={stageAndDryRun} disabled={busy}
+                className="text-sm font-bold text-white px-4 py-2.5 rounded-xl flex items-center gap-1.5 disabled:opacity-60"
+                style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>Stage & dry-run <ArrowRight size={14} /></button>
+            </div>
+          </div>
+        )}
+
+        {/* STEP: PREVIEW & RUN */}
+        {(step === 'preview' || step === 'results') && (
+          <div className="space-y-4">
+            <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+              <STAT label="Total" value={pv.total} />
+              <STAT label="Ready" value={pv.ready} tone={C.primary} />
+              <STAT label="Blocked" value={pv.blocked} tone={pv.blocked ? C.red : undefined} />
+              <STAT label="New" value={pv.newAcct} />
+              <STAT label="Existing" value={pv.existing} />
+              <STAT label="Conflicts" value={pv.conflicts} tone={pv.conflicts ? C.amber : undefined} />
+              <STAT label="Imported" value={pv.done} tone={pv.done ? C.green : undefined} />
+              <STAT label="Invited" value={pv.invited} />
+              <STAT label="Failed" value={pv.failed} tone={pv.failed ? C.red : undefined} />
+              <STAT label="Skipped" value={pv.skipped} />
+            </div>
+
+            {/* progress */}
+            {(proc.running || proc.done || proc.tally) && (
+              <div className="glass-card p-4" style={{ borderRadius: 14 }}>
+                <div className="flex items-center justify-between text-sm mb-2">
+                  <span style={{ color: C.textSoft }}>{proc.running ? 'Processing…' : proc.done ? 'Done.' : proc.paused ? 'Paused.' : 'Ready.'}</span>
+                  <span style={{ color: C.textMute }}>{pv.done + pv.failed + pv.skipped + pv.blocked}/{pv.total}</span>
+                </div>
+                <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--wash-strong)' }}>
+                  <div style={{ width: `${pv.total ? Math.round(((pv.done + pv.failed + pv.skipped + pv.blocked) / pv.total) * 100) : 0}%`, height: '100%', background: C.primary, transition: 'width .3s' }} />
+                </div>
+              </div>
+            )}
+
+            {/* actions */}
+            <div className="flex items-center gap-2 flex-wrap">
+              {!proc.running ? (
+                <button onClick={() => setConfirmOpen(true)} disabled={readyToProcess === 0}
+                  className="text-sm font-bold text-white px-4 py-2.5 rounded-xl flex items-center gap-1.5 disabled:opacity-50"
+                  style={{ ...ADMIN_BTN_OK }}>
+                  <Play size={14} /> Process {readyToProcess} ready
+                </button>
+              ) : (
+                <button onClick={pauseProcess} className="text-sm font-bold px-4 py-2.5 rounded-xl flex items-center gap-1.5"
+                  style={{ background: 'var(--wash-strong)', color: C.text, border: `1px solid ${C.border}` }}><Pause size={14} /> Pause</button>
+              )}
+              {pv.failed > 0 && !proc.running && (
+                <button onClick={() => runProcess(true)} className="text-sm font-semibold px-3 py-2.5 rounded-xl flex items-center gap-1.5"
+                  style={{ background: 'var(--wash)', color: C.text, border: `1px solid ${C.border}` }}><RefreshCw size={14} /> Retry failed ({pv.failed})</button>
+              )}
+              <button onClick={() => loadPreview()} className="text-sm px-3 py-2.5 rounded-xl flex items-center gap-1.5" style={{ color: C.textSoft }}><RefreshCw size={13} /> Refresh</button>
+              <button onClick={downloadErrorReport} className="text-sm px-3 py-2.5 rounded-xl flex items-center gap-1.5" style={{ color: C.textSoft }}><Download size={13} /> Issues report</button>
+            </div>
+
+            {/* filters + search */}
+            <div className="flex items-center gap-2 flex-wrap">
+              {['all', 'ready', 'blocked', 'done', 'failed', 'skipped'].map((f) => (
+                <AdminFilterChip key={f} active={filter === f} label={f[0].toUpperCase() + f.slice(1)}
+                  count={f === 'all' ? pv.total : previewRows.filter((r) => r.processing_status === f).length}
+                  onClick={() => setFilter(f)} />
+              ))}
+              <div className="relative flex-1 min-w-[160px]">
+                <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+                <input className="gh-input w-full pl-8" placeholder="Search email / id / name" value={search} onChange={(e) => setSearch(e.target.value)} />
+              </div>
+            </div>
+
+            {/* table */}
+            <div className="glass-card overflow-hidden" style={{ borderRadius: 14 }}>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm" style={{ minWidth: 640 }}>
+                  <thead><tr style={{ background: 'var(--table-sticky-bg)', color: C.textMute }}>
+                    {['#', 'Email', 'Thinkific id', 'Match', 'Plan', 'Status', ''].map((h) => (
+                      <th key={h} className="text-left px-3 py-2 text-xs font-semibold" style={{ whiteSpace: 'nowrap' }}>{h}</th>))}
+                  </tr></thead>
+                  <tbody>
+                    {filtered.slice(0, 300).map((r) => (
+                      <tr key={r.id} style={{ borderTop: `1px solid ${C.border}` }}>
+                        <td className="px-3 py-2" style={{ color: C.textMute }}>{r.source_row_number}</td>
+                        <td className="px-3 py-2" style={{ color: C.text }}>{r.email_display || <span style={{ color: C.red }}>— missing —</span>}</td>
+                        <td className="px-3 py-2" style={{ color: C.textSoft, fontFamily: fontMono, fontSize: 12 }}>{r.external_user_id || '—'}</td>
+                        <td className="px-3 py-2" style={{ color: C.textSoft }}>{r.match_result || '—'}</td>
+                        <td className="px-3 py-2" style={{ color: C.textSoft }}>{r.proposed_plan_key ? planLabel(r.proposed_plan_key) : '—'}</td>
+                        <td className="px-3 py-2"><ImportStatusPill status={r.processing_status} /></td>
+                        <td className="px-3 py-2 text-right">
+                          <button onClick={() => setDetailRow(r)} className="text-xs" style={{ color: C.primary }}>Details</button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {filtered.length > 300 && <div className="px-3 py-2 text-xs" style={{ color: C.textMute }}>Showing first 300 of {filtered.length}. Use search/filters to narrow.</div>}
+              {!filtered.length && <div className="px-3 py-8 text-center text-sm" style={{ color: C.textMute }}>No rows match.</div>}
+            </div>
+
+            <div className="text-xs" style={{ color: C.textMute }}>
+              Job {jobId?.slice(0, 8)} · resumable — you can leave and come back; processing continues from where it stopped.
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* row detail */}
+      {detailRow && (
+        <AccountModal title={`Row ${detailRow.source_row_number}`} subtitle={detailRow.email_display || 'no email'} icon={<User size={16} />}
+          onClose={() => setDetailRow(null)} maxW="max-w-lg">
+          <div className="space-y-2 text-sm">
+            {[['Thinkific id', detailRow.external_user_id], ['Email', detailRow.email_display], ['Match', detailRow.match_result],
+              ['Intended', detailRow.intended_action], ['Plan', detailRow.proposed_plan_key && planLabel(detailRow.proposed_plan_key)],
+              ['Term mode', detailRow.proposed_term_mode], ['Start', detailRow.proposed_started_at], ['Expiry', detailRow.proposed_ends_at],
+              ['Status', detailRow.processing_status], ['Invite', detailRow.invite_status], ['Attempts', detailRow.attempts]].map(([k, v]) => (
+              <div key={k} className="flex gap-3"><span className="w-28 flex-shrink-0" style={{ color: C.textMute }}>{k}</span><span style={{ color: C.text }}>{v == null || v === '' ? '—' : String(v)}</span></div>
+            ))}
+            {!!(detailRow.errors && detailRow.errors.length) && (
+              <div className="rounded-lg px-3 py-2 text-xs" style={{ background: 'var(--status-danger-bg)', color: 'var(--status-danger-fg)', border: '1px solid var(--status-danger-bd)' }}>
+                {detailRow.errors.join(' · ')}</div>)}
+            {!!(detailRow.warnings && detailRow.warnings.length) && (
+              <div className="rounded-lg px-3 py-2 text-xs" style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)', border: '1px solid var(--status-warn-bd)' }}>
+                {detailRow.warnings.join(' · ')}</div>)}
+            {(detailRow.invite_status === 'failed' || detailRow.invite_status === 'sent') && detailRow.processing_status === 'done' && (
+              <button onClick={() => { resendInvite(detailRow.id); setDetailRow(null); }}
+                className="mt-1 text-sm font-semibold flex items-center gap-1.5 px-3 py-2 rounded-lg" style={{ color: C.primary, background: 'var(--primary-tint)' }}>
+                <Mail size={14} /> Resend invite</button>
+            )}
+          </div>
+        </AccountModal>
+      )}
+
+      {/* confirm */}
+      {confirmOpen && (
+        <AccountModal title="Confirm import" subtitle="This creates real accounts + memberships." icon={<ShieldCheck size={16} />} tone="ok"
+          onClose={() => setConfirmOpen(false)} maxW="max-w-md">
+          <div className="text-sm space-y-3" style={{ color: C.text }}>
+            <p>You are about to process <strong>{readyToProcess}</strong> ready row{readyToProcess !== 1 ? 's' : ''}:</p>
+            <ul className="text-sm space-y-1" style={{ color: C.textSoft }}>
+              <li>• New accounts (invited): <strong>{previewRows.filter((r) => r.processing_status === 'ready' && r.match_result === 'new').length}</strong></li>
+              <li>• Existing accounts merged: <strong>{previewRows.filter((r) => r.processing_status === 'ready' && (r.match_result === 'existing_by_source' || r.match_result === 'existing_by_email')).length}</strong></li>
+              <li>• Blocked (excluded): <strong>{pv.blocked}</strong></li>
+            </ul>
+            <p className="text-xs" style={{ color: C.textMute }}>Blocked rows are never processed. Imported members set their own password. Safe to re-run.</p>
+            <div className="flex gap-2 justify-end pt-1">
+              <button onClick={() => setConfirmOpen(false)} className="text-sm px-3 py-2 rounded-lg" style={{ color: C.textSoft, background: 'var(--wash)' }}>Cancel</button>
+              <button onClick={() => { setConfirmOpen(false); runProcess(false); }} className="text-sm font-bold text-white px-4 py-2 rounded-lg" style={{ ...ADMIN_BTN_OK }}>Start import</button>
+            </div>
+          </div>
+        </AccountModal>
+      )}
+    </div>
+  );
+}
+
+// Small status pill for the import preview table (reuses the semantic status tokens).
+function ImportStatusPill({ status }) {
+  const map = {
+    ready: { bg: 'var(--status-info-bg)', bd: 'var(--status-info-bd)', fg: 'var(--status-info-fg)', label: 'Ready' },
+    blocked: { bg: 'var(--status-danger-bg)', bd: 'var(--status-danger-bd)', fg: 'var(--status-danger-fg)', label: 'Blocked' },
+    done: { bg: 'var(--status-ok-bg)', bd: 'var(--status-ok-bd)', fg: 'var(--status-ok-fg)', label: 'Imported' },
+    failed: { bg: 'var(--status-danger-bg)', bd: 'var(--status-danger-bd)', fg: 'var(--status-danger-fg)', label: 'Failed' },
+    skipped: { bg: 'var(--status-neutral-bg)', bd: 'var(--status-neutral-bd)', fg: 'var(--status-neutral-fg)', label: 'Skipped' },
+    pending: { bg: 'var(--status-neutral-bg)', bd: 'var(--status-neutral-bd)', fg: 'var(--status-neutral-fg)', label: 'Pending' },
+    processing: { bg: 'var(--status-info-bg)', bd: 'var(--status-info-bd)', fg: 'var(--status-info-fg)', label: 'Processing' },
+  };
+  const s = map[status] || map.pending;
+  return <span className="px-2 py-0.5 rounded-full text-xs font-semibold" style={{ background: s.bg, border: `1px solid ${s.bd}`, color: s.fg }}>{s.label}</span>;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -6546,7 +9668,7 @@ function RestrictedTab({ active, goto }) {
         )}
 
         <div className="mt-7 flex flex-wrap items-center gap-2.5">
-          <button onClick={() => goto('dashboard')}
+          <button onClick={() => setPanelParam('upgrade')}
             className="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl text-sm font-bold text-white transition hover:opacity-95"
             style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
             <Crown size={15} /> Upgrade or renew
@@ -6573,10 +9695,11 @@ function RestrictedTab({ active, goto }) {
 // COMPONENT: MEMBERSHIP PANEL (Dashboard) — the student's subscription at a glance
 // ═══════════════════════════════════════════════════════════════════
 // Self-contained (owns its useAuth/fetches) so Dashboard's signature stays untouched.
-// Fail-silent by design: admins, gate-off builds, query errors, and users with no
-// membership data all render null — the dashboard must never break because of this.
-// "Renew" opens the paywall in renewal mode as a full-screen overlay (no route/gate
-// change); while the renewal is pending the member keeps full access.
+// Admins, gate-off builds, and users with no membership data render null; a query
+// error shows a compact retry card (never a silently missing panel). "Renew" opens
+// the URL-driven ?panel=renew surface rendered at the root (module-scope setPanelParam
+// — no prop threading through the memoized TabPanel tree); while the renewal is
+// pending the member keeps full access.
 
 function MembershipPanel() {
   const { user, profile, signOut } = useAuth();
@@ -6585,11 +9708,13 @@ function MembershipPanel() {
   const [sub, setSub] = useState(null);
   const [reqs, setReqs] = useState([]);
   const [plan, setPlan] = useState(null);
+  const [batchRow, setBatchRow] = useState(null);   // #32: the member's cohort (gold/vip)
   const [loaded, setLoaded] = useState(false);
-  const [failed, setFailed] = useState(false);   // fail-silent: error → no panel, no skeleton
-  const [renewOpen, setRenewOpen] = useState(false);
+  const [failed, setFailed] = useState(false);   // error → compact retry card (see render)
   const [reloadKey, setReloadKey] = useState(0);
-  const reload = () => setReloadKey(k => k + 1);
+  // Retry must clear `failed` — the load effect only ever sets it on catch, so without
+  // this the error card would stick even after a successful refetch.
+  const reload = () => { setFailed(false); setReloadKey(k => k + 1); };
 
   useEffect(() => {
     if (!REQUIRE_ENROLLMENT || !uid || isAdmin) { setLoaded(false); return; }
@@ -6606,12 +9731,13 @@ function MembershipPanel() {
         const s = subRes.error ? null : (subRes.data || null);
         const r = reqRes.error ? [] : (reqRes.data || []);
         setSub(s); setReqs(r);
+        if (s?.batch_id) fetchBatchRow(s.batch_id).then(b => { if (!cancelled) setBatchRow(b); });
+        else setBatchRow(null);
         const planKey = s?.plan_key || r.find(x => x.status === 'approved')?.plan_key || profile?.plan || null;
         if (planKey) {
           let p = null;
           try {
-            const { data } = await supabase.from('enrollment_plans').select('*').eq('key', planKey).maybeSingle();
-            p = data || null;
+            p = await fetchPlanRow(planKey);
           } catch { /* fallback below */ }
           if (!cancelled) setPlan(p || ENROLLMENT_PLANS_FALLBACK.find(x => x.key === planKey) || null);
         } else if (!cancelled) {
@@ -6620,7 +9746,7 @@ function MembershipPanel() {
         if (!cancelled) setLoaded(true);
       } catch (e) {
         console.error('[membership] panel load failed', e);
-        if (!cancelled) { setLoaded(false); setFailed(true); }   // fail-silent: panel just doesn't render
+        if (!cancelled) { setLoaded(false); setFailed(true); }   // → compact retry card in render
       }
     })();
     return () => { cancelled = true; };
@@ -6645,11 +9771,51 @@ function MembershipPanel() {
     };
   }, [uid, isAdmin]);
 
+  // Renew/extend/upgrade submit + close happen at the root ?panel= render site now, so this
+  // card can't refresh via an onSubmitted prop (and realtime is inert without the publication;
+  // the poll is 60s). Reload the moment a billing panel closes — a submit may have changed our
+  // rows. Only the billing→closed transition reloads; plain tab switches also fire the route
+  // event and must not.
+  const prevPanelRef = useRef(readAppRoute().panel);
+  useEffect(() => {
+    const onRoute = () => {
+      const p = readAppRoute().panel;
+      const prev = prevPanelRef.current;
+      prevPanelRef.current = p;
+      if (!p && (prev === 'renew' || prev === 'extend' || prev === 'upgrade')) reload();
+    };
+    window.addEventListener(APP_ROUTE_CHANGE_EVENT, onRoute);
+    window.addEventListener('popstate', onRoute);
+    return () => {
+      window.removeEventListener(APP_ROUTE_CHANGE_EVENT, onRoute);
+      window.removeEventListener('popstate', onRoute);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   if (!REQUIRE_ENROLLMENT || !uid || isAdmin) return null;
   // First load in flight → fixed-height skeleton so the Dashboard doesn't reflow/flash
-  // when the real panel lands. Errors stay fail-silent (no panel, no skeleton).
+  // when the real panel lands. A failed load shows a compact retry card — a student's
+  // membership card must never just vanish with no explanation.
   if (!loaded) {
-    if (failed) return null;
+    if (failed) return (
+      <div className="glass-card p-5 mb-8 flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-start gap-2.5 min-w-0">
+          <AlertTriangle size={16} className="flex-shrink-0 mt-0.5" style={{ color: C.amber }} />
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>Unable to load membership details</div>
+            <div className="mt-0.5" style={{ fontSize: 12, color: C.textSoft, lineHeight: 1.45 }}>
+              Please refresh, or contact support if this keeps happening.
+            </div>
+          </div>
+        </div>
+        <button onClick={reload}
+          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-semibold transition hover:opacity-80"
+          style={{ color: C.textSoft, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+          <RefreshCw size={13} /> Refresh
+        </button>
+      </div>
+    );
     return (
       <div className="glass-card p-6 mb-8 animate-pulse" aria-hidden="true" style={{ minHeight: 110 }}>
         <div className="rounded" style={{ height: 10, width: 110, background: 'var(--wash-strong)' }} />
@@ -6703,6 +9869,7 @@ function MembershipPanel() {
   const facts = [
     ['Plan', planName],
     ['Access', scopeLabel],
+    ...(batchRow ? [['Batch', `${batchRow.name} (${batchRow.code})`]] : []),
     ['Started', sub?.started_at ? fmtEnrollDate(sub.started_at) : latestApproved ? fmtEnrollDate(latestApproved.reviewed_at || latestApproved.created_at) : '—'],
     ['Expires', acc.has ? (acc.legacy ? 'No expiry' : fmtEnrollDate(sub.ends_at)) : 'No expiry'],
     ...(inGrace ? [['Grace ends', fmtEnrollDate(sub.grace_ends_at)]] : []),
@@ -6726,7 +9893,7 @@ function MembershipPanel() {
           </div>
         </div>
         {showRenew && (
-          <button onClick={() => setRenewOpen(true)}
+          <button onClick={() => setPanelParam('renew')}
             className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-bold transition hover:opacity-95"
             style={renewPrimary
               ? { color: 'white', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }
@@ -6815,15 +9982,6 @@ function MembershipPanel() {
         <a href={`mailto:${supportEmail}`} style={{ color: C.primary, fontWeight: 600 }}>support</a>.
       </div>
 
-      {renewOpen && (
-        <div className="fixed inset-0 z-50 gh-app-bg" style={{ background: C.bg }}>
-          <EnrollmentPaywall user={user} profile={profile} renewal currentSub={sub}
-            priorRequest={renewalRejected ? latest : null}
-            onClose={() => setRenewOpen(false)}
-            onSubmitted={() => { setRenewOpen(false); reload(); }}
-            onSignOut={signOut} />
-        </div>
-      )}
     </div>
   );
 }
@@ -6850,6 +10008,7 @@ function Dashboard({ goto }) {
         { id: 'industryacc', label: 'Industry Accounting', desc: '12 industries · QBO workflows',   icon: Building2,       color: '#3B82F6' },
         { id: 'ustax',       label: 'US Tax 101',          desc: 'Forms, deadlines, IRS links',     icon: Landmark,        color: '#0A1E3F' },
         { id: 'chat',        label: 'ProAdvisor Chat',     desc: 'Live mentor for clean-ups',       icon: MessageCircle,   color: '#0EA5E9' },
+        { id: 'niche',       label: 'Niche Selector Quiz', desc: 'Find your best-fit industry',     icon: Target,          color: '#2563EB' },
       ],
     },
     {
@@ -6860,7 +10019,7 @@ function Dashboard({ goto }) {
         { label: 'Self Discovery',          tabIds: ['brand'] },
         { label: 'Profile Optimization',    tabIds: ['resumestrategy', 'linkedinopt'] },
         { label: 'Interview',               tabIds: ['coachalex', 'interview', 'qbdiag'] },
-        { label: 'Proposal / Cover Letters', tabIds: ['painpoints', 'proposal'] },
+        { label: 'Proposal / Cover Letters', tabIds: ['painpoints', 'proposal', 'discovery'] },
       ],
       tiles: [
         // Self Discovery
@@ -6875,6 +10034,7 @@ function Dashboard({ goto }) {
         // Proposal / Cover Letters
         { id: 'painpoints',    label: 'Painpoints & Solutions',   desc: 'AI-generated by industry',              icon: Target,    color: '#0EA5E9' },
         { id: 'proposal',      label: 'Proposal Generator',       desc: 'Hormozi × Martell style',               icon: Sparkles,  color: '#1E40AF' },
+        { id: 'discovery',     label: 'Discovery Call Simulator', desc: 'AI roleplay · practice client calls',   icon: Phone,     color: '#3B82F6' },
       ],
     },
     {
@@ -7399,6 +10559,438 @@ function SignedLessonVideo({ lesson }) {
   return <video key={lesson.id} controls className="w-full rounded-xl bg-black" style={{ maxHeight: 460 }} src={src} />;
 }
 
+// ── Admin: AI Trainer panel inside the course builder ───────────────────────────
+// Self-contained (reads course_ai_sources via admin RLS, does server work through
+// courseTrainerApi). Lets an admin enable the course for the AI voice trainer, watch
+// per-lesson index/transcript status, transcribe uploads (Scribe), edit transcripts +
+// trainer notes, sync the index, and preview what a given plan's learner could get.
+// A pre-#27 DB degrades to a "finish setup" card (never a red crash). No layout-width
+// changes — one glass-card in the builder stack.
+const TRAINER_STATUS_STYLE = {
+  ready:      { label: 'Ready',      bg: 'var(--status-ok-bg)',      fg: 'var(--status-ok-fg)' },
+  pending:    { label: 'Needs sync', bg: 'var(--status-info-bg)',    fg: 'var(--status-info-fg)' },
+  processing: { label: 'Working…',   bg: 'var(--status-info-bg)',    fg: 'var(--status-info-fg)' },
+  stale:      { label: 'Stale',      bg: 'var(--status-warn-bg)',    fg: 'var(--status-warn-fg)' },
+  failed:     { label: 'Failed',     bg: 'var(--status-danger-bg)',  fg: 'var(--status-danger-fg)' },
+  none:       { label: 'Not indexed', bg: 'var(--status-neutral-bg)', fg: 'var(--status-neutral-fg)' },
+};
+function TrainerStatusPill({ status }) {
+  const s = TRAINER_STATUS_STYLE[status] || TRAINER_STATUS_STYLE.none;
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold whitespace-nowrap"
+      style={{ background: s.bg, color: s.fg }}>
+      {status === 'processing' && <Loader2 size={10} className="animate-spin" />}
+      {s.label}
+    </span>
+  );
+}
+
+function CourseAiTrainerPanel({ course, modules, onEnabledChange }) {
+  const [enabled, setEnabled] = useState(false);
+  const [migrated, setMigrated] = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);          // toggle / sync in flight
+  const [rowBusy, setRowBusy] = useState(null);     // source_id or lesson_id acting
+  const [sources, setSources] = useState([]);       // course_ai_sources rows
+  const [embeddings, setEmbeddings] = useState('unknown');
+  const [notice, setNotice] = useState(null);       // { kind, text }
+  const [editing, setEditing] = useState(null);     // transcript/notes editor
+  const [confirmTx, setConfirmTx] = useState(null); // lesson pending transcribe confirm
+  const [preview, setPreview] = useState(null);     // { planKey, query, result?, busy? }
+  const [syncMsg, setSyncMsg] = useState('');
+
+  const lessons = useMemo(
+    () => (modules || []).flatMap((m) => (m.lessons || []).map((l) => ({ ...l, moduleTitle: m.title }))),
+    [modules]
+  );
+  const byLessonKind = useMemo(() => {
+    const map = {};
+    for (const s of sources) {
+      if (!s.lesson_id) continue;
+      (map[s.lesson_id] = map[s.lesson_id] || {})[s.kind] = s;
+    }
+    return map;
+  }, [sources]);
+  const courseNotes = useMemo(() => sources.find((s) => !s.lesson_id && s.kind === 'trainer_notes') || null, [sources]);
+
+  const missingCol = (e) => ['42P01', '42703', 'PGRST205', 'PGRST204'].includes(e?.code);
+
+  async function refresh({ silent } = {}) {
+    if (!silent) setLoading(true);
+    try {
+      const { data: crow, error: cErr } = await supabase.from('courses').select('ai_trainer_enabled').eq('id', course.id).maybeSingle();
+      if (cErr) { if (missingCol(cErr)) { setMigrated(false); return; } throw cErr; }
+      const en = !!crow?.ai_trainer_enabled;
+      setEnabled(en); onEnabledChange?.(en);
+      const { data: srcs, error: sErr } = await supabase.from('course_ai_sources')
+        .select('id,lesson_id,kind,status,included,source_version,transcript_origin,error_detail,indexed_at,transcribed_at')
+        .eq('course_id', course.id);
+      if (sErr) { if (missingCol(sErr)) { setMigrated(false); return; } throw sErr; }
+      setMigrated(true);
+      setSources(srcs || []);
+      try {
+        const st = await courseTrainerApi('status', { course_id: course.id });
+        if (st?.migrated === false) setMigrated(false);
+        else if (st?.embeddings) setEmbeddings(st.embeddings);
+      } catch { /* status is best-effort */ }
+    } catch (e) {
+      setNotice({ kind: 'error', text: describeDbError(e, 'Could not load AI trainer status.') });
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }
+  useEffect(() => { refresh(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [course.id]);
+
+  async function toggleEnabled() {
+    const next = !enabled;
+    setBusy(true); setNotice(null);
+    try {
+      const { error } = await supabase.from('courses').update({ ai_trainer_enabled: next, updated_at: new Date().toISOString() }).eq('id', course.id);
+      if (error) { if (missingCol(error)) { setMigrated(false); return; } throw error; }
+      setEnabled(next); onEnabledChange?.(next);
+      if (next) { setNotice({ kind: 'ok', text: 'AI trainer enabled. Click "Sync index" to prepare this course’s lessons.' }); }
+    } catch (e) { setNotice({ kind: 'error', text: describeDbError(e, 'Could not change the AI trainer setting.') }); }
+    finally { setBusy(false); }
+  }
+
+  async function runSync() {
+    setBusy(true); setNotice(null); setSyncMsg('Preparing lessons…');
+    try {
+      let guard = 0;
+      for (;;) {
+        const r = await courseTrainerApi('sync', { course_id: course.id });
+        if (r?.migrated === false) { setMigrated(false); return; }
+        if (r?.embeddings) setEmbeddings(r.embeddings);
+        setSyncMsg(`Indexed ${r.processed || 0} source(s)… ${r.remaining || 0} left`);
+        await refresh({ silent: true });
+        if (r?.done || ++guard > 40) break;
+      }
+      setNotice({ kind: 'ok', text: embeddings === 'keyword'
+        ? 'Index updated (keyword search — deploy the trainer-embed function for semantic search).'
+        : 'Index updated.' });
+    } catch (e) { setNotice({ kind: 'error', text: e.message || 'Sync failed.' }); }
+    finally { setBusy(false); setSyncMsg(''); }
+  }
+
+  async function transcribeLesson(lesson) {
+    setConfirmTx(null); setRowBusy(lesson.id); setNotice(null);
+    try {
+      const r = await courseTrainerApi('transcribe', { lesson_id: lesson.id });
+      if (r?.ok) setNotice({ kind: 'ok', text: `Transcribed ${r.chars || 0} characters — review it, then Approve & index.` });
+      else setNotice({ kind: 'error', text: r?.error || 'Transcription failed. You can paste a transcript manually.' });
+      await refresh({ silent: true });
+    } catch (e) { setNotice({ kind: 'error', text: e.message || 'Transcription failed.' }); }
+    finally { setRowBusy(null); }
+  }
+
+  async function retrySource(src) {
+    setRowBusy(src.id); setNotice(null);
+    try { await courseTrainerApi('retry-source', { source_id: src.id }); await refresh({ silent: true }); }
+    catch (e) { setNotice({ kind: 'error', text: e.message || 'Retry failed.' }); }
+    finally { setRowBusy(null); }
+  }
+  async function toggleIncluded(src) {
+    setRowBusy(src.id);
+    try { await courseTrainerApi('set-source-included', { source_id: src.id, included: !src.included }); await refresh({ silent: true }); }
+    catch (e) { setNotice({ kind: 'error', text: e.message || 'Could not update.' }); }
+    finally { setRowBusy(null); }
+  }
+
+  // Open the transcript/notes editor, loading the current content on demand.
+  async function openEditor({ lesson, courseNotes: isNotes }) {
+    const base = isNotes
+      ? { courseNotes: true, title: 'Course trainer notes' }
+      : { lessonId: lesson.id, title: lesson.title };
+    setEditing({ ...base, content: '', loading: true });
+    try {
+      let q = supabase.from('course_ai_sources').select('content')
+        .eq('course_id', course.id).eq('kind', isNotes ? 'trainer_notes' : 'transcript');
+      q = isNotes ? q.is('lesson_id', null) : q.eq('lesson_id', lesson.id);
+      const { data } = await q.maybeSingle();
+      setEditing((cur) => cur && { ...cur, content: data?.content || '', loading: false });
+    } catch { setEditing((cur) => cur && { ...cur, loading: false }); }
+  }
+  async function saveEditor({ approve }) {
+    if (!editing) return;
+    const content = (editing.content || '').trim();
+    if (!content) { setNotice({ kind: 'error', text: 'Add some text first.' }); return; }
+    setEditing((cur) => ({ ...cur, saving: true }));
+    try {
+      const payload = editing.courseNotes
+        ? { course_notes: true, course_id: course.id, content, approve }
+        : { lesson_id: editing.lessonId, content, approve };
+      const res = await courseTrainerApi('save-transcript', payload);
+      setEditing(null);
+      if (res?.migrated === false) { setMigrated(false); return; }
+      if (!approve) {
+        setNotice({ kind: 'ok', text: 'Saved as a draft — click "Approve & index" when ready.' });
+      } else if (res?.indexed) {
+        // Server drained the index queue — report honestly (incl. keyword-fallback).
+        setNotice({ kind: 'ok', text: res?.sync?.embeddings === 'keyword'
+          ? 'Saved and indexed (keyword search — deploy the trainer-embed function for semantic search).'
+          : 'Saved and indexed.' });
+      } else {
+        // Approved + saved, but the queue didn't fully drain (large course hit the cap) — the
+        // draft IS saved/approved but some sources are still pending. Don't claim "indexed".
+        setNotice({ kind: 'ok', text: 'Saved and approved — click "Sync" to finish indexing the remaining sources.' });
+      }
+      await refresh({ silent: true });
+    } catch (e) { setNotice({ kind: 'error', text: e.message || 'Could not save.' }); setEditing((cur) => cur && { ...cur, saving: false }); }
+  }
+
+  async function runPreview() {
+    setPreview((p) => ({ ...p, busy: true, result: null }));
+    try {
+      const r = await courseTrainerApi('preview', { plan_key: preview.planKey, query: preview.query });
+      setPreview((p) => ({ ...p, busy: false, result: r }));
+    } catch (e) { setPreview((p) => ({ ...p, busy: false, error: e.message || 'Preview failed.' })); }
+  }
+
+  const brandTitle = (
+    <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg font-bold flex items-center gap-2">
+      <GraduationCap size={18} /> AI Trainer
+    </div>
+  );
+
+  // Pre-#27 DB → guidance card, never a red error.
+  if (!migrated) {
+    return (
+      <div className="glass-card rounded-2xl p-5" style={{ background: SHEEN }}>
+        <div className="flex items-center justify-between mb-2 flex-wrap gap-3">{brandTitle}</div>
+        <div className="flex items-start gap-3 p-4 rounded-xl border"
+          style={{ background: 'var(--status-info-bg)', borderColor: 'var(--status-info-bd)' }}>
+          <Database size={18} className="mt-0.5 flex-shrink-0" style={{ color: 'var(--status-info-fg)' }} />
+          <div className="text-sm" style={{ color: C.text }}>
+            <strong>Finish backend setup.</strong> Run <code>db/2026-07-24-course-ai-trainer.sql</code> in Supabase → SQL Editor,
+            then reload. See <code>COURSE_AI_TRAINER_SETUP.md</code>.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const embStyle = embeddings === 'vector'
+    ? { bg: 'var(--status-ok-bg)', fg: 'var(--status-ok-fg)', label: 'Semantic search on' }
+    : embeddings === 'keyword'
+      ? { bg: 'var(--status-warn-bg)', fg: 'var(--status-warn-fg)', label: 'Keyword fallback' }
+      : { bg: 'var(--status-neutral-bg)', fg: 'var(--status-neutral-fg)', label: 'Checking…' };
+  const counts = sources.reduce((a, s) => { a[s.status] = (a[s.status] || 0) + 1; return a; }, {});
+
+  return (
+    <div className="glass-card rounded-2xl p-5" style={{ background: SHEEN }}>
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-3">
+        {brandTitle}
+        <button onClick={toggleEnabled} disabled={busy}
+          className="px-4 py-2 rounded-xl text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-60"
+          style={enabled ? { background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)' } : { background: 'var(--status-neutral-bg)', color: 'var(--status-neutral-fg)' }}>
+          {busy ? <Loader2 size={15} className="animate-spin" /> : enabled ? <Sparkles size={15} /> : <CircleOff size={15} />}
+          {enabled ? 'Enabled' : 'Off'}
+          <span className="opacity-60 font-normal">· click to {enabled ? 'disable' : 'enable'}</span>
+        </button>
+      </div>
+
+      {!enabled && (
+        <p className="text-sm text-slate-500">
+          Turn this on to let enrolled learners study this course with the voice trainer. Course content stays private —
+          every request re-checks the learner’s plan on the server.
+        </p>
+      )}
+
+      {loading && enabled && (
+        <div className="flex items-center gap-2 text-sm text-slate-500 py-2"><Loader2 size={15} className="animate-spin" /> Loading trainer status…</div>
+      )}
+
+      {enabled && !loading && (
+        <>
+          {/* Status strip */}
+          <div className="flex flex-wrap items-center gap-2 mb-3 text-xs">
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-semibold" style={{ background: embStyle.bg, color: embStyle.fg }}>
+              <Sparkles size={12} /> {embStyle.label}
+            </span>
+            <span className="text-slate-400">
+              {counts.ready || 0} ready · {counts.pending || 0} to sync · {counts.stale || 0} stale · {counts.failed || 0} failed
+            </span>
+          </div>
+
+          {notice && <div className="mb-3"><AdminNotice kind={notice.kind} onDismiss={() => setNotice(null)}>{notice.text}</AdminNotice></div>}
+
+          {/* Per-lesson source table */}
+          <div className="rounded-xl border border-slate-200 divide-y divide-slate-100 overflow-hidden bg-white">
+            {lessons.length === 0 && <div className="p-4 text-sm text-slate-400">Add lessons to this course, then sync.</div>}
+            {lessons.map((l) => {
+              const isVideo = l.type === 'video';
+              const canScribe = isVideo && ['upload', 'mp4'].includes(l.video_provider);
+              const textSrc = byLessonKind[l.id]?.lesson_text || null;
+              const txSrc = byLessonKind[l.id]?.transcript || null;
+              const primary = isVideo ? txSrc : textSrc;
+              const failed = [textSrc, txSrc].find((s) => s?.status === 'failed');
+              return (
+                <div key={l.id} className="flex items-center gap-2 px-3 py-2.5">
+                  {isVideo ? <Play size={14} className="text-slate-400 flex-shrink-0" /> : <FileText size={14} className="text-slate-400 flex-shrink-0" />}
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium text-slate-700 truncate">{l.title}</div>
+                    <div className="text-[11px] text-slate-400 truncate">{l.moduleTitle}{primary?.source_version ? ` · v${primary.source_version}` : ''}</div>
+                  </div>
+                  <TrainerStatusPill status={primary?.status || 'none'} />
+                  {/* Include/exclude */}
+                  {primary && (
+                    <button onClick={() => toggleIncluded(primary)} disabled={rowBusy === primary.id}
+                      title={primary.included ? 'Included in the trainer — click to exclude' : 'Excluded — click to include'}
+                      className="p-1.5 rounded-lg hover:bg-slate-100 disabled:opacity-40"
+                      style={{ color: primary.included ? 'var(--status-ok-fg)' : C.textMute }}>
+                      {rowBusy === primary.id ? <Loader2 size={14} className="animate-spin" /> : primary.included ? <Eye size={14} /> : <EyeOff size={14} />}
+                    </button>
+                  )}
+                  {/* Retry a failed source */}
+                  {failed && (
+                    <button onClick={() => retrySource(failed)} disabled={rowBusy === failed.id} title="Retry"
+                      className="p-1.5 rounded-lg text-amber-500 hover:bg-amber-50 disabled:opacity-40">
+                      {rowBusy === failed.id ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+                    </button>
+                  )}
+                  {/* Transcript actions (video lessons only) */}
+                  {isVideo && (canScribe ? (
+                    <>
+                      <button onClick={() => setConfirmTx(l)} disabled={rowBusy === l.id} title="Transcribe with Scribe (paid)"
+                        className="p-1.5 rounded-lg text-blue-600 hover:bg-blue-50 disabled:opacity-40">
+                        {rowBusy === l.id ? <Loader2 size={14} className="animate-spin" /> : <Mic size={14} />}
+                      </button>
+                      {txSrc && <button onClick={() => openEditor({ lesson: l })} title="Edit transcript" className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100"><Edit3 size={14} /></button>}
+                    </>
+                  ) : (
+                    <button onClick={() => openEditor({ lesson: l })} title="Paste/edit transcript (YouTube/Vimeo — manual only)"
+                      className="px-2 py-1 rounded-lg text-[11px] font-semibold text-slate-500 hover:bg-slate-100 inline-flex items-center gap-1">
+                      <Edit3 size={12} /> {txSrc ? 'Edit' : 'Add'} transcript
+                    </button>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Course trainer notes + actions */}
+          <div className="flex flex-wrap items-center justify-between gap-2 mt-3">
+            <button onClick={() => openEditor({ courseNotes: true })}
+              className="text-sm font-semibold text-slate-600 inline-flex items-center gap-1.5 px-3 py-1.5 hover:bg-slate-100 rounded-lg">
+              <MessageSquare size={15} /> {courseNotes ? 'Edit' : 'Add'} course trainer notes
+              {courseNotes && <TrainerStatusPill status={courseNotes.status} />}
+            </button>
+            <div className="flex items-center gap-2">
+              <button onClick={() => setPreview({ planKey: 'sampler', query: '', result: null })}
+                className="px-3 py-2 rounded-xl text-sm font-semibold text-slate-600 border border-slate-200 inline-flex items-center gap-2 hover:bg-slate-50">
+                <Eye size={15} /> Preview as plan
+              </button>
+              <button onClick={runSync} disabled={busy}
+                className="px-4 py-2 rounded-xl text-white text-sm font-bold inline-flex items-center gap-2 disabled:opacity-60" style={ADMIN_BTN_OK}>
+                {busy ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />} {busy && syncMsg ? syncMsg : 'Sync index'}
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Transcribe confirm */}
+      {confirmTx && (
+        <AccountModal title="Transcribe this video?" subtitle={confirmTx.title} icon={Mic} tone="primary"
+          onClose={() => setConfirmTx(null)}>
+          <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+            This sends the video to ElevenLabs Scribe (a <strong>paid</strong> transcription API, billed per audio hour).
+            The transcript lands as a <strong>draft for your review</strong> — nothing is taught until you approve it.
+          </p>
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button onClick={() => setConfirmTx(null)} className="px-4 py-2 rounded-xl text-sm font-semibold"
+              style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>Cancel</button>
+            <button onClick={() => transcribeLesson(confirmTx)} className="px-4 py-2 rounded-xl text-sm font-bold text-white inline-flex items-center gap-2" style={ADMIN_BTN_OK}>
+              <Mic size={15} /> Transcribe
+            </button>
+          </div>
+        </AccountModal>
+      )}
+
+      {/* Transcript / notes editor */}
+      {editing && (
+        <AccountModal title={editing.courseNotes ? 'Course trainer notes' : 'Lesson transcript'} subtitle={editing.title}
+          icon={editing.courseNotes ? MessageSquare : FileText} tone="primary" maxW="max-w-2xl"
+          canClose={!editing.saving} onClose={() => setEditing(null)}>
+          {editing.loading ? (
+            <div className="flex items-center gap-2 text-sm text-slate-500 py-6 justify-center"><Loader2 size={16} className="animate-spin" /> Loading…</div>
+          ) : (
+            <>
+              <p style={{ fontSize: 12, color: C.textSoft }} className="mb-2">
+                {editing.courseNotes
+                  ? 'Extra teaching context for the whole course (e.g. a summary, key definitions). The trainer may draw on it alongside lessons.'
+                  : 'The approved transcript the trainer teaches from. Edit freely — Approve & index makes it live.'}
+              </p>
+              <textarea value={editing.content} onChange={(e) => setEditing((cur) => ({ ...cur, content: e.target.value }))}
+                rows={12} placeholder="Paste or write the transcript…"
+                className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-y"
+                style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+              <div className="mt-4 flex items-center justify-end gap-2.5">
+                <button onClick={() => setEditing(null)} disabled={editing.saving} className="px-4 py-2 rounded-xl text-sm font-semibold disabled:opacity-60"
+                  style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>Cancel</button>
+                <button onClick={() => saveEditor({ approve: false })} disabled={editing.saving}
+                  className="px-4 py-2 rounded-xl text-sm font-semibold disabled:opacity-60"
+                  style={{ background: 'var(--wash-strong)', color: C.textSoft, border: `1px solid ${C.border}` }}>
+                  {editing.saving ? <Loader2 size={14} className="animate-spin" /> : 'Save draft'}
+                </button>
+                <button onClick={() => saveEditor({ approve: true })} disabled={editing.saving}
+                  className="px-4 py-2 rounded-xl text-sm font-bold text-white inline-flex items-center gap-2 disabled:opacity-60" style={ADMIN_BTN_OK}>
+                  {editing.saving ? <Loader2 size={14} className="animate-spin" /> : <Check size={15} />} Approve &amp; index
+                </button>
+              </div>
+            </>
+          )}
+        </AccountModal>
+      )}
+
+      {/* Preview as plan */}
+      {preview && (
+        <AccountModal title="Preview as a plan" subtitle="See what a learner on this plan could get" icon={Eye} tone="primary" maxW="max-w-lg"
+          onClose={() => setPreview(null)}>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <label className="block">
+              <span className="text-[11px] font-semibold uppercase tracking-wide" style={{ color: C.textSoft }}>Plan</span>
+              <select value={preview.planKey} onChange={(e) => setPreview((p) => ({ ...p, planKey: e.target.value }))}
+                className="mt-1 w-full px-3 py-2 rounded-lg text-sm" style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text }}>
+                {ENROLLMENT_PLANS_FALLBACK.map((p) => <option key={p.key} value={p.key}>{p.name}</option>)}
+              </select>
+            </label>
+            <label className="block">
+              <span className="text-[11px] font-semibold uppercase tracking-wide" style={{ color: C.textSoft }}>Test question</span>
+              <input value={preview.query} onChange={(e) => setPreview((p) => ({ ...p, query: e.target.value }))}
+                placeholder="e.g. how do I reconcile a bank account"
+                className="mt-1 w-full px-3 py-2 rounded-lg text-sm" style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text }} />
+            </label>
+          </div>
+          <button onClick={runPreview} disabled={preview.busy || !preview.query.trim()}
+            className="mt-3 px-4 py-2 rounded-xl text-white text-sm font-bold inline-flex items-center gap-2 disabled:opacity-60"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+            {preview.busy ? <Loader2 size={15} className="animate-spin" /> : <Zap size={15} />} Run preview
+          </button>
+          {preview.error && <div className="mt-3"><AdminNotice kind="error">{preview.error}</AdminNotice></div>}
+          {preview.result && (
+            <div className="mt-4 space-y-3">
+              <div className="text-xs" style={{ color: C.textSoft }}>
+                This plan can study: {(preview.result.courses || []).map((c) => c.title).join(', ') || 'no courses'}.
+                {preview.result.embeddings && ` (${preview.result.embeddings} search)`}
+              </div>
+              {(preview.result.chunks || []).length === 0 && <div className="text-sm text-slate-400">No matching material for that question on this plan.</div>}
+              {(preview.result.chunks || []).map((c, i) => (
+                <div key={i} className="p-3 rounded-xl border border-slate-200 bg-white">
+                  <div className="text-[11px] font-semibold" style={{ color: C.primary }}>
+                    {[c.course_title, c.module_title, c.lesson_title].filter(Boolean).join(' › ')}
+                  </div>
+                  <div className="text-sm text-slate-600 mt-1">{c.excerpt}…</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </AccountModal>
+      )}
+    </div>
+  );
+}
+
 function CourseProgram({
   slug = 'qbo-mastery',
   courseId = null,                                       // catalog mode: load by id instead of slug
@@ -7410,6 +11002,7 @@ function CourseProgram({
   comingSoonText = 'Your QuickBooks Online Mastery Program is being prepared. Check back soon.',
   embedded = false,                                      // hide the sticky SectionHead when nested inside a subtab
   initialNotice = null,                                  // one-time success banner (e.g. after duplicating a course)
+  initialLessonId = null,                                // deep-link (?lesson=) — open straight to this lesson if it exists
 } = {}) {
   const { user, profile } = useAuth();
   const isAdmin = !!profile?.is_admin;
@@ -7423,6 +11016,10 @@ function CourseProgram({
   const [doneIds, setDoneIds] = useState(new Set());
   const [completion, setCompletion] = useState(null);
   const [activeLessonId, setActiveLessonId] = useState(null);
+  // AI-trainer enabled flag — owned here (fed up by CourseAiTrainerPanel, which
+  // fetches it resiliently) so COURSE_ROW_SELECT stays untouched and a pre-#27 DB
+  // never breaks course loading. Gates the saveLesson auto re-index kick.
+  const [aiTrainerEnabled, setAiTrainerEnabled] = useState(false);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState('');
   const [notConfigured, setNotConfigured] = useState(false); // Supabase course tables not created yet
@@ -7530,6 +11127,9 @@ function CourseProgram({
         try { storedActiveLessonId = (await window.storage.get(activeLessonKey(courseRow.id)))?.value || null; } catch {}
       }
       setActiveLessonId(prev => {
+        // A ?lesson= deep-link (e.g. the voice trainer's open_course_lesson) wins over
+        // the remembered/first-incomplete lesson when it resolves to a real lesson.
+        if (initialLessonId && all.some(l => l.id === initialLessonId)) return initialLessonId;
         if (prev && all.some(l => l.id === prev)) return prev;
         if (storedActiveLessonId && all.some(l => l.id === storedActiveLessonId)) return storedActiveLessonId;
         return (all.find(l => !done.has(l.id)) || all[0])?.id || null;
@@ -7574,6 +11174,12 @@ function CourseProgram({
 
   // ── Derived ──
   const allLessons = modules.flatMap(m => m.lessons || []);
+  // In-place ?lesson= change while the course is already open (a second voice
+  // deep-link into the same course): jump to it once it resolves to a real lesson.
+  useEffect(() => {
+    if (initialLessonId && allLessons.some(l => l.id === initialLessonId)) setActiveLessonId(initialLessonId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialLessonId]);
   const totalLessons = allLessons.length;
   const completedCount = allLessons.filter(l => doneIds.has(l.id)).length;
   const progressPct = totalLessons ? Math.round((completedCount / totalLessons) * 100) : 0;
@@ -7873,6 +11479,10 @@ function CourseProgram({
       clearLessonDraft();
       setEditingLesson(null);
       await load();
+      // If this course has the AI trainer on, re-index in the background so the change
+      // reaches the trainer. The #27 trigger already marked the source stale, so
+      // retrieval stays correct even if this fire-and-forget kick never lands.
+      if (isAdmin && aiTrainerEnabled && course?.id) kickTrainerSync(course.id);
     } catch (e) { logDbError('[CourseProgram] saveLesson', e, { courseId: course?.id, lessonId: d.id }); setErr(describeDbError(e, 'Could not save lesson.')); }
     finally { setSavingLesson(false); }
   }
@@ -8117,6 +11727,9 @@ function CourseProgram({
           <button onClick={saveCourseMeta} disabled={metaBusy} className="mt-3 px-4 py-2 rounded-xl text-white text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-60"
             style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>{metaBusy ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />} Save details</button>
         </div>
+
+        {/* AI Trainer — index this course for the voice trainer (per-course opt-in). */}
+        {course?.id && <CourseAiTrainerPanel course={course} modules={modules} onEnabledChange={setAiTrainerEnabled} />}
 
         {/* Modules */}
         {modules.map((m, mi) => (
@@ -8578,6 +12191,7 @@ function CourseCatalog({
   const initialCatalogRouteRef = useRef(null);
   if (!initialCatalogRouteRef.current) initialCatalogRouteRef.current = readAppRoute();
   const initialSelectedId = initialCatalogRouteRef.current.tab === catalogTabId ? initialCatalogRouteRef.current.courseId : null;
+  const initialLessonId = initialCatalogRouteRef.current.tab === catalogTabId ? initialCatalogRouteRef.current.lessonId : null;
 
   const [courses, setCourses] = useState([]);
   const [counts, setCounts] = useState({});            // course_id -> total lessons
@@ -8586,6 +12200,7 @@ function CourseCatalog({
   const [err, setErr] = useState('');
   const [notConfigured, setNotConfigured] = useState(false);
   const [selectedId, setSelectedId] = useState(initialSelectedId);  // null = grid; otherwise the open course
+  const [deepLinkLessonId, setDeepLinkLessonId] = useState(initialLessonId); // ?lesson= handoff to CourseProgram
   const [busy, setBusy] = useState(false);             // create / delete / reorder / cover / duplicate in flight
   const [menuOpenId, setMenuOpenId] = useState(null);  // which card's ⋮ action menu is open
   const [lastDuplicatedId, setLastDuplicatedId] = useState(null); // highlight + open the fresh copy in the builder
@@ -8608,12 +12223,21 @@ function CourseCatalog({
     loadCatalog();
   }
   useEffect(() => {
-    const onPopState = () => {
+    // Sync the open course AND the ?lesson= deep-link from the URL on both Back/Forward
+    // (popstate) and in-app route writes (the bookkeeper:route-change event — how the
+    // voice trainer's open_course_lesson navigates here via writeAppRoute/pushState).
+    const onRoute = () => {
       const route = readAppRoute();
-      if (route.tab === catalogTabId) setSelectedId(route.courseId || null);
+      if (route.tab !== catalogTabId) return;
+      setSelectedId(route.courseId || null);
+      setDeepLinkLessonId(route.lessonId || null);
     };
-    window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
+    window.addEventListener('popstate', onRoute);
+    window.addEventListener(APP_ROUTE_CHANGE_EVENT, onRoute);
+    return () => {
+      window.removeEventListener('popstate', onRoute);
+      window.removeEventListener(APP_ROUTE_CHANGE_EVENT, onRoute);
+    };
   }, [catalogTabId]);
   // Close the ⋮ menu on Escape while one is open.
   useEffect(() => {
@@ -8855,6 +12479,7 @@ function CourseCatalog({
   if (selectedId) {
     return <CourseProgram key={selectedId} courseId={selectedId}
       eyebrow={eyebrow} courseTitle={title} comingSoonText={comingSoonDesc}
+      initialLessonId={deepLinkLessonId}
       initialNotice={selectedId === lastDuplicatedId
         ? '✓ Course duplicated as a draft. Edit the title, month, and lessons below, then publish when ready.'
         : null}
@@ -9624,6 +13249,2581 @@ Output ONLY this format. No markdown, no explanation.`
             </div>
           </div>
         </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// COMPONENT: COMMUNITY (member feed — posts, comments, reactions)
+// ═══════════════════════════════════════════════════════════════════
+// Supabase-backed forum (community_* tables — db/2026-07-20-community.sql #23 + the forum
+// upgrade db/2026-07-21-community-forum.sql #24; walkthrough in COMMUNITY_SETUP.md).
+// Every ACTIVE paid plan includes Community: the tab id is in every plan's entitlement
+// allowlist client-side, and the server gate is is_approved() + is_enrolled() RLS — so
+// access ends with the membership term (expired members are FULLY blocked, reads
+// included). author_name + author_avatar_url are DENORMALIZED onto post/comment rows at
+// insert (non-admins can't read other users' profiles rows — the enrollment_requests
+// precedent) and SERVER-STAMPED by community_stamp_author(). Avatars render through the
+// shared MemberAvatar (<img> from the public avatars bucket, initials fallback).
+// Forum model: fixed categories (community_tags) + free-form #tags (community_post_tags) +
+// pinned/comments_locked posts (admin-set; server-guarded by community_posts_guard()) +
+// image/video/link attachments (private community-media bucket, batch-signed URLs) +
+// @mentions (autocomplete via the search_community_members RPC; the #24 notify triggers
+// fan reply/mention rows into community_notifications for the bell) + announcement
+// read-tracking (community_announcement_reads; announcements are react-only).
+// Moderation is INLINE for admins (pin/lock/hide/restore/hard-delete + Announcements
+// posting); members edit + soft-delete (status='deleted') their own rows — RLS blocks
+// everything else server-side. CommunityHub takes ZERO props so the memoized TabPanel
+// keep-alive stays intact; it loads once on mount and then refreshes silently (realtime
+// INSERTs → a "new discussions" pill + a throttled focus refetch). The ?post= deep link
+// mirrors CourseCatalog's ?course= idiom; the bell (useCommunityBell + NotificationBell)
+// lives in the ROOT shell and navigates via module-scope writeAppRoute — no TabPanel props.
+
+// Relative-time label for feed timestamps. First app-wide use — keep it dependency-free.
+function timeAgo(iso) {
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return '';
+  const s = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (s < 60) return 'just now';
+  const m = Math.floor(s / 60); if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24); if (d < 7) return `${d}d ago`;
+  const dt = new Date(t);
+  return dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', ...(dt.getFullYear() !== new Date().getFullYear() ? { year: 'numeric' } : {}) });
+}
+
+const COMMUNITY_PAGE_SIZE = 20;
+// Reaction set mirrors the community_reactions CHECK constraint — keep in sync.
+const COMMUNITY_REACTIONS = [
+  { type: 'like',      label: 'Like',      icon: ThumbsUp },
+  { type: 'celebrate', label: 'Celebrate', icon: PartyPopper },
+  { type: 'helpful',   label: 'Helpful',   icon: Lightbulb },
+];
+// Icons for the seeded categories (an admin-added tag falls back to MessageSquare).
+const COMMUNITY_TAG_ICONS = {
+  announcements: Megaphone, introductions: User, questions: HelpCircle,
+  'quickbooks-help': Calculator, 'us-bookkeeping': Landmark, 'course-questions': GraduationCap,
+  'job-applications': Briefcase, 'resume-interview': FileText, 'client-management': HeartHandshake,
+  wins: Award,
+};
+// Attachment limits (the buckets enforce size/mime server-side; these are the client mirrors).
+const COMMUNITY_MAX_ATTACHMENTS = 4;
+const COMMUNITY_IMAGE_MAX_MB = 5;
+const COMMUNITY_VIDEO_MAX_MB = 50;
+const COMMUNITY_MAX_FREE_TAGS = 5;
+const COMMUNITY_ANNOUNCEMENTS_SLUG = 'announcements';
+// Mentions travel in post/comment bodies as @[Display Name](uuid) — inserted by the
+// autocomplete, parsed server-side by the notify triggers (db #24), and rendered as chips
+// by renderCommunityBody. Keep this source in sync with the SQL regex.
+const COMMUNITY_MENTION_SRC = '@\\[([^\\]]{1,80})\\]\\(([0-9a-fA-F-]{36})\\)';
+const COMMUNITY_URL_SRC = 'https?:\\/\\/[^\\s<>"\')]+';
+// Compiled once (the sources are constant) so a feed/thread render doesn't rebuild the
+// same pattern per body. Both are `g`-stateful, so every user MUST reset lastIndex / drain
+// the exec loop before relying on them (stripCommunityMarkup uses String.replace, which
+// resets lastIndex itself; renderCommunityBody resets before its loop).
+const COMMUNITY_MENTION_RE = new RegExp(COMMUNITY_MENTION_SRC, 'g');
+const COMMUNITY_BODY_RE = new RegExp(`${COMMUNITY_MENTION_SRC}|(${COMMUNITY_URL_SRC})`, 'g');
+// Local event: community screens poke the bell hook after read/mark actions so the badge
+// updates instantly without any prop threading through the memoized TabPanel tree.
+const COMMUNITY_BELL_POKE = 'bookkeeper:community-bell-poke';
+
+// Plain-text form of a body (mention markup → @Name) for feed snippets and titles.
+function stripCommunityMarkup(body) {
+  return String(body || '').replace(COMMUNITY_MENTION_RE, '@$1');
+}
+
+// Tokenizes a body into React nodes: mention chips + safe auto-linked https? URLs + plain
+// text (rendered inside a pre-wrap container). Never dangerouslySetInnerHTML — mentions and
+// link labels render as text nodes, and only https?:// hrefs are ever emitted.
+function renderCommunityBody(body) {
+  const text = String(body || '');
+  const re = COMMUNITY_BODY_RE;
+  re.lastIndex = 0;   // shared stateful `g` regex — reset before this call's exec loop
+  const out = [];
+  let last = 0, m, k = 0;
+  while ((m = re.exec(text))) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    if (m[1] !== undefined) {
+      out.push(
+        <span key={`m${k++}`} className="inline-flex items-center gap-0.5 px-1.5 py-px rounded-md align-baseline"
+          style={{ fontSize: '0.92em', fontWeight: 700, color: C.primary, background: 'var(--primary-tint)' }}>
+          <AtSign size={11} style={{ flexShrink: 0 }} />{m[1]}
+        </span>
+      );
+    } else {
+      const url = m[3];
+      out.push(
+        <a key={`u${k++}`} href={url} target="_blank" rel="noopener noreferrer"
+          className="underline underline-offset-2 transition hover:opacity-75" style={{ color: C.primary, overflowWrap: 'anywhere' }}>
+          {url.length > 72 ? `${url.slice(0, 69)}…` : url}
+        </a>
+      );
+    }
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
+// profiles.avatar_url is either a storage path in the public avatars bucket (set_my_avatar)
+// or a legacy full URL from Google OAuth metadata — branch on the prefix.
+function resolveAvatarUrl(v) {
+  if (!v) return null;
+  if (/^https?:\/\//i.test(v)) return v;
+  try { return supabase.storage.from('avatars').getPublicUrl(v).data?.publicUrl || null; } catch { return null; }
+}
+
+// THE shared avatar primitive: <img> when a picture exists, the house initials-in-a-
+// gradient-circle formula as the fallback (and on a broken image). Used by the sidebar
+// identity card/rail, AccountMenu, the settings drawer, and everything in Community.
+function MemberAvatar({ name, src, size = 40, title }) {
+  const [broken, setBroken] = useState(false);
+  useEffect(() => { setBroken(false); }, [src]);
+  if (src && !broken) {
+    return (
+      <img src={src} alt="" title={title} onError={() => setBroken(true)}
+        className="flex-shrink-0 rounded-full object-cover"
+        style={{ width: size, height: size, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }} />
+    );
+  }
+  const initial = (((name || '?').trim()[0]) || '?').toUpperCase();
+  return (
+    <div className="flex items-center justify-center flex-shrink-0 rounded-full text-white font-bold" title={title}
+      style={{ width: size, height: size, fontSize: Math.round(size * 0.38), background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+      {initial}
+    </div>
+  );
+}
+
+// A community query failing because the DB predates a migration: #23 missing → tables
+// absent (PGRST205/42P01); #23 applied but #24 missing → new columns absent (42703/PGRST204).
+function communitySchemaGap(e) {
+  const msg = e?.message || '';
+  if (e?.code === 'PGRST205' || e?.code === '42P01' || /schema cache|could not find the table/i.test(msg)) return 'missing';
+  if (e?.code === '42703' || e?.code === 'PGRST204' || /column .* does not exist|could not find the .* column/i.test(msg)) return 'upgrade';
+  return null;
+}
+
+// Textarea with @mention autocomplete (search_community_members RPC — display name +
+// avatar only, never email). Typing "@que" opens a keyboard-navigable picker; picking
+// inserts the @[Name](uuid) markup at the caret. When `onSubmitEnter` is set (the comment
+// composer), Enter sends — unless the picker is open, where Enter selects instead.
+function MentionTextarea({ value, onChange, placeholder, rows = 3, maxLength = 5000, className = '', disabled = false, onSubmitEnter = null, spaceId = null }) {
+  const taRef = useRef(null);
+  const [sugg, setSugg] = useState(null);        // { items, hi } | null
+  const debRef = useRef(0);
+  const seqRef = useRef(0);
+
+  useEffect(() => () => clearTimeout(debRef.current), []);
+  useEffect(() => {
+    if (!sugg) return;
+    const onPointerDown = (e) => { if (!(e.target.closest && e.target.closest('[data-mention-box]'))) setSugg(null); };
+    document.addEventListener('pointerdown', onPointerDown, true);
+    return () => document.removeEventListener('pointerdown', onPointerDown, true);
+  }, [!!sugg]);
+
+  function trailingMention(el) {
+    const caret = el.selectionStart ?? el.value.length;
+    const before = el.value.slice(0, caret);
+    const m = /(^|[\s])@([A-Za-z0-9][A-Za-z0-9 ._-]{0,39})$/.exec(before);
+    return m ? { query: m[2], caret } : null;
+  }
+
+  function handleChange(e) {
+    onChange(e.target.value);
+    const el = e.target;
+    const t = trailingMention(el);
+    clearTimeout(debRef.current);
+    if (!t) { setSugg(null); return; }
+    debRef.current = setTimeout(async () => {
+      const seq = ++seqRef.current;
+      try {
+        // #32: scope the directory to the active space — only its eligible
+        // members come back (server-enforced; null = pre-#32 signature).
+        const { data, error } = await supabase.rpc('search_community_members',
+          spaceId ? { p_query: t.query.trim(), p_space_id: spaceId } : { p_query: t.query.trim() });
+        if (error) throw error;
+        if (seq !== seqRef.current) return;
+        const items = (data || []).slice(0, 8);
+        setSugg(items.length ? { items, hi: 0 } : null);
+      } catch { if (seq === seqRef.current) setSugg(null); }
+    }, 220);
+  }
+
+  function pick(item) {
+    const el = taRef.current;
+    if (!el || !item) return;
+    const t = trailingMention(el);
+    const caret = t ? t.caret : (el.selectionStart ?? el.value.length);
+    const start = t ? caret - t.query.length - 1 : caret;
+    const insert = `@[${item.display_name}](${item.id}) `;
+    const next = el.value.slice(0, start) + insert + el.value.slice(caret);
+    setSugg(null);
+    if (next.length > maxLength) return;
+    onChange(next);
+    requestAnimationFrame(() => {
+      if (!taRef.current) return;
+      taRef.current.focus();
+      const pos = start + insert.length;
+      taRef.current.setSelectionRange(pos, pos);
+    });
+  }
+
+  function handleKeyDown(e) {
+    if (sugg && sugg.items.length) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); setSugg(s => ({ ...s, hi: (s.hi + 1) % s.items.length })); return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); setSugg(s => ({ ...s, hi: (s.hi - 1 + s.items.length) % s.items.length })); return; }
+      if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); pick(sugg.items[sugg.hi]); return; }
+      if (e.key === 'Escape') {
+        // Stop the bubble too: AccountModal closes on window-level Escape,
+        // which would tear down the whole composer draft instead of the picker.
+        e.preventDefault(); e.stopPropagation(); setSugg(null); return;
+      }
+    }
+    if (onSubmitEnter && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSubmitEnter(); }
+  }
+
+  return (
+    <div className="relative" data-mention-box>
+      <textarea ref={taRef} value={value} onChange={handleChange} onKeyDown={handleKeyDown}
+        placeholder={placeholder} rows={rows} maxLength={maxLength} disabled={disabled}
+        className={className} />
+      {sugg && sugg.items.length > 0 && (
+        <div role="listbox" aria-label="Mention a member"
+          className="absolute left-0 top-full mt-1 z-30 w-full max-w-xs rounded-xl overflow-hidden shadow-xl py-1"
+          style={{ background: C.white, border: `1px solid ${GLASS.border}` }}>
+          {sugg.items.map((it, i) => (
+            <button key={it.id} role="option" aria-selected={i === sugg.hi} type="button"
+              onPointerDown={(e) => { e.preventDefault(); pick(it); }}
+              onMouseEnter={() => setSugg(s => (s ? { ...s, hi: i } : s))}
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-left transition"
+              style={{ background: i === sugg.hi ? 'var(--wash)' : 'transparent' }}>
+              <MemberAvatar name={it.display_name} src={resolveAvatarUrl(it.avatar_url)} size={22} />
+              <span className="truncate" style={{ fontSize: 12.5, fontWeight: 600, color: C.text }}>{it.display_name}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Renders a post's attachments in the detail view: image grid, native <video> players
+// (private community-media bucket — signed URLs arrive via the signedUrls map), and safe
+// link cards. A not-yet-signed file shows a shimmer placeholder until the batch sign lands.
+function AttachmentGallery({ items, signedUrls }) {
+  const files = (items || []).filter(a => a.kind !== 'link');
+  const links = (items || []).filter(a => a.kind === 'link' && /^https?:\/\//i.test(a.url || ''));
+  if (!files.length && !links.length) return null;
+  const images = files.filter(a => a.kind === 'image');
+  return (
+    <div className="mt-3 space-y-2.5">
+      {images.length > 0 && (
+        <div className={images.length > 1 ? 'grid grid-cols-2 gap-2' : ''}>
+          {images.map(a => {
+            const url = a.storage_path ? signedUrls[a.storage_path] : null;
+            return url ? (
+              <a key={a.id} href={url} target="_blank" rel="noopener noreferrer" className="block">
+                <img src={url} alt={a.file_name || 'Attached image'} loading="lazy"
+                  className="w-full rounded-xl object-cover"
+                  style={{ maxHeight: images.length > 1 ? 220 : 420, border: `1px solid ${GLASS.borderSoft}`, background: 'var(--wash)' }} />
+              </a>
+            ) : (
+              <div key={a.id} className="w-full rounded-xl shimmer" style={{ height: 180, background: 'var(--wash)' }} />
+            );
+          })}
+        </div>
+      )}
+      {files.filter(a => a.kind === 'video').map(a => {
+        const url = a.storage_path ? signedUrls[a.storage_path] : null;
+        return url ? (
+          <video key={a.id} controls preload="metadata" src={url}
+            className="w-full rounded-xl" style={{ maxHeight: 420, background: '#000', border: `1px solid ${GLASS.borderSoft}` }} />
+        ) : (
+          <div key={a.id} className="w-full rounded-xl shimmer flex items-center justify-center gap-2" style={{ height: 180, background: 'var(--wash)' }}>
+            <Video size={18} style={{ color: C.textMute }} />
+            <span style={{ fontSize: 12, color: C.textMute }}>Loading video…</span>
+          </div>
+        );
+      })}
+      {links.map(a => {
+        let host = '';
+        try { host = new URL(a.url).hostname.replace(/^www\./, ''); } catch {}
+        return (
+          <a key={a.id} href={a.url} target="_blank" rel="noopener noreferrer"
+            className="flex items-center gap-2.5 px-3.5 py-2.5 rounded-xl transition hover:opacity-80"
+            style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <Link2 size={15} style={{ color: C.primary, flexShrink: 0 }} />
+            <span className="min-w-0">
+              <span className="block truncate" style={{ fontSize: 12.5, fontWeight: 700, color: C.text }}>{host || 'External link'}</span>
+              <span className="block truncate" style={{ fontSize: 11, color: C.textMute }}>{a.url}</span>
+            </span>
+            <ExternalLink size={13} className="ml-auto flex-shrink-0" style={{ color: C.textMute }} />
+          </a>
+        );
+      })}
+    </div>
+  );
+}
+
+// One compact row in the forum topic list (the Discourse-style table row): pinned /
+// announcement badges, title, one-line snippet, category + free tags, author, activity
+// time, participant avatars, reply count. The whole row opens the post detail.
+// React.memo'd (custom comparator) so unrelated CommunityHub state churn — above all a
+// search keystroke — doesn't re-render + re-parse every visible row; onOpen's identity is
+// ignored because its behavior is constant (it always opens the row's own post).
+const CommunityTopicRow = React.memo(function CommunityTopicRow({ post, tag, postTags, isAdmin, participants, reactTotal, attachCount, annUnread, onOpen }) {
+  const hidden = post.status === 'hidden';
+  const isAnn = post.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG;
+  const TagIcon = (tag && COMMUNITY_TAG_ICONS[tag.slug]) || MessageSquare;
+  const stripped = stripCommunityMarkup(post.body);   // parse the body once (title + snippet reuse it)
+  const titleText = (post.title || '').trim() || stripped.split('\n')[0];
+  const snippet = stripped.replace(/\s+/g, ' ').trim();
+  const replies = typeof post.comment_count === 'number' ? post.comment_count : (participants ? participants.total : 0);
+  const activity = post.last_activity_at || post.created_at;
+  return (
+    <article role="button" tabIndex={0} aria-label={`Open discussion: ${titleText}`}
+      onClick={() => onOpen(post)}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(post); } }}
+      className="glass-card rounded-2xl px-4 py-3.5 sm:px-5 cursor-pointer transition hover:-translate-y-px"
+      style={{
+        ...(hidden ? { opacity: 0.7 } : {}),
+        ...(isAnn ? { borderLeft: '3px solid var(--status-warn-fg)' } : post.pinned ? { borderLeft: `3px solid ${C.primary}` } : {}),
+      }}>
+      <div className="flex items-start gap-3">
+        <MemberAvatar name={post.author_name} src={resolveAvatarUrl(post.author_avatar_url)} size={38} />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {post.pinned && <Pin size={13} style={{ color: C.primary, flexShrink: 0 }} aria-label="Pinned" />}
+            {isAnn && (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wide"
+                style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)', border: '1px solid var(--status-warn-bd)' }}>
+                <Megaphone size={10} /> Announcement
+              </span>
+            )}
+            <span className="min-w-0 truncate" style={{ fontFamily: fontDisplay, fontWeight: 750, fontSize: 15, color: C.text }}>
+              {titleText}
+            </span>
+            {annUnread && <span className="flex-shrink-0 w-2 h-2 rounded-full" style={{ background: 'var(--status-warn-fg)' }} aria-label="Unread" />}
+            {hidden && (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-semibold flex-shrink-0"
+                style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)', border: '1px solid var(--status-warn-bd)' }}>
+                <EyeOff size={10} /> Hidden
+              </span>
+            )}
+          </div>
+          {snippet && snippet !== titleText && (
+            <div className="mt-0.5 truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{snippet.slice(0, 200)}</div>
+          )}
+          <div className="mt-1.5 flex items-center gap-1.5 flex-wrap" style={{ fontSize: 11, color: C.textMute }}>
+            {tag && (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md font-semibold"
+                style={{ background: 'var(--status-neutral-bg)', color: 'var(--status-neutral-fg)', border: '1px solid var(--status-neutral-bd)', fontSize: 10.5 }}>
+                <TagIcon size={10} /> {tag.label}
+              </span>
+            )}
+            {(postTags || []).slice(0, 3).map(t => (
+              <span key={t} className="px-1.5 py-0.5 rounded-md font-semibold" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}`, color: C.textSoft, fontSize: 10.5 }}>
+                #{t}
+              </span>
+            ))}
+            {attachCount > 0 && (
+              <span className="inline-flex items-center gap-0.5"><Paperclip size={10} /> {attachCount}</span>
+            )}
+            <span className="truncate">{post.author_name}</span>
+            <span aria-hidden="true">·</span>
+            <span title={new Date(activity).toLocaleString()}>{timeAgo(activity)}</span>
+          </div>
+        </div>
+        <div className="hidden sm:flex flex-col items-end gap-1.5 flex-shrink-0 pt-0.5">
+          {participants && participants.list.length > 0 && (
+            <span className="flex items-center">
+              {participants.list.slice(0, 3).map((p, i) => (
+                <span key={i} style={{ marginLeft: i === 0 ? 0 : -7, boxShadow: `0 0 0 2px ${C.white}`, borderRadius: '9999px', display: 'inline-flex' }}>
+                  <MemberAvatar name={p.name} src={p.avatar} size={20} title={p.name} />
+                </span>
+              ))}
+            </span>
+          )}
+          <span className="inline-flex items-center gap-2" style={{ fontSize: 11.5, color: C.textMute }}>
+            <span className="inline-flex items-center gap-1"><MessageSquare size={12} /> <span className="gh-tnum">{replies}</span></span>
+            {reactTotal > 0 && <span className="inline-flex items-center gap-1"><ThumbsUp size={12} /> <span className="gh-tnum">{reactTotal}</span></span>}
+          </span>
+        </div>
+      </div>
+    </article>
+  );
+}, (a, b) => (
+  a.post === b.post && a.tag === b.tag && a.isAdmin === b.isAdmin
+  && a.participants === b.participants && a.reactTotal === b.reactTotal
+  && a.attachCount === b.attachCount && a.annUnread === b.annUnread
+  // postTagsMeta[id] keeps a stable ref when present; `|| []` only mints a fresh empty
+  // array for tagless posts, so treat two empties as equal.
+  && (a.postTags === b.postTags || ((a.postTags?.length || 0) === 0 && (b.postTags?.length || 0) === 0))
+));
+
+// Left category rail (lg+). Below lg the hub renders its horizontal chip scroller instead.
+function CommunityCategoryRail({ tags, counts, activeTag, filter, onPick, totalCount }) {
+  return (
+    <nav aria-label="Community categories" className="glass-card rounded-2xl p-2.5">
+      <div className="px-2 pt-1.5 pb-2" style={{ fontSize: 10.5, fontWeight: 700, color: C.textMute, textTransform: 'uppercase', letterSpacing: '0.09em' }}>
+        Categories
+      </div>
+      <div className="space-y-0.5">
+        <button onClick={() => onPick('all')} aria-pressed={activeTag === 'all' && filter !== 'announcements'}
+          className="w-full flex items-center gap-2 px-2.5 py-2 rounded-xl text-left transition"
+          style={activeTag === 'all' && filter !== 'announcements'
+            ? { background: 'var(--primary-tint)', color: C.primary, fontWeight: 700, fontSize: 12.5 }
+            : { color: C.textSoft, fontWeight: 600, fontSize: 12.5 }}>
+          <MessagesSquare size={14} className="flex-shrink-0" />
+          <span className="flex-1 truncate">All discussions</span>
+          <span className="gh-tnum" style={{ fontSize: 11, color: C.textMute }}>{totalCount || 0}</span>
+        </button>
+        {tags.map(t => {
+          const Icon = COMMUNITY_TAG_ICONS[t.slug] || MessageSquare;
+          const on = activeTag === t.slug && filter !== 'announcements';
+          return (
+            <button key={t.slug} onClick={() => onPick(t.slug)} aria-pressed={on}
+              className="w-full flex items-center gap-2 px-2.5 py-2 rounded-xl text-left transition"
+              style={on
+                ? { background: 'var(--primary-tint)', color: C.primary, fontWeight: 700, fontSize: 12.5 }
+                : { color: C.textSoft, fontWeight: 600, fontSize: 12.5 }}>
+              <Icon size={14} className="flex-shrink-0" />
+              <span className="flex-1 truncate">{t.label}</span>
+              <span className="gh-tnum" style={{ fontSize: 11, color: C.textMute }}>{counts[t.slug] || 0}</span>
+            </button>
+          );
+        })}
+      </div>
+    </nav>
+  );
+}
+
+// Space switcher (#32) — compact pill row of the member's ACCESSIBLE spaces
+// (General + their private batch space, everything for admins) with the member
+// counts the server said they may see. Hidden when only one space is reachable.
+const COMMUNITY_SPACE_ICONS = { general: Globe, gold: Crown, vip: Sparkles };
+function CommunitySpaceSwitcher({ spaces, activeId, onSwitch }) {
+  if (!spaces || spaces.length < 2) return null;
+  return (
+    <div className="mb-4 max-w-6xl mx-auto flex items-center gap-2 flex-wrap" role="tablist" aria-label="Community spaces">
+      {spaces.map(sp => {
+        const Icon = COMMUNITY_SPACE_ICONS[sp.kind] || MessagesSquare;
+        const active = sp.id === activeId;
+        return (
+          <button key={sp.id} role="tab" aria-selected={active} onClick={() => onSwitch(sp.slug)}
+            className={`gh-pill inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold${active ? ' is-active' : ''}`}
+            title={sp.kind === 'general' ? 'Open to every active member' : 'Private batch community'}>
+            <Icon size={13} /> {sp.name}
+            {sp.kind !== 'general' && <Lock size={10} style={{ opacity: 0.6 }} />}
+            <span className="px-1.5 py-0.5 rounded-full inline-flex items-center gap-1"
+              style={{ background: 'var(--wash)', fontSize: 10, fontWeight: 700, color: C.textMute }}>
+              <Users size={9} /> {Number(sp.member_count) || 0}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// Filter tabs + search + the New discussion button — the forum toolbar.
+// showUnanswered=false (a reactions-only space — no replies) drops that tab.
+function CommunityFilterTabs({ filter, onFilter, searchInput, onSearchInput, onNewTopic, showUnanswered = true }) {
+  const FILTERS = [
+    { key: 'latest', label: 'Latest' },
+    { key: 'new', label: 'New' },
+    ...(showUnanswered ? [{ key: 'unanswered', label: 'Unanswered' }] : []),
+    { key: 'announcements', label: 'Announcements', icon: Megaphone },
+  ];
+  return (
+    <div className="flex items-center gap-2 flex-wrap">
+      <div className="flex items-center gap-1.5 flex-wrap">
+        {FILTERS.map(f => {
+          const Icon = f.icon;
+          return (
+            <button key={f.key} onClick={() => onFilter(f.key)} aria-pressed={filter === f.key}
+              className={`gh-pill inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold${filter === f.key ? ' is-active' : ''}`}>
+              {Icon && <Icon size={12} />} {f.label}
+            </button>
+          );
+        })}
+      </div>
+      <div className="relative flex-1 min-w-[160px] sm:max-w-[240px] ml-auto">
+        <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: C.textMute }} />
+        <input value={searchInput} onChange={e => onSearchInput(e.target.value)} type="search"
+          placeholder="Search discussions…" aria-label="Search discussions"
+          className="gh-input w-full pl-8 pr-8 py-2 rounded-xl text-sm" />
+        {searchInput && (
+          <button onClick={() => onSearchInput('')} aria-label="Clear search"
+            className="absolute right-2.5 top-1/2 -translate-y-1/2 transition hover:opacity-70" style={{ color: C.textMute }}>
+            <X size={13} />
+          </button>
+        )}
+      </div>
+      {onNewTopic && (
+        <button onClick={onNewTopic}
+          className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-bold text-white transition hover:opacity-95 flex-shrink-0"
+          style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -3px var(--primary-glow)` }}>
+          <Plus size={15} /> New discussion
+        </button>
+      )}
+    </div>
+  );
+}
+
+// Right rail (xl+): latest announcements, most-active loaded discussions, popular tags.
+function CommunityRightRail({ announcements, annReadIds, uid, topPosts, popularTags, onOpen, onPickFreeTag }) {
+  return (
+    <div className="space-y-4">
+      {announcements.length > 0 && (
+        <div className="glass-card rounded-2xl p-4">
+          <div className="flex items-center gap-1.5 mb-2.5" style={{ fontSize: 11, fontWeight: 700, color: 'var(--status-warn-fg)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+            <Megaphone size={12} /> Announcements
+          </div>
+          <div className="space-y-2.5">
+            {announcements.map(a => {
+              const unread = a.author_id !== uid && !annReadIds.has(a.id);
+              return (
+                <button key={a.id} onClick={() => onOpen(a)} className="w-full text-left transition hover:opacity-80">
+                  <span className="flex items-start gap-1.5">
+                    {unread && <span className="mt-1.5 w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: 'var(--status-warn-fg)' }} />}
+                    <span className="min-w-0">
+                      <span className="block truncate" style={{ fontSize: 12.5, fontWeight: unread ? 750 : 600, color: C.text }}>
+                        {(a.title || '').trim() || stripCommunityMarkup(a.body).split('\n')[0]}
+                      </span>
+                      <span className="block" style={{ fontSize: 10.5, color: C.textMute }}>{timeAgo(a.created_at)}</span>
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      {topPosts.length > 0 && (
+        <div className="glass-card rounded-2xl p-4">
+          <div className="mb-2.5" style={{ fontSize: 11, fontWeight: 700, color: C.textMute, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+            Most active
+          </div>
+          <div className="space-y-2.5">
+            {topPosts.map((p, i) => (
+              <button key={p.id} onClick={() => onOpen(p)} className="w-full text-left flex items-start gap-2 transition hover:opacity-80">
+                <span className="gh-tnum flex-shrink-0" style={{ fontSize: 11, fontWeight: 700, color: C.textMute, paddingTop: 1 }}>{i + 1}.</span>
+                <span className="min-w-0">
+                  <span className="block truncate" style={{ fontSize: 12.5, fontWeight: 600, color: C.text }}>
+                    {(p.title || '').trim() || stripCommunityMarkup(p.body).split('\n')[0]}
+                  </span>
+                  <span className="inline-flex items-center gap-1" style={{ fontSize: 10.5, color: C.textMute }}>
+                    <MessageSquare size={10} /> {p.comment_count || 0} {(p.comment_count || 0) === 1 ? 'reply' : 'replies'}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      {popularTags.length > 0 && (
+        <div className="glass-card rounded-2xl p-4">
+          <div className="mb-2.5" style={{ fontSize: 11, fontWeight: 700, color: C.textMute, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+            Popular tags
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {popularTags.map(([t, n]) => (
+              <button key={t} onClick={() => onPickFreeTag(t)}
+                className="px-2 py-1 rounded-lg text-[11px] font-semibold transition hover:opacity-80"
+                style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}`, color: C.textSoft }}>
+                #{t} <span className="gh-tnum" style={{ color: C.textMute }}>{n}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The New-discussion / Edit-post modal (AccountModal shell — portal + a11y + hidden-tab
+// suppression for free). Title + category are required; body supports @mentions; free-form
+// tags normalize to slugs; attachments = images ≤5MB / videos ≤50MB (private
+// community-media bucket, <uid>/ folder) + https links, max 4 per post. Publish uploads
+// files first, then inserts the post row, then the attachment/tag child rows — a child
+// failure keeps the post and surfaces a warning (files without a post row are removed).
+// Edit mode updates title/body/category + replaces tags; attachments are immutable on edit.
+function CommunityComposer({ editPost, editTags, spaceId, spaceName, composerTags, uid, myName, myAvatar, onClose, onPublished, onSaved }) {
+  const isEdit = !!editPost;
+  const [title, setTitle] = useState(isEdit ? (editPost.title || '') : '');
+  const [body, setBody] = useState(isEdit ? (editPost.body || '') : '');
+  const [tagSlug, setTagSlug] = useState(isEdit ? editPost.tag_slug : ((composerTags.find(t => !t.admin_only) || composerTags[0] || {}).slug || ''));
+  const [freeTags, setFreeTags] = useState(isEdit ? (editTags || []) : []);
+  const [tagInput, setTagInput] = useState('');
+  const [files, setFiles] = useState([]);          // { id, file, kind, status: 'ready'|'uploading'|'done'|'error' }
+  const [links, setLinks] = useState([]);
+  const [linkInput, setLinkInput] = useState('');
+  const [showLinkInput, setShowLinkInput] = useState(false);
+  const [posting, setPosting] = useState(false);
+  const [err, setErr] = useState('');
+  const imgInputRef = useRef(null);
+  const vidInputRef = useRef(null);
+
+  const attachTotal = files.length + links.length;
+
+  // The default category is picked at mount; if the modal opened before the
+  // tags query resolved, adopt the first member category when it arrives so
+  // Publish isn't silently dead behind an empty picker.
+  useEffect(() => {
+    if (isEdit || tagSlug) return;
+    const first = composerTags.find(t => !t.admin_only) || composerTags[0];
+    if (first) setTagSlug(first.slug);
+  }, [composerTags, isEdit, tagSlug]);
+
+  function addFiles(list, kind) {
+    setErr('');
+    const next = [];
+    for (const file of Array.from(list || [])) {
+      if (files.length + links.length + next.length >= COMMUNITY_MAX_ATTACHMENTS) { setErr(`Up to ${COMMUNITY_MAX_ATTACHMENTS} attachments per post.`); break; }
+      if (kind === 'image') {
+        if (!/^image\//i.test(file.type)) { setErr(`${file.name} isn’t an image.`); continue; }
+        if (file.size > COMMUNITY_IMAGE_MAX_MB * 1024 * 1024) { setErr(`${file.name} is over ${COMMUNITY_IMAGE_MAX_MB} MB — please resize it.`); continue; }
+      } else {
+        if (!/^video\//i.test(file.type)) { setErr(`${file.name} isn’t a video.`); continue; }
+        if (file.size > COMMUNITY_VIDEO_MAX_MB * 1024 * 1024) { setErr(`${file.name} is over ${COMMUNITY_VIDEO_MAX_MB} MB — please compress it or share a link instead.`); continue; }
+      }
+      next.push({ id: crypto.randomUUID(), file, kind, status: 'ready' });
+    }
+    if (next.length) setFiles(prev => [...prev, ...next]);
+  }
+
+  function addLink() {
+    const url = linkInput.trim();
+    if (!url) return;
+    if (!/^https?:\/\/\S+$/i.test(url)) { setErr('Links must start with http:// or https://'); return; }
+    if (attachTotal >= COMMUNITY_MAX_ATTACHMENTS) { setErr(`Up to ${COMMUNITY_MAX_ATTACHMENTS} attachments per post.`); return; }
+    setErr(''); setLinks(prev => [...prev, url]); setLinkInput(''); setShowLinkInput(false);
+  }
+
+  function addFreeTag() {
+    const norm = tagInput.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24);
+    setTagInput('');
+    if (!norm || freeTags.includes(norm)) return;
+    if (freeTags.length >= COMMUNITY_MAX_FREE_TAGS) { setErr(`Up to ${COMMUNITY_MAX_FREE_TAGS} tags per post.`); return; }
+    setErr(''); setFreeTags(prev => [...prev, norm]);
+  }
+
+  async function publish() {
+    if (posting) return;
+    const t = title.trim(), b = body.trim();
+    if (!t || !b || !tagSlug) return;
+    setPosting(true); setErr('');
+    const uploaded = [];
+    let postCreated = false;
+    try {
+      if (isEdit) {
+        const patch = { title: t.slice(0, 120), body: b.slice(0, 5000), tag_slug: tagSlug, updated_at: new Date().toISOString() };
+        const { data, error } = await supabase.from('community_posts').update(patch).eq('id', editPost.id).select('id');
+        if (error) throw error;
+        if (!data || !data.length) throw new Error('This post can no longer be edited — it may have been hidden or removed. Refresh the feed.');
+        // Replace tags (best-effort — the post itself saved).
+        try {
+          await supabase.from('community_post_tags').delete().eq('post_id', editPost.id);
+          if (freeTags.length) await supabase.from('community_post_tags').insert(freeTags.map(tag => ({ post_id: editPost.id, tag })));
+        } catch { /* tags are cosmetic */ }
+        onSaved(editPost.id, patch, freeTags);
+        return;
+      }
+      for (const f of files) {
+        setFiles(prev => prev.map(x => (x.id === f.id ? { ...x, status: 'uploading' } : x)));
+        const safe = f.file.name.replace(/[^\w.\-]+/g, '_');
+        // #32 path shape <space_id>/<uid>/… (legacy <uid>/… when no space —
+        // pre-#32 DB). Read access stays attachment-join based either way.
+        const path = `${spaceId ? `${spaceId}/` : ''}${uid}/${crypto.randomUUID()}-${safe}`;
+        const { error } = await supabase.storage.from('community-media')
+          .upload(path, f.file, { upsert: false, contentType: f.file.type || 'application/octet-stream' });
+        if (error) {
+          setFiles(prev => prev.map(x => (x.id === f.id ? { ...x, status: 'error' } : x)));
+          throw new Error(`Could not upload ${f.file.name} — ${error.message || 'storage error'}. If this keeps happening, the community-media bucket may not be set up yet (see COMMUNITY_SETUP.md).`);
+        }
+        uploaded.push({ path, f });
+        setFiles(prev => prev.map(x => (x.id === f.id ? { ...x, status: 'done' } : x)));
+      }
+      const row = {
+        author_id: uid, author_name: myName, title: t.slice(0, 120), body: b.slice(0, 5000), tag_slug: tagSlug,
+        // #32: publish into the active space; omitted pre-#32 (the guard
+        // trigger fills General once the migration lands).
+        ...(spaceId ? { space_id: spaceId } : {}),
+      };
+      const { data: post, error } = await supabase.from('community_posts').insert(row).select().single();
+      if (error) throw error;
+      postCreated = true;
+      const warns = [];
+      const attachRows = [
+        ...uploaded.map((u, i) => ({
+          post_id: post.id, uploader_id: uid, kind: u.f.kind, storage_path: u.path,
+          file_name: u.f.file.name, mime_type: u.f.file.type || null, file_size: u.f.file.size || null, position: i,
+        })),
+        ...links.map((url, i) => ({ post_id: post.id, uploader_id: uid, kind: 'link', url, position: uploaded.length + i })),
+      ];
+      if (attachRows.length) {
+        const { error: aErr } = await supabase.from('community_attachments').insert(attachRows);
+        if (aErr) {
+          logDbError('[Community] attachments', aErr, { postId: post.id }); warns.push('attachments');
+          // The post saved but its attachment rows didn't. The uploaded files would otherwise
+          // orphan permanently: without an attachment row they're unreadable (the read policy
+          // requires one on an active post) AND unrecoverable by admin hard-delete (which derives
+          // paths FROM attachment rows). Best-effort remove them — links have no files to clean.
+          if (uploaded.length) {
+            supabase.storage.from('community-media').remove(uploaded.map(u => u.path)).catch(() => {});
+          }
+        }
+      }
+      if (freeTags.length) {
+        const { error: tErr } = await supabase.from('community_post_tags').insert(freeTags.map(tag => ({ post_id: post.id, tag })));
+        if (tErr) { logDbError('[Community] post tags', tErr, { postId: post.id }); warns.push('tags'); }
+      }
+      onPublished(post, warns);
+    } catch (e) {
+      logDbError('[Community] publish', e, { isEdit: !!isEdit });
+      // Files uploaded for a post that never landed are orphans — clean them up.
+      if (!isEdit && uploaded.length && !postCreated) {
+        supabase.storage.from('community-media').remove(uploaded.map(u => u.path)).catch(() => {});
+      }
+      setErr(e?.message && /Could not upload|no longer be edited/.test(e.message) ? e.message : describeDbError(e, 'Could not publish your post. Please try again.'));
+    } finally { setPosting(false); }
+  }
+
+  const canPublish = !posting && title.trim() && body.trim() && tagSlug;
+
+  return (
+    <AccountModal title={isEdit ? 'Edit discussion' : 'Start a discussion'}
+      subtitle={isEdit
+        ? 'Update your post — attachments can’t be changed after publishing'
+        : (spaceName ? `Posting in ${spaceName}` : 'Ask a question, share a win, help another bookkeeper')}
+      icon={isEdit ? Edit3 : MessagesSquare} maxW="max-w-2xl" canClose={!posting} onClose={onClose}>
+      <div className="flex items-start gap-3">
+        <MemberAvatar name={myName} src={myAvatar} size={36} />
+        <div className="flex-1 min-w-0">
+          <input value={title} onChange={e => setTitle(e.target.value)} maxLength={120} autoFocus
+            placeholder="Title — what’s this discussion about?"
+            className="gh-input w-full px-3.5 py-2.5 rounded-xl text-sm" />
+          <div className="mt-2">
+            <MentionTextarea value={body} onChange={setBody} rows={6} maxLength={5000} spaceId={spaceId}
+              placeholder="Write your post… Type @ to mention a member."
+              className="gh-input w-full px-3.5 py-2.5 rounded-xl text-sm resize-y" />
+          </div>
+
+          {/* Category */}
+          <div className="mt-3" style={{ fontSize: 11, fontWeight: 700, color: C.textMute, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Category</div>
+          <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">
+            {composerTags.length === 0 && (
+              <div className="text-xs px-3 py-2 rounded-lg"
+                style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
+                Categories haven’t loaded — check your connection, close this window, and try again.
+              </div>
+            )}
+            {composerTags.map(ct => {
+              const Icon = COMMUNITY_TAG_ICONS[ct.slug] || MessageSquare;
+              const on = tagSlug === ct.slug;
+              return (
+                <button key={ct.slug} type="button" onClick={() => setTagSlug(ct.slug)} aria-pressed={on}
+                  className={`gh-pill inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold${on ? ' is-active' : ''}`}>
+                  <Icon size={12} /> {ct.label}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Free-form tags */}
+          <div className="mt-3" style={{ fontSize: 11, fontWeight: 700, color: C.textMute, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Tags <span style={{ fontWeight: 500, textTransform: 'none', letterSpacing: 0 }}>(optional, up to {COMMUNITY_MAX_FREE_TAGS})</span></div>
+          <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">
+            {freeTags.map(tg => (
+              <span key={tg} className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold"
+                style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}`, color: C.textSoft }}>
+                #{tg}
+                <button type="button" onClick={() => setFreeTags(prev => prev.filter(x => x !== tg))} aria-label={`Remove tag ${tg}`}
+                  className="transition hover:opacity-70" style={{ color: C.textMute }}><X size={11} /></button>
+              </span>
+            ))}
+            <input value={tagInput} onChange={e => setTagInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); addFreeTag(); } }}
+              onBlur={() => { if (tagInput.trim()) addFreeTag(); }}
+              placeholder={freeTags.length ? 'Add tag…' : 'e.g. reconciliation, quickbooks…'}
+              className="gh-input px-2.5 py-1.5 rounded-lg text-xs" style={{ width: 160 }} />
+          </div>
+
+          {/* Attachments (new posts only — immutable on edit) */}
+          {!isEdit && (
+            <>
+              <div className="mt-3" style={{ fontSize: 11, fontWeight: 700, color: C.textMute, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Attachments <span style={{ fontWeight: 500, textTransform: 'none', letterSpacing: 0 }}>(optional, up to {COMMUNITY_MAX_ATTACHMENTS})</span></div>
+              <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">
+                <button type="button" onClick={() => imgInputRef.current?.click()} disabled={attachTotal >= COMMUNITY_MAX_ATTACHMENTS}
+                  className="gh-btn-ghost inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold disabled:opacity-50">
+                  <ImageIcon size={13} /> Image <span style={{ color: C.textMute, fontWeight: 500 }}>≤{COMMUNITY_IMAGE_MAX_MB}MB</span>
+                </button>
+                <button type="button" onClick={() => vidInputRef.current?.click()} disabled={attachTotal >= COMMUNITY_MAX_ATTACHMENTS}
+                  className="gh-btn-ghost inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold disabled:opacity-50">
+                  <Video size={13} /> Video <span style={{ color: C.textMute, fontWeight: 500 }}>≤{COMMUNITY_VIDEO_MAX_MB}MB</span>
+                </button>
+                <button type="button" onClick={() => setShowLinkInput(v => !v)} disabled={attachTotal >= COMMUNITY_MAX_ATTACHMENTS}
+                  className="gh-btn-ghost inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold disabled:opacity-50">
+                  <Link2 size={13} /> Link
+                </button>
+                <input ref={imgInputRef} type="file" accept="image/*" multiple className="hidden"
+                  onChange={e => { addFiles(e.target.files, 'image'); e.target.value = ''; }} />
+                <input ref={vidInputRef} type="file" accept="video/*" className="hidden"
+                  onChange={e => { addFiles(e.target.files, 'video'); e.target.value = ''; }} />
+              </div>
+              {showLinkInput && (
+                <div className="mt-2 flex items-center gap-2">
+                  <input value={linkInput} onChange={e => setLinkInput(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addLink(); } }}
+                    placeholder="https://…" autoFocus
+                    className="gh-input flex-1 px-3 py-2 rounded-xl text-sm" />
+                  <button type="button" onClick={addLink} className="gh-btn-ghost px-3.5 py-2 rounded-xl text-xs font-semibold">Add</button>
+                </div>
+              )}
+              {(files.length > 0 || links.length > 0) && (
+                <div className="mt-2 space-y-1.5">
+                  {files.map(f => (
+                    <div key={f.id} className="flex items-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+                      {f.kind === 'image' ? <ImageIcon size={14} style={{ color: C.primary, flexShrink: 0 }} /> : <Video size={14} style={{ color: C.primary, flexShrink: 0 }} />}
+                      <span className="flex-1 truncate" style={{ fontSize: 12, color: C.text }}>{f.file.name}</span>
+                      <span className="gh-tnum flex-shrink-0" style={{ fontSize: 10.5, color: C.textMute }}>{(f.file.size / 1024 / 1024).toFixed(1)} MB</span>
+                      {f.status === 'uploading' ? <Loader2 size={13} className="animate-spin flex-shrink-0" style={{ color: C.primary }} />
+                        : f.status === 'done' ? <CheckCircle2 size={13} className="flex-shrink-0" style={{ color: C.green }} />
+                        : f.status === 'error' ? <AlertTriangle size={13} className="flex-shrink-0" style={{ color: 'var(--status-danger-fg)' }} />
+                        : (
+                          <button type="button" onClick={() => setFiles(prev => prev.filter(x => x.id !== f.id))} aria-label={`Remove ${f.file.name}`}
+                            className="flex-shrink-0 transition hover:opacity-70" style={{ color: C.textMute }} disabled={posting}><X size={13} /></button>
+                        )}
+                    </div>
+                  ))}
+                  {links.map(url => (
+                    <div key={url} className="flex items-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+                      <Link2 size={14} style={{ color: C.primary, flexShrink: 0 }} />
+                      <span className="flex-1 truncate" style={{ fontSize: 12, color: C.text }}>{url}</span>
+                      <button type="button" onClick={() => setLinks(prev => prev.filter(x => x !== url))} aria-label="Remove link"
+                        className="flex-shrink-0 transition hover:opacity-70" style={{ color: C.textMute }} disabled={posting}><X size={13} /></button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
+          {err && <div className="mt-3 text-xs" style={{ color: 'var(--status-danger-fg)' }}>{err}</div>}
+          <div className="mt-4 flex items-center justify-between gap-3">
+            <span className="gh-tnum" style={{ fontSize: 11, color: body.length > 4500 ? 'var(--status-warn-fg)' : C.textMute }}>
+              {body.length > 4500 ? `${body.length}/5000` : ''}
+            </span>
+            <div className="flex items-center gap-2">
+              <button onClick={onClose} disabled={posting} className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold disabled:opacity-60">Cancel</button>
+              <button onClick={publish} disabled={!canPublish}
+                className="inline-flex items-center gap-2 px-5 py-2 rounded-xl text-sm font-bold text-white transition disabled:opacity-60"
+                style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+                {posting ? <Loader2 size={15} className="animate-spin" /> : isEdit ? <Save size={15} /> : <Send size={15} />}
+                {posting ? (files.some(f => f.status === 'uploading') ? 'Uploading…' : 'Publishing…') : isEdit ? 'Save changes' : 'Publish'}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </AccountModal>
+  );
+}
+
+// Unread state for the notification bell: reply/mention rows (community_notifications,
+// written only by the db #24 triggers) + unread announcements (announcement posts minus
+// the member's community_announcement_reads). Lives in the ROOT component — never threaded
+// through TabPanel (memo contract); CommunityHub pokes it via the COMMUNITY_BELL_POKE
+// window event after read/mark actions. A pre-#24 database silently disables the bell.
+function useCommunityBell(uid, enabled) {
+  const [notifs, setNotifs] = useState([]);
+  const [annUnread, setAnnUnread] = useState([]);
+  const [available, setAvailable] = useState(true);
+  const lastRef = useRef(0);
+  // Staleness guard (the loadFeed idiom): mark-read actions bump the seq so a
+  // response fetched before them can't resurrect just-cleared items; a uid
+  // switch bumps it too so user A's in-flight load never lands under user B.
+  const seqRef = useRef(0);
+
+  const load = useCallback(async () => {
+    if (!uid || !enabled) return;
+    const seq = ++seqRef.current;
+    try {
+      const [nRes, aRes, rRes] = await Promise.all([
+        supabase.from('community_notifications').select('*')
+          .eq('user_id', uid).is('read_at', null)
+          .order('created_at', { ascending: false }).limit(20),
+        supabase.from('community_posts').select('id,title,body,author_id,author_name,created_at')
+          .eq('tag_slug', COMMUNITY_ANNOUNCEMENTS_SLUG).eq('status', 'active').neq('author_id', uid)
+          .order('created_at', { ascending: false }).limit(30),
+        supabase.from('community_announcement_reads').select('post_id').eq('user_id', uid),
+      ]);
+      if (nRes.error) throw nRes.error;
+      if (seq !== seqRef.current) return;   // superseded by a newer load or a mark-read
+      // Announcements degrade quietly: without the reads table there is no unread state.
+      const read = new Set((rRes.error ? [] : (rRes.data || [])).map(r => r.post_id));
+      setNotifs(nRes.data || []);
+      setAnnUnread(rRes.error ? [] : ((aRes.error ? [] : (aRes.data || [])).filter(p => !read.has(p.id))));
+      setAvailable(true);
+      lastRef.current = Date.now();
+    } catch (e) {
+      if (communitySchemaGap(e)) setAvailable(false);
+      // Any other failure keeps the previous state — the bell is best-effort chrome.
+    }
+  }, [uid, enabled]);
+
+  // Account switch: clear the previous user's items immediately — the root
+  // stays mounted across sign-out, so stale state would otherwise render
+  // under the next signed-in user until their first load resolves.
+  useEffect(() => {
+    seqRef.current++;
+    setNotifs([]); setAnnUnread([]); lastRef.current = 0;
+  }, [uid]);
+
+  useEffect(() => { if (uid && enabled) load(); }, [uid, enabled, load]);
+
+  useEffect(() => {
+    if (!uid || !enabled) return;
+    const ch = supabase
+      .channel(`community-bell-${uid}`)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'community_notifications', filter: `user_id=eq.${uid}` }, (payload) => {
+        const row = payload.new;
+        if (!row || row.read_at) return;
+        setNotifs(prev => (prev.some(n => n.id === row.id) ? prev : [row, ...prev].slice(0, 20)));
+      })
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'community_posts' }, (payload) => {
+        const row = payload.new;
+        if (row && row.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG && row.author_id !== uid && row.status === 'active') load();
+      })
+      .subscribe();
+    const onFocus = () => { if (Date.now() - lastRef.current > 30000) load(); };
+    const onPoke = () => load();
+    window.addEventListener('focus', onFocus);
+    window.addEventListener(COMMUNITY_BELL_POKE, onPoke);
+    return () => {
+      supabase.removeChannel(ch);
+      window.removeEventListener('focus', onFocus);
+      window.removeEventListener(COMMUNITY_BELL_POKE, onPoke);
+    };
+  }, [uid, enabled, load]);
+
+  const markRead = useCallback(async (id) => {
+    seqRef.current++;   // drop any in-flight load fetched before this action
+    setNotifs(prev => prev.filter(n => n.id !== id));
+    try { await supabase.from('community_notifications').update({ read_at: new Date().toISOString() }).eq('id', id); } catch {}
+  }, []);
+
+  const markAnnRead = useCallback(async (postId) => {
+    seqRef.current++;
+    setAnnUnread(prev => prev.filter(a => a.id !== postId));
+    try {
+      await supabase.from('community_announcement_reads')
+        .upsert({ user_id: uid, post_id: postId }, { onConflict: 'user_id,post_id', ignoreDuplicates: true });
+    } catch {}
+  }, [uid]);
+
+  const markAllRead = useCallback(async () => {
+    const anns = annUnread;
+    seqRef.current++;
+    setNotifs([]); setAnnUnread([]);
+    try {
+      await Promise.all([
+        supabase.from('community_notifications').update({ read_at: new Date().toISOString() }).eq('user_id', uid).is('read_at', null),
+        anns.length
+          ? supabase.from('community_announcement_reads')
+              .upsert(anns.map(a => ({ user_id: uid, post_id: a.id })), { onConflict: 'user_id,post_id', ignoreDuplicates: true })
+          : Promise.resolve(),
+      ]);
+    } catch {}
+  }, [uid, annUnread]);
+
+  return {
+    available: available && !!enabled,
+    notifs, annUnread,
+    count: notifs.length + annUnread.length,
+    load, markRead, markAnnRead, markAllRead,
+  };
+}
+
+// The bell button + its dropdown. The trigger lives in live shell chrome (sidebar identity
+// card, collapsed rail, mobile topbar); the panel renders through OverlayPortal so the
+// sidebar's transform/backdrop-filter can never clip it. AccountMenu's a11y idiom: Escape,
+// document-level pointerdown outside-click (data-attr guard — the panel is portaled, so a
+// contains() check on the trigger wrapper can't see it), focus restore to the trigger.
+// Clicking an item marks it read and deep-links straight to the post via the module-scope
+// writeAppRoute — no prop threading (the setPanelParam precedent).
+function NotificationBell({ bell, placement = 'card' }) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState(null);
+  const triggerRef = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => { if (e.key === 'Escape') { setOpen(false); triggerRef.current?.focus(); } };
+    const onPointerDown = (e) => { if (!(e.target.closest && e.target.closest('[data-bell-root]'))) setOpen(false); };
+    window.addEventListener('keydown', onKey);
+    document.addEventListener('pointerdown', onPointerDown, true);
+    return () => { window.removeEventListener('keydown', onKey); document.removeEventListener('pointerdown', onPointerDown, true); };
+  }, [open]);
+  if (!bell || !bell.available) return null;
+  const count = bell.count;
+
+  function toggle() {
+    if (!open && triggerRef.current) {
+      const r = triggerRef.current.getBoundingClientRect();
+      const width = Math.min(336, window.innerWidth - 16);
+      let left, top;
+      if (placement === 'rail') {
+        left = r.right + 8;
+        top = Math.max(12, Math.min(r.top - 40, window.innerHeight - 440));
+      } else {
+        left = Math.max(8, Math.min(r.right - width, window.innerWidth - width - 8));
+        top = r.bottom + 8;
+      }
+      setPos({ left, top, width });
+      bell.load();     // refresh on open — the badge may be stale
+    }
+    setOpen(o => !o);
+  }
+
+  function openNotif(n) {
+    setOpen(false);
+    bell.markRead(n.id);
+    if (n.post_id) writeAppRoute('community', { postId: n.post_id });
+  }
+  function openAnn(a) {
+    setOpen(false);
+    bell.markAnnRead(a.id);
+    writeAppRoute('community', { postId: a.id });
+  }
+
+  return (
+    <div data-bell-root className="relative flex-shrink-0">
+      <button ref={triggerRef} onClick={toggle} aria-haspopup="dialog" aria-expanded={open}
+        aria-label={count > 0 ? `Notifications — ${count} unread` : 'Notifications'} title="Notifications"
+        className="relative flex-shrink-0 p-1.5 rounded-lg transition hover:opacity-80"
+        style={{ color: C.textMute, background: open ? 'var(--wash)' : 'transparent' }}>
+        <Bell size={16} />
+        {count > 0 && (
+          <span aria-hidden="true"
+            className="absolute -top-0.5 -right-0.5 min-w-[15px] h-[15px] px-0.5 rounded-full text-[9px] font-bold text-white flex items-center justify-center"
+            style={{ background: C.red }}>
+            {count > 99 ? '99+' : count}
+          </span>
+        )}
+      </button>
+      {open && pos && (
+        <OverlayPortal>
+          <div data-bell-root role="dialog" aria-label="Notifications"
+            className="fixed z-[65] rounded-2xl shadow-xl overflow-hidden flex flex-col"
+            style={{ left: pos.left, top: pos.top, width: pos.width, maxHeight: 420,
+              background: C.white, border: `1px solid ${GLASS.border}`,
+              boxShadow: '0 18px 44px -12px rgba(15,23,42,0.30)', fontFamily: fontBody, color: C.text }}>
+            <div className="px-4 py-3 flex items-center gap-2" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+              <Bell size={14} style={{ color: C.primary }} />
+              <span style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 13.5 }}>Notifications</span>
+              {count > 0 && (
+                <button onClick={() => bell.markAllRead()}
+                  className="ml-auto inline-flex items-center gap-1 text-[11px] font-semibold transition hover:opacity-75" style={{ color: C.primary }}>
+                  <CheckCheck size={12} /> Mark all read
+                </button>
+              )}
+            </div>
+            <div className="overflow-y-auto py-1">
+              {count === 0 && (
+                <div className="px-4 py-8 text-center">
+                  <CheckCircle2 size={22} className="mx-auto mb-2" style={{ color: C.green }} />
+                  <div style={{ fontSize: 12.5, color: C.textSoft }}>You’re all caught up.</div>
+                </div>
+              )}
+              {bell.annUnread.length > 0 && (
+                <>
+                  <div className="px-4 pt-2 pb-1" style={{ fontSize: 10, fontWeight: 700, color: 'var(--status-warn-fg)', textTransform: 'uppercase', letterSpacing: '0.09em' }}>
+                    Announcements
+                  </div>
+                  {bell.annUnread.slice(0, 6).map(a => (
+                    <button key={a.id} onClick={() => openAnn(a)}
+                      className="w-full flex items-start gap-2.5 px-4 py-2 text-left transition hover:bg-[color:var(--wash)]">
+                      <span className="flex items-center justify-center rounded-lg flex-shrink-0 mt-0.5"
+                        style={{ width: 28, height: 28, background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)' }}>
+                        <Megaphone size={13} style={{ color: 'var(--status-warn-fg)' }} />
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate" style={{ fontSize: 12.5, fontWeight: 700 }}>
+                          {(a.title || '').trim() || stripCommunityMarkup(a.body).split('\n')[0]}
+                        </span>
+                        <span className="block" style={{ fontSize: 10.5, color: C.textMute }}>{a.author_name} · {timeAgo(a.created_at)}</span>
+                      </span>
+                    </button>
+                  ))}
+                </>
+              )}
+              {bell.notifs.length > 0 && bell.annUnread.length > 0 && (
+                <div className="px-4 pt-2 pb-1" style={{ fontSize: 10, fontWeight: 700, color: C.textMute, textTransform: 'uppercase', letterSpacing: '0.09em' }}>
+                  Activity
+                </div>
+              )}
+              {bell.notifs.map(n => (
+                <button key={n.id} onClick={() => openNotif(n)}
+                  className="w-full flex items-start gap-2.5 px-4 py-2 text-left transition hover:bg-[color:var(--wash)]">
+                  <span className="mt-0.5"><MemberAvatar name={n.actor_name} src={resolveAvatarUrl(n.actor_avatar_url)} size={28} /></span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block" style={{ fontSize: 12.5, lineHeight: 1.4 }}>
+                      <b>{n.actor_name}</b>{' '}
+                      {n.kind === 'mention' ? 'mentioned you' : 'replied to your discussion'}
+                    </span>
+                    {n.post_title && <span className="block truncate" style={{ fontSize: 11.5, color: C.textSoft }}>{stripCommunityMarkup(n.post_title)}</span>}
+                    <span className="block" style={{ fontSize: 10.5, color: C.textMute }}>{timeAgo(n.created_at)}</span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </OverlayPortal>
+      )}
+    </div>
+  );
+}
+
+// One discussion in the DETAIL view: header (author/time/category + moderation ⋮), full
+// body (mention chips + auto-links), attachment gallery, reaction bar, and the flat reply
+// thread with per-comment reactions + a mention-aware composer. Announcements render
+// highlighted and comment-locked (react + mark-as-read only). Comment drafts are card-
+// local state (keep-alive preserves them).
+function CommunityPostCard({ post, tag, postTags, attachments, signedUrls, isAdmin, uid, myName, myAvatar,
+  commentCount, reactions, commentsState, commentReacts, annUnread,
+  canComment = true, canReact = true, spaceId = null,
+  menuOpen, onMenuToggle, onToggleReact, onToggleCommentReact, onAddComment, onEdit,
+  onModerate, onModerateComment, onAskDelete, onTogglePin, onToggleLock, onMarkAnnRead }) {
+  const isOwn = post.author_id === uid;
+  const hidden = post.status === 'hidden';
+  const isAnn = post.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG;
+  // Replies close when the thread is locked OR the space is reactions-only for
+  // members (#32 — General; admins keep the composer via admin_all RLS).
+  const locked = !!post.comments_locked || !canComment;
+  const [draft, setDraft] = useState('');
+  const [sending, setSending] = useState(false);
+  const [commentErr, setCommentErr] = useState('');
+
+  const TagIcon = (tag && COMMUNITY_TAG_ICONS[tag.slug]) || MessageSquare;
+  // Status-only updates (hide/restore/soft-delete/pin/lock) never stamp updated_at, so this
+  // only flags genuine content edits (5s slack for the insert's two default timestamps).
+  const edited = post.updated_at && post.created_at && (new Date(post.updated_at) - new Date(post.created_at) > 5000);
+  const rows = (commentsState && commentsState.rows) || [];
+
+  async function sendComment() {
+    const text = draft.trim();
+    if (!text || sending) return;
+    setSending(true); setCommentErr('');
+    try { await onAddComment(post.id, text); setDraft(''); }
+    catch (e) { setCommentErr(describeDbError(e, 'Could not post your comment.')); }
+    finally { setSending(false); }
+  }
+
+  return (
+    <article className="glass-card rounded-2xl p-5"
+      style={{ ...(hidden ? { opacity: 0.8 } : {}), ...(isAnn ? { borderLeft: '3px solid var(--status-warn-fg)' } : post.pinned ? { borderLeft: `3px solid ${C.primary}` } : {}) }}>
+      <div className="flex items-start gap-3">
+        <MemberAvatar name={post.author_name} src={resolveAvatarUrl(post.author_avatar_url)} />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="truncate" style={{ fontWeight: 700, fontSize: 14, color: C.text }}>{post.author_name}</span>
+            <span style={{ fontSize: 11.5, color: C.textMute }} title={new Date(post.created_at).toLocaleString()}>{timeAgo(post.created_at)}</span>
+            {edited && <span style={{ fontSize: 11, color: C.textMute }}>(edited)</span>}
+            {post.pinned && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold"
+                style={{ background: 'var(--primary-tint)', color: C.primary }}>
+                <Pin size={10} /> Pinned
+              </span>
+            )}
+            {hidden && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold"
+                style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)', border: '1px solid var(--status-warn-bd)' }}>
+                <EyeOff size={10} /> Hidden — only admins see this
+              </span>
+            )}
+          </div>
+          <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+            {isAnn && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wide"
+                style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)', border: '1px solid var(--status-warn-bd)' }}>
+                <Megaphone size={10} /> Announcement
+              </span>
+            )}
+            {tag && !isAnn && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10.5px] font-semibold"
+                style={{ background: 'var(--status-neutral-bg)', color: 'var(--status-neutral-fg)', border: '1px solid var(--status-neutral-bd)' }}>
+                <TagIcon size={10} /> {tag.label}
+              </span>
+            )}
+            {(postTags || []).map(t => (
+              <span key={t} className="px-1.5 py-0.5 rounded-md text-[10.5px] font-semibold"
+                style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}`, color: C.textSoft }}>
+                #{t}
+              </span>
+            ))}
+          </div>
+        </div>
+        {(isOwn || isAdmin) && (
+          <div className="relative flex-shrink-0" data-community-menu>
+            <button onClick={onMenuToggle} aria-haspopup="menu" aria-expanded={menuOpen} aria-label="Post actions"
+              className="p-1.5 rounded-lg transition hover:opacity-75" style={{ color: C.textMute }}>
+              <MoreVertical size={16} />
+            </button>
+            {menuOpen && (
+              <div role="menu" className="absolute right-0 top-8 z-20 w-52 rounded-xl overflow-hidden py-1 shadow-lg"
+                style={{ background: C.white, border: `1px solid ${C.border}` }}>
+                {isOwn && post.status === 'active' && (
+                  <button role="menuitem" onClick={() => { onMenuToggle(); onEdit(post); }}
+                    className="w-full text-left px-3.5 py-2 text-sm font-medium transition hover:opacity-75 flex items-center gap-2"
+                    style={{ color: C.text }}>
+                    <Edit3 size={14} /> Edit post
+                  </button>
+                )}
+                {isAdmin && (
+                  <button role="menuitem" onClick={() => { onMenuToggle(); onTogglePin(post); }}
+                    className="w-full text-left px-3.5 py-2 text-sm font-medium transition hover:opacity-75 flex items-center gap-2"
+                    style={{ color: C.text }}>
+                    <Pin size={14} /> {post.pinned ? 'Unpin' : 'Pin to top'}
+                  </button>
+                )}
+                {isAdmin && (
+                  <button role="menuitem" onClick={() => { onMenuToggle(); onToggleLock(post); }}
+                    className="w-full text-left px-3.5 py-2 text-sm font-medium transition hover:opacity-75 flex items-center gap-2"
+                    style={{ color: C.text }}>
+                    {locked ? <Unlock size={14} /> : <Lock size={14} />} {locked ? 'Unlock comments' : 'Lock comments'}
+                  </button>
+                )}
+                {isAdmin && (
+                  <button role="menuitem" onClick={() => { onMenuToggle(); onModerate(post, hidden ? 'active' : 'hidden'); }}
+                    className="w-full text-left px-3.5 py-2 text-sm font-medium transition hover:opacity-75 flex items-center gap-2"
+                    style={{ color: C.text }}>
+                    {hidden ? <Eye size={14} /> : <EyeOff size={14} />} {hidden ? 'Restore to feed' : 'Hide from feed'}
+                  </button>
+                )}
+                <button role="menuitem" onClick={() => { onMenuToggle(); onAskDelete({ kind: 'post', item: post }); }}
+                  className="w-full text-left px-3.5 py-2 text-sm font-medium transition hover:opacity-75 flex items-center gap-2"
+                  style={{ color: C.red }}>
+                  <Trash2 size={14} /> Delete…
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {post.title && (
+        <h3 className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 800, fontSize: 19, lineHeight: 1.3, color: C.text }}>{post.title}</h3>
+      )}
+      <div className={post.title ? 'mt-1.5' : 'mt-3'}
+        style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 14, lineHeight: 1.65, color: C.text }}>
+        {renderCommunityBody(post.body)}
+      </div>
+      <AttachmentGallery items={attachments} signedUrls={signedUrls} />
+
+      <div className="mt-4 flex items-center gap-1.5 flex-wrap">
+        {COMMUNITY_REACTIONS.map(r => {
+          const n = (reactions && reactions.counts[r.type]) || 0;
+          const mine = !!(reactions && reactions.mine.has(r.type));
+          const Icon = r.icon;
+          return (
+            <button key={r.type} onClick={() => canReact && onToggleReact(post.id, r.type)} aria-pressed={mine} title={r.label}
+              disabled={!canReact}
+              className={`gh-pill inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold${mine ? ' is-active' : ''}${canReact ? '' : ' opacity-60 cursor-default'}`}>
+              <Icon size={13} /> {r.label}{n > 0 && <span className="gh-tnum">{n}</span>}
+            </button>
+          );
+        })}
+        {isAnn && annUnread && (
+          <button onClick={() => onMarkAnnRead(post)}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition hover:opacity-90"
+            style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)', border: '1px solid var(--status-warn-bd)' }}>
+            <CheckCheck size={13} /> Mark as read
+          </button>
+        )}
+        <span className="ml-auto inline-flex items-center gap-1.5" style={{ fontSize: 12, color: C.textMute }}>
+          <MessageSquare size={13} /> <span className="gh-tnum">{commentCount}</span> {commentCount === 1 ? 'reply' : 'replies'}
+        </span>
+      </div>
+
+      <div className="mt-4 pt-4 space-y-3" style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
+        {/* Spinner only while there's nothing to show — a silent refresh (realtime /
+            re-open) keeps the cached list + composer mounted, so no flash or focus loss. */}
+        {commentsState && commentsState.loading && !rows.length ? (
+          <div className="flex items-center gap-2 text-xs" style={{ color: C.textMute }}>
+            <Loader2 size={14} className="animate-spin" /> Loading replies…
+          </div>
+        ) : commentsState && commentsState.err ? (
+          <div className="text-xs" style={{ color: 'var(--status-danger-fg)' }}>{commentsState.err}</div>
+        ) : (
+          <>
+            {rows.length === 0 && !locked && (
+              <div className="text-xs" style={{ color: C.textMute }}>No replies yet — be the first to reply.</div>
+            )}
+            {rows.map(cm => {
+              const own = cm.author_id === uid;
+              const cmHidden = cm.status === 'hidden';
+              const rx = commentReacts && commentReacts[cm.id];
+              return (
+                <div key={cm.id} className="flex items-start gap-2.5">
+                  <MemberAvatar name={cm.author_name} src={resolveAvatarUrl(cm.author_avatar_url)} size={28} />
+                  <div className="flex-1 min-w-0 rounded-xl px-3 py-2" style={{ background: 'var(--wash)', ...(cmHidden ? { opacity: 0.65 } : {}) }}>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span style={{ fontSize: 12.5, fontWeight: 700, color: C.text }}>{cm.author_name}</span>
+                      <span style={{ fontSize: 11, color: C.textMute }} title={new Date(cm.created_at).toLocaleString()}>{timeAgo(cm.created_at)}</span>
+                      {cmHidden && (
+                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-semibold"
+                          style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)', border: '1px solid var(--status-warn-bd)' }}>
+                          <EyeOff size={10} /> Hidden
+                        </span>
+                      )}
+                      <span className="ml-auto inline-flex items-center gap-0.5">
+                        {isAdmin && (
+                          <button onClick={() => onModerateComment(post.id, cm, cmHidden ? 'active' : 'hidden')}
+                            title={cmHidden ? 'Restore comment' : 'Hide comment'} aria-label={cmHidden ? 'Restore comment' : 'Hide comment'}
+                            className="p-1 rounded-md transition hover:opacity-70" style={{ color: C.textMute }}>
+                            {cmHidden ? <Eye size={12} /> : <EyeOff size={12} />}
+                          </button>
+                        )}
+                        {(own || isAdmin) && (
+                          <button onClick={() => onAskDelete({ kind: 'comment', item: cm, postId: post.id })}
+                            title="Delete comment" aria-label="Delete comment"
+                            className="p-1 rounded-md transition hover:opacity-70" style={{ color: C.textMute }}>
+                            <Trash2 size={12} />
+                          </button>
+                        )}
+                      </span>
+                    </div>
+                    <div className="mt-0.5" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 13, lineHeight: 1.55, color: C.text }}>
+                      {renderCommunityBody(cm.body)}
+                    </div>
+                    <div className="mt-1.5 flex items-center gap-1 flex-wrap">
+                      {COMMUNITY_REACTIONS.map(r => {
+                        const n = (rx && rx.counts[r.type]) || 0;
+                        const mine = !!(rx && rx.mine.has(r.type));
+                        const Icon = r.icon;
+                        return (
+                          <button key={r.type} onClick={() => canReact && onToggleCommentReact(post.id, cm.id, r.type)} aria-pressed={mine} title={r.label}
+                            disabled={!canReact}
+                            className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10.5px] font-semibold transition${canReact ? ' hover:opacity-80' : ' opacity-60 cursor-default'}`}
+                            style={mine
+                              ? { background: 'var(--primary-tint)', color: C.primary }
+                              : { color: C.textMute }}>
+                            <Icon size={11} />{n > 0 && <span className="gh-tnum">{n}</span>}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+            {locked ? (
+              <div className="flex items-center gap-2 px-3.5 py-2.5 rounded-xl text-xs font-semibold"
+                style={{ background: 'var(--status-neutral-bg)', border: '1px solid var(--status-neutral-bd)', color: 'var(--status-neutral-fg)' }}>
+                {isAnn ? <Megaphone size={13} /> : !canComment ? <ThumbsUp size={13} /> : <Lock size={13} />}
+                {isAnn ? 'Announcements are read-only — react above to acknowledge.'
+                  : !canComment ? 'This space is reactions-only — react above to respond.'
+                  : 'Replies are locked on this discussion.'}
+              </div>
+            ) : (
+              <div className="flex items-start gap-2.5 pt-1">
+                <MemberAvatar name={myName} src={myAvatar} size={28} />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-end gap-2">
+                    <div className="flex-1 min-w-0">
+                      <MentionTextarea value={draft} onChange={setDraft} rows={1} maxLength={2000} spaceId={spaceId}
+                        placeholder="Write a reply… Type @ to mention. (Enter to send)"
+                        onSubmitEnter={sendComment}
+                        className="gh-input w-full px-3.5 py-2.5 rounded-xl text-sm resize-none" />
+                    </div>
+                    <button onClick={sendComment} disabled={sending || !draft.trim()} aria-label="Send reply"
+                      className="p-2.5 rounded-xl text-white flex-shrink-0 transition disabled:opacity-50"
+                      style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+                      {sending ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
+                    </button>
+                  </div>
+                  {commentErr && <div className="mt-1.5 text-xs" style={{ color: 'var(--status-danger-fg)' }}>{commentErr}</div>}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </article>
+  );
+}
+
+function CommunityHub() {
+  const { user, profile } = useAuth();
+  const isAdmin = !!profile?.is_admin;
+  const uid = user?.id;
+  const myName = (profile?.full_name || '').trim() || (user?.email || 'Member');
+  const myAvatar = resolveAvatarUrl(profile?.avatar_url);
+
+  const [tags, setTags] = useState([]);
+  const [posts, setPosts] = useState([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [activeTag, setActiveTag] = useState('all');         // category rail selection
+  const [filter, setFilter] = useState('latest');            // latest | new | unanswered | announcements
+  const [searchInput, setSearchInput] = useState('');
+  const [freeTag, setFreeTag] = useState(null);              // #tag filter (community_post_tags)
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [err, setErr] = useState('');
+  const [schemaGap, setSchemaGap] = useState(null);          // null | 'missing' (#23 not run) | 'upgrade' (#24 not run)
+  const [catCounts, setCatCounts] = useState({});            // tag_slug -> active post count
+  const [reactMeta, setReactMeta] = useState({});            // post_id -> { counts: {type:n}, mine: Set }
+  const [participantsMeta, setParticipantsMeta] = useState({}); // post_id -> { list: [{name, avatar}], total }
+  const [attachMeta, setAttachMeta] = useState({});          // post_id -> attachment rows
+  const [postTagsMeta, setPostTagsMeta] = useState({});      // post_id -> [tag]
+  const [signedUrls, setSignedUrls] = useState({});          // storage_path -> signed url
+  const [comments, setComments] = useState({});              // post_id -> { rows, loading, err }
+  const [commentReactMeta, setCommentReactMeta] = useState({}); // comment_id -> { counts, mine: Set }
+  const [annReadIds, setAnnReadIds] = useState(() => new Set()); // my community_announcement_reads
+  const [annPreview, setAnnPreview] = useState([]);          // right-rail latest announcements
+  const [pendingNew, setPendingNew] = useState(0);           // realtime arrivals not yet merged
+  // Space engine (#32): accessible spaces from my_community_spaces(); the active
+  // space scopes every feed/meta query + the realtime channel. spacesReady:
+  // null = resolving, true = space-scoped, 'legacy' = pre-#32 DB (RPC MISSING)
+  // → single-space mode, exactly the pre-#32 behavior (nothing can leak — no
+  // private spaces exist yet), with an admin-only setup notice; 'error' = the
+  // RPC exists but failed. 'error' must NEVER fall through to legacy mode: with
+  // no spaceId the composer omits space_id and community_posts_guard() defaults
+  // it to GENERAL, so a gold/vip member would silently publish a private post
+  // to every plan. On 'error' we refuse to post and show a retry instead.
+  const [spaces, setSpaces] = useState([]);
+  const [spaceId, setSpaceId] = useState(null);
+  const [spacesReady, setSpacesReadyState] = useState(null);
+  // Mirrored in a ref because loadFeed/handlers read it outside the render cycle
+  // (and the bootstrap calls loadFeed in the same tick as the state write).
+  const spacesReadyRef = useRef(null);
+  const setSpacesReady = (v) => { spacesReadyRef.current = v; setSpacesReadyState(v); };
+  const spacesRef = useRef([]);
+  useEffect(() => { spacesRef.current = spaces; }, [spaces]);
+  // Detail view (?post=<id> deep link — the CourseCatalog ?course= idiom).
+  const [selectedPostId, setSelectedPostId] = useState(() => {
+    const r = readAppRoute();
+    return r.tab === 'community' ? (r.postId || null) : null;
+  });
+  const [detailPost, setDetailPost] = useState(null);        // fetched row when not in the loaded feed
+  const [detailState, setDetailState] = useState('idle');    // idle | loading | missing
+  // Composer modal (new post) / edit target (existing post through the same modal).
+  const [composerOpen, setComposerOpen] = useState(false);
+  const [editTarget, setEditTarget] = useState(null);        // { post, tags }
+  // Menus + delete confirm.
+  const [menuOpenId, setMenuOpenId] = useState(null);
+  const [confirmDel, setConfirmDel] = useState(null);        // { kind: 'post'|'comment', item, postId? }
+  const [busyDel, setBusyDel] = useState(false);
+  const lastLoadRef = useRef(0);
+  const activeTagRef = useRef('all');
+  const filterRef = useRef('latest');
+  const searchRef = useRef('');
+  const freeTagRef = useRef(null);
+  const selectedPostIdRef = useRef(selectedPostId);
+  const spaceIdRef = useRef(null);                           // live space for query builders + realtime guards
+  const spaceSlugRef = useRef(null);
+  // Deep-linked ?space= slug, held until the spaces RPC resolves.
+  const initialSpaceSlugRef = useRef((() => {
+    const r = readAppRoute();
+    return r.tab === 'community' ? (r.space || null) : null;
+  })());
+  const detailSeenRef = useRef(null);                        // last selection we initialized (comments/meta/seen)
+  const signedExpRef = useRef({});                           // storage_path -> expiry ts (re-sign before it lapses)
+  // Staleness guard: every loadFeed bumps the seq; any response (loadFeed or
+  // loadMore) that resolves after a newer load started is dropped, so a rapid
+  // filter switch can never commit the previous view's rows under the new one.
+  const loadSeqRef = useRef(0);
+  // Loaded-row count mirror for the stale-closure realtime/focus handlers, so a
+  // silent refresh can re-fetch everything on screen instead of truncating a
+  // paginated feed back to page 1 (which would unmount cards + their drafts).
+  const postsLenRef = useRef(0);
+  const postIdsRef = useRef(new Set());   // loaded feed ids — lets realtime skip meta refresh for off-screen posts
+  useEffect(() => { activeTagRef.current = activeTag; }, [activeTag]);
+  useEffect(() => { filterRef.current = filter; }, [filter]);
+  useEffect(() => { freeTagRef.current = freeTag; }, [freeTag]);
+  useEffect(() => { selectedPostIdRef.current = selectedPostId; }, [selectedPostId]);
+  useEffect(() => { postsLenRef.current = posts.length; postIdsRef.current = new Set(posts.map(p => p.id)); }, [posts]);
+
+  function buildFeedQuery({ tag, filter: filt, search, ids, from, limit = COMMUNITY_PAGE_SIZE }) {
+    // RLS hides 'hidden' rows from members (admins see them, badged); 'deleted'
+    // (author soft-deletes) is excluded for everyone, admins included.
+    let q = supabase.from('community_posts').select('*').neq('status', 'deleted');
+    // Space scoping (#32): null in legacy mode → unscoped, the pre-#32 feed.
+    if (spaceIdRef.current) q = q.eq('space_id', spaceIdRef.current);
+    if (filt === 'announcements') q = q.eq('tag_slug', COMMUNITY_ANNOUNCEMENTS_SLUG);
+    else if (tag && tag !== 'all') q = q.eq('tag_slug', tag);
+    if (filt === 'unanswered') q = q.eq('comment_count', 0);
+    if (ids) q = q.in('id', ids);
+    if (search) {
+      // Strip the chars PostgREST's or() grammar reserves + quotes/backslashes (a stray " or \
+      // otherwise makes a malformed or() value → 400), THEN escape ilike wildcards.
+      const safe = search.replace(/[(),"\\]/g, ' ').replace(/[%_]/g, '\\$&').trim();
+      if (safe) q = q.or(`title.ilike.%${safe}%,body.ilike.%${safe}%`);
+    }
+    if (filt === 'new') q = q.order('created_at', { ascending: false });
+    else q = q.order('pinned', { ascending: false }).order('last_activity_at', { ascending: false });
+    q = q.order('id', { ascending: false });                 // deterministic tiebreak for range paging
+    return q.range(from, from + limit - 1);
+  }
+
+  // Post ids carrying the active free-form #tag (two-step filter — no PostgREST embeds).
+  async function freeTagIds(ft) {
+    // Deterministic order so loadFeed and loadMore (which each call this independently)
+    // resolve the SAME id set — an unordered LIMIT can return a different 400 per call,
+    // making range paging skip rows. post_id desc ≈ newest-first (v4 uuids aren't time-
+    // ordered, but the order is at least STABLE across the two calls).
+    const { data, error } = await supabase.from('community_post_tags')
+      .select('post_id').eq('tag', ft).order('post_id', { ascending: false }).limit(400);
+    if (error) throw error;
+    return [...new Set((data || []).map(r => r.post_id))];
+  }
+
+  // Batch-sign private community-media paths (one createSignedUrls call per page),
+  // cached with expiry so re-renders and pagination never re-sign fresh paths.
+  async function signPaths(paths) {
+    const now = Date.now();
+    const need = [...new Set(paths)].filter(p => p && (!signedExpRef.current[p] || signedExpRef.current[p] < now + 5 * 60 * 1000));
+    if (!need.length) return;
+    const sidAtCall = spaceIdRef.current;      // a switch mid-flight invalidates these
+    try {
+      const { data, error } = await supabase.storage.from('community-media').createSignedUrls(need, 3600);
+      if (error) throw error;
+      if (sidAtCall !== spaceIdRef.current) return;   // adoptSpace already cleared the map
+      const add = {};
+      (data || []).forEach((r, i) => {
+        const p = r.path || need[i];
+        if (r.signedUrl) { add[p] = r.signedUrl; signedExpRef.current[p] = now + 3600 * 1000; }
+      });
+      if (Object.keys(add).length) setSignedUrls(prev => ({ ...prev, ...add }));
+    } catch { /* gallery shows placeholders; the next load retries */ }
+  }
+
+  // Per-post meta for a set of ids: participants (+ count fallback), reactions,
+  // attachments (+ signing), free tags. Client-side reduce (the CourseCatalog counts
+  // idiom) — no PostgREST embeds. Each query is independent + best-effort so a pre-#24
+  // database (no attachments/tags tables) degrades to the plain feed.
+  // `seq` pins this call to the feed load that requested it. Without it a switch to
+  // another space merges the PREVIOUS space's rows into the meta maps — and because
+  // popularTags reduces over every value of postTagsMeta (not just the loaded ids),
+  // private-space tag slugs would surface in the right rail of the space you switched
+  // to. Single-post refreshes pass no seq and are always current.
+  async function loadMeta(ids, seq = null) {
+    if (!ids.length) return;
+    // Two independent staleness axes. `seq` catches a newer feed load; the SPACE stamp
+    // catches a space switch — which `seq` alone misses for callers that pass no seq
+    // (the realtime single-post refresh), and that path is enough to merge a private
+    // space's tag slugs into postTagsMeta, whose every value feeds the popular-tags rail.
+    const sidAtCall = spaceIdRef.current;
+    const fresh = () => (seq === null || seq === loadSeqRef.current) && sidAtCall === spaceIdRef.current;
+    try {
+      // Only the ≤4-avatar participant strip needs these rows — the reply COUNT comes from
+      // the denormalized post.comment_count (CommunityTopicRow prefers it; `total` here is a
+      // pre-#24 fallback). So take a bounded, newest-first sample instead of every comment of
+      // every post on the page (a hot thread could otherwise ship hundreds of rows for 4 avatars).
+      const { data } = await supabase.from('community_comments')
+        .select('post_id,author_id,author_name,author_avatar_url').in('post_id', ids).eq('status', 'active')
+        .order('created_at', { ascending: false }).limit(ids.length * 12);
+      if (!fresh()) return;
+      setParticipantsMeta(prev => {
+        const next = { ...prev };
+        ids.forEach(id => { next[id] = { list: [], total: 0 }; });
+        (data || []).forEach(r => {
+          const m = next[r.post_id];
+          if (!m) return;
+          m.total += 1;
+          if (!m.list.some(p => p.id === r.author_id) && m.list.length < 4) {
+            m.list.push({ id: r.author_id, name: r.author_name, avatar: resolveAvatarUrl(r.author_avatar_url) });
+          }
+        });
+        return next;
+      });
+    } catch { /* cosmetic */ }
+    try {
+      const { data } = await supabase.from('community_reactions')
+        .select('post_id,reaction_type,user_id').in('post_id', ids);
+      if (!fresh()) return;
+      setReactMeta(prev => {
+        const next = { ...prev };
+        ids.forEach(id => { next[id] = { counts: {}, mine: new Set() }; });
+        (data || []).forEach(r => {
+          const m = next[r.post_id];
+          if (!m) return;
+          m.counts[r.reaction_type] = (m.counts[r.reaction_type] || 0) + 1;
+          if (r.user_id === uid) m.mine.add(r.reaction_type);
+        });
+        return next;
+      });
+    } catch { /* cosmetic */ }
+    try {
+      const { data, error } = await supabase.from('community_attachments')
+        .select('*').in('post_id', ids).order('position');
+      if (!error && fresh()) {
+        setAttachMeta(prev => {
+          const next = { ...prev };
+          ids.forEach(id => { next[id] = []; });
+          (data || []).forEach(a => { (next[a.post_id] = next[a.post_id] || []).push(a); });
+          return next;
+        });
+        signPaths((data || []).map(a => a.storage_path).filter(Boolean));
+      }
+    } catch { /* pre-#24 database */ }
+    try {
+      const { data, error } = await supabase.from('community_post_tags')
+        .select('post_id,tag').in('post_id', ids);
+      if (!error && fresh()) {
+        setPostTagsMeta(prev => {
+          const next = { ...prev };
+          ids.forEach(id => { next[id] = []; });
+          (data || []).forEach(r => { (next[r.post_id] = next[r.post_id] || []).push(r.tag); });
+          return next;
+        });
+      }
+    } catch { /* pre-#24 database */ }
+  }
+
+  async function loadFeed(silent = false) {
+    // The space engine failed, so spaceIdRef is null and this query would run UNSCOPED —
+    // a mixed cross-space feed presented as one space, and its success path would clear
+    // the very error banner that says so. Refuse; the only way out is a reload/retry.
+    if (spacesReadyRef.current === 'error') return;
+    const tag = activeTagRef.current, filt = filterRef.current, q = searchRef.current, ft = freeTagRef.current;
+    const seq = ++loadSeqRef.current;
+    if (!silent) { setLoading(true); setErr(''); }
+    try {
+      // Re-fetch everything already on screen (not just page 1) so a silent
+      // refresh never truncates a paginated feed and unmounts cards mid-draft.
+      const want = Math.max(postsLenRef.current, COMMUNITY_PAGE_SIZE);
+      const ids = ft ? await freeTagIds(ft) : null;
+      const sid = spaceIdRef.current;
+      let annQ = supabase.from('community_posts').select('*').eq('tag_slug', COMMUNITY_ANNOUNCEMENTS_SLUG).eq('status', 'active');
+      if (sid) annQ = annQ.eq('space_id', sid);
+      const [tagRes, postRes, cntRes, annRes, readRes] = await Promise.all([
+        supabase.from('community_tags').select('*').order('position').order('label'),
+        ids && !ids.length ? Promise.resolve({ data: [], error: null }) : buildFeedQuery({ tag, filter: filt, search: q, ids, from: 0, limit: want }),
+        // Grouped counts done server-side (#25 RPC → ~10 rows) instead of streaming every
+        // active post's tag_slug to the browser. Missing RPC (pre-#25) → cntRes.error, and the
+        // guard below just leaves the sidebar counts blank rather than erroring the whole feed.
+        // #32: scoped to the active space (the RPC stays SECURITY INVOKER — RLS is the boundary).
+        sid ? supabase.rpc('community_category_counts', { p_space_id: sid }) : supabase.rpc('community_category_counts'),
+        annQ.order('created_at', { ascending: false }).limit(3),
+        supabase.from('community_announcement_reads').select('post_id').eq('user_id', uid),
+      ]);
+      if (tagRes.error) throw tagRes.error;
+      if (postRes.error) throw postRes.error;
+      if (seq !== loadSeqRef.current) return;                                  // stale response — a newer load owns the feed
+      const tagRows = tagRes.data || [];
+      const rows = postRes.data || [];
+      setTags(tagRows);
+      setPosts(rows);
+      setHasMore(rows.length === want);   // loadMore recomputes the free-tag id set, so the ids path pages too
+      if (!cntRes.error) {
+        const counts = {};
+        (cntRes.data || []).forEach(r => { counts[r.tag_slug] = Number(r.n) || 0; });
+        setCatCounts(counts);
+      }
+      if (!annRes.error) setAnnPreview(annRes.data || []);
+      if (!readRes.error) setAnnReadIds(new Set((readRes.data || []).map(r => r.post_id)));
+      setSchemaGap(null); setErr(''); setPendingNew(0);
+      lastLoadRef.current = Date.now();
+      loadMeta(rows.map(r => r.id), seq);
+    } catch (e) {
+      if (seq !== loadSeqRef.current) return;                                  // a newer load owns the error surface too
+      logDbError('[Community] load', e, { tag, filter: filt });
+      const gap = communitySchemaGap(e);
+      if (gap) {
+        setSchemaGap(gap); setPosts([]);
+        if (gap === 'missing') setTags([]);
+      } else if (!silent) {
+        setErr(describeDbError(e, 'Could not load the community.'));
+      }
+    } finally {
+      // The NEWEST load always clears the skeleton (even a silent one — no-op when
+      // already false), so a superseded visible load can never strand loading=true.
+      if (seq === loadSeqRef.current) setLoading(false);
+    }
+  }
+
+  async function loadMore() {
+    if (loadingMore) return;
+    const tag = activeTagRef.current, filt = filterRef.current, q = searchRef.current, ft = freeTagRef.current;
+    const seq = loadSeqRef.current;
+    setLoadingMore(true);
+    try {
+      const ids = ft ? await freeTagIds(ft) : null;
+      const { data, error } = await buildFeedQuery({ tag, filter: filt, search: q, ids, from: posts.length });
+      if (error) throw error;
+      if (seq !== loadSeqRef.current) return;                                  // feed changed under us — drop the page
+      const rows = data || [];
+      setPosts(prev => {
+        const seen = new Set(prev.map(p => p.id));
+        return [...prev, ...rows.filter(r => !seen.has(r.id))];
+      });
+      setHasMore(rows.length === COMMUNITY_PAGE_SIZE);
+      lastLoadRef.current = Date.now();
+      loadMeta(rows.map(r => r.id), seq);
+    } catch (e) {
+      logDbError('[Community] load more', e, {});
+      if (seq === loadSeqRef.current) setErr(describeDbError(e, 'Could not load more posts.'));
+    } finally { setLoadingMore(false); }
+  }
+
+  function resetAndLoad() {
+    setPosts([]); setHasMore(false); setPendingNew(0);
+    postsLenRef.current = 0;   // fresh view asks for one page (the ref effect lags a render)
+    loadFeed(false);
+  }
+
+  function pickCategory(slug) {
+    if (slug === activeTagRef.current && filterRef.current !== 'announcements') return;
+    setActiveTag(slug); activeTagRef.current = slug;
+    if (filterRef.current === 'announcements') { setFilter('latest'); filterRef.current = 'latest'; }
+    resetAndLoad();
+  }
+
+  function pickFilter(f) {
+    if (f === filterRef.current) return;
+    setFilter(f); filterRef.current = f;
+    resetAndLoad();
+  }
+
+  function pickFreeTag(t) {
+    const next = t === freeTagRef.current ? null : t;
+    setFreeTag(next); freeTagRef.current = next;
+    resetAndLoad();
+  }
+
+  // ── Space engine (#32) ────────────────────────────────────────────
+  // Hard view reset when the active space changes — feed, meta, filters, and
+  // any open detail all belong to the OLD space and must never flash into the
+  // new one. keepPost=true (deep-link adoption) keeps the selected post.
+  function adoptSpace(sp, { keepPost = false, writeRoute = true, replace = false } = {}) {
+    if (!sp || sp.id === spaceIdRef.current) return;
+    spaceIdRef.current = sp.id;
+    spaceSlugRef.current = sp.slug;
+    setSpaceId(sp.id);
+    setPosts([]); setHasMore(false); setPendingNew(0); postsLenRef.current = 0;
+    setCatCounts({}); setAnnPreview([]);
+    setComments({}); setCommentReactMeta({});
+    setReactMeta({}); setParticipantsMeta({}); setAttachMeta({}); setPostTagsMeta({});
+    // Drop the previous space's live signed media URLs (1-hour TTL) and any open
+    // row menu — nothing renders them once attachMeta is cleared, but holding
+    // private-media URLs in memory after leaving the space is needless.
+    setSignedUrls({}); signedExpRef.current = {}; setMenuOpenId(null);
+    setSearchInput(''); searchRef.current = '';
+    setFreeTag(null); freeTagRef.current = null;
+    setActiveTag('all'); activeTagRef.current = 'all';
+    // The Unanswered filter needs replies — a reactions-only space can't show it.
+    if (filterRef.current === 'unanswered' && sp.member_comments === false) {
+      setFilter('latest'); filterRef.current = 'latest';
+    }
+    if (!keepPost && selectedPostIdRef.current) {
+      setSelectedPostId(null); selectedPostIdRef.current = null;
+      setDetailPost(null); setDetailState('idle'); detailSeenRef.current = null;
+    }
+    if (writeRoute) {
+      writeAppRoute('community', {
+        space: sp.slug,
+        ...(keepPost && selectedPostIdRef.current ? { postId: selectedPostIdRef.current } : {}),
+        replace,
+      });
+    }
+    window.storage.set('community:lastSpace', sp.slug).catch?.(() => {});
+    loadFeed(false);
+  }
+
+  const switchSpace = (slug) => adoptSpace(spaces.find(s => s.slug === slug) || null);
+
+  // Debounced search → applied value (refs first, then reload — the loadFeed idiom).
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const q = searchInput.trim();
+      if (q === searchRef.current) return;
+      searchRef.current = q;
+      setPosts([]); setHasMore(false); setPendingNew(0);
+      postsLenRef.current = 0;
+      loadFeed(false);
+    }, 300);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line
+  }, [searchInput]);
+
+  async function toggleReact(postId, type) {
+    if (!uid) return;
+    const cur = reactMeta[postId];
+    const has = !!(cur && cur.mine.has(type));
+    // Optimistic flip; on error, reload that post's meta (server truth wins).
+    setReactMeta(prev => {
+      const m = prev[postId] || { counts: {}, mine: new Set() };
+      const mine = new Set(m.mine);
+      const counts = { ...m.counts };
+      if (has) { mine.delete(type); counts[type] = Math.max(0, (counts[type] || 1) - 1); }
+      else { mine.add(type); counts[type] = (counts[type] || 0) + 1; }
+      return { ...prev, [postId]: { counts, mine } };
+    });
+    try {
+      if (has) {
+        const { error } = await supabase.from('community_reactions').delete()
+          .eq('post_id', postId).eq('user_id', uid).eq('reaction_type', type);
+        if (error) throw error;
+      } else {
+        const { error } = await supabase.from('community_reactions')
+          .insert({ post_id: postId, user_id: uid, reaction_type: type });
+        if (error && error.code !== '23505') throw error;  // 23505 = already reacted (race) — fine
+      }
+    } catch (e) {
+      logDbError('[Community] react', e, { postId, type });
+      loadMeta([postId]);
+    }
+  }
+
+  async function loadCommentReacts(commentIds) {
+    if (!commentIds.length) return;
+    try {
+      const { data, error } = await supabase.from('community_reactions')
+        .select('comment_id,reaction_type,user_id').in('comment_id', commentIds);
+      if (error) return;                                     // pre-#24 database (no comment_id column)
+      setCommentReactMeta(prev => {
+        const next = { ...prev };
+        commentIds.forEach(id => { next[id] = { counts: {}, mine: new Set() }; });
+        (data || []).forEach(r => {
+          const m = next[r.comment_id];
+          if (!m) return;
+          m.counts[r.reaction_type] = (m.counts[r.reaction_type] || 0) + 1;
+          if (r.user_id === uid) m.mine.add(r.reaction_type);
+        });
+        return next;
+      });
+    } catch { /* cosmetic */ }
+  }
+
+  async function toggleCommentReact(postId, commentId, type) {
+    if (!uid) return;
+    const cur = commentReactMeta[commentId];
+    const has = !!(cur && cur.mine.has(type));
+    setCommentReactMeta(prev => {
+      const m = prev[commentId] || { counts: {}, mine: new Set() };
+      const mine = new Set(m.mine);
+      const counts = { ...m.counts };
+      if (has) { mine.delete(type); counts[type] = Math.max(0, (counts[type] || 1) - 1); }
+      else { mine.add(type); counts[type] = (counts[type] || 0) + 1; }
+      return { ...prev, [commentId]: { counts, mine } };
+    });
+    try {
+      if (has) {
+        const { error } = await supabase.from('community_reactions').delete()
+          .eq('comment_id', commentId).eq('user_id', uid).eq('reaction_type', type);
+        if (error) throw error;
+      } else {
+        const { error } = await supabase.from('community_reactions')
+          .insert({ comment_id: commentId, user_id: uid, reaction_type: type });
+        if (error && error.code !== '23505') throw error;
+      }
+    } catch (e) {
+      logDbError('[Community] comment react', e, { commentId, type });
+      loadCommentReacts([commentId]);
+    }
+  }
+
+  async function loadComments(postId) {
+    setComments(prev => ({ ...prev, [postId]: { rows: (prev[postId] || {}).rows || [], loading: true, err: '' } }));
+    try {
+      // Newest 500, re-sorted chronological — an unbounded select would hit
+      // PostgREST's max_rows=1000 and silently truncate a huge thread at the
+      // OLD end (dropping the newest replies, which are the ones that matter).
+      const { data, error } = await supabase.from('community_comments').select('*')
+        .eq('post_id', postId).neq('status', 'deleted')
+        .order('created_at', { ascending: false }).limit(500);
+      if (error) throw error;
+      const rows = (data || []).reverse();
+      setComments(prev => ({ ...prev, [postId]: { rows, loading: false, err: '' } }));
+      loadCommentReacts(rows.map(r => r.id));
+    } catch (e) {
+      logDbError('[Community] comments', e, { postId });
+      setComments(prev => ({ ...prev, [postId]: { rows: [], loading: false, err: describeDbError(e, 'Could not load replies.') } }));
+    }
+  }
+
+  // Throws on failure — CommunityPostCard catches and shows an inline error.
+  async function addComment(postId, text) {
+    const row = { post_id: postId, author_id: uid, author_name: myName, body: text.slice(0, 2000) };
+    const { data, error } = await supabase.from('community_comments').insert(row).select().single();
+    if (error) throw error;
+    setComments(prev => ({ ...prev, [postId]: { rows: [...((prev[postId] || {}).rows || []), data], loading: false, err: '' } }));
+    const bump = (p) => (p.id === postId
+      ? { ...p, comment_count: (p.comment_count || 0) + 1, last_activity_at: data.created_at || p.last_activity_at }
+      : p);
+    setPosts(prev => prev.map(bump));
+    setDetailPost(prev => (prev && prev.id === postId ? bump(prev) : prev));
+  }
+
+  // Admin-only column patches (pin / lock — the community_posts_guard trigger freezes
+  // these for members server-side; this call site is admin-gated in the UI).
+  async function adminPatchPost(post, patch, label) {
+    try {
+      const { error } = await supabase.from('community_posts').update(patch).eq('id', post.id);
+      if (error) throw error;
+      setPosts(prev => prev.map(p => (p.id === post.id ? { ...p, ...patch } : p)));
+      setDetailPost(prev => (prev && prev.id === post.id ? { ...prev, ...patch } : prev));
+      if ('pinned' in patch) loadFeed(true);                 // pin flips feed order
+    } catch (e) {
+      logDbError('[Community] admin patch', e, { id: post.id, patch });
+      setErr(describeDbError(e, `Could not ${label}.`));
+    }
+  }
+  const togglePin = (post) => adminPatchPost(post, { pinned: !post.pinned }, post.pinned ? 'unpin the post' : 'pin the post');
+  const toggleLock = (post) => adminPatchPost(post, { comments_locked: !post.comments_locked }, post.comments_locked ? 'unlock replies' : 'lock replies');
+
+  async function moderatePost(post, nextStatus) {
+    try {
+      const { error } = await supabase.from('community_posts').update({ status: nextStatus }).eq('id', post.id);
+      if (error) throw error;
+      setPosts(prev => prev.map(p => (p.id === post.id ? { ...p, status: nextStatus } : p)));
+      setDetailPost(prev => (prev && prev.id === post.id ? { ...prev, status: nextStatus } : prev));
+    } catch (e) {
+      logDbError('[Community] moderate', e, { id: post.id, nextStatus });
+      setErr(describeDbError(e, 'Could not update the post.'));
+    }
+  }
+
+  async function moderateComment(postId, cm, nextStatus) {
+    try {
+      const { error } = await supabase.from('community_comments').update({ status: nextStatus }).eq('id', cm.id);
+      if (error) throw error;
+      setComments(prev => ({
+        ...prev,
+        [postId]: { ...(prev[postId] || { loading: false, err: '' }), rows: ((prev[postId] || {}).rows || []).map(r => (r.id === cm.id ? { ...r, status: nextStatus } : r)) },
+      }));
+      // Hide/restore changes the active count (the rollup trigger recomputed it server-side).
+      const delta = nextStatus === 'active' ? 1 : -1;
+      const bump = (p) => (p.id === postId ? { ...p, comment_count: Math.max(0, (p.comment_count || 0) + delta) } : p);
+      setPosts(prev => prev.map(bump));
+      setDetailPost(prev => (prev && prev.id === postId ? bump(prev) : prev));
+      loadMeta([postId]);
+    } catch (e) {
+      logDbError('[Community] moderate comment', e, { id: cm.id, nextStatus });
+      setErr(describeDbError(e, 'Could not update the comment.'));
+    }
+  }
+
+  // Members soft-delete their own rows (status='deleted' — no DELETE policy exists for
+  // them); admins hard-delete (FK cascade clears a post's comments/reactions/attachments,
+  // and the storage files are removed after — attachment files are never shared across
+  // posts, unlike course media, so no removeMediaIfUnreferenced-style refcheck is needed).
+  async function doDelete() {
+    if (!confirmDel || busyDel) return;
+    const { kind, item, postId } = confirmDel;
+    setBusyDel(true);
+    try {
+      const table = kind === 'post' ? 'community_posts' : 'community_comments';
+      let mediaPaths = [];
+      if (kind === 'post' && isAdmin) {
+        mediaPaths = (attachMeta[item.id] || []).filter(a => a.storage_path).map(a => a.storage_path);
+        if (!mediaPaths.length) {
+          try {
+            const { data } = await supabase.from('community_attachments').select('storage_path').eq('post_id', item.id);
+            mediaPaths = (data || []).map(a => a.storage_path).filter(Boolean);
+          } catch { /* pre-#24 database */ }
+        }
+      }
+      const { error } = isAdmin
+        ? await supabase.from(table).delete().eq('id', item.id)
+        : await supabase.from(table).update({ status: 'deleted' }).eq('id', item.id);
+      if (error) throw error;
+      if (kind === 'post') {
+        if (isAdmin && mediaPaths.length) {
+          supabase.storage.from('community-media').remove(mediaPaths).catch(() => {});
+        }
+        setPosts(prev => prev.filter(p => p.id !== item.id));
+        if (selectedPostIdRef.current === item.id) closePost();
+      } else {
+        setComments(prev => ({
+          ...prev,
+          [postId]: { ...(prev[postId] || { loading: false, err: '' }), rows: ((prev[postId] || {}).rows || []).filter(r => r.id !== item.id) },
+        }));
+        if (item.status === 'active') {
+          const bump = (p) => (p.id === postId ? { ...p, comment_count: Math.max(0, (p.comment_count || 1) - 1) } : p);
+          setPosts(prev => prev.map(bump));
+          setDetailPost(prev => (prev && prev.id === postId ? bump(prev) : prev));
+        }
+      }
+      setConfirmDel(null);
+    } catch (e) {
+      logDbError('[Community] delete', e, { kind, id: item.id });
+      setErr(describeDbError(e, 'Could not delete. Please try again.'));
+      setConfirmDel(null);
+    } finally { setBusyDel(false); }
+  }
+
+  // Opening a post clears its unread notifications for me and (for announcements)
+  // stamps the read marker — then pokes the bell so the badge updates instantly.
+  async function markPostSeen(post) {
+    if (!uid || !post) return;
+    try {
+      await supabase.from('community_notifications').update({ read_at: new Date().toISOString() })
+        .eq('user_id', uid).eq('post_id', post.id).is('read_at', null);
+    } catch { /* pre-#24 database */ }
+    if (post.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG && post.author_id !== uid && !annReadIds.has(post.id)) {
+      await markAnnRead(post);
+      return;                                                // markAnnRead already poked
+    }
+    try { window.dispatchEvent(new CustomEvent(COMMUNITY_BELL_POKE)); } catch {}
+  }
+
+  async function markAnnRead(post) {
+    setAnnReadIds(prev => { const n = new Set(prev); n.add(post.id); return n; });
+    try {
+      await supabase.from('community_announcement_reads')
+        .upsert({ user_id: uid, post_id: post.id }, { onConflict: 'user_id,post_id', ignoreDuplicates: true });
+      window.dispatchEvent(new CustomEvent(COMMUNITY_BELL_POKE));
+    } catch { /* pre-#24 database */ }
+  }
+
+  // ── Detail view (?post=) ──────────────────────────────────────────
+  function openPost(post) {
+    if (menuOpenId) setMenuOpenId(null);
+    setDetailPost(post); setDetailState('idle');
+    setSelectedPostId(post.id);
+    writeAppRoute('community', { space: spaceSlugRef.current || undefined, postId: post.id });
+  }
+
+  function closePost() {
+    setSelectedPostId(null); setDetailPost(null); setDetailState('idle');
+    detailSeenRef.current = null;
+    writeAppRoute('community', { space: spaceSlugRef.current || undefined, replace: true });
+  }
+
+  // Back/Forward + bell deep links re-sync the selection from the URL (the
+  // CourseCatalog popstate idiom, plus the route-change event for in-app writes).
+  useEffect(() => {
+    const sync = () => {
+      const r = readAppRoute();
+      if (r.tab !== 'community') return;
+      // Back/Forward across a space switch: re-adopt the URL's space (no route
+      // write — the URL is already right). A missing/foreign slug is ignored.
+      if (r.space && r.space !== spaceSlugRef.current) {
+        const sp = spacesRef.current.find(s => s.slug === r.space);
+        if (sp) {
+          // adoptSpace wipes `comments`/meta, so an entry that changes only ?space=
+          // while keeping ?post= must re-initialize the open detail (same reset the
+          // deep-link adoption does) or its replies stay blank with no reload.
+          detailSeenRef.current = null;
+          adoptSpace(sp, { keepPost: !!r.postId, writeRoute: false });
+        }
+      }
+      const next = r.postId || null;
+      if (selectedPostIdRef.current === next) return;
+      if (!next) { setDetailPost(null); setDetailState('idle'); detailSeenRef.current = null; }
+      setSelectedPostId(next);
+    };
+    window.addEventListener('popstate', sync);
+    window.addEventListener(APP_ROUTE_CHANGE_EVENT, sync);
+    return () => {
+      window.removeEventListener('popstate', sync);
+      window.removeEventListener(APP_ROUTE_CHANGE_EVENT, sync);
+    };
+  }, []);
+
+  // Initialize a selection once per post id: load replies + meta, mark seen, and fetch
+  // the row when it isn't in the loaded feed (deep link / bell click / right rail).
+  useEffect(() => {
+    // Wait for the space bootstrap. On a cold mount (every bell click — NotificationBell
+    // navigates with ?post= and no ?space=) this effect's single-row PK select would
+    // otherwise beat my_community_spaces()' aggregate, leaving spacesRef empty so the
+    // auto-adopt below silently no-ops. The stale space then drives canComment/spaceId,
+    // rendering a reply composer on a post whose space refuses member comments.
+    if (!selectedPostId || !uid || spacesReady === null || spacesReady === 'error') return;
+    const row = posts.find(p => p.id === selectedPostId) || (detailPost?.id === selectedPostId ? detailPost : null);
+    if (row && detailPost?.id !== row.id) setDetailPost(row);
+    if (detailSeenRef.current === selectedPostId) return;
+    detailSeenRef.current = selectedPostId;
+    loadComments(selectedPostId);
+    loadMeta([selectedPostId]);
+    if (row) { setDetailState('idle'); markPostSeen(row); return; }
+    setDetailState('loading');
+    (async () => {
+      try {
+        const { data, error } = await supabase.from('community_posts').select('*')
+          .eq('id', selectedPostId).neq('status', 'deleted').maybeSingle();
+        if (error) throw error;
+        if (selectedPostIdRef.current !== selectedPostId) return;
+        if (!data) { setDetailState('missing'); return; }
+        setDetailPost(data); setDetailState('idle');
+        markPostSeen(data);
+        // Deep link into a DIFFERENT accessible space (bell click, pasted URL):
+        // adopt that space so closing the post lands on the right feed. RLS
+        // already proved access (the row came back). detailSeenRef resets so
+        // this effect re-initializes replies/meta after the adoption wipe.
+        if (data.space_id && data.space_id !== spaceIdRef.current) {
+          const sp = spacesRef.current.find(s => s.id === data.space_id);
+          if (sp) {
+            detailSeenRef.current = null;
+            adoptSpace(sp, { keepPost: true, replace: true });
+          }
+        }
+      } catch (e) {
+        if (selectedPostIdRef.current !== selectedPostId) return;
+        logDbError('[Community] post detail', e, { id: selectedPostId });
+        const gap = communitySchemaGap(e);
+        if (gap) setSchemaGap(gap); else setDetailState('missing');
+      }
+    })();
+    // eslint-disable-next-line
+  }, [selectedPostId, uid, posts.length, spacesReady]);
+
+  // Long-dwell detail views outlive the 1-hour signed URLs: periodically (and
+  // on tab return) re-sign the open post's attachment paths. signPaths no-ops
+  // while URLs are still fresh and retries a previously failed batch.
+  useEffect(() => {
+    if (!selectedPostId) return;
+    const paths = (attachMeta[selectedPostId] || []).map(a => a.storage_path).filter(Boolean);
+    if (!paths.length) return;
+    const resign = () => { signPaths(paths); };
+    const iv = setInterval(resign, 4 * 60 * 1000);
+    const onVis = () => { if (!document.hidden) resign(); };
+    document.addEventListener('visibilitychange', onVis);
+    return () => { clearInterval(iv); document.removeEventListener('visibilitychange', onVis); };
+    // eslint-disable-next-line
+  }, [selectedPostId, attachMeta]);
+
+  // ── Composer callbacks ────────────────────────────────────────────
+  function handlePublished(post, warns) {
+    setComposerOpen(false); setEditTarget(null);
+    setReactMeta(prev => ({ ...prev, [post.id]: { counts: {}, mine: new Set() } }));
+    if (warns && warns.length) {
+      setErr(`Your post is live, but its ${warns.join(' and ')} didn’t save. You can delete the post and try again.`);
+    }
+    // Reset the view so the new post is visible near the top.
+    setFilter('latest'); filterRef.current = 'latest';
+    setSearchInput(''); searchRef.current = '';
+    setFreeTag(null); freeTagRef.current = null;
+    if (activeTagRef.current !== 'all' && activeTagRef.current !== post.tag_slug) {
+      setActiveTag('all'); activeTagRef.current = 'all';
+    }
+    setPosts([]); setHasMore(false); postsLenRef.current = 0;
+    loadFeed(false);
+  }
+
+  function handleSaved(postId, patch, nextTags) {
+    setComposerOpen(false); setEditTarget(null);
+    setPosts(prev => prev.map(p => (p.id === postId ? { ...p, ...patch } : p)));
+    setDetailPost(prev => (prev && prev.id === postId ? { ...prev, ...patch } : prev));
+    setPostTagsMeta(prev => ({ ...prev, [postId]: nextTags || [] }));
+  }
+
+  const openEdit = (post) => setEditTarget({ post, tags: postTagsMeta[post.id] || [] });
+
+  // Mount bootstrap: resolve the accessible spaces FIRST, pick the initial one
+  // (?space= deep link → last selection from window.storage → the RPC default:
+  // gold/vip land in their private space), then load the scoped feed. A pre-#32
+  // DB (RPC missing → PGRST202/404) drops to legacy single-space mode.
+  useEffect(() => {
+    if (!uid) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data, error } = await supabase.rpc('my_community_spaces');
+        if (error) throw error;
+        if (cancelled) return;
+        const rows = data || [];
+        // Post-#32 every gate-passing member resolves at least General, so zero rows
+        // means the General space is missing/deactivated — a misconfiguration, NOT a
+        // pre-#32 database. Falling through to unscoped mode here would be wrong.
+        if (!rows.length) {
+          setSpacesReady('error');
+          setErr('No community spaces are available for your account. If this persists, contact support.');
+          setLoading(false);
+          return;
+        }
+        setSpaces(rows);
+        let stored = null;
+        // window.storage.get resolves to { value } — unwrap it or the stored slug
+        // never matches and the last-selection preference is silently dead.
+        try { stored = (await window.storage.get('community:lastSpace'))?.value || null; } catch { /* pref only */ }
+        if (cancelled) return;
+        const chosen = pickInitialSpace({ urlSlug: initialSpaceSlugRef.current, storedSlug: stored, spaces: rows });
+        if (chosen) {
+          spaceIdRef.current = chosen.id;
+          spaceSlugRef.current = chosen.slug;
+          setSpaceId(chosen.id);
+          // Make the first history entry carry the space so Back restores it and the
+          // initial URL is shareable (the bootstrap previously left /community bare).
+          // Read the ref, not the render-scope value: the bell can open a post while this
+          // effect is still awaiting, and a stale capture would drop ?post= on replace.
+          writeAppRoute('community', { space: chosen.slug, postId: selectedPostIdRef.current || undefined, replace: true });
+        }
+        setSpacesReady(true);
+        loadFeed(false);
+      } catch (e) {
+        if (cancelled) return;
+        // "Is this a pre-#32 database?" is a question about the SCHEMA, and an error code
+        // alone cannot answer it — legacy mode leaves spaceId null, which is how a private
+        // post gets filed into General, so a false positive here reopens the whole leak:
+        //   • my_community_spaces() calls user_community_space_ids(); if THAT helper is
+        //     missing, Postgres raises 42883 with "function … does not exist" — the outer
+        //     RPC exists and the DB is #32, but a code/message test says "pre-#32".
+        //   • PGRST202 is a schema-CACHE miss, not proof of absence (reload windows,
+        //     pool restarts).
+        // So treat those only as a hint, then confirm against the table itself.
+        const code = String(e?.code || '');
+        const msg = String(e?.message || '');
+        const maybePre32 = code === 'PGRST202'
+          || (/my_community_spaces/i.test(msg) && /does not exist|could not find/i.test(msg));
+        if (maybePre32) {
+          const probe = await supabase.from('community_spaces').select('id').limit(1);
+          if (cancelled) return;
+          // Same missing-table codes AdminEnrollments uses for its pre-#32 sentinel.
+          if (probe.error && ['42P01', 'PGRST205'].includes(String(probe.error.code))) {
+            setSpacesReady('legacy'); loadFeed(false); return;
+          }
+        }
+        setSpacesReady('error');
+        setErr(describeDbError(e, 'Could not load your community spaces. Check your connection and retry.'));
+        setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line
+  }, [uid]);
+
+  // Menus: Escape + a document-level pointerdown outside-click (the house dropdown
+  // idiom — never a fixed-inset catcher).
+  useEffect(() => {
+    if (!menuOpenId) return;
+    const onKey = (e) => { if (e.key === 'Escape') setMenuOpenId(null); };
+    const onPointerDown = (e) => { if (!(e.target.closest && e.target.closest('[data-community-menu]'))) setMenuOpenId(null); };
+    window.addEventListener('keydown', onKey);
+    document.addEventListener('pointerdown', onPointerDown, true);
+    return () => { window.removeEventListener('keydown', onKey); document.removeEventListener('pointerdown', onPointerDown, true); };
+  }, [menuOpenId]);
+
+  // Realtime INSERTs (best-effort — inert if the tables aren't in the publication;
+  // payloads respect RLS) + a throttled focus refetch as the fallback. New posts show
+  // as a "new discussions" pill instead of auto-prepending (no mid-scroll jumps, and
+  // raw payloads lack attachment/tag meta anyway).
+  useEffect(() => {
+    // Wait for the bootstrap; and in 'error' never subscribe — the focus refetch it
+    // registers would run loadFeed unscoped and wipe the error banner.
+    if (!uid || spacesReady === null || spacesReady === 'error') return;
+    // #32: one channel per active space, filtered server-side (space_id rides on
+    // posts AND comments — the comment denorm exists for exactly this filter).
+    // The filter is efficiency, not the boundary: delivery already respects RLS.
+    // Legacy mode (no spaceId) keeps the unfiltered pre-#32 channel.
+    const sid = spaceId || null;
+    const spaceFilter = sid ? { filter: `space_id=eq.${sid}` } : {};
+    const ch = supabase
+      .channel(sid ? `community-feed-${sid}` : 'community-feed')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'community_posts', ...spaceFilter }, (payload) => {
+        const row = payload.new;
+        if (!row || row.author_id === uid || row.status !== 'active') return;   // own posts reload locally
+        if (spaceIdRef.current && row.space_id && row.space_id !== spaceIdRef.current) return;  // belt-and-braces
+        // Only count arrivals the CURRENT view could surface — a pill whose
+        // refresh visibly changes nothing reads as broken. Search / #tag views
+        // skip the pill; category + Announcements views require a tag match.
+        if (searchRef.current || freeTagRef.current) return;
+        if (activeTagRef.current !== 'all' && row.tag_slug !== activeTagRef.current) return;
+        if (filterRef.current === 'announcements' && row.tag_slug !== COMMUNITY_ANNOUNCEMENTS_SLUG) return;
+        setPendingNew(n => n + 1);
+      })
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'community_comments', ...spaceFilter }, (payload) => {
+        const cm = payload.new;
+        const pid = cm && cm.post_id;
+        if (!pid || cm.author_id === uid) return;                              // own comments append locally
+        if (spaceIdRef.current && cm.space_id && cm.space_id !== spaceIdRef.current) return;    // belt-and-braces
+        if (cm.status === 'active') {
+          const bump = (p) => (p.id === pid
+            ? { ...p, comment_count: (p.comment_count || 0) + 1, last_activity_at: cm.created_at || p.last_activity_at }
+            : p);
+          setPosts(prev => prev.map(bump));
+          setDetailPost(prev => (prev && prev.id === pid ? bump(prev) : prev));
+        }
+        // Only refresh meta for a post that's actually on screen or open — RLS lets a member
+        // read every active comment forum-wide, so without this guard an idle keep-alive tab
+        // fires loadMeta's queries for every comment anyone posts anywhere.
+        if (selectedPostIdRef.current === pid || postIdsRef.current.has(pid)) loadMeta([pid]);
+        if (selectedPostIdRef.current === pid) loadComments(pid);
+      })
+      .subscribe();
+    const onFocus = () => { if (Date.now() - lastLoadRef.current > 30000) loadFeed(true); };
+    window.addEventListener('focus', onFocus);
+    return () => { supabase.removeChannel(ch); window.removeEventListener('focus', onFocus); };
+    // eslint-disable-next-line
+  }, [uid, spaceId, spacesReady]);
+
+  const activeTags = tags.filter(t => t.active);
+  const composerTags = activeTags.filter(t => isAdmin || !t.admin_only);   // Announcements chip = admins only
+  // #32 capability flags — legacy mode (no space) keeps today's full behavior.
+  // spacesReady === 'error' means we don't know the space: refuse every write
+  // rather than let it default into General (see the spacesReady comment above).
+  const spacesFailed = spacesReady === 'error';
+  const currentSpace = spaceId ? (spaces.find(s => s.id === spaceId) || null) : null;
+  const memberCanComment = !currentSpace || currentSpace.member_comments !== false;
+  const canComment = !spacesFailed && (isAdmin || memberCanComment);  // admins moderate/answer everywhere (admin_all RLS)
+  const canPost = !spacesFailed && (isAdmin || !currentSpace || currentSpace.member_posting !== false);
+  const canReact = !spacesFailed && (isAdmin || !currentSpace || currentSpace.member_reactions !== false);
+  const tagBySlug = {};
+  tags.forEach(t => { tagBySlug[t.slug] = t; });
+  const detailRow = selectedPostId ? (posts.find(p => p.id === selectedPostId) || detailPost) : null;
+  const totalCount = Object.values(catCounts).reduce((a, b) => a + b, 0);
+  const topPosts = posts
+    .filter(p => p.status === 'active' && (p.comment_count || 0) > 0)
+    .slice().sort((a, b) => (b.comment_count || 0) - (a.comment_count || 0)).slice(0, 5);
+  const popularTags = (() => {
+    const m = {};
+    Object.values(postTagsMeta).forEach(list => (list || []).forEach(t => { m[t] = (m[t] || 0) + 1; }));
+    return Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 10);
+  })();
+
+  const emptyCopy = (() => {
+    // The feed is intentionally not loaded in this state — don't invite a post.
+    if (spacesFailed) return { title: 'Community unavailable', desc: 'We couldn’t work out which communities you have access to, so the feed is paused. Reload the page to try again.' };
+    if (searchRef.current) return { title: 'No matches', desc: `No discussions match “${searchRef.current}”. Try a different search.` };
+    if (freeTag) return { title: 'Nothing tagged yet', desc: `No discussions tagged #${freeTag} yet.` };
+    if (filter === 'unanswered') return { title: 'All caught up', desc: 'No unanswered discussions — every question has a reply.' };
+    if (filter === 'announcements') return { title: 'No announcements yet', desc: isAdmin ? 'Post the first announcement — it publishes to every member.' : 'Announcements from Coach Alex’s team will appear here.' };
+    if (activeTag !== 'all') return { title: 'Nothing here yet', desc: `No discussions in ${(tagBySlug[activeTag] || {}).label || 'this category'} yet — be the first to start one.` };
+    return { title: 'No discussions yet', desc: 'Start the first discussion — introduce yourself or ask a question.' };
+  })();
+
+  return (
+    <div>
+      <SectionHead eyebrow="Member Community" title="Community"
+        desc={isAdmin
+          ? 'Post announcements, pin important discussions, and moderate the forum inline.'
+          : 'A member forum — ask questions, share wins, discuss the courses, and follow announcements.'} gold />
+
+      {!schemaGap && (
+        <CommunitySpaceSwitcher spaces={spaces} activeId={spaceId} onSwitch={switchSpace} />
+      )}
+
+      {spacesReady === 'legacy' && isAdmin && !schemaGap && (
+        <div className="mb-4 max-w-3xl mx-auto">
+          <AdminNotice kind="warn">
+            Community spaces aren’t set up yet — run <code>db/2026-07-28-community-spaces-batches.sql</code> (#32)
+            in the Supabase SQL Editor, then refresh. Until then the community runs as one shared feed.
+          </AdminNotice>
+        </div>
+      )}
+
+      {spacesReady === true && currentSpace && currentSpace.member_comments === false && !selectedPostId && !schemaGap && (
+        <div className="mb-4 max-w-6xl mx-auto inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold"
+          style={{ background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)', color: 'var(--status-info-fg)' }}>
+          <ThumbsUp size={12} /> Reactions only — start discussions and react here; member replies are off in {currentSpace.name}.
+        </div>
+      )}
+
+      {err && (
+        <div className="mb-4 max-w-3xl mx-auto p-4 rounded-xl border flex items-start gap-3"
+          style={{ background: 'var(--status-danger-bg)', borderColor: 'var(--status-danger-bd)' }}>
+          <AlertTriangle size={18} className="mt-0.5 flex-shrink-0" style={{ color: 'var(--status-danger-fg)' }} />
+          <div className="text-sm flex-1" style={{ color: C.text }}>{err}</div>
+          <button onClick={() => setErr('')} aria-label="Dismiss" className="transition hover:opacity-70" style={{ color: 'var(--status-danger-fg)' }}>
+            <X size={16} />
+          </button>
+        </div>
+      )}
+
+      {schemaGap ? (
+        <div className="mt-6 max-w-3xl mx-auto glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
+          <MessagesSquare size={40} className="mx-auto mb-3" style={{ color: ROYAL }} />
+          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">
+            {isAdmin ? 'Finish backend setup' : 'Community is coming soon'}
+          </div>
+          <div className="text-slate-500 mt-2 text-sm max-w-md mx-auto">
+            {isAdmin
+              ? (schemaGap === 'missing'
+                ? 'The community tables aren’t in Supabase yet. Run db/2026-07-20-community.sql (#23) and then db/2026-07-21-community-forum.sql (#24) in the SQL Editor (see COMMUNITY_SETUP.md), then refresh this page.'
+                : 'The forum upgrade hasn’t been applied yet. Run db/2026-07-21-community-forum.sql (#24) in the SQL Editor (see COMMUNITY_SETUP.md), then refresh this page.')
+              : 'The member community is being set up — check back soon to introduce yourself, ask questions, and share your wins.'}
+          </div>
+          {isAdmin && (
+            <div className="mt-4 inline-flex items-center gap-2 text-xs font-semibold px-3 py-1.5 rounded-full"
+              style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)' }}>
+              <AlertTriangle size={13} /> See COMMUNITY_SETUP.md
+            </div>
+          )}
+        </div>
+      ) : selectedPostId ? (
+        /* ── Post detail (deep-linkable ?post=<id>) ── */
+        <div className="max-w-3xl mx-auto">
+          <button onClick={closePost}
+            className="gh-btn-ghost mb-4 inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-semibold">
+            <ArrowLeft size={15} /> All discussions
+          </button>
+          {/* Row presence wins over the fetch state machine — the feed often
+              already holds the post even when the by-id fetch failed or hung.
+              key: a bell click can swap A→B with both rows loaded; an unkeyed
+              card would carry A's half-typed reply into B's thread. */}
+          {!detailRow ? (
+            detailState === 'missing' ? (
+              <div className="glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
+                <MessagesSquare size={36} className="mx-auto mb-3" style={{ color: ROYAL }} />
+                <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg font-bold">Discussion not found</div>
+                <div className="text-slate-500 mt-2 text-sm max-w-sm mx-auto">
+                  It may have been removed, or the link is out of date.
+                </div>
+              </div>
+            ) : (
+              <AdminListSkeleton rows={2} />
+            )
+          ) : (
+            <CommunityPostCard key={detailRow.id} post={detailRow} tag={tagBySlug[detailRow.tag_slug]}
+              postTags={postTagsMeta[detailRow.id] || []}
+              attachments={attachMeta[detailRow.id] || []}
+              signedUrls={signedUrls}
+              canComment={canComment} canReact={canReact} spaceId={spaceId}
+              isAdmin={isAdmin} uid={uid} myName={myName} myAvatar={myAvatar}
+              commentCount={typeof detailRow.comment_count === 'number' ? detailRow.comment_count : ((comments[detailRow.id] || {}).rows || []).filter(r => r.status === 'active').length}
+              reactions={reactMeta[detailRow.id]}
+              commentsState={comments[detailRow.id]}
+              commentReacts={commentReactMeta}
+              annUnread={detailRow.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG && detailRow.author_id !== uid && !annReadIds.has(detailRow.id)}
+              menuOpen={menuOpenId === detailRow.id}
+              onMenuToggle={() => setMenuOpenId(v => (v === detailRow.id ? null : detailRow.id))}
+              onToggleReact={toggleReact}
+              onToggleCommentReact={toggleCommentReact}
+              onAddComment={addComment}
+              onEdit={openEdit}
+              onModerate={moderatePost}
+              onModerateComment={moderateComment}
+              onAskDelete={setConfirmDel}
+              onTogglePin={togglePin}
+              onToggleLock={toggleLock}
+              onMarkAnnRead={markAnnRead} />
+          )}
+        </div>
+      ) : (
+        /* ── Forum home: category rail · feed · right rail ── */
+        <div className="max-w-6xl mx-auto">
+          <div className="lg:grid lg:grid-cols-[218px_minmax(0,1fr)] xl:grid-cols-[218px_minmax(0,1fr)_264px] lg:gap-5 lg:items-start">
+            <div className="hidden lg:block">
+              <CommunityCategoryRail tags={activeTags} counts={catCounts} activeTag={activeTag}
+                filter={filter} onPick={pickCategory} totalCount={totalCount} />
+            </div>
+
+            <div className="min-w-0">
+              <CommunityFilterTabs filter={filter} onFilter={pickFilter}
+                searchInput={searchInput} onSearchInput={setSearchInput}
+                showUnanswered={canComment}
+                onNewTopic={canPost ? () => setComposerOpen(true) : null} />
+
+              {/* Category chips — the < lg fallback for the rail */}
+              <div className="lg:hidden mt-3 -mx-1 px-1 overflow-x-auto">
+                <div className="flex items-center gap-1.5 w-max pb-1">
+                  <button onClick={() => pickCategory('all')}
+                    className={`gh-pill px-3.5 py-1.5 text-xs font-semibold${activeTag === 'all' && filter !== 'announcements' ? ' is-active' : ''}`}>
+                    All
+                  </button>
+                  {activeTags.map(t => {
+                    const Icon = COMMUNITY_TAG_ICONS[t.slug] || MessageSquare;
+                    return (
+                      <button key={t.slug} onClick={() => pickCategory(t.slug)}
+                        className={`gh-pill inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold${activeTag === t.slug && filter !== 'announcements' ? ' is-active' : ''}`}>
+                        <Icon size={12} /> {t.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {freeTag && (
+                <div className="mt-3 flex items-center gap-2">
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold"
+                    style={{ background: 'var(--primary-tint)', color: C.primary }}>
+                    #{freeTag}
+                    <button onClick={() => pickFreeTag(freeTag)} aria-label={`Clear tag filter ${freeTag}`}
+                      className="transition hover:opacity-70"><X size={12} /></button>
+                  </span>
+                  <span style={{ fontSize: 11.5, color: C.textMute }}>Showing discussions with this tag</span>
+                </div>
+              )}
+
+              {pendingNew > 0 && (
+                <button onClick={() => { setPendingNew(0); loadFeed(true); }}
+                  className="mt-3 w-full py-2 rounded-xl text-xs font-bold transition hover:opacity-90 inline-flex items-center justify-center gap-1.5"
+                  style={{ background: 'var(--primary-tint)', color: C.primary, border: '1px solid var(--primary-halo)' }}>
+                  <RefreshCw size={13} /> {pendingNew} new {pendingNew === 1 ? 'discussion' : 'discussions'} — tap to refresh
+                </button>
+              )}
+
+              <div className="mt-4">
+                {loading && posts.length === 0 ? (
+                  <AdminListSkeleton rows={5} />
+                ) : posts.length === 0 ? (
+                  <div className="glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
+                    <MessagesSquare size={36} className="mx-auto mb-3" style={{ color: ROYAL }} />
+                    <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg font-bold">{emptyCopy.title}</div>
+                    <div className="text-slate-500 mt-2 text-sm max-w-sm mx-auto">{emptyCopy.desc}</div>
+                  </div>
+                ) : (
+                  <div className="space-y-2.5">
+                    {posts.map(post => (
+                      <CommunityTopicRow key={post.id} post={post} tag={tagBySlug[post.tag_slug]}
+                        postTags={postTagsMeta[post.id] || []}
+                        isAdmin={isAdmin}
+                        participants={participantsMeta[post.id]}
+                        reactTotal={Object.values((reactMeta[post.id] || {}).counts || {}).reduce((a, b) => a + b, 0)}
+                        attachCount={(attachMeta[post.id] || []).length}
+                        annUnread={post.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG && post.author_id !== uid && !annReadIds.has(post.id)}
+                        onOpen={openPost} />
+                    ))}
+                    {hasMore && (
+                      <div className="text-center pt-2">
+                        <button onClick={loadMore} disabled={loadingMore}
+                          className="gh-btn-ghost inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold disabled:opacity-60">
+                          {loadingMore ? <Loader2 size={15} className="animate-spin" /> : <ChevronDown size={15} />} Load more
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="hidden xl:block">
+              <CommunityRightRail announcements={annPreview} annReadIds={annReadIds} uid={uid}
+                topPosts={topPosts} popularTags={popularTags}
+                onOpen={openPost} onPickFreeTag={pickFreeTag} />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {(composerOpen || editTarget) && (
+        <CommunityComposer key={editTarget ? `edit-${editTarget.post.id}` : 'new'}
+          editPost={editTarget ? editTarget.post : null}
+          editTags={editTarget ? editTarget.tags : []}
+          spaceId={spaceId} spaceName={currentSpace ? currentSpace.name : null}
+          composerTags={composerTags} uid={uid} myName={myName} myAvatar={myAvatar}
+          onClose={() => { setComposerOpen(false); setEditTarget(null); }}
+          onPublished={handlePublished}
+          onSaved={handleSaved} />
+      )}
+
+      {confirmDel && (
+        <AccountModal
+          title={confirmDel.kind === 'post' ? 'Delete this post?' : 'Delete this reply?'}
+          subtitle={isAdmin ? 'Admin delete — permanent' : 'This removes it from the community'}
+          icon={Trash2} tone="danger" maxW="max-w-sm" canClose={!busyDel}
+          onClose={() => setConfirmDel(null)}>
+          <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+            {isAdmin
+              ? `This permanently removes the ${confirmDel.kind === 'post' ? 'post along with its replies, reactions and attachments' : 'reply'}. This cannot be undone.`
+              : `Your ${confirmDel.kind === 'post' ? 'post' : 'reply'} will be removed from the community.`}
+          </p>
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button onClick={() => setConfirmDel(null)} disabled={busyDel}
+              className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold disabled:opacity-60">
+              Cancel
+            </button>
+            <button onClick={doDelete} disabled={busyDel}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
+              style={ADMIN_BTN_DANGER}>
+              {busyDel ? <Loader2 size={15} className="animate-spin" /> : <Trash2 size={15} />} Delete
+            </button>
+          </div>
+        </AccountModal>
       )}
     </div>
   );
@@ -19523,6 +25723,7 @@ function BudgetingTool() {
   const [loaded, setLoaded] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
   const [aiNote, setAiNote] = useState(null);
+  const [confirmResetOpen, setConfirmResetOpen] = useState(false);
 
   // Persistence
   useEffect(() => {
@@ -19601,8 +25802,8 @@ function BudgetingTool() {
     setGroups(prev => ({ ...prev, [group]: prev[group].filter((_, i) => i !== idx) }));
   };
 
-  const resetBudget = () => {
-    if (!confirm('Reset entire budget to blank starting categories? This cannot be undone.')) return;
+  // Confirmed via the in-app AccountModal (confirmResetOpen) — no native confirm().
+  const doResetBudget = () => {
     setGroups(JSON.parse(JSON.stringify(BUDGET_CATEGORIES)));
   };
 
@@ -19836,7 +26037,7 @@ tr.derived { background: #F0F9FF; font-weight: 700; border-top: 2px solid #0A84F
         <div className="flex-1" />
         <button onClick={exportCSV} className="gh-btn-ghost flex items-center gap-1.5 text-xs font-semibold"><Download size={13} /> Export CSV</button>
         <button onClick={exportWord} className="sheen-btn px-4 py-2 text-xs font-semibold flex items-center gap-1.5"><Download size={13} /> Export Word</button>
-        <button onClick={resetBudget} className="gh-btn-ghost flex items-center gap-1.5 text-xs font-semibold" style={{ color: C.red }}>Reset</button>
+        <button onClick={() => setConfirmResetOpen(true)} className="gh-btn-ghost flex items-center gap-1.5 text-xs font-semibold" style={{ color: C.red }}>Reset</button>
       </div>
 
       {/* AI note */}
@@ -19959,6 +26160,21 @@ tr.derived { background: #F0F9FF; font-weight: 700; border-top: 2px solid #0A84F
       <div className="text-xs mt-3 px-1" style={{ color: C.textMute }}>
         Tip: "Growth %" applies monthly compound growth from the base amount. Use 2-5% for growing revenue lines, 0% for fixed expenses. Your work auto-saves as you type.
       </div>
+
+      {confirmResetOpen && (
+        <AccountModal title="Reset entire budget?" subtitle="All categories and amounts go back to the blank starting template."
+          icon={AlertTriangle} tone="danger" maxW="max-w-sm" onClose={() => setConfirmResetOpen(false)}>
+          <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>This cannot be undone.</p>
+          <div className="mt-4 flex justify-end gap-2.5">
+            <button onClick={() => setConfirmResetOpen(false)} className="gh-btn-ghost text-sm font-semibold px-4 py-2">Cancel</button>
+            <button onClick={() => { doResetBudget(); setConfirmResetOpen(false); }}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white transition hover:opacity-95"
+              style={{ background: 'linear-gradient(180deg, var(--red-hi), var(--c-red))', boxShadow: '0 4px 12px -3px var(--red-glow)' }}>
+              Reset budget
+            </button>
+          </div>
+        </AccountModal>
+      )}
     </div>
   );
 }
