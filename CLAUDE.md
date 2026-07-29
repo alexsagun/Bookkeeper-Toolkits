@@ -618,7 +618,20 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   dropped `updated_at`, the `rejected_at`/`rejected_by` clearing and `rejection_reason = null`, and
   changed `approved_at` to first-approval — #34 restores #32's body verbatim keeping only the
   `v_holds_seat` change, and gates `community_media_delete` to match
-  `community_attachments_own_delete`; folded **verbatim as §21**. **Always run #34 with #33.**).
+  `community_attachments_own_delete`; folded **verbatim as §21**. **Always run #34 with #33.**) →
+  batch-entitlements (**#35**, the cohort-entitlement LEDGER — `batch_entitlements` replaces the single
+  mutable `subscriptions.batch_id`; one row = one seat in one cohort; a 180-day Gold plan grants SIX
+  cohorts; runs are allocated from the batches REGISTRY in `code` order, never by calendar arithmetic;
+  both predicates require the stamped `segment` to equal the member's LIVE plan segment, so a downgrade
+  cuts access instantly; `grant_batch_run()` is the ONLY function that locks `batches`; adds
+  `app_error()` stable codes carried in `hint`) → community-plan-capabilities (**#36**, seven fail-closed
+  capability booleans on `enrollment_plans` fused with the space flags by `user_community_capabilities()`;
+  **D2: General is announcement-only for EVERY plan** — posting and commenting off, reactions on — pinned
+  by a CHECK; own-UPDATE split into withdraw vs keep-published; **fixes a latent bug where member
+  soft-delete could never work**, because Postgres refuses an UPDATE whose resulting row would be
+  invisible to the writer and `community_posts_read` admitted only `status='active'`).
+  **Applied to production 2026-07-29; both verified against a disposable shadow project first — see
+  [docs/db/shadow-project.md](docs/db/shadow-project.md) and `npm run test:db`.**
   **Expiry-warning policy:** student-facing surfaces (menu pill, Dashboard `MembershipPanel`, the
   sidebar "Access until" line) turn amber ≤ 5 days / red ≤ 3 (+ the grace state); admin views
   (Enrollments membership strip + the "Expiring ≤ 14d" filter) intentionally use a 14-day lead
@@ -1068,6 +1081,15 @@ docs **in the same change**:
   deployed) **in the same change**, so the voice assistant's knowledge never drifts from the app.
   `npm run ai:knowledge:check` must pass (it exits 1 when the committed doc no longer matches the
   code — run it before calling any tools/plans change done).
+- **Changing community write permissions** → four places move together: the `enrollment_plans`
+  capability columns (#36) ↔ `user_community_capabilities()` ↔ the five community write policies ↔
+  `capabilitiesFor()`/`effectiveCaps()` in `src/lib/communityCapabilities.js`
+  (`test/communityCapabilities.test.mjs` pins the 60-cell truth table).
+- **Changing how many cohorts a plan grants** → `plan_batch_count()` ↔
+  `enrollment_plans.eligible_batch_count` ↔ `planBatchCount()` in `src/lib/batchEntitlements.js`
+  (`test/batchEntitlements.test.mjs` pins it).
+- **Adding an error code** → `app_error_catalog()` ↔ `APP_ERROR_CODES` in `src/lib/appErrors.js`.
+  Clients branch on `error.hint`, never on the HTTP status.
 - **Changing plan-scope rules** (which plan reads which courses) → four places move together:
   the `courses_read` RLS policy, the #27 parameterized mirrors (`trainer_visible_courses` /
   `trainer_courses_for_plan`), `PLAN_ENTITLEMENTS`, and `planScopeAllows()` in

@@ -171,12 +171,12 @@ client silently runs the old single-space forum and admins see a setup notice.
 5. Run the write-gate migration **#28** ([`db/2026-07-26-community-write-gate.sql`](db/2026-07-26-community-write-gate.sql)) — closes an RLS gap so an expired member can't edit/soft-delete their own posts/comments via REST. Idempotent, policy-only. (A **fresh** install already has it from the bootstrap.)
 6. Run the spaces & batches migration **#32** ([`db/2026-07-28-community-spaces-batches.sql`](db/2026-07-28-community-spaces-batches.sql)) — the General + per-batch Gold/VIP model above. Needs #12 + #13 + #20 + #23/#24 + #30; run after #29/#31. Existing posts backfill into General; the August 2026 batch (`2026-08`) is seeded open. (A **fresh** install gets it from the bootstrap §19.)
 7. Run the batch hardening migration **#33** ([`db/2026-07-29-community-batch-hardening.sql`](db/2026-07-29-community-batch-hardening.sql)) — seat-occupancy capacity fix, attachment path binding, set-based mention search, notification column grant — **immediately followed by #34** ([`db/2026-07-29-batch-hardening-followup.sql`](db/2026-07-29-batch-hardening-followup.sql)), which corrects #33's copy of `admin_finalize_enrollment` and gates `community_media_delete`. Running #33 without #34 leaves the approval RPC missing its `updated_at`/`rejected_*` housekeeping. Both additive and idempotent. (A **fresh** install gets them from the bootstrap §20/§21.)
-8. **Deploy the matching client build.** Steps 2–5 were RLS-only and went live on refresh; **#32 is not** — see the callout above. Until the new build is deployed there is a known gap: General ships with member replies OFF, so the *old* client still renders reply composers whose inserts RLS now refuses. If that window will be long, soften it with one row:
-   ```sql
-   update public.community_spaces set member_comments = true where slug = 'general';
-   ```
-   and set it back to `false` in the same session as the deploy.
-9. Refresh the app — the forum goes live.
+8. **Deploy the matching client build.** Steps 2–5 were RLS-only and went live on refresh; **#32 is not** — see the callout above. Deploy the client build **before** running #36, so the app reads the new space flags and hides the compose controls instead of rendering buttons whose inserts RLS refuses.
+
+   > ⚠ **Do NOT "temporarily soften" General by flipping `member_comments` back on.** That instruction used to live here, it was followed, and it was never reverted — production ran for a week with every plan able to reply in General, which is the exact problem this feature exists to remove. Since **#36** the flags are pinned by a CHECK constraint (`community_spaces_general_announcement_only`), so reversing D2 now requires dropping a named constraint and recording it in `db/README.md`. That friction is deliberate.
+
+9. Run the entitlement + capability migrations **#35** ([`db/2026-07-30-batch-entitlements.sql`](db/2026-07-30-batch-entitlements.sql)) then **#36** ([`db/2026-07-31-community-plan-capabilities.sql`](db/2026-07-31-community-plan-capabilities.sql)). #35 is member-invisible (the cohort ledger). **#36 is the visible one:** it makes General announcement-only for every plan and removes posting/replying from every self-paced member. Announce it before you run it.
+10. Refresh the app — the forum goes live.
 
 ## Step 1 — Run the community migration (#23, required)
 
@@ -262,11 +262,13 @@ The object policies were already applied by the migration either way.
   grants made outside `admin_finalize_enrollment()` (SQL editor, imports without a
   `batch_code`) land batch-less by design (fail closed). Assign them in Admin → **Batches** →
   "Needs batch assignment".
-- **A member asks why they can't reply in General.** By design (#32): General is
-  posts + reactions only (`community_spaces.member_comments = false`); replies live in the
-  premium batch communities. Flip it back anytime with
-  `update public.community_spaces set member_comments = true where slug = 'general';` —
-  no migration needed.
+- **A member asks why they can't post or reply in General.** By design (D2, #36): General is an
+  **announcement space** — admins post, everyone reads and reacts, nobody replies. That applies to
+  **every** plan, including Gold and VIP; their discussion happens in their own per-batch space.
+  The flags are pinned by the `community_spaces_general_announcement_only` CHECK, so reversing it is
+  a deliberate act: drop the constraint, change the flags, flip the plan capability columns, and
+  record it in `db/README.md`. Do not just run an UPDATE — an unrecorded UPDATE is how production
+  drifted from #32 in the first place.
 - **A mention doesn't autocomplete or notify in a private space.** The directory and the
   notify triggers are space-scoped: only currently-eligible members of THAT space match, and
   a cross-space uuid pasted into the body notifies nobody. Both are server-enforced.

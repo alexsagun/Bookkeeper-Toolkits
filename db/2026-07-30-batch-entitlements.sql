@@ -467,6 +467,12 @@ as $$
          end;
 $$;
 
+-- Pure arithmetic, but there is no reason for anon to hold it. authenticated
+-- keeps EXECUTE because plan_eligible_batch_count() runs with invoker rights
+-- and calls straight through to it.
+revoke all on function public.plan_batch_count(int, int) from public, anon;
+grant execute on function public.plan_batch_count(int, int) to authenticated;
+
 comment on function public.plan_batch_count(int, int) is
   'D1: coalesce(override, ceil(access_days/30)), clamped 1..24. NULL for a lifetime plan so the '
   'caller fails closed rather than granting unlimited cohorts. Mirrored by planBatchCount() in '
@@ -611,6 +617,13 @@ begin
   return new;
 end;
 $$;
+
+-- A trigger function needs no EXECUTE grant to fire from its trigger, and
+-- Postgres refuses a direct call anyway ("trigger functions can only be called
+-- as triggers"). But it is SECURITY DEFINER, so leaving the default PUBLIC
+-- EXECUTE in place raises a Supabase advisor finding — and a definer function
+-- reachable by anon is the wrong shape to normalise, exploitable or not.
+revoke all on function public.batch_entitlements_guard() from public, anon, authenticated;
 
 drop trigger if exists batch_entitlements_guard_trg on public.batch_entitlements;
 create trigger batch_entitlements_guard_trg
@@ -1287,6 +1300,8 @@ begin
   return null;
 end;
 $fn$;
+
+revoke all on function public.zz_batches_allocate_queued() from public, anon, authenticated;
 
 drop trigger if exists zz_batches_allocate_queued on public.batches;
 create trigger zz_batches_allocate_queued
