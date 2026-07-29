@@ -18,6 +18,7 @@
     "test": "node --test",
     "test:db": "node --test-concurrency=1 --test \"test-db/*.dbtest.mjs\"",
     "test:all": "npm test && npm run test:db",
+    "db:audit": "node scripts/audit-db.mjs",
     "db:shadow:apply": "node scripts/apply-db-files.mjs",
     "db:shadow:verify": "node scripts/apply-db-files.mjs --verify"
   },

@@ -19,6 +19,28 @@ OAuth, email templates, the two `VITE_SUPABASE_*` env vars) live in the setup do
 > diff the table against `ls db/*.sql`. This exists because two applied-looking migrations (#20/#21)
 > turned out never to have run in prod — see the #31 row below.
 
+### "Is my database up to date?" — run `npm run db:audit`
+
+**Three different things get counted, and none of them match. Only one is authoritative.**
+
+| Where | What it is |
+|---|---|
+| Supabase Dashboard → **SQL Editor** | Saved editor **tabs** — paste history. Ad-hoc queries, retries, duplicates, occasionally a tab whose name doesn't match its contents. Migrations applied via the Management API leave **no tab at all**. |
+| **`db/*.sql`** here | The dated migrations **+** `000_full_database_bootstrap.sql`, which is fresh-install-only and is deliberately never applied to an existing database (so it is never logged). |
+| **`public.schema_migrations`** | The apply log. **Authoritative.** |
+
+So the tab count will always be higher or lower than the file count, and neither tells you whether the
+database is current. Instead:
+
+```bash
+npm run db:audit          # read-only; add --json for CI
+```
+
+It diffs `db/*.sql` against the live apply log **and** verifies the objects each migration promises
+actually exist — because a log row only *claims* a file ran. That second half is what would have caught
+the #20/#21 incident. Full explanation and a per-tab inventory:
+[`../docs/db/sql-editor-snippets.md`](../docs/db/sql-editor-snippets.md).
+
 ---
 
 ## Fresh install (new project) — recommended path
