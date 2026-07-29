@@ -6,6 +6,8 @@ dist-ssr
 .env
 .env.local
 .env.*.local
+# Shadow-project credentials for the DB/RLS suite (npm run test:db)
+.env.test
 
 # Logs
 *.log
