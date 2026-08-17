@@ -15,35 +15,47 @@
 // premium rows with no confirmed open batch — it never guesses.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Mirror of the enrollment_plans.community_segment seed (#32). Used only when
-// a plans row is unavailable (fallback plan list / missing column) — the live
+// Mirror of the enrollment_plans.community_segment seed (#32, narrowed to VIP-only
+// in #39 when the Gold plan and the whole 'gold' segment were removed). Used only
+// when a plans row is unavailable (fallback plan list / missing column) — the live
 // column is the authority everywhere a row exists.
 export const PLAN_SEGMENT_FALLBACK = {
-  gold_live: 'gold',
   vip: 'vip',
 };
 
-export const COMMUNITY_SEGMENTS = ['general', 'gold', 'vip'];
+export const COMMUNITY_SEGMENTS = ['general', 'vip'];
 
-// planSegment(planKey, plansByKey?) → 'general' | 'gold' | 'vip'.
-// plansByKey values may carry community_segment (live rows post-#32);
-// unknown/legacy/null plans are ALWAYS 'general' (fail closed — General only).
+// planSegment(planKey, plansByKey?) → 'general' | 'vip' | the row's own segment string.
+// plansByKey values may carry community_segment (live rows post-#32); an unknown/null
+// plan with no row is ALWAYS 'general' (fail closed — General only).
+//
+// ★ A row carrying a segment this build does not know (a pre-#39 `gold`, or a segment
+// added later) is returned VERBATIM, not flattened to 'general'. Flattening looks
+// harmless and is not: isPremiumSegment() would then read false, resolveBatchForImport()
+// would skip the batch requirement entirely, and an import would grant a batch-less
+// premium term with no blocked row to show for it — the exact failure the comment in
+// api/admin/student-imports.js warns about. Returning it verbatim keeps it PREMIUM
+// (see isPremiumSegment), so such a row blocks instead. This matters in the window where
+// the code has shipped but the migration has not yet run.
 export function planSegment(planKey, plansByKey) {
   if (!planKey) return 'general';
   const row = plansByKey && plansByKey[planKey];
   const seg = row && row.community_segment;
-  if (COMMUNITY_SEGMENTS.includes(seg)) return seg;
+  if (typeof seg === 'string' && seg.trim()) return seg.trim();
   return PLAN_SEGMENT_FALLBACK[planKey] || 'general';
 }
 
+// VIP is the only premium (private per-batch community) segment this build ships.
+// Anything that is not 'general' is treated as premium so an UNRECOGNISED segment
+// errs toward "needs an explicit batch" rather than toward granting one without.
 export function isPremiumSegment(segment) {
-  return segment === 'gold' || segment === 'vip';
+  return typeof segment === 'string' && segment.trim() !== '' && segment !== 'general';
 }
 
 // ── Batch codes ──────────────────────────────────────────────────────────────
 // Business key shape: 'YYYY-MM' with a real month (mirrors the batches.code CHECK,
 // tightened in #33 — '2026-13' used to pass on both sides and would have minted a
-// gold-2026-13 space).
+// vip-2026-13 space).
 export const BATCH_CODE_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 
 export function normalizeBatchCode(raw) {
@@ -61,10 +73,16 @@ export function spaceSlugFor(kind, batchCode) {
   return `${kind}-${normalizeBatchCode(batchCode)}`;
 }
 
+// ★ PLAIN HYPHEN (U+002D), not an em dash. Verified against the live database: every
+// existing space name is 'VIP - <batch>' (codepoint 45), even though the #32 and #38
+// SOURCE files both write an em dash (U+2014) — the deployed functions were installed
+// through a channel that mangled the character, so the source and the data disagreed and
+// this mirror matched the source rather than reality. #39 writes an ASCII hyphen at both
+// SQL sites (nothing left to mangle) and normalizes any em-dash row it finds, so source,
+// data, and this mirror finally agree.
 export function spaceNameFor(kind, batchName) {
   if (kind === 'general') return 'General';
-  const label = kind === 'gold' ? 'Gold' : 'VIP';
-  return `${label} — ${batchName}`;
+  return `VIP - ${batchName}`;
 }
 
 // ── Import resolution ────────────────────────────────────────────────────────
@@ -89,7 +107,7 @@ export function resolveBatchForImport({ segment, batchCodeRaw, batchesByCode }) 
   if (!code) {
     return {
       batchId: null, blocked: true, warning: null,
-      reason: 'Needs batch assignment — gold/VIP rows require a confirmed open batch_code.',
+      reason: 'Needs batch assignment — VIP rows require a confirmed open batch_code.',
     };
   }
   if (!BATCH_CODE_RE.test(code)) {
@@ -144,9 +162,8 @@ export function batchGapForProcess({ segment, proposedBatchId, batch }) {
 //   • general segment  → no batch, no picker.
 //   • extension        → the current batch, LOCKED (extensions never move).
 //   • renewal          → current batch, else the checkout choice; changeable.
-//   • upgrade          → current batch IF the target segment has a space there
-//                        (gold↔vip same-batch switch), else checkout choice;
-//                        changeable.
+//   • upgrade          → current batch IF the target segment has a space there,
+//                        else checkout choice; changeable.
 //   • new              → the checkout choice; changeable.
 // required=true means approval cannot proceed without a batch id.
 export function approvalBatchPreselect({

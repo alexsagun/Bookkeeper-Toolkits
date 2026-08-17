@@ -34,10 +34,10 @@
 --   • public.is_enrolled()  = the date-aware version (checks an ACTIVE, non-expired
 --     subscription), NOT the early is_admin-or-is_paid version.
 --   • courses_read / modules_read / lessons_read = is_admin() OR (published AND
---     is_approved() AND is_enrolled() AND per-plan course scope) — the plan conjuncts scope
---     higher-tier courses (core_self_paced → qbo-* only; sampler → qbo-* AND
---     access_tier='essentials' only, i.e. QBO Essentials not Mastery; §13b). No-arg helpers
---     are wrapped in (select …) so each is one InitPlan per query.
+--     is_approved() AND is_enrolled() AND per-plan course scope) — sampler is the ONE
+--     scoped plan (qbo-* AND access_tier='essentials' only, i.e. QBO Essentials not
+--     Mastery; §13b). §26 removed the second scope rule with core_self_paced. No-arg
+--     helpers are wrapped in (select …) so each is one InitPlan per query.
 --   • course_videos_read = is_admin() OR (is_enrolled() AND (full-access plan OR
 --     course_object_allowed(name))).
 --   • feature_guides_read = is_approved() AND is_enrolled().
@@ -189,10 +189,23 @@ create table if not exists public.course_lessons (
   storage_path   text,
   text_content   text,
   duration_label text,
+  -- #37b, folded IN PLACE (db/2026-08-05-lesson-zoom-replay.sql). Optional
+  -- supplementary "Zoom Live Replay" link; dormant — the client half was lost
+  -- with the original migration and is not in the repo. See that file's header.
+  zoom_replay_url text,
   position       integer not null default 0,
   created_at     timestamptz not null default now()
 );
 create index if not exists idx_lessons_module on public.course_lessons(module_id, position);
+
+comment on column public.course_lessons.zoom_replay_url is
+  'Optional supplementary "Zoom Live Replay" link, rendered BELOW the lesson content and ABOVE the '
+  'completion controls. Never replaces video_url/video_provider/storage_path and never affects '
+  'lesson_progress/course_completions/certificates. Validated and classified client-side by '
+  'src/lib/lessonReplay.js (absolute https only; Zoom hosts are linked, never embedded, because Zoom '
+  'recording pages set X-Frame-Options). Deliberately has no CHECK constraint and no index — see the '
+  'header of db/2026-08-05-lesson-zoom-replay.sql (#37b). NOTE: as of 2026-08-17 the client half of '
+  'this feature is not present in the repo; the column is dormant.';
 
 create table if not exists public.lesson_progress (
   user_id      uuid not null references auth.users(id) on delete cascade,
@@ -416,27 +429,25 @@ create table if not exists public.enrollment_plans (
   updated_at          timestamptz not null default now()
 );
 
+-- The THREE live plans at their final prices and positions (#39). Seeded in place
+-- rather than seeded-then-corrected, exactly as the Sampler support-days fix (#22)
+-- was: #39's guarded UPDATEs and its DELETE then match NOTHING on a fresh install,
+-- so no fresh database ever creates `core_self_paced` or `gold_live`.
+-- Keep in lockstep with ENROLLMENT_PLANS_FALLBACK in src/lib/planCatalog.js
+-- (test/planCatalog.test.mjs pins the client half).
 insert into public.enrollment_plans
   (key, name, tagline, price_php, compare_at_php, badge, features, limit_note, position, access_days, support_days, entitlement_summary) values
-  ('core_self_paced', 'QBO Mastery Only', 'Core · Self-Paced', 999, null, null,
-   '["Simulated annual bookkeeping project for an NY-based construction company","60-day QBO Mastery course access","Weekly Discord chat (Thu)"]'::jsonb,
-   null, 1, 60, null,
-   '["60-day QBO Mastery access","Weekly Discord chat"]'::jsonb),
   ('sampler', 'Sampler Session', 'Essentials', 1499, null, null,
    '["1 Live Zoom Session (3 hours)","60-day course access","60-day group chat support"]'::jsonb,
-   'Limited offer', 2, 60, 60,
+   'Limited offer', 1, 60, 60,
    '["60-day course access","60-day group chat support","1 live Zoom session"]'::jsonb),
-  ('silver_self_paced', 'QBO + Resume Combo', 'Silver · Self-Paced', 1999, null, null,
+  ('silver_self_paced', 'QBO + Resume Combo', 'Silver · Self-Paced', 2999, null, null,
    '["Simulated annual bookkeeping project for an NY-based construction company","60-day QBO Mastery course access","60-day Resume & Interview course access","Weekly Discord chat (Thu)"]'::jsonb,
-   null, 3, 60, null,
+   null, 2, 60, null,
    '["60-day QBO Mastery access","60-day Resume & Interview access"]'::jsonb),
-  ('gold_live', 'Live Group Track', 'Gold Package', 9999, 35000, 'BEST VALUE',
-   '["Simulated annual bookkeeping project for an NY-based construction company","12 LIVE Group Zoom Trainings (MWF 9am to 11am PH time)","180-day resume + interview course access","Weekly group consult until hired","Discord chat support until and after hired"]'::jsonb,
-   null, 4, 180, null,
-   '["180-day full access","12 live group trainings","Weekly consult until hired"]'::jsonb),
-  ('vip', 'Personalized Coaching Program', 'VIP Package', 15999, 35000, 'BEST SELLER',
+  ('vip', 'Personalized Coaching Program', 'VIP Package', 16999, 35000, 'BEST SELLER',
    '["Simulated annual bookkeeping project for an NY-based construction company","12 Live Group Zoom Trainings (MWF 9am to 11am PH Time)","1-on-1 Resume & Interview Coaching (1 session)","Weekly group consult until hired","Discord chat support until and after hired"]'::jsonb,
-   'Limited to 10 slots per month', 5, 180, null,
+   'Limited to 10 slots per month', 3, 180, null,
    '["180-day full access","1-on-1 coaching","Weekly consult until hired"]'::jsonb)
 on conflict (key) do nothing;
 
@@ -773,12 +784,13 @@ grant execute on function public.expire_overdue_subscriptions() to authenticated
 
 -- ───────────────────────────────────────────────────────────────────
 -- 13b) PLAN-SCOPED course access helpers (server half of the per-plan entitlement model;
---      client half = PLAN_ENTITLEMENTS in src/BookkeeperPro.jsx). core_self_paced may read
---      ONLY qbo-* courses (the sole Supabase courses in Training & Skills); admins + every
---      OTHER/null plan → full. Consumed by the §14/§14b read policies. See
---      db/2026-07-09-plan-course-access.sql for the full rationale. Placed after
---      subscriptions (§12) since current_plan_key() selects from it. Keep in sync with the
---      client PLAN_ENTITLEMENTS map when entitlements change.
+--      client half = PLAN_ENTITLEMENTS in src/lib/planCatalog.js). `sampler` may read ONLY
+--      qbo-* courses at access_tier='essentials'; admins + every other/null plan → full.
+--      Consumed by the §14/§14b read policies. See db/2026-07-09-plan-course-access.sql
+--      for the full rationale. Placed after subscriptions (§12) since current_plan_key()
+--      selects from it. Keep in sync with the client PLAN_ENTITLEMENTS map.
+--      ★ plan_is_qbo_only() below is created here for §14's original shape and DROPPED by
+--        §26 — it existed only for core_self_paced. Do not build on it.
 -- ───────────────────────────────────────────────────────────────────
 create or replace function public.current_plan_key()
 returns text
@@ -5244,6 +5256,5860 @@ insert into public.schema_migrations (filename, checksum, notes)
 values ('2026-07-29-batch-hardening-followup.sql', null,
         'restores #32 body of admin_finalize_enrollment (updated_at / rejected_* / rejection_reason / approved_at) keeping only the #33 seat fix; gates community_media_delete')
 on conflict (filename) do nothing;
+
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- §22) FOLDED VERBATIM — 2026-07-30-batch-entitlements.sql
+--      the cohort-entitlement ledger (L1) + stable error codes
+--
+--      Appended at the tail for the same reason as §19-§21: the earlier
+--      sections create the pre-#35 shapes, and these files' DROP+CREATE must
+--      win on a fresh install. Every file is idempotent and self-guarded, so
+--      appending reproduces the live end state exactly.
+--      RE-FOLD whenever the dated file changes.
+-- ═════════════════════════════════════════════════════════════════════════════
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- #35 — batch_entitlements: the durable cohort-seat ledger
+--
+-- WHY
+--   Until now a member's cohort membership was ONE nullable, mutable column:
+--   subscriptions.batch_id. That column cannot express the product:
+--     • a 180-day Gold plan buys SIX monthly cohorts (D1), not one;
+--     • reassigning a member OVERWRITES the record of why they had access, so
+--       "which batches has this student been in, and why?" is unanswerable;
+--     • user_community_space_ids() read exactly one subscription (limit 1) and
+--       its single batch_id, so multi-cohort access was impossible by construction.
+--
+--   #35 introduces public.batch_entitlements — an append-only ledger where one
+--   row is ONE SEAT IN ONE COHORT, stamped with WHY it exists (grant_reason +
+--   the source subscription/request/import row), WHERE it sits in the purchased
+--   run (batch_index), and HOW LONG it lasts (valid_until). History is never
+--   rewritten; a seat is withdrawn by revoking it, not by editing it.
+--
+-- THE ONE AUTHORITATIVE ENTITLEMENT SOURCE
+--   Three layers. Each reads only the layer below. Nothing re-derives a lower one.
+--
+--     L2  CAPABILITY  user_community_capabilities()  (#36)
+--                     user_batch_course_access()     (#37)
+--     L1  SCOPE       ★ public.batch_entitlements ★
+--                     user_entitled_batches(p_user) · batch_seat_holders()
+--                     user_community_space_ids(p_user) · my_* wrappers
+--     L0  MEMBERSHIP  user_is_enrolled() · user_is_approved() · user_plan_key()
+--                     ↑ these ALREADY EXIST (#27). #35 must NOT redefine them —
+--                       they are the AI trainer's authorization mirrors, and a
+--                       create-or-replace here would silently change who can
+--                       talk to the paid course trainer. The preflight asserts
+--                       their bodies are intact instead.
+--
+-- TWO PREDICATES, ONE CORE (read this before editing either)
+--   OCCUPANCY (capacity) — batch_seat_holders(batch, segment):
+--       status='active' AND batch_id=B AND segment=S
+--       AND (valid_until is null or valid_until > now())
+--       AND segment = the member's LIVE plan segment
+--   ACCESS (RLS) — user_entitled_batches(p_user): the same, PLUS
+--       AND (activates_at is null or activates_at <= now())
+--   The single difference is activates_at. A seat in next month's cohort is
+--   OCCUPIED (it was sold, it consumes capacity — D8) but does not yet GRANT
+--   access. Collapsing these two would either let capacity be oversold or reveal
+--   a cohort before it starts.
+--
+-- LIVE PLAN RECONCILIATION (the security conjunct — do not remove)
+--   Both predicates require e.segment = the member's CURRENT plan segment.
+--   #32 had this property for free because it joined the live subscription to
+--   enrollment_plans. Stamping entitlements loses it, and without the conjunct a
+--   member who downgrades, refunds, or charges back keeps the ₱9,999 Gold space
+--   forever. With it, the instant their live plan stops selling that segment,
+--   every stamped row for it stops resolving. revoke_batch_run() is ALSO
+--   implemented — as bookkeeping, not as the control.
+--
+-- REGISTRY ALLOCATION, NEVER CALENDAR ARITHMETIC
+--   A seat does not compute a month. grant_batch_run() walks the batches
+--   REGISTRY in `code` order and takes the next N cohorts that actually exist.
+--   A shortfall is recorded as status='queued' (batch_id null) and bound by a
+--   FIFO trigger when the next batch is created. Computing `start + N months`
+--   would violate the project's non-negotiable rule (src/lib/communitySpaces.js:11
+--   — a batch is NEVER inferred from a date) and would promise cohorts that
+--   Alex, who skips months, may never run.
+--
+-- LOCK ORDER
+--   grant_batch_run() is the ONLY function that locks `batches`, and it always
+--   locks in ascending `code` order in a single statement. admin_finalize_enrollment
+--   and admin_assign_batch therefore no longer take their own batch lock —
+--   doing so inverted the order against the run and could deadlock two
+--   concurrent approvals into overlapping runs.
+--
+-- ORDER
+--   Run AFTER db/2026-07-29-batch-hardening-followup.sql (#34).
+--   Idempotent, additive, non-destructive. Nothing is dropped; no data is deleted.
+--   subscriptions.batch_id keeps being written as the start-batch cache and keeps
+--   working as a read bridge for members who predate the ledger (#39 retires it).
+--
+-- HOW TO RUN
+--   Paste into the Supabase SQL editor and run once, then confirm the
+--   verification block at the tail. Safe to re-run.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- ───────────────────────────────────────────────────────────────────
+-- 0) Preflight — abort with an actionable message, never degrade silently.
+-- ───────────────────────────────────────────────────────────────────
+do $$
+begin
+  if to_regclass('public.batches') is null or to_regclass('public.community_spaces') is null then
+    raise exception '#35 requires #32 — run db/2026-07-28-community-spaces-batches.sql first.';
+  end if;
+  if to_regclass('public.schema_migrations') is null then
+    raise exception '#35 requires #31 — run db/2026-07-26-schema-migrations-log.sql first (the tail insert would abort).';
+  end if;
+  if to_regproc('public.admin_finalize_enrollment') is null then
+    raise exception '#35 requires #32 (admin_finalize_enrollment).';
+  end if;
+
+  -- #34 restored four things #33's rewrite dropped (updated_at, the rejected_*
+  -- clearing, rejection_reason = null, most-recent-approval semantics). #35's
+  -- base text is #34's, so applying on a #33-only database would re-lose them.
+  --
+  -- The check must stay true AFTER #35 has run, or this file stops being
+  -- re-runnable (#35 replaces admin_finalize_enrollment, and its replacement no
+  -- longer contains v_holds_seat — that concept moved into grant_batch_run).
+  -- So: the housekeeping marker must be present, and the body must be either
+  -- #34's (v_holds_seat) or #35's own (grant_batch_run). #31's apply-log is
+  -- accepted as independent evidence for installs that logged the run.
+  if not exists (select 1 from public.schema_migrations
+                  where filename = '2026-07-29-batch-hardening-followup.sql')
+     and not exists (
+       select 1 from pg_proc
+        where proname = 'admin_finalize_enrollment'
+          and prosrc like '%rejected_at = null%'
+          and (prosrc like '%v_holds_seat%' or prosrc like '%grant_batch_run%')
+     ) then
+    raise exception '#35 requires BOTH #33 and #34 — run db/2026-07-29-batch-hardening-followup.sql first.';
+  end if;
+
+  -- L0 mirrors belong to #27. Assert, never replace.
+  -- to_regPROCEDURE, not to_regproc: only the former parses an argument list —
+  -- to_regproc('f(uuid)') silently returns NULL, which would make this guard
+  -- fire on a perfectly good database.
+  if to_regprocedure('public.user_is_enrolled(uuid)') is null
+     or to_regprocedure('public.user_is_approved(uuid)') is null
+     or to_regprocedure('public.user_plan_key(uuid)') is null then
+    raise exception '#35 requires #27 — db/2026-07-24-course-ai-trainer.sql supplies user_is_enrolled/user_is_approved/user_plan_key.';
+  end if;
+  if not exists (
+    select 1 from pg_proc where proname = 'user_is_enrolled'
+       and prosrc like '%grace_ends_at%' and prosrc like '%not exists%'
+  ) then
+    raise exception '#35: user_is_enrolled(uuid) has drifted from #27''s body — reconcile before proceeding.';
+  end if;
+
+  if not exists (
+    select 1 from information_schema.columns
+     where table_schema='public' and table_name='enrollment_plans' and column_name='community_segment'
+  ) then
+    raise exception '#35 requires enrollment_plans.community_segment (#32).';
+  end if;
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 1) app_error() — stable, machine-readable error codes across PostgREST.
+--
+--    SQLSTATE 'PT###' is PostgREST's HTTP-status override. The code itself
+--    rides in HINT (the client's branch key) and, redundantly, inside a JSON
+--    envelope in DETAIL — so a proxy that strips one still leaves the other.
+--    The MESSAGE stays a human sentence, which is what an admin reads when the
+--    client does not know the code yet.
+--
+--    Clients branch on `hint`. They must NOT branch on the HTTP status: PT###
+--    is a PostgREST convention, not a Postgres guarantee, so if that mapping
+--    ever changes the status degrades while hint/details keep working.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.app_error(
+  p_code    text,
+  p_message text,
+  p_http    int default 400,
+  p_context jsonb default null
+)
+returns void
+language plpgsql
+-- VOLATILE (the default) on purpose: this function's entire job is to raise.
+-- Marking it IMMUTABLE would invite the planner to constant-fold a call with
+-- literal arguments, moving the raise from execution time to plan time.
+volatile
+set search_path = public
+as $$
+begin
+  raise exception using
+    errcode = 'PT' || lpad(greatest(400, least(599, coalesce(p_http, 400)))::text, 3, '0'),
+    message = p_message,
+    detail  = jsonb_build_object('code', p_code, 'context', coalesce(p_context, '{}'::jsonb))::text,
+    hint    = p_code;
+end;
+$$;
+
+revoke all on function public.app_error(text, text, int, jsonb) from public, anon, authenticated;
+
+-- The catalog, readable by the client so it can render safe fallback copy for a
+-- code it does not know yet — and so a test can diff it against APP_ERROR_CODES
+-- in src/lib/appErrors.js. Adding a code in SQL before the client ships is safe.
+create or replace function public.app_error_catalog()
+returns table (code text, http int, summary text)
+language sql
+immutable
+parallel safe
+set search_path = public
+as $$
+  select * from (values
+    ('BATCH_REQUIRED',               422, 'A Gold/VIP action needs an explicit batch; none was supplied.'),
+    ('BATCH_NOT_FOUND',              404, 'The batch id or month code does not exist.'),
+    ('BATCH_CLOSED',                 409, 'The batch is closed to new assignments, or archived.'),
+    ('BATCH_FULL',                   409, 'A cohort in the run has no seats left.'),
+    ('NO_SPACE_FOR_SEGMENT',         409, 'The batch has no active community space for that plan segment.'),
+    ('INVALID_BATCH_CODE',           422, 'Not a real YYYY-MM month.'),
+    ('ENTITLEMENT_EXPIRED',          403, 'The membership term (or its grace) has ended.'),
+    ('INVALID_PLAN',                 422, 'Unknown, inactive, or non-premium plan for this action.'),
+    ('ALREADY_ENTITLED',             409, 'The member already holds an outstanding seat in that cohort.'),
+    ('RUN_LIMIT_EXCEEDED',           409, 'Outstanding seats would exceed the per-member ceiling.'),
+    ('SEGMENT_MISMATCH',             409, 'The grant would mix Gold and VIP seats in one outstanding run.'),
+    ('INVALID_MEMBERSHIP_TRANSITION',409, 'The current membership state does not allow this transition.'),
+    ('IMMUTABLE_ENTITLEMENT',        409, 'An attempt to rewrite a frozen ledger column.'),
+    ('FORBIDDEN',                    403, 'Admin-only operation called by a non-admin.'),
+    ('REQUEST_NOT_FOUND',            404, 'The enrollment request does not exist.'),
+    ('COURSE_ACCESS_DENIED',         403, 'Course hidden by plan scope, publication, or cohort entitlement.'),
+    ('LESSON_NOT_RELEASED',          403, 'The cohort drip has not unlocked this lesson yet.'),
+    ('COMMUNITY_ACCESS_DENIED',      403, 'The community write was refused.'),
+    ('COMMENT_PERMISSION_DENIED',    403, 'Replies are off in this space.'),
+    ('ASSIGNMENT_CLOSED',            409, 'Past the due date, or the assignment is unpublished.'),
+    ('SUBMISSION_LOCKED',            409, 'The submission is handed in or graded; edits refused.'),
+    ('COURSE_HAS_SUBMISSIONS',       409, 'The course has graded assignment work and cannot be deleted.')
+  ) as t(code, http, summary);
+$$;
+
+revoke all on function public.app_error_catalog() from public, anon;
+grant execute on function public.app_error_catalog() to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 2) Column additions + the updated_at trigger #32 forgot.
+-- ───────────────────────────────────────────────────────────────────
+
+-- D1's override. NULL = derive from access_days. Pinning Gold back to 2 cohorts
+-- is then a one-row UPDATE with no migration.
+alter table public.enrollment_plans
+  add column if not exists eligible_batch_count int;
+
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'enrollment_plans_eligible_batch_count_check') then
+    alter table public.enrollment_plans
+      add constraint enrollment_plans_eligible_batch_count_check
+      check (eligible_batch_count is null or (eligible_batch_count between 1 and 24));
+  end if;
+end $$;
+
+comment on column public.enrollment_plans.eligible_batch_count is
+  'D1 override for how many monthly cohorts this plan grants. NULL = derive ceil(access_days/30). '
+  'Mirrored by planBatchCount() in src/lib/batchEntitlements.js — keep in lockstep.';
+
+-- A combined cap alongside the per-segment ones. NULL = unlimited, as before.
+alter table public.batches
+  add column if not exists total_capacity int;
+
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'batches_total_capacity_check') then
+    alter table public.batches
+      add constraint batches_total_capacity_check
+      check (total_capacity is null or total_capacity > 0);
+  end if;
+end $$;
+
+comment on column public.batches.total_capacity is
+  'Combined gold+vip seat cap for this cohort. NULL = unlimited. Checked alongside '
+  'gold_capacity/vip_capacity by grant_batch_run(). Under D8 a seat is consumed in EVERY '
+  'cohort of a member''s run, so one 6-cohort Gold approval consumes one seat in six batches.';
+
+-- #32 created batches/community_spaces with updated_at defaults but no trigger,
+-- so the column has silently never advanced. Admin screens sort by it.
+create or replace function public.touch_updated_at()
+returns trigger
+language plpgsql
+set search_path = public
+as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$;
+
+drop trigger if exists batches_touch_updated_at on public.batches;
+create trigger batches_touch_updated_at
+  before update on public.batches
+  for each row execute function public.touch_updated_at();
+
+drop trigger if exists community_spaces_touch_updated_at on public.community_spaces;
+create trigger community_spaces_touch_updated_at
+  before update on public.community_spaces
+  for each row execute function public.touch_updated_at();
+
+-- batch_events is the immutable admin audit trail; widen its vocabulary for the
+-- ledger's actions. Strictly more permissive, so no existing row can fail.
+do $$
+declare v_con text;
+begin
+  select conname into v_con
+    from pg_constraint
+   where conrelid = 'public.batch_events'::regclass
+     and contype = 'c'
+     and pg_get_constraintdef(oid) ilike '%action%';
+  if v_con is not null then
+    execute format('alter table public.batch_events drop constraint %I', v_con);
+  end if;
+  alter table public.batch_events
+    add constraint batch_events_action_check
+    check (action in (
+      'create', 'open', 'close', 'archive', 'assign', 'reassign', 'unassign',
+      'capacity', 'space_create',
+      'entitle', 'entitle_allocate', 'entitle_revoke', 'entitle_supersede', 'entitle_extend'
+    ));
+exception when undefined_table then
+  raise notice '#35: public.batch_events not present — skipping its CHECK widening.';
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 3) batch_entitlements — L1, the ledger.
+-- ───────────────────────────────────────────────────────────────────
+create table if not exists public.batch_entitlements (
+  id                     uuid primary key default gen_random_uuid(),
+  user_id                uuid not null references public.profiles(id) on delete cascade,
+
+  -- The ALLOCATED cohort. NULL while the seat is queued: it was paid for, but
+  -- the cohort it will occupy does not exist in the registry yet.
+  batch_id               uuid references public.batches(id) on delete restrict,
+  segment                text not null check (segment in ('gold', 'vip')),
+
+  -- Position in the member's purchased run (0-based) and the run it belongs to.
+  -- batch_index is the FIFO ordering key, not a month number.
+  batch_index            int  not null check (batch_index >= 0 and batch_index < 24),
+  run_id                 uuid not null,
+  run_length             int  not null check (run_length between 1 and 24),
+
+  status                 text not null default 'queued'
+                         check (status in ('queued', 'active', 'revoked', 'superseded')),
+
+  -- WHY this seat exists. Never inferred.
+  grant_reason           text not null check (grant_reason in
+                           ('approval', 'renewal', 'extension', 'upgrade', 'import', 'admin_manual', 'backfill')),
+  source_subscription_id uuid references public.subscriptions(id)       on delete set null,
+  source_plan_key        text references public.enrollment_plans(key)   on delete set null on update cascade,
+  source_request_id      uuid references public.enrollment_requests(id) on delete set null,
+  source_import_row_id   uuid,
+  granted_by             uuid references public.profiles(id) on delete set null,
+  granted_at             timestamptz not null default now(),
+
+  -- HOW LONG. Stamped from the source term's coalesce(grace_ends_at, ends_at).
+  -- Forward-only: an extension advances it, nothing moves it back.
+  valid_until            timestamptz,
+  -- WHEN it starts granting access. Stamped at allocation from batches.starts_on.
+  activates_at           timestamptz,
+  allocated_at           timestamptz,
+
+  revoked_at             timestamptz,
+  revoked_by             uuid references public.profiles(id) on delete set null,
+  revoke_reason          text,
+  superseded_by_run_id   uuid,
+
+  created_at             timestamptz not null default now(),
+  updated_at             timestamptz not null default now(),
+
+  constraint batch_entitlements_active_bound   check (status <> 'active' or batch_id is not null),
+  constraint batch_entitlements_queued_unbound check (status <> 'queued' or batch_id is null),
+  constraint batch_entitlements_revoked_shape  check ((status = 'revoked') = (revoked_at is not null))
+);
+
+-- student_import_rows may not exist on an install that skipped #26; add the FK
+-- conditionally so the ledger still works there.
+do $$
+begin
+  if to_regclass('public.student_import_rows') is not null
+     and not exists (select 1 from pg_constraint where conname = 'batch_entitlements_source_import_row_fk') then
+    alter table public.batch_entitlements
+      add constraint batch_entitlements_source_import_row_fk
+      foreign key (source_import_row_id) references public.student_import_rows(id) on delete set null;
+  end if;
+end $$;
+
+comment on table public.batch_entitlements is
+  'L1 — THE authoritative cohort-entitlement source (#35). One row = one seat in one cohort. '
+  'Append-only: history is never rewritten, only revoked/superseded. Writes go exclusively through '
+  'the SECURITY DEFINER RPCs; authenticated holds SELECT on own rows and nothing else.';
+
+-- Indexes. Each serves a named query shape; see db/README.md.
+-- THE RLS hot path: user_entitled_batches runs once per statement (InitPlan) on
+-- every community read and write and every LMS read. Index-only, ~6 rows/user.
+create index if not exists batch_entitlements_user_active_idx
+  on public.batch_entitlements (user_id)
+  include (batch_id, segment, valid_until, activates_at)
+  where status = 'active' and batch_id is not null;
+
+-- batch_seat_holders(): the capacity count inside grant_batch_run (once per
+-- candidate, under the lock) and every admin_batch_overview count.
+create index if not exists batch_entitlements_batch_segment_idx
+  on public.batch_entitlements (batch_id, segment)
+  include (user_id, valid_until)
+  where status = 'active';
+
+-- The FIFO binder and admin_reconcile_queued_entitlements().
+create index if not exists batch_entitlements_queued_fifo_idx
+  on public.batch_entitlements (segment, granted_at, batch_index)
+  where status = 'queued';
+
+-- Member panel + admin drill-down; also covers the user_id FK (ON DELETE CASCADE).
+create index if not exists batch_entitlements_user_granted_idx
+  on public.batch_entitlements (user_id, granted_at desc);
+
+-- Covers the batch_id FK (ON DELETE RESTRICT scans this on every batch delete)
+-- and the batch roster query.
+create index if not exists batch_entitlements_batch_idx
+  on public.batch_entitlements (batch_id);
+
+-- FK cover + the drift view's join + "what did this term grant?".
+create index if not exists batch_entitlements_source_sub_idx
+  on public.batch_entitlements (source_subscription_id);
+
+-- FK cover + the approve receipt.
+create index if not exists batch_entitlements_source_request_idx
+  on public.batch_entitlements (source_request_id);
+
+-- CORRECTNESS: a member can never hold two outstanding seats in one cohort.
+-- NOTE: this index protects BOUND seats only — a queued seat has batch_id NULL
+-- and is therefore outside it, which is why admin_grant_batch_run needs its own
+-- ALREADY_ENTITLED check (#37) to stay idempotent.
+create unique index if not exists batch_entitlements_one_seat_per_cohort
+  on public.batch_entitlements (user_id, batch_id)
+  where status in ('queued', 'active') and batch_id is not null;
+
+-- Exact per-approval idempotency: re-running a grant for the same request
+-- cannot duplicate the run. The ON CONFLICT inference target.
+create unique index if not exists batch_entitlements_request_seat_uniq
+  on public.batch_entitlements (user_id, source_request_id, batch_index)
+  where status in ('queued', 'active') and source_request_id is not null;
+
+-- Import idempotency (mirrors subscriptions.source_import_row_id's partial unique).
+create unique index if not exists batch_entitlements_import_seat_uniq
+  on public.batch_entitlements (source_import_row_id, batch_index)
+  where status in ('queued', 'active') and source_import_row_id is not null;
+
+alter table public.batch_entitlements enable row level security;
+
+-- ONE permissive SELECT policy rather than the house *_read + *_admin_all pair,
+-- so this table adds nothing to the 31 multiple_permissive_policies advisor
+-- findings. Both branches are (select …)-wrapped per #29 (InitPlan once).
+drop policy if exists batch_entitlements_read on public.batch_entitlements;
+create policy batch_entitlements_read on public.batch_entitlements
+  for select to authenticated
+  using (user_id = (select auth.uid()) or (select public.is_admin()));
+
+-- NO insert/update/delete policy — writes go only through the SECURITY DEFINER
+-- RPCs (the community_notifications precedent).
+--
+-- ★ The revoke is load-bearing and is NOT implied by the missing policy:
+-- Supabase's default grants leave `authenticated` holding table-level DML, and
+-- RLS without a policy denies... but only while RLS stays enabled. Belt and
+-- braces on the table that decides who is in a ₱9,999 cohort.
+revoke insert, update, delete, truncate on public.batch_entitlements from authenticated, anon, public;
+grant select on public.batch_entitlements to authenticated;
+
+drop trigger if exists batch_entitlements_touch_updated_at on public.batch_entitlements;
+create trigger batch_entitlements_touch_updated_at
+  before update on public.batch_entitlements
+  for each row execute function public.touch_updated_at();
+
+-- ───────────────────────────────────────────────────────────────────
+-- 4) Run length (D1). Pure integer arithmetic — no date maths anywhere.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.plan_batch_count(p_access_days int, p_override int)
+returns int
+language sql
+immutable
+parallel safe
+set search_path = public
+as $$
+  select case
+           when p_override is not null then least(24, greatest(1, p_override))
+           when p_access_days is null or p_access_days <= 0 then null   -- caller MUST fail closed
+           else least(24, greatest(1, ceil(p_access_days / 30.0)::int))
+         end;
+$$;
+
+-- Pure arithmetic, but there is no reason for anon to hold it. authenticated
+-- keeps EXECUTE because plan_eligible_batch_count() runs with invoker rights
+-- and calls straight through to it.
+revoke all on function public.plan_batch_count(int, int) from public, anon;
+grant execute on function public.plan_batch_count(int, int) to authenticated;
+
+comment on function public.plan_batch_count(int, int) is
+  'D1: coalesce(override, ceil(access_days/30)), clamped 1..24. NULL for a lifetime plan so the '
+  'caller fails closed rather than granting unlimited cohorts. Mirrored by planBatchCount() in '
+  'src/lib/batchEntitlements.js (test/batchEntitlements.test.mjs pins the truth table).';
+
+create or replace function public.plan_eligible_batch_count(p_plan_key text)
+returns int
+language sql
+stable
+parallel safe
+set search_path = public
+as $$
+  select public.plan_batch_count(ep.access_days, ep.eligible_batch_count)
+    from public.enrollment_plans ep
+   where ep.key = p_plan_key;
+$$;
+
+revoke all on function public.plan_eligible_batch_count(text) from public, anon;
+grant execute on function public.plan_eligible_batch_count(text) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 5) Guard trigger — the layer that survives a policy mistake.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.batch_entitlements_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_seg_ok boolean;
+begin
+  if tg_op = 'INSERT' then
+    -- A bound seat must have a real, active space for its segment. This is what
+    -- makes "granted into a cohort with no Gold space" impossible rather than
+    -- merely unlikely.
+    if new.batch_id is not null then
+      select exists (
+        select 1 from public.community_spaces sp
+         where sp.batch_id = new.batch_id and sp.kind = new.segment and sp.active
+      ) into v_seg_ok;
+      if not v_seg_ok then
+        perform public.app_error('NO_SPACE_FOR_SEGMENT',
+          format('batch has no active %s space', new.segment), 409,
+          jsonb_build_object('batch_id', new.batch_id, 'segment', new.segment));
+      end if;
+    end if;
+
+    -- valid_until may never outlive the source term.
+    if new.valid_until is not null and new.source_subscription_id is not null then
+      if exists (
+        select 1 from public.subscriptions s
+         where s.id = new.source_subscription_id
+           and s.ends_at is not null
+           and new.valid_until > coalesce(s.grace_ends_at, s.ends_at) + interval '1 minute'
+      ) then
+        perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+          'entitlement would outlive its source subscription term', 409,
+          jsonb_build_object('source_subscription_id', new.source_subscription_id));
+      end if;
+    end if;
+
+    -- granted_by, when set, must be an admin.
+    if new.granted_by is not null
+       and not coalesce((select p.is_admin from public.profiles p where p.id = new.granted_by), false) then
+      perform public.app_error('FORBIDDEN', 'granted_by must reference an admin', 403, null);
+    end if;
+
+    if new.batch_index >= new.run_length then
+      perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+        'batch_index must be inside the run', 409,
+        jsonb_build_object('batch_index', new.batch_index, 'run_length', new.run_length));
+    end if;
+
+    return new;
+  end if;
+
+  -- ── UPDATE ────────────────────────────────────────────────────────
+  -- Frozen identity/provenance columns. Rewriting any of these would destroy
+  -- the audit answer to "why did this member have access?".
+  if new.user_id     is distinct from old.user_id
+     or new.segment      is distinct from old.segment
+     or new.batch_index  is distinct from old.batch_index
+     or new.run_id       is distinct from old.run_id
+     or new.run_length   is distinct from old.run_length
+     or new.grant_reason is distinct from old.grant_reason
+     or new.granted_at   is distinct from old.granted_at
+     or new.created_at   is distinct from old.created_at then
+    perform public.app_error('IMMUTABLE_ENTITLEMENT',
+      'batch entitlement identity columns are frozen', 409, null);
+  end if;
+
+  -- ★ Provenance FKs and granted_by may transition to NULL. That is Postgres
+  -- executing ON DELETE SET NULL / ON UPDATE CASCADE, which arrives here as an
+  -- UPDATE. Freezing them outright would make every referenced profile,
+  -- request, subscription and plan key permanently undeletable — a reviewer
+  -- found exactly this. Reject only non-null → a DIFFERENT non-null.
+  if (old.source_subscription_id is not null and new.source_subscription_id is not null
+      and new.source_subscription_id is distinct from old.source_subscription_id)
+     or (old.source_plan_key is not null and new.source_plan_key is not null
+         and new.source_plan_key is distinct from old.source_plan_key)
+     or (old.source_request_id is not null and new.source_request_id is not null
+         and new.source_request_id is distinct from old.source_request_id)
+     or (old.source_import_row_id is not null and new.source_import_row_id is not null
+         and new.source_import_row_id is distinct from old.source_import_row_id)
+     or (old.granted_by is not null and new.granted_by is not null
+         and new.granted_by is distinct from old.granted_by) then
+    perform public.app_error('IMMUTABLE_ENTITLEMENT',
+      'batch entitlement provenance cannot be re-pointed', 409, null);
+  end if;
+
+  -- batch_id: NULL → a real id exactly once (allocation). Never re-pointed,
+  -- never cleared. Moving a member between cohorts revokes and re-grants, so
+  -- the old seat stays in the record.
+  if old.batch_id is not null and new.batch_id is distinct from old.batch_id then
+    perform public.app_error('IMMUTABLE_ENTITLEMENT',
+      'an allocated seat cannot be moved — revoke it and grant a new one', 409,
+      jsonb_build_object('batch_id', old.batch_id));
+  end if;
+
+  -- status: queued → active → {revoked|superseded}, both terminal.
+  if old.status <> new.status then
+    if old.status in ('revoked', 'superseded') then
+      perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+        format('%s is a terminal entitlement status', old.status), 409, null);
+    end if;
+    if old.status = 'active' and new.status = 'queued' then
+      perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+        'an allocated seat cannot return to the queue', 409, null);
+    end if;
+  end if;
+
+  -- valid_until is forward-only. Clearing it (→ NULL) would silently grant
+  -- perpetual access; shortening it is a revoke, which has its own path.
+  if old.valid_until is not null
+     and (new.valid_until is null or new.valid_until < old.valid_until)
+     and new.status not in ('revoked', 'superseded') then
+    perform public.app_error('IMMUTABLE_ENTITLEMENT',
+      'valid_until only moves forward — revoke the seat to end it early', 409, null);
+  end if;
+
+  return new;
+end;
+$$;
+
+-- A trigger function needs no EXECUTE grant to fire from its trigger, and
+-- Postgres refuses a direct call anyway ("trigger functions can only be called
+-- as triggers"). But it is SECURITY DEFINER, so leaving the default PUBLIC
+-- EXECUTE in place raises a Supabase advisor finding — and a definer function
+-- reachable by anon is the wrong shape to normalise, exploitable or not.
+revoke all on function public.batch_entitlements_guard() from public, anon, authenticated;
+
+drop trigger if exists batch_entitlements_guard_trg on public.batch_entitlements;
+create trigger batch_entitlements_guard_trg
+  before insert or update on public.batch_entitlements
+  for each row execute function public.batch_entitlements_guard();
+
+-- ───────────────────────────────────────────────────────────────────
+-- 6) batch_seat_holders() — THE occupancy predicate (capacity).
+--
+--    Counts members who OCCUPY a seat in (batch, segment): sold and unexpired,
+--    whether or not the cohort has started (D8). Used by grant_batch_run's
+--    capacity check, admin_batch_overview, and the batch roster.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.batch_seat_holders(p_batch_id uuid, p_segment text)
+returns setof uuid
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select e.user_id
+    from public.batch_entitlements e
+    join public.profiles pr on pr.id = e.user_id
+    -- LIVE plan reconciliation: a downgraded/refunded member stops occupying a
+    -- seat the moment their current plan stops selling this segment.
+    join lateral (
+      select coalesce(ep.community_segment, 'general') as segment
+        from public.subscriptions s
+        left join public.enrollment_plans ep on ep.key = s.plan_key
+       where s.user_id = e.user_id
+         and s.status = 'active'
+         and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+       order by s.created_at desc
+       limit 1
+    ) live on true
+   where e.batch_id = p_batch_id
+     and e.segment = p_segment
+     and e.status = 'active'
+     and (e.valid_until is null or e.valid_until > now())
+     and live.segment = e.segment
+     and (pr.approval_status = 'approved' or pr.is_admin)
+   group by e.user_id;
+$$;
+
+revoke all on function public.batch_seat_holders(uuid, text) from public, anon, authenticated;
+
+comment on function public.batch_seat_holders(uuid, text) is
+  'Occupancy predicate: who consumes a seat in (batch, segment). Differs from the ACCESS predicate '
+  '(user_entitled_batches) by ONE conjunct — it ignores activates_at, because a seat in a future '
+  'cohort is sold and therefore consumes capacity (D8) without yet granting access.';
+
+-- ───────────────────────────────────────────────────────────────────
+-- 7) user_entitled_batches() — THE access predicate (L1), and its wrappers.
+--
+--    The `legacy` CTE is a STAGED BRIDGE for members granted before #35, and it
+--    is subordinate to the ledger: it applies only to users with ZERO ledger
+--    rows. The moment a member has one row, revocation bites immediately and
+--    the stale subscriptions.batch_id cache can no longer resurrect access.
+--    #39 deletes the CTE once the drift view reads clean.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.user_entitled_batches(p_user uuid)
+returns table (batch_id uuid, segment text, batch_index int, activates_at timestamptz, valid_until timestamptz)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  with gate as (
+    select public.user_is_enrolled(p_user) as enrolled,
+           public.user_is_approved(p_user) as approved
+  ),
+  live as (
+    select coalesce(ep.community_segment, 'general') as segment
+      from public.subscriptions s
+      left join public.enrollment_plans ep on ep.key = s.plan_key
+     where s.user_id = p_user
+       and s.status = 'active'
+       and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+     order by s.created_at desc
+     limit 1
+  ),
+  ledger as (
+    select e.batch_id, e.segment, e.batch_index, e.activates_at, e.valid_until
+      from public.batch_entitlements e
+     where e.user_id = p_user
+       and e.status = 'active'
+       and e.batch_id is not null
+       and (e.valid_until  is null or e.valid_until  > now())
+       and (e.activates_at is null or e.activates_at <= now())
+       and e.segment = (select segment from live)
+  ),
+  bridge as (
+    -- Pre-#35 grants only. Scoped to members with NO ledger rows at all.
+    select s.batch_id,
+           coalesce(ep.community_segment, 'general') as segment,
+           0 as batch_index,
+           null::timestamptz as activates_at,
+           coalesce(s.grace_ends_at, s.ends_at) as valid_until
+      from public.subscriptions s
+      join public.enrollment_plans ep on ep.key = s.plan_key
+     where s.user_id = p_user
+       and s.status = 'active'
+       and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+       and s.batch_id is not null
+       and coalesce(ep.community_segment, 'general') in ('gold', 'vip')
+       and not exists (select 1 from public.batch_entitlements e2 where e2.user_id = p_user)
+  )
+  select b.batch_id, b.segment, b.batch_index, b.activates_at, b.valid_until
+    from (select * from ledger union all select * from bridge) b, gate g
+   where g.enrolled and g.approved;
+$$;
+
+revoke all on function public.user_entitled_batches(uuid) from public, anon, authenticated;
+
+create or replace function public.my_entitled_batches()
+returns table (batch_id uuid, segment text, batch_index int, activates_at timestamptz, valid_until timestamptz)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select * from public.user_entitled_batches(auth.uid());
+$$;
+
+revoke all on function public.my_entitled_batches() from public, anon;
+grant execute on function public.my_entitled_batches() to authenticated;
+
+-- Bare id set, for policies that do not need the segment.
+-- ★ Cohort tables that carry per-segment content (sessions, announcements) must
+-- use my_entitled_batches() and match the SEGMENT too — Gold and VIP share a
+-- batch, so a batch-id-only check leaks VIP call links to Gold.
+create or replace function public.my_entitled_batch_ids()
+returns setof uuid
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select batch_id from public.user_entitled_batches(auth.uid());
+$$;
+
+revoke all on function public.my_entitled_batch_ids() from public, anon;
+grant execute on function public.my_entitled_batch_ids() to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 8) user_community_space_ids() — rewritten over L1 (#32 §8 replaced).
+--    Same signature, same fail-closed shape; the premium branch now reads the
+--    ledger instead of one mutable subscriptions.batch_id.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.user_community_space_ids(p_user uuid)
+returns setof uuid
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  with me as (
+    select p.is_admin,
+           (p.approval_status = 'approved' or p.is_admin) as approved,
+           p.is_paid
+      from public.profiles p
+     where p.id = p_user
+  ),
+  cur as (
+    select s.plan_key, s.batch_id
+      from public.subscriptions s
+     where s.user_id = p_user
+       and s.status = 'active'
+       and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+     order by s.created_at desc
+     limit 1
+  ),
+  gate as (
+    select coalesce((select is_admin from me), false) as is_admin,
+           (coalesce((select approved from me), false)
+            and (exists (select 1 from cur)
+                 or (coalesce((select is_paid from me), false)
+                     and not exists (select 1 from public.subscriptions s2
+                                      where s2.user_id = p_user)))) as is_member
+  ),
+  scope as (select batch_id, segment from public.user_entitled_batches(p_user))
+  select sp.id
+    from public.community_spaces sp, gate g
+   where g.is_admin
+      or (g.is_member and sp.active
+          and (sp.kind = 'general'
+               or exists (select 1 from scope s
+                           where s.segment = sp.kind and s.batch_id = sp.batch_id)));
+$$;
+
+revoke all on function public.user_community_space_ids(uuid) from public, anon, authenticated;
+
+-- my_community_space_ids() is unchanged in shape but re-issued so its grants are
+-- unambiguous after the rewrite above.
+create or replace function public.my_community_space_ids()
+returns setof uuid
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select * from public.user_community_space_ids(auth.uid());
+$$;
+
+revoke all on function public.my_community_space_ids() from public, anon;
+grant execute on function public.my_community_space_ids() to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 9) grant_batch_run() — the ONE allocator.
+--
+--    Every path that grants cohort access routes through this function:
+--    admin_finalize_enrollment (approval/renewal/extension/upgrade),
+--    admin_assign_batch (manual), and the import endpoint. That is what makes
+--    "one writer, one reader" true, and it is why capacity, closed-batch and
+--    ordering rules cannot be bypassed by picking a different entry point.
+--
+--    ★ THIS IS THE ONLY FUNCTION THAT LOCKS `batches`, and it always locks in
+--    ascending `code` order in ONE statement. Callers must NOT take their own
+--    batch lock: doing so inverts the order against a run and deadlocks two
+--    concurrent approvals whose runs overlap in different orders.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.grant_batch_run(
+  p_user_id                uuid,
+  p_segment                text,
+  p_start_batch_id         uuid,
+  p_count                  int,
+  p_grant_reason           text,
+  p_source_subscription_id uuid        default null,
+  p_source_plan_key        text        default null,
+  p_source_request_id      uuid        default null,
+  p_source_import_row_id   uuid        default null,
+  p_valid_until            timestamptz default null,
+  p_actor                  uuid        default null,
+  p_enforce_capacity       boolean     default true
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  v_run_id      uuid := gen_random_uuid();
+  v_start       public.batches%rowtype;
+  v_outstanding int;
+  v_other_seg   text;
+  v_cand        record;
+  v_idx         int := 0;
+  v_cap         int;
+  v_used        int;
+  v_allocated   jsonb := '[]'::jsonb;
+  v_queued      int := 0;
+  v_activates   timestamptz;
+begin
+  if p_segment not in ('gold', 'vip') then
+    perform public.app_error('INVALID_PLAN',
+      format('%s is not a cohort segment', coalesce(p_segment, 'null')), 422,
+      jsonb_build_object('segment', p_segment));
+  end if;
+  if p_count is null or p_count < 1 then
+    perform public.app_error('INVALID_PLAN',
+      'this plan has no cohort run length - set enrollment_plans.eligible_batch_count', 422,
+      jsonb_build_object('plan_key', p_source_plan_key));
+  end if;
+  if p_count > 24 then
+    perform public.app_error('RUN_LIMIT_EXCEEDED', 'a run cannot exceed 24 cohorts', 409,
+      jsonb_build_object('requested', p_count));
+  end if;
+
+  select * into v_start from public.batches where id = p_start_batch_id;
+  if v_start.id is null then
+    perform public.app_error('BATCH_NOT_FOUND', 'batch not found', 404,
+      jsonb_build_object('batch_id', p_start_batch_id));
+  end if;
+
+  -- Mixing segments inside one member's outstanding run makes "which seat does
+  -- this member occupy?" ambiguous for capacity. An upgrade must supersede the
+  -- old run first (admin_finalize_enrollment does).
+  select e.segment into v_other_seg
+    from public.batch_entitlements e
+   where e.user_id = p_user_id
+     and e.status in ('queued', 'active')
+     and e.segment <> p_segment
+   limit 1;
+  if v_other_seg is not null then
+    perform public.app_error('SEGMENT_MISMATCH',
+      format('member already holds outstanding %s seats', v_other_seg), 409,
+      jsonb_build_object('held_segment', v_other_seg, 'requested_segment', p_segment));
+  end if;
+
+  select count(*) into v_outstanding
+    from public.batch_entitlements e
+   where e.user_id = p_user_id and e.status in ('queued', 'active');
+  if v_outstanding + p_count > 24 then
+    perform public.app_error('RUN_LIMIT_EXCEEDED',
+      'this member already holds the maximum number of upcoming cohort seats', 409,
+      jsonb_build_object('outstanding', v_outstanding, 'requested', p_count));
+  end if;
+
+  -- The explicitly chosen starting cohort must itself be usable - a precise
+  -- error here beats silently starting the run a month later.
+  if v_start.status = 'archived' then
+    perform public.app_error('BATCH_CLOSED', format('batch %s is archived', v_start.code), 409,
+      jsonb_build_object('batch_code', v_start.code, 'status', v_start.status));
+  end if;
+  if not exists (select 1 from public.community_spaces sp
+                  where sp.batch_id = v_start.id and sp.kind = p_segment and sp.active) then
+    perform public.app_error('NO_SPACE_FOR_SEGMENT',
+      format('batch %s has no active %s space', v_start.code, p_segment), 409,
+      jsonb_build_object('batch_code', v_start.code, 'segment', p_segment));
+  end if;
+  -- A closed start batch blocks only when this is a NEW seat there. A member who
+  -- already holds a seat in it (renewal, extension) continues unimpeded - the
+  -- #33/#34 v_holds_seat intent, now expressed per cohort.
+  if v_start.status <> 'open'
+     and not exists (select 1 from public.batch_entitlements e
+                      where e.user_id = p_user_id and e.batch_id = v_start.id
+                        and e.status in ('queued', 'active')) then
+    perform public.app_error('BATCH_CLOSED',
+      format('batch %s is closed to new assignments', v_start.code), 409,
+      jsonb_build_object('batch_code', v_start.code, 'status', v_start.status));
+  end if;
+
+  -- Allocate from the REGISTRY, in code order, under one ordered lock.
+  for v_cand in
+    select b.id, b.code, b.status, b.starts_on, b.gold_capacity, b.vip_capacity, b.total_capacity
+      from public.batches b
+     where b.code >= v_start.code
+       and b.status = 'open'
+       and exists (select 1 from public.community_spaces sp
+                    where sp.batch_id = b.id and sp.kind = p_segment and sp.active)
+       and not exists (select 1 from public.batch_entitlements e2
+                        where e2.user_id = p_user_id and e2.batch_id = b.id
+                          and e2.status in ('queued', 'active'))
+     order by b.code
+     limit p_count
+     for update
+  loop
+    if p_enforce_capacity then
+      v_cap := case p_segment when 'gold' then v_cand.gold_capacity else v_cand.vip_capacity end;
+      if v_cap is not null then
+        select count(*) into v_used
+          from public.batch_seat_holders(v_cand.id, p_segment) h
+         where h <> p_user_id;
+        if v_used >= v_cap then
+          perform public.app_error('BATCH_FULL',
+            format('batch %s is full for %s (%s of %s seats)', v_cand.code, p_segment, v_used, v_cap), 409,
+            jsonb_build_object('batch_code', v_cand.code, 'segment', p_segment,
+                               'used', v_used, 'capacity', v_cap, 'scope', 'segment'));
+        end if;
+      end if;
+
+      if v_cand.total_capacity is not null then
+        select count(*) into v_used from (
+          select h from public.batch_seat_holders(v_cand.id, 'gold') h
+          union
+          select h from public.batch_seat_holders(v_cand.id, 'vip')  h
+        ) all_holders where h <> p_user_id;
+        if v_used >= v_cand.total_capacity then
+          perform public.app_error('BATCH_FULL',
+            format('batch %s is full (%s of %s total seats)', v_cand.code, v_used, v_cand.total_capacity), 409,
+            jsonb_build_object('batch_code', v_cand.code, 'used', v_used,
+                               'capacity', v_cand.total_capacity, 'scope', 'total'));
+        end if;
+      end if;
+    end if;
+
+    -- A cohort reveals itself when it starts. Falling back to the month encoded
+    -- in `code` keeps this deterministic when starts_on has not been set.
+    v_activates := coalesce(v_cand.starts_on::timestamptz,
+                            to_date(v_cand.code || '-01', 'YYYY-MM-DD')::timestamptz);
+
+    insert into public.batch_entitlements (
+      user_id, batch_id, segment, batch_index, run_id, run_length, status, grant_reason,
+      source_subscription_id, source_plan_key, source_request_id, source_import_row_id,
+      granted_by, valid_until, activates_at, allocated_at
+    ) values (
+      p_user_id, v_cand.id, p_segment, v_idx, v_run_id, p_count, 'active', p_grant_reason,
+      p_source_subscription_id, p_source_plan_key, p_source_request_id, p_source_import_row_id,
+      p_actor, p_valid_until, v_activates, now()
+    );
+
+    insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+    values (v_cand.id, p_user_id, p_actor, 'entitle_allocate',
+            jsonb_build_object('run_id', v_run_id, 'segment', p_segment,
+                               'batch_index', v_idx, 'reason', p_grant_reason));
+
+    v_allocated := v_allocated || jsonb_build_object('batch_id', v_cand.id, 'code', v_cand.code,
+                                                     'batch_index', v_idx);
+    v_idx := v_idx + 1;
+  end loop;
+
+  -- Shortfall: cohorts that do not exist yet. The seat is still owed, so it is
+  -- recorded and bound by the FIFO trigger when Alex creates the next batch.
+  while v_idx < p_count loop
+    insert into public.batch_entitlements (
+      user_id, batch_id, segment, batch_index, run_id, run_length, status, grant_reason,
+      source_subscription_id, source_plan_key, source_request_id, source_import_row_id,
+      granted_by, valid_until
+    ) values (
+      p_user_id, null, p_segment, v_idx, v_run_id, p_count, 'queued', p_grant_reason,
+      p_source_subscription_id, p_source_plan_key, p_source_request_id, p_source_import_row_id,
+      p_actor, p_valid_until
+    );
+    v_queued := v_queued + 1;
+    v_idx := v_idx + 1;
+  end loop;
+
+  if v_queued > 0 then
+    insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+    values (null, p_user_id, p_actor, 'entitle',
+            jsonb_build_object('run_id', v_run_id, 'segment', p_segment,
+                               'queued', v_queued, 'reason', p_grant_reason));
+  end if;
+
+  return jsonb_build_object(
+    'ok', true, 'run_id', v_run_id, 'segment', p_segment,
+    'run_length', p_count, 'allocated', v_allocated, 'queued', v_queued
+  );
+end;
+$fn$;
+
+revoke all on function public.grant_batch_run(uuid, text, uuid, int, text, uuid, text, uuid, uuid, timestamptz, uuid, boolean)
+  from public, anon, authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 10) revoke_batch_run() and the admin wrappers.
+--     Revocation is bookkeeping hygiene, NOT the security control - the live
+--     segment conjunct in L1 already cuts access the moment a plan changes.
+--     It exists so the ledger tells the truth and so the seat is released.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.revoke_batch_run(
+  p_user_id uuid,
+  p_run_id  uuid default null,
+  p_reason  text default null,
+  p_actor   uuid default null,
+  p_status  text default 'revoked'
+)
+returns int
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare v_n int;
+begin
+  if p_status not in ('revoked', 'superseded') then
+    perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+      'revoke_batch_run can only set revoked or superseded', 409, null);
+  end if;
+
+  with touched as (
+    update public.batch_entitlements e
+       set status        = p_status,
+           revoked_at    = case when p_status = 'revoked' then now() else e.revoked_at end,
+           revoked_by    = case when p_status = 'revoked' then p_actor else e.revoked_by end,
+           revoke_reason = coalesce(p_reason, e.revoke_reason),
+           updated_at    = now()
+     where e.user_id = p_user_id
+       and e.status in ('queued', 'active')
+       and (p_run_id is null or e.run_id = p_run_id)
+    returning e.batch_id, e.run_id, e.segment
+  )
+  insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+  select t.batch_id, p_user_id, p_actor,
+         case when p_status = 'revoked' then 'entitle_revoke' else 'entitle_supersede' end,
+         jsonb_build_object('run_id', t.run_id, 'segment', t.segment, 'reason', p_reason)
+    from touched t;
+
+  get diagnostics v_n = row_count;
+
+  -- Keep the legacy cache honest: leaving a stale subscriptions.batch_id behind
+  -- would let the #39 bridge resurrect access for a member with no ledger rows.
+  update public.subscriptions s
+     set batch_id = null, updated_at = now()
+   where s.user_id = p_user_id
+     and s.batch_id is not null
+     and not exists (select 1 from public.batch_entitlements e
+                      where e.user_id = p_user_id and e.status in ('queued', 'active'));
+
+  return v_n;
+end;
+$fn$;
+
+revoke all on function public.revoke_batch_run(uuid, uuid, text, uuid, text) from public, anon, authenticated;
+
+create or replace function public.admin_revoke_batch_run(
+  p_user_id uuid,
+  p_run_id  uuid default null,
+  p_reason  text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare v_n int;
+begin
+  if not public.is_admin() then
+    perform public.app_error('FORBIDDEN', 'admin_revoke_batch_run: admin only', 403, null);
+  end if;
+  v_n := public.revoke_batch_run(p_user_id, p_run_id, p_reason, auth.uid(), 'revoked');
+  return jsonb_build_object('ok', true, 'revoked', v_n);
+end;
+$fn$;
+
+revoke all on function public.admin_revoke_batch_run(uuid, uuid, text) from public, anon;
+grant execute on function public.admin_revoke_batch_run(uuid, uuid, text) to authenticated;
+
+-- Admin manual grant: the audited override. Capacity is enforced by DEFAULT -
+-- an admin who wants to overfill must pass p_force, because the whole point of
+-- capacity is that Alex can only teach so many people at once.
+create or replace function public.admin_grant_batch_run(
+  p_user_id  uuid,
+  p_batch_id uuid,
+  p_count    int     default null,
+  p_force    boolean default false
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  v_sub     public.subscriptions%rowtype;
+  v_segment text;
+  v_count   int;
+begin
+  if not public.is_admin() then
+    perform public.app_error('FORBIDDEN', 'admin_grant_batch_run: admin only', 403, null);
+  end if;
+
+  select * into v_sub from public.subscriptions s
+   where s.user_id = p_user_id and s.status = 'active'
+     and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+   order by s.created_at desc limit 1;
+  if v_sub.id is null then
+    perform public.app_error('ENTITLEMENT_EXPIRED',
+      'member has no active membership term to attach a cohort seat to', 403,
+      jsonb_build_object('user_id', p_user_id));
+  end if;
+
+  select coalesce(ep.community_segment, 'general') into v_segment
+    from public.enrollment_plans ep where ep.key = v_sub.plan_key;
+  if v_segment not in ('gold', 'vip') then
+    perform public.app_error('INVALID_PLAN',
+      format('plan %s is not a cohort plan', v_sub.plan_key), 422,
+      jsonb_build_object('plan_key', v_sub.plan_key, 'segment', v_segment));
+  end if;
+
+  v_count := coalesce(p_count, public.plan_eligible_batch_count(v_sub.plan_key), 1);
+
+  return public.grant_batch_run(
+    p_user_id, v_segment, p_batch_id, v_count, 'admin_manual',
+    v_sub.id, v_sub.plan_key, null, null,
+    coalesce(v_sub.grace_ends_at, v_sub.ends_at), auth.uid(), not p_force);
+end;
+$fn$;
+
+revoke all on function public.admin_grant_batch_run(uuid, uuid, int, boolean) from public, anon;
+grant execute on function public.admin_grant_batch_run(uuid, uuid, int, boolean) to authenticated;
+
+-- Import path: the endpoint has already verified the caller is an admin and
+-- holds the service role, but it has no is_admin() JWT context. This wrapper
+-- exists only to bridge that, and is revoked from every browser-reachable role.
+create or replace function public.grant_batch_run_for_import(
+  p_user_id                uuid,
+  p_segment                text,
+  p_batch_id               uuid,
+  p_count                  int,
+  p_source_subscription_id uuid,
+  p_source_plan_key        text,
+  p_source_import_row_id   uuid,
+  p_valid_until            timestamptz
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+begin
+  -- Imports are capacity-EXEMPT by design (the #32 precedent: a CSV migration of
+  -- existing paying students must not be refused by a cap set afterwards), but
+  -- they now WRITE the ledger, so those seats are visible in Admin - Batches and
+  -- count against every subsequent capacity check.
+  return public.grant_batch_run(
+    p_user_id, p_segment, p_batch_id, p_count, 'import',
+    p_source_subscription_id, p_source_plan_key, null, p_source_import_row_id,
+    p_valid_until, null, false);
+end;
+$fn$;
+
+revoke all on function public.grant_batch_run_for_import(uuid, text, uuid, int, uuid, text, uuid, timestamptz)
+  from public, anon, authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 11) FIFO binder - when a cohort is created, the oldest owed seats claim it.
+--     Capacity is deliberately NOT enforced here: these seats were already sold.
+--     Refusing them would repudiate a paid entitlement; the admin sees committed
+--     demand per cohort in Admin - Batches and sets capacity from that evidence.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.allocate_queued_entitlements(p_batch_id uuid default null)
+returns int
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  v_b   record;
+  v_e   record;
+  v_n   int := 0;
+  v_act timestamptz;
+begin
+  for v_b in
+    select b.id, b.code, b.starts_on
+      from public.batches b
+     where (p_batch_id is null or b.id = p_batch_id)
+       and b.status = 'open'
+     order by b.code
+  loop
+    v_act := coalesce(v_b.starts_on::timestamptz, to_date(v_b.code || '-01', 'YYYY-MM-DD')::timestamptz);
+
+    for v_e in
+      select e.id, e.user_id, e.segment, e.run_id
+        from public.batch_entitlements e
+       where e.status = 'queued'
+         and (e.valid_until is null or e.valid_until > now())
+         and exists (select 1 from public.community_spaces sp
+                      where sp.batch_id = v_b.id and sp.kind = e.segment and sp.active)
+         and not exists (select 1 from public.batch_entitlements e2
+                          where e2.user_id = e.user_id and e2.batch_id = v_b.id
+                            and e2.status in ('queued', 'active'))
+       order by e.granted_at, e.batch_index
+       for update skip locked
+    loop
+      -- ★ The cursor's `not exists` guard was evaluated against the snapshot
+      -- taken when the cursor opened, so it cannot see seats allocated by
+      -- EARLIER ITERATIONS OF THIS LOOP. A member holding three queued seats
+      -- would therefore have all three bound to this one cohort, violating
+      -- batch_entitlements_one_seat_per_cohort. Re-check inside the loop, where
+      -- our own uncommitted writes are visible: one member, one seat, per cohort.
+      if exists (select 1 from public.batch_entitlements e2
+                  where e2.user_id = v_e.user_id
+                    and e2.batch_id = v_b.id
+                    and e2.status in ('queued', 'active')) then
+        continue;
+      end if;
+
+      update public.batch_entitlements
+         set batch_id = v_b.id, status = 'active',
+             activates_at = v_act, allocated_at = now(), updated_at = now()
+       where id = v_e.id;
+
+      insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+      values (v_b.id, v_e.user_id, null, 'entitle_allocate',
+              jsonb_build_object('run_id', v_e.run_id, 'segment', v_e.segment, 'source', 'fifo_binder'));
+      v_n := v_n + 1;
+    end loop;
+  end loop;
+  return v_n;
+end;
+$fn$;
+
+revoke all on function public.allocate_queued_entitlements(uuid) from public, anon, authenticated;
+
+-- zz_ prefix so it fires AFTER batches_create_spaces - the binder needs the new
+-- cohort's Gold/VIP spaces to exist before it can bind a seat to them.
+create or replace function public.zz_batches_allocate_queued()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+begin
+  perform public.allocate_queued_entitlements(new.id);
+  return null;
+end;
+$fn$;
+
+revoke all on function public.zz_batches_allocate_queued() from public, anon, authenticated;
+
+drop trigger if exists zz_batches_allocate_queued on public.batches;
+create trigger zz_batches_allocate_queued
+  after insert on public.batches
+  for each row execute function public.zz_batches_allocate_queued();
+
+create or replace function public.admin_reconcile_queued_entitlements(p_batch_id uuid default null)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare v_n int;
+begin
+  if not public.is_admin() then
+    perform public.app_error('FORBIDDEN', 'admin_reconcile_queued_entitlements: admin only', 403, null);
+  end if;
+  v_n := public.allocate_queued_entitlements(p_batch_id);
+  return jsonb_build_object('ok', true, 'allocated', v_n);
+end;
+$fn$;
+
+revoke all on function public.admin_reconcile_queued_entitlements(uuid) from public, anon;
+grant execute on function public.admin_reconcile_queued_entitlements(uuid) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 12) admin_finalize_enrollment() — #34's body, extended to materialise the run.
+--
+--     WHAT IS PRESERVED FROM #34 (do not "tidy" any of it away):
+--       · the FOR UPDATE on the request row and the already-approved no-op;
+--       · v_eff_plan (an extension stays on the member's CURRENT plan);
+--       · the batch precedence chain per request kind;
+--       · the profile patch INCLUDING updated_at, rejected_at/rejected_by = null
+--         and rejection_reason = null - #33 dropped these and #34 restored them,
+--         which is exactly the mistake this file must not repeat;
+--       · most-recent-approval semantics for approved_at/approved_by.
+--
+--     WHAT CHANGED, AND WHY:
+--       · The start batch is no longer locked here, and capacity is no longer
+--         counted here. grant_batch_run() owns every `batches` lock and takes
+--         them in ascending code order; a second lock taken here would invert
+--         that order against the run and deadlock concurrent approvals.
+--       · v_holds_seat / v_new_assignment are gone as separate concepts: the
+--         per-cohort equivalent lives in grant_batch_run (a closed batch blocks
+--         only a NEW seat there), which is the same intent expressed per seat.
+--       · An upgrade that CHANGES segment supersedes the outstanding run first,
+--         so gold and vip seats never coexist for one member.
+--       · An extension advances valid_until on seats already held (forward-only)
+--         and grants ceil(extension_days/30) MORE cohorts (D9).
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.admin_finalize_enrollment(
+  p_request_id uuid,
+  p_batch_id   uuid default null
+)
+returns jsonb
+language plpgsql security definer set search_path = public
+as $fn$
+declare
+  v_req          public.enrollment_requests%rowtype;
+  v_prev         public.subscriptions%rowtype;
+  v_new          public.subscriptions%rowtype;
+  v_plan         public.enrollment_plans%rowtype;
+  v_kind         text;
+  v_eff_plan     text;
+  v_segment      text;
+  v_prev_segment text;
+  v_batch        uuid;
+  v_batch_row    public.batches%rowtype;
+  v_count        int;
+  v_valid_until  timestamptz;
+  v_run          jsonb := null;
+begin
+  if not public.is_admin() then
+    perform public.app_error('FORBIDDEN', 'admin_finalize_enrollment: admin only', 403, null);
+  end if;
+
+  select * into v_req from public.enrollment_requests
+   where id = p_request_id for update;
+  if v_req.id is null then
+    perform public.app_error('REQUEST_NOT_FOUND', 'admin_finalize_enrollment: request not found', 404,
+      jsonb_build_object('request_id', p_request_id));
+  end if;
+
+  -- Idempotency: re-approving an approved request is a no-op.
+  if v_req.status = 'approved' then
+    return jsonb_build_object('ok', true, 'already', true);
+  end if;
+  if v_req.status <> 'pending_review' then
+    perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+      format('admin_finalize_enrollment: request is %s - only pending_review can be approved', v_req.status),
+      409, jsonb_build_object('status', v_req.status));
+  end if;
+
+  v_kind := coalesce(v_req.request_kind, 'new');
+
+  select * into v_prev from public.subscriptions
+   where user_id = v_req.user_id
+   order by created_at desc limit 1;
+
+  -- Effective plan: extensions stay on the member's CURRENT plan.
+  v_eff_plan := case when v_kind = 'extension'
+                     then coalesce(v_prev.plan_key, v_req.plan_key)
+                     else v_req.plan_key end;
+
+  select * into v_plan from public.enrollment_plans where key = v_eff_plan;
+  if v_plan.key is null then
+    perform public.app_error('INVALID_PLAN', format('admin_finalize_enrollment: unknown plan %s', v_eff_plan),
+      422, jsonb_build_object('plan_key', v_eff_plan));
+  end if;
+  -- New sales require a sellable plan; extensions may continue a retired one.
+  if v_kind <> 'extension' and not v_plan.active then
+    perform public.app_error('INVALID_PLAN', format('admin_finalize_enrollment: plan %s is inactive', v_eff_plan),
+      422, jsonb_build_object('plan_key', v_eff_plan));
+  end if;
+
+  v_segment := coalesce(v_plan.community_segment, 'general');
+  if v_prev.plan_key is not null then
+    select coalesce(ep.community_segment, 'general') into v_prev_segment
+      from public.enrollment_plans ep where ep.key = v_prev.plan_key;
+  end if;
+
+  if v_segment not in ('gold', 'vip') then
+    v_batch := null;
+  else
+    if v_kind in ('renewal', 'extension') then
+      v_batch := coalesce(p_batch_id, v_prev.batch_id, v_req.batch_id);
+      if v_kind = 'extension' and p_batch_id is not null
+         and v_prev.batch_id is not null and p_batch_id <> v_prev.batch_id then
+        perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+          'admin_finalize_enrollment: an extension keeps the current batch - use the batch manager to move members',
+          409, jsonb_build_object('current_batch_id', v_prev.batch_id));
+      end if;
+      -- A renewal may arrive after every held seat lapsed; fall back to the
+      -- member's most recent cohort so the run continues from the right place.
+      if v_batch is null then
+        select e.batch_id into v_batch
+          from public.batch_entitlements e
+         where e.user_id = v_req.user_id and e.batch_id is not null
+         order by e.granted_at desc, e.batch_index desc
+         limit 1;
+      end if;
+    elsif v_kind = 'upgrade' then
+      v_batch := p_batch_id;
+      if v_batch is null and v_prev.batch_id is not null
+         and exists (select 1 from public.community_spaces sp
+                      where sp.kind = v_segment and sp.batch_id = v_prev.batch_id and sp.active) then
+        v_batch := v_prev.batch_id;
+      end if;
+      if v_batch is null then v_batch := v_req.batch_id; end if;
+    else
+      v_batch := coalesce(p_batch_id, v_req.batch_id);
+    end if;
+
+    if v_batch is null then
+      perform public.app_error('BATCH_REQUIRED',
+        format('admin_finalize_enrollment: %s needs a batch - pick an open batch in the approve dialog', v_eff_plan),
+        422, jsonb_build_object('plan_key', v_eff_plan, 'segment', v_segment));
+    end if;
+
+    -- Read-only validation for a precise error. The LOCK belongs to
+    -- grant_batch_run, which takes every batch lock in code order.
+    select * into v_batch_row from public.batches where id = v_batch;
+    if v_batch_row.id is null then
+      perform public.app_error('BATCH_NOT_FOUND', 'admin_finalize_enrollment: batch not found', 404,
+        jsonb_build_object('batch_id', v_batch));
+    end if;
+  end if;
+
+  -- Grant the term through the EXISTING functions (stacking / supersede / grace /
+  -- the 60-365 clamp / the legacy-lifetime guard all live there).
+  if v_kind = 'extension' then
+    if v_req.extension_days is null or v_req.extension_days <= 0 then
+      perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+        'admin_finalize_enrollment: extension request has no extension_days', 409, null);
+    end if;
+    v_new := public.approve_extension(v_req.user_id, v_req.id, v_req.extension_days);
+  else
+    v_new := public.approve_subscription(v_req.user_id, v_req.plan_key, v_req.id);
+  end if;
+
+  update public.subscriptions
+     set batch_id = v_batch, updated_at = now()
+   where id = v_new.id;
+
+  -- ── Materialise the cohort run (L1) ───────────────────────────────
+  if v_segment in ('gold', 'vip') then
+    v_valid_until := coalesce(v_new.grace_ends_at, v_new.ends_at);
+
+    -- Every outstanding seat rides the new expiry. Forward-only, enforced by the
+    -- guard trigger. Without this an extension would leave already-held seats
+    -- expiring on the old date.
+    update public.batch_entitlements e
+       set valid_until = v_valid_until, updated_at = now()
+     where e.user_id = v_req.user_id
+       and e.status in ('queued', 'active')
+       and v_valid_until is not null
+       and (e.valid_until is null or e.valid_until < v_valid_until);
+
+    -- A segment change must not leave gold and vip seats coexisting.
+    if v_prev_segment is not null and v_prev_segment <> v_segment then
+      perform public.revoke_batch_run(v_req.user_id, null,
+        format('upgrade %s -> %s', v_prev_segment, v_segment), auth.uid(), 'superseded');
+    end if;
+
+    v_count := case
+                 when v_kind = 'extension'
+                   then greatest(1, least(12, ceil(v_req.extension_days / 30.0)::int))   -- D9
+                 else public.plan_batch_count(v_plan.access_days, v_plan.eligible_batch_count)
+               end;
+
+    if v_count is null then
+      perform public.app_error('INVALID_PLAN',
+        format('plan %s has no access_days and no eligible_batch_count - cannot size the cohort run', v_eff_plan),
+        422, jsonb_build_object('plan_key', v_eff_plan));
+    end if;
+
+    v_run := public.grant_batch_run(
+      v_req.user_id, v_segment, v_batch, v_count,
+      case when v_kind = 'new' then 'approval' else v_kind end,
+      v_new.id, v_eff_plan, v_req.id, null, v_valid_until, auth.uid(), true);
+  end if;
+
+  -- Profile cache (mirrors the old client step 2).
+  update public.profiles
+     set is_paid = true,
+         plan = v_eff_plan,
+         approval_status = 'approved',
+         approved_at = now(),
+         approved_by = auth.uid(),
+         rejected_at = null,
+         rejected_by = null,
+         rejection_reason = null,
+         updated_at = now()
+   where id = v_req.user_id;
+
+  -- Request row (mirrors the old client step 3) + the resolved batch.
+  update public.enrollment_requests
+     set status = 'approved',
+         rejection_reason = null,
+         reviewed_at = now(),
+         reviewed_by = auth.uid(),
+         batch_id = v_batch,
+         updated_at = now()
+   where id = v_req.id;
+
+  return jsonb_build_object(
+    'ok', true,
+    'subscription_id', v_new.id,
+    'ends_at', v_new.ends_at,
+    'batch_id', v_batch,
+    'batch_code', (select code from public.batches where id = v_batch),
+    'run', v_run
+  );
+end;
+$fn$;
+
+revoke all on function public.admin_finalize_enrollment(uuid, uuid) from public, anon;
+grant execute on function public.admin_finalize_enrollment(uuid, uuid) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 13) admin_assign_batch() - routed through the ledger.
+--
+--     #32's version overwrote subscriptions.batch_id, which destroyed the record
+--     of the previous cohort: the member instantly lost that cohort's courses,
+--     recordings and discussion with nothing left to say why they ever had them.
+--     Reassignment now SUPERSEDES the outstanding run and grants a new one, so
+--     both the old and the new seats stay in the ledger.
+--
+--     The skip-reason vocabulary is preserved so the existing client message
+--     ("N assigned - M skipped (reason, reason)") keeps working, with two
+--     additions: no_run_length and run_conflict.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.admin_assign_batch(p_user_ids uuid[], p_batch_id uuid)
+returns jsonb
+language plpgsql security definer set search_path = public
+as $fn$
+declare
+  v_uid       uuid;
+  v_sub       public.subscriptions%rowtype;
+  v_segment   text;
+  v_count     int;
+  v_assigned  int := 0;
+  v_skipped   jsonb := '[]'::jsonb;
+  v_batch     public.batches%rowtype;
+  v_held      boolean;
+  v_hint      text;
+begin
+  if not public.is_admin() then
+    perform public.app_error('FORBIDDEN', 'admin_assign_batch: admin only', 403, null);
+  end if;
+
+  select * into v_batch from public.batches where id = p_batch_id;
+  if v_batch.id is null then
+    perform public.app_error('BATCH_NOT_FOUND', 'admin_assign_batch: batch not found', 404,
+      jsonb_build_object('batch_id', p_batch_id));
+  end if;
+  if v_batch.status <> 'open' then
+    perform public.app_error('BATCH_CLOSED',
+      format('admin_assign_batch: batch %s is %s', v_batch.code, v_batch.status), 409,
+      jsonb_build_object('batch_code', v_batch.code, 'status', v_batch.status));
+  end if;
+
+  foreach v_uid in array coalesce(p_user_ids, array[]::uuid[]) loop
+    begin
+      select * into v_sub from public.subscriptions s
+       where s.user_id = v_uid and s.status = 'active'
+         and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+       order by s.created_at desc limit 1;
+
+      if v_sub.id is null then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'no_active_subscription');
+        continue;
+      end if;
+
+      select coalesce(ep.community_segment, 'general') into v_segment
+        from public.enrollment_plans ep where ep.key = v_sub.plan_key;
+      if v_segment not in ('gold', 'vip') then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'not_a_premium_plan');
+        continue;
+      end if;
+
+      select exists (select 1 from public.batch_entitlements e
+                      where e.user_id = v_uid and e.batch_id = p_batch_id
+                        and e.status in ('queued', 'active')) into v_held;
+      if v_held then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'already_assigned');
+        continue;
+      end if;
+
+      if not exists (select 1 from public.community_spaces sp
+                      where sp.batch_id = p_batch_id and sp.kind = v_segment and sp.active) then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'no_space_for_segment');
+        continue;
+      end if;
+
+      v_count := public.plan_eligible_batch_count(v_sub.plan_key);
+      if v_count is null then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'no_run_length');
+        continue;
+      end if;
+
+      -- Move, do not destroy: supersede the outstanding run, then grant a new
+      -- one from the chosen cohort. Both remain in the ledger.
+      perform public.revoke_batch_run(v_uid, null,
+        format('reassigned to %s', v_batch.code), auth.uid(), 'superseded');
+
+      perform public.grant_batch_run(
+        v_uid, v_segment, p_batch_id, v_count, 'admin_manual',
+        v_sub.id, v_sub.plan_key, null, null,
+        coalesce(v_sub.grace_ends_at, v_sub.ends_at), auth.uid(), true);
+
+      update public.subscriptions set batch_id = p_batch_id, updated_at = now() where id = v_sub.id;
+
+      insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+      values (p_batch_id, v_uid, auth.uid(),
+              case when v_sub.batch_id is null then 'assign' else 'reassign' end,
+              jsonb_build_object('subscription_id', v_sub.id, 'segment', v_segment,
+                                 'from_batch_id', v_sub.batch_id, 'to_batch_id', p_batch_id));
+      v_assigned := v_assigned + 1;
+
+    exception
+      -- Only OUR refusals become a per-user skip. A deadlock or serialization
+      -- failure must surface, not masquerade as "this member was skipped" —
+      -- that would silently under-assign a bulk operation.
+      when sqlstate 'PT409' or sqlstate 'PT422' or sqlstate 'PT403' or sqlstate 'PT404' then
+        get stacked diagnostics v_hint = pg_exception_hint;
+        v_skipped := v_skipped || jsonb_build_object(
+          'user_id', v_uid,
+          'reason', lower(coalesce(nullif(v_hint, ''), 'run_conflict')));
+    end;
+  end loop;
+
+  return jsonb_build_object('ok', true, 'assigned', v_assigned,
+                            'skipped', v_skipped, 'batch_code', v_batch.code);
+end;
+$fn$;
+
+revoke all on function public.admin_assign_batch(uuid[], uuid) from public, anon;
+grant execute on function public.admin_assign_batch(uuid[], uuid) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 14) Admin read RPCs, all counting from L1 so the numbers agree everywhere.
+-- ───────────────────────────────────────────────────────────────────
+-- DROP + CREATE: the return type gains total_capacity and the queued counters,
+-- and Postgres refuses to change an OUT-parameter row type in place. A dropped
+-- function LOSES ITS GRANTS, so the grant below is not optional housekeeping —
+-- omitting it is the classic way a drop+recreate silently breaks an admin screen.
+drop function if exists public.admin_batch_overview();
+
+create function public.admin_batch_overview()
+returns table (
+  batch_id uuid, code text, name text, status text,
+  starts_on date, ends_on date,
+  gold_capacity int, vip_capacity int, total_capacity int,
+  gold_active bigint, vip_active bigint, total_active bigint,
+  gold_queued bigint, vip_queued bigint
+)
+language sql stable security definer set search_path = public
+as $fn$
+  select b.id, b.code, b.name, b.status, b.starts_on, b.ends_on,
+         b.gold_capacity, b.vip_capacity, b.total_capacity,
+         (select count(*) from public.batch_seat_holders(b.id, 'gold')) as gold_active,
+         (select count(*) from public.batch_seat_holders(b.id, 'vip'))  as vip_active,
+         (select count(*) from (
+            select h from public.batch_seat_holders(b.id, 'gold') h
+            union
+            select h from public.batch_seat_holders(b.id, 'vip') h) u)  as total_active,
+         -- Committed demand: seats already sold that no cohort has absorbed yet.
+         -- Alex needs this BEFORE setting a capacity, because queued seats are
+         -- never retro-refused (they were paid for).
+         (select count(*) from public.batch_entitlements e
+           where e.status = 'queued' and e.segment = 'gold'
+             and (e.valid_until is null or e.valid_until > now()))       as gold_queued,
+         (select count(*) from public.batch_entitlements e
+           where e.status = 'queued' and e.segment = 'vip'
+             and (e.valid_until is null or e.valid_until > now()))       as vip_queued
+    from public.batches b
+   where public.is_admin()
+   order by b.code desc;
+$fn$;
+
+revoke all on function public.admin_batch_overview() from public, anon;
+grant execute on function public.admin_batch_overview() to authenticated;
+
+-- Server-side, paged replacement for the client's "needs batch assignment"
+-- queue. The old client query fetched 400 subscriptions and THEN filtered to
+-- premium in JS, so 400+ general rows hid the queue entirely.
+create or replace function public.admin_batches_needing_assignment(
+  p_limit int default 50,
+  p_offset int default 0
+)
+returns table (
+  user_id uuid, email text, full_name text,
+  plan_key text, segment text, subscription_id uuid, ends_at timestamptz, total_count bigint
+)
+language sql stable security definer set search_path = public
+as $fn$
+  with live as (
+    select distinct on (s.user_id) s.user_id, s.id as subscription_id, s.plan_key,
+           coalesce(ep.community_segment, 'general') as segment,
+           coalesce(s.grace_ends_at, s.ends_at) as ends_at
+      from public.subscriptions s
+      join public.enrollment_plans ep on ep.key = s.plan_key
+     where s.status = 'active'
+       and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+     order by s.user_id, s.created_at desc
+  ),
+  needy as (
+    select l.*
+      from live l
+     where l.segment in ('gold', 'vip')
+       and not exists (select 1 from public.batch_entitlements e
+                        where e.user_id = l.user_id and e.status in ('queued', 'active'))
+  )
+  select n.user_id, p.email, p.full_name, n.plan_key, n.segment,
+         n.subscription_id, n.ends_at,
+         (select count(*) from needy) as total_count
+    from needy n
+    join public.profiles p on p.id = n.user_id
+   where public.is_admin()
+   order by n.ends_at nulls last, n.user_id
+   limit greatest(1, least(200, coalesce(p_limit, 50)))
+  offset greatest(0, coalesce(p_offset, 0));
+$fn$;
+
+revoke all on function public.admin_batches_needing_assignment(int, int) from public, anon;
+grant execute on function public.admin_batches_needing_assignment(int, int) to authenticated;
+
+-- Roster for one cohort+segment, paged.
+create or replace function public.admin_batch_roster(
+  p_batch_id uuid, p_segment text, p_limit int default 50, p_offset int default 0
+)
+returns table (user_id uuid, email text, full_name text, avatar_url text, total_count bigint)
+language sql stable security definer set search_path = public
+as $fn$
+  with holders as (select h from public.batch_seat_holders(p_batch_id, p_segment) h)
+  select p.id, p.email, p.full_name, p.avatar_url, (select count(*) from holders)
+    from holders
+    join public.profiles p on p.id = holders.h
+   where public.is_admin()
+   order by p.full_name nulls last, p.id
+   limit greatest(1, least(200, coalesce(p_limit, 50)))
+  offset greatest(0, coalesce(p_offset, 0));
+$fn$;
+
+revoke all on function public.admin_batch_roster(uuid, text, int, int) from public, anon;
+grant execute on function public.admin_batch_roster(uuid, text, int, int) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 15) Drift view - the #39 gate. Every premium member should have a ledger row
+--     that agrees with their subscription cache. Anything else is named here.
+-- ───────────────────────────────────────────────────────────────────
+create or replace view public.v_batch_entitlement_drift
+with (security_invoker = true)
+as
+select s.user_id,
+       s.id as subscription_id,
+       s.plan_key,
+       coalesce(ep.community_segment, 'general') as segment,
+       s.batch_id as cached_batch_id,
+       (select count(*) from public.batch_entitlements e
+         where e.user_id = s.user_id and e.status in ('queued', 'active')) as outstanding_seats,
+       case
+         when coalesce(ep.community_segment, 'general') not in ('gold', 'vip') then
+           case when s.batch_id is null then 'ok' else 'general_plan_has_batch' end
+         when not exists (select 1 from public.batch_entitlements e
+                           where e.user_id = s.user_id and e.status in ('queued', 'active'))
+           then 'premium_without_ledger'
+         when s.batch_id is null then 'missing_cache'
+         when not exists (select 1 from public.batch_entitlements e
+                           where e.user_id = s.user_id and e.batch_id = s.batch_id
+                             and e.status in ('queued', 'active'))
+           then 'cache_not_in_ledger'
+         else 'ok'
+       end as drift
+  from public.subscriptions s
+  left join public.enrollment_plans ep on ep.key = s.plan_key
+ where s.status = 'active'
+   and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now());
+
+comment on view public.v_batch_entitlement_drift is
+  'Gate for #39 (retiring the subscriptions.batch_id read bridge). security_invoker = the caller''s '
+  'RLS applies, so a member sees only their own row and an admin sees all. #39 may run only when '
+  'this reads ''ok'' for every row.';
+
+-- ───────────────────────────────────────────────────────────────────
+-- 16) Backfill - idempotent, capacity-EXEMPT, archived batches skipped.
+--
+--     Members granted before #35 already paid; a capacity set afterwards must
+--     never retro-refuse them. On the live database this matches nothing today
+--     (zero subscriptions carry a batch_id), which is precisely why it has to be
+--     written and reviewed now rather than the first time it matters.
+--
+--     Historical expired/cancelled premium terms are deliberately NOT
+--     backfilled: inventing granted_at/valid_until for closed terms would put
+--     fiction in an audit table. subscriptions + batch_events remain the
+--     pre-#35 record.
+-- ───────────────────────────────────────────────────────────────────
+do $$
+declare
+  r        record;
+  v_users  int := 0;
+  v_skip   int := 0;
+begin
+  for r in
+    select s.id, s.user_id, s.plan_key, s.request_id,
+           coalesce(s.grace_ends_at, s.ends_at) as valid_until,
+           b.id as batch_id, b.status as batch_status,
+           coalesce(ep.community_segment, 'general') as segment,
+           public.plan_batch_count(ep.access_days, ep.eligible_batch_count) as run_count
+      from public.subscriptions s
+      join public.batches b on b.id = s.batch_id
+      join public.enrollment_plans ep on ep.key = s.plan_key
+     where s.status = 'active'
+       and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+       and coalesce(ep.community_segment, 'general') in ('gold', 'vip')
+       and not exists (select 1 from public.batch_entitlements e
+                        where e.user_id = s.user_id and e.status in ('queued', 'active'))
+     order by s.user_id
+  loop
+    if r.run_count is null then
+      raise notice '#35 backfill: user % on lifetime premium plan % has no eligible_batch_count - skipped',
+        r.user_id, r.plan_key;
+      v_skip := v_skip + 1;
+      continue;
+    end if;
+    if r.batch_status = 'archived' then
+      raise notice '#35 backfill: user % cached into ARCHIVED batch - skipped, assign manually', r.user_id;
+      v_skip := v_skip + 1;
+      continue;
+    end if;
+
+    perform public.grant_batch_run(
+      r.user_id, r.segment, r.batch_id, r.run_count, 'backfill',
+      r.id, r.plan_key, r.request_id, null, r.valid_until, null, false);
+    v_users := v_users + 1;
+  end loop;
+
+  raise notice '#35 backfill: % premium subscription(s) materialised, % skipped', v_users, v_skip;
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 17) Reload PostgREST's schema cache so the new RPCs resolve immediately.
+-- ───────────────────────────────────────────────────────────────────
+notify pgrst, 'reload schema';
+
+-- ═══════════════════════════════════════════════════════════════════
+-- AFTER RUNNING - paste these and confirm the expected values.
+--
+--   -- the ledger exists and is empty on a database with no premium members
+--   select count(*) from public.batch_entitlements;                          -- 0
+--
+--   -- authenticated cannot write it, policy or no policy
+--   select has_table_privilege('authenticated','public.batch_entitlements','insert'),   -- f
+--          has_table_privilege('authenticated','public.batch_entitlements','update'),   -- f
+--          has_table_privilege('authenticated','public.batch_entitlements','delete');   -- f
+--
+--   -- the allocator is not callable from a browser
+--   select has_function_privilege('authenticated',
+--     'public.grant_batch_run(uuid,text,uuid,int,text,uuid,text,uuid,uuid,timestamptz,uuid,boolean)',
+--     'execute');                                                            -- f
+--
+--   -- #34's housekeeping survived, and the run is materialised
+--   select prosrc like '%rejected_at = null%'  as clears_rejection,
+--          prosrc like '%grant_batch_run%'     as materialises_run
+--     from pg_proc where proname = 'admin_finalize_enrollment';              -- t | t
+--
+--   -- L1 is the space source, with the bridge subordinate to the ledger
+--   select prosrc like '%user_entitled_batches%' as reads_ledger
+--     from pg_proc where proname = 'user_community_space_ids';               -- t
+--   select prosrc like '%not exists (select 1 from public.batch_entitlements e2%' as bridge_subordinate
+--     from pg_proc where proname = 'user_entitled_batches';                  -- t
+--
+--   -- D1 run lengths
+--   select public.plan_eligible_batch_count('gold_live'),                    -- 6
+--          public.plan_eligible_batch_count('vip'),                          -- 6
+--          public.plan_eligible_batch_count('core_self_paced');              -- 2
+--
+--   -- a nobody gets nothing
+--   select count(*) from public.user_community_space_ids
+--     ('00000000-0000-0000-0000-000000000000'::uuid);                        -- 0
+--
+--   -- no drift
+--   select drift, count(*) from public.v_batch_entitlement_drift group by 1; -- only 'ok'
+--
+--   -- error contract, from the APP as an admin (not the SQL editor):
+--   --   rpc('admin_finalize_enrollment', { p_request_id: '<a gold request>' })
+--   --   -> HTTP 422, { hint: 'BATCH_REQUIRED', details: '{"code":"BATCH_REQUIRED",...}' }
+-- ═══════════════════════════════════════════════════════════════════
+
+insert into public.schema_migrations (filename, checksum, notes) values
+ ('2026-07-30-batch-entitlements.sql', null,
+  'batch_entitlements ledger (#35): registry-allocated cohort runs + FIFO queue, one seat predicate, '
+  'live-segment reconciliation, entitlement-backed user_community_space_ids (per-user legacy bridge), '
+  'PT-errcode stable error codes, admin_assign_batch + imports routed through grant_batch_run')
+on conflict (filename) do nothing;
+
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- §23) FOLDED VERBATIM — 2026-07-31-community-plan-capabilities.sql
+--      per-plan community capabilities + D2 General announcement-only
+--
+--      Appended at the tail for the same reason as §19-§21: the earlier
+--      sections create the pre-#35 shapes, and these files' DROP+CREATE must
+--      win on a fresh install. Every file is idempotent and self-guarded, so
+--      appending reproduces the live end state exactly.
+--      RE-FOLD whenever the dated file changes.
+-- ═════════════════════════════════════════════════════════════════════════════
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- #36 — per-PLAN community capabilities, and General as an announcement space
+--
+-- WHY
+--   Until now a member's community rights came from ONE place: the three
+--   capability flags on community_spaces (member_posting / member_comments /
+--   member_reactions), read inline by each INSERT policy. Those flags are
+--   per-SPACE, so inside the shared General space every plan necessarily has
+--   identical rights. That makes the product rule inexpressible:
+--
+--     Core / Sampler(Essentials) / Silver  →  read + react, never write
+--     Gold / VIP                           →  full forum, but only inside their
+--                                             own per-batch private space
+--
+--   In Discord this gap is the actual business problem: self-paced students ask
+--   questions in the open channel and the support load lands on one person.
+--
+-- WHAT #36 ADDS
+--   The missing dimension — the PLAN — as seven fail-closed booleans on
+--   enrollment_plans, fused with the existing space flags by ONE resolver:
+--
+--     effective = plan capability
+--             AND space flag
+--             AND space membership (L1)
+--             AND is_approved() AND is_enrolled()
+--
+--   No policy re-derives that. They all read user_community_capabilities().
+--
+-- ★ D2 — GENERAL IS ANNOUNCEMENT-ONLY (a product decision, applied as data)
+--   No member may create a post or a comment in General. Not Core, not Sampler,
+--   not Silver, and NOT Gold or VIP. Reactions stay ON for every plan, because
+--   reacting is not creating discussion and the plan matrix grants it to all.
+--   Admins still post announcements through the *_admin_all policies.
+--
+--   PRODUCTION HAS DRIFTED: #32 seeded General with member_comments = false, and
+--   a documented "temporary softening" UPDATE (COMMUNITY_SETUP.md step 8) set it
+--   back to true and was never reverted. Live right now, member_posting = true
+--   and member_comments = true, so every plan can post AND reply in General.
+--
+--   ⚠ USER-VISIBLE CONSEQUENCE, STATED PLAINLY
+--     On the day this ships, EVERY CURRENT MEMBER LOSES THE ABILITY TO WRITE
+--     ANYTHING IN THE COMMUNITY. There are 4 profiles, 2 active subscriptions and
+--     zero Gold/VIP members; all three existing posts are in General and every
+--     member is on a general-segment plan. What remains for them: reading
+--     everything — including those three posts and all historical replies — and
+--     reacting. Only the admin can post. Gold and VIP members regain the full
+--     forum, but only inside their own per-batch space, and there are none of
+--     those members yet.
+--
+--     Existing content is NEVER deleted. Authors keep the ability to withdraw
+--     their own posts (see the UPDATE split below).
+--
+--     #36 MUST SHIP WITH ITS CLIENT BUILD. The currently deployed client
+--     computes canPost as `!currentSpace || currentSpace.member_posting !== false`
+--     — it defaults OPEN when the space is unresolved, so a stale bundle would
+--     show a New Topic button whose submit returns a bare 42501.
+--
+-- ORDER
+--   Run AFTER db/2026-07-30-batch-entitlements.sql (#35) — the resolver reads L1.
+--   Idempotent, additive. No table or column is dropped; no row is deleted.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- ───────────────────────────────────────────────────────────────────
+-- 0) Preflight.
+-- ───────────────────────────────────────────────────────────────────
+do $$
+begin
+  if to_regclass('public.batch_entitlements') is null then
+    raise exception '#36 requires #35 — run db/2026-07-30-batch-entitlements.sql first.';
+  end if;
+  if to_regclass('public.community_spaces') is null or to_regclass('public.community_posts') is null then
+    raise exception '#36 requires #32/#23/#24 (community spaces + forum).';
+  end if;
+  if to_regproc('public.app_error') is null then
+    raise exception '#36 requires public.app_error() from #35.';
+  end if;
+  if to_regclass('public.schema_migrations') is null then
+    raise exception '#36 requires #31 — the tail insert would abort the migration.';
+  end if;
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 1) Per-plan capability columns.
+--
+--    Every default is FALSE except the two react flags. That is the whole
+--    safety property: a plan added later — or an unknown/typo'd plan key —
+--    grants no ability to write anything until someone deliberately says so.
+--    Reactions default true because D2 grants them to every plan and a reaction
+--    creates no content and no support load.
+--
+--    There is deliberately NO `private_community_access` column:
+--    enrollment_plans.community_segment already is that flag and L1 already is
+--    its enforcement point. A second boolean could disagree with the segment,
+--    and would add one more member to the lockstep set for no gain.
+-- ───────────────────────────────────────────────────────────────────
+alter table public.enrollment_plans
+  add column if not exists can_post_in_general     boolean not null default false,
+  add column if not exists can_comment_in_general  boolean not null default false,
+  add column if not exists can_react_in_general    boolean not null default true,
+  add column if not exists can_post_in_private     boolean not null default false,
+  add column if not exists can_comment_in_private  boolean not null default false,
+  add column if not exists can_react_in_private    boolean not null default true,
+  add column if not exists can_upload_attachments  boolean not null default false;
+
+comment on column public.enrollment_plans.can_post_in_general is
+  'D2: false for EVERY plan — General is announcement-only. Flipping this to true for a plan is a '
+  'product decision; the community_spaces_general_announcement_only CHECK must be dropped too.';
+comment on column public.enrollment_plans.can_comment_in_private is
+  'Gold/VIP only. Fused with community_spaces.member_comments by user_community_capabilities(); '
+  'mirrored by src/lib/communityCapabilities.js — keep in lockstep.';
+
+-- D2 seed. Guarded so it runs only on FIRST apply: a later admin edit (say,
+-- opening posting in the Gold spaces) must not be clobbered by a re-run.
+do $$
+declare v_seeded boolean;
+begin
+  select exists (
+    select 1 from public.schema_migrations
+     where filename = '2026-07-31-community-plan-capabilities.sql'
+  ) into v_seeded;
+
+  if v_seeded then
+    raise notice '#36: capability seed skipped — already applied once (admin edits preserved).';
+  else
+    -- Nobody writes in General.
+    update public.enrollment_plans
+       set can_post_in_general = false,
+           can_comment_in_general = false,
+           can_react_in_general = true;
+
+    -- The two cohort plans get the full forum in their own private space.
+    update public.enrollment_plans
+       set can_post_in_private = true,
+           can_comment_in_private = true,
+           can_react_in_private = true,
+           can_upload_attachments = true
+     where coalesce(community_segment, 'general') in ('gold', 'vip');
+
+    -- Self-paced plans may still react, and may attach nothing (they cannot
+    -- create the content an attachment would belong to).
+    update public.enrollment_plans
+       set can_upload_attachments = false
+     where coalesce(community_segment, 'general') = 'general';
+
+    raise notice '#36: capability columns seeded for D2.';
+  end if;
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 2) ★ The D2 flip on the General space, pinned by a CHECK.
+--
+--    The UPDATE is written so it is a no-op once correct (idempotent), and the
+--    CHECK makes the state deliberate: reversing D2 means dropping a named
+--    constraint and recording it, not quietly running an UPDATE that the next
+--    deploy silently re-applies. That is exactly how prod drifted the first time.
+-- ───────────────────────────────────────────────────────────────────
+update public.community_spaces
+   set member_posting = false,
+       member_comments = false,
+       member_reactions = true,
+       updated_at = now()
+ where kind = 'general'
+   and (member_posting or member_comments or not member_reactions);
+
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'community_spaces_general_announcement_only') then
+    alter table public.community_spaces
+      add constraint community_spaces_general_announcement_only
+      check (kind <> 'general' or (member_posting = false and member_comments = false));
+  end if;
+end $$;
+
+comment on constraint community_spaces_general_announcement_only on public.community_spaces is
+  'D2 (#36): General is announcement-only — members read and react, only admins post. To reverse '
+  'the product decision, DROP this constraint explicitly and record it in db/README.md. Do not work '
+  'around it with an UPDATE: an un-recorded UPDATE is how production drifted from #32 in the first place.';
+
+-- ───────────────────────────────────────────────────────────────────
+-- 3) The resolver — ONE definition of "what may I do here?".
+--
+--    Set-returning rather than a per-row scalar so policies consume it as an
+--    UNCORRELATED subquery:
+--
+--      ✅ space_id in (select c.space_id from public.my_community_capabilities() c where c.can_post)
+--      ❌ exists (select 1 from public.my_community_capabilities() c where c.space_id = <row>.space_id ...)
+--
+--    The first is an InitPlan — evaluated ONCE per statement (the #29
+--    discipline). The second re-runs the whole resolver per candidate row,
+--    which on a 20-post feed page means 20 executions of a function that itself
+--    joins subscriptions and enrollment_plans.
+--
+--    bool_or across every currently-valid term: a member has exactly one live
+--    subscription today, but if that ever changes the most permissive of their
+--    paid plans is the defensible answer, and bool_or over an empty set is NULL
+--    → coalesced to the fail-closed default below.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.user_community_capabilities(p_user uuid)
+returns table (
+  space_id uuid, kind text,
+  can_post boolean, can_comment boolean, can_react boolean, can_attach boolean
+)
+language sql
+stable
+security definer
+set search_path = public
+as $fn$
+  with me as (
+    select coalesce(p.is_admin, false) as is_admin,
+           (p.approval_status = 'approved' or p.is_admin) as approved
+      from public.profiles p where p.id = p_user
+  ),
+  caps as (
+    select bool_or(coalesce(ep.can_post_in_general, false))    as post_general,
+           bool_or(coalesce(ep.can_comment_in_general, false)) as comment_general,
+           bool_or(coalesce(ep.can_react_in_general, true))    as react_general,
+           bool_or(coalesce(ep.can_post_in_private, false))    as post_private,
+           bool_or(coalesce(ep.can_comment_in_private, false)) as comment_private,
+           bool_or(coalesce(ep.can_react_in_private, true))    as react_private,
+           bool_or(coalesce(ep.can_upload_attachments, false)) as attach
+      from public.subscriptions s
+      join public.enrollment_plans ep on ep.key = s.plan_key
+     where s.user_id = p_user
+       and s.status = 'active'
+       and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+  ),
+  eff as (
+    select coalesce((select is_admin from me), false)  as is_admin,
+           -- A member with no resolvable plan row (legacy grandfather, unknown
+           -- key) gets the fail-closed defaults: read and react, write nothing.
+           coalesce((select post_general    from caps), false) as post_general,
+           coalesce((select comment_general from caps), false) as comment_general,
+           coalesce((select react_general   from caps), true)  as react_general,
+           coalesce((select post_private    from caps), false) as post_private,
+           coalesce((select comment_private from caps), false) as comment_private,
+           coalesce((select react_private   from caps), true)  as react_private,
+           coalesce((select attach          from caps), false) as attach,
+           coalesce((select approved from me), false) as approved
+  )
+  select sp.id,
+         sp.kind,
+         e.is_admin or (e.approved and sp.member_posting
+                        and case when sp.kind = 'general' then e.post_general else e.post_private end),
+         e.is_admin or (e.approved and sp.member_comments
+                        and case when sp.kind = 'general' then e.comment_general else e.comment_private end),
+         e.is_admin or (e.approved and sp.member_reactions
+                        and case when sp.kind = 'general' then e.react_general else e.react_private end),
+         -- Attaching requires BOTH the attachment right and the right to create
+         -- the thing the attachment hangs off — otherwise a plan that cannot
+         -- post could still fill the private bucket.
+         e.is_admin or (e.approved and e.attach and sp.member_posting
+                        and case when sp.kind = 'general' then e.post_general else e.post_private end)
+    from public.community_spaces sp, eff e
+   -- L1 is the single membership seam. Never re-derive it here.
+   where sp.id in (select public.user_community_space_ids(p_user));
+$fn$;
+
+revoke all on function public.user_community_capabilities(uuid) from public, anon, authenticated;
+
+create or replace function public.my_community_capabilities()
+returns table (
+  space_id uuid, kind text,
+  can_post boolean, can_comment boolean, can_react boolean, can_attach boolean
+)
+language sql
+stable
+security definer
+set search_path = public
+as $fn$
+  select * from public.user_community_capabilities(auth.uid());
+$fn$;
+
+revoke all on function public.my_community_capabilities() from public, anon;
+grant execute on function public.my_community_capabilities() to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 4) my_community_spaces() — the client switcher RPC, now carrying the
+--    EFFECTIVE capabilities so the UI and the database cannot disagree.
+--
+--    DROP + CREATE because the return type changes. A dropped function loses
+--    its grants, so the grant is re-applied immediately below — forgetting that
+--    is the classic way a drop+recreate silently breaks an admin screen.
+--
+--    member_count now comes from the indexed seat predicate instead of the old
+--    whole-table DISTINCT ON over subscriptions, which ran on every community load.
+-- ───────────────────────────────────────────────────────────────────
+drop function if exists public.my_community_spaces();
+
+create function public.my_community_spaces()
+returns table (
+  id uuid, slug text, kind text, name text, batch_code text,
+  member_posting boolean, member_comments boolean, member_reactions boolean,
+  can_post boolean, can_comment boolean, can_react boolean, can_attach boolean,
+  member_count bigint, is_default boolean
+)
+language sql
+stable
+security definer
+set search_path = public
+as $fn$
+  with caps as (select * from public.user_community_capabilities(auth.uid())),
+  my_default as (
+    select coalesce(
+      -- A cohort member lands in their own private space, newest cohort first.
+      (select sp.id
+         from public.community_spaces sp
+         join public.user_entitled_batches(auth.uid()) eb
+           on eb.batch_id = sp.batch_id and eb.segment = sp.kind
+        where sp.active
+        order by sp.created_at desc
+        limit 1),
+      (select sp.id from public.community_spaces sp where sp.kind = 'general' limit 1)
+    ) as space_id
+  )
+  select sp.id, sp.slug, sp.kind, sp.name, b.code as batch_code,
+         sp.member_posting, sp.member_comments, sp.member_reactions,
+         c.can_post, c.can_comment, c.can_react, c.can_attach,
+         case
+           when sp.kind = 'general' then
+             (select count(*) from public.profiles p
+               where (p.approval_status = 'approved' or p.is_admin)
+                 and public.user_is_enrolled(p.id))
+           else (select count(*) from public.batch_seat_holders(sp.batch_id, sp.kind))
+         end::bigint as member_count,
+         (sp.id = (select space_id from my_default)) as is_default
+    from caps c
+    join public.community_spaces sp on sp.id = c.space_id
+    left join public.batches b on b.id = sp.batch_id
+   order by (sp.kind = 'general') desc, b.code desc nulls last, sp.name;
+$fn$;
+
+revoke all on function public.my_community_spaces() from public, anon;
+grant execute on function public.my_community_spaces() to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 5) community_write_denial() — a read-only DIAGNOSTIC, never an authorization.
+--
+--    RLS cannot carry an error code: Postgres raises 42501 from the executor
+--    with a fixed message and no hook. Moving authorization out of RLS into
+--    triggers just to attach a code would trade a proven boundary for a
+--    friendlier string — refused. Instead the client asks this function WHY a
+--    write would fail, so it can disable the composer and say something honest
+--    instead of surfacing a raw permission error.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.community_write_denial(p_space_id uuid, p_kind text default 'post')
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public
+as $fn$
+  with sp as (select * from public.community_spaces where id = p_space_id),
+  cap as (select * from public.my_community_capabilities() where space_id = p_space_id)
+  select case
+    when not exists (select 1 from sp) then
+      jsonb_build_object('allowed', false, 'code', 'COMMUNITY_ACCESS_DENIED', 'reason', 'no_such_space')
+    when not exists (select 1 from cap) then
+      jsonb_build_object('allowed', false, 'code', 'COMMUNITY_ACCESS_DENIED', 'reason', 'not_a_member')
+    when p_kind = 'comment' and (select can_comment from cap) then jsonb_build_object('allowed', true)
+    when p_kind = 'react'   and (select can_react   from cap) then jsonb_build_object('allowed', true)
+    when p_kind = 'attach'  and (select can_attach  from cap) then jsonb_build_object('allowed', true)
+    when p_kind = 'post'    and (select can_post    from cap) then jsonb_build_object('allowed', true)
+    when (select kind from sp) = 'general' then
+      jsonb_build_object('allowed', false,
+        'code', case when p_kind = 'comment' then 'COMMENT_PERMISSION_DENIED' else 'COMMUNITY_ACCESS_DENIED' end,
+        'reason', 'announcement_space')
+    when p_kind = 'comment' then
+      jsonb_build_object('allowed', false, 'code', 'COMMENT_PERMISSION_DENIED', 'reason', 'plan_or_space')
+    else
+      jsonb_build_object('allowed', false, 'code', 'COMMUNITY_ACCESS_DENIED', 'reason', 'plan_or_space')
+  end;
+$fn$;
+
+revoke all on function public.community_write_denial(uuid, text) from public, anon;
+grant execute on function public.community_write_denial(uuid, text) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 6) The write policies, re-pointed at the resolver.
+--
+--    Shape is unchanged; only the capability SOURCE moves from the raw space
+--    flag to the fused plan × space answer. is_approved()/is_enrolled() stay
+--    (the #28 write-gate), and the admin-only-tag rule stays.
+-- ───────────────────────────────────────────────────────────────────
+-- ★ READ must admit an author's OWN withdrawn rows, or withdrawal is impossible.
+--
+--   Postgres refuses an UPDATE whose resulting row would not be visible to the
+--   writer under the table's SELECT policies. `community_posts_read` (from #24)
+--   admits only status = 'active', so an author setting status = 'deleted'
+--   produces a row they can no longer see, and the statement fails with 42501 —
+--   "new row violates row-level security policy".
+--
+--   Consequence: the member soft-delete that CLAUDE.md and #24/#28 describe
+--   ("members edit and soft-delete their own rows") could never actually have
+--   succeeded. It was never covered by a test, because until now nothing
+--   executed these policies as a real member. Adding the author branch below
+--   makes withdrawal work, and is strictly narrower than it looks: it lets an
+--   author see only their OWN non-active rows, which they wrote.
+--
+--   Hiding stays admin-only and stays invisible to the author: the branch is
+--   deliberately limited to 'deleted', so an admin-hidden post does not become
+--   readable by the person who wrote it.
+drop policy if exists community_posts_read on public.community_posts;
+create policy community_posts_read on public.community_posts
+  for select to authenticated
+  using (
+    (select public.is_admin())
+    or (status = 'active'
+        and (select public.is_approved()) and (select public.is_enrolled())
+        and space_id in (select public.my_community_space_ids()))
+    or (author_id = (select auth.uid()) and status = 'deleted')
+  );
+
+drop policy if exists community_comments_read on public.community_comments;
+create policy community_comments_read on public.community_comments
+  for select to authenticated
+  using (
+    (select public.is_admin())
+    or (status = 'active'
+        and (select public.is_approved()) and (select public.is_enrolled())
+        and space_id in (select public.my_community_space_ids())
+        and exists (select 1 from public.community_posts p
+                     where p.id = post_id and p.status = 'active'))
+    or (author_id = (select auth.uid()) and status = 'deleted')
+  );
+
+drop policy if exists community_posts_own_insert on public.community_posts;
+create policy community_posts_own_insert on public.community_posts
+  for insert to authenticated
+  with check (
+    author_id = (select auth.uid())
+    and status = 'active'
+    and (select public.is_approved()) and (select public.is_enrolled())
+    and space_id in (select c.space_id from public.my_community_capabilities() c where c.can_post)
+    and not exists (select 1 from public.community_tags t
+                     where t.slug = tag_slug and t.admin_only)
+  );
+
+-- ★ The UPDATE split (withdraw vs keep-published).
+--
+--   Gating the whole policy on can_post would strand every historical General
+--   post: its author could neither edit NOR delete it, because #28's own-update
+--   policy is also the soft-delete path. Gating on nothing lets a Core member
+--   keep re-publishing content D2 forbids. So:
+--     • status → 'deleted'  (WITHDRAW): allowed in any space you belong to;
+--     • status → 'active'   (EDIT / restore): requires create rights.
+--
+--   Consequence, deliberate and documented: a soft-delete in General is
+--   terminal, because restoring sets status='active'. The client only ever
+--   soft-deletes and already treats 'deleted' as terminal, so no UI changes.
+drop policy if exists community_posts_own_update on public.community_posts;
+create policy community_posts_own_update on public.community_posts
+  for update to authenticated
+  using (author_id = (select auth.uid()) and status <> 'hidden')
+  with check (
+    author_id = (select auth.uid())
+    and (select public.is_approved()) and (select public.is_enrolled())
+    and (
+      (status = 'deleted'
+        and space_id in (select public.my_community_space_ids()))
+      or
+      (status = 'active'
+        and space_id in (select c.space_id from public.my_community_capabilities() c where c.can_post)
+        and not exists (select 1 from public.community_tags t
+                         where t.slug = tag_slug and t.admin_only))
+    )
+  );
+
+drop policy if exists community_comments_own_insert on public.community_comments;
+create policy community_comments_own_insert on public.community_comments
+  for insert to authenticated
+  with check (
+    author_id = (select auth.uid())
+    and status = 'active'
+    and (select public.is_approved()) and (select public.is_enrolled())
+    and exists (
+      select 1 from public.community_posts p
+       where p.id = post_id
+         and p.status = 'active'
+         and not p.comments_locked
+         and p.space_id in (select c.space_id from public.my_community_capabilities() c where c.can_comment)
+    )
+  );
+
+drop policy if exists community_comments_own_update on public.community_comments;
+create policy community_comments_own_update on public.community_comments
+  for update to authenticated
+  using (author_id = (select auth.uid()) and status <> 'hidden')
+  with check (
+    author_id = (select auth.uid())
+    and (select public.is_approved()) and (select public.is_enrolled())
+    and (
+      (status = 'deleted' and space_id in (select public.my_community_space_ids()))
+      or
+      (status = 'active'
+        and space_id in (select c.space_id from public.my_community_capabilities() c where c.can_comment))
+    )
+  );
+
+-- Reactions: the ONE write every plan keeps. Insert AND delete, so a member can
+-- react and un-react. Requires read access to the target, which the space
+-- membership conjunct provides.
+drop policy if exists community_reactions_own_insert on public.community_reactions;
+create policy community_reactions_own_insert on public.community_reactions
+  for insert to authenticated
+  with check (
+    user_id = (select auth.uid())
+    and (select public.is_approved()) and (select public.is_enrolled())
+    and (
+      (post_id is not null and exists (
+         select 1 from public.community_posts p
+          where p.id = post_id and p.status = 'active'
+            and p.space_id in (select c.space_id from public.my_community_capabilities() c where c.can_react)))
+      or
+      (comment_id is not null and exists (
+         select 1 from public.community_comments c2
+           join public.community_posts p on p.id = c2.post_id
+          where c2.id = comment_id and c2.status = 'active' and p.status = 'active'
+            and p.space_id in (select c.space_id from public.my_community_capabilities() c where c.can_react)))
+    )
+  );
+
+drop policy if exists community_reactions_own_delete on public.community_reactions;
+create policy community_reactions_own_delete on public.community_reactions
+  for delete to authenticated
+  using (user_id = (select auth.uid()));
+
+-- Attachments follow the right to create the content they hang off.
+drop policy if exists community_attachments_own_insert on public.community_attachments;
+create policy community_attachments_own_insert on public.community_attachments
+  for insert to authenticated
+  with check (
+    (select public.is_approved()) and (select public.is_enrolled())
+    and exists (
+      select 1 from public.community_posts p
+       where p.id = post_id
+         and p.author_id = (select auth.uid())
+         and p.space_id in (select c.space_id from public.my_community_capabilities() c where c.can_attach)
+    )
+    -- #33's storage-path binding: the object must live under the caller's own
+    -- folder, in either the legacy <uid>/… or the space-scoped <space>/<uid>/… shape.
+    and (
+      (storage.foldername(storage_path))[1] = (select auth.uid())::text
+      or ((storage.foldername(storage_path))[2] = (select auth.uid())::text)
+    )
+  );
+
+-- ───────────────────────────────────────────────────────────────────
+-- 7) Storage — community-media INSERT must match the table policy.
+--
+--    #33 bound the path to the uploader. #36 additionally requires that the
+--    uploader can create content SOMEWHERE, so a plan with no write rights can
+--    no longer fill a private bucket with orphan objects. READ and DELETE keep
+--    the legacy path branch so objects uploaded before the space-scoped naming
+--    stay reachable and removable (#34's delete-parity gate).
+-- ───────────────────────────────────────────────────────────────────
+do $$
+begin
+  if not exists (select 1 from storage.buckets where id = 'community-media') then
+    raise notice '#36: community-media bucket not found — skipping its storage policy.';
+    return;
+  end if;
+
+  execute 'drop policy if exists community_media_own_insert on storage.objects';
+  execute $pol$
+    create policy community_media_own_insert on storage.objects
+      for insert to authenticated
+      with check (
+        bucket_id = 'community-media'
+        and (select public.is_approved()) and (select public.is_enrolled())
+        and (
+          (storage.foldername(name))[1] = (select auth.uid())::text
+          or (storage.foldername(name))[2] = (select auth.uid())::text
+        )
+        and exists (select 1 from public.my_community_capabilities() c where c.can_attach)
+      )
+  $pol$;
+end $$;
+
+-- Orphan sweep: objects whose attachment row never landed (a failed compose).
+-- Admin-only, read-only, paged — a list to act on, not an automatic delete.
+create or replace function public.admin_community_media_orphans(p_limit int default 100)
+returns table (name text, created_at timestamptz, size bigint)
+language sql
+stable
+security definer
+set search_path = public
+as $fn$
+  select o.name, o.created_at, (o.metadata->>'size')::bigint
+    from storage.objects o
+   where public.is_admin()
+     and o.bucket_id = 'community-media'
+     and not exists (select 1 from public.community_attachments a where a.storage_path = o.name)
+   order by o.created_at
+   limit greatest(1, least(500, coalesce(p_limit, 100)));
+$fn$;
+
+revoke all on function public.admin_community_media_orphans(int) from public, anon;
+grant execute on function public.admin_community_media_orphans(int) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 8) search_community_members() — the mention directory, gated.
+--
+--    Signature unchanged, so no client call site breaks. Behaviour tightens:
+--      · p_space_id is REQUIRED (null → empty, never "default to General");
+--      · the caller must be able to post OR comment in that space — you cannot
+--        enumerate a roster you have no way to address;
+--      · General is refused outright (D2: nobody can mention anyone there);
+--      · a query shorter than 2 characters returns nothing, so the directory
+--        cannot be walked one letter at a time.
+--    Membership comes from L1, so a mention list can only ever contain people
+--    who share the space.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.search_community_members(
+  p_query    text,
+  p_space_id uuid default null
+)
+returns table (id uuid, display_name text, avatar_url text)
+language sql
+stable
+security definer
+set search_path = public
+as $fn$
+  with tgt as (
+    select sp.id, sp.kind, sp.batch_id
+      from public.community_spaces sp
+     where sp.id = p_space_id
+       and sp.kind <> 'general'
+  ),
+  allowed as (
+    select 1
+      from public.my_community_capabilities() c, tgt
+     where c.space_id = tgt.id
+       and (c.can_post or c.can_comment)
+  ),
+  roster as (
+    select h as user_id from tgt, lateral public.batch_seat_holders(tgt.batch_id, tgt.kind) h
+  )
+  select p.id, trim(p.full_name) as display_name, p.avatar_url
+    from public.profiles p
+   where exists (select 1 from allowed)
+     and char_length(btrim(coalesce(p_query, ''))) >= 2
+     and (p.id in (select user_id from roster) or coalesce(p.is_admin, false))
+     -- Nameless profiles are unmentionable: the markup needs a display name, and
+     -- falling back to the email address would leak it.
+     and coalesce(btrim(p.full_name), '') <> ''
+     and p.full_name ilike '%' || btrim(p_query) || '%'
+   order by p.full_name
+   limit 20;
+$fn$;
+
+revoke all on function public.search_community_members(text, uuid) from public, anon;
+grant execute on function public.search_community_members(text, uuid) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ═══════════════════════════════════════════════════════════════════
+-- AFTER RUNNING
+--   -- D2 is data AND a constraint
+--   select slug, member_posting, member_comments, member_reactions
+--     from public.community_spaces where kind = 'general';        -- f | f | t
+--   select conname from pg_constraint
+--    where conname = 'community_spaces_general_announcement_only'; -- 1 row
+--
+--   -- the plan matrix
+--   select key, can_post_in_general, can_comment_in_general, can_react_in_general,
+--          can_post_in_private, can_comment_in_private, can_upload_attachments
+--     from public.enrollment_plans order by key;
+--   -- core/sampler/silver → f f t f f f ;  gold_live/vip → f f t t t t
+--
+--   -- policies read the resolver, not the raw flags
+--   select policyname, with_check like '%my_community_capabilities%' as uses_resolver
+--     from pg_policies
+--    where tablename in ('community_posts','community_comments','community_reactions')
+--      and cmd in ('INSERT','UPDATE');                            -- all true
+--
+--   -- the resolver is not directly callable with someone else's id
+--   select has_function_privilege('authenticated',
+--     'public.user_community_capabilities(uuid)', 'execute');     -- f
+--
+--   -- existing General posts are still READABLE (nothing was deleted)
+--   select count(*) from public.community_posts
+--    where status = 'active'
+--      and space_id = (select id from public.community_spaces where kind='general');
+-- ═══════════════════════════════════════════════════════════════════
+
+insert into public.schema_migrations (filename, checksum, notes) values
+ ('2026-07-31-community-plan-capabilities.sql', null,
+  'per-plan community capabilities (#36): 7 enrollment_plans flags + user_community_capabilities(), '
+  'D2 General announcement-only (posting + commenting OFF, reactions ON) pinned by a CHECK, '
+  'withdraw/keep-published UPDATE split, search_community_members create-rights gate, '
+  'community-media insert narrowed to members who can attach')
+on conflict (filename) do nothing;
+
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- §24) FOLDED VERBATIM — 2026-08-01-entitlement-hardening.sql
+--      code-review corrections to #35/#36
+--
+--      Appended at the tail for the same reason as §19-§21: the earlier
+--      sections create the pre-#35 shapes, and these files' DROP+CREATE must
+--      win on a fresh install. Every file is idempotent and self-guarded, so
+--      appending reproduces the live end state exactly.
+--      RE-FOLD whenever the dated file changes.
+-- ═════════════════════════════════════════════════════════════════════════════
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- #37 — Corrections to #35/#36 found in code review
+--
+-- WHY
+--   Five defects, one of them a silent regression of #33's hardening applied
+--   two days earlier. #35 and #36 are already live, so this lands on top of
+--   them rather than editing them (the #33 → #34 precedent: never rewrite an
+--   applied file from memory; patch it with a new one that states the diff).
+--
+--   ① CRITICAL — #36's community_attachments_own_insert dropped THREE conjuncts
+--      that #33 had deliberately added:
+--        · `uploader_id = auth.uid()` — community_attachments.uploader_id is
+--          NOT NULL and CLIENT-SUPPLIED. Unlike community_posts.author_id there
+--          is no stamping trigger, so without this a member could file an
+--          attachment row attributed to another profile. The own-DELETE policy
+--          keys on uploader_id, so both provenance AND deletability were forged.
+--        · the `storage_path is null` branch — the table CHECK is
+--          `((kind = 'link') = (storage_path is null))`, so a LINK attachment
+--          has a NULL path. `storage.foldername(NULL)[1] = uid` evaluates to
+--          NULL, so the WITH CHECK could never pass: link attachments have been
+--          IMPOSSIBLE TO CREATE since #36 shipped.
+--        · the space binding `[1] = p.space_id` on two-level paths — without it
+--          an attachment row can be pointed at another space's object.
+--      The `can_attach` gate #36 added is correct and is KEPT; this restores the
+--      three conjuncts on top of it.
+--
+--   ② #36's community_media_own_insert likewise lost #33's requirement that a
+--      uuid-shaped first path segment be one of the caller's own spaces
+--      (including #33's regex guard, which exists so a non-uuid segment yields a
+--      clean policy denial instead of "invalid input syntax for type uuid" —
+--      a 500 where a 403 belongs).
+--
+--   ③ A segment-changing upgrade left subscriptions.batch_id NULL.
+--      admin_finalize_enrollment sets the cache, then (on gold↔vip) calls
+--      revoke_batch_run(...,'superseded'), whose tail cleared the cache because
+--      at that instant the member has zero outstanding entitlements — and
+--      nothing re-set it afterwards. Access was unaffected (the ledger carries
+--      it) but v_batch_entitlement_drift reported 'missing_cache' forever, so
+--      the #39 gate could never read clean.
+--      FIX: only a genuine REVOKE clears the cache. Superseding is one step of
+--      an in-flight upgrade, not a withdrawal. This is safe because the #39
+--      bridge is disabled by the presence of ANY ledger row for the user
+--      (`not exists (… where e2.user_id = p_user)` — no status filter), so a
+--      stale batch_id can never resurrect access once a member has any row.
+--      Chosen over re-emitting admin_finalize_enrollment precisely to avoid
+--      reconstructing a 150-line function that #34 already had to restore once.
+--
+--   ④ The FIFO binder had no forward-only floor. Creating a batch for a PAST
+--      month — entirely plausible while importing historical students — bound
+--      every queued seat in the system to it, out of run order, with
+--      activates_at already in the past. A member would gain a cohort they
+--      never bought.
+--
+--   ⑤ admin_grant_batch_run was not idempotent. If the member already held a
+--      seat in every open batch, the candidate loop allocated none and the
+--      shortfall path minted p_count fresh QUEUED seats — sold, capacity-exempt,
+--      and auto-bound to future cohorts. ALREADY_ENTITLED was in the catalogue
+--      but never raised anywhere.
+--
+-- ORDER
+--   Run AFTER db/2026-07-31-community-plan-capabilities.sql (#36).
+--   Additive, idempotent, non-destructive. No table or column is dropped; no
+--   row is deleted.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+do $$
+begin
+  if to_regclass('public.batch_entitlements') is null then
+    raise exception '#37 requires #35 — run db/2026-07-30-batch-entitlements.sql first.';
+  end if;
+  if not exists (select 1 from information_schema.columns
+                  where table_schema='public' and table_name='enrollment_plans'
+                    and column_name='can_upload_attachments') then
+    raise exception '#37 requires #36 — run db/2026-07-31-community-plan-capabilities.sql first.';
+  end if;
+  if to_regclass('public.schema_migrations') is null then
+    raise exception '#37 requires #31 — the tail insert would abort the migration.';
+  end if;
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 1) ① Restore #33's attachment binding, keeping #36's can_attach gate.
+--
+--    Reading order matters here: ownership → gate → post ownership + capability
+--    → path binding. The path clause keeps all three shapes #33 allowed:
+--      · NULL          — a link attachment (enforced by the table CHECK)
+--      · <uid>/…       — legacy, pre-#32
+--      · <space>/<uid>/… — #32's space-scoped naming, bound to the POST's space
+-- ───────────────────────────────────────────────────────────────────
+drop policy if exists community_attachments_own_insert on public.community_attachments;
+create policy community_attachments_own_insert on public.community_attachments
+  for insert to authenticated
+  with check (
+    uploader_id = (select auth.uid())
+    and (select public.is_approved()) and (select public.is_enrolled())
+    and exists (
+      select 1 from public.community_posts p
+       where p.id = community_attachments.post_id
+         and p.author_id = (select auth.uid())
+         and p.space_id in (select c.space_id
+                              from public.my_community_capabilities() c
+                             where c.can_attach)
+         and (community_attachments.storage_path is null
+              or (storage.foldername(community_attachments.storage_path))[1] = (select auth.uid())::text
+              or ((storage.foldername(community_attachments.storage_path))[1] = p.space_id::text
+                  and (storage.foldername(community_attachments.storage_path))[2] = (select auth.uid())::text))
+    )
+  );
+
+-- ───────────────────────────────────────────────────────────────────
+-- 2) ② Restore #33's storage-side space check, keeping #36's can_attach gate.
+--    The regex guard is #33's and is load-bearing: casting a non-uuid segment
+--    would raise 22P02 (a 500) instead of failing the policy cleanly (a 403).
+-- ───────────────────────────────────────────────────────────────────
+do $$
+begin
+  if not exists (select 1 from storage.buckets where id = 'community-media') then
+    raise notice '#37: community-media bucket not found — skipping its storage policy.';
+    return;
+  end if;
+
+  execute 'drop policy if exists community_media_own_insert on storage.objects';
+  execute $pol$
+    create policy community_media_own_insert on storage.objects
+      for insert to authenticated
+      with check (
+        bucket_id = 'community-media'
+        and (select public.is_approved()) and (select public.is_enrolled())
+        and exists (select 1 from public.my_community_capabilities() c where c.can_attach)
+        and (
+          (storage.foldername(name))[1] = (select auth.uid())::text
+          or
+          ((storage.foldername(name))[2] = (select auth.uid())::text
+           and (case when (storage.foldername(name))[1] ~
+                          '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                     then ((storage.foldername(name))[1])::uuid
+                     else null end) in (select public.my_community_space_ids()))
+        )
+      )
+  $pol$;
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 3) ③ Only a REVOKE clears the legacy cache.
+--    Byte-identical to #35's body except the final UPDATE's guard.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.revoke_batch_run(
+  p_user_id uuid,
+  p_run_id  uuid default null,
+  p_reason  text default null,
+  p_actor   uuid default null,
+  p_status  text default 'revoked'
+)
+returns int
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare v_n int;
+begin
+  if p_status not in ('revoked', 'superseded') then
+    perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+      'revoke_batch_run can only set revoked or superseded', 409, null);
+  end if;
+
+  with touched as (
+    update public.batch_entitlements e
+       set status        = p_status,
+           revoked_at    = case when p_status = 'revoked' then now() else e.revoked_at end,
+           revoked_by    = case when p_status = 'revoked' then p_actor else e.revoked_by end,
+           revoke_reason = coalesce(p_reason, e.revoke_reason),
+           updated_at    = now()
+     where e.user_id = p_user_id
+       and e.status in ('queued', 'active')
+       and (p_run_id is null or e.run_id = p_run_id)
+    returning e.batch_id, e.run_id, e.segment
+  )
+  insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+  select t.batch_id, p_user_id, p_actor,
+         case when p_status = 'revoked' then 'entitle_revoke' else 'entitle_supersede' end,
+         jsonb_build_object('run_id', t.run_id, 'segment', t.segment, 'reason', p_reason)
+    from touched t;
+
+  get diagnostics v_n = row_count;
+
+  -- ★ #37: `p_status = 'revoked'` added. Superseding is one step of an in-flight
+  -- upgrade — the caller grants a replacement run immediately afterwards — so
+  -- clearing the cache here left every segment-changing upgrade with
+  -- subscriptions.batch_id NULL and the drift view stuck on 'missing_cache'.
+  -- Safe because the #39 bridge is disabled by the presence of ANY ledger row
+  -- for the user, so a stale batch_id cannot resurrect access.
+  if p_status = 'revoked' then
+    update public.subscriptions s
+       set batch_id = null, updated_at = now()
+     where s.user_id = p_user_id
+       and s.batch_id is not null
+       and not exists (select 1 from public.batch_entitlements e
+                        where e.user_id = p_user_id and e.status in ('queued', 'active'));
+  end if;
+
+  return v_n;
+end;
+$fn$;
+
+revoke all on function public.revoke_batch_run(uuid, uuid, text, uuid, text) from public, anon, authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 4) ④ The FIFO binder becomes forward-only WITHIN a run.
+--    A queued seat may only claim a cohort later than every cohort its run has
+--    already been allocated, so a backdated batch cannot absorb owed seats or
+--    reorder a member's run.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.allocate_queued_entitlements(p_batch_id uuid default null)
+returns int
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  v_b   record;
+  v_e   record;
+  v_n   int := 0;
+  v_act timestamptz;
+begin
+  for v_b in
+    select b.id, b.code, b.starts_on
+      from public.batches b
+     where (p_batch_id is null or b.id = p_batch_id)
+       and b.status = 'open'
+     order by b.code
+  loop
+    v_act := coalesce(v_b.starts_on::timestamptz, to_date(v_b.code || '-01', 'YYYY-MM-DD')::timestamptz);
+
+    for v_e in
+      select e.id, e.user_id, e.segment, e.run_id
+        from public.batch_entitlements e
+       where e.status = 'queued'
+         and (e.valid_until is null or e.valid_until > now())
+         and exists (select 1 from public.community_spaces sp
+                      where sp.batch_id = v_b.id and sp.kind = e.segment and sp.active)
+         and not exists (select 1 from public.batch_entitlements e2
+                          where e2.user_id = e.user_id and e2.batch_id = v_b.id
+                            and e2.status in ('queued', 'active'))
+         -- ★ #37: forward-only within the run. Without this, creating a batch
+         -- for a PAST month bound every queued seat to it, out of order and
+         -- already active.
+         and v_b.code > coalesce((
+               select max(b2.code)
+                 from public.batch_entitlements e3
+                 join public.batches b2 on b2.id = e3.batch_id
+                where e3.run_id = e.run_id
+                  and e3.batch_id is not null
+                  and e3.status in ('queued', 'active')), '')
+       order by e.granted_at, e.batch_index
+       for update skip locked
+    loop
+      -- The cursor's guard was evaluated against the open-time snapshot, so it
+      -- cannot see seats allocated by EARLIER iterations of this loop. Re-check
+      -- where our own uncommitted writes are visible: one member, one seat, per
+      -- cohort.
+      if exists (select 1 from public.batch_entitlements e2
+                  where e2.user_id = v_e.user_id
+                    and e2.batch_id = v_b.id
+                    and e2.status in ('queued', 'active')) then
+        continue;
+      end if;
+
+      update public.batch_entitlements
+         set batch_id = v_b.id, status = 'active',
+             activates_at = v_act, allocated_at = now(), updated_at = now()
+       where id = v_e.id;
+
+      insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+      values (v_b.id, v_e.user_id, null, 'entitle_allocate',
+              jsonb_build_object('run_id', v_e.run_id, 'segment', v_e.segment, 'source', 'fifo_binder'));
+      v_n := v_n + 1;
+    end loop;
+  end loop;
+  return v_n;
+end;
+$fn$;
+
+revoke all on function public.allocate_queued_entitlements(uuid) from public, anon, authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 5) ⑤ admin_grant_batch_run refuses a duplicate run unless forced.
+--    p_force already existed to bypass capacity; it now also bypasses this,
+--    which is the right pairing — both are "I know, do it anyway".
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.admin_grant_batch_run(
+  p_user_id  uuid,
+  p_batch_id uuid,
+  p_count    int     default null,
+  p_force    boolean default false
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  v_sub         public.subscriptions%rowtype;
+  v_segment     text;
+  v_count       int;
+  v_outstanding int;
+begin
+  if not public.is_admin() then
+    perform public.app_error('FORBIDDEN', 'admin_grant_batch_run: admin only', 403, null);
+  end if;
+
+  select * into v_sub from public.subscriptions s
+   where s.user_id = p_user_id and s.status = 'active'
+     and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+   order by s.created_at desc limit 1;
+  if v_sub.id is null then
+    perform public.app_error('ENTITLEMENT_EXPIRED',
+      'member has no active membership term to attach a cohort seat to', 403,
+      jsonb_build_object('user_id', p_user_id));
+  end if;
+
+  select coalesce(ep.community_segment, 'general') into v_segment
+    from public.enrollment_plans ep where ep.key = v_sub.plan_key;
+  if v_segment not in ('gold', 'vip') then
+    perform public.app_error('INVALID_PLAN',
+      format('plan %s is not a cohort plan', v_sub.plan_key), 422,
+      jsonb_build_object('plan_key', v_sub.plan_key, 'segment', v_segment));
+  end if;
+
+  v_count := coalesce(p_count, public.plan_eligible_batch_count(v_sub.plan_key), 1);
+
+  -- ★ #37: idempotency. The one-seat-per-cohort unique index only protects
+  -- BOUND seats, so a repeat call on a member who already holds every open
+  -- cohort fell through to the shortfall path and minted a second full run of
+  -- queued seats — sold, capacity-exempt, and auto-bound later by the binder.
+  if not p_force then
+    select count(*) into v_outstanding
+      from public.batch_entitlements e
+     where e.user_id = p_user_id and e.status in ('queued', 'active');
+    if v_outstanding >= v_count then
+      perform public.app_error('ALREADY_ENTITLED',
+        format('member already holds %s outstanding cohort seat(s); pass p_force to stack another run',
+               v_outstanding), 409,
+        jsonb_build_object('outstanding', v_outstanding, 'requested', v_count));
+    end if;
+  end if;
+
+  return public.grant_batch_run(
+    p_user_id, v_segment, p_batch_id, v_count, 'admin_manual',
+    v_sub.id, v_sub.plan_key, null, null,
+    coalesce(v_sub.grace_ends_at, v_sub.ends_at), auth.uid(), not p_force);
+end;
+$fn$;
+
+revoke all on function public.admin_grant_batch_run(uuid, uuid, int, boolean) from public, anon;
+grant execute on function public.admin_grant_batch_run(uuid, uuid, int, boolean) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 6) my_community_spaces() — General's member_count was O(N) SECDEF calls.
+--    user_is_enrolled(p.id) ran once per profile; at the 500+ user target that
+--    is 500 SECURITY DEFINER invocations on every community load. Same answer,
+--    computed set-based from the live-subscription join (#32's valid_subs idiom).
+-- ───────────────────────────────────────────────────────────────────
+drop function if exists public.my_community_spaces();
+
+create function public.my_community_spaces()
+returns table (
+  id uuid, slug text, kind text, name text, batch_code text,
+  member_posting boolean, member_comments boolean, member_reactions boolean,
+  can_post boolean, can_comment boolean, can_react boolean, can_attach boolean,
+  member_count bigint, is_default boolean
+)
+language sql
+stable
+security definer
+set search_path = public
+as $fn$
+  with caps as (select * from public.user_community_capabilities(auth.uid())),
+  general_members as (
+    select count(*)::bigint as n
+      from public.profiles p
+     where (p.approval_status = 'approved' or p.is_admin)
+       and (
+         exists (select 1 from public.subscriptions s
+                  where s.user_id = p.id and s.status = 'active'
+                    and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now()))
+         or (p.is_paid and not exists (select 1 from public.subscriptions s2 where s2.user_id = p.id))
+       )
+  ),
+  my_default as (
+    select coalesce(
+      (select sp.id
+         from public.community_spaces sp
+         join public.user_entitled_batches(auth.uid()) eb
+           on eb.batch_id = sp.batch_id and eb.segment = sp.kind
+        where sp.active
+        order by sp.created_at desc
+        limit 1),
+      (select sp.id from public.community_spaces sp where sp.kind = 'general' limit 1)
+    ) as space_id
+  )
+  select sp.id, sp.slug, sp.kind, sp.name, b.code as batch_code,
+         sp.member_posting, sp.member_comments, sp.member_reactions,
+         c.can_post, c.can_comment, c.can_react, c.can_attach,
+         case
+           when sp.kind = 'general' then (select n from general_members)
+           else (select count(*) from public.batch_seat_holders(sp.batch_id, sp.kind))
+         end::bigint as member_count,
+         (sp.id = (select space_id from my_default)) as is_default
+    from caps c
+    join public.community_spaces sp on sp.id = c.space_id
+    left join public.batches b on b.id = sp.batch_id
+   order by (sp.kind = 'general') desc, b.code desc nulls last, sp.name;
+$fn$;
+
+revoke all on function public.my_community_spaces() from public, anon;
+grant execute on function public.my_community_spaces() to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ═══════════════════════════════════════════════════════════════════
+-- AFTER RUNNING
+--   -- ① attachment binding restored (all four conjuncts back)
+--   -- NOTE: pg_policies.with_check is the PARSED expression, not your source
+--   -- text — Postgres uppercases `IS NULL` and parenthesises `(p.space_id)::text`.
+--   -- Match case-insensitively or you will get a false negative.
+--   select with_check ilike '%uploader_id =%'            as owns_row,
+--          with_check ilike '%storage_path IS NULL%'     as link_allowed,
+--          with_check ilike '%(p.space_id)::text%'       as space_bound,
+--          with_check ilike '%can_attach%'               as plan_gated
+--     from pg_policies where policyname = 'community_attachments_own_insert';
+--   -- expect: t | t | t | t
+--
+--   -- ② storage space check restored
+--   select with_check like '%my_community_space_ids%' as space_checked,
+--          with_check like '%can_attach%'             as plan_gated
+--     from pg_policies where policyname = 'community_media_own_insert';   -- t | t
+--
+--   -- ③ only a revoke clears the cache
+--   select prosrc like '%if p_status = ''revoked'' then%' as guarded
+--     from pg_proc where proname = 'revoke_batch_run';                    -- t
+--
+--   -- ④ binder is forward-only within a run
+--   select prosrc like '%select max(b2.code)%' as has_floor
+--     from pg_proc where proname = 'allocate_queued_entitlements';        -- t
+--
+--   -- ⑤ duplicate runs refused
+--   select prosrc like '%ALREADY_ENTITLED%' as idempotent
+--     from pg_proc where proname = 'admin_grant_batch_run';               -- t
+--
+--   -- drift should read only 'ok'
+--   select drift, count(*) from public.v_batch_entitlement_drift group by 1;
+-- ═══════════════════════════════════════════════════════════════════
+
+insert into public.schema_migrations (filename, checksum, notes) values
+ ('2026-08-01-entitlement-hardening.sql', null,
+  'code-review corrections to #35/#36 (#37): restores #33''s attachment uploader/link/space binding that '
+  '#36 dropped (link attachments were impossible to create, uploader_id was forgeable); restores the '
+  'community-media storage space check; only a REVOKE clears subscriptions.batch_id, so a segment-changing '
+  'upgrade no longer strands the cache; the FIFO binder is forward-only within a run so a backdated batch '
+  'cannot absorb queued seats; admin_grant_batch_run raises ALREADY_ENTITLED instead of minting a duplicate '
+  'run; my_community_spaces General member_count is set-based instead of O(N) SECDEF calls')
+on conflict (filename) do nothing;
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- §25) FOLDED VERBATIM — 2026-08-16-batch-lifecycle.sql
+--      editable batch records, the past-lock, and automatic month-end closure
+--
+--      Appended at the tail for the same reason as §19-§24: the earlier
+--      sections create the pre-#38 shapes, and this file's DROP+CREATE must
+--      win on a fresh install. Every file is idempotent and self-guarded, so
+--      appending reproduces the live end state exactly.
+--      RE-FOLD whenever the dated file changes.
+-- ═════════════════════════════════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════════════════
+-- #38 — Batch lifecycle: editable records, a past-lock, and automatic closure
+--
+-- WHY
+--   Admin → Batches can create a batch and toggle its status. Nothing else. The
+--   period columns #32 shipped (starts_on / ends_on / timezone) have never been
+--   written, so three things are broken at once:
+--
+--   ① A TYPO IS PERMANENT. The live registry holds a batch displayed as
+--      "August" whose code is 2026-09, and one displayed as "October" coded
+--      2026-10. There is no in-app path to either. But `code` is NOT a label:
+--      grant_batch_run() scans `where b.code >= v_start.code and b.status='open'
+--      order by b.code … for update`, and allocate_queued_entitlements() applies
+--      a forward-only floor `v_b.code > max(code the run already holds)`. A
+--      careless re-code silently REORDERS a member's already-purchased run. So
+--      the code cannot be a plain client UPDATE, and the fix is not "add an
+--      input" — it is a guarded RPC plus a privilege that makes the direct path
+--      impossible.
+--
+--   ② NOTHING EVER CLOSES. ends_on is NULL on every row and no code reads it, so
+--      a batch stays `open` after its month ends — still offered in the student
+--      checkout picker (enroll_req_own_insert admits only open batches) and
+--      still absorbing queued ledger seats. Closure has always been a thing Alex
+--      had to remember.
+--
+--   ③ "PAST" HAD NO DEFINITION. Editing must stop once a batch's period has
+--      genuinely elapsed — and `closed`/`archived` is the wrong proxy, because a
+--      batch can be closed early or archived while its month is still running.
+--      The lock is the CALENDAR, read in the batch's OWN timezone: past means
+--      today-local > ends_on, so a batch stays editable through its final local
+--      day. Comparing timestamps in UTC would lock an Asia/Manila batch up to
+--      16 hours early for the one admin who uses this screen.
+--
+-- WHAT THIS ADDS
+--   • batches.closed_at / close_reason  — so a card can say "Closed
+--     automatically on 1 Jan 2027" from one row read instead of an event scan.
+--   • A one-time date BACKFILL from `code`, run BEFORE any guard exists.
+--   • batch_is_past(ends_on, timezone)  — the ONE definition of past. Mirrored
+--     by isPastBatch() in src/lib/batchLifecycle.js.
+--   • batches_guard()   — BEFORE INSERT OR UPDATE. Fills the period on insert so
+--     SQL-editor inserts are as reliable as the UI's; enforces the past-lock and
+--     period validity on update; refuses an id change.
+--   • A column-level REVOKE on batches.code — the half a trigger cannot give.
+--     After this, a direct PATCH of `code` by `authenticated` is refused on
+--     PRIVILEGE, whatever RLS says. The owner (SQL editor, Management API) and
+--     `service_role` keep table-level UPDATE, so batches_guard() ALSO re-checks
+--     the code's shape and rank on every UPDATE — privilege stops the API,
+--     the trigger stops the console, and admin_update_batch() is the one path
+--     that does both plus the audit row.
+--   • admin_update_batch()      — the transactional editor.
+--   • close_due_batches()       — the idempotent sweep, plus an admin wrapper.
+--   • A pg_cron job running the sweep hourly.
+--
+-- WHAT THIS DELIBERATELY DOES NOT DO
+--   • It does not rename community_spaces.slug. The slug is what `?space=` deep
+--     links and the stored community:lastSpace preference key on, and
+--     pickInitialSpace() falls back SILENTLY on an unknown slug — a renamed slug
+--     would send bookmarks to the wrong space with no error anyone could see.
+--     The slug is a permalink; only the space NAME follows the batch.
+--   • It does not rewrite entitlement, subscription, audit or batch history.
+--     The only ledger write is re-stamping activates_at on seats that have NOT
+--     yet activated, when the admin corrects a start date.
+--   • It never archives. Automatic closure sets `closed`, full stop.
+--   • It does not touch expire_overdue_subscriptions(), which has the same
+--     cron-hostile is_admin() guard. That is a follow-up, not this file.
+--
+-- ORDER
+--   Run AFTER db/2026-08-01-entitlement-hardening.sql (#37).
+--   Additive, idempotent, non-destructive. No table or column is dropped; no row
+--   is deleted. admin_batch_overview() is DROPped and recreated (its row type
+--   gains columns) and its grant is restored in the same breath.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- ───────────────────────────────────────────────────────────────────
+-- 0) Guards. #38 patches shapes that #32 and #35 created.
+-- ───────────────────────────────────────────────────────────────────
+do $$
+begin
+  if to_regclass('public.batches') is null then
+    raise exception '#38 requires #32 — run db/2026-07-28-community-spaces-batches.sql first.';
+  end if;
+  if to_regclass('public.batch_entitlements') is null then
+    raise exception '#38 requires #35 — run db/2026-07-30-batch-entitlements.sql first.';
+  end if;
+  if to_regprocedure('public.app_error(text, text, int, jsonb)') is null then
+    raise exception '#38 requires #35''s app_error() — run db/2026-07-30-batch-entitlements.sql first.';
+  end if;
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 1) Closure provenance.
+-- ───────────────────────────────────────────────────────────────────
+alter table public.batches
+  add column if not exists closed_at    timestamptz,
+  add column if not exists close_reason text;
+
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'batches_close_reason_check') then
+    alter table public.batches
+      add constraint batches_close_reason_check
+      check (close_reason is null or close_reason in ('manual', 'auto', 'archive'));
+  end if;
+end $$;
+
+comment on column public.batches.closed_at is
+  'When the batch stopped accepting new assignments. Set by close_due_batches() (auto) or an admin.';
+comment on column public.batches.close_reason is
+  'manual | auto | archive. ''auto'' means the month-end sweep closed it — the card says so.';
+
+-- ───────────────────────────────────────────────────────────────────
+-- 2) BACKFILL the period from `code`. This MUST run before batches_guard
+--    exists, because it writes rows that are already past and the guard is
+--    about to make those read-only.
+--
+--    ★ This is behaviour-neutral, not a guess. `to_date(code || '-01')` is the
+--    EXACT fallback grant_batch_run() (§6256) and allocate_queued_entitlements()
+--    (§8151) already use to derive activates_at when starts_on is null, and
+--    batches_code_check guarantees a real month. So every future allocation
+--    computes precisely what it computed before this file ran, and no
+--    already-stamped activates_at is touched.
+--
+--    Idempotent: the WHERE clause matches nothing on a second run.
+-- ───────────────────────────────────────────────────────────────────
+update public.batches
+   set starts_on = coalesce(starts_on, to_date(code || '-01', 'YYYY-MM-DD')),
+       ends_on   = coalesce(ends_on,
+                     (to_date(code || '-01', 'YYYY-MM-DD') + interval '1 month - 1 day')::date)
+ where starts_on is null
+    or ends_on is null;
+
+-- ★ And normalise any timezone Postgres does not recognise. #32 declared the
+-- column `not null default 'Asia/Manila'` and never validated it, so a row
+-- written by hand can hold anything. `now() at time zone 'Gotham/Central'` does
+-- not return null — it RAISES 22023 — and batch_is_past() is evaluated once per
+-- row by admin_batch_overview() and inside close_due_batches()'s WHERE. So a
+-- single bad row would 500 the whole Batches screen and abort the sweep for
+-- EVERY batch, hourly, with the failure buried in cron.job_run_details.
+-- This runs before the guard exists, so it can also repair a past row.
+update public.batches b
+   set timezone = 'Asia/Manila'
+ where coalesce(b.timezone, '') = ''
+    or not exists (select 1 from pg_timezone_names z where z.name = b.timezone);
+
+-- ───────────────────────────────────────────────────────────────────
+-- 3) The error catalogue gains this file's codes. Kept in lockstep BY HAND
+--    with APP_ERROR_CODES + APP_ERROR_COPY in src/lib/appErrors.js.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.app_error_catalog()
+returns table (code text, http int, summary text)
+language sql
+immutable
+parallel safe
+set search_path = public
+as $$
+  select * from (values
+    ('BATCH_REQUIRED',               422, 'A Gold/VIP action needs an explicit batch; none was supplied.'),
+    ('BATCH_NOT_FOUND',              404, 'The batch id or month code does not exist.'),
+    ('BATCH_CLOSED',                 409, 'The batch is closed to new assignments, or archived.'),
+    ('BATCH_FULL',                   409, 'A cohort in the run has no seats left.'),
+    ('NO_SPACE_FOR_SEGMENT',         409, 'The batch has no active community space for that plan segment.'),
+    ('INVALID_BATCH_CODE',           422, 'Not a real YYYY-MM month.'),
+    ('ENTITLEMENT_EXPIRED',          403, 'The membership term (or its grace) has ended.'),
+    ('INVALID_PLAN',                 422, 'Unknown, inactive, or non-premium plan for this action.'),
+    ('ALREADY_ENTITLED',             409, 'The member already holds an outstanding seat in that cohort.'),
+    ('RUN_LIMIT_EXCEEDED',           409, 'Outstanding seats would exceed the per-member ceiling.'),
+    ('SEGMENT_MISMATCH',             409, 'The grant would mix Gold and VIP seats in one outstanding run.'),
+    ('INVALID_MEMBERSHIP_TRANSITION',409, 'The current membership state does not allow this transition.'),
+    ('IMMUTABLE_ENTITLEMENT',        409, 'An attempt to rewrite a frozen ledger column.'),
+    ('FORBIDDEN',                    403, 'Admin-only operation called by a non-admin.'),
+    ('REQUEST_NOT_FOUND',            404, 'The enrollment request does not exist.'),
+    ('COURSE_ACCESS_DENIED',         403, 'Course hidden by plan scope, publication, or cohort entitlement.'),
+    ('LESSON_NOT_RELEASED',          403, 'The cohort drip has not unlocked this lesson yet.'),
+    ('COMMUNITY_ACCESS_DENIED',      403, 'The community write was refused.'),
+    ('COMMENT_PERMISSION_DENIED',    403, 'Replies are off in this space.'),
+    ('ASSIGNMENT_CLOSED',            409, 'Past the due date, or the assignment is unpublished.'),
+    ('SUBMISSION_LOCKED',            409, 'The submission is handed in or graded; edits refused.'),
+    ('COURSE_HAS_SUBMISSIONS',       409, 'The course has graded assignment work and cannot be deleted.'),
+    -- ── #38, batch lifecycle ──
+    ('BATCH_PAST',                   409, 'The batch period has elapsed in its own timezone; it is read-only.'),
+    ('BATCH_CODE_TAKEN',             409, 'Another batch already uses that month code.'),
+    ('BATCH_CODE_REORDER',           409, 'The new code would move the batch past a sibling and reorder members'' runs.'),
+    ('BATCH_PERIOD_PAST',            422, 'The requested period has already ended; a batch cannot be edited into the past.'),
+    ('BATCH_PERIOD_INVALID',         422, 'The end date falls before the start date, or a date is missing.'),
+    ('BATCH_TIMEZONE_INVALID',       422, 'Not a timezone Postgres recognises (see pg_timezone_names).'),
+    ('BATCH_CAPACITY_BELOW_OCCUPANCY',409,'The new capacity is below the seats already sold in that segment.')
+  ) as t(code, http, summary);
+$$;
+
+revoke all on function public.app_error_catalog() from public, anon;
+grant execute on function public.app_error_catalog() to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 4) batch_events.action gains 'edit' and 'auto_close'.
+--    Found by DEFINITION, not by name (#35's idiom) — the constraint has been
+--    both anonymous and named across the file's history.
+-- ───────────────────────────────────────────────────────────────────
+do $$
+declare
+  v_con text;
+begin
+  select conname into v_con
+    from pg_constraint
+   where conrelid = 'public.batch_events'::regclass
+     and contype = 'c'
+     and pg_get_constraintdef(oid) ilike '%action%';
+  if v_con is not null then
+    execute format('alter table public.batch_events drop constraint %I', v_con);
+  end if;
+  alter table public.batch_events
+    add constraint batch_events_action_check
+    check (action in (
+      'create', 'open', 'close', 'archive', 'assign', 'reassign', 'unassign',
+      'capacity', 'space_create',
+      'entitle', 'entitle_allocate', 'entitle_revoke', 'entitle_supersede', 'entitle_extend',
+      'edit', 'auto_close'
+    ));
+exception when undefined_table then
+  raise notice '#38: public.batch_events not present — skipping its CHECK widening.';
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 5) THE definition of "past". Everything else calls this.
+--
+--    STABLE, not IMMUTABLE: it reads now(). An undated batch is never past —
+--    failing OPEN here is deliberate, and is the opposite of lmsSchedule's
+--    fail-closed anchor rule. There, a missing anchor would leak paid lessons;
+--    here, a missing end date would freeze a live batch an admin still needs.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.batch_is_past(p_ends_on date, p_timezone text)
+returns boolean
+language sql
+stable
+parallel safe
+set search_path = public
+as $$
+  -- The zone is resolved through pg_timezone_names rather than passed straight to
+  -- `at time zone`, which RAISES 22023 on an unknown name instead of returning
+  -- null. This function is called once per row by admin_batch_overview() and in
+  -- close_due_batches()'s WHERE clause, so one unrecognised zone would take out
+  -- the admin screen and every future sweep rather than one batch. §2 normalises
+  -- existing rows and batches_guard() rejects new ones; this is the third layer,
+  -- and it degrades to the column default the same way localDateIn() does in
+  -- src/lib/batchLifecycle.js — the two halves must agree even on bad input.
+  select p_ends_on is not null
+     and (now() at time zone (
+            select coalesce(
+              (select z.name from pg_timezone_names z where z.name = p_timezone),
+              'Asia/Manila')
+          ))::date > p_ends_on;
+$$;
+
+comment on function public.batch_is_past(date, text) is
+  'A batch is past when TODAY, read in its own timezone, is later than ends_on — so it stays '
+  'editable through its final local day. Mirrored by isPastBatch() in src/lib/batchLifecycle.js.';
+
+revoke all on function public.batch_is_past(date, text) from public, anon;
+grant execute on function public.batch_is_past(date, text) to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 6) batches_guard() — column-level protection RLS cannot give.
+--
+--    Named `batches_guard` so it sorts BEFORE batches_touch_updated_at: Postgres
+--    fires same-timing triggers in name order, and the guard must see the row
+--    before updated_at is stamped.
+--
+--    BREAK-GLASS: a session running as the TABLE OWNER (the SQL editor, the
+--    Management API) may `set local app.batch_admin_override = 'on'` to edit a
+--    past batch — e.g. to correct the historical "August"/2026-09 name. Gated on
+--    ownership rather than a role attribute, because Supabase's `postgres` is not
+--    a superuser and a rolsuper gate would make this unreachable on the one
+--    database that needs it. PostgREST connects as `authenticator`, which is not a
+--    member of the owner, so the API can never reach it — and the owner could
+--    disable the trigger outright anyway, so this only makes the intent explicit
+--    and auditable.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.batches_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  v_tz       text;
+  v_override boolean;
+begin
+  if tg_op = 'INSERT' then
+    v_tz := coalesce(nullif(new.timezone, ''), 'Asia/Manila');
+    if not exists (select 1 from pg_timezone_names z where z.name = v_tz) then
+      perform public.app_error('BATCH_TIMEZONE_INVALID',
+        format('%s is not a timezone Postgres recognises', v_tz), 422,
+        jsonb_build_object('timezone', v_tz));
+    end if;
+    new.timezone := v_tz;
+
+    -- Check the code shape BEFORE deriving dates from it. batches_code_check
+    -- would catch a bad code, but CHECK constraints run AFTER before-triggers, so
+    -- to_date('abc-01','YYYY-MM-DD') would get there first and report "invalid
+    -- value for YYYY" — a parser complaint where a business error belongs.
+    if new.code is null or new.code !~ '^\d{4}-(0[1-9]|1[0-2])$' then
+      perform public.app_error('INVALID_BATCH_CODE',
+        format('%s is not a real YYYY-MM month', coalesce(new.code, 'null')), 422,
+        jsonb_build_object('code', new.code));
+    end if;
+
+    -- Every batch is born with a reliable period, whoever inserted it. This is
+    -- what lets the client keep a plain INSERT and still satisfy "a new batch
+    -- always has starts_on, ends_on and a timezone".
+    if new.starts_on is null then
+      new.starts_on := to_date(new.code || '-01', 'YYYY-MM-DD');
+    end if;
+    if new.ends_on is null then
+      new.ends_on := (to_date(new.code || '-01', 'YYYY-MM-DD') + interval '1 month - 1 day')::date;
+    end if;
+    if new.starts_on > new.ends_on then
+      perform public.app_error('BATCH_PERIOD_INVALID',
+        'the end date falls before the start date', 422,
+        jsonb_build_object('starts_on', new.starts_on, 'ends_on', new.ends_on));
+    end if;
+    return new;
+  end if;
+
+  -- ── UPDATE ────────────────────────────────────────────────────────
+  -- The primary key is the one thing every entitlement, space and audit row
+  -- points at. It is never editable, by anyone, through any path.
+  if new.id is distinct from old.id then
+    perform public.app_error('IMMUTABLE_ENTITLEMENT',
+      'batches.id is frozen — entitlements, spaces and audit rows reference it', 409, null);
+  end if;
+
+  -- The gate is TABLE OWNERSHIP, not a role attribute. Gating on rolsuper alone
+  -- would make the break-glass unreachable on the one database that needs it:
+  -- Supabase's `postgres` — what the SQL editor and the Management API run as —
+  -- is not a superuser. Ownership says exactly what is meant ("only whoever owns
+  -- this table may bypass its guard") and needs no guessing about which
+  -- attributes a given platform grants. PostgREST connects as `authenticator`,
+  -- which is not a member of the owner, so the API can never reach this.
+  -- pg_has_role() is already true for a superuser (they are implicitly a member of
+  -- every role), so ownership alone covers both cases and needs no second branch.
+  v_override := coalesce(current_setting('app.batch_admin_override', true), '') = 'on'
+                and pg_has_role(session_user,
+                                (select c.relowner from pg_class c
+                                   join pg_namespace n on n.oid = c.relnamespace
+                                  where n.nspname = 'public' and c.relname = 'batches'),
+                                'member');
+
+  if public.batch_is_past(old.ends_on, old.timezone) and not v_override then
+    -- A past batch cannot be REOPENED. Without this the sweep and the admin fight:
+    -- reopening succeeds (status is not a frozen field), then close_due_batches()
+    -- matches `status='open' and is_past` and closes it again within the hour,
+    -- and the batch cannot be extended out of the past either — a dead end with no
+    -- error to explain it. Un-archiving a past batch restores it to `closed`,
+    -- which is the only truthful state for a period that has ended.
+    if new.status = 'open' and old.status <> 'open' then
+      perform public.app_error('BATCH_PAST',
+        format('batch %s ended on %s (%s) and cannot be reopened — create the next batch instead',
+               old.code, old.ends_on, old.timezone), 409,
+        jsonb_build_object('batch_code', old.code, 'ends_on', old.ends_on,
+                           'timezone', old.timezone, 'attempted_status', 'open'));
+    end if;
+
+    -- Otherwise a past batch keeps exactly the lifecycle actions: close (the sweep
+    -- lands here), archive, un-archive-to-closed. Every descriptive field is frozen.
+    if new.code           is distinct from old.code
+       or new.name           is distinct from old.name
+       or new.starts_on      is distinct from old.starts_on
+       or new.ends_on        is distinct from old.ends_on
+       or new.timezone       is distinct from old.timezone
+       or new.gold_capacity  is distinct from old.gold_capacity
+       or new.vip_capacity   is distinct from old.vip_capacity
+       or new.total_capacity is distinct from old.total_capacity then
+      perform public.app_error('BATCH_PAST',
+        format('batch %s ended on %s (%s) and is read-only',
+               old.code, old.ends_on, old.timezone), 409,
+        jsonb_build_object('batch_code', old.code, 'ends_on', old.ends_on,
+                           'timezone', old.timezone));
+    end if;
+    return new;
+  end if;
+
+  -- ★ RANK PRESERVATION IS ENFORCED HERE, not only in admin_update_batch().
+  -- The column-level revoke stops `authenticated`, but `service_role` keeps
+  -- table-level UPDATE and the SQL editor runs as the owner — and db/README.md
+  -- documents the SQL editor as a first-class way to reach this database. Without
+  -- this branch, `update batches set code = '2026-06' where code = '2026-12';`
+  -- succeeds with no error and no audit row, and silently reorders a member's
+  -- purchased run months later: the exact defect in this file's WHY ①. The RPC
+  -- validates first, so for that path this is a no-op re-check.
+  if new.code is distinct from old.code and not v_override then
+    if new.code is null or new.code !~ '^\d{4}-(0[1-9]|1[0-2])$' then
+      perform public.app_error('INVALID_BATCH_CODE',
+        format('%s is not a real YYYY-MM month', coalesce(new.code, 'null')), 422,
+        jsonb_build_object('code', new.code));
+    end if;
+    if exists (select 1 from public.batches b
+                where b.id <> new.id
+                  and ((b.code < old.code) is distinct from (b.code < new.code))) then
+      perform public.app_error('BATCH_CODE_REORDER',
+        format('%s would move batch %s past a sibling and reorder members'' cohort runs',
+               new.code, old.code), 409,
+        jsonb_build_object('code', new.code, 'from_code', old.code));
+    end if;
+  end if;
+
+  v_tz := coalesce(nullif(new.timezone, ''), 'Asia/Manila');
+  if v_tz is distinct from coalesce(nullif(old.timezone, ''), 'Asia/Manila')
+     and not exists (select 1 from pg_timezone_names z where z.name = v_tz) then
+    perform public.app_error('BATCH_TIMEZONE_INVALID',
+      format('%s is not a timezone Postgres recognises', v_tz), 422,
+      jsonb_build_object('timezone', v_tz));
+  end if;
+  new.timezone := v_tz;
+
+  if new.starts_on is not null and new.ends_on is not null and new.starts_on > new.ends_on then
+    perform public.app_error('BATCH_PERIOD_INVALID',
+      'the end date falls before the start date', 422,
+      jsonb_build_object('starts_on', new.starts_on, 'ends_on', new.ends_on));
+  end if;
+
+  -- A live batch may not be edited INTO the past. Only a period change can do
+  -- this, so a plain status flip on a running batch is unaffected.
+  if (new.ends_on is distinct from old.ends_on or new.timezone is distinct from old.timezone)
+     and public.batch_is_past(new.ends_on, new.timezone) and not v_override then
+    perform public.app_error('BATCH_PERIOD_PAST',
+      format('that period has already ended in %s', new.timezone), 422,
+      jsonb_build_object('ends_on', new.ends_on, 'timezone', new.timezone));
+  end if;
+
+  return new;
+end;
+$fn$;
+
+revoke all on function public.batches_guard() from public, anon, authenticated;
+
+drop trigger if exists batches_guard on public.batches;
+create trigger batches_guard
+  before insert or update on public.batches
+  for each row execute function public.batches_guard();
+
+-- ───────────────────────────────────────────────────────────────────
+-- 7) Column privileges — the half a trigger cannot give.
+--
+--    batches_admin_all is `for all to authenticated using (is_admin())`, so
+--    until now an admin could PATCH `code` straight over PostgREST. RLS has no
+--    column granularity; GRANT does. After this, a REST update touching `code`
+--    or `id` is refused on PRIVILEGE regardless of policy, and the SECURITY
+--    DEFINER RPC below (running as owner) is the only ordinary path.
+--
+--    Pinned by scripts/audit-db.mjs, because a later blanket
+--    `grant all on all tables in schema public` would silently undo it.
+-- ───────────────────────────────────────────────────────────────────
+-- These two are a pair. Revoking the table-level privilege also drops the
+-- column-level grants, so a statement-at-a-time re-run (scripts/apply-db-files.mjs,
+-- MCP execute_sql) has a sub-second window with no admin write access. Harmless
+-- and self-healing, but do not split them across a review boundary.
+revoke update on public.batches from authenticated, anon;
+grant update (name, starts_on, ends_on, timezone, status,
+              gold_capacity, vip_capacity, total_capacity,
+              closed_at, close_reason, updated_at)
+  on public.batches to authenticated;
+
+comment on column public.batches.code is
+  'The business key AND the allocation ordering key: grant_batch_run() and '
+  'allocate_queued_entitlements() walk the registry in `code` order. UPDATE on this column is '
+  'revoked from authenticated — change it only through admin_update_batch(), which preserves '
+  'the batch''s rank in that order.';
+
+comment on column public.community_spaces.slug is
+  'PERMALINK. Derived from batches.code at creation and never rewritten — it is the value in '
+  '?space=<slug> deep links and the stored community:lastSpace preference, and pickInitialSpace() '
+  'falls back silently on an unknown slug. A code rename updates the space NAME only.';
+
+-- ───────────────────────────────────────────────────────────────────
+-- 8) admin_update_batch() — the transactional editor.
+--    One statement's worth of validation, then the row, its two space names,
+--    the not-yet-started seats, and the audit row, in one transaction.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.admin_update_batch(
+  p_batch_id       uuid,
+  p_code           text,
+  p_name           text,
+  p_starts_on      date,
+  p_ends_on        date,
+  p_timezone       text,
+  -- ★ NO DEFAULTS. `null` here means "unlimited", so a defaulted 6-argument call
+  -- would silently REMOVE every cap — and the occupancy checks below are all
+  -- `p_x is not null and …`, so none of them would fire. Omitted named arguments
+  -- take defaults over PostgREST, and this function is granted to `authenticated`,
+  -- so a defaulted signature would leave "not supplied" indistinguishable from
+  -- "remove the cap" in exactly the surface this file otherwise locks down.
+  -- The only caller already sends all nine.
+  p_gold_capacity  int,
+  p_vip_capacity   int,
+  p_total_capacity int
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  v_old      public.batches%rowtype;
+  v_code     text;
+  v_name     text;
+  v_tz       text;
+  v_clash    text;
+  v_old_act  timestamptz;
+  v_new_act  timestamptz;
+  v_spaces   int := 0;
+  v_shifted  int := 0;
+  v_used     int;
+begin
+  if not public.is_admin() then
+    perform public.app_error('FORBIDDEN', 'admin_update_batch: admin only', 403, null);
+  end if;
+
+  select * into v_old from public.batches where id = p_batch_id for update;
+  if v_old.id is null then
+    perform public.app_error('BATCH_NOT_FOUND', 'admin_update_batch: batch not found', 404,
+      jsonb_build_object('batch_id', p_batch_id));
+  end if;
+
+  if public.batch_is_past(v_old.ends_on, v_old.timezone) then
+    perform public.app_error('BATCH_PAST',
+      format('batch %s ended on %s (%s) and is read-only',
+             v_old.code, v_old.ends_on, v_old.timezone), 409,
+      jsonb_build_object('batch_code', v_old.code, 'ends_on', v_old.ends_on,
+                         'timezone', v_old.timezone));
+  end if;
+
+  -- ── Name ──
+  v_name := nullif(btrim(coalesce(p_name, '')), '');
+  if v_name is null then
+    perform public.app_error('BATCH_PERIOD_INVALID', 'a batch needs a display name', 422, null);
+  end if;
+
+  -- ── Code: shape, uniqueness, and RANK ──
+  v_code := lower(btrim(coalesce(p_code, '')));
+  if v_code !~ '^\d{4}-(0[1-9]|1[0-2])$' then
+    perform public.app_error('INVALID_BATCH_CODE',
+      format('%s is not a real YYYY-MM month', coalesce(p_code, 'null')), 422,
+      jsonb_build_object('code', p_code));
+  end if;
+
+  if v_code <> v_old.code then
+    if exists (select 1 from public.batches b where b.code = v_code and b.id <> p_batch_id) then
+      perform public.app_error('BATCH_CODE_TAKEN',
+        format('another batch already uses %s', v_code), 409,
+        jsonb_build_object('code', v_code));
+    end if;
+
+    -- ★ RANK PRESERVATION. grant_batch_run() allocates `order by b.code` from a
+    -- start batch, and allocate_queued_entitlements() refuses any cohort not
+    -- strictly above the highest code a run already holds. A code that crosses a
+    -- sibling therefore reorders somebody's paid run — silently, and only
+    -- visibly months later. Refuse it; a same-position correction is allowed.
+    select b.code into v_clash
+      from public.batches b
+     where b.id <> p_batch_id
+       and ((b.code < v_old.code) is distinct from (b.code < v_code))
+     order by b.code
+     limit 1;
+    if v_clash is not null then
+      perform public.app_error('BATCH_CODE_REORDER',
+        format('%s would move this batch past %s and reorder members'' cohort runs',
+               v_code, v_clash), 409,
+        jsonb_build_object('code', v_code, 'from_code', v_old.code, 'crosses', v_clash));
+    end if;
+  end if;
+
+  -- ── Timezone + period ──
+  v_tz := coalesce(nullif(btrim(coalesce(p_timezone, '')), ''), 'Asia/Manila');
+  if not exists (select 1 from pg_timezone_names z where z.name = v_tz) then
+    perform public.app_error('BATCH_TIMEZONE_INVALID',
+      format('%s is not a timezone Postgres recognises', v_tz), 422,
+      jsonb_build_object('timezone', v_tz));
+  end if;
+
+  if p_starts_on is null or p_ends_on is null then
+    perform public.app_error('BATCH_PERIOD_INVALID',
+      'a batch needs both a start and an end date', 422, null);
+  end if;
+  if p_starts_on > p_ends_on then
+    perform public.app_error('BATCH_PERIOD_INVALID',
+      'the end date falls before the start date', 422,
+      jsonb_build_object('starts_on', p_starts_on, 'ends_on', p_ends_on));
+  end if;
+  if public.batch_is_past(p_ends_on, v_tz) then
+    perform public.app_error('BATCH_PERIOD_PAST',
+      format('that period has already ended in %s', v_tz), 422,
+      jsonb_build_object('ends_on', p_ends_on, 'timezone', v_tz));
+  end if;
+
+  -- ── Capacity may not fall below seats already sold ──
+  -- batch_seat_holders() is the OCCUPANCY predicate (it ignores activates_at, so
+  -- a seat in a future cohort still counts — it was paid for).
+  select count(*) into v_used from public.batch_seat_holders(p_batch_id, 'gold');
+  if p_gold_capacity is not null and p_gold_capacity < v_used then
+    perform public.app_error('BATCH_CAPACITY_BELOW_OCCUPANCY',
+      format('%s Gold seat(s) are already sold in %s', v_used, v_old.code), 409,
+      jsonb_build_object('segment', 'gold', 'used', v_used, 'requested', p_gold_capacity));
+  end if;
+
+  select count(*) into v_used from public.batch_seat_holders(p_batch_id, 'vip');
+  if p_vip_capacity is not null and p_vip_capacity < v_used then
+    perform public.app_error('BATCH_CAPACITY_BELOW_OCCUPANCY',
+      format('%s VIP seat(s) are already sold in %s', v_used, v_old.code), 409,
+      jsonb_build_object('segment', 'vip', 'used', v_used, 'requested', p_vip_capacity));
+  end if;
+
+  select count(*) into v_used from (
+    select h from public.batch_seat_holders(p_batch_id, 'gold') h
+    union
+    select h from public.batch_seat_holders(p_batch_id, 'vip') h) u;
+  if p_total_capacity is not null and p_total_capacity < v_used then
+    perform public.app_error('BATCH_CAPACITY_BELOW_OCCUPANCY',
+      format('%s seat(s) are already sold in %s', v_used, v_old.code), 409,
+      jsonb_build_object('segment', 'total', 'used', v_used, 'requested', p_total_capacity));
+  end if;
+
+  -- ── Write ──
+  update public.batches
+     set code           = v_code,
+         name           = v_name,
+         starts_on      = p_starts_on,
+         ends_on        = p_ends_on,
+         timezone       = v_tz,
+         gold_capacity  = p_gold_capacity,
+         vip_capacity   = p_vip_capacity,
+         total_capacity = p_total_capacity,
+         updated_at     = now()
+   where id = p_batch_id;
+
+  -- Dependent DISPLAY data, same transaction. The slug is NOT touched: it is a
+  -- permalink (see its column comment). Only what a member reads follows.
+  if v_name <> v_old.name then
+    update public.community_spaces sp
+       set name = case sp.kind when 'gold' then 'Gold — ' else 'VIP — ' end || v_name,
+           updated_at = now()
+     where sp.batch_id = p_batch_id
+       and sp.kind in ('gold', 'vip');
+    get diagnostics v_spaces = row_count;
+  end if;
+
+  -- A corrected start date moves seats that have NOT started yet. Already-active
+  -- seats and revoked/superseded history are never rewritten — this can delay or
+  -- advance a future cohort, never retract access somebody already has.
+  v_old_act := coalesce(v_old.starts_on::timestamptz,
+                        to_date(v_old.code || '-01', 'YYYY-MM-DD')::timestamptz);
+  v_new_act := coalesce(p_starts_on::timestamptz,
+                        to_date(v_code || '-01', 'YYYY-MM-DD')::timestamptz);
+  if v_new_act is distinct from v_old_act then
+    update public.batch_entitlements e
+       set activates_at = v_new_act, updated_at = now()
+     where e.batch_id = p_batch_id
+       and e.status in ('queued', 'active')
+       and e.activates_at is not null
+       and e.activates_at > now();
+    get diagnostics v_shifted = row_count;
+  end if;
+
+  insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+  values (p_batch_id, null, auth.uid(), 'edit',
+          jsonb_build_object(
+            'before', jsonb_build_object(
+              'code', v_old.code, 'name', v_old.name,
+              'starts_on', v_old.starts_on, 'ends_on', v_old.ends_on,
+              'timezone', v_old.timezone, 'gold_capacity', v_old.gold_capacity,
+              'vip_capacity', v_old.vip_capacity, 'total_capacity', v_old.total_capacity),
+            'after', jsonb_build_object(
+              'code', v_code, 'name', v_name,
+              'starts_on', p_starts_on, 'ends_on', p_ends_on,
+              'timezone', v_tz, 'gold_capacity', p_gold_capacity,
+              'vip_capacity', p_vip_capacity, 'total_capacity', p_total_capacity),
+            'spaces_renamed', v_spaces,
+            'activations_shifted', v_shifted));
+
+  return jsonb_build_object(
+    'ok', true,
+    'batch_id', p_batch_id,
+    'code', v_code,
+    'code_changed', v_code <> v_old.code,
+    'name', v_name,
+    'spaces_renamed', v_spaces,
+    'activations_shifted', v_shifted);
+end;
+$fn$;
+
+comment on function public.admin_update_batch(uuid, text, text, date, date, text, int, int, int) is
+  'THE editor for a batch record. Refuses a past batch, a duplicate or rank-changing code, an '
+  'already-elapsed period, an unknown timezone, and a capacity below seats already sold. Renames '
+  'the two space NAMES (never the slug) and re-stamps only not-yet-started activates_at, in one '
+  'transaction, audited as a batch_events ''edit'' row carrying before + after.';
+
+revoke all on function public.admin_update_batch(uuid, text, text, date, date, text, int, int, int)
+  from public, anon;
+grant execute on function public.admin_update_batch(uuid, text, text, date, date, text, int, int, int)
+  to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 9) close_due_batches() — the sweep.
+--
+--    ★ NO is_admin() GUARD, DELIBERATELY. expire_overdue_subscriptions() has
+--    one, and that is exactly why it can only ever run when an admin opens a
+--    tab: under pg_cron there is no JWT, so auth.uid() is null and is_admin()
+--    is false. This function is instead REVOKED from every client role, so the
+--    scheduler (and an admin through the wrapper below) are the only callers.
+--
+--    Idempotent by construction: `status = 'open'` means a late or repeated run
+--    matches nothing and writes no event. It never archives, and it never reads
+--    or writes batch_entitlements, community_spaces or subscriptions — existing
+--    members keep their seats, their private space and their history. What
+--    closing DOES block is already implemented elsewhere: grant_batch_run()
+--    refuses a non-open batch for a NEW seat while letting an existing
+--    seat-holder's renewal through, admin_assign_batch() refuses outright,
+--    enroll_req_own_insert stops students selecting it, and the FIFO binder
+--    skips it.
+-- ───────────────────────────────────────────────────────────────────
+create or replace function public.close_due_batches()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare
+  v_closed jsonb := '[]'::jsonb;
+  v_n      int   := 0;
+begin
+  with due as (
+    update public.batches b
+       set status       = 'closed',
+           closed_at    = now(),
+           close_reason = 'auto',
+           updated_at   = now()
+     where b.status = 'open'
+       and public.batch_is_past(b.ends_on, b.timezone)
+    returning b.id, b.code, b.ends_on, b.timezone
+  ), logged as (
+    insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+    select d.id, null, null, 'auto_close',
+           jsonb_build_object('code', d.code, 'ends_on', d.ends_on,
+                              'timezone', d.timezone, 'reason', 'period_ended')
+      from due d
+    returning batch_id, detail ->> 'code' as code
+  )
+  select coalesce(jsonb_agg(jsonb_build_object('batch_id', l.batch_id, 'code', l.code)
+                            order by l.code), '[]'::jsonb),
+         count(*)::int
+    into v_closed, v_n
+    from logged l;
+
+  return jsonb_build_object('ok', true, 'closed', v_n, 'batches', v_closed, 'ran_at', now());
+end;
+$fn$;
+
+comment on function public.close_due_batches() is
+  'Month-end sweep: closes every OPEN batch whose period has elapsed in its own timezone, stamps '
+  'close_reason = ''auto'', and writes one auto_close batch_events row each. Idempotent — a repeat '
+  'or late run closes nothing. Never archives, never touches entitlements. Run hourly by the '
+  'pg_cron job ''close-due-batches''; revoked from every client role.';
+
+revoke all on function public.close_due_batches() from public, anon, authenticated;
+
+-- The admin-triggered path: the "Run closures now" button, and the recovery
+-- route if the scheduler is ever mis-configured.
+create or replace function public.admin_close_due_batches()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+begin
+  if not public.is_admin() then
+    perform public.app_error('FORBIDDEN', 'admin_close_due_batches: admin only', 403, null);
+  end if;
+  return public.close_due_batches();
+end;
+$fn$;
+
+revoke all on function public.admin_close_due_batches() from public, anon;
+grant execute on function public.admin_close_due_batches() to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 10) admin_batch_overview() gains the lifecycle columns.
+--     DROP + CREATE: Postgres refuses to change an OUT-parameter row type in
+--     place. A dropped function LOSES ITS GRANTS — the grant below is not
+--     housekeeping, it is the difference between a working admin screen and a
+--     403 (the same warning #35 left on this function).
+-- ───────────────────────────────────────────────────────────────────
+drop function if exists public.admin_batch_overview();
+
+create function public.admin_batch_overview()
+returns table (
+  batch_id uuid, code text, name text, status text,
+  starts_on date, ends_on date, timezone text,
+  closed_at timestamptz, close_reason text, is_past boolean,
+  gold_capacity int, vip_capacity int, total_capacity int,
+  gold_active bigint, vip_active bigint, total_active bigint,
+  gold_queued bigint, vip_queued bigint
+)
+language sql stable security definer set search_path = public
+as $fn$
+  select b.id, b.code, b.name, b.status,
+         b.starts_on, b.ends_on, b.timezone,
+         b.closed_at, b.close_reason,
+         public.batch_is_past(b.ends_on, b.timezone) as is_past,
+         b.gold_capacity, b.vip_capacity, b.total_capacity,
+         (select count(*) from public.batch_seat_holders(b.id, 'gold')) as gold_active,
+         (select count(*) from public.batch_seat_holders(b.id, 'vip'))  as vip_active,
+         (select count(*) from (
+            select h from public.batch_seat_holders(b.id, 'gold') h
+            union
+            select h from public.batch_seat_holders(b.id, 'vip') h) u)  as total_active,
+         -- Committed demand: seats already sold that no cohort has absorbed yet.
+         -- Alex needs this BEFORE setting a capacity, because queued seats are
+         -- never retro-refused (they were paid for). Deliberately NOT correlated
+         -- to b.id — a queued row has no batch_id, so this is a registry-wide
+         -- total repeated on every row.
+         (select count(*) from public.batch_entitlements e
+           where e.status = 'queued' and e.segment = 'gold'
+             and (e.valid_until is null or e.valid_until > now()))       as gold_queued,
+         (select count(*) from public.batch_entitlements e
+           where e.status = 'queued' and e.segment = 'vip'
+             and (e.valid_until is null or e.valid_until > now()))       as vip_queued
+    from public.batches b
+   where public.is_admin()
+   order by b.code desc;
+$fn$;
+
+revoke all on function public.admin_batch_overview() from public, anon;
+grant execute on function public.admin_batch_overview() to authenticated;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 11) The scheduler. Supabase Cron is pg_cron: the job is a plain SQL call in
+--     the same database, so there is no network hop, no secret and no HTTP
+--     surface to protect.
+--
+--     HOURLY, not daily, because pg_cron schedules in UTC while each batch
+--     carries its own timezone — an hourly sweep catches every local midnight
+--     within the hour, whatever zones the registry holds.
+--
+--     Guarded: a shadow project or a restricted role that cannot create the
+--     extension still applies this file cleanly and prints what to run by hand.
+-- ───────────────────────────────────────────────────────────────────
+do $$
+begin
+  create extension if not exists pg_cron;
+
+  perform cron.unschedule('close-due-batches')
+    where exists (select 1 from cron.job j where j.jobname = 'close-due-batches');
+
+  perform cron.schedule('close-due-batches', '0 * * * *',
+                        $c$select public.close_due_batches();$c$);
+
+  raise notice '#38: pg_cron job "close-due-batches" scheduled hourly.';
+exception when others then
+  raise notice '#38: could not schedule pg_cron (%). Enable Dashboard → Integrations → Cron, then run: '
+               'select cron.schedule(''close-due-batches'', ''0 * * * *'', '
+               '''select public.close_due_batches();'');', sqlerrm;
+end $$;
+
+-- ───────────────────────────────────────────────────────────────────
+-- 12) Refresh PostgREST's schema cache so the new RPCs resolve immediately.
+-- ───────────────────────────────────────────────────────────────────
+notify pgrst, 'reload schema';
+
+-- ═══════════════════════════════════════════════════════════════════
+-- AFTER RUNNING
+--   -- ① every batch now has a period
+--   select code, starts_on, ends_on, timezone,
+--          public.batch_is_past(ends_on, timezone) as is_past
+--     from public.batches order by code;                   -- no NULLs
+--
+--   -- ② the code is not writable over REST
+--   select has_column_privilege('authenticated','public.batches','code','UPDATE') as bad;
+--   -- expect: f
+--
+--   -- ③ the guard is armed
+--   select tgname from pg_trigger
+--    where tgrelid = 'public.batches'::regclass and not tgisinternal order by tgname;
+--   -- expect: batches_guard before batches_touch_updated_at
+--
+--   -- ④ the sweep is scheduled
+--   select jobname, schedule, command from cron.job where jobname = 'close-due-batches';
+--   select * from cron.job_run_details where jobname = 'close-due-batches'
+--    order by start_time desc limit 5;
+--
+--   -- ⑤ the sweep is idempotent — run it twice, the second closes nothing
+--   select public.close_due_batches();
+--   select public.close_due_batches();                     -- "closed": 0
+--
+--   -- ⑥ what it did
+--   select created_at, action, detail from public.batch_events
+--    where action in ('auto_close','edit') order by created_at desc limit 20;
+--
+-- BREAK-GLASS (SQL editor / table-owner session only) — edit a PAST batch, e.g.
+-- to correct the historical "August" / 2026-09 display name:
+--   begin;
+--     set local app.batch_admin_override = 'on';
+--     update public.batches set name = 'September 2026' where code = '2026-09';
+--   commit;
+-- ═══════════════════════════════════════════════════════════════════
+
+insert into public.schema_migrations (filename, checksum, notes) values
+ ('2026-08-16-batch-lifecycle.sql', null,
+  'batch lifecycle (#38): batches.closed_at/close_reason + a one-time period backfill from `code` '
+  '(the same derivation grant_batch_run already used, so allocation behaviour is unchanged); '
+  'batch_is_past() defines "past" as today-in-the-batch''s-own-timezone > ends_on; batches_guard() '
+  'fills the period on insert and freezes a past batch''s fields; UPDATE on batches.code is REVOKED '
+  'from authenticated so admin_update_batch() is the only path, and that RPC preserves the batch''s '
+  'rank in `code` order because grant_batch_run/allocate_queued_entitlements allocate by it; '
+  'community_spaces.slug is documented as a permalink and never renamed; close_due_batches() is an '
+  'idempotent hourly pg_cron sweep that closes (never archives) due open batches')
+-- schema_migrations.filename is the PRIMARY KEY, so a bare insert makes this file
+-- fail on a second run — the header calls it idempotent, and every other statement
+-- above is. That is the same defect the #35 row records ("was not re-runnable"),
+-- and it is exactly what a shadow-project rehearsal or a retry after a partial
+-- apply would hit. Added 2026-08-17, after the file had already been applied to
+-- production; the row it wrote is unaffected.
+on conflict (filename) do nothing;
+
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- §26) FOLDED VERBATIM — 2026-08-17-three-plan-catalog.sql
+--      the three-plan catalog: core_self_paced + gold_live and the whole gold
+--
+--      community segment are removed; VIP is the only premium segment
+--      
+--      Appended at the tail for the same reason as §19-§25: the earlier sections
+--      create the pre-#39 shapes (the gold space kind, batches.gold_capacity, the
+--      9-arg admin_update_batch, plan_is_qbo_only), and this file must win on a
+--      fresh install. Hand-collapsing it into those sections is what broke #34 —
+--      see that row in db/README.md.
+--      
+--      Its §9 counterpart IS folded in place: the plan seed above already carries
+--      the three final plans, so this file's guarded UPDATEs and its DELETE match
+--      nothing here. On a fresh install the only gold artefacts that briefly exist
+--      are one community_spaces row for the seed batch and a NULL column, both
+--      removed below before any user, bucket or deployment exists.
+--      RE-FOLD whenever the dated file changes.
+-- ═════════════════════════════════════════════════════════════════════════════
+-- ════════════════════════════════════════════════════════════════════════════
+-- #39 — THREE-PLAN CATALOG. Removes `core_self_paced` and `gold_live`, and the
+--       entire `gold` community segment with them. VIP becomes the ONLY premium
+--       / private-batch / private-community segment.
+--       2026-08-17
+-- ════════════════════════════════════════════════════════════════════════════
+--
+-- WHAT CHANGES
+--   ① The catalog is exactly three plans: sampler ₱1,499 (1), silver_self_paced
+--     ₱2,999 (2), vip ₱16,999 (3). The two removed rows are DELETED, not
+--     deactivated — `active = false` would leave them renewable via an extension
+--     (admin_finalize_enrollment deliberately lets an extension continue a
+--     retired plan) and still readable by every plan-scope helper.
+--   ② The `gold` segment is removed at the schema level: batches.gold_capacity is
+--     dropped, three CHECKs are narrowed, batches_create_spaces() stops minting a
+--     Gold space, and every `in ('gold','vip')` guard becomes `= 'vip'`.
+--   ③ plan_is_qbo_only() existed ONLY for core_self_paced. The four course-read
+--     policies and course_object_allowed() lose its conjunct, then it is dropped.
+--     Sampler's Essentials-only rule is untouched — it is the one surviving
+--     plan-scope restriction.
+--
+-- WHY THE DELETE IS SAFE HERE
+--   ★ Step 1 REFUSES to run if any member still holds a LIVE term (active, not past
+--   its grace) on a retired plan. That assertion — NOT the foreign key — is what
+--   protects a person: Step 2b deletes those subscription rows, so it runs before
+--   `subscriptions_plan_key_fkey`'s ON DELETE RESTRICT could ever fire. Expired
+--   history deletes freely. The FK still earns its keep AFTERWARDS: once the plan
+--   rows are gone a subscription physically cannot name a deleted plan, which is why
+--   the client-side fail-closed branch is defence in depth rather than the only
+--   thing standing there.
+--
+-- APPLY AS ONE TRANSACTION. Every statement here is transactional in Postgres,
+-- so a single paste into the SQL editor (or one execute_sql body) is all-or-
+-- nothing. Do NOT add begin;/commit; — that would break splitSqlStatements() in
+-- scripts/apply-db-files.mjs, which is how the shadow rehearsal runs this file
+-- statement-at-a-time to catch ordering bugs the single transaction would hide.
+--
+-- ★ ORDERING HAZARD (the one that bites): batches_guard() (Step 5k) dereferences
+--   new.gold_capacity. If Step 7a drops the column while the old guard is still
+--   installed, EVERY update on batches raises `record "new" has no field
+--   "gold_capacity"` — including the hourly pg_cron close_due_batches() sweep,
+--   silently, forever. Step 5k MUST run before Step 7a.
+--
+-- Idempotent: re-running is a no-op. Every cleanup predicate is scoped to
+-- `plan_key in ('core_self_paced','gold_live')` or `kind = 'gold'`, so it is
+-- structurally incapable of touching VIP, General, or retained-plan data.
+-- ════════════════════════════════════════════════════════════════════════════
+
+
+-- ── Step 0 — Preflight: refuse to run against the wrong schema ──────────────
+do $$
+begin
+  if to_regclass('public.batch_entitlements') is null then
+    raise exception '#39 requires #35 - run db/2026-07-30-batch-entitlements.sql first.';
+  end if;
+  if to_regprocedure('public.batch_is_past(date, text)') is null then
+    raise exception '#39 requires #38 - run db/2026-08-16-batch-lifecycle.sql first.';
+  end if;
+  if to_regclass('public.schema_migrations') is null then
+    raise exception '#39 requires #31 - its own apply-log insert would abort the file.';
+  end if;
+end $$;
+
+
+-- ── Step 1 — Refuse to destroy real member content ─────────────────────────
+-- The difference between "dev cleanup" and "data loss". These assertions read
+-- only; they stop the file BEFORE Step 2 deletes anything.
+do $$
+declare
+  v_posts int; v_comments int; v_gold_seats int; v_done_imports int; v_live_terms int;
+begin
+  select count(*) into v_posts
+    from public.community_posts p
+    join public.community_spaces s on s.id = p.space_id
+   where s.kind = 'gold';
+  select count(*) into v_comments
+    from public.community_comments c
+    join public.community_spaces s on s.id = c.space_id
+   where s.kind = 'gold';
+  if v_posts > 0 or v_comments > 0 then
+    raise exception '#39 refuses: % post(s) and % comment(s) live in gold spaces. '
+                    'Migrate or archive them first - this file will not delete member content.',
+                    v_posts, v_comments;
+  end if;
+
+  -- Every status, including revoked/superseded history: the narrowed CHECK in
+  -- Step 7c validates the whole table, not just live rows.
+  select count(*) into v_gold_seats from public.batch_entitlements where segment = 'gold';
+  if v_gold_seats > 0 then
+    raise exception '#39 refuses: % gold cohort seat(s) exist. Revoke or supersede them first.',
+                    v_gold_seats;
+  end if;
+
+  select count(*) into v_done_imports
+    from public.student_import_rows
+   where proposed_plan_key in ('core_self_paced', 'gold_live')
+     and (processing_status = 'done' or subscription_granted);
+  if v_done_imports > 0 then
+    raise exception '#39 refuses: % completed import row(s) granted a removed plan.', v_done_imports;
+  end if;
+
+  -- ★ THE ONE THAT ACTUALLY PROTECTS A MEMBER. Step 2b deletes retired-plan
+  -- subscriptions, which runs BEFORE the ON DELETE RESTRICT FK could ever fire — so
+  -- that FK is NOT what stops this file stranding somebody, this assertion is. A term
+  -- that is still running (or inside its grace) is a person with paid access; deleting
+  -- it silently would remove their access, their receipt row and their is_paid flag
+  -- with no error and no audit row. Expired/superseded history deletes freely.
+  --
+  -- To purge a development database that legitimately has such rows (the case this
+  -- file was written for), delete or expire those terms first — deliberately a
+  -- separate, visible act, not a side effect of a schema migration.
+  select count(*) into v_live_terms
+    from public.subscriptions s
+   where s.plan_key in ('core_self_paced', 'gold_live')
+     and s.status = 'active'
+     and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now());
+  if v_live_terms > 0 then
+    raise exception '#39 refuses: % member(s) still hold a LIVE term on a retired plan. '
+                    'Migrate or end those memberships first - this file will not silently '
+                    'revoke paid access.', v_live_terms;
+  end if;
+end $$;
+
+
+-- ── Step 2 — Guarded destructive DEV-DATA cleanup ──────────────────────────
+-- FK ordering, all verified against pg_constraint:
+--   • subscriptions.plan_key      → ON DELETE RESTRICT  ⇒ terms die before the plan
+--   • enrollment_requests.plan_key→ NO ACTION           ⇒ requests die before the plan
+--   • subscriptions.request_id    → ON DELETE SET NULL  ⇒ either order is legal
+--   • batch_entitlements.source_* → ON DELETE SET NULL, and batch_entitlements_guard()
+--                                   explicitly permits non-null → NULL
+--   • community_notifications.space_id → ON DELETE CASCADE; posts/comments are
+--     RESTRICT but Step 1 proved there are none.
+-- Auth users are NOT touched here — that needs the Admin API and a per-user
+-- decision, so it lives in scripts/dev-purge-removed-plans.mjs. Keeping UUIDs out
+-- of this file is also what lets it fold into the bootstrap verbatim.
+do $$
+declare
+  v_spaces int; v_subs int; v_reqs int; v_rows int; v_profiles int;
+begin
+  -- 2a) Gold spaces. NOT blocked by batches_guard (that trigger is BEFORE INSERT
+  --     OR UPDATE on `batches`), and not blocked by three of the four batches
+  --     being archived/past — deleting a SPACE never touches its batch row.
+  delete from public.community_spaces where kind = 'gold';
+  get diagnostics v_spaces = row_count;
+
+  -- 2b) Terms first (subscriptions_plan_key_fkey is ON DELETE RESTRICT).
+  delete from public.subscriptions where plan_key in ('core_self_paced', 'gold_live');
+  get diagnostics v_subs = row_count;
+
+  -- 2c) Then the payment-proof rows (enrollment_requests_plan_key_fkey is NO ACTION).
+  delete from public.enrollment_requests where plan_key in ('core_self_paced', 'gold_live');
+  get diagnostics v_reqs = row_count;
+
+  -- 2d) Profile cache only. approval_status and is_admin are never touched.
+  update public.profiles
+     set plan = 'free', is_paid = false, updated_at = now()
+   where plan in ('core_self_paced', 'gold_live');
+  get diagnostics v_profiles = row_count;
+
+  -- 2e) Staged imports proposing a removed plan: NEUTRALIZE, do not delete — the
+  --     row is the audit record of what the operator staged. proposed_plan_key
+  --     has no FK, so without this the row stays actionable and the import
+  --     endpoint would later try to grant a plan that no longer exists.
+  update public.student_import_rows
+     set proposed_plan_key = null,
+         processing_status = 'skipped',
+         warnings = coalesce(warnings, '[]'::jsonb) || jsonb_build_array(
+           jsonb_build_object('code', 'plan_removed',
+             'detail', 'proposed plan retired by #39 (three-plan catalog); restage on sampler/silver/vip')),
+         updated_at = now()
+   where proposed_plan_key in ('core_self_paced', 'gold_live');
+  get diagnostics v_rows = row_count;
+
+  raise notice '#39 cleanup: % gold space(s), % subscription(s), % request(s), % profile(s), % import row(s).',
+               v_spaces, v_subs, v_reqs, v_profiles, v_rows;
+end $$;
+
+
+-- ── Step 3 — The catalog ───────────────────────────────────────────────────
+-- The guarded-UPDATE shape (`and ... is distinct from ...`) is the #22 idiom: it
+-- makes every statement here match NOTHING on a fresh install, where the
+-- bootstrap seed already carries the final three plans at their final prices.
+do $$
+begin
+  delete from public.enrollment_plans where key in ('core_self_paced', 'gold_live');
+
+  update public.enrollment_plans
+     set price_php = 2999, position = 2, updated_at = now()
+   where key = 'silver_self_paced'
+     and (price_php is distinct from 2999 or position is distinct from 2);
+
+  update public.enrollment_plans
+     set price_php = 16999, position = 3, updated_at = now()
+   where key = 'vip'
+     and (price_php is distinct from 16999 or position is distinct from 3);
+
+  update public.enrollment_plans
+     set position = 1, updated_at = now()
+   where key = 'sampler' and position is distinct from 1;
+
+  if (select count(*) from public.enrollment_plans) <> 3 then
+    raise exception '#39: expected exactly 3 plans after the delete, found %',
+                    (select count(*) from public.enrollment_plans);
+  end if;
+  -- user_entitled_batches() derives the segment from THIS column and requires the
+  -- ledger's stamped segment to equal it. A wrong value here silently strands
+  -- every VIP member's private space.
+  if (select community_segment from public.enrollment_plans where key = 'vip') <> 'vip' then
+    raise exception '#39: vip.community_segment is not ''vip'' - refusing to continue.';
+  end if;
+end $$;
+
+
+-- ── Step 4 — Course scope: drop the core-only conjunct ─────────────────────
+-- ALTER POLICY, not DROP + CREATE: it is atomic, so there is no window in which a
+-- read policy is absent (which DROP+CREATE genuinely has under statement-at-a-time
+-- application). Order matters — course_object_allowed() calls plan_is_qbo_only(),
+-- so it is replaced first and the function is dropped last.
+
+-- 4a) course_object_allowed(): sampler is now the only scoped plan.
+create or replace function public.course_object_allowed(p_name text)
+returns boolean
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+declare
+  v_cid  uuid;
+  v_slug text;
+  v_tier text;
+begin
+  if public.is_admin() then return true; end if;
+  if not public.plan_is_sampler() then
+    return true;                                              -- full-access plans: no restriction
+  end if;
+  begin
+    v_cid := split_part(p_name, '/', 2)::uuid;                -- lessons/<course_id>/...
+  exception when others then
+    return true;                                              -- unparseable path → don't block
+  end;
+  select slug, access_tier into v_slug, v_tier from public.courses where id = v_cid;
+  if v_slug is null then return true; end if;                 -- unknown course → don't block
+  return v_slug like 'qbo-%' and v_tier = 'essentials';
+end;
+$$;
+
+-- 4b) The four content-read policies.
+alter policy courses_read on public.courses
+  using (
+    (select public.is_admin())
+    or (published = true
+        and (select public.is_approved())
+        and (select public.is_enrolled())
+        and ((not (select public.plan_is_sampler()))
+             or (slug like 'qbo-%' and access_tier = 'essentials')))
+  );
+
+alter policy modules_read on public.course_modules
+  using (
+    (select public.is_admin())
+    or ((select public.is_approved()) and (select public.is_enrolled())
+        and exists (
+          select 1 from public.courses c
+           where c.id = course_modules.course_id
+             and c.published = true
+             and ((not (select public.plan_is_sampler()))
+                  or (c.slug like 'qbo-%' and c.access_tier = 'essentials'))))
+  );
+
+alter policy lessons_read on public.course_lessons
+  using (
+    (select public.is_admin())
+    or ((select public.is_approved()) and (select public.is_enrolled())
+        and exists (
+          select 1 from public.courses c
+           where c.id = course_lessons.course_id
+             and c.published = true
+             and ((not (select public.plan_is_sampler()))
+                  or (c.slug like 'qbo-%' and c.access_tier = 'essentials'))))
+  );
+
+alter policy course_videos_read on storage.objects
+  using (
+    bucket_id = 'course-videos'
+    and ((select public.is_admin())
+         or ((select public.is_enrolled())
+             and ((not (select public.plan_is_sampler())) or public.course_object_allowed(name))))
+  );
+
+-- 4c) The trainer mirrors. These carry a "MIRRORS courses_read — drift here is a
+--     security bug" contract, so they change in the same breath as 4b.
+create or replace function public.trainer_visible_courses(p_user uuid)
+returns table(id uuid, slug text, title text, access_tier text)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select c.id, c.slug, c.title, c.access_tier
+  from public.courses c
+  where c.ai_trainer_enabled = true
+    and (
+      coalesce((select p.is_admin from public.profiles p where p.id = p_user), false)
+      or (c.published = true
+          and public.user_is_approved(p_user)
+          and public.user_is_enrolled(p_user)
+          and (not coalesce(public.user_plan_key(p_user) = 'sampler', false)
+               or (c.slug like 'qbo-%' and c.access_tier = 'essentials')))
+    )
+$$;
+
+create or replace function public.trainer_courses_for_plan(p_plan_key text)
+returns table(id uuid, slug text, title text, access_tier text)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select c.id, c.slug, c.title, c.access_tier
+  from public.courses c
+  where c.ai_trainer_enabled = true and c.published = true
+    and (not coalesce(p_plan_key = 'sampler', false)
+         or (c.slug like 'qbo-%' and c.access_tier = 'essentials'))
+$$;
+
+-- 4d) Now, and only now. NO CASCADE on purpose: if a policy still references it,
+--     this errors and stops the file rather than silently dropping a read policy.
+drop function if exists public.plan_is_qbo_only();
+
+
+-- ── Step 5 — Segment functions become VIP-only ─────────────────────────────
+-- All `create or replace`, so grants and REVOKEs are preserved.
+
+-- 5a) One space per batch. MUST precede the community_spaces_kind_check
+--     narrowing in Step 7c, or the next batch insert fails on the gold row.
+create or replace function public.batches_create_spaces()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.community_spaces (kind, batch_id, slug, name)
+  values ('vip', new.id, 'vip-' || new.code, 'VIP - ' || new.name)
+  on conflict (kind, batch_id) do nothing;
+  insert into public.batch_events (batch_id, actor_id, action, detail)
+  values (new.id, auth.uid(), 'create',
+          jsonb_build_object('code', new.code, 'name', new.name));
+  return new;
+end;
+$$;
+
+revoke all on function public.batches_create_spaces() from public, anon, authenticated;
+
+-- 5b) grant_batch_run: VIP is the only cohort segment, and capacity is read from
+--     vip_capacity directly rather than a per-segment case.
+create or replace function public.grant_batch_run(
+  p_user_id uuid, p_segment text, p_start_batch_id uuid, p_count integer,
+  p_grant_reason text, p_source_subscription_id uuid default null,
+  p_source_plan_key text default null, p_source_request_id uuid default null,
+  p_source_import_row_id uuid default null, p_valid_until timestamptz default null,
+  p_actor uuid default null, p_enforce_capacity boolean default true)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_run_id      uuid := gen_random_uuid();
+  v_start       public.batches%rowtype;
+  v_outstanding int;
+  v_other_seg   text;
+  v_cand        record;
+  v_idx         int := 0;
+  v_cap         int;
+  v_used        int;
+  v_allocated   jsonb := '[]'::jsonb;
+  v_queued      int := 0;
+  v_activates   timestamptz;
+begin
+  if p_segment is distinct from 'vip' then
+    perform public.app_error('INVALID_PLAN',
+      format('%s is not a cohort segment', coalesce(p_segment, 'null')), 422,
+      jsonb_build_object('segment', p_segment));
+  end if;
+  if p_count is null or p_count < 1 then
+    perform public.app_error('INVALID_PLAN',
+      'this plan has no cohort run length - set enrollment_plans.eligible_batch_count', 422,
+      jsonb_build_object('plan_key', p_source_plan_key));
+  end if;
+  if p_count > 24 then
+    perform public.app_error('RUN_LIMIT_EXCEEDED', 'a run cannot exceed 24 cohorts', 409,
+      jsonb_build_object('requested', p_count));
+  end if;
+
+  select * into v_start from public.batches where id = p_start_batch_id;
+  if v_start.id is null then
+    perform public.app_error('BATCH_NOT_FOUND', 'batch not found', 404,
+      jsonb_build_object('batch_id', p_start_batch_id));
+  end if;
+
+  -- Mixing segments inside one member's outstanding run makes "which seat does
+  -- this member occupy?" ambiguous for capacity. With one live segment this can
+  -- now only fire on stamped history, which is exactly when it should.
+  select e.segment into v_other_seg
+    from public.batch_entitlements e
+   where e.user_id = p_user_id
+     and e.status in ('queued', 'active')
+     and e.segment <> p_segment
+   limit 1;
+  if v_other_seg is not null then
+    perform public.app_error('SEGMENT_MISMATCH',
+      format('member already holds outstanding %s seats', v_other_seg), 409,
+      jsonb_build_object('held_segment', v_other_seg, 'requested_segment', p_segment));
+  end if;
+
+  select count(*) into v_outstanding
+    from public.batch_entitlements e
+   where e.user_id = p_user_id and e.status in ('queued', 'active');
+  if v_outstanding + p_count > 24 then
+    perform public.app_error('RUN_LIMIT_EXCEEDED',
+      'this member already holds the maximum number of upcoming cohort seats', 409,
+      jsonb_build_object('outstanding', v_outstanding, 'requested', p_count));
+  end if;
+
+  -- The explicitly chosen starting cohort must itself be usable - a precise
+  -- error here beats silently starting the run a month later.
+  if v_start.status = 'archived' then
+    perform public.app_error('BATCH_CLOSED', format('batch %s is archived', v_start.code), 409,
+      jsonb_build_object('batch_code', v_start.code, 'status', v_start.status));
+  end if;
+  if not exists (select 1 from public.community_spaces sp
+                  where sp.batch_id = v_start.id and sp.kind = p_segment and sp.active) then
+    perform public.app_error('NO_SPACE_FOR_SEGMENT',
+      format('batch %s has no active %s space', v_start.code, p_segment), 409,
+      jsonb_build_object('batch_code', v_start.code, 'segment', p_segment));
+  end if;
+  -- A closed start batch blocks only when this is a NEW seat there. A member who
+  -- already holds a seat in it (renewal, extension) continues unimpeded - the
+  -- #33/#34 v_holds_seat intent, now expressed per cohort.
+  if v_start.status <> 'open'
+     and not exists (select 1 from public.batch_entitlements e
+                      where e.user_id = p_user_id and e.batch_id = v_start.id
+                        and e.status in ('queued', 'active')) then
+    perform public.app_error('BATCH_CLOSED',
+      format('batch %s is closed to new assignments', v_start.code), 409,
+      jsonb_build_object('batch_code', v_start.code, 'status', v_start.status));
+  end if;
+
+  -- Allocate from the REGISTRY, in code order, under one ordered lock.
+  for v_cand in
+    select b.id, b.code, b.status, b.starts_on, b.vip_capacity, b.total_capacity
+      from public.batches b
+     where b.code >= v_start.code
+       and b.status = 'open'
+       and exists (select 1 from public.community_spaces sp
+                    where sp.batch_id = b.id and sp.kind = p_segment and sp.active)
+       and not exists (select 1 from public.batch_entitlements e2
+                        where e2.user_id = p_user_id and e2.batch_id = b.id
+                          and e2.status in ('queued', 'active'))
+     order by b.code
+     limit p_count
+     for update
+  loop
+    if p_enforce_capacity then
+      v_cap := v_cand.vip_capacity;
+      if v_cap is not null then
+        select count(*) into v_used
+          from public.batch_seat_holders(v_cand.id, p_segment) h
+         where h <> p_user_id;
+        if v_used >= v_cap then
+          perform public.app_error('BATCH_FULL',
+            format('batch %s is full for %s (%s of %s seats)', v_cand.code, p_segment, v_used, v_cap), 409,
+            jsonb_build_object('batch_code', v_cand.code, 'segment', p_segment,
+                               'used', v_used, 'capacity', v_cap, 'scope', 'segment'));
+        end if;
+      end if;
+
+      -- total_capacity is retained: it is the cap across every cohort segment,
+      -- which is one today but is the knob that stays correct if another is added.
+      if v_cand.total_capacity is not null then
+        select count(*) into v_used
+          from public.batch_seat_holders(v_cand.id, 'vip') h
+         where h <> p_user_id;
+        if v_used >= v_cand.total_capacity then
+          perform public.app_error('BATCH_FULL',
+            format('batch %s is full (%s of %s total seats)', v_cand.code, v_used, v_cand.total_capacity), 409,
+            jsonb_build_object('batch_code', v_cand.code, 'used', v_used,
+                               'capacity', v_cand.total_capacity, 'scope', 'total'));
+        end if;
+      end if;
+    end if;
+
+    -- A cohort reveals itself when it starts. Falling back to the month encoded
+    -- in `code` keeps this deterministic when starts_on has not been set.
+    v_activates := coalesce(v_cand.starts_on::timestamptz,
+                            to_date(v_cand.code || '-01', 'YYYY-MM-DD')::timestamptz);
+
+    insert into public.batch_entitlements (
+      user_id, batch_id, segment, batch_index, run_id, run_length, status, grant_reason,
+      source_subscription_id, source_plan_key, source_request_id, source_import_row_id,
+      granted_by, valid_until, activates_at, allocated_at
+    ) values (
+      p_user_id, v_cand.id, p_segment, v_idx, v_run_id, p_count, 'active', p_grant_reason,
+      p_source_subscription_id, p_source_plan_key, p_source_request_id, p_source_import_row_id,
+      p_actor, p_valid_until, v_activates, now()
+    );
+
+    insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+    values (v_cand.id, p_user_id, p_actor, 'entitle_allocate',
+            jsonb_build_object('run_id', v_run_id, 'segment', p_segment,
+                               'batch_index', v_idx, 'reason', p_grant_reason));
+
+    v_allocated := v_allocated || jsonb_build_object('batch_id', v_cand.id, 'code', v_cand.code,
+                                                     'batch_index', v_idx);
+    v_idx := v_idx + 1;
+  end loop;
+
+  -- Shortfall: cohorts that do not exist yet. The seat is still owed, so it is
+  -- recorded and bound by the FIFO trigger when Alex creates the next batch.
+  while v_idx < p_count loop
+    insert into public.batch_entitlements (
+      user_id, batch_id, segment, batch_index, run_id, run_length, status, grant_reason,
+      source_subscription_id, source_plan_key, source_request_id, source_import_row_id,
+      granted_by, valid_until
+    ) values (
+      p_user_id, null, p_segment, v_idx, v_run_id, p_count, 'queued', p_grant_reason,
+      p_source_subscription_id, p_source_plan_key, p_source_request_id, p_source_import_row_id,
+      p_actor, p_valid_until
+    );
+    v_queued := v_queued + 1;
+    v_idx := v_idx + 1;
+  end loop;
+
+  if v_queued > 0 then
+    insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+    values (null, p_user_id, p_actor, 'entitle',
+            jsonb_build_object('run_id', v_run_id, 'segment', p_segment,
+                               'queued', v_queued, 'reason', p_grant_reason));
+  end if;
+
+  return jsonb_build_object(
+    'ok', true, 'run_id', v_run_id, 'segment', p_segment,
+    'run_length', p_count, 'allocated', v_allocated, 'queued', v_queued
+  );
+end;
+$$;
+
+revoke all on function public.grant_batch_run(uuid, text, uuid, int, text, uuid, text, uuid, uuid, timestamptz, uuid, boolean)
+  from public, anon, authenticated;
+
+-- 5c) user_entitled_batches: the pre-#35 bridge is VIP-only.
+create or replace function public.user_entitled_batches(p_user uuid)
+returns table(batch_id uuid, segment text, batch_index integer,
+              activates_at timestamptz, valid_until timestamptz)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  with gate as (
+    select public.user_is_enrolled(p_user) as enrolled,
+           public.user_is_approved(p_user) as approved
+  ),
+  live as (
+    select coalesce(ep.community_segment, 'general') as segment
+      from public.subscriptions s
+      left join public.enrollment_plans ep on ep.key = s.plan_key
+     where s.user_id = p_user
+       and s.status = 'active'
+       and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+     order by s.created_at desc
+     limit 1
+  ),
+  ledger as (
+    select e.batch_id, e.segment, e.batch_index, e.activates_at, e.valid_until
+      from public.batch_entitlements e
+     where e.user_id = p_user
+       and e.status = 'active'
+       and e.batch_id is not null
+       and (e.valid_until  is null or e.valid_until  > now())
+       and (e.activates_at is null or e.activates_at <= now())
+       and e.segment = (select segment from live)
+  ),
+  bridge as (
+    -- Pre-#35 grants only. Scoped to members with NO ledger rows at all.
+    select s.batch_id,
+           coalesce(ep.community_segment, 'general') as segment,
+           0 as batch_index,
+           null::timestamptz as activates_at,
+           coalesce(s.grace_ends_at, s.ends_at) as valid_until
+      from public.subscriptions s
+      join public.enrollment_plans ep on ep.key = s.plan_key
+     where s.user_id = p_user
+       and s.status = 'active'
+       and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+       and s.batch_id is not null
+       and coalesce(ep.community_segment, 'general') = 'vip'
+       and not exists (select 1 from public.batch_entitlements e2 where e2.user_id = p_user)
+  )
+  select b.batch_id, b.segment, b.batch_index, b.activates_at, b.valid_until
+    from (select * from ledger union all select * from bridge) b, gate g
+   where g.enrolled and g.approved;
+$$;
+
+-- 5d) admin_finalize_enrollment: #34's body VERBATIM, with exactly two lines
+--     changed (the two segment guards). Everything else — updated_at, the
+--     rejected_at/rejected_by clearing, rejection_reason = null, the
+--     v_prev_segment supersede — is preserved byte-for-byte. scripts/audit-db.mjs
+--     greps this body for 'rejected_at = null'; losing it re-opens the #34
+--     regression AND fails the audit.
+create or replace function public.admin_finalize_enrollment(p_request_id uuid, p_batch_id uuid default null)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_req          public.enrollment_requests%rowtype;
+  v_prev         public.subscriptions%rowtype;
+  v_new          public.subscriptions%rowtype;
+  v_plan         public.enrollment_plans%rowtype;
+  v_kind         text;
+  v_eff_plan     text;
+  v_segment      text;
+  v_prev_segment text;
+  v_batch        uuid;
+  v_batch_row    public.batches%rowtype;
+  v_count        int;
+  v_valid_until  timestamptz;
+  v_run          jsonb := null;
+begin
+  if not public.is_admin() then
+    perform public.app_error('FORBIDDEN', 'admin_finalize_enrollment: admin only', 403, null);
+  end if;
+
+  select * into v_req from public.enrollment_requests
+   where id = p_request_id for update;
+  if v_req.id is null then
+    perform public.app_error('REQUEST_NOT_FOUND', 'admin_finalize_enrollment: request not found', 404,
+      jsonb_build_object('request_id', p_request_id));
+  end if;
+
+  -- Idempotency: re-approving an approved request is a no-op.
+  if v_req.status = 'approved' then
+    return jsonb_build_object('ok', true, 'already', true);
+  end if;
+  if v_req.status <> 'pending_review' then
+    perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+      format('admin_finalize_enrollment: request is %s - only pending_review can be approved', v_req.status),
+      409, jsonb_build_object('status', v_req.status));
+  end if;
+
+  v_kind := coalesce(v_req.request_kind, 'new');
+
+  select * into v_prev from public.subscriptions
+   where user_id = v_req.user_id
+   order by created_at desc limit 1;
+
+  -- Effective plan: extensions stay on the member's CURRENT plan.
+  v_eff_plan := case when v_kind = 'extension'
+                     then coalesce(v_prev.plan_key, v_req.plan_key)
+                     else v_req.plan_key end;
+
+  select * into v_plan from public.enrollment_plans where key = v_eff_plan;
+  if v_plan.key is null then
+    perform public.app_error('INVALID_PLAN', format('admin_finalize_enrollment: unknown plan %s', v_eff_plan),
+      422, jsonb_build_object('plan_key', v_eff_plan));
+  end if;
+  -- New sales require a sellable plan; extensions may continue a retired one.
+  if v_kind <> 'extension' and not v_plan.active then
+    perform public.app_error('INVALID_PLAN', format('admin_finalize_enrollment: plan %s is inactive', v_eff_plan),
+      422, jsonb_build_object('plan_key', v_eff_plan));
+  end if;
+
+  v_segment := coalesce(v_plan.community_segment, 'general');
+  if v_prev.plan_key is not null then
+    select coalesce(ep.community_segment, 'general') into v_prev_segment
+      from public.enrollment_plans ep where ep.key = v_prev.plan_key;
+  end if;
+
+  if v_segment is distinct from 'vip' then
+    v_batch := null;
+  else
+    if v_kind in ('renewal', 'extension') then
+      v_batch := coalesce(p_batch_id, v_prev.batch_id, v_req.batch_id);
+      if v_kind = 'extension' and p_batch_id is not null
+         and v_prev.batch_id is not null and p_batch_id <> v_prev.batch_id then
+        perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+          'admin_finalize_enrollment: an extension keeps the current batch - use the batch manager to move members',
+          409, jsonb_build_object('current_batch_id', v_prev.batch_id));
+      end if;
+      -- A renewal may arrive after every held seat lapsed; fall back to the
+      -- member's most recent cohort so the run continues from the right place.
+      if v_batch is null then
+        select e.batch_id into v_batch
+          from public.batch_entitlements e
+         where e.user_id = v_req.user_id and e.batch_id is not null
+         order by e.granted_at desc, e.batch_index desc
+         limit 1;
+      end if;
+    elsif v_kind = 'upgrade' then
+      v_batch := p_batch_id;
+      if v_batch is null and v_prev.batch_id is not null
+         and exists (select 1 from public.community_spaces sp
+                      where sp.kind = v_segment and sp.batch_id = v_prev.batch_id and sp.active) then
+        v_batch := v_prev.batch_id;
+      end if;
+      if v_batch is null then v_batch := v_req.batch_id; end if;
+    else
+      v_batch := coalesce(p_batch_id, v_req.batch_id);
+    end if;
+
+    if v_batch is null then
+      perform public.app_error('BATCH_REQUIRED',
+        format('admin_finalize_enrollment: %s needs a batch - pick an open batch in the approve dialog', v_eff_plan),
+        422, jsonb_build_object('plan_key', v_eff_plan, 'segment', v_segment));
+    end if;
+
+    -- Read-only validation for a precise error. The LOCK belongs to
+    -- grant_batch_run, which takes every batch lock in code order.
+    select * into v_batch_row from public.batches where id = v_batch;
+    if v_batch_row.id is null then
+      perform public.app_error('BATCH_NOT_FOUND', 'admin_finalize_enrollment: batch not found', 404,
+        jsonb_build_object('batch_id', v_batch));
+    end if;
+  end if;
+
+  -- Grant the term through the EXISTING functions (stacking / supersede / grace /
+  -- the 60-365 clamp / the legacy-lifetime guard all live there).
+  if v_kind = 'extension' then
+    if v_req.extension_days is null or v_req.extension_days <= 0 then
+      perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+        'admin_finalize_enrollment: extension request has no extension_days', 409, null);
+    end if;
+    v_new := public.approve_extension(v_req.user_id, v_req.id, v_req.extension_days);
+  else
+    v_new := public.approve_subscription(v_req.user_id, v_req.plan_key, v_req.id);
+  end if;
+
+  update public.subscriptions
+     set batch_id = v_batch, updated_at = now()
+   where id = v_new.id;
+
+  -- ── Materialise the cohort run (L1) ───────────────────────────────
+  if v_segment = 'vip' then
+    v_valid_until := coalesce(v_new.grace_ends_at, v_new.ends_at);
+
+    -- Every outstanding seat rides the new expiry. Forward-only, enforced by the
+    -- guard trigger. Without this an extension would leave already-held seats
+    -- expiring on the old date.
+    update public.batch_entitlements e
+       set valid_until = v_valid_until, updated_at = now()
+     where e.user_id = v_req.user_id
+       and e.status in ('queued', 'active')
+       and v_valid_until is not null
+       and (e.valid_until is null or e.valid_until < v_valid_until);
+
+    -- A segment change must not leave seats from two segments coexisting.
+    if v_prev_segment is not null and v_prev_segment <> v_segment then
+      perform public.revoke_batch_run(v_req.user_id, null,
+        format('upgrade %s -> %s', v_prev_segment, v_segment), auth.uid(), 'superseded');
+    end if;
+
+    v_count := case
+                 when v_kind = 'extension'
+                   then greatest(1, least(12, ceil(v_req.extension_days / 30.0)::int))   -- D9
+                 else public.plan_batch_count(v_plan.access_days, v_plan.eligible_batch_count)
+               end;
+
+    if v_count is null then
+      perform public.app_error('INVALID_PLAN',
+        format('plan %s has no access_days and no eligible_batch_count - cannot size the cohort run', v_eff_plan),
+        422, jsonb_build_object('plan_key', v_eff_plan));
+    end if;
+
+    v_run := public.grant_batch_run(
+      v_req.user_id, v_segment, v_batch, v_count,
+      case when v_kind = 'new' then 'approval' else v_kind end,
+      v_new.id, v_eff_plan, v_req.id, null, v_valid_until, auth.uid(), true);
+  end if;
+
+  -- Profile cache (mirrors the old client step 2).
+  update public.profiles
+     set is_paid = true,
+         plan = v_eff_plan,
+         approval_status = 'approved',
+         approved_at = now(),
+         approved_by = auth.uid(),
+         rejected_at = null,
+         rejected_by = null,
+         rejection_reason = null,
+         updated_at = now()
+   where id = v_req.user_id;
+
+  -- Request row (mirrors the old client step 3) + the resolved batch.
+  update public.enrollment_requests
+     set status = 'approved',
+         rejection_reason = null,
+         reviewed_at = now(),
+         reviewed_by = auth.uid(),
+         batch_id = v_batch,
+         updated_at = now()
+   where id = v_req.id;
+
+  return jsonb_build_object(
+    'ok', true,
+    'subscription_id', v_new.id,
+    'ends_at', v_new.ends_at,
+    'batch_id', v_batch,
+    'batch_code', (select code from public.batches where id = v_batch),
+    'run', v_run
+  );
+end;
+$$;
+
+revoke all on function public.admin_finalize_enrollment(uuid, uuid) from public, anon;
+grant execute on function public.admin_finalize_enrollment(uuid, uuid) to authenticated;
+
+-- 5e) admin_assign_batch — one guard line.
+create or replace function public.admin_assign_batch(p_user_ids uuid[], p_batch_id uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_uid       uuid;
+  v_sub       public.subscriptions%rowtype;
+  v_segment   text;
+  v_count     int;
+  v_assigned  int := 0;
+  v_skipped   jsonb := '[]'::jsonb;
+  v_batch     public.batches%rowtype;
+  v_held      boolean;
+  v_hint      text;
+begin
+  if not public.is_admin() then
+    perform public.app_error('FORBIDDEN', 'admin_assign_batch: admin only', 403, null);
+  end if;
+
+  select * into v_batch from public.batches where id = p_batch_id;
+  if v_batch.id is null then
+    perform public.app_error('BATCH_NOT_FOUND', 'admin_assign_batch: batch not found', 404,
+      jsonb_build_object('batch_id', p_batch_id));
+  end if;
+  if v_batch.status <> 'open' then
+    perform public.app_error('BATCH_CLOSED',
+      format('admin_assign_batch: batch %s is %s', v_batch.code, v_batch.status), 409,
+      jsonb_build_object('batch_code', v_batch.code, 'status', v_batch.status));
+  end if;
+
+  foreach v_uid in array coalesce(p_user_ids, array[]::uuid[]) loop
+    begin
+      select * into v_sub from public.subscriptions s
+       where s.user_id = v_uid and s.status = 'active'
+         and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+       order by s.created_at desc limit 1;
+
+      if v_sub.id is null then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'no_active_subscription');
+        continue;
+      end if;
+
+      select coalesce(ep.community_segment, 'general') into v_segment
+        from public.enrollment_plans ep where ep.key = v_sub.plan_key;
+      if v_segment is distinct from 'vip' then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'not_a_premium_plan');
+        continue;
+      end if;
+
+      select exists (select 1 from public.batch_entitlements e
+                      where e.user_id = v_uid and e.batch_id = p_batch_id
+                        and e.status in ('queued', 'active')) into v_held;
+      if v_held then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'already_assigned');
+        continue;
+      end if;
+
+      if not exists (select 1 from public.community_spaces sp
+                      where sp.batch_id = p_batch_id and sp.kind = v_segment and sp.active) then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'no_space_for_segment');
+        continue;
+      end if;
+
+      v_count := public.plan_eligible_batch_count(v_sub.plan_key);
+      if v_count is null then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'no_run_length');
+        continue;
+      end if;
+
+      -- Move, do not destroy: supersede the outstanding run, then grant a new
+      -- one from the chosen cohort. Both remain in the ledger.
+      perform public.revoke_batch_run(v_uid, null,
+        format('reassigned to %s', v_batch.code), auth.uid(), 'superseded');
+
+      perform public.grant_batch_run(
+        v_uid, v_segment, p_batch_id, v_count, 'admin_manual',
+        v_sub.id, v_sub.plan_key, null, null,
+        coalesce(v_sub.grace_ends_at, v_sub.ends_at), auth.uid(), true);
+
+      update public.subscriptions set batch_id = p_batch_id, updated_at = now() where id = v_sub.id;
+
+      insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+      values (p_batch_id, v_uid, auth.uid(),
+              case when v_sub.batch_id is null then 'assign' else 'reassign' end,
+              jsonb_build_object('subscription_id', v_sub.id, 'segment', v_segment,
+                                 'from_batch_id', v_sub.batch_id, 'to_batch_id', p_batch_id));
+      v_assigned := v_assigned + 1;
+
+    exception
+      -- Only OUR refusals become a per-user skip. A deadlock or serialization
+      -- failure must surface, not masquerade as "this member was skipped" —
+      -- that would silently under-assign a bulk operation.
+      when sqlstate 'PT409' or sqlstate 'PT422' or sqlstate 'PT403' or sqlstate 'PT404' then
+        get stacked diagnostics v_hint = pg_exception_hint;
+        v_skipped := v_skipped || jsonb_build_object(
+          'user_id', v_uid,
+          'reason', lower(coalesce(nullif(v_hint, ''), 'run_conflict')));
+    end;
+  end loop;
+
+  return jsonb_build_object('ok', true, 'assigned', v_assigned,
+                            'skipped', v_skipped, 'batch_code', v_batch.code);
+end;
+$$;
+
+revoke all on function public.admin_assign_batch(uuid[], uuid) from public, anon;
+grant execute on function public.admin_assign_batch(uuid[], uuid) to authenticated;
+
+-- 5f) admin_grant_batch_run — one guard line.
+create or replace function public.admin_grant_batch_run(
+  p_user_id uuid, p_batch_id uuid, p_count integer default null, p_force boolean default false)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_sub         public.subscriptions%rowtype;
+  v_segment     text;
+  v_count       int;
+  v_outstanding int;
+begin
+  if not public.is_admin() then
+    perform public.app_error('FORBIDDEN', 'admin_grant_batch_run: admin only', 403, null);
+  end if;
+
+  select * into v_sub from public.subscriptions s
+   where s.user_id = p_user_id and s.status = 'active'
+     and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+   order by s.created_at desc limit 1;
+  if v_sub.id is null then
+    perform public.app_error('ENTITLEMENT_EXPIRED',
+      'member has no active membership term to attach a cohort seat to', 403,
+      jsonb_build_object('user_id', p_user_id));
+  end if;
+
+  select coalesce(ep.community_segment, 'general') into v_segment
+    from public.enrollment_plans ep where ep.key = v_sub.plan_key;
+  if v_segment is distinct from 'vip' then
+    perform public.app_error('INVALID_PLAN',
+      format('plan %s is not a cohort plan', v_sub.plan_key), 422,
+      jsonb_build_object('plan_key', v_sub.plan_key, 'segment', v_segment));
+  end if;
+
+  v_count := coalesce(p_count, public.plan_eligible_batch_count(v_sub.plan_key), 1);
+
+  -- ★ #37: idempotency. The one-seat-per-cohort unique index only protects
+  -- BOUND seats, so a repeat call on a member who already holds every open
+  -- cohort fell through to the shortfall path and minted a second full run of
+  -- queued seats — sold, capacity-exempt, and auto-bound later by the binder.
+  if not p_force then
+    select count(*) into v_outstanding
+      from public.batch_entitlements e
+     where e.user_id = p_user_id and e.status in ('queued', 'active');
+    if v_outstanding >= v_count then
+      perform public.app_error('ALREADY_ENTITLED',
+        format('member already holds %s outstanding cohort seat(s); pass p_force to stack another run',
+               v_outstanding), 409,
+        jsonb_build_object('outstanding', v_outstanding, 'requested', v_count));
+    end if;
+  end if;
+
+  return public.grant_batch_run(
+    p_user_id, v_segment, p_batch_id, v_count, 'admin_manual',
+    v_sub.id, v_sub.plan_key, null, null,
+    coalesce(v_sub.grace_ends_at, v_sub.ends_at), auth.uid(), not p_force);
+end;
+$$;
+
+revoke all on function public.admin_grant_batch_run(uuid, uuid, integer, boolean) from public, anon;
+grant execute on function public.admin_grant_batch_run(uuid, uuid, integer, boolean) to authenticated;
+
+-- 5g) admin_batches_needing_assignment — one predicate.
+create or replace function public.admin_batches_needing_assignment(
+  p_limit integer default 50, p_offset integer default 0)
+returns table(user_id uuid, email text, full_name text, plan_key text, segment text,
+              subscription_id uuid, ends_at timestamptz, total_count bigint)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  with live as (
+    select distinct on (s.user_id) s.user_id, s.id as subscription_id, s.plan_key,
+           coalesce(ep.community_segment, 'general') as segment,
+           coalesce(s.grace_ends_at, s.ends_at) as ends_at
+      from public.subscriptions s
+      join public.enrollment_plans ep on ep.key = s.plan_key
+     where s.status = 'active'
+       and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+     order by s.user_id, s.created_at desc
+  ),
+  needy as (
+    select l.*
+      from live l
+     where l.segment = 'vip'
+       and not exists (select 1 from public.batch_entitlements e
+                        where e.user_id = l.user_id and e.status in ('queued', 'active'))
+  )
+  select n.user_id, p.email, p.full_name, n.plan_key, n.segment,
+         n.subscription_id, n.ends_at,
+         (select count(*) from needy) as total_count
+    from needy n
+    join public.profiles p on p.id = n.user_id
+   where public.is_admin()
+   order by n.ends_at nulls last, n.user_id
+   limit greatest(1, least(200, coalesce(p_limit, 50)))
+  offset greatest(0, coalesce(p_offset, 0));
+$$;
+
+revoke all on function public.admin_batches_needing_assignment(integer, integer) from public, anon;
+grant execute on function public.admin_batches_needing_assignment(integer, integer) to authenticated;
+
+-- 5i) The drift view — column list unchanged, so `or replace` is legal.
+create or replace view public.v_batch_entitlement_drift
+with (security_invoker = true) as
+  select s.user_id,
+         s.id as subscription_id,
+         s.plan_key,
+         coalesce(ep.community_segment, 'general') as segment,
+         s.batch_id as cached_batch_id,
+         (select count(*) from public.batch_entitlements e
+           where e.user_id = s.user_id and e.status in ('queued', 'active')) as outstanding_seats,
+         case
+           when coalesce(ep.community_segment, 'general') is distinct from 'vip' then
+             case when s.batch_id is null then 'ok' else 'general_plan_has_batch' end
+           when not exists (select 1 from public.batch_entitlements e
+                             where e.user_id = s.user_id and e.status in ('queued', 'active'))
+             then 'premium_without_ledger'
+           when s.batch_id is null then 'missing_cache'
+           when not exists (select 1 from public.batch_entitlements e
+                             where e.user_id = s.user_id and e.batch_id = s.batch_id
+                               and e.status in ('queued', 'active'))
+             then 'cache_not_in_ledger'
+           else 'ok'
+         end as drift
+    from public.subscriptions s
+    left join public.enrollment_plans ep on ep.key = s.plan_key
+   where s.status = 'active'
+     and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now());
+
+-- 5j) app_error_catalog: EVERY code is kept — src/lib/appErrors.js mirrors this
+--     list by name and dropping one would break the client copy mapper. Only the
+--     two summaries that name Gold are reworded.
+create or replace function public.app_error_catalog()
+returns table(code text, http integer, summary text)
+language sql
+immutable
+parallel safe
+set search_path = public
+as $$
+  select * from (values
+    ('BATCH_REQUIRED',               422, 'A VIP action needs an explicit batch; none was supplied.'),
+    ('BATCH_NOT_FOUND',              404, 'The batch id or month code does not exist.'),
+    ('BATCH_CLOSED',                 409, 'The batch is closed to new assignments, or archived.'),
+    ('BATCH_FULL',                   409, 'A cohort in the run has no seats left.'),
+    ('NO_SPACE_FOR_SEGMENT',         409, 'The batch has no active community space for that plan segment.'),
+    ('INVALID_BATCH_CODE',           422, 'Not a real YYYY-MM month.'),
+    ('ENTITLEMENT_EXPIRED',          403, 'The membership term (or its grace) has ended.'),
+    ('INVALID_PLAN',                 422, 'Unknown, inactive, or non-premium plan for this action.'),
+    ('ALREADY_ENTITLED',             409, 'The member already holds an outstanding seat in that cohort.'),
+    ('RUN_LIMIT_EXCEEDED',           409, 'Outstanding seats would exceed the per-member ceiling.'),
+    ('SEGMENT_MISMATCH',             409, 'The grant would mix cohort segments in one outstanding run.'),
+    ('INVALID_MEMBERSHIP_TRANSITION',409, 'The current membership state does not allow this transition.'),
+    ('IMMUTABLE_ENTITLEMENT',        409, 'An attempt to rewrite a frozen ledger column.'),
+    ('FORBIDDEN',                    403, 'Admin-only operation called by a non-admin.'),
+    ('REQUEST_NOT_FOUND',            404, 'The enrollment request does not exist.'),
+    ('COURSE_ACCESS_DENIED',         403, 'Course hidden by plan scope, publication, or cohort entitlement.'),
+    ('LESSON_NOT_RELEASED',          403, 'The cohort drip has not unlocked this lesson yet.'),
+    ('COMMUNITY_ACCESS_DENIED',      403, 'The community write was refused.'),
+    ('COMMENT_PERMISSION_DENIED',    403, 'Replies are off in this space.'),
+    ('ASSIGNMENT_CLOSED',            409, 'Past the due date, or the assignment is unpublished.'),
+    ('SUBMISSION_LOCKED',            409, 'The submission is handed in or graded; edits refused.'),
+    ('COURSE_HAS_SUBMISSIONS',       409, 'The course has graded assignment work and cannot be deleted.'),
+    -- ── #38, batch lifecycle ──
+    ('BATCH_PAST',                   409, 'The batch period has elapsed in its own timezone; it is read-only.'),
+    ('BATCH_CODE_TAKEN',             409, 'Another batch already uses that month code.'),
+    ('BATCH_CODE_REORDER',           409, 'The new code would move the batch past a sibling and reorder members'' runs.'),
+    ('BATCH_PERIOD_PAST',            422, 'The requested period has already ended; a batch cannot be edited into the past.'),
+    ('BATCH_PERIOD_INVALID',         422, 'The end date falls before the start date, or a date is missing.'),
+    ('BATCH_TIMEZONE_INVALID',       422, 'Not a timezone Postgres recognises (see pg_timezone_names).'),
+    ('BATCH_CAPACITY_BELOW_OCCUPANCY',409,'The new capacity is below the seats already sold in that segment.')
+  ) as t(code, http, summary);
+$$;
+
+revoke all on function public.app_error_catalog() from public, anon;
+grant execute on function public.app_error_catalog() to authenticated;
+
+-- 5l) batch_entitlements_guard: comment-only reword (the body is unchanged), so
+--     that "no function mentions gold" is a verifiable one-query fact.
+create or replace function public.batch_entitlements_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_seg_ok boolean;
+begin
+  if tg_op = 'INSERT' then
+    -- A bound seat must have a real, active space for its segment. This is what
+    -- makes "granted into a cohort with no VIP space" impossible rather than
+    -- merely unlikely.
+    if new.batch_id is not null then
+      select exists (
+        select 1 from public.community_spaces sp
+         where sp.batch_id = new.batch_id and sp.kind = new.segment and sp.active
+      ) into v_seg_ok;
+      if not v_seg_ok then
+        perform public.app_error('NO_SPACE_FOR_SEGMENT',
+          format('batch has no active %s space', new.segment), 409,
+          jsonb_build_object('batch_id', new.batch_id, 'segment', new.segment));
+      end if;
+    end if;
+
+    -- valid_until may never outlive the source term.
+    if new.valid_until is not null and new.source_subscription_id is not null then
+      if exists (
+        select 1 from public.subscriptions s
+         where s.id = new.source_subscription_id
+           and s.ends_at is not null
+           and new.valid_until > coalesce(s.grace_ends_at, s.ends_at) + interval '1 minute'
+      ) then
+        perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+          'entitlement would outlive its source subscription term', 409,
+          jsonb_build_object('source_subscription_id', new.source_subscription_id));
+      end if;
+    end if;
+
+    -- granted_by, when set, must be an admin.
+    if new.granted_by is not null
+       and not coalesce((select p.is_admin from public.profiles p where p.id = new.granted_by), false) then
+      perform public.app_error('FORBIDDEN', 'granted_by must reference an admin', 403, null);
+    end if;
+
+    if new.batch_index >= new.run_length then
+      perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+        'batch_index must be inside the run', 409,
+        jsonb_build_object('batch_index', new.batch_index, 'run_length', new.run_length));
+    end if;
+
+    return new;
+  end if;
+
+  -- ── UPDATE ────────────────────────────────────────────────────────
+  -- Frozen identity/provenance columns. Rewriting any of these would destroy
+  -- the audit answer to "why did this member have access?".
+  if new.user_id     is distinct from old.user_id
+     or new.segment      is distinct from old.segment
+     or new.batch_index  is distinct from old.batch_index
+     or new.run_id       is distinct from old.run_id
+     or new.run_length   is distinct from old.run_length
+     or new.grant_reason is distinct from old.grant_reason
+     or new.granted_at   is distinct from old.granted_at
+     or new.created_at   is distinct from old.created_at then
+    perform public.app_error('IMMUTABLE_ENTITLEMENT',
+      'batch entitlement identity columns are frozen', 409, null);
+  end if;
+
+  -- ★ Provenance FKs and granted_by may transition to NULL. That is Postgres
+  -- executing ON DELETE SET NULL / ON UPDATE CASCADE, which arrives here as an
+  -- UPDATE. Freezing them outright would make every referenced profile,
+  -- request, subscription and plan key permanently undeletable — a reviewer
+  -- found exactly this. (It is also what lets #39 delete the retired plan rows:
+  -- source_plan_key transitions to NULL rather than blocking.) Reject only
+  -- non-null → a DIFFERENT non-null.
+  if (old.source_subscription_id is not null and new.source_subscription_id is not null
+      and new.source_subscription_id is distinct from old.source_subscription_id)
+     or (old.source_plan_key is not null and new.source_plan_key is not null
+         and new.source_plan_key is distinct from old.source_plan_key)
+     or (old.source_request_id is not null and new.source_request_id is not null
+         and new.source_request_id is distinct from old.source_request_id)
+     or (old.source_import_row_id is not null and new.source_import_row_id is not null
+         and new.source_import_row_id is distinct from old.source_import_row_id)
+     or (old.granted_by is not null and new.granted_by is not null
+         and new.granted_by is distinct from old.granted_by) then
+    perform public.app_error('IMMUTABLE_ENTITLEMENT',
+      'batch entitlement provenance cannot be re-pointed', 409, null);
+  end if;
+
+  -- batch_id: NULL → a real id exactly once (allocation). Never re-pointed,
+  -- never cleared. Moving a member between cohorts revokes and re-grants, so
+  -- the old seat stays in the record.
+  if old.batch_id is not null and new.batch_id is distinct from old.batch_id then
+    perform public.app_error('IMMUTABLE_ENTITLEMENT',
+      'an allocated seat cannot be moved - revoke it and grant a new one', 409,
+      jsonb_build_object('batch_id', old.batch_id));
+  end if;
+
+  -- status: queued → active → {revoked|superseded}, both terminal.
+  if old.status <> new.status then
+    if old.status in ('revoked', 'superseded') then
+      perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+        format('%s is a terminal entitlement status', old.status), 409, null);
+    end if;
+    if old.status = 'active' and new.status = 'queued' then
+      perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+        'an allocated seat cannot return to the queue', 409, null);
+    end if;
+  end if;
+
+  -- valid_until is forward-only. Clearing it (→ NULL) would silently grant
+  -- perpetual access; shortening it is a revoke, which has its own path.
+  if old.valid_until is not null
+     and (new.valid_until is null or new.valid_until < old.valid_until)
+     and new.status not in ('revoked', 'superseded') then
+    perform public.app_error('IMMUTABLE_ENTITLEMENT',
+      'valid_until only moves forward - revoke the seat to end it early', 409, null);
+  end if;
+
+  return new;
+end;
+$$;
+
+revoke all on function public.batch_entitlements_guard() from public, anon, authenticated;
+
+-- 5k) ★ batches_guard: drop gold_capacity from the past-lock freeze list.
+--     MUST run BEFORE Step 7a — see the ORDERING HAZARD note at the top.
+create or replace function public.batches_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_tz       text;
+  v_override boolean;
+begin
+  if tg_op = 'INSERT' then
+    v_tz := coalesce(nullif(new.timezone, ''), 'Asia/Manila');
+    if not exists (select 1 from pg_timezone_names z where z.name = v_tz) then
+      perform public.app_error('BATCH_TIMEZONE_INVALID',
+        format('%s is not a timezone Postgres recognises', v_tz), 422,
+        jsonb_build_object('timezone', v_tz));
+    end if;
+    new.timezone := v_tz;
+
+    -- Check the code shape BEFORE deriving dates from it. batches_code_check
+    -- would catch a bad code, but CHECK constraints run AFTER before-triggers, so
+    -- to_date('abc-01','YYYY-MM-DD') would get there first and report "invalid
+    -- value for YYYY" — a parser complaint where a business error belongs.
+    if new.code is null or new.code !~ '^\d{4}-(0[1-9]|1[0-2])$' then
+      perform public.app_error('INVALID_BATCH_CODE',
+        format('%s is not a real YYYY-MM month', coalesce(new.code, 'null')), 422,
+        jsonb_build_object('code', new.code));
+    end if;
+
+    -- Every batch is born with a reliable period, whoever inserted it. This is
+    -- what lets the client keep a plain INSERT and still satisfy "a new batch
+    -- always has starts_on, ends_on and a timezone".
+    if new.starts_on is null then
+      new.starts_on := to_date(new.code || '-01', 'YYYY-MM-DD');
+    end if;
+    if new.ends_on is null then
+      new.ends_on := (to_date(new.code || '-01', 'YYYY-MM-DD') + interval '1 month - 1 day')::date;
+    end if;
+    if new.starts_on > new.ends_on then
+      perform public.app_error('BATCH_PERIOD_INVALID',
+        'the end date falls before the start date', 422,
+        jsonb_build_object('starts_on', new.starts_on, 'ends_on', new.ends_on));
+    end if;
+    return new;
+  end if;
+
+  -- ── UPDATE ────────────────────────────────────────────────────────
+  -- The primary key is the one thing every entitlement, space and audit row
+  -- points at. It is never editable, by anyone, through any path.
+  if new.id is distinct from old.id then
+    perform public.app_error('IMMUTABLE_ENTITLEMENT',
+      'batches.id is frozen - entitlements, spaces and audit rows reference it', 409, null);
+  end if;
+
+  -- The gate is TABLE OWNERSHIP, not a role attribute. Gating on rolsuper alone
+  -- would make the break-glass unreachable on the one database that needs it:
+  -- Supabase's `postgres` — what the SQL editor and the Management API run as —
+  -- is not a superuser. Ownership says exactly what is meant ("only whoever owns
+  -- this table may bypass its guard") and needs no guessing about which
+  -- attributes a given platform grants. PostgREST connects as `authenticator`,
+  -- which is not a member of the owner, so the API can never reach this.
+  -- pg_has_role() is already true for a superuser (they are implicitly a member of
+  -- every role), so ownership alone covers both cases and needs no second branch.
+  v_override := coalesce(current_setting('app.batch_admin_override', true), '') = 'on'
+                and pg_has_role(session_user,
+                                (select c.relowner from pg_class c
+                                   join pg_namespace n on n.oid = c.relnamespace
+                                  where n.nspname = 'public' and c.relname = 'batches'),
+                                'member');
+
+  if public.batch_is_past(old.ends_on, old.timezone) and not v_override then
+    -- A past batch cannot be REOPENED. Without this the sweep and the admin fight:
+    -- reopening succeeds (status is not a frozen field), then close_due_batches()
+    -- matches `status='open' and is_past` and closes it again within the hour,
+    -- and the batch cannot be extended out of the past either — a dead end with no
+    -- error to explain it. Un-archiving a past batch restores it to `closed`,
+    -- which is the only truthful state for a period that has ended.
+    if new.status = 'open' and old.status <> 'open' then
+      perform public.app_error('BATCH_PAST',
+        format('batch %s ended on %s (%s) and cannot be reopened - create the next batch instead',
+               old.code, old.ends_on, old.timezone), 409,
+        jsonb_build_object('batch_code', old.code, 'ends_on', old.ends_on,
+                           'timezone', old.timezone, 'attempted_status', 'open'));
+    end if;
+
+    -- Otherwise a past batch keeps exactly the lifecycle actions: close (the sweep
+    -- lands here), archive, un-archive-to-closed. Every descriptive field is frozen.
+    if new.code           is distinct from old.code
+       or new.name           is distinct from old.name
+       or new.starts_on      is distinct from old.starts_on
+       or new.ends_on        is distinct from old.ends_on
+       or new.timezone       is distinct from old.timezone
+       or new.vip_capacity   is distinct from old.vip_capacity
+       or new.total_capacity is distinct from old.total_capacity then
+      perform public.app_error('BATCH_PAST',
+        format('batch %s ended on %s (%s) and is read-only',
+               old.code, old.ends_on, old.timezone), 409,
+        jsonb_build_object('batch_code', old.code, 'ends_on', old.ends_on,
+                           'timezone', old.timezone));
+    end if;
+    return new;
+  end if;
+
+  -- ★ RANK PRESERVATION IS ENFORCED HERE, not only in admin_update_batch().
+  -- The column-level revoke stops `authenticated`, but `service_role` keeps
+  -- table-level UPDATE and the SQL editor runs as the owner — and db/README.md
+  -- documents the SQL editor as a first-class way to reach this database. Without
+  -- this branch, `update batches set code = '2026-06' where code = '2026-12';`
+  -- succeeds with no error and no audit row, and silently reorders a member's
+  -- purchased run months later. The RPC validates first, so for that path this is
+  -- a no-op re-check.
+  if new.code is distinct from old.code and not v_override then
+    if new.code is null or new.code !~ '^\d{4}-(0[1-9]|1[0-2])$' then
+      perform public.app_error('INVALID_BATCH_CODE',
+        format('%s is not a real YYYY-MM month', coalesce(new.code, 'null')), 422,
+        jsonb_build_object('code', new.code));
+    end if;
+    if exists (select 1 from public.batches b
+                where b.id <> new.id
+                  and ((b.code < old.code) is distinct from (b.code < new.code))) then
+      perform public.app_error('BATCH_CODE_REORDER',
+        format('%s would move batch %s past a sibling and reorder members'' cohort runs',
+               new.code, old.code), 409,
+        jsonb_build_object('code', new.code, 'from_code', old.code));
+    end if;
+  end if;
+
+  v_tz := coalesce(nullif(new.timezone, ''), 'Asia/Manila');
+  if v_tz is distinct from coalesce(nullif(old.timezone, ''), 'Asia/Manila')
+     and not exists (select 1 from pg_timezone_names z where z.name = v_tz) then
+    perform public.app_error('BATCH_TIMEZONE_INVALID',
+      format('%s is not a timezone Postgres recognises', v_tz), 422,
+      jsonb_build_object('timezone', v_tz));
+  end if;
+  new.timezone := v_tz;
+
+  if new.starts_on is not null and new.ends_on is not null and new.starts_on > new.ends_on then
+    perform public.app_error('BATCH_PERIOD_INVALID',
+      'the end date falls before the start date', 422,
+      jsonb_build_object('starts_on', new.starts_on, 'ends_on', new.ends_on));
+  end if;
+
+  -- A live batch may not be edited INTO the past. Only a period change can do
+  -- this, so a plain status flip on a running batch is unaffected.
+  if (new.ends_on is distinct from old.ends_on or new.timezone is distinct from old.timezone)
+     and public.batch_is_past(new.ends_on, new.timezone) and not v_override then
+    perform public.app_error('BATCH_PERIOD_PAST',
+      format('that period has already ended in %s', new.timezone), 422,
+      jsonb_build_object('ends_on', new.ends_on, 'timezone', new.timezone));
+  end if;
+
+  return new;
+end;
+$$;
+
+revoke all on function public.batches_guard() from public, anon, authenticated;
+
+drop trigger if exists batches_guard on public.batches;
+create trigger batches_guard
+  before insert or update on public.batches
+  for each row execute function public.batches_guard();
+
+
+-- ── Step 6 — Signature / OUT-type changes (DROP + CREATE + re-GRANT) ───────
+
+-- 6a) admin_update_batch: 9 args → 8. The old overload MUST be dropped, or both
+--     resolve over PostgREST and a client that omits p_gold_capacity silently
+--     binds a different function than one that sends it.
+drop function if exists public.admin_update_batch(uuid, text, text, date, date, text, int, int, int);
+
+-- `create OR REPLACE` for the new arity: the DROP above removes the old overload,
+-- but on a re-run the 8-arg form already exists and a bare CREATE would fail with
+-- 42723 (caught by re-running this file during development).
+create or replace function public.admin_update_batch(
+  p_batch_id uuid, p_code text, p_name text,
+  p_starts_on date, p_ends_on date, p_timezone text,
+  p_vip_capacity int, p_total_capacity int)          -- ★ still NO DEFAULTS (#38's reasoning)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_old      public.batches%rowtype;
+  v_code     text;
+  v_name     text;
+  v_tz       text;
+  v_clash    text;
+  v_old_act  timestamptz;
+  v_new_act  timestamptz;
+  v_spaces   int := 0;
+  v_shifted  int := 0;
+  v_used     int;
+begin
+  if not public.is_admin() then
+    perform public.app_error('FORBIDDEN', 'admin_update_batch: admin only', 403, null);
+  end if;
+
+  select * into v_old from public.batches where id = p_batch_id for update;
+  if v_old.id is null then
+    perform public.app_error('BATCH_NOT_FOUND', 'admin_update_batch: batch not found', 404,
+      jsonb_build_object('batch_id', p_batch_id));
+  end if;
+
+  if public.batch_is_past(v_old.ends_on, v_old.timezone) then
+    perform public.app_error('BATCH_PAST',
+      format('batch %s ended on %s (%s) and is read-only',
+             v_old.code, v_old.ends_on, v_old.timezone), 409,
+      jsonb_build_object('batch_code', v_old.code, 'ends_on', v_old.ends_on,
+                         'timezone', v_old.timezone));
+  end if;
+
+  -- ── Name ──
+  v_name := nullif(btrim(coalesce(p_name, '')), '');
+  if v_name is null then
+    perform public.app_error('BATCH_PERIOD_INVALID', 'a batch needs a display name', 422, null);
+  end if;
+
+  -- ── Code: shape, uniqueness, and RANK ──
+  v_code := lower(btrim(coalesce(p_code, '')));
+  if v_code !~ '^\d{4}-(0[1-9]|1[0-2])$' then
+    perform public.app_error('INVALID_BATCH_CODE',
+      format('%s is not a real YYYY-MM month', coalesce(p_code, 'null')), 422,
+      jsonb_build_object('code', p_code));
+  end if;
+
+  if v_code <> v_old.code then
+    if exists (select 1 from public.batches b where b.code = v_code and b.id <> p_batch_id) then
+      perform public.app_error('BATCH_CODE_TAKEN',
+        format('another batch already uses %s', v_code), 409,
+        jsonb_build_object('code', v_code));
+    end if;
+
+    -- ★ RANK PRESERVATION. grant_batch_run() allocates `order by b.code` from a
+    -- start batch, and allocate_queued_entitlements() refuses any cohort not
+    -- strictly above the highest code a run already holds. A code that crosses a
+    -- sibling therefore reorders somebody's paid run — silently, and only
+    -- visibly months later. Refuse it; a same-position correction is allowed.
+    select b.code into v_clash
+      from public.batches b
+     where b.id <> p_batch_id
+       and ((b.code < v_old.code) is distinct from (b.code < v_code))
+     order by b.code
+     limit 1;
+    if v_clash is not null then
+      perform public.app_error('BATCH_CODE_REORDER',
+        format('%s would move this batch past %s and reorder members'' cohort runs',
+               v_code, v_clash), 409,
+        jsonb_build_object('code', v_code, 'from_code', v_old.code, 'crosses', v_clash));
+    end if;
+  end if;
+
+  -- ── Timezone + period ──
+  v_tz := coalesce(nullif(btrim(coalesce(p_timezone, '')), ''), 'Asia/Manila');
+  if not exists (select 1 from pg_timezone_names z where z.name = v_tz) then
+    perform public.app_error('BATCH_TIMEZONE_INVALID',
+      format('%s is not a timezone Postgres recognises', v_tz), 422,
+      jsonb_build_object('timezone', v_tz));
+  end if;
+
+  if p_starts_on is null or p_ends_on is null then
+    perform public.app_error('BATCH_PERIOD_INVALID',
+      'a batch needs both a start and an end date', 422, null);
+  end if;
+  if p_starts_on > p_ends_on then
+    perform public.app_error('BATCH_PERIOD_INVALID',
+      'the end date falls before the start date', 422,
+      jsonb_build_object('starts_on', p_starts_on, 'ends_on', p_ends_on));
+  end if;
+  if public.batch_is_past(p_ends_on, v_tz) then
+    perform public.app_error('BATCH_PERIOD_PAST',
+      format('that period has already ended in %s', v_tz), 422,
+      jsonb_build_object('ends_on', p_ends_on, 'timezone', v_tz));
+  end if;
+
+  -- ── Capacity may not fall below seats already sold ──
+  -- batch_seat_holders() is the OCCUPANCY predicate (it ignores activates_at, so
+  -- a seat in a future cohort still counts — it was paid for).
+  select count(*) into v_used from public.batch_seat_holders(p_batch_id, 'vip');
+  if p_vip_capacity is not null and p_vip_capacity < v_used then
+    perform public.app_error('BATCH_CAPACITY_BELOW_OCCUPANCY',
+      format('%s VIP seat(s) are already sold in %s', v_used, v_old.code), 409,
+      jsonb_build_object('segment', 'vip', 'used', v_used, 'requested', p_vip_capacity));
+  end if;
+
+  if p_total_capacity is not null and p_total_capacity < v_used then
+    perform public.app_error('BATCH_CAPACITY_BELOW_OCCUPANCY',
+      format('%s seat(s) are already sold in %s', v_used, v_old.code), 409,
+      jsonb_build_object('segment', 'total', 'used', v_used, 'requested', p_total_capacity));
+  end if;
+
+  -- ── Write ──
+  update public.batches
+     set code           = v_code,
+         name           = v_name,
+         starts_on      = p_starts_on,
+         ends_on        = p_ends_on,
+         timezone       = v_tz,
+         vip_capacity   = p_vip_capacity,
+         total_capacity = p_total_capacity,
+         updated_at     = now()
+   where id = p_batch_id;
+
+  -- Dependent DISPLAY data, same transaction. The slug is NOT touched: it is a
+  -- permalink (see its column comment). Only what a member reads follows.
+  if v_name <> v_old.name then
+    update public.community_spaces sp
+       set name = 'VIP - ' || v_name,
+           updated_at = now()
+     where sp.batch_id = p_batch_id
+       and sp.kind = 'vip';
+    get diagnostics v_spaces = row_count;
+  end if;
+
+  -- A corrected start date moves seats that have NOT started yet. Already-active
+  -- seats and revoked/superseded history are never rewritten — this can delay or
+  -- advance a future cohort, never retract access somebody already has.
+  v_old_act := coalesce(v_old.starts_on::timestamptz,
+                        to_date(v_old.code || '-01', 'YYYY-MM-DD')::timestamptz);
+  v_new_act := coalesce(p_starts_on::timestamptz,
+                        to_date(v_code || '-01', 'YYYY-MM-DD')::timestamptz);
+  if v_new_act is distinct from v_old_act then
+    update public.batch_entitlements e
+       set activates_at = v_new_act, updated_at = now()
+     where e.batch_id = p_batch_id
+       and e.status in ('queued', 'active')
+       and e.activates_at is not null
+       and e.activates_at > now();
+    get diagnostics v_shifted = row_count;
+  end if;
+
+  insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+  values (p_batch_id, null, auth.uid(), 'edit',
+          jsonb_build_object(
+            'before', jsonb_build_object(
+              'code', v_old.code, 'name', v_old.name,
+              'starts_on', v_old.starts_on, 'ends_on', v_old.ends_on,
+              'timezone', v_old.timezone,
+              'vip_capacity', v_old.vip_capacity, 'total_capacity', v_old.total_capacity),
+            'after', jsonb_build_object(
+              'code', v_code, 'name', v_name,
+              'starts_on', p_starts_on, 'ends_on', p_ends_on,
+              'timezone', v_tz,
+              'vip_capacity', p_vip_capacity, 'total_capacity', p_total_capacity),
+            'spaces_renamed', v_spaces,
+            'activations_shifted', v_shifted));
+
+  return jsonb_build_object(
+    'ok', true,
+    'batch_id', p_batch_id,
+    'code', v_code,
+    'code_changed', v_code <> v_old.code,
+    'name', v_name,
+    'spaces_renamed', v_spaces,
+    'activations_shifted', v_shifted);
+end;
+$$;
+
+comment on function public.admin_update_batch(uuid, text, text, date, date, text, int, int) is
+  'The ONLY path that may edit a batch record. Preserves the batch''s rank in `code` order '
+  '(grant_batch_run/allocate_queued_entitlements allocate by it), renames the VIP space NAME but '
+  'never its slug (a permalink), re-stamps activates_at on seats that have not started, and audits '
+  'before/after. Refuses a past batch. #39 dropped p_gold_capacity with the Gold segment.';
+
+revoke all on function public.admin_update_batch(uuid, text, text, date, date, text, int, int) from public, anon;
+grant execute on function public.admin_update_batch(uuid, text, text, date, date, text, int, int) to authenticated;
+
+-- 6b) admin_batch_overview: the OUT row type loses the three gold_* columns.
+--     DROP + CREATE loses grants — the re-grant below is not optional.
+-- DROP is required (not CREATE OR REPLACE): the OUT row type changes, and
+-- Postgres refuses to replace a function whose return type differs.
+drop function if exists public.admin_batch_overview();
+
+create function public.admin_batch_overview()
+returns table (
+  batch_id uuid, code text, name text, status text,
+  starts_on date, ends_on date, timezone text,
+  closed_at timestamptz, close_reason text, is_past boolean,
+  vip_capacity integer, total_capacity integer,
+  vip_active bigint, total_active bigint,
+  vip_queued bigint
+)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select b.id, b.code, b.name, b.status,
+         b.starts_on, b.ends_on, b.timezone,
+         b.closed_at, b.close_reason,
+         public.batch_is_past(b.ends_on, b.timezone) as is_past,
+         b.vip_capacity, b.total_capacity,
+         (select count(*) from public.batch_seat_holders(b.id, 'vip')) as vip_active,
+         -- total_active is retained (equal to vip_active while VIP is the only
+         -- cohort segment) so the Batches screen keeps one row shape whether or
+         -- not another segment is ever added.
+         (select count(*) from public.batch_seat_holders(b.id, 'vip')) as total_active,
+         -- Committed demand: seats already sold that no cohort has absorbed yet.
+         -- Alex needs this BEFORE setting a capacity, because queued seats are
+         -- never retro-refused (they were paid for). Deliberately NOT correlated
+         -- to b.id — a queued row has no batch_id, so this is a registry-wide
+         -- total repeated on every row.
+         (select count(*) from public.batch_entitlements e
+           where e.status = 'queued' and e.segment = 'vip'
+             and (e.valid_until is null or e.valid_until > now()))       as vip_queued
+    from public.batches b
+   where public.is_admin()
+   order by b.code desc;
+$$;
+
+revoke all on function public.admin_batch_overview() from public, anon;
+grant execute on function public.admin_batch_overview() to authenticated;
+
+
+-- ── Step 7 — Schema narrowing (LAST) ───────────────────────────────────────
+
+-- 7a) DDL, not DML. `alter table ... drop column` does NOT fire batches_guard(),
+--     so the three archived/past batches are unaffected. NEVER write
+--     `update public.batches set gold_capacity = null` — that WOULD fire the
+--     guard and raise BATCH_PAST on every past row. Dropping the column also
+--     removes batches_gold_capacity_check and the column's privileges.
+alter table public.batches drop column if exists gold_capacity;
+
+-- 7b) Re-issue #38's column-grant pair WITHOUT gold_capacity. These two are a
+--     PAIR — splitting them leaves admins unable to write to batches at all.
+revoke update on public.batches from authenticated, anon;
+grant update (name, starts_on, ends_on, timezone, status,
+              vip_capacity, total_capacity, closed_at, close_reason, updated_at)
+  on public.batches to authenticated;
+
+-- 7c) Narrow the three segment CHECKs.
+--     Found by DEFINITION, not by name (#38's idiom) — but note Postgres renders
+--     a single-value IN as `= 'vip'::text` rather than `= ANY(...)`, so the
+--     finder matches either rendering plus the canonical name, and loops. That is
+--     what makes this re-runnable.
+--     The `kind = ANY` finder is deliberately narrow: a bare `%kind%` would also
+--     match the anonymous `((kind = 'general') = (batch_id is null))` pairing
+--     check and community_spaces_general_announcement_only, both of which must
+--     survive untouched.
+do $$
+declare v_con text;
+begin
+  for v_con in
+    select conname from pg_constraint
+     where conrelid = 'public.community_spaces'::regclass and contype = 'c'
+       and (pg_get_constraintdef(oid) ilike '%kind = ANY%'
+            or conname = 'community_spaces_kind_check')
+  loop
+    execute format('alter table public.community_spaces drop constraint %I', v_con);
+  end loop;
+  alter table public.community_spaces
+    add constraint community_spaces_kind_check check (kind in ('general', 'vip'));
+end $$;
+
+do $$
+declare v_con text;
+begin
+  for v_con in
+    select conname from pg_constraint
+     where conrelid = 'public.enrollment_plans'::regclass and contype = 'c'
+       and (pg_get_constraintdef(oid) ilike '%community_segment = ANY%'
+            or pg_get_constraintdef(oid) ilike '%community_segment = ''vip''%'
+            or conname = 'enrollment_plans_community_segment_check')
+  loop
+    execute format('alter table public.enrollment_plans drop constraint %I', v_con);
+  end loop;
+  alter table public.enrollment_plans
+    add constraint enrollment_plans_community_segment_check
+    check (community_segment in ('general', 'vip'));
+end $$;
+
+do $$
+declare v_con text;
+begin
+  for v_con in
+    select conname from pg_constraint
+     where conrelid = 'public.batch_entitlements'::regclass and contype = 'c'
+       and (pg_get_constraintdef(oid) ilike '%segment = ANY%'
+            or pg_get_constraintdef(oid) ilike '%segment = ''vip''%'
+            or conname = 'batch_entitlements_segment_check')
+  loop
+    execute format('alter table public.batch_entitlements drop constraint %I', v_con);
+  end loop;
+  alter table public.batch_entitlements
+    add constraint batch_entitlements_segment_check check (segment = 'vip');
+end $$;
+
+-- 7c-bis) Space-name convergence. #32/#38 SOURCE writes 'VIP — ' (em dash, U+2014) while
+--   every row this database actually holds says 'VIP - ' (ASCII hyphen) — the deployed
+--   functions were installed through a channel that mangled the character. #39 writes a
+--   plain hyphen at BOTH SQL sites (there is nothing left to mangle), so normalize any row
+--   that still carries the em dash. Idempotent, and a no-op wherever the data is already
+--   consistent. Slugs are untouched: they are permalinks.
+update public.community_spaces
+   set name = replace(name, ' ' || chr(8212) || ' ', ' - '), updated_at = now()
+ where kind <> 'general'
+   and name like '%' || chr(8212) || '%';
+
+-- 7d) Comment hygiene, so "no gold anywhere" is verifiable with one query.
+comment on column public.batches.total_capacity is
+  'Total seat cap for this cohort across every segment. NULL = unlimited. Checked alongside '
+  'vip_capacity by grant_batch_run(). Under D8 a seat is consumed in EVERY cohort of a run.';
+
+comment on column public.community_spaces.kind is
+  'general = the announcement space every active plan reads; vip = a batch''s private cohort '
+  'forum. #39 removed the third kind (gold) with the Gold plan.';
+
+
+-- ── Step 8 — Cache refresh + apply log ─────────────────────────────────────
+notify pgrst, 'reload schema';
+
+insert into public.schema_migrations (filename, checksum, notes) values
+ ('2026-08-17-three-plan-catalog.sql', null,
+  'three-plan catalog (#39): removes core_self_paced + gold_live and the whole gold community '
+  'segment. VIP is the only premium/private-batch segment. Deletes gold community_spaces, the '
+  'terms/requests keyed to the removed plans, and neutralizes staged import rows; silver 2999 / '
+  'vip 16999; positions sampler=1 silver=2 vip=3. Drops batches.gold_capacity + the gold_* OUT '
+  'columns of admin_batch_overview(); admin_update_batch() loses p_gold_capacity (the 9-arg form '
+  'is DROPPED). Narrows community_spaces.kind, enrollment_plans.community_segment and '
+  'batch_entitlements.segment. plan_is_qbo_only() is dropped and the 4 course-read policies + '
+  'course_object_allowed + the two trainer mirrors lose its conjunct; sampler keeps its '
+  'Essentials-only rule. NOTE: the "#39" named in #35/#37 comments as the subscriptions.batch_id '
+  'bridge retirement is now #40.')
+on conflict (filename) do nothing;
+
 
 -- ═════════════════════════════════════════════════════════════════════════════
 -- AFTER RUNNING (fresh install)

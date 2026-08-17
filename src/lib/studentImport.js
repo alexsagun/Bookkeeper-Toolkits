@@ -208,17 +208,19 @@ export function classifyCourse(title) {
 }
 
 // Suggest a plan for a combo. Returns { suggested: planKey|null, reason }.
-// IMPORTANT: this is advisory only — the admin must confirm every mapping. Sampler,
-// Gold, and VIP can never be inferred from course history, so we never suggest them.
+// IMPORTANT: this is advisory only — the admin must confirm every mapping. Sampler
+// and VIP can never be inferred from course history, so we never suggest them.
+//
+// QBO-ONLY HISTORY HAS NO SUGGESTION (#39). It used to map to `core_self_paced`
+// (QBO Mastery Only), which no longer exists. The remaining plans all grant MORE
+// than QBO-only did, so auto-mapping that history would silently upsell an imported
+// student into a broader, more expensive plan — it goes to manual review instead.
 export function suggestPlanForCombo(courses) {
   const cats = new Set(courses.map(classifyCourse));
   const hasQbo = cats.has('qbo');
   const hasResume = cats.has('resume') || cats.has('profile');
   if (hasQbo && hasResume) {
     return { suggested: 'silver_self_paced', reason: 'QBO + Resume history — SUGGESTION only; confirm the actual purchased package.' };
-  }
-  if (hasQbo && cats.size <= 2) {
-    return { suggested: 'core_self_paced', reason: 'QBO-only history — SUGGESTION only; confirm the actual purchased package.' };
   }
   return { suggested: null, reason: 'Cannot be inferred from course history — map manually or send to review.' };
 }

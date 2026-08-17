@@ -31,6 +31,20 @@ import {
   planSegment, isPremiumSegment, isValidBatchCode, normalizeBatchCode,
   approvalBatchPreselect, pickInitialSpace,
 } from './lib/communitySpaces';
+import {
+  BATCH_TIMEZONES, batchPeriodState, closureLabel, dueForAutoClose, editLockReason,
+  formatBatchDate, hasUpcomingOpenBatch, isPastBatch, monthBounds, periodProgress,
+  validateBatchEdit,
+} from './lib/batchLifecycle';
+import { appErrorCode, appErrorMessage } from './lib/appErrors';
+import {
+  ENROLLMENT_PLANS_FALLBACK, PLAN_LABELS, PLAN_ENTITLEMENTS, planEntitlement,
+  FULL_ENTITLEMENT, filterStagesForEntitlement, extensionPrice,
+} from './lib/planCatalog';
+import {
+  COVER_INDUSTRIES, DEFAULT_INDUSTRY_ID, getIndustry, detectIndustry, scrubDashes,
+} from './lib/coverLetterIndustry';
+import { parseLooseJson } from './lib/partialJson';
 
 const DEFAULT_APP_TAB = 'dashboard';
 
@@ -56,23 +70,11 @@ const REQUIRE_ADMIN_APPROVAL =
 const REQUIRE_ENROLLMENT =
   String(import.meta.env.VITE_REQUIRE_ENROLLMENT ?? 'true').toLowerCase() !== 'false';
 
-// Fallback pricing cards mirroring the enrollment_plans seed (db/2026-07-04-enrollment.sql).
-// Used only when the table is missing/empty so the paywall never renders blank; the live
-// table (admin-editable) always wins when it loads. Prices are FIXED ₱ (PHP) bank-transfer
-// amounts — format with phpFmt, never useCurrency (no USD conversion applies here).
-const ENROLLMENT_PLANS_FALLBACK = [
-  { key: 'core_self_paced', name: 'QBO Mastery Only', tagline: 'Core · Self-Paced', price_php: 999, compare_at_php: null, badge: null, limit_note: null, position: 1, access_days: 60, support_days: null,
-    features: ['Simulated annual bookkeeping project for an NY-based construction company', '60-day QBO Mastery course access', 'Weekly Discord chat (Thu)'] },
-  { key: 'sampler', name: 'Sampler Session', tagline: 'Essentials', price_php: 1499, compare_at_php: null, badge: null, limit_note: 'Limited offer', position: 2, access_days: 60, support_days: 60,
-    features: ['1 Live Zoom Session (3 hours)', '60-day course access', '60-day group chat support'] },
-  { key: 'silver_self_paced', name: 'QBO + Resume Combo', tagline: 'Silver · Self-Paced', price_php: 1999, compare_at_php: null, badge: null, limit_note: null, position: 3, access_days: 60, support_days: null,
-    features: ['Simulated annual bookkeeping project for an NY-based construction company', '60-day QBO Mastery course access', '60-day Resume & Interview course access', 'Weekly Discord chat (Thu)'] },
-  { key: 'gold_live', name: 'Live Group Track', tagline: 'Gold Package', price_php: 9999, compare_at_php: 35000, badge: 'BEST VALUE', limit_note: null, position: 4, access_days: 180, support_days: null, community_segment: 'gold',
-    features: ['Simulated annual bookkeeping project for an NY-based construction company', '12 LIVE Group Zoom Trainings (MWF 9am to 11am PH time)', '180-day resume + interview course access', 'Weekly group consult until hired', 'Discord chat support until and after hired'] },
-  { key: 'vip', name: 'Personalized Coaching Program', tagline: 'VIP Package', price_php: 15999, compare_at_php: 35000, badge: 'BEST SELLER', limit_note: 'Limited to 10 slots per month', position: 5, access_days: 180, support_days: null, community_segment: 'vip',
-    features: ['Simulated annual bookkeeping project for an NY-based construction company', '12 Live Group Zoom Trainings (MWF 9am to 11am PH Time)', '1-on-1 Resume & Interview Coaching (1 session)', 'Weekly group consult until hired', 'Discord chat support until and after hired'] },
-];
-const PLAN_LABELS = ENROLLMENT_PLANS_FALLBACK.reduce((m, p) => { m[p.key] = p.name; return m; }, {});
+// The three-plan catalog + entitlement rules live in src/lib/planCatalog.js (pure,
+// shared with the knowledge generator + node:test). The fallback array is used only
+// when the enrollment_plans table is missing/empty so the paywall never renders blank;
+// the live table (admin-editable) always wins when it loads. Prices are FIXED ₱ (PHP)
+// bank-transfer amounts — format with phpFmt, never useCurrency (no USD conversion).
 const phpFmt = (n) => '₱' + Number(n || 0).toLocaleString('en-US');
 
 // Manual-payment instructions shown on the paywall when payment_settings hasn't loaded
@@ -308,7 +310,7 @@ function shouldHandleInAppClick(e) {
 // same change (see "Keeping docs current" in CLAUDE.md).
 const VOICE_TAB_INFO = {
   dashboard:    { label: 'Dashboard', stage: 'Home', desc: 'Progress overview with career-stage tiles, membership status, and quick links to every tool.' },
-  community:    { label: 'Community', stage: 'Home', desc: 'Member forum split into spaces: a General space for every active member (start discussions and react; replies live in the premium communities) plus private per-batch Gold and VIP spaces with the full forum — search, free-form tags, image/video/link attachments, @mentions, reactions, pinned posts, and admin announcements with read-tracking, plus a notification bell. Gold and VIP members land in their own batch community; access follows the membership automatically.' },
+  community:    { label: 'Community', stage: 'Home', desc: 'Member forum split into spaces: a General space every active member can read and react to (announcements only — nobody replies there) plus a private per-batch VIP space with the full forum — search, free-form tags, image/video/link attachments, @mentions, reactions, pinned posts, and admin announcements with read-tracking, plus a notification bell. VIP members land in their own batch community; access follows the membership automatically.' },
   course:       { label: 'Accounting 101', stage: 'Training & Skills', desc: 'Self-paced foundational accounting course (8 modules).' },
   qbomastery:   { label: 'QuickBooks Online Mastery', stage: 'Training & Skills', desc: 'QuickBooks Online video-course catalog (Essentials and Mastery programs) with completion certificates.' },
   industryacc:  { label: 'Industry Accounting', stage: 'Training & Skills', desc: 'Accounting playbooks for 12 US industries with QuickBooks workflows.' },
@@ -322,7 +324,7 @@ const VOICE_TAB_INFO = {
   interview:    { label: 'Job Interview Mastery', stage: 'Job Application', desc: 'Interview prep hub: winning-strategy courses, mock interview simulator, common and accounting questions, body language, JD question generator, and salary negotiation.' },
   qbdiag:       { label: 'Free QB Diagnostic', stage: 'Job Application', desc: 'QuickBooks file diagnostic checklist to offer prospects as a free audit.' },
   painpoints:   { label: 'Painpoints & Solutions', stage: 'Job Application', desc: 'AI generator for client pain points and how a remote bookkeeper solves them.' },
-  proposal:     { label: 'Proposal Generator', stage: 'Job Application', desc: 'AI proposal and outreach generator tailored to a specific job post.' },
+  proposal:     { label: 'Cover Letter Generator', stage: 'Job Application', desc: 'Paste a job post to get three cover letters, a timed video-introduction script, and an interview prep pack.' },
   discovery:    { label: 'Discovery Call Simulator', stage: 'Job Application', desc: 'AI-simulated discovery-call practice with a prospective US client.' },
   engagement:   { label: 'Engagement Letter', stage: 'Client Management & Delivery', desc: 'Generates a professional bookkeeping engagement letter.' },
   onboarding:   { label: 'Client Onboarding', stage: 'Client Management & Delivery', desc: 'New-client onboarding checklist and workflow.' },
@@ -344,7 +346,7 @@ const VOICE_TAB_INFO = {
   accessrequests: { label: 'Access Requests', stage: 'Admin', desc: 'Admin screen: approve or reject new signups.', adminOnly: true },
   enrollments:  { label: 'Enrollments', stage: 'Admin', desc: 'Admin screen: review payment receipts, approve subscriptions, and manage renewals.', adminOnly: true },
   studentimports: { label: 'Student Imports', stage: 'Admin', desc: 'Admin screen: migrate legacy Thinkific students — validate, map course-combos to plans, dry-run, and import accounts + memberships.', adminOnly: true },
-  batches: { label: 'Batches', stage: 'Admin', desc: 'Admin screen: manage Gold/VIP cohorts (batches) — create monthly batches, set capacities, close or archive them, and assign members to their private batch communities.', adminOnly: true },
+  batches: { label: 'Batches', stage: 'Admin', desc: 'Admin screen: manage the VIP batches — create a monthly batch, edit its name, code, dates, timezone and seat capacities while the batch is current or upcoming, close or archive it, and assign members to their private batch communities. A batch closes automatically once its month ends, and a batch whose period has passed becomes read-only.', adminOnly: true },
 };
 
 // Spoken-name aliases → navigation targets. Values are either { tab, interviewSub? }
@@ -399,6 +401,9 @@ const VOICE_TOOL_ALIASES = {
   'pain points': { tab: 'painpoints' },
   'proposals': { tab: 'proposal' },
   'cover letter': { tab: 'proposal' },
+  'cover letters': { tab: 'proposal' },
+  'cover email': { tab: 'proposal' },
+  'cover emails': { tab: 'proposal' },
   'discovery call': { tab: 'discovery' },
   'chart of accounts generator': { tab: 'coa' },
   'coa generator': { tab: 'coa' },
@@ -485,7 +490,7 @@ const VOICE_FEATURE_HELP = {
   mock_interview_simulator: { tab: 'interview', interviewSub: 'mock', blurb: 'Voice-based mock interview practice. Watch the guide video on this page first — the launch button unlocks after the video finishes, then it opens the external simulator.' },
   bank_feed_ai: { tab: 'bankfeed', blurb: 'Paste the raw memo or description from a bank feed; the AI returns the nearest vendor match and the right QuickBooks account category. Review each suggestion before posting.' },
   statement_converter: { tab: 'converter', blurb: 'Upload a PDF or image bank statement; the AI extracts the transactions into a clean CSV you can import into QuickBooks.' },
-  proposal_generator: { tab: 'proposal', blurb: 'Paste a job post; the AI writes a tailored, direct-response proposal focused on the bookkeeping pain points the client is feeling.' },
+  proposal_generator: { tab: 'proposal', blurb: 'Paste a job post and pick the platform. The AI detects the industry, then writes three cover-letter variations, a video-introduction script broken into timed beats, and an interview prep pack with likely questions and red flags. Copy any piece, or download the whole set as a text file.' },
   chart_of_accounts: { tab: 'coa', blurb: 'Pick the client\'s industry to generate a QuickBooks-import-ready Chart of Accounts, then download it as a spreadsheet.' },
   qbo_mastery: { tab: 'qbomastery', blurb: 'Open a course card to watch lessons in order; completing every lesson unlocks a downloadable PDF certificate.' },
   invoice_creator: { tab: 'invoice', blurb: 'Fill in the client details and line items to generate a professional invoice you can download.' },
@@ -1410,7 +1415,7 @@ function downloadFile(content, filename, mimeType) {
 }
 
 // ── Date helpers (timezone-safe, date-only) ──────────────────────────
-// Used by the course platform for the editable cohort/run date (`courses.course_date`).
+// Used by the course platform for the editable batch-run date (`courses.course_date`).
 // We deliberately avoid `new Date('2026-06-17')` (parsed as UTC midnight → shifts a day in
 // negative offsets) and `toISOString().slice(0,10)` for "today" (UTC date) — both stay LOCAL
 // so the date a creator picks is always the date that displays back.
@@ -1425,8 +1430,11 @@ function formatCourseDate(iso, opts) {
   if (!y || !m || !d) return '';
   return new Date(y, m - 1, d).toLocaleDateString('en-US', opts || { month: 'long', day: 'numeric', year: 'numeric' });
 }
-// Auto-derived "June 2026" cohort label from a YYYY-MM-DD course date.
-const cohortLabel = (iso) => formatCourseDate(iso, { month: 'long', year: 'numeric' });
+// Auto-derived "June 2026" batch-run label from a YYYY-MM-DD course date.
+// ★ Display only. courses.course_date has NO relationship to the `batches`
+// registry — no FK, no join, nothing reads it server-side. It labels which run
+// of a course a card represents; it never assigns the course to a batch.
+const batchRunLabel = (iso) => formatCourseDate(iso, { month: 'long', year: 'numeric' });
 
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2440,104 +2448,9 @@ function membershipStatus(sub, latestReq) {
   return { label: 'Active', tone: C.green };
 }
 
-// Extend-access pricing — pro-rate the plan's OWN price over its OWN duration so a member
-// buys time at the same daily rate. days = months × 30 (never below the 2-month / 60-day
-// minimum). For a 60-day plan, 2 months == the full plan price (₱999/₱1,499/₱1,999).
-function extensionPrice(plan, months) {
-  const price = Number(plan?.price_php) || 0;
-  const planDays = Number(plan?.access_days) || 60;
-  const days = Math.max(60, Math.round((Number(months) || 0) * 30));
-  const amount = Math.round((price / planDays) * days);
-  return { days, amount };
-}
-
-// ── Plan entitlements ────────────────────────────────────────────────────────
-// Which stages/tabs (and, for `sampler`, which COURSES within a catalog) each plan
-// unlocks. Two plans are SCOPED today:
-//   • `core_self_paced` (QBO Mastery Only, ₱999 / 60 days) — Home + the Training &
-//     Skills stage only; reads BOTH qbo-* courses (Essentials + Mastery).
-//   • `sampler` (Sampler Session, ₱1,499 / 60 days) — Home + the QuickBooks catalog
-//     (`qbomastery`, but only its `access_tier='essentials'` course, i.e. QuickBooks
-//     Online Essentials — NOT Mastery) + the two 1-on-1 booking tabs (`linkedinopt`,
-//     `coachalex`). The ₱1,499 buys the coaching session, not more course content, so
-//     sampler is MORE restricted than the ₱999 core plan — never assume price ⇒ scope.
-// `silver_self_paced` (QBO + Resume Combo, ₱1,999 / 60 days) is the premium self-paced
-// tier — it gets FULL non-admin toolkit access, listed explicitly (`full: true`) so a
-// future edit never mistakes it for a limited plan. Every OTHER known plan (gold_live /
-// vip), every UNKNOWN key, and null/grandfathered users also get FULL access via the
-// default branch below. Admins are handled at the call site (they always resolve to FULL).
-//
-// This is the CLIENT half of the plan-access model. The SERVER half lives in
-// db/2026-07-09-plan-course-access.sql (core → qbo-* courses) + db/2026-07-11-sampler-
-// essentials-access.sql (sampler → qbo-* AND access_tier='essentials'). Keep the client
-// tab-allowlist + `courseTier` and the SQL slug/tier predicates in sync when entitlements
-// change.
-const TRAINING_ONLY_TAB_IDS = ['dashboard', 'course', 'qbomastery', 'industryacc', 'ustax', 'chat', 'niche', 'community']; // community: every paid plan includes the member feed (server gate = is_enrolled() RLS)
-const PLAN_ENTITLEMENTS = {
-  // Limited: Home + Training & Skills only (matches the SQL `qbo-%` course rule).
-  core_self_paced: {
-    scopeLabel: 'Training & Skills only',
-    stageIds: ['home', 'training'],
-    tabIds: TRAINING_ONLY_TAB_IDS,
-  },
-  // Essentials + 1-on-1 coaching: Home, the QuickBooks catalog (Essentials course only),
-  // and both Alex booking pages. `courseTier` scopes courses WITHIN an allowed catalog
-  // (matches courses.access_tier + the SQL sampler rule).
-  sampler: {
-    scopeLabel: 'Essentials + 1-on-1 coaching',
-    stageIds: ['home', 'training', 'jobsearch'],
-    tabIds: ['dashboard', 'qbomastery', 'linkedinopt', 'coachalex', 'community'],
-    courseTier: 'essentials',
-  },
-  // Premium self-paced: full non-admin toolkit (explicit — NOT QBO-only limited).
-  silver_self_paced: { full: true, scopeLabel: 'Full toolkit access' },
-};
-// planEntitlement(key) → { full, planKey, label, scopeLabel, allowsStage(id), allowsTab(id), allowsCourse(course) }.
-function planEntitlement(planKey) {
-  const cfg = planKey ? PLAN_ENTITLEMENTS[planKey] : null;
-  const label = PLAN_LABELS[planKey] || planKey || null;
-  // No config, or an explicitly-full plan (e.g. silver_self_paced) → full access.
-  if (!cfg || cfg.full) {
-    return {
-      full: true, planKey: planKey || null, label,
-      scopeLabel: cfg?.scopeLabel || 'Full toolkit access',
-      allowsStage: () => true, allowsTab: () => true, allowsCourse: () => true,
-    };
-  }
-  const stageSet = new Set(cfg.stageIds);
-  const tabSet = new Set(cfg.tabIds);
-  return {
-    full: false, planKey, label: label || 'Your plan', scopeLabel: cfg.scopeLabel,
-    allowsStage: (id) => stageSet.has(id),
-    // Home is unconditionally allowed — RestrictedTab's "Back to Dashboard" fallback (and
-    // the stale-lastTab reset) must never dead-end, even if a future plan omits it.
-    allowsTab: (id) => id === 'dashboard' || tabSet.has(id),
-    // Course-level scope within an allowed catalog. No `courseTier` (e.g. core) → all
-    // courses the tab allows. `sampler` → only `access_tier='essentials'` courses.
-    // RLS is the real boundary; this drives the catalog card list + a deep-link guard.
-    allowsCourse: (course) => !cfg.courseTier || (course?.access_tier || 'standard') === cfg.courseTier,
-  };
-}
-const FULL_ENTITLEMENT = planEntitlement(null);
-
-// Drop stages/tabs a plan can't access. Keeps stable stage/tab ids + group keys, so
-// per-user collapse state and admin `effLabel` overrides are unaffected. Empty groups
-// and empty stages are removed so the sidebar never renders a bare header.
-function filterStagesForEntitlement(stages, ent) {
-  if (!ent || ent.full) return stages;
-  return stages
-    .map((s) => {
-      const tabs = s.tabs.filter((t) => ent.allowsTab(t.id));
-      if (tabs.length === 0) return null;
-      const groups = s.groups
-        ? s.groups
-            .map((g) => ({ ...g, tabIds: g.tabIds.filter((id) => ent.allowsTab(id)) }))
-            .filter((g) => g.tabIds.length > 0)
-        : undefined;
-      return { ...s, tabs, ...(groups ? { groups } : {}) };
-    })
-    .filter(Boolean);
-}
+// `extensionPrice`, `PLAN_ENTITLEMENTS`, `planEntitlement`, `FULL_ENTITLEMENT` and
+// `filterStagesForEntitlement` are imported from src/lib/planCatalog.js (pure + unit-tested).
+// An unknown plan key now FAILS CLOSED there — see the UNKNOWN_PLAN_ENTITLEMENT note.
 
 // Shared so Dashboard tiles + RestrictedTab read the SAME entitlement the root resolves
 // (root wraps the app shell in the provider). Defaults to FULL so any consumer rendered
@@ -2767,7 +2680,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
   const [plans, setPlans] = useState(ENROLLMENT_PLANS_FALLBACK);
   const [pay, setPay] = useState(PAYMENT_SETTINGS_FALLBACK);
   const [selected, setSelected] = useState(null);
-  // #32: gold/vip checkout requires picking an OPEN batch (training month).
+  // #32: VIP checkout requires picking an OPEN batch (training month).
   // null = the batches table isn't reachable (pre-#32) → no selector, the
   // admin resolves the batch at approval instead.
   const [openBatches, setOpenBatches] = useState(null);
@@ -2812,7 +2725,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
   const selectPlan = (p) => {
     setSelected(p);
     setAmountPaid(String(p.price_php ?? ''));
-    // Gold/VIP enroll into a batch: preselect when exactly one is open.
+    // VIP enrolls into a batch: preselect when exactly one is open.
     setBatchId(isPremiumSegment(planSegment(p.key, { [p.key]: p })) && openBatches?.length === 1
       ? openBatches[0].id : null);
     setErr('');
@@ -3029,8 +2942,11 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
           </div>
         )}
 
-        {/* Pricing cards — flex-wrap (not a grid) so an orphan last row (5 cards in 3
-            columns) centers instead of hugging the left edge. */}
+        {/* Pricing cards — three plans (#39). flex-wrap, not a grid: at lg they fill one
+            exact row (33.3% each inside the max-w-5xl shell ≈ 310px cards); below lg they
+            fall to 2 + a CENTERED third rather than hugging the left edge, and to one
+            column on mobile. VIP's badge makes it the only `featured` card, so the row has
+            a single focal point — don't add badges to the other two to "balance" it. */}
         {step === 'plans' && (
           <div className="mt-8 flex flex-wrap justify-center gap-4 items-stretch">
             {plans.map((p) => {
@@ -3161,7 +3077,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
                         </div>
                       )}
                       <p className="mt-1.5" style={{ fontSize: 11, color: C.textMute }}>
-                        Your batch is your live-training cohort — it also unlocks that batch’s private {selectedSegment === 'vip' ? 'VIP' : 'Gold'} community.
+                        Your batch is your live-training group — it also unlocks that batch’s private VIP community.
                       </p>
                     </div>
                   )}
@@ -3595,6 +3511,69 @@ function CopyIdButton({ value }) {
       style={{ fontSize: 10, color: copied ? C.green : C.textMute, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
       {copied ? <Check size={11} /> : <Copy size={11} />} {copied ? 'Copied' : 'Copy'}
     </button>
+  );
+}
+
+// General-purpose copy chip — the same guard/await/catch/ref-cleaned-timer contract as
+// CopyIdButton above, but parameterised and with two things that one does not need:
+// an aria-live region (so the confirmation reaches a screen reader, not just the eye)
+// and a VISIBLE failure state. Most copy buttons in this file are fire-and-forget
+// `navigator.clipboard.writeText(x)` with no await and no catch, which silently reports
+// success on a denied permission or a non-secure context. A tool whose entire output is
+// meant to be pasted elsewhere cannot lie about whether the paste will work.
+function CopyButton({ text, label = 'Copy', small = false }) {
+  const [state, setState] = useState('idle'); // idle | copied | failed
+  const timerRef = useRef(null);
+  useEffect(() => () => clearTimeout(timerRef.current), []);
+
+  const flash = (next) => {
+    setState(next);
+    clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => setState('idle'), next === 'failed' ? 4000 : 1800);
+  };
+
+  const copy = async () => {
+    try {
+      if (!navigator.clipboard) throw new Error('clipboard unavailable');
+      await navigator.clipboard.writeText(text || '');
+      flash('copied');
+    } catch {
+      // Permission denied, or an insecure context. The text stays on screen and
+      // selectable, so say so rather than pretending it worked.
+      flash('failed');
+    }
+  };
+
+  const tone = state === 'copied'
+    ? { color: 'var(--status-ok-fg)', background: 'var(--status-ok-bg)', borderColor: 'var(--status-ok-bd)' }
+    : state === 'failed'
+      ? { color: 'var(--status-danger-fg)', background: 'var(--status-danger-bg)', borderColor: 'var(--status-danger-bd)' }
+      : { color: C.primary, background: 'var(--pill-bg)', borderColor: GLASS.border };
+
+  return (
+    <span className="inline-flex items-center gap-2">
+      {/* No aria-label: the visible text IS the accessible name, so the two can never
+          disagree (WCAG 2.5.3) and the name does not mutate under focus while the
+          status region is also announcing. Callers pass a DISTINCT `label` so several
+          copy buttons on one page are told apart. */}
+      <button
+        type="button"
+        onClick={copy}
+        className={`inline-flex items-center gap-1.5 rounded-lg font-semibold border transition hover:opacity-80 whitespace-nowrap ${small ? 'px-2.5 py-1' : 'px-3.5 py-1.5'}`}
+        style={{ fontSize: small ? 10 : 11, ...tone }}
+      >
+        {state === 'copied' ? <Check size={small ? 11 : 13} />
+          : state === 'failed' ? <AlertTriangle size={small ? 11 : 13} />
+            : <Copy size={small ? 11 : 13} />}
+        {state === 'copied' ? 'Copied' : state === 'failed' ? 'Copy failed' : label}
+      </button>
+      {/* Announced, not shown — the button's own label already carries the visual cue. */}
+      <span role="status" aria-live="polite" className="sr-only">
+        {state === 'copied' ? `${label} copied to clipboard`
+          : state === 'failed' ? `${label} could not be copied. Select the text and copy it manually.`
+            : ''}
+      </span>
+    </span>
   );
 }
 
@@ -5214,7 +5193,7 @@ function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImport
     case 'interview': return <InterviewPrep initialSub={interviewSub || undefined} />;
     case 'brand': return <AuthenticBranding standalone />;
     case 'painpoints': return <PainPointsGenerator />;
-    case 'proposal': return <ProposalGenerator />;
+    case 'proposal': return <CoverLetterGenerator />;
     case 'engagement': return <EngagementLetter />;
     case 'invoice': return <InvoiceCreator />;
     case 'emails': return <EmailTemplates />;
@@ -5488,7 +5467,7 @@ export default function BookkeeperProToolkit() {
         { id: 'qbdiag',        label: 'Free QB Diagnostic',       icon: Shield },
         // Proposal / Cover Letters
         { id: 'painpoints',    label: 'Painpoints & Solutions',   icon: Target },
-        { id: 'proposal',      label: 'Proposal Generator',       icon: Sparkles },
+        { id: 'proposal',      label: 'Cover Letter Generator',   icon: Sparkles },
         { id: 'discovery',     label: 'Discovery Call Simulator', icon: Phone },
       ],
     },
@@ -5692,7 +5671,7 @@ export default function BookkeeperProToolkit() {
   // Bump when a code change should re-reconcile every user's saved sidebar layout (e.g. a new
   // default tab that must land in a specific spot). On load, a stored version below this triggers
   // a one-time normalizeTabOrder() pass so already-saved layouts adopt the new default ordering.
-  const SIDEBAR_VERSION = 3;
+  const SIDEBAR_VERSION = 4;
 
   // Re-sort each stage's tabs to follow DEFAULT_STAGES order (preserving user renames). Safe:
   // grouped stages render by explicit tabIds, so only flat stages (e.g. Training) are affected.
@@ -5710,6 +5689,7 @@ export default function BookkeeperProToolkit() {
   // tab's PRIOR default — preserving any genuine user rename of the same tab.
   const RENAMED_TAB_LABELS = {
     interview: { from: 'Interview Prep', to: 'Job Interview Mastery' },
+    proposal: { from: 'Proposal Generator', to: 'Cover Letter Generator' },
   };
   const reconcileRenamedLabels = (stgs) => stgs.map(s => ({
     ...s,
@@ -6330,7 +6310,7 @@ export default function BookkeeperProToolkit() {
             </a>
           )}
 
-          {/* Batches — admin only (#32): Gold/VIP cohorts + their private communities. */}
+          {/* Batches — admin only (#32): VIP batches + their private communities. */}
           {isAdmin && (
             <a
               href={tabHref('batches')}
@@ -6943,13 +6923,21 @@ const ADMIN_BTN_DANGER = {
 };
 
 // Success / error banner with a dismiss control (status-token colors end to end).
+// 'warn' (#38) is for something an admin should act on but that has broken
+// nothing yet — e.g. no batch is open for next month. Red overstates those and
+// makes real failures easier to ignore. Any kind that is not 'ok' or 'warn'
+// stays danger, so every existing call site is unchanged.
+const ADMIN_NOTICE_KINDS = {
+  ok: { fg: 'var(--status-ok-fg)', bg: 'var(--status-ok-bg)', bd: 'var(--status-ok-bd)', Icon: CheckCircle2 },
+  warn: { fg: 'var(--status-warn-fg)', bg: 'var(--status-warn-bg)', bd: 'var(--status-warn-bd)', Icon: AlertCircle },
+  danger: { fg: 'var(--status-danger-fg)', bg: 'var(--status-danger-bg)', bd: 'var(--status-danger-bd)', Icon: AlertTriangle },
+};
+
 function AdminNotice({ kind = 'ok', children, onDismiss }) {
-  const ok = kind === 'ok';
-  const fg = ok ? 'var(--status-ok-fg)' : 'var(--status-danger-fg)';
-  const Icon = ok ? CheckCircle2 : AlertTriangle;
+  const { fg, bg, bd, Icon } = ADMIN_NOTICE_KINDS[kind] || ADMIN_NOTICE_KINDS.danger;
   return (
     <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border"
-      style={{ background: ok ? 'var(--status-ok-bg)' : 'var(--status-danger-bg)', borderColor: ok ? 'var(--status-ok-bd)' : 'var(--status-danger-bd)' }}>
+      style={{ background: bg, borderColor: bd }}>
       <Icon size={18} className="mt-0.5 flex-shrink-0" style={{ color: fg }} />
       <div className="text-sm flex-1" style={{ color: C.text }}>{children}</div>
       {onDismiss && (
@@ -7036,13 +7024,24 @@ function AdminUserCell({ name, email, meta, badges }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// COMPONENT: ADMIN BATCHES (#32) — cohort manager for the gold/vip
-// private communities. Creation auto-spawns the batch's Gold + VIP
-// spaces (SQL trigger); open/close/archive + capacities are plain
-// admin-RLS writes; (re)assignment goes through the transactional
-// admin_assign_batch() RPC and is audited in batch_events. The
-// "Needs batch assignment" queue = ACTIVE premium subscriptions with
-// no batch (imports without batch_code, SQL-editor grants).
+// COMPONENT: ADMIN BATCHES (#32, editable since #38) — the batch
+// registry behind the VIP private communities. Creation
+// auto-spawns the batch's VIP space (SQL trigger); open/close/
+// archive are plain admin-RLS writes; (re)assignment goes through the
+// transactional admin_assign_batch() RPC and is audited in
+// batch_events. The "Needs batch assignment" queue = ACTIVE premium
+// subscriptions with no batch (imports without batch_code, SQL-editor
+// grants).
+//
+// #38 — EDITING IS NOT A CLIENT UPDATE. batches.code is the key
+// grant_batch_run() and allocate_queued_entitlements() allocate by, so
+// every field change goes through admin_update_batch(), which preserves
+// the batch's rank in code order, renames the space NAME (never its
+// slug — that is a permalink in ?space= links), and audits
+// before/after. UPDATE on batches.code is revoked from `authenticated`,
+// so there is no direct path to work around. A batch whose period has
+// elapsed IN ITS OWN TIMEZONE is read-only; validateBatchEdit() mirrors
+// every server rule so the modal can refuse before a round trip.
 // ═══════════════════════════════════════════════════════════════════
 function AdminBatches() {
   const { profile } = useAuth();
@@ -7060,13 +7059,18 @@ function AdminBatches() {
   const [createOpen, setCreateOpen] = useState(false);
   const [cCode, setCCode] = useState('');
   const [cName, setCName] = useState('');
-  const [cGoldCap, setCGoldCap] = useState('');
   const [cVipCap, setCVipCap] = useState('');
+  const [cTz, setCTz] = useState('Asia/Manila');
   // Assignment
   const [selectedUids, setSelectedUids] = useState(() => new Set());
   const [assignTarget, setAssignTarget] = useState('');
   const [confirmAssign, setConfirmAssign] = useState(false);
   const [archiveFor, setArchiveFor] = useState(null);   // batch pending archive confirmation
+  // Edit (#38)
+  const [editFor, setEditFor] = useState(null);         // the overview row being edited
+  const [editDraft, setEditDraft] = useState(null);
+  const [editErrs, setEditErrs] = useState({});
+  const [sweeping, setSweeping] = useState(false);      // "Run closures now"
 
   const load = async (silent = false) => {
     if (!silent) setLoading(true);
@@ -7124,39 +7128,149 @@ function AdminBatches() {
     setBusy(true); setErr(''); setNotice('');
     try {
       const row = {
-        code, name: cName.trim(), status: 'open',
-        gold_capacity: cGoldCap ? Number(cGoldCap) : null,
+        code, name: cName.trim(), status: 'open', timezone: cTz,
         vip_capacity: cVipCap ? Number(cVipCap) : null,
       };
+      // starts_on / ends_on are left out on purpose: batches_guard() fills them
+      // from the code, so an SQL-editor insert is as reliable as this one.
       const { error } = await supabase.from('batches').insert(row);
       if (error) throw error;
-      setNotice(`Batch ${cName.trim()} (${code}) created — its Gold and VIP spaces are live.`);
-      setCreateOpen(false); setCCode(''); setCName(''); setCGoldCap(''); setCVipCap('');
+      setNotice(`Batch ${cName.trim()} (${code}) created — its VIP space is live.`);
+      setCreateOpen(false); setCCode(''); setCName(''); setCVipCap(''); setCTz('Asia/Manila');
       load(true);
     } catch (e) {
-      setErr(e?.code === '23505' ? `A batch with code ${code} already exists.` : (e?.message || 'Could not create the batch.'));
+      setErr(e?.code === '23505'
+        ? `A batch with code ${code} already exists.`
+        : appErrorMessage(e, 'Could not create the batch.'));
     } finally { setBusy(false); }
   };
 
   const setStatus = async (b, status) => {
     setBusy(true); setErr(''); setNotice('');
     try {
-      const { error } = await supabase.from('batches').update({ status, updated_at: new Date().toISOString() }).eq('id', b.batch_id);
+      // Reopening clears the closure stamp; closing/archiving records who did it,
+      // so the card can distinguish a deliberate close from the month-end sweep.
+      // The two stamp columns arrive with #38, and the client ships before the SQL
+      // is applied at least as often as the other way round — so send them ONLY
+      // when the loaded row proves they exist (the CommunityHub "#24 not applied"
+      // idiom). Without this, every Close/Archive click on a pre-#38 database
+      // fails with PGRST204 on a column the admin never asked to write.
+      const stamped = b && 'close_reason' in b;
+      const patch = { status, updated_at: new Date().toISOString() };
+      if (stamped) {
+        if (status === 'open') {
+          patch.closed_at = null;
+          patch.close_reason = null;
+        } else if (!(status === 'closed' && b.closed_at)) {
+          // Don't restamp a batch that is ALREADY closed — un-archiving one the
+          // sweep closed in November would otherwise relabel it "Closed on <today>",
+          // rewriting the provenance the card exists to report.
+          patch.closed_at = new Date().toISOString();
+          patch.close_reason = status === 'archived' ? 'archive' : 'manual';
+        }
+      }
+      const { error } = await supabase.from('batches').update(patch).eq('id', b.batch_id);
       if (error) throw error;
       logBatchEvent(b.batch_id, null, status === 'open' ? 'open' : status === 'closed' ? 'close' : 'archive', { code: b.code });
       setNotice(`Batch ${b.code} is now ${status}.`);
       load(true);
-    } catch (e) { setErr(e?.message || 'Could not update the batch.'); } finally { setBusy(false); }
+    } catch (e) { setErr(appErrorMessage(e, 'Could not update the batch.')); } finally { setBusy(false); }
   };
 
-  const saveCapacity = async (b, field, raw) => {
-    const v = raw === '' ? null : Math.max(1, Number(raw) || 1);
+  // ── Edit (#38) ────────────────────────────────────────────────────
+  const openEdit = (b) => {
+    setErr(''); setNotice(''); setEditErrs({});
+    setEditFor(b);
+    setEditDraft({
+      code: b.code || '',
+      name: b.name || '',
+      starts_on: b.starts_on || '',
+      ends_on: b.ends_on || '',
+      timezone: b.timezone || 'Asia/Manila',
+      vip_capacity: b.vip_capacity ?? '',
+      total_capacity: b.total_capacity ?? '',
+    });
+  };
+  const closeEdit = () => { setEditFor(null); setEditDraft(null); setEditErrs({}); };
+  const patchDraft = (patch) => setEditDraft(d => ({ ...d, ...patch }));
+
+  const useWholeMonth = () => {
+    const b = monthBounds(editDraft?.code);
+    if (b) patchDraft({ starts_on: b.startsOn, ends_on: b.endsOn });
+  };
+
+  const saveEdit = async () => {
+    if (!editFor || !editDraft) return;
+    // Mirror of the server's chain, so an obvious mistake never costs a round trip.
+    // `rows` are admin_batch_overview() records, whose primary key is `batch_id` —
+    // normalise it to `id` or the batch fails to exclude ITSELF from the sibling
+    // list and its own unchanged code reads as a duplicate.
+    const check = validateBatchEdit(editDraft, {
+      current: { ...editFor, id: editFor.batch_id },
+      siblings: rows.map(r => ({ id: r.batch_id, code: r.code })),
+    });
+    setEditErrs(check.errors);
+    if (!check.ok) { if (check.errors._form) setErr(check.errors._form); return; }
+
+    setBusy(true); setErr(''); setNotice('');
     try {
-      const { error } = await supabase.from('batches').update({ [field]: v, updated_at: new Date().toISOString() }).eq('id', b.batch_id);
+      const num = (v) => (v === '' || v == null ? null : Number(v));
+      const { data, error } = await supabase.rpc('admin_update_batch', {
+        p_batch_id: editFor.batch_id,
+        p_code: normalizeBatchCode(editDraft.code),
+        p_name: editDraft.name.trim(),
+        p_starts_on: editDraft.starts_on,
+        p_ends_on: editDraft.ends_on,
+        p_timezone: editDraft.timezone,
+        p_vip_capacity: num(editDraft.vip_capacity),
+        p_total_capacity: num(editDraft.total_capacity),
+      });
       if (error) throw error;
-      logBatchEvent(b.batch_id, null, 'capacity', { code: b.code, [field]: v });
+      const bits = [`Batch saved as ${data?.code || editDraft.code}.`];
+      if (data?.spaces_renamed) bits.push('Its VIP community name was updated.');
+      if (data?.activations_shifted) {
+        bits.push(`${data.activations_shifted} upcoming seat${data.activations_shifted === 1 ? '' : 's'} moved to the new start date.`);
+      }
+      setNotice(bits.join(' '));
+      closeEdit();
       load(true);
-    } catch (e) { setErr(e?.message || 'Could not save the capacity.'); }
+    } catch (e) {
+      // Branch on the stable code (error.hint), never the HTTP status.
+      const code = appErrorCode(e);
+      const msg = appErrorMessage(e, 'Could not save the batch.');
+      if (code === 'MIGRATION_MISSING') {
+        setErr('Batch editing needs migration #38 — run db/2026-08-16-batch-lifecycle.sql, then refresh. Nothing was changed.');
+        closeEdit();
+      } else if (code === 'BATCH_CODE_TAKEN' || code === 'BATCH_CODE_REORDER' || code === 'INVALID_BATCH_CODE') {
+        setEditErrs(p => ({ ...p, code: msg }));
+      } else if (code === 'BATCH_PERIOD_PAST' || code === 'BATCH_PERIOD_INVALID') {
+        setEditErrs(p => ({ ...p, ends_on: msg }));
+      } else if (code === 'BATCH_TIMEZONE_INVALID') {
+        setEditErrs(p => ({ ...p, timezone: msg }));
+      } else {
+        setErr(msg);
+        if (code === 'BATCH_PAST') { closeEdit(); load(true); }
+      }
+    } finally { setBusy(false); }
+  };
+
+  // Manual trigger for the same sweep pg_cron runs hourly — a recovery path if
+  // the scheduler is ever mis-configured, and the way to see it work now.
+  const runClosures = async () => {
+    setSweeping(true); setErr(''); setNotice('');
+    try {
+      const { data, error } = await supabase.rpc('admin_close_due_batches');
+      if (error) throw error;
+      const n = data?.closed ?? 0;
+      setNotice(n === 0
+        ? 'No batches were due — every open batch is still inside its period.'
+        : `Closed ${n} batch${n === 1 ? '' : 'es'}: ${(data.batches || []).map(x => x.code).join(', ')}.`);
+      load(true);
+    } catch (e) {
+      setErr(appErrorCode(e) === 'MIGRATION_MISSING'
+        ? 'Automatic closure needs migration #38 — run db/2026-08-16-batch-lifecycle.sql, then refresh.'
+        : appErrorMessage(e, 'Could not run the closures.'));
+    } finally { setSweeping(false); }
   };
 
   const runAssign = async () => {
@@ -7184,12 +7298,23 @@ function AdminBatches() {
   }
 
   const openBatchOptions = rows.filter(b => b.status === 'open');
+  // Overdue but still open: the sweep has not landed yet (or pg_cron isn't wired).
+  const dueBatches = dueForAutoClose(rows);
+  // Is #38 applied? admin_batch_overview() gained is_past/close_reason there, so a
+  // #32-but-not-#38 database still renders this screen perfectly — every card would
+  // just look editable and every Save would fail with a generic message. Detect it
+  // from the row shape and say so once, rather than per failed click.
+  const lifecycleReady = rows.length === 0 || 'is_past' in rows[0];
   const inputStyle = { background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody };
+  const labelStyle = { fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' };
+  const fieldErr = (k) => (editErrs[k]
+    ? <div className="mt-1" style={{ fontSize: 11.5, color: 'var(--status-danger-fg)' }}>{editErrs[k]}</div>
+    : null);
 
   return (
     <div>
       <SectionHead eyebrow="Admin" title="Batches"
-        desc="Cohorts for the Gold / VIP live tracks — each batch carries its own private Gold and VIP communities. Membership follows the approved subscription automatically." gold />
+        desc="Batches for the VIP live track — each batch carries its own private VIP community. Membership follows the approved subscription automatically, and a batch closes on its own when its month ends." gold />
 
       {notReady ? (
         <div className="mt-6 max-w-3xl mx-auto glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
@@ -7204,13 +7329,44 @@ function AdminBatches() {
           {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
           {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
 
+          {!loading && !lifecycleReady && (
+            <AdminNotice kind="warn">
+              Batch editing and automatic closure need migration #38. Run
+              <span style={{ fontFamily: fontMono }}> db/2026-08-16-batch-lifecycle.sql </span>
+              in the Supabase SQL Editor, then refresh — until then batches never close on their own.
+            </AdminNotice>
+          )}
+
+          {/* With automatic closure live, an empty open set silently removes the
+              VIP checkout picker and stalls queued-seat allocation. Say so. */}
+          {!loading && rows.length > 0 && !hasUpcomingOpenBatch(rows) && (
+            <AdminNotice kind="warn">
+              No batch is open for the current or an upcoming month. VIP checkout loses its
+              batch picker, and queued seats wait until you create the next batch.
+            </AdminNotice>
+          )}
+          {!loading && dueBatches.length > 0 && (
+            <AdminNotice kind="warn">
+              {dueBatches.length} batch{dueBatches.length === 1 ? '' : 'es'} ({dueBatches.map(b => b.code).join(', ')})
+              {dueBatches.length === 1 ? ' has' : ' have'} passed their end date and are waiting on the hourly
+              sweep. Use “Run closures now” if you don’t want to wait.
+            </AdminNotice>
+          )}
+
           <div className="mt-4 flex items-center justify-between gap-3 flex-wrap">
-            <AdminFilterCaption>Cohorts</AdminFilterCaption>
-            <button onClick={() => setCreateOpen(true)}
-              className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition"
-              style={ADMIN_BTN_OK}>
-              <Plus size={15} /> New batch
-            </button>
+            <AdminFilterCaption>Batches</AdminFilterCaption>
+            <div className="flex items-center gap-2">
+              <button onClick={runClosures} disabled={sweeping || busy || !lifecycleReady}
+                className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 disabled:opacity-60"
+                title="Runs the same month-end sweep pg_cron runs hourly">
+                {sweeping ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />} Run closures now
+              </button>
+              <button onClick={() => setCreateOpen(true)}
+                className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition"
+                style={ADMIN_BTN_OK}>
+                <Plus size={15} /> New batch
+              </button>
+            </div>
           </div>
 
           {loading ? <AdminListSkeleton rows={3} /> : (
@@ -7218,46 +7374,97 @@ function AdminBatches() {
               {rows.length === 0 && (
                 <div className="glass-card rounded-2xl p-8 text-center">
                   <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg font-bold">No batches yet</div>
-                  <div className="text-slate-500 mt-1.5 text-sm">Create the first cohort (e.g. August 2026 · 2026-08) — its Gold and VIP communities are created automatically.</div>
+                  <div className="text-slate-500 mt-1.5 text-sm">Create the first batch (e.g. August 2026 · 2026-08) — its VIP community is created automatically.</div>
                 </div>
               )}
               {rows.map(b => {
                 const stStyle = b.status === 'open' ? { background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)', border: '1px solid var(--status-ok-bd)' }
                   : b.status === 'closed' ? { background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)', border: '1px solid var(--status-warn-bd)' }
                   : { background: 'var(--status-neutral-bg)', color: 'var(--status-neutral-fg)', border: '1px solid var(--status-neutral-bd)' };
+                // Prefer the server's verdict; a pre-#38 database has no is_past
+                // column, so fall back to the same rule computed locally.
+                const past = typeof b.is_past === 'boolean' ? b.is_past : isPastBatch(b);
+                const lock = past ? 'Past batch — editing is locked.' : editLockReason(b);
+                const prog = periodProgress(b);
                 return (
                   <div key={b.batch_id} className="glass-card rounded-2xl p-4">
                     <div className="flex items-center gap-3 flex-wrap">
                       <span style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 15, color: C.text }}>{b.name}</span>
                       <span style={{ fontFamily: fontMono, fontSize: 12, color: C.textMute }}>{b.code}</span>
                       <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase" style={stStyle}>{b.status}</span>
+                      {batchPeriodState(b) === 'running' && !past && (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase"
+                          style={{ background: 'var(--status-info-bg)', color: 'var(--status-info-fg)' }}>Running</span>
+                      )}
                       <div className="ml-auto flex items-center gap-1.5">
-                        {b.status !== 'open' && (
+                        {past ? (
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold"
+                            style={{ background: 'var(--status-neutral-bg)', color: 'var(--status-neutral-fg)' }}>
+                            <Lock size={12} /> Locked
+                          </span>
+                        ) : lifecycleReady && (
+                          <button onClick={() => openEdit(b)} disabled={busy}
+                            className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 disabled:opacity-60">
+                            <Edit3 size={13} /> Edit batch
+                          </button>
+                        )}
+                        {/* A past batch can never be `open` — the sweep would just close
+                            it again within the hour, and it cannot be extended out of the
+                            past either. So Reopen disappears, and Un-archive restores to
+                            `closed`, which is the only truthful state for a finished period. */}
+                        {b.status === 'archived' && (
+                          <button onClick={() => setStatus(b, past ? 'closed' : 'open')} disabled={busy} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold disabled:opacity-60">
+                            Un-archive
+                          </button>
+                        )}
+                        {b.status === 'closed' && !past && (
                           <button onClick={() => setStatus(b, 'open')} disabled={busy} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold disabled:opacity-60">
-                            {b.status === 'archived' ? 'Un-archive' : 'Reopen'}
+                            Reopen
                           </button>
                         )}
                         {b.status === 'open' && (
-                          <button onClick={() => setStatus(b, 'closed')} disabled={busy} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold disabled:opacity-60">Close</button>
+                          <button onClick={() => setStatus(b, 'closed')} disabled={busy} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold disabled:opacity-60">Close now</button>
                         )}
                         {b.status !== 'archived' && (
                           <button onClick={() => setArchiveFor(b)} disabled={busy} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold disabled:opacity-60" style={{ color: C.red }}>Archive</button>
                         )}
                       </div>
                     </div>
+
+                    {/* The batch's own window, with today as the leading edge. It
+                        encodes the lock rule: once the bar is full, editing is over. */}
+                    {prog && (
+                      <div aria-hidden="true" className="mt-2.5 h-[3px] rounded-full overflow-hidden" style={{ background: 'var(--wash-strong)' }}>
+                        <div style={{
+                          width: `${Math.round(prog.pct * 100)}%`, height: '100%',
+                          background: prog.state === 'past'
+                            ? 'var(--status-neutral-fg)'
+                            : `linear-gradient(90deg, ${C.primary}, ${C.primaryHi})`,
+                        }} />
+                      </div>
+                    )}
+
+                    <div className="mt-2 flex items-center gap-1.5 flex-wrap" style={{ fontSize: 11.5, color: C.textMute }}>
+                      <CalendarClock size={12} />
+                      <span>{closureLabel(b)}</span>
+                      {lock && (
+                        <span className="inline-flex items-center gap-1 ml-1" style={{ color: 'var(--status-neutral-fg)', fontWeight: 600 }}>
+                          <Lock size={11} /> {lock}
+                        </span>
+                      )}
+                    </div>
+
                     <div className="mt-3 grid gap-2 sm:grid-cols-2" style={{ fontSize: 12.5, color: C.textSoft }}>
-                      {[['gold', 'Gold', Number(b.gold_active) || 0, b.gold_capacity, 'gold_capacity'],
-                        ['vip', 'VIP', Number(b.vip_active) || 0, b.vip_capacity, 'vip_capacity']].map(([seg, label, active, cap, field]) => (
+                      {[['vip', 'VIP', Number(b.vip_active) || 0, b.vip_capacity],
+                        ['total', 'Total', Number(b.total_active) || 0, b.total_capacity]].map(([seg, label, active, cap]) => (
                         <div key={seg} className="flex items-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'var(--wash)' }}>
-                          {seg === 'gold' ? <Crown size={13} style={{ color: C.primary }} /> : <Sparkles size={13} style={{ color: C.primary }} />}
+                          {seg === 'vip' ? <Sparkles size={13} style={{ color: C.primary }} /> : <Users size={13} style={{ color: C.primary }} />}
                           <span style={{ fontWeight: 700, color: C.text }}>{label}</span>
                           <span className="gh-tnum">{active}{cap != null ? ` / ${cap}` : ''} enrolled</span>
                           {cap != null && active >= cap && (
                             <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold" style={{ background: 'var(--status-danger-bg)', color: 'var(--status-danger-fg)' }}>FULL</span>
                           )}
-                          <input type="number" min="1" placeholder="∞" defaultValue={cap ?? ''} aria-label={`${label} capacity`}
-                            onBlur={e => { const v = e.target.value; if (String(cap ?? '') !== v) saveCapacity(b, field, v); }}
-                            className="ml-auto w-16 px-2 py-1 rounded-lg text-xs text-right outline-none" style={inputStyle} />
+                          {cap == null && <span className="ml-auto" style={{ fontSize: 11, color: C.textMute }}>Unlimited</span>}
                         </div>
                       ))}
                     </div>
@@ -7267,7 +7474,7 @@ function AdminBatches() {
             </div>
           )}
 
-          {/* Needs batch assignment — active premium members with no cohort */}
+          {/* Needs batch assignment — active premium members with no batch */}
           <div className="mt-8 flex items-center gap-2 flex-wrap">
             <AdminFilterCaption>Needs batch assignment</AdminFilterCaption>
             {queue.length > 0 && (
@@ -7279,7 +7486,7 @@ function AdminBatches() {
           {queue.length === 0 ? (
             !loading && (
               <div className="mt-3 glass-card rounded-2xl p-5 text-center" style={{ fontSize: 13, color: C.textSoft }}>
-                Every active Gold / VIP member has a batch. New members get theirs at approval; imported members land here until assigned.
+                Every active VIP member has a batch. New members get theirs at approval; imported members land here until assigned.
               </div>
             )
           ) : (
@@ -7316,29 +7523,45 @@ function AdminBatches() {
       )}
 
       {createOpen && (
-        <AccountModal title="New batch" subtitle="Creates the cohort + its private Gold and VIP communities"
+        <AccountModal title="New batch" subtitle="Creates the batch + its private VIP community"
           icon={CalendarPlus} tone="primary" maxW="max-w-md" canClose={!busy} onClose={() => setCreateOpen(false)}>
           <div className="grid gap-3">
             <div>
-              <label className="block mb-1.5" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Code (YYYY-MM) *</label>
+              <label className="block mb-1.5" style={labelStyle}>Batch code (YYYY-MM) *</label>
               <input className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={{ ...inputStyle, fontFamily: fontMono }}
                 value={cCode} onChange={e => setCCode(e.target.value)} placeholder="2026-08" />
+              {(() => {
+                const mb = monthBounds(cCode);
+                return (
+                  <div className="mt-1.5" style={{ fontSize: 11.5, color: C.textMute }}>
+                    {mb
+                      ? `Runs ${formatBatchDate(mb.startsOn)} – ${formatBatchDate(mb.endsOn)} · closes automatically after that.`
+                      : 'The month sets the batch period and the order it receives queued seats.'}
+                  </div>
+                );
+              })()}
             </div>
             <div>
-              <label className="block mb-1.5" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Display name *</label>
+              <label className="block mb-1.5" style={labelStyle}>Display name *</label>
               <input className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={inputStyle}
                 value={cName} onChange={e => setCName(e.target.value)} placeholder="August 2026" />
             </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block mb-1.5" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Gold seats</label>
-                <input type="number" min="1" className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={inputStyle}
-                  value={cGoldCap} onChange={e => setCGoldCap(e.target.value)} placeholder="Unlimited" />
+            <div>
+              <label className="block mb-1.5" style={labelStyle}>Timezone</label>
+              <select className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={inputStyle}
+                value={cTz} onChange={e => setCTz(e.target.value)}>
+                {BATCH_TIMEZONES.map(tz => <option key={tz} value={tz}>{tz}</option>)}
+              </select>
+              <div className="mt-1.5" style={{ fontSize: 11.5, color: C.textMute }}>
+                Decides when the batch’s last day actually ends.
               </div>
-              <div>
-                <label className="block mb-1.5" style={{ fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' }}>VIP seats</label>
-                <input type="number" min="1" className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={inputStyle}
-                  value={cVipCap} onChange={e => setCVipCap(e.target.value)} placeholder="Unlimited" />
+            </div>
+            <div>
+              <label className="block mb-1.5" style={labelStyle}>VIP seats</label>
+              <input type="number" min="1" className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={inputStyle}
+                value={cVipCap} onChange={e => setCVipCap(e.target.value)} placeholder="Unlimited" />
+              <div className="mt-1.5" style={{ fontSize: 11.5, color: C.textMute }}>
+                How many VIP members this batch can take. Leave blank for unlimited.
               </div>
             </div>
           </div>
@@ -7352,11 +7575,114 @@ function AdminBatches() {
         </AccountModal>
       )}
 
+      {editFor && editDraft && (
+        <AccountModal title="Edit batch" subtitle={`${editFor.name} · ${editFor.code}`}
+          icon={Edit3} tone="primary" maxW="max-w-lg" canClose={!busy} onClose={closeEdit}>
+          <div className="grid gap-3.5">
+            <div>
+              <label className="block mb-1.5" style={labelStyle}>Display name *</label>
+              <input className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={inputStyle}
+                value={editDraft.name} onChange={e => patchDraft({ name: e.target.value })} placeholder="December 2026" />
+              {fieldErr('name')}
+              <div className="mt-1.5" style={{ fontSize: 11.5, color: C.textMute }}>
+                Renames this batch’s VIP community too. Its link keeps working.
+              </div>
+            </div>
+
+            <div>
+              <label className="block mb-1.5" style={labelStyle}>Batch code (YYYY-MM) *</label>
+              <input className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={{ ...inputStyle, fontFamily: fontMono }}
+                value={editDraft.code} onChange={e => patchDraft({ code: e.target.value })} placeholder="2026-12" />
+              {fieldErr('code')}
+              <div className="mt-1.5" style={{ fontSize: 11.5, color: C.textMute }}>
+                The code decides the order batches receive queued seats, so a new code must keep this
+                batch in the same position in the list.
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block mb-1.5" style={labelStyle}>Starts</label>
+                <input type="date" className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={inputStyle}
+                  value={editDraft.starts_on || ''} onChange={e => patchDraft({ starts_on: e.target.value })} />
+                {fieldErr('starts_on')}
+              </div>
+              <div>
+                <label className="block mb-1.5" style={labelStyle}>Ends</label>
+                <input type="date" className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={inputStyle}
+                  value={editDraft.ends_on || ''} onChange={e => patchDraft({ ends_on: e.target.value })} />
+                {fieldErr('ends_on')}
+              </div>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <button type="button" onClick={useWholeMonth} disabled={!monthBounds(editDraft.code)}
+                className="gh-btn-ghost self-start px-3 py-1.5 rounded-lg text-xs font-semibold disabled:opacity-40">
+                Use the whole month
+              </button>
+              {/* Seats are allocated in CODE order but activate on starts_on, so a
+                  period outside the code's own month makes a batch queue early and
+                  begin late. Legal, occasionally deliberate, usually a typo. */}
+              {(() => {
+                const mb = monthBounds(editDraft.code);
+                const off = mb && editDraft.starts_on && !String(editDraft.starts_on).startsWith(editDraft.code.trim());
+                return off ? (
+                  <span style={{ fontSize: 11.5, color: 'var(--status-warn-fg)' }}>
+                    Heads up — this period is outside {editDraft.code.trim()}.
+                  </span>
+                ) : null;
+              })()}
+            </div>
+
+            <div>
+              <label className="block mb-1.5" style={labelStyle}>Timezone</label>
+              <select className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={inputStyle}
+                value={editDraft.timezone} onChange={e => patchDraft({ timezone: e.target.value })}>
+                {[...new Set([editDraft.timezone, ...BATCH_TIMEZONES])].filter(Boolean)
+                  .map(tz => <option key={tz} value={tz}>{tz}</option>)}
+              </select>
+              {fieldErr('timezone')}
+              <div className="mt-1.5" style={{ fontSize: 11.5, color: C.textMute }}>
+                The batch stays editable through its final day in this timezone, then locks.
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {[['vip_capacity', 'VIP seats', Number(editFor.vip_active) || 0],
+                ['total_capacity', 'Total seats', Number(editFor.total_active) || 0]].map(([field, label, active]) => (
+                <div key={field}>
+                  <label className="block mb-1.5" style={labelStyle}>{label}</label>
+                  <input type="number" min="1" className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none" style={inputStyle}
+                    value={editDraft[field]} onChange={e => patchDraft({ [field]: e.target.value })} placeholder="Unlimited" />
+                  {fieldErr(field)}
+                  <div className="mt-1" style={{ fontSize: 11, color: C.textMute }}>{active} enrolled now</div>
+                </div>
+              ))}
+            </div>
+
+            {/* The immutable identity, visible but never editable — every
+                entitlement, space and audit row points at it. */}
+            <div className="flex items-center gap-2 px-3 py-2.5 rounded-xl" style={{ background: 'var(--wash)' }}>
+              <span style={{ ...labelStyle, marginBottom: 0 }}>Batch ID</span>
+              <code className="flex-1 min-w-0 truncate" style={{ fontFamily: fontMono, fontSize: 11.5, color: C.textSoft }}>{editFor.batch_id}</code>
+              <button type="button" onClick={() => navigator.clipboard?.writeText(editFor.batch_id)}
+                className="gh-btn-ghost px-2 py-1 rounded-lg" aria-label="Copy batch ID"><Copy size={13} /></button>
+            </div>
+          </div>
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button onClick={closeEdit} disabled={busy} className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold disabled:opacity-60">Cancel</button>
+            <button onClick={saveEdit} disabled={busy}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60" style={ADMIN_BTN_OK}>
+              {busy ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />} Save batch
+            </button>
+          </div>
+        </AccountModal>
+      )}
+
       {confirmAssign && (
         <AccountModal title="Assign batch?" subtitle={`${selectedUids.size} member${selectedUids.size === 1 ? '' : 's'} → ${(openBatchOptions.find(b => b.batch_id === assignTarget) || {}).name || 'batch'}`}
           icon={UserCheck} tone="ok" maxW="max-w-sm" canClose={!busy} onClose={() => setConfirmAssign(false)}>
           <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
-            Each member’s active Gold/VIP subscription joins this batch and unlocks its private community immediately.
+            Each member’s active VIP subscription joins this batch and unlocks its private community immediately.
             Members already in the batch are skipped; capacity is enforced server-side.
           </p>
           <div className="mt-5 flex items-center justify-end gap-2.5">
@@ -7371,7 +7697,7 @@ function AdminBatches() {
 
       {/* Archiving is the one batch action that hits EXISTING members: the approve RPC
           refuses an archived batch before the new-assignment carve-out, so renewals and
-          extensions stop for the whole cohort. Confirm it like any destructive action. */}
+          extensions stop for the whole batch. Confirm it like any destructive action. */}
       {archiveFor && (
         <AccountModal title="Archive this batch?" subtitle={`${archiveFor.name} (${archiveFor.code})`}
           icon={AlertTriangle} tone="danger" maxW="max-w-sm" canClose={!busy} onClose={() => setArchiveFor(null)}>
@@ -7791,11 +8117,11 @@ function AdminEnrollments({ onCountChange }) {
           // Leaving `batches` at undefined would strand the approve modal on
           // "Loading batches…" forever with Approve disabled and no explanation.
           console.warn('[enroll] batches fetch failed', bErr?.code, bErr?.message);
-          setErr('Could not load the batch registry — click Refresh before approving a Gold/VIP request.');
+          setErr('Could not load the batch registry — click Refresh before approving a VIP request.');
         }
       } catch (e) {
         console.warn('[enroll] batches fetch failed', e?.message);
-        setErr('Could not load the batch registry — click Refresh before approving a Gold/VIP request.');
+        setErr('Could not load the batch registry — click Refresh before approving a VIP request.');
       }
     } catch (e) {
       setErr(String(e?.message || e));
@@ -8010,7 +8336,7 @@ function AdminEnrollments({ onCountChange }) {
     }
   };
 
-  // #32: whenever the approve modal opens for a gold/vip request, preselect its
+  // #32: whenever the approve modal opens for a VIP request, preselect its
   // batch by the SAME precedence the RPC applies (pure mirror in
   // src/lib/communitySpaces.js — extension inherits+locks, renewal inherits,
   // upgrade inherits when the target space exists, new uses the checkout choice).
@@ -8025,8 +8351,8 @@ function AdminEnrollments({ onCountChange }) {
       segment: planSegment(effKey, plansByKey),
       prevBatchId: prev?.batch_id || null,
       requestBatchId: approveFor.batch_id || null,
-      // Every batch gets both a Gold and a VIP space from the #32 trigger, and there is
-      // no UI to deactivate one, so this holds for every batch the app can create. If a
+      // Every batch gets a VIP space from the #32 trigger, and there is
+      // no UI to deactivate it, so this holds for every batch the app can create. If a
       // space were deactivated by direct SQL, the RPC's upgrade branch would silently
       // fall through to the request's batch instead of raising — so this preselect (and
       // the displayed batch) could then differ from the granted one. Pass the real flag
@@ -8542,7 +8868,7 @@ function AdminEnrollments({ onCountChange }) {
                       <span className="inline-flex items-center gap-1" style={{ color: ent.full ? C.textMute : 'var(--status-warn-fg)', fontWeight: 600 }}>
                         {ent.full ? <ShieldCheck size={10} /> : <Lock size={10} />} {ent.scopeLabel}
                       </span>
-                      {/* #32: batch chip for gold/vip members; amber "no batch" flags the needs-assignment queue */}
+                      {/* #32: batch chip for VIP members; amber "no batch" flags the needs-assignment queue */}
                       {isPremiumSegment(planSegment(s.plan_key, plansByKey)) && (
                         s.batch_id ? (
                           <span className="inline-flex items-center gap-1 font-semibold" style={{ color: C.textSoft }}>
@@ -8626,7 +8952,7 @@ function AdminEnrollments({ onCountChange }) {
             ))}
           </div>
           {(() => {
-            // #32: batch resolution for premium (gold/vip) requests. Extensions
+            // #32: batch resolution for premium (VIP) requests. Extensions
             // inherit + lock; everything else is a picker over listable batches
             // (open ones + the preselected one, so a now-closed inherited batch
             // still displays — the RPC remains the validator).
@@ -8635,7 +8961,7 @@ function AdminEnrollments({ onCountChange }) {
             const effKey = (isExt && prev?.plan_key) ? prev.plan_key : approveFor.plan_key;
             const seg = planSegment(effKey, plansByKey);
             if (!isPremiumSegment(seg)) return null;
-            const segLabel = seg === 'vip' ? 'VIP' : 'Gold';
+            const segLabel = 'VIP';
             if (batches === undefined) {
               return (
                 <div className="mt-3 px-3.5 py-2.5 rounded-xl flex items-center gap-2" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}`, fontSize: 12.5, color: C.textMute }}>
@@ -8703,7 +9029,7 @@ function AdminEnrollments({ onCountChange }) {
                 {!approveBatchId && !locked && (
                   <div className="mt-1.5" style={{ fontSize: 11.5, color: 'var(--status-warn-strong-fg)' }}>
                     {options.length
-                      ? <>A batch is required — it unlocks that cohort’s private {segLabel} community.</>
+                      ? <>A batch is required — it unlocks that batch’s private {segLabel} community.</>
                       : <>No open batches exist yet — create one in <span style={{ fontWeight: 700 }}>Admin → Batches</span> first, then approve.</>}
                   </div>
                 )}
@@ -8842,8 +9168,10 @@ const IMPORT_CANON_FIELDS = [
   { key: 'source_created_at', label: 'Account created', hints: ['date created', 'created'] },
   { key: 'last_sign_in_at', label: 'Last sign in', hints: ['last sign in', 'last_sign_in'] },
   { key: 'sign_in_count', label: 'Sign-in count', hints: ['sign in count', 'sign_in_count'] },
-  // #32: gold/vip rows must carry an explicit cohort — never inferred from history.
-  { key: 'batch_code', label: 'Batch code (gold/VIP)', hints: ['batch_code', 'batch', 'cohort'] },
+  // #32: VIP rows must carry an explicit batch — never inferred from history.
+  // The 'cohort' hint stays: legacy exports use that header, and dropping it would
+  // silently stop matching those files.
+  { key: 'batch_code', label: 'Batch code (VIP)', hints: ['batch_code', 'batch', 'cohort'] },
 ];
 const IMPORT_TERM_MODES = [
   { key: 'preserve', label: 'Preserve exact expiry (default)', desc: 'Uses membership_ends_at from the source; expired → renewal.' },
@@ -8978,9 +9306,9 @@ function StudentImports({ onCountChange }) {
   const downloadTemplate = () => {
     const csv = toCsv([{
       thinkific_user_id: '123456', first_name: 'Jane', last_name: 'Doe', email: 'jane@example.com',
-      plan_key: 'core_self_paced', membership_started_at: '2026-01-15', membership_ends_at: '2026-03-16',
-      payment_status: 'paid', amount_paid: '999', currency: 'PHP', legacy_enrollments: 'QuickBooks Online Mastery - Jan 2026',
-      batch_code: '',   // gold/vip only — e.g. 2026-08 (must be an existing OPEN batch)
+      plan_key: 'silver_self_paced', membership_started_at: '2026-01-15', membership_ends_at: '2026-03-16',
+      payment_status: 'paid', amount_paid: '2999', currency: 'PHP', legacy_enrollments: 'QuickBooks Online Mastery - Jan 2026',
+      batch_code: '',   // VIP only — e.g. 2026-08 (must be an existing OPEN batch)
     }], IMPORT_TEMPLATE_COLUMNS);
     downloadFile(csv, 'student-import-template.csv', 'text/csv');
   };
@@ -9132,7 +9460,7 @@ function StudentImports({ onCountChange }) {
         last_sign_in_at: parseStrictDate(g('last_sign_in_at')).iso || null,
         sign_in_count: g('sign_in_count') ? Number(g('sign_in_count')) || null : null,
         legacy_enrollments: courses,
-        batch_code: g('batch_code') || null,   // #32: explicit cohort for gold/vip rows
+        batch_code: g('batch_code') || null,   // #32: explicit batch for VIP rows
       },
     };
   };
@@ -9392,7 +9720,7 @@ function StudentImports({ onCountChange }) {
           <div className="space-y-4">
             <div className="glass-card p-5" style={{ borderRadius: 16 }}>
               <div style={{ fontWeight: 700, color: C.text, marginBottom: 4 }}>Map course-combinations to plans</div>
-              <div className="text-xs mb-3" style={{ color: C.textSoft }}>Suggestions are advisory — confirm each. Sampler/Gold/VIP can't be inferred from course history.</div>
+              <div className="text-xs mb-3" style={{ color: C.textSoft }}>Suggestions are advisory — confirm each. Sampler and VIP can't be inferred from course history, and QBO-only history no longer maps to a plan.</div>
               <div className="space-y-2">
                 {combos.map((c) => (
                   <div key={c.key} className="rounded-xl px-3 py-2.5 flex items-center gap-3 flex-wrap" style={{ background: 'var(--wash)', border: `1px solid ${C.border}` }}>
@@ -9434,7 +9762,7 @@ function StudentImports({ onCountChange }) {
               <div className="sm:col-span-2 flex items-start gap-2 px-3 py-2.5 rounded-xl"
                 style={{ background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)', fontSize: 12, color: 'var(--status-info-fg)', lineHeight: 1.5 }}>
                 <AlertCircle size={14} className="flex-shrink-0 mt-px" />
-                <span>Gold / VIP rows need a confirmed <span style={{ fontFamily: fontMono }}>batch_code</span> (an existing OPEN batch, e.g. 2026-08) — rows without one are blocked for manual review and appear in Admin → Batches. A batch is never inferred from course history.</span>
+                <span>VIP rows need a confirmed <span style={{ fontFamily: fontMono }}>batch_code</span> (an existing OPEN batch, e.g. 2026-08) — rows without one are blocked for manual review and appear in Admin → Batches. A batch is never inferred from course history.</span>
               </div>
             </div>
 
@@ -9708,7 +10036,7 @@ function MembershipPanel() {
   const [sub, setSub] = useState(null);
   const [reqs, setReqs] = useState([]);
   const [plan, setPlan] = useState(null);
-  const [batchRow, setBatchRow] = useState(null);   // #32: the member's cohort (gold/vip)
+  const [batchRow, setBatchRow] = useState(null);   // #32: the member's batch (VIP)
   const [loaded, setLoaded] = useState(false);
   const [failed, setFailed] = useState(false);   // error → compact retry card (see render)
   const [reloadKey, setReloadKey] = useState(0);
@@ -10033,7 +10361,7 @@ function Dashboard({ goto }) {
         { id: 'qbdiag',        label: 'Free QB Diagnostic',       desc: 'Hook prospects · audit P&L + BS',       icon: Shield,    color: '#DC2626' },
         // Proposal / Cover Letters
         { id: 'painpoints',    label: 'Painpoints & Solutions',   desc: 'AI-generated by industry',              icon: Target,    color: '#0EA5E9' },
-        { id: 'proposal',      label: 'Proposal Generator',       desc: 'Hormozi × Martell style',               icon: Sparkles,  color: '#1E40AF' },
+        { id: 'proposal',      label: 'Cover Letter Generator',   desc: '3 letters + video script + prep',       icon: Sparkles,  color: '#1E40AF' },
         { id: 'discovery',     label: 'Discovery Call Simulator', desc: 'AI roleplay · practice client calls',   icon: Phone,     color: '#3B82F6' },
       ],
     },
@@ -11705,7 +12033,7 @@ function CourseProgram({
                 className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
             </label>
             <label className="block sm:col-span-2">
-              <span className="text-xs font-semibold text-slate-500 inline-flex items-center gap-1.5"><CalendarClock size={13} /> Course Date / Cohort Date</span>
+              <span className="text-xs font-semibold text-slate-500 inline-flex items-center gap-1.5"><CalendarClock size={13} /> Course date / Batch run date</span>
               <div className="mt-1 flex flex-wrap items-center gap-2">
                 <input type="date" value={courseDraft.course_date || ''}
                   onChange={e => setCourseDraft(d => ({ ...d, course_date: e.target.value }))}
@@ -11713,10 +12041,10 @@ function CourseProgram({
                 <button type="button" onClick={() => setCourseDraft(d => ({ ...d, course_date: todayISODate() }))}
                   className="px-3 py-2 rounded-lg border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-50">Today</button>
                 {courseDraft.course_date
-                  ? <span className="text-xs font-semibold px-2 py-1 rounded-full" style={{ background: 'var(--status-info-bg)', color: 'var(--status-info-fg)' }}>Cohort: {cohortLabel(courseDraft.course_date)}</span>
+                  ? <span className="text-xs font-semibold px-2 py-1 rounded-full" style={{ background: 'var(--status-info-bg)', color: 'var(--status-info-fg)' }}>Batch: {batchRunLabel(courseDraft.course_date)}</span>
                   : course.month ? <span className="text-xs text-slate-400">Legacy label: {course.month}</span> : null}
               </div>
-              <span className="block mt-1 text-[11px] text-slate-400">Defaults to today. Update this for monthly cohorts or future course runs.</span>
+              <span className="block mt-1 text-[11px] text-slate-400">Defaults to today. Set it for monthly batch runs. This labels the course card only — it does not link the course to a batch in Admin → Batches.</span>
             </label>
             <label className="block sm:col-span-2">
               <span className="text-xs font-semibold text-slate-500">Description</span>
@@ -12332,7 +12660,7 @@ function CourseCatalog({
       const coursePayload = {
         slug, title: newTitle,
         subtitle: src.subtitle ?? '', description: src.description ?? null,
-        course_date: todayISODate(), cover_path: src.cover_path ?? null,  // default the cohort date to today, not the source's (avoids a June re-run inheriting May)
+        course_date: todayISODate(), cover_path: src.cover_path ?? null,  // default the batch-run date to today, not the source's (avoids a June re-run inheriting May)
         access_tier: src.access_tier ?? 'standard',  // a re-run of an Essentials course stays Sampler-accessible
         source_course_id: src.id, published: false, position,
       };
@@ -12606,7 +12934,7 @@ function CourseCatalog({
                 <div className="p-4 flex-1 flex flex-col">
                   <button onClick={() => openCourse(c.id)} className="text-left flex-1">
                     <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
-                      {(c.course_date || c.month) && <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full" style={{ background: 'var(--status-info-bg)', color: 'var(--status-info-fg)' }}><CalendarClock size={11} /> {c.course_date ? cohortLabel(c.course_date) : c.month}</span>}
+                      {(c.course_date || c.month) && <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full" style={{ background: 'var(--status-info-bg)', color: 'var(--status-info-fg)' }}><CalendarClock size={11} /> {c.course_date ? batchRunLabel(c.course_date) : c.month}</span>}
                       {isAdmin && c.access_tier === 'essentials' && <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full" style={{ background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)' }}><Sparkles size={11} /> Essentials · Sampler</span>}
                     </div>
                     <div style={{ fontFamily: fontDisplay, color: NAVY }} className="font-bold text-[15px] leading-tight">{c.title}</div>
@@ -13703,7 +14031,10 @@ function CommunityCategoryRail({ tags, counts, activeTag, filter, onPick, totalC
 // Space switcher (#32) — compact pill row of the member's ACCESSIBLE spaces
 // (General + their private batch space, everything for admins) with the member
 // counts the server said they may see. Hidden when only one space is reachable.
-const COMMUNITY_SPACE_ICONS = { general: Globe, gold: Crown, vip: Sparkles };
+// Keyed by community_spaces.kind; the lookup below falls back to MessagesSquare for
+// any kind this build doesn't know, so a space that arrives before/after a schema
+// change still renders.
+const COMMUNITY_SPACE_ICONS = { general: Globe, vip: Sparkles };
 function CommunitySpaceSwitcher({ spaces, activeId, onSwitch }) {
   if (!spaces || spaces.length < 2) return null;
   return (
@@ -14691,7 +15022,7 @@ function CommunityHub() {
   // private spaces exist yet), with an admin-only setup notice; 'error' = the
   // RPC exists but failed. 'error' must NEVER fall through to legacy mode: with
   // no spaceId the composer omits space_id and community_posts_guard() defaults
-  // it to GENERAL, so a gold/vip member would silently publish a private post
+  // it to GENERAL, so a VIP member would silently publish a private post
   // to every plan. On 'error' we refuse to post and show a retry instead.
   const [spaces, setSpaces] = useState([]);
   const [spaceId, setSpaceId] = useState(null);
@@ -15416,7 +15747,7 @@ function CommunityHub() {
 
   // Mount bootstrap: resolve the accessible spaces FIRST, pick the initial one
   // (?space= deep link → last selection from window.storage → the RPC default:
-  // gold/vip land in their private space), then load the scoped feed. A pre-#32
+  // VIP lands in their private space), then load the scoped feed. A pre-#32
   // DB (RPC missing → PGRST202/404) drops to legacy single-space mode.
   useEffect(() => {
     if (!uid) return;
@@ -17438,280 +17769,1073 @@ ${(profile.authenticWeaknesses || []).map(w => `
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// COMPONENT: PROPOSAL / OUTREACH EMAIL GENERATOR
+// COMPONENT: COVER LETTER GENERATOR (job-application outreach)
 // ═══════════════════════════════════════════════════════════════════
+// Replaces the former client-proposal generator (seven document types aimed at pitching
+// a prospect business). This solves the problem the Job Application stage actually has:
+// paste a job post, get three ready-to-send letters, the video-intro script, and a prep
+// pack for the call that follows.
+//
+// The industry table and its keyword detector live in src/lib/coverLetterIndustry.js so
+// the scoring rules are covered by `npm test` — nothing else in this tool is testable
+// without a DOM.
 
-function ProposalGenerator() {
-  const [type, setType] = useState('Cold Outreach Email');
-  const [bizName, setBizName] = useState('');
-  const [contactName, setContactName] = useState('');
-  const [industry, setIndustry] = useState('General Small Business');
-  const [services, setServices] = useState('Monthly bookkeeping in QBO/Xero, bank & credit card reconciliations, monthly P&L + Balance Sheet + Cash Flow delivered by the 12th, A/R aging follow-up, 1099 vendor tracking, quarterly tax estimates prep for CPA');
-  const [pricing, setPricing] = useState('$1,500/month');
-  const [yourName, setYourName] = useState('Alex Sagun');
-  const [yourFirm, setYourFirm] = useState('Sagun Bookkeeping Services');
-  const [hook, setHook] = useState('Their books are 3+ months behind and they are paying a US local bookkeeper too much for too little');
-  const [generated, setGenerated] = useState('');
-  const [busy, setBusy] = useState(false);
+const COVER_PLATFORMS = [
+  { id: 'onlinejobs', label: 'OnlineJobs.ph', min: 50, max: 95, note: 'conversational and direct' },
+  { id: 'upwork', label: 'Upwork', min: 50, max: 95, note: 'hook opener proving you read the post, concrete CTA' },
+  { id: 'linkedin', label: 'LinkedIn', min: 50, max: 150, note: 'slightly more formal, connection-message friendly' },
+  { id: 'coldemail', label: 'Cold Email', min: 0, max: 100, note: 'pattern-interrupt subject, hook + offer + CTA' },
+];
 
-  const generate = async () => {
-    setBusy(true);
-    setGenerated('');
-    try {
-      const sys = `You write outreach and proposals for FILIPINO REMOTE BOOKKEEPERS and accountants pitching US clients. Voice: Alex Hormozi + Dan Martell — direct-response, value-stacked, conversion-focused. Hard rules:
+// Beat durations are fixed by the framework, NOT returned by the model, so the running
+// timecodes below are deterministic. That is the point: the panel tells a student when
+// each beat lands in a ~60-second recording, which is information they can act on —
+// unlike colour-coding the beats by their position, which encodes nothing.
+const TMAY_BEATS = [
+  { key: 'hook', label: 'Hook', seconds: 8 },
+  { key: 'credibility', label: 'Credibility', seconds: 13 },
+  { key: 'solution', label: 'Solution', seconds: 18 },
+  { key: 'proof', label: 'Proof', seconds: 13 },
+  { key: 'close', label: 'Close', seconds: 8 },
+];
 
-WHO IS WRITING:
-- A remote bookkeeper or accountant based in the Philippines (or similar offshore) targeting US small business owners, US accounting/tax/CFO firms, or US accounting practices looking to scale.
-- Their unfair advantages: cost arbitrage (1/3 the price of US bookkeepers), timezone coverage (work happens while the US client sleeps), dedicated focus (not splitting between local clients), QBO/Xero certified, async-first workflow (Slack + Loom + Google Drive).
+const mmss = (total) => `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
 
-PAIN POINTS A REMOTE BOOKKEEPER SOLVES (use these in your writing):
-- Owner is 6+ months behind on books — needs a cleanup engagement
+// Precomputed once at module scope — the cumulative start offset for each beat.
+const TMAY_TIMELINE = (() => {
+  let elapsed = 0;
+  return TMAY_BEATS.map((b) => {
+    const timecode = mmss(elapsed);
+    elapsed += b.seconds;
+    return { ...b, timecode };
+  });
+})();
+const TMAY_TOTAL_SECONDS = TMAY_BEATS.reduce((n, b) => n + b.seconds, 0);
+
+const MIN_JD_CHARS = 20;
+// Guards input token spend. A pasted job post is a few hundred words; anything past this
+// is a page dump, and the proxy's 5 MB body limit is far too loose to catch it.
+const MAX_JD_CHARS = 15000;
+
+const wordCount = (s) => (s || '').trim().split(/\s+/).filter(Boolean).length;
+
+// The prompt only ever reads three buckets from each slider, so the UI shows which bucket
+// the current position resolves to. Without it the sliders imply a precision they do not
+// have, and they announce nothing at all to a screen reader.
+const toneBucket = (v) => (v < 30 ? 'Casual' : v > 70 ? 'Professional' : 'Balanced');
+const lengthBucket = (v) => (v < 30 ? 'Tight' : v > 70 ? 'Detailed' : 'Balanced');
+const toneBrief = (v) => (v < 30
+  ? 'Very casual, contractions welcome, slight imperfection OK'
+  : v > 70 ? 'Professional and tight, no fluff' : 'Balanced, professional but not stiff');
+const lengthBrief = (v) => (v < 30
+  ? 'Aim for the BOTTOM of the word range'
+  : v > 70 ? 'Aim for the TOP of the word range' : 'Hit the MIDDLE of the word range');
+
+// ── Prompt ─────────────────────────────────────────────────────────────────────
+// Split static/variable to match the house pattern: everything invariant sits in the
+// system prompt, everything derived from the form goes in the user turn.
+
+const COVER_LETTER_SYSTEM = `You write cold-outreach application letters for REMOTE BOOKKEEPERS applying to work with US business owners. You return JSON only. No preamble, no explanation, no markdown fences.
+
+# CRITICAL: WRITE LIKE A HUMAN, NOT AN AI
+This is the most important rule. If the output sounds like ChatGPT wrote it, you have failed. A real remote bookkeeper typing this on their phone between calls would not write in perfectly balanced clauses.
+
+HARD-BANNED PUNCTUATION:
+- NEVER use em-dashes or en-dashes. Use a period, a comma, or start a new sentence.
+- NEVER use semicolons. Break into two sentences.
+- NEVER use rhetorical parallel structures like "not X, but Y" or "not just X, but also Y".
+- NEVER use the three-item comma list pattern (X, Y, and Z) more than once per letter.
+
+HARD-BANNED WORDS AND PHRASES (rewrite any sentence containing these):
+streamline, ensure, utilize, leverage, optimize, comprehensive, delve into, dive deep, unlock, elevate, crafted, tailored (as an adjective), meticulous, foster, pivotal, realm, landscape, journey, empower, navigate, align/alignment, game-changer, moving forward, at the end of the day, in today's world, "I understand that", "I would love to", "I am confident that", Furthermore, Moreover, Additionally, In conclusion, "That said," as a transition, "Here's the thing:" as an opener.
+
+HUMAN VOICE MARKERS TO USE INSTEAD:
+- Fragments are fine. Real ones. "Sound familiar?" "Not fun." "Fixable."
+- Start sentences with And, But, So. Real humans do this constantly.
+- Contractions everywhere: don't, can't, won't, I'll, you'll, it's, that's, here's.
+- Occasional colloquial words: yeah, honestly, look, thing is, catch, hassle, mess, headache, grind.
+- Simple concrete verbs: fix, clean up, catch, spot, sort out, handle, take off your plate.
+- Vary sentence length wildly. A very short one. Then one that stretches out because there is more to say. Then short again.
+- Occasional imperfection is human. A sentence may end slightly abruptly.
+
+PUNCTUATION RULE: periods and commas only. If you feel the urge for an em-dash, use a period and start a new sentence. That is the single biggest AI tell and it must not appear.
+
+SENTENCE OPENING VARIETY: do not start three sentences in a row the same way. Do not start every paragraph with "I". Mix it up: sometimes You, sometimes the pain point, sometimes a fragment.
+
+# CRITICAL FRAMING
+This is NOT a job application letter. This is one business owner talking to another. Voice inspiration: Alex Hormozi. Direct. Blunt about the problem. Obsessed with the outcome. Talks about money, hours and stress in concrete terms. Write as if the reader's attention dies in 7 seconds, because it does.
+
+# CORE POSITIONING
+The writer is NOT a VA or a data-entry clerk. Their product is FREEDOM for the owner. Take the weight of the books off the owner's shoulders. End the 11pm anxiety. Turn the P&L into a decision tool. Spot leaks and missed deductions BEFORE they cost money.
+
+# WHAT THIS WRITER ACTUALLY SOLVES
+Draw on these real bookkeeping pains where they fit the job post. Do not list them; use the one or two that match.
+- Owner is 6+ months behind on books and needs a cleanup engagement
 - Owner is closing books at 11pm Sunday instead of seeing family
 - Books are in shoeboxes, not a real accounting system
-- They pay a US local bookkeeper $4K-$8K/month for work that could be done for $1.5K-$3K remote
-- 1099 chaos every January — missing W-9s, last-minute panic
-- No monthly financials, so they can't make decisions or get a loan
+- They pay a US local bookkeeper $4K-$8K/month for work that can be done remotely for $1.5K-$3K
+- 1099 chaos every January, missing W-9s, last-minute panic
+- No monthly financials, so they cannot make decisions or get a loan
 - Bank reconciliations 3 months stale
-- Mixing personal and business expenses on the same card
+- Personal and business expenses mixed on the same card
 - Sales tax exposure across multiple states (Wayfair nexus)
-- Inventory accounting wrong (e-comm, restaurant)
-- Tax surprise every April because no quarterly planning
-- Owner doing data entry themselves at $200/hour effective rate
+- Inventory accounting wrong (e-commerce, restaurant)
+- Tax surprise every April because there is no quarterly planning
+- Owner doing data entry themselves at a $200/hour effective rate
 - Accounting firm partner stuck doing Tier 1 production work
-- US firm wants to scale past $500K rev but capacity-capped
+- US firm wants to scale past $500K revenue but is capacity-capped
+Never call yourself cheap or low-cost. Say "at a fraction of the cost" or "a third of what a local bookkeeper costs".
 
-VOICE:
-- Punchy. Short sentences. Often 3-5 words.
-- Hormozi cadence: callouts. Bold claims. Specific numbers.
-- Dan Martell cadence: framework-driven, mentor energy, "here's what most people miss" tone.
-- Conversational, not corporate. Talk like a smart friend who happens to be an expert.
-- Use "you" 5x more than "I."
-- Lead with the prospect's BOOKKEEPING pain or outcome. NEVER lead with yourself.
-- Where natural, weave in remote-delivery advantages (cost, timezone, focus) — but make it about the OUTCOME for the client, not features of being offshore.
+# ABSOLUTE RULES
+1. Write TO the business owner. Never "hiring team" or "your company".
+2. Lead with the OUTCOME. Never "I am a bookkeeper with X years".
+3. Every message includes ONE proactive offer they did not ask for.
+4. Use specific numbers.
+5. Name the emotional cost ONCE, then offer the calm.
+6. Stack: outcome + timeline + proactive extra + risk reversal.
+7. BANNED WORDS: synergy, leverage, passionate, dynamic, results-driven, dedicated, hardworking, team player, value-add, robust, seamless, world-class, rockstar, ninja, guru.
+8. BANNED OPENINGS: Dear Hiring Manager, Dear Sir/Madam, I hope this email finds you well, My name is, I am writing to apply, I am reaching out, I came across your post, I saw your job posting.
+9. Short sentences. One-line paragraphs welcome.
+10. No emojis. No bullet lists in the body. Prose only.
+11. Every tool named in the job description must appear by name in every message.
 
-STRUCTURE:
-- Hook in first 7 words. Make them stop scrolling.
-- Pattern interrupts: one-line paragraphs. White space.
-- Specificity beats generality: "$47K in unreconciled transactions" beats "messy books."
-- Stack value: list 3-5 concrete BOOKKEEPING outcomes (reconciled accounts by the 10th, monthly P&L by the 12th, 1099s ready by January 31), not features.
-- Risk reversal: explicit guarantee or trial offer when appropriate.
-- ONE clear CTA. Always.
+# SUBJECT LINES
+3 to 7 words. Lowercase is fine. Owner-to-owner. GOOD: "quick thought on your books", "your bank recs handled". BAD: "Application for Bookkeeper Position".
 
-BANNED WORDS/PHRASES — never use any of these:
-- "I hope this email finds you well"
-- "Just wanted to reach out"
-- "Touch base," "circle back," "synergy," "leverage," "robust"
-- "I am writing to inform you"
-- "Kindly," "please find attached"
-- "It would be my pleasure"
-- "At your earliest convenience"
-- "Looking forward to hearing from you" (use a real CTA instead)
-- Em-dash overuse, "in today's fast-paced world," generic gratitude openers
-- Any sentence that could appear in a 1990s business letter
-- Never call yourself "cheap" or "low-cost" — instead say "at a fraction of the cost" or "a third of what a local bookkeeper costs"
+# OUTPUT FORMAT
+Return ONLY this JSON object. No markdown fences. Use \\n for line breaks inside body strings.
+{
+  "variations": [
+    {"label":"Direct","subject":"...","body":"full letter A INCLUDING the closing block"},
+    {"label":"Story-driven","subject":"...","body":"full letter B INCLUDING the closing block"},
+    {"label":"Curious","subject":"...","body":"full letter C INCLUDING the closing block"}
+  ],
+  "tmayScript": {
+    "hook": "5 to 10 seconds. Pattern-interrupt opener that names the problem or the outcome. Never a 'hi my name is' opener.",
+    "credibility": "10 to 15 seconds on why this writer is credible for THIS role, tied to the job post and the industry.",
+    "solution": "15 to 20 seconds on the specific outcome the writer will deliver for this owner, tied to the pains in the job post.",
+    "proof": "10 to 15 seconds with one concrete example, past win, or proactive offer.",
+    "close": "5 to 10 second CTA that feels warm and low friction. Owner-to-owner, not applicant-to-hirer.",
+    "deliveryTips": ["exactly 3 tips on pacing, tone or body language specific to remote video introductions"],
+    "totalDuration": "e.g. 60 to 75 seconds"
+  },
+  "prep": {
+    "painPoints": [{"pain":"a real pain from the job post in plain owner language","why":"one sentence on why it costs the owner money, hours or sleep"}],
+    "likelyQuestions": [{"question":"a question the owner is likely to ask on the call","how":"one or two sentences on how to answer well without over-promising"}],
+    "researchBeforeCall": ["one specific thing to look up or verify before the call"],
+    "redFlags": ["one specific thing to watch out for during the call"]
+  }
+}
 
-REQUIRED STYLE TICS (Hormozi/Martell):
-- Bullet stacks with → or • prefixes
-- One-line paragraphs for emphasis
-- "Here's the truth:" / "Here's what most people miss:" / "The math is simple:"
-- Specific dollar amounts and timeframes
-- Direct callouts: "If you're like most ${industry === 'General Small Business' ? 'US business owners' : industry + ' owners in the US'}, you're..."
-- End with a 1-line CTA that's a question or a directive ("Hit reply with a yes" / "Want me to send 3 time slots?")
+COUNTS: variations exactly 3. deliveryTips exactly 3. painPoints 3 to 5. likelyQuestions 4 to 6. researchBeforeCall 3 to 5. redFlags 2 to 4.
 
-Write everything as if your reader's attention dies in 7 seconds. Because it does.`;
+For prep.painPoints: extract real pains the owner mentioned or clearly implied. Rephrase into plain owner language, not corporate speak.
+For prep.likelyQuestions: skip generic HR questions. Focus on domain questions an owner actually asks a bookkeeper.
+For prep.redFlags: be direct about unrealistic scope, unclear budget, and unmanaged expectations.
 
-      const user = `Generate a ${type} for a FILIPINO REMOTE BOOKKEEPER (writing in first person) pitching a US prospect, using Hormozi/Martell direct-response style.
+For tmayScript: this is a tell-me-about-yourself video script the student will record or say out loud. Write it in first person, the way it will be SAID rather than read. Contractions. Short sentences. One idea per sentence. Total should feel like 60 to 90 seconds spoken naturally. The same anti-AI rules apply: no em-dashes, no semicolons, none of the banned words.`;
 
-CONTEXT:
-- Prospect business name: ${bizName || '[Business Name]'}
-- Contact person: ${contactName || '[Contact Name]'}
-- Their US industry: ${industry}
-- BOOKKEEPING services I deliver remotely: ${services}
-- My monthly pricing: ${pricing}
-- Specific pain point / hook to lead with: ${hook}
-- My name: ${yourName}
-- My remote bookkeeping firm name: ${yourFirm}
+// The job post and the personal notes are user text dropped between <<<MARKER>>> fences.
+// Stripping any marker they contain keeps a pasted block from closing its own fence and
+// letting the rest of the paste read as instructions.
+const stripPromptMarkers = (s) => String(s || '').replace(/<<<\s*\/?[A-Z_]+\s*>>>/g, '');
 
-CRITICAL: Every output must center on BOOKKEEPING PAIN POINTS a remote bookkeeper specifically solves (not generic business advice). The hook, the value stack, and the CTA must all be tied to financial / bookkeeping / accounting outcomes — not general marketing or growth.
+function buildCoverLetterUser({ ind, plat, tone, length, experience, notes, senderName, whatsapp, jd }) {
+  const nameToUse = stripPromptMarkers(senderName).trim() || '[YOUR_NAME]';
+  const waToUse = stripPromptMarkers(whatsapp).trim() || '[WHATSAPP_NUMBER]';
+  const wordTarget = plat.min === 0 ? 'under 100' : `${plat.min}-${plat.max}`;
 
-OUTPUT REQUIREMENTS for ${type}:
-${type === 'Cold Outreach Email' ? `- Subject line: 4-7 words. Curiosity gap or specific outcome. Lowercase ok.
-- Body: 80-130 words. Hook → pain → 3-bullet value stack → ONE CTA.
-- Open with a pattern interrupt — NEVER "I hope" or "My name is."
-- Single CTA: ask for a 15-min call OR a single yes/no question.` : ''}
-${type === 'Follow-Up Email (Day 3)' ? `- Subject: "re:" + 3-5 words OR a single-word curiosity hook.
-- Body: 50-80 words. Add ONE new value point. Drop a specific number/outcome.
-- End with a 1-line ask that's easy to say yes to.` : ''}
-${type === 'Follow-Up Email (Day 7)' ? `- Subject: 2-4 words, often a single phrase like "closing the loop" or "last note"
-- Body: 40-70 words. Break-up energy. Low-pressure. Leave door open. Hormozi-style: "No worries if not — but if this is on your radar, here's the easiest yes."` : ''}
-${type === 'Full Proposal Document' ? `Write a Hormozi/Martell-style proposal from a REMOTE BOOKKEEPER pitching a US prospect, with these sections (short, punchy headers):
+  const expContext = experience === 'none'
+    ? `MODE: SOLUTION-FORWARD. Never describe the writer as new, newbie, entry-level, junior, aspiring, learning, inexperienced, or unfamiliar. Never say "I have not worked in this industry", "I am new", "first time", or "starting out". Never apologize for tenure. Lead entirely with the SOLUTION and the OUTCOME. Show industry fluency by naming pain points and workflows accurately. Treat mastery of ${ind.tools.join(', ')} as a matter of fact. Offer a paid trial week as confident risk reversal, not as an apology. Read like a capable operator.
+HARD-BANNED PHRASES in this mode: new to, newbie, starting out, aspiring, learning, building experience, first time, have not worked in, entry-level, junior, inexperienced, unfamiliar with, "while I haven't", "even though I am new", "I am still building". Rewrite any sentence containing these.`
+    : `MODE: WITH INDUSTRY TRACK RECORD. Lead with a specific past outcome tied to the OWNER's relief. Reference industry workflows by name (for example: ${ind.deliverables[0]}). Speak like a seasoned partner. Include one proactive observation.`;
 
-THE PROBLEM (4-5 lines)
-State their specific BOOKKEEPING pain — pulled from the pain points listed in the system prompt. Use "you" not "businesses." Make them nod. Example: "Your books are 4 months behind. You're closing them yourself at midnight on Sundays. You missed two 1099s last January and got an IRS letter. You know you need help — but the local bookkeepers all want $5K/month."
+  const variationInstr = experience === 'none'
+    ? `A. DIRECT. Open with the pain, then the fix. Concrete 30-day plan. Include one proactive offer. End the body with: "Open to a paid trial week to prove it?" NEVER mention being new.
 
-WHAT YOU GET (the value stack)
-Bullet-list 5-7 specific BOOKKEEPING DELIVERABLES. Each one is an OUTCOME with a timeline.
-Format: "→ [Specific bookkeeping outcome by specific date] (so you can [client benefit])"
-Examples:
-→ All bank/credit card accounts reconciled by the 10th of every month (so you have real numbers for decisions)
-→ Monthly P&L + Balance Sheet + Cash Flow delivered by the 12th (so you stop guessing if you're profitable)
-→ A/R aging review every Friday with collection reminders sent (so you stop chasing payments yourself)
-→ 1099 vendor tracking + W-9 collection year-round (so January is calm, not chaos)
-→ Sales tax filing in every nexus state (so you sleep at night)
-→ Quarterly tax estimates calculated and sent to your CPA (so no April surprises)
+B. STORY-DRIVEN. Open with a vivid scenario of the owner's mess. Pivot to the specific fix. Offer one week-one deliverable. End the body with: "Happy to prove it on a bounded task this week." NEVER mention lack of experience.
 
-THE INVESTMENT
-State price. Then anchor it: "A local US bookkeeper for this scope: $4,500–$8,000/month. My rate: ${pricing}. You save $3K-$5K/month while getting better books." Mention cost of NOT solving it (lost deductions, IRS penalties, missed loans because no clean financials).
+C. CURIOUS. Open with a sharp owner-to-owner question. Position as a calm partner. End the body with: "Reply 'sample' and I'll send a one-week reconciliation on your last bank month plus a health check." NEVER apologize or hedge.`
+    : `A. DIRECT. Open with owner relief tied to a past win. State the offer plus one proactive thing. End the body with: "Worth a 15-min call Thursday or Friday?"
 
-THE GUARANTEE
-Specific risk reversal. Examples: "First month free if you're not thrilled" / "30-day money-back" / "I close your books by the 10th every month — or I refund that month."
+B. STORY-DRIVEN. Open with a one-sentence case study anchored in the OWNER's relief. Connect it to their situation. End the body with: "Same playbook fits your shop. Worth a 15-min call this week?"
 
-ONBOARDING — WEEK BY WEEK
-3-week sprint. Specific deliverables per week:
-Week 1: Onboarding call, QBO Accountant access, document collection, current-state diagnostic.
-Week 2: Cleanup engagement starts (if needed), prior month bank rec, chart of accounts audit.
-Week 3: First full monthly close delivered, KPI dashboard set up, monthly review call scheduled.
+C. CURIOUS. Open with a sharp owner-to-owner question. Reference patterns from similar shops. End the body with: "Reply 'sample' and I'll send a one-week reconciliation on your last bank month plus a health check. No charge."`;
 
-WHY ME, NOT THEM
-3-4 bullet differentiators. NO clichés. Specific proof points. Lean into REAL remote-bookkeeper advantages:
-- Dedicated focus: you are one of my top 15 clients, not one of 60 like at a local firm
-- Timezone arbitrage: your bank feeds get reconciled while you sleep
-- Cost: 60% less than a US local bookkeeper at the same skill level
-- Async-first: Slack + Loom + Google Drive means no scheduling pain
-- Cloud-native: QBO + Xero ProAdvisor certified, no legacy desktop dependencies
+  const safeNotes = stripPromptMarkers(notes).trim();
+  const notesBlock = safeNotes
+    ? `\n# PERSONAL NOTES FROM THE WRITER\nWeave these in naturally. Do not list them all in one place, and do not invent anything beyond them.\n<<<NOTES_START>>>\n${safeNotes}\n<<<NOTES_END>>>\n`
+    : '';
 
-WHAT HAPPENS NEXT
-3 clear steps. Make it impossible to be confused.
+  return `Write the 3 cold-outreach messages, the video-introduction script, and the interview prep pack for the job post below.
 
-Total length: 500-750 words. Heavy white space. Headers in CAPS or with → markers.` : ''}
-${type === 'LinkedIn Connection Request' ? `- 280 characters MAX (LinkedIn limit).
-- Personalized. Reference something specific about them.
-- ZERO pitch. Just a real connection reason.
-- Hormozi style: blunt, specific, no fluff.` : ''}
-${type === 'LinkedIn Follow-Up Message' ? `- 70-110 words after they accept.
-- One specific compliment or observation about their business.
-- ONE clear value drop (no full pitch).
-- Single CTA: a question OR an offer of value (free audit / free template / free 15-min call).
-- Martell mentor energy.` : ''}
-${type === 'Referral Request Email' ? `- 80-120 words.
-- Lead with appreciation — specific to what they got from working with you.
-- Make the ask EASY: "Know one ${industry === 'General Small Business' ? 'business owner' : industry + ' owner'} drowning in their books? Forward this email."
-- Include a 1-line forwardable script they can use.` : ''}
+# INDUSTRY: ${ind.label}
+Pain points: ${ind.pain.join('; ')}
+Deliverables: ${ind.deliverables.join('; ')}
+Common tools: ${ind.tools.join(', ')}
 
-Output the email/document directly with no preamble or explanation. Use heavy whitespace. Sign as ${yourName} | ${yourFirm}. Add a P.S. on every email — Hormozi always uses P.S.`;
+# EXPERIENCE
+${expContext}
 
-      const text = (await callClaude({ max_tokens: 2000, system: sys, messages: [{ role: 'user', content: user }] })).trim();
-      setGenerated(text);
-    } catch (e) {
-      setGenerated('Error generating — please try again.');
+# PLATFORM: ${plat.label}
+Word target for the BODY, excluding the closing block: ${wordTarget} words.
+Rules: ${plat.note}${plat.id === 'onlinejobs' ? '\nMention the Philippines timezone advantage once, briefly.' : ''}${plat.id === 'coldemail' ? '\nKeep subject lines at the short end of the range, lowercase and human.' : ''}
+
+# TONE / LENGTH
+TONE: ${toneBrief(tone)}
+LENGTH: ${lengthBrief(length)}
+
+# MANDATORY OPENING GREETING
+Every letter MUST start with a warm, human greeting on its own line, then a blank line before the body begins.
+- If the job post contains the owner's or hiring person's first name, use it ("Hi Sarah," / "Hey Mike,").
+- If no name appears, use a warm generic that fits the platform: "Hi there," / "Hey," / "Hi," / "Good morning," / "Hope your week is going well," / "Quick note,"
+- VARY the greeting across the three variations. Never use the same one twice.
+- Never use: Dear Hiring Manager, To Whom It May Concern, Dear Sir/Madam, Greetings.
+- After the greeting add a blank line, then start the body. Do not continue on the same line.
+
+# THREE VARIATIONS
+${variationInstr}
+
+# MANDATORY CLOSING BLOCK
+Every message MUST end with all four of these, in this order. Vary the wording between variations.
+1. Resume mention. Example: "Resume is attached if you want the full picture."
+2. WhatsApp line. Example: "Fastest way to reach me is WhatsApp: ${waToUse}"
+3. Warm closing, not "Best regards". Example: "Talk soon." or "Appreciate your time."
+4. The name on its own line: ${nameToUse}
+${notesBlock}
+# JOB DESCRIPTION
+<<<JD_START>>>
+${stripPromptMarkers(jd).trim()}
+<<<JD_END>>>`;
+}
+
+// ── Response handling ──────────────────────────────────────────────────────────
+
+// Per-section, non-throwing coercion. The response has three independent top-level keys
+// and the model emits them in order, so a clipped `prep` must never cost the user three
+// perfectly good letters. Only an empty `variations` is fatal.
+function coerceCoverLetterResult(parsed) {
+  const cleanStr = (v) => (typeof v === 'string' ? v.trim() : '');
+  const strList = (a) => (Array.isArray(a) ? a : [])
+    .filter((x) => typeof x === 'string' && x.trim())
+    .map((x) => x.trim());
+
+  const variations = (Array.isArray(parsed?.variations) ? parsed.variations : [])
+    .filter((v) => v && cleanStr(v.body))
+    .slice(0, 3) // the prompt asks for exactly 3; bound the UI regardless of what arrives
+    .map((v, i) => ({
+      label: cleanStr(v.label) || `Variation ${i + 1}`,
+      subject: scrubDashes(cleanStr(v.subject)),
+      body: scrubDashes(cleanStr(v.body)),
+    }));
+
+  const t = parsed?.tmayScript;
+  let tmay = (t && typeof t === 'object' && !Array.isArray(t))
+    ? {
+      beats: TMAY_TIMELINE
+        .map((b) => ({ ...b, text: scrubDashes(cleanStr(t[b.key])) }))
+        .filter((b) => b.text),
+      deliveryTips: strList(t.deliveryTips).map(scrubDashes),
+      totalDuration: cleanStr(t.totalDuration) || `about ${TMAY_TOTAL_SECONDS} seconds`,
     }
-    setBusy(false);
+    : null;
+  // A present-but-empty object is not a result. Collapsing it to null here is what stops
+  // the renderer drawing a card with a header and no body, the jump-nav offering a pill
+  // that scrolls to nothing, and the "did not come through" notice staying silent.
+  if (tmay && !tmay.beats.length && !tmay.deliveryTips.length) tmay = null;
+
+  const p = parsed?.prep;
+  let prep = (p && typeof p === 'object' && !Array.isArray(p))
+    ? {
+      painPoints: (Array.isArray(p.painPoints) ? p.painPoints : [])
+        .filter((x) => x && cleanStr(x.pain))
+        .map((x) => ({ pain: cleanStr(x.pain), why: cleanStr(x.why) })),
+      likelyQuestions: (Array.isArray(p.likelyQuestions) ? p.likelyQuestions : [])
+        .filter((x) => x && cleanStr(x.question))
+        .map((x) => ({ question: cleanStr(x.question), how: cleanStr(x.how) })),
+      researchBeforeCall: strList(p.researchBeforeCall),
+      redFlags: strList(p.redFlags),
+    }
+    : null;
+  // Same reasoning as tmay above — an object whose four lists are all empty is nothing.
+  if (prep && !prep.painPoints.length && !prep.likelyQuestions.length
+    && !prep.researchBeforeCall.length && !prep.redFlags.length) prep = null;
+
+  return { variations, tmay, prep };
+}
+
+function composeCoverLetterTxt({ industryLabel, platformLabel, variations, tmay, prep }) {
+  const out = [];
+  const rule = '='.repeat(60);
+  out.push(`COVER LETTER PACK — ${industryLabel} · ${platformLabel}`, rule, '');
+
+  variations.forEach((v, i) => {
+    out.push(`LETTER ${String.fromCharCode(65 + i)} — ${v.label.toUpperCase()}`, '-'.repeat(60));
+    if (v.subject) out.push(`Subject: ${v.subject}`, '');
+    out.push(v.body, '', '');
+  });
+
+  if (tmay && tmay.beats.length) {
+    out.push('VIDEO INTRODUCTION SCRIPT', rule);
+    if (tmay.totalDuration) out.push(`Target length: ${tmay.totalDuration}`, '');
+    tmay.beats.forEach((b) => {
+      out.push(`[${b.timecode}] ${b.label.toUpperCase()} (~${b.seconds}s)`, b.text, '');
+    });
+    if (tmay.deliveryTips.length) {
+      out.push('Delivery tips:');
+      tmay.deliveryTips.forEach((tip, i) => out.push(`  ${i + 1}. ${tip}`));
+      out.push('');
+    }
+    out.push('');
+  }
+
+  if (prep) {
+    out.push('INTERVIEW PREP', rule, '');
+    if (prep.painPoints.length) {
+      out.push('Pain points from the job post:');
+      prep.painPoints.forEach((p) => out.push(`  • ${p.pain}${p.why ? `\n    Why it matters: ${p.why}` : ''}`));
+      out.push('');
+    }
+    if (prep.likelyQuestions.length) {
+      out.push('Likely questions and how to answer:');
+      prep.likelyQuestions.forEach((q) => out.push(`  Q: ${q.question}${q.how ? `\n  A: ${q.how}` : ''}`, ''));
+    }
+    if (prep.researchBeforeCall.length) {
+      out.push('Research before the call:');
+      prep.researchBeforeCall.forEach((r, i) => out.push(`  ${i + 1}. ${r}`));
+      out.push('');
+    }
+    if (prep.redFlags.length) {
+      out.push('Red flags to watch for:');
+      prep.redFlags.forEach((r) => out.push(`  ! ${r}`));
+      out.push('');
+    }
+  }
+
+  return out.join('\n');
+}
+
+// ── Small presentational helpers ───────────────────────────────────────────────
+
+// Section boundaries get the uppercase eyebrow. Individual field labels deliberately do
+// NOT — applying the same treatment at every level (as the source mockup did, 12 times
+// over) flattens the hierarchy so a section header and a single text input read as
+// equally important.
+function FieldGroupLabel({ children, className = '' }) {
+  return <div className={`gh-label ${className}`} style={{ color: NAVY, fontSize: 11 }}>{children}</div>;
+}
+
+function SubFieldLabel({ children, htmlFor }) {
+  return (
+    <label htmlFor={htmlFor} className="block mb-1.5 text-[11px] font-semibold" style={{ color: C.textSoft }}>
+      {children}
+    </label>
+  );
+}
+
+function ChoiceChip({ active, onClick, children, title }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      title={title}
+      className={`gh-pill px-3.5 py-2 text-xs font-semibold${active ? ' is-active' : ''}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function ResultCard({ innerRef, id, title, eyebrow, icon: Icon, action, children }) {
+  return (
+    <section
+      ref={innerRef}
+      tabIndex={-1}
+      aria-labelledby={id}
+      className="glass-card overflow-hidden mt-5"
+      style={{ scrollMarginTop: 24 }}
+    >
+      <div
+        className="px-5 py-4 flex items-start justify-between gap-3 flex-wrap"
+        style={{ borderBottom: `1px solid ${GLASS.borderSoft}`, background: 'var(--primary-tint)' }}
+      >
+        <div className="min-w-0 flex-1">
+          {eyebrow && (
+            <div className="inline-flex items-center gap-1.5 mb-2 px-2.5 py-1 rounded-full text-white text-[10px] font-bold uppercase tracking-wider"
+              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+              {Icon && <Icon size={11} />} {eyebrow}
+            </div>
+          )}
+          <h2 id={id} className="text-base font-bold" style={{ color: C.text, fontFamily: fontDisplay, letterSpacing: '-0.015em' }}>
+            {title}
+          </h2>
+        </div>
+        {action}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function CoverLetterGenerator() {
+  const [jd, setJd] = useState('');
+  const [notes, setNotes] = useState('');
+  const [senderName, setSenderName] = useState('');
+  const [whatsapp, setWhatsapp] = useState('');
+  const [platform, setPlatform] = useState('onlinejobs');
+  const [industry, setIndustry] = useState(DEFAULT_INDUSTRY_ID);
+  // Once the user overrides the picker we stop auto-detecting. Without this latch the
+  // detector reassigns on every keystroke, so choosing "Law Firms" and then typing one
+  // more character silently snaps the selection back.
+  const [industryTouched, setIndustryTouched] = useState(false);
+  // Whether the detector actually identified a SPECIFIC vertical, as opposed to falling
+  // back to `general`. Without this the panel claims "auto-detected" for the default.
+  const [industryDetected, setIndustryDetected] = useState(false);
+  const [showIndustryPicker, setShowIndustryPicker] = useState(false);
+  const [experience, setExperience] = useState('with');
+  const [tone, setTone] = useState(50);
+  const [length, setLength] = useState(50);
+
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
+  const [variations, setVariations] = useState(null);
+  const [tmay, setTmay] = useState(null);
+  const [prep, setPrep] = useState(null);
+  // The industry + platform the current results were generated FOR, frozen at request
+  // time so changing the form afterwards cannot relabel an existing pack.
+  const [resultMeta, setResultMeta] = useState(null);
+
+  const letterRefs = [useRef(null), useRef(null), useRef(null)];
+  const scriptRef = useRef(null);
+  const prepRef = useRef(null);
+  const topRef = useRef(null);
+  const industryToggleRef = useRef(null);
+
+  const ind = getIndustry(industry);
+  const plat = COVER_PLATFORMS.find(p => p.id === platform) || COVER_PLATFORMS[0];
+  const jdWords = wordCount(jd);
+  const jdReady = jd.trim().length >= MIN_JD_CHARS;
+  const hasResults = !!(variations || tmay || prep);
+
+  // Concise spoken summary. Deliberately NOT the result markup itself — see the
+  // aria-busy comment on the results container below.
+  const resultAnnouncement = hasResults
+    ? [
+      `${(variations || []).length} cover ${(variations || []).length === 1 ? 'letter' : 'letters'} ready`,
+      tmay ? 'video script included' : '',
+      prep ? 'interview prep included' : '',
+    ].filter(Boolean).join(', ') + '.'
+    : '';
+
+  const applyJd = (raw) => {
+    const next = raw.length > MAX_JD_CHARS ? raw.slice(0, MAX_JD_CHARS) : raw;
+    setJd(next);
+    if (raw.length > MAX_JD_CHARS) {
+      setNotice(`Job description trimmed to ${MAX_JD_CHARS.toLocaleString()} characters. Paste just the post itself for the sharpest letters.`);
+    }
+    if (!industryTouched) {
+      // Always reassign, never leave the previous answer standing. detectIndustry
+      // returns null below its own 30-char floor while jdReady fires at 20, so a
+      // "keep what we had" branch let a construction JD's industry survive being
+      // replaced by a short unrelated post — and the panel still called it detected.
+      const detected = detectIndustry(next);
+      setIndustry(detected || DEFAULT_INDUSTRY_ID);
+      setIndustryDetected(!!detected && detected !== DEFAULT_INDUSTRY_ID);
+    }
   };
 
-  const copy = () => {
-    navigator.clipboard.writeText(generated);
+  const chooseIndustry = (id) => {
+    setIndustry(id);
+    setIndustryTouched(true);
+    setShowIndustryPicker(false);
+    // Picking a chip unmounts the chip row, which would drop focus to <body>. Hand it
+    // back to the control that opened the picker.
+    requestAnimationFrame(() => industryToggleRef.current?.focus());
   };
 
-  const download = () => {
-    downloadFile(generated, `${type.replace(/[^a-z0-9]/gi, '_')}_${bizName.replace(/[^a-z0-9]/gi, '_') || 'draft'}.txt`, 'text/plain');
+  const loadSample = () => {
+    setNotice('');
+    // Deliberately routed through applyJd rather than latching industryTouched: each
+    // sample detects as its own industry, so detection agrees with the button. Latching
+    // here would silently disable auto-detect for the real job post pasted next.
+    applyJd(ind.sample);
   };
+
+  const jumpTo = (ref) => {
+    const el = ref?.current;
+    if (!el) return;
+    const reduce = typeof window !== 'undefined'
+      && typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    // scrollIntoView walks ancestor scrollers. The app scrolls <main>, not the window,
+    // so window.scrollTo would do nothing at all here.
+    el.scrollIntoView({ block: 'start', behavior: reduce ? 'auto' : 'smooth' });
+    el.focus({ preventScroll: true });
+  };
+
+  const generate = async () => {
+    if (!jdReady || busy) return;
+    setBusy(true);
+    setErr('');
+    setNotice('');
+    // Results are NOT cleared here. A 429 or a transient 5xx would otherwise destroy a
+    // pack the user already had, with no persistence to recover it from. They stay
+    // hidden while `busy` (the skeleton renders instead) and are replaced only on
+    // success, so a failed retry leaves the previous output intact.
+
+    try {
+      const { text, data } = await callClaude({
+        max_tokens: 8000,
+        system: COVER_LETTER_SYSTEM,
+        messages: [{
+          role: 'user',
+          content: buildCoverLetterUser({ ind, plat, tone, length, experience, notes, senderName, whatsapp, jd }),
+        }],
+      }, { returnData: true });
+
+      // The three sections are emitted in order (letters, script, prep), so a response
+      // clipped by max_tokens usually still contains every complete letter. Opting into
+      // prefix recovery here is what makes that salvageable — see src/lib/partialJson.js.
+      const truncated = data?.stop_reason === 'max_tokens';
+      let parsed;
+      try {
+        parsed = parseLooseJson(text, { allowTruncated: truncated });
+      } catch (parseErr) {
+        console.error('[cover-letter] JSON parse failed', parseErr);
+        throw new Error(truncated
+          ? 'The response was cut off before it finished. Try a shorter job description, then generate again.'
+          : 'The AI returned a response we could not read. Please generate again.');
+      }
+
+      const result = coerceCoverLetterResult(parsed);
+      if (!result.variations.length) {
+        throw new Error(truncated
+          ? 'The response was cut off before any letter finished. Try a shorter job description.'
+          : 'The AI returned an unexpected format. Please generate again.');
+      }
+
+      setVariations(result.variations);
+      setTmay(result.tmay);
+      setPrep(result.prep);
+      // Snapshot what these letters were actually written for. Reading `ind`/`plat` at
+      // render or download time would relabel an existing pack the moment the user
+      // clicked a different platform chip, without regenerating anything.
+      setResultMeta({ industryLabel: ind.label, platformLabel: plat.label });
+
+      const missing = [];
+      if (!result.tmay) missing.push('the video script');
+      if (!result.prep) missing.push('the interview prep');
+      if (missing.length) {
+        setNotice(`Your letters are ready, but ${missing.join(' and ')} did not come through${truncated ? ' before the response was cut off' : ''}. Generate again to get the full pack.`);
+      }
+    } catch (e) {
+      console.error(e);
+      // callClaude throws `Claude API <status>: <body>` for HTTP failures. Match on the
+      // status it puts at the FRONT, not on the body text — a body that merely contains
+      // "429" is not a rate limit. Our own thrown messages are already user-facing.
+      const raw = e?.message || '';
+      const status = Number((raw.match(/^Claude API (\d{3})/) || [])[1] || 0);
+      setErr(
+        status === 429 ? 'Too many requests in a row. Wait about a minute, then generate again.'
+          : status === 401 ? 'Your session has expired. Sign out, sign back in, then try again.'
+            : status === 403 ? 'Your current plan does not include the AI tools. Check Account → Membership.'
+              : status ? 'The AI service is unavailable right now. Wait a moment, then generate again.'
+                : raw || 'AI request failed. Please try again in a moment.'
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const downloadAll = () => {
+    // resultMeta, not the live form: the file must describe the brief these letters were
+    // actually written to, even if the user has since clicked a different chip.
+    const meta = resultMeta || { industryLabel: ind.label, platformLabel: plat.label };
+    const txt = composeCoverLetterTxt({ ...meta, variations: variations || [], tmay, prep });
+    const slug = (s) => s.replace(/[^a-z0-9]+/gi, '_').replace(/^_|_$/g, '').toLowerCase();
+    downloadFile(
+      txt,
+      `cover_letters_${slug(meta.industryLabel)}_${slug(meta.platformLabel)}_${todayISODate()}.txt`,
+      'text/plain',
+    );
+  };
+
+  const sliderRow = (id, label, value, setValue, bucketFn, lowLabel, highLabel) => (
+    <div>
+      <div className="flex items-baseline justify-between mb-1.5">
+        <SubFieldLabel htmlFor={id}>{label}</SubFieldLabel>
+        <span className="text-[11px] font-bold" style={{ color: C.primary }}>{bucketFn(value)}</span>
+      </div>
+      <input
+        id={id}
+        type="range"
+        min="0"
+        max="100"
+        step="1"
+        value={value}
+        onChange={e => setValue(Number(e.target.value))}
+        aria-valuetext={bucketFn(value)}
+        className="w-full"
+        style={{ accentColor: C.primary }}
+      />
+      <div className="flex justify-between text-[10px] mt-0.5" style={{ color: C.textSoft }}>
+        <span>{lowLabel}</span><span>{highLabel}</span>
+      </div>
+    </div>
+  );
 
   return (
-    <div>
-      <SectionHead eyebrow="Job Application · Tool" title="Proposal & Outreach Generator (Remote Bookkeeper)" desc="Hormozi × Martell direct-response style — laser-focused on the bookkeeping and accounting pain points a REMOTE bookkeeper solves for US clients. Every output centers on the financial outcomes you deliver, with remote-delivery advantages (cost, focus, timezone) baked in naturally." />
+    <div className="cl-tool">
+      {/* Title matches the sidebar, the Dashboard tile and VOICE_TAB_INFO exactly.
+          Clicking "Cover Letter Generator" must not land on a page headed something
+          else. */}
+      <SectionHead
+        eyebrow="Job Application · Tool"
+        title="Cover Letter Generator"
+        desc="Paste a job post and get three ready-to-send letters, a video-introduction script timed beat by beat, and a prep pack for the call that follows. Written owner-to-owner, not applicant-to-hirer."
+      />
 
-      {/* Style callout */}
-      <div className="mt-6 p-4 rounded-2xl border border-blue-200 flex items-center gap-3" style={{ background: 'var(--status-info-bg)' }}>
-        <Sparkles size={18} style={{ color: ROYAL }} className="flex-shrink-0" />
-        <div className="text-sm text-slate-800">
-          <span className="font-bold" style={{ color: ROYAL }}>Style guide:</span> Short sentences. Specific numbers. One CTA. P.S. on every email. Zero corporate clichés. Built on the playbook used by Alex Hormozi (Acquisition.com) and Dan Martell (SaaS Academy).
-        </div>
-      </div>
+      <div className="max-w-3xl mx-auto" ref={topRef} tabIndex={-1} style={{ scrollMarginTop: 24 }}>
 
-      <div style={{ background: SHEEN }} className="glass-card p-7 rounded-2xl mt-6">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="text-xs uppercase tracking-wider font-bold text-slate-600 block mb-2">Document Type</label>
-            <select value={type} onChange={e => setType(e.target.value)}
-              className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-white text-sm font-medium focus:border-blue-500 outline-none">
-              <option>Cold Outreach Email</option>
-              <option>Follow-Up Email (Day 3)</option>
-              <option>Follow-Up Email (Day 7)</option>
-              <option>Full Proposal Document</option>
-              <option>LinkedIn Connection Request</option>
-              <option>LinkedIn Follow-Up Message</option>
-              <option>Referral Request Email</option>
-            </select>
-          </div>
-          <div>
-            <label className="text-xs uppercase tracking-wider font-bold text-slate-600 block mb-2">Prospect Industry</label>
-            <select value={industry} onChange={e => setIndustry(e.target.value)}
-              className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-white text-sm font-medium focus:border-blue-500 outline-none">
-              <option>General Small Business</option>
-              {INDUSTRIES.map(i => <option key={i}>{i}</option>)}
-            </select>
-          </div>
-          <div>
-            <label className="text-xs uppercase tracking-wider font-bold text-slate-600 block mb-2">Prospect Business Name</label>
-            <input value={bizName} onChange={e => setBizName(e.target.value)} placeholder="e.g., Acme Plumbing"
-              className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-blue-500 outline-none" />
-          </div>
-          <div>
-            <label className="text-xs uppercase tracking-wider font-bold text-slate-600 block mb-2">Contact Person Name</label>
-            <input value={contactName} onChange={e => setContactName(e.target.value)} placeholder="e.g., Sarah Johnson"
-              className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-blue-500 outline-none" />
-          </div>
-          <div className="md:col-span-2">
-            <label className="text-xs uppercase tracking-wider font-bold text-slate-600 block mb-2">Services You Offer</label>
-            <input value={services} onChange={e => setServices(e.target.value)}
-              className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-blue-500 outline-none" />
-          </div>
-          <div>
-            <label className="text-xs uppercase tracking-wider font-bold text-slate-600 block mb-2">Your Pricing</label>
-            <input value={pricing} onChange={e => setPricing(e.target.value)} placeholder="e.g., $650/month"
-              className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-blue-500 outline-none" />
-          </div>
-          <div>
-            <label className="text-xs uppercase tracking-wider font-bold text-slate-600 block mb-2">Your Hook / Angle</label>
-            <input value={hook} onChange={e => setHook(e.target.value)} placeholder="Why you're reaching out"
-              className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-blue-500 outline-none" />
-          </div>
-          <div>
-            <label className="text-xs uppercase tracking-wider font-bold text-slate-600 block mb-2">Your Name</label>
-            <input value={yourName} onChange={e => setYourName(e.target.value)}
-              className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-blue-500 outline-none" />
-          </div>
-          <div>
-            <label className="text-xs uppercase tracking-wider font-bold text-slate-600 block mb-2">Your Firm Name</label>
-            <input value={yourFirm} onChange={e => setYourFirm(e.target.value)}
-              className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-blue-500 outline-none" />
-          </div>
-        </div>
+        {/* ── Form ───────────────────────────────────────────────── */}
+        <div className="glass-card p-5 sm:p-6" style={{ background: SHEEN }}>
 
-        <button onClick={generate} disabled={busy}
-          className="sheen-btn mt-5 text-white font-bold py-3 px-8 rounded-xl shadow-lg text-sm tracking-wide flex items-center gap-2 disabled:opacity-60">
-          {busy ? <><Loader2 size={16} className="animate-spin" /> Drafting with AI...</> : <><Sparkles size={16} /> Generate {type}</>}
-        </button>
-      </div>
-
-      {generated && (
-        <div className="mt-8 fade-in">
-          <div className="flex justify-between items-center mb-3">
-            <div style={{ color: NAVY, fontFamily: fontDisplay }} className="text-xl font-bold">{type}</div>
-            <div className="flex gap-2">
-              <button onClick={copy} className="flex items-center gap-2 px-4 py-2 rounded-xl bg-white border border-slate-300 hover:border-blue-400 transition text-sm font-semibold text-slate-700 shadow-sm">
-                📋 Copy
-              </button>
-              <button onClick={download} className="flex items-center gap-2 px-4 py-2 rounded-xl bg-white border border-slate-300 hover:border-blue-400 transition text-sm font-semibold text-slate-700 shadow-sm">
-                <Download size={14} /> Download .txt
+          <div className="flex items-center justify-between gap-3 mb-2">
+            <FieldGroupLabel>
+              <label htmlFor="cl-jd">Job description</label>
+            </FieldGroupLabel>
+            <div className="flex items-center gap-3">
+              {jdWords > 0 && (
+                <span className="gh-num text-[11px]" style={{ color: C.textSoft }}>{jdWords} words</span>
+              )}
+              <button type="button" onClick={loadSample}
+                className="text-xs font-semibold hover:opacity-75 transition" style={{ color: C.primary }}>
+                Load sample
               </button>
             </div>
           </div>
-          <div className="glossy-card rounded-2xl p-8 border border-slate-200">
-            <div className="whitespace-pre-wrap text-slate-800 text-sm leading-relaxed" style={{ fontFamily: fontBody }}>{generated}</div>
+          <textarea
+            id="cl-jd"
+            rows={5}
+            value={jd}
+            onChange={e => applyJd(e.target.value)}
+            /* No maxLength: the browser would silently truncate an over-long paste
+               before onChange ever saw it, so applyJd could never tell the user it
+               happened. applyJd does the trimming and says so. */
+            placeholder="Paste the job post here. The industry is detected as you type."
+            className="gh-input w-full leading-relaxed"
+            style={{ resize: 'vertical' }}
+          />
+
+          {/* Personal notes */}
+          <div className="mt-4 p-4 rounded-xl" style={{ background: 'var(--primary-tint)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <div className="flex items-center gap-2 mb-1">
+              <FieldGroupLabel><label htmlFor="cl-notes">Personal notes</label></FieldGroupLabel>
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold"
+                style={{ background: 'var(--wash)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}` }}>
+                Optional
+              </span>
+            </div>
+            <p className="text-[11px] mb-2" style={{ color: C.textSoft }}>
+              Years of experience, tools you know, certifications, rate, availability.
+            </p>
+            <textarea
+              id="cl-notes"
+              rows={3}
+              value={notes}
+              onChange={e => setNotes(e.target.value)}
+              placeholder="e.g. 3 years bookkeeping for US clients, QBO ProAdvisor, $12/hr, available 9AM-6PM EST"
+              className="gh-input w-full text-[13px] leading-relaxed"
+              style={{ resize: 'vertical' }}
+            />
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+              <div>
+                <SubFieldLabel htmlFor="cl-name">Your name</SubFieldLabel>
+                <input id="cl-name" type="text" value={senderName} onChange={e => setSenderName(e.target.value)}
+                  placeholder="Maria Santos" className="gh-input w-full text-[13px]" />
+              </div>
+              <div>
+                <SubFieldLabel htmlFor="cl-wa">WhatsApp</SubFieldLabel>
+                <input id="cl-wa" type="tel" value={whatsapp} onChange={e => setWhatsapp(e.target.value)}
+                  placeholder="+63 917 123 4567" className="gh-input w-full text-[13px]" />
+              </div>
+            </div>
+          </div>
+
+          {/* Platform */}
+          <FieldGroupLabel className="mt-5 mb-2">Platform</FieldGroupLabel>
+          <div role="group" aria-label="Platform" className="flex flex-wrap gap-2">
+            {COVER_PLATFORMS.map(p => (
+              <ChoiceChip key={p.id} active={platform === p.id} onClick={() => setPlatform(p.id)}
+                title={p.min === 0 ? 'Body under 100 words' : `Body ${p.min}-${p.max} words`}>
+                {p.label}
+              </ChoiceChip>
+            ))}
+          </div>
+
+          {/* Detected industry */}
+          <FieldGroupLabel className="mt-5 mb-2">Detected industry</FieldGroupLabel>
+          <div className="flex items-center gap-3 px-4 py-3 rounded-xl"
+            style={{ background: jdReady ? 'var(--primary-tint)' : 'var(--wash)', border: `1px solid ${jdReady ? 'var(--status-info-bd)' : GLASS.borderSoft}` }}>
+            <span className="w-2 h-2 rounded-full flex-shrink-0"
+              style={{ background: jdReady ? C.primary : C.textMute }} aria-hidden="true" />
+            <div className="flex-1 min-w-0">
+              {jdReady ? (
+                <>
+                  <div className="text-sm font-semibold" style={{ color: C.text }}>{ind.label}</div>
+                  <div className="text-[11px]" style={{ color: C.textSoft }}>
+                    {industryTouched ? 'Chosen by you'
+                      : industryDetected ? 'Auto-detected from the job post'
+                        : 'No clear industry detected — using a general brief'}
+                  </div>
+                </>
+              ) : (
+                <div className="text-[13px] italic" style={{ color: C.textSoft }}>
+                  Paste a job post above to detect the industry
+                </div>
+              )}
+            </div>
+            <button type="button" ref={industryToggleRef} onClick={() => setShowIndustryPicker(v => !v)}
+              aria-expanded={showIndustryPicker}
+              aria-controls="cl-industry-picker"
+              aria-label={showIndustryPicker ? 'Cancel changing industry' : 'Change detected industry'}
+              className="gh-btn-ghost px-3 py-1.5 rounded-lg text-[11px] font-semibold flex-shrink-0">
+              {showIndustryPicker ? 'Cancel' : 'Change'}
+            </button>
+          </div>
+          {showIndustryPicker && (
+            <div id="cl-industry-picker" role="group" aria-label="Choose industry" className="flex flex-wrap gap-2 mt-2 p-2 rounded-xl" style={{ background: 'var(--wash)' }}>
+              {COVER_INDUSTRIES.map(i => (
+                <ChoiceChip key={i.id} active={industry === i.id} onClick={() => chooseIndustry(i.id)}>
+                  {i.label}
+                </ChoiceChip>
+              ))}
+            </div>
+          )}
+
+          {/* Experience */}
+          <FieldGroupLabel className="mt-5 mb-2">Experience in {ind.label}</FieldGroupLabel>
+          <div role="group" aria-label={`Experience in ${ind.label}`} className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {[
+              { val: 'with', title: 'With experience', sub: 'Lead with past wins' },
+              { val: 'none', title: 'No experience', sub: 'Solution-forward, no hedging' },
+            ].map(e => {
+              const active = experience === e.val;
+              return (
+                <button key={e.val} type="button" onClick={() => setExperience(e.val)} aria-pressed={active}
+                  className="text-left px-4 py-3 rounded-xl transition"
+                  style={active
+                    ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff', border: '1px solid transparent', boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)' }
+                    : { background: 'var(--pill-bg)', color: C.textSoft, border: `1px solid ${GLASS.border}` }}>
+                  <div className="text-[13px] font-semibold">{e.title}</div>
+                  {/* No opacity: this is the ONLY text explaining what the two modes do,
+                      and 80% dropped it to 2.6:1 on the selected gradient. */}
+                  <div className="text-[11px] mt-0.5" style={{ color: active ? '#fff' : C.textSoft }}>{e.sub}</div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Tone / Length */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-5 mt-5">
+            {sliderRow('cl-tone', 'Tone', tone, setTone, toneBucket, 'Casual', 'Professional')}
+            {sliderRow('cl-length', 'Length', length, setLength, lengthBucket, 'Tight', 'Detailed')}
+          </div>
+
+          {/* Generate */}
+          <div className="mt-6">
+            {/* aria-disabled, not disabled: a native `disabled` applied while the button
+                HAS focus (which it does, the user just pressed it) blurs it and drops
+                focus to <body>, with nothing to return it. generate() already no-ops
+                when it is not runnable, so the guard does not need the DOM attribute. */}
+            <button
+              type="button"
+              onClick={generate}
+              aria-disabled={!jdReady || busy}
+              aria-describedby={!jdReady ? 'cl-gate' : undefined}
+              className={`sheen-btn w-full py-3.5 px-6 text-sm font-bold flex items-center justify-center gap-2${(!jdReady || busy) ? ' opacity-50 cursor-not-allowed' : ''}`}
+            >
+              {busy
+                ? <><Loader2 size={16} className="animate-spin" /> Writing your 3 letters...</>
+                : <><Sparkles size={16} /> Generate 3 winning letters</>}
+            </button>
+            {!jdReady && (
+              <p id="cl-gate" className="text-center text-[11px] mt-2" style={{ color: C.textSoft }}>
+                Paste at least {MIN_JD_CHARS} characters of the job post to generate.
+              </p>
+            )}
           </div>
         </div>
-      )}
+
+        {/* ErrorNote renders null when there is no message, so this stays an empty
+            alert region until a failure lands — which is what makes it announce. */}
+        <div role="alert">
+          <ErrorNote msg={err} onClose={() => setErr('')} />
+          {err && (
+            <div className="flex justify-center mt-3">
+              <button type="button" onClick={generate} disabled={busy || !jdReady}
+                className="gh-btn-ghost px-4 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-2 disabled:opacity-50">
+                <RefreshCw size={13} /> Try again
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* Wrapper is ALWAYS mounted, same reason as the role="alert" above: a live
+            region created in the same commit as its content does not announce. */}
+        <div role="status">
+          {notice && (
+            <div className="mt-4 flex items-start gap-3 p-4 rounded-xl"
+              style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)' }}>
+              <AlertTriangle size={18} className="mt-0.5 flex-shrink-0" style={{ color: 'var(--status-warn-fg)' }} />
+              <div className="text-sm flex-1" style={{ color: 'var(--status-warn-fg)' }}>{notice}</div>
+              <button type="button" onClick={() => setNotice('')} aria-label="Dismiss notice"
+                style={{ color: 'var(--status-warn-fg)' }} className="hover:opacity-70"><X size={16} /></button>
+            </div>
+          )}
+        </div>
+
+        {/* ── Results ────────────────────────────────────────────── */}
+        {/* This status line is a SIBLING of the aria-busy container, never a child:
+            aria-busy="true" tells assistive tech to withhold changes inside its own
+            subtree, so a live region nested in it stays silent for the whole request —
+            which is precisely when the user needs to hear something. */}
+        <p className="sr-only" role="status">
+          {busy ? 'Writing your letters. This usually takes under a minute.' : resultAnnouncement}
+        </p>
+
+        {/* aria-busy only, NOT a live region: wrapping the whole result set in
+            aria-live would make a screen reader read all three letters, the script
+            AND the prep pack aloud the moment they arrive. */}
+        <div aria-busy={busy} className="mt-6">
+
+          {busy && (
+            <div aria-hidden="true">
+              {[0, 1, 2].map(i => (
+                <div key={i} className="glass-card p-6 mt-5">
+                  <div className="shimmer rounded-lg mb-3" style={{ height: 28, width: '45%' }} />
+                  <div className="shimmer rounded-lg mb-3" style={{ height: 44, width: '100%' }} />
+                  <div className="shimmer rounded-lg" style={{ height: 90, width: '100%' }} />
+                </div>
+              ))}
+            </div>
+          )}
+
+          {!busy && hasResults && (
+            <>
+              {/* Results index. Deliberately not sticky: SectionHead is already
+                  sticky with a variable-height title, so a second sticky bar needs a
+                  hardcoded offset that breaks whenever the description wraps. */}
+              {resultMeta && (
+                <p className="text-[11px] mb-2" style={{ color: C.textSoft }}>
+                  Written for <strong style={{ color: C.text }}>{resultMeta.industryLabel}</strong>
+                  {' · '}<strong style={{ color: C.text }}>{resultMeta.platformLabel}</strong>
+                </p>
+              )}
+              <nav aria-label="Jump to results" className="flex flex-wrap gap-2">
+                {(variations || []).map((v, i) => (
+                  <button key={i} type="button" onClick={() => jumpTo(letterRefs[i])}
+                    className="gh-pill px-3 py-1.5 text-[11px] font-semibold inline-flex items-center gap-1.5">
+                    <span className="w-4 h-4 rounded grid place-items-center text-white text-[9px] font-bold"
+                      style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+                      {String.fromCharCode(65 + i)}
+                    </span>
+                    {v.label}
+                  </button>
+                ))}
+                {tmay && (
+                  <button type="button" onClick={() => jumpTo(scriptRef)} className="gh-pill px-3 py-1.5 text-[11px] font-semibold">
+                    Video script
+                  </button>
+                )}
+                {prep && (
+                  <button type="button" onClick={() => jumpTo(prepRef)} className="gh-pill px-3 py-1.5 text-[11px] font-semibold">
+                    Interview prep
+                  </button>
+                )}
+                <button type="button" onClick={() => jumpTo(topRef)} className="gh-pill px-3 py-1.5 text-[11px] font-semibold">
+                  Back to top
+                </button>
+              </nav>
+
+              {/* Letters */}
+              {(variations || []).map((v, i) => (
+                <ResultCard
+                  key={i}
+                  innerRef={letterRefs[i]}
+                  id={`cl-letter-${i}`}
+                  eyebrow={`Letter ${String.fromCharCode(65 + i)}`}
+                  title={v.label}
+                  action={<CopyButton
+                    text={v.subject ? `Subject: ${v.subject}\n\n${v.body}` : v.body}
+                    label={`Copy letter ${String.fromCharCode(65 + i)}`}
+                  />}
+                >
+                  <div className="px-5 pt-4">
+                    {v.subject && (
+                      <div className="rounded-xl px-4 py-3 flex items-center justify-between gap-3 flex-wrap"
+                        style={{ background: 'var(--primary-tint)', border: '1px solid var(--status-info-bd)' }}>
+                        <div className="min-w-0">
+                          <div className="gh-label mb-1" style={{ color: NAVY, fontSize: 10 }}>Subject</div>
+                          <div className="text-[13px] font-semibold" style={{ color: C.text }}>{v.subject}</div>
+                        </div>
+                        <CopyButton text={v.subject} label={`Copy subject ${String.fromCharCode(65 + i)}`} small />
+                      </div>
+                    )}
+                  </div>
+                  <div className="px-5 py-4 text-sm leading-relaxed whitespace-pre-wrap break-words"
+                    style={{ color: C.text, fontFamily: fontBody }}>
+                    {v.body}
+                  </div>
+                </ResultCard>
+              ))}
+
+              {/* Video script */}
+              {tmay && (
+                <ResultCard
+                  innerRef={scriptRef}
+                  id="cl-script"
+                  eyebrow="Video introduction"
+                  icon={Video}
+                  title="Tell me about yourself, tailored"
+                  action={<CopyButton text={tmay.beats.map(b => b.text).join('\n\n')} label="Copy script" />}
+                >
+                  <p className="px-5 pt-4 text-[12px]" style={{ color: C.textSoft }}>
+                    Read it, record it, or say it live. Structured for {tmay.totalDuration} of natural delivery.
+                    The timecodes show where each beat lands.
+                  </p>
+                  <div className="px-5 py-4">
+                    {tmay.beats.map(b => (
+                      <div key={b.key} className="flex flex-col sm:flex-row gap-2 sm:gap-4 mb-4 last:mb-0">
+                        {/* w-auto below sm: stacked, the gutter is a ROW holding ~150px of
+                            unshrinkable content, so a 72px box would just be ignored. */}
+                        <div className="flex sm:flex-col items-baseline sm:items-start gap-2 sm:gap-0.5 w-auto sm:w-[90px] flex-shrink-0">
+                          <div className="gh-num text-[13px] font-bold" style={{ color: C.text }}>{b.timecode}</div>
+                          <div className="gh-label" style={{ color: NAVY, fontSize: 10 }}>{b.label}</div>
+                          <div className="gh-num text-[10px]" style={{ color: C.textSoft }}>~{b.seconds}s</div>
+                        </div>
+                        <div className="flex-1 min-w-0 rounded-xl px-4 py-3 text-[13px] leading-relaxed"
+                          style={{ background: 'var(--primary-tint)', borderLeft: `3px solid ${C.primary}`, color: C.text }}>
+                          {b.text}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {tmay.deliveryTips.length > 0 && (
+                    <div className="px-5 py-4" style={{ borderTop: `1px solid ${GLASS.borderSoft}`, background: 'var(--wash)' }}>
+                      <h3 className="gh-label mb-2.5" style={{ color: NAVY, fontSize: 10 }}>Delivery tips</h3>
+                      <ul className="space-y-2">
+                        {tmay.deliveryTips.map((tip, i) => (
+                          <li key={i} className="flex gap-2.5 items-start text-[12px]" style={{ color: C.text }}>
+                            <span className="w-4 h-4 rounded grid place-items-center text-[10px] font-bold flex-shrink-0 mt-0.5"
+                              style={{ background: 'var(--primary-halo)', color: C.primary }}>{i + 1}</span>
+                            {tip}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </ResultCard>
+              )}
+
+              {/* Interview prep */}
+              {prep && (
+                <ResultCard
+                  innerRef={prepRef}
+                  id="cl-prep"
+                  eyebrow="Interview prep"
+                  icon={ClipboardList}
+                  title="Get ready for the call"
+                  action={null}
+                >
+                  {prep.painPoints.length > 0 && (
+                    <div className="px-5 py-4">
+                      <h3 className="gh-label mb-3 flex items-center gap-1.5" style={{ color: NAVY, fontSize: 10 }}>
+                        <Target size={11} /> Pain points from the job post
+                      </h3>
+                      <div className="space-y-2.5">
+                        {prep.painPoints.map((p, i) => (
+                          <div key={i} className="rounded-xl px-4 py-3"
+                            style={{ background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)', borderLeft: '3px solid var(--status-danger-fg)' }}>
+                            <div className="text-[13px] font-semibold" style={{ color: C.text }}>{p.pain}</div>
+                            {p.why && <div className="text-[12px] mt-1" style={{ color: C.textSoft }}>{p.why}</div>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {prep.likelyQuestions.length > 0 && (
+                    <div className="px-5 py-4" style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
+                      <h3 className="gh-label mb-3 flex items-center gap-1.5" style={{ color: NAVY, fontSize: 10 }}>
+                        <HelpCircle size={11} /> Likely questions and how to answer
+                      </h3>
+                      <div className="space-y-2.5">
+                        {prep.likelyQuestions.map((q, i) => (
+                          <div key={i} className="rounded-xl px-4 py-3"
+                            style={{ background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)' }}>
+                            <div className="text-[13px] font-semibold" style={{ color: C.text }}>{q.question}</div>
+                            {q.how && (
+                              <div className="text-[12px] mt-1.5" style={{ color: C.textSoft }}>
+                                <span className="gh-label mr-1.5" style={{ color: NAVY, fontSize: 10 }}>How</span>
+                                {q.how}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {prep.researchBeforeCall.length > 0 && (
+                    <div className="px-5 py-4" style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
+                      <h3 className="gh-label mb-3 flex items-center gap-1.5" style={{ color: NAVY, fontSize: 10 }}>
+                        <Search size={11} /> Research before the call
+                      </h3>
+                      <ul className="space-y-2">
+                        {prep.researchBeforeCall.map((r, i) => (
+                          <li key={i} className="flex gap-2.5 items-start text-[12px] rounded-lg px-3 py-2"
+                            style={{ background: 'var(--status-neutral-bg)', border: '1px solid var(--status-neutral-bd)', color: C.text }}>
+                            <span className="w-4 h-4 rounded grid place-items-center text-[10px] font-bold flex-shrink-0 mt-0.5"
+                              style={{ background: 'var(--primary-halo)', color: C.primary }}>{i + 1}</span>
+                            {r}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {prep.redFlags.length > 0 && (
+                    <div className="px-5 py-4" style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
+                      <h3 className="gh-label mb-3 flex items-center gap-1.5" style={{ color: NAVY, fontSize: 10 }}>
+                        <AlertTriangle size={11} /> Red flags to watch for
+                      </h3>
+                      <ul className="space-y-2">
+                        {prep.redFlags.map((r, i) => (
+                          <li key={i} className="flex gap-2.5 items-start text-[12px] rounded-lg px-3 py-2"
+                            style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
+                            <AlertTriangle size={13} className="flex-shrink-0 mt-0.5" />
+                            {r}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </ResultCard>
+              )}
+
+              <div className="flex justify-center mt-6">
+                <button type="button" onClick={downloadAll}
+                  className="gh-btn-ghost px-5 py-2.5 rounded-xl text-xs font-semibold inline-flex items-center gap-2">
+                  <Download size={14} /> Download everything (.txt)
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

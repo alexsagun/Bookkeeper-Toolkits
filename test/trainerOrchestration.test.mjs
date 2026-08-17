@@ -54,8 +54,8 @@ test('doCatalog: empty authorized set → empty_catalog, no queries', async () =
 // ── Context (the retrieval action) ────────────────────────────────────────────────
 test('doContext: course published but NOT in plan → denied, no retrieval, no leak of the denied title', async () => {
   const { admin, calls } = makeAdmin({
-    tables: { courses: { list: [courseA, courseB] }, enrollment_plans: { single: { name: 'Core Self-Paced' } } },
-    rpc: { user_plan_key: 'core_self_paced' },
+    tables: { courses: { list: [courseA, courseB] }, enrollment_plans: { single: { name: 'Sampler Session' } } },
+    rpc: { user_plan_key: 'sampler' },
   });
   const r = await doContext(admin, UID, [courseA], { course_ref: 'beta', mode: 'explain' });
   assert.equal(r.status, 'denied');
@@ -63,7 +63,7 @@ test('doContext: course published but NOT in plan → denied, no retrieval, no l
   assert.ok(!calledRetrieval(calls), 'must NOT retrieve chunks on a denial');
   assert.ok(!r.chunks, 'denial must carry no chunks');
   // The denial names the plan + only the learner's OWN allowed titles, never the denied course.
-  assert.ok(r.message.includes('Core Self-Paced'));
+  assert.ok(r.message.includes('Sampler Session'));
   assert.ok(!r.message.includes('Beta'), 'must not name the out-of-plan course');
 });
 

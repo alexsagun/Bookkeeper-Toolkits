@@ -162,9 +162,9 @@ don't need to add auth checks inside a tool. See the "Authentication" section in
 
 ## Dates (timezone-safe, date-only)
 
-For date-only fields (e.g. the course platform's `course_date` cohort date), reuse the module-level
+For date-only fields (e.g. the course platform's `course_date` batch-run date), reuse the module-level
 helpers near `downloadFile` (~L709): `todayISODate()` → local `YYYY-MM-DD` for a "today" default,
-`formatCourseDate(iso, opts)` → human-readable display, and `cohortLabel(iso)` → an auto-derived
+`formatCourseDate(iso, opts)` → human-readable display, and `batchRunLabel(iso)` → an auto-derived
 "Month Year" label. They build a **local** `Date` from the parts and never use `new Date('YYYY-MM-DD')`
 or `toISOString().slice(0,10)`, both of which shift a day across the UTC boundary. Store as a Postgres
 `date` and bind to `<input type="date">`.

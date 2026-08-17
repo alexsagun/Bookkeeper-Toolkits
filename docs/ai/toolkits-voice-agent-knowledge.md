@@ -1,5 +1,5 @@
 <!-- GENERATED FILE — do not hand-edit. Regenerate with `npm run ai:knowledge`
-     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-07-28 -->
+     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-08-17 -->
 
 # Toolkits by Alex — Voice Assistant Knowledge
 
@@ -44,7 +44,7 @@ paths never change.
 | Tool | Tab id | URL path | What it does |
 |---|---|---|---|
 | Dashboard | `dashboard` | `/` | Progress overview with career-stage tiles, membership status, and quick links to every tool. |
-| Community | `community` | `/community` | Member forum split into spaces: a General space for every active member (start discussions and react; replies live in the premium communities) plus private per-batch Gold and VIP spaces with the full forum — search, free-form tags, image/video/link attachments, @mentions, reactions, pinned posts, and admin announcements with read-tracking, plus a notification bell. Gold and VIP members land in their own batch community; access follows the membership automatically. |
+| Community | `community` | `/community` | Member forum split into spaces: a General space every active member can read and react to (announcements only — nobody replies there) plus a private per-batch VIP space with the full forum — search, free-form tags, image/video/link attachments, @mentions, reactions, pinned posts, and admin announcements with read-tracking, plus a notification bell. VIP members land in their own batch community; access follows the membership automatically. |
 
 ### Training & Skills
 
@@ -68,7 +68,7 @@ paths never change.
 | Job Interview Mastery | `interview` | `/job-interview-mastery` | Interview prep hub: winning-strategy courses, mock interview simulator, common and accounting questions, body language, JD question generator, and salary negotiation. |
 | Free QB Diagnostic | `qbdiag` | `/quickbooks-diagnostic` | QuickBooks file diagnostic checklist to offer prospects as a free audit. |
 | Painpoints & Solutions | `painpoints` | `/painpoints-solutions` | AI generator for client pain points and how a remote bookkeeper solves them. |
-| Proposal Generator | `proposal` | `/proposal-generator` | AI proposal and outreach generator tailored to a specific job post. |
+| Cover Letter Generator | `proposal` | `/proposal-generator` | Paste a job post to get three cover letters, a timed video-introduction script, and an interview prep pack. |
 | Discovery Call Simulator | `discovery` | `/discovery-call-simulator` | AI-simulated discovery-call practice with a prospective US client. |
 
 ### Client Management & Delivery
@@ -100,7 +100,7 @@ paths never change.
 | Access Requests | `accessrequests` | `/admin/access-requests` | Admin screen: approve or reject new signups. |
 | Enrollments | `enrollments` | `/admin/enrollments` | Admin screen: review payment receipts, approve subscriptions, and manage renewals. |
 | Student Imports | `studentimports` | `/admin/student-imports` | Admin screen: migrate legacy Thinkific students — validate, map course-combos to plans, dry-run, and import accounts + memberships. |
-| Batches | `batches` | `/admin/batches` | Admin screen: manage Gold/VIP cohorts (batches) — create monthly batches, set capacities, close or archive them, and assign members to their private batch communities. |
+| Batches | `batches` | `/admin/batches` | Admin screen: manage the VIP batches — create a monthly batch, edit its name, code, dates, timezone and seat capacities while the batch is current or upcoming, close or archive it, and assign members to their private batch communities. A batch closes automatically once its month ends, and a batch whose period has passed becomes read-only. |
 
 Special sub-sections of Job Interview Mastery (tab `interview`): winning-strategy
 courses (`winstrat`), mock interview simulator (`mock`), common questions
@@ -114,23 +114,22 @@ to USD.
 
 | Plan | Key | Price (PHP) | Access | Highlights |
 |---|---|---|---|---|
-| QBO Mastery Only (Core · Self-Paced) | `core_self_paced` | ₱999 | 60 days | Simulated annual bookkeeping project for an NY-based construction company; 60-day QBO Mastery course access; Weekly Discord chat (Thu) |
 | Sampler Session (Essentials) | `sampler` | ₱1,499 | 60 days | 1 Live Zoom Session (3 hours); 60-day course access; 60-day group chat support; Limited offer · 60-day support |
-| QBO + Resume Combo (Silver · Self-Paced) | `silver_self_paced` | ₱1,999 | 60 days | Simulated annual bookkeeping project for an NY-based construction company; 60-day QBO Mastery course access; 60-day Resume & Interview course access; Weekly Discord chat (Thu) |
-| Live Group Track (Gold Package) | `gold_live` | ₱9,999 (was ₱35,000) | 180 days | Simulated annual bookkeeping project for an NY-based construction company; 12 LIVE Group Zoom Trainings (MWF 9am to 11am PH time); 180-day resume + interview course access; Weekly group consult until hired; Discord chat support until and after hired; BEST VALUE |
-| Personalized Coaching Program (VIP Package) | `vip` | ₱15,999 (was ₱35,000) | 180 days | Simulated annual bookkeeping project for an NY-based construction company; 12 Live Group Zoom Trainings (MWF 9am to 11am PH Time); 1-on-1 Resume & Interview Coaching (1 session); Weekly group consult until hired; Discord chat support until and after hired; BEST SELLER · Limited to 10 slots per month |
+| QBO + Resume Combo (Silver · Self-Paced) | `silver_self_paced` | ₱2,999 | 60 days | Simulated annual bookkeeping project for an NY-based construction company; 60-day QBO Mastery course access; 60-day Resume & Interview course access; Weekly Discord chat (Thu) |
+| Personalized Coaching Program (VIP Package) | `vip` | ₱16,999 (was ₱35,000) | 180 days | Simulated annual bookkeeping project for an NY-based construction company; 12 Live Group Zoom Trainings (MWF 9am to 11am PH Time); 1-on-1 Resume & Interview Coaching (1 session); Weekly group consult until hired; Discord chat support until and after hired; BEST SELLER · Limited to 10 slots per month |
 
 **What each plan can open (entitlement scope):**
 
-- **QBO Mastery Only** (`core_self_paced`): Training & Skills only. Can open: Dashboard, Accounting 101, QuickBooks Online Mastery, Industry Accounting, US Tax 101, ProAdvisor Chat, Niche Selector Quiz, Community.
 - **Sampler Session** (`sampler`): Essentials + 1-on-1 coaching. Can open: Dashboard, QuickBooks Online Mastery, Book 1-on-1 with Alex, Personalized Coaching With Alex, Community. Within the QuickBooks catalog it can only open **essentials-tier** courses (QuickBooks Online Essentials — NOT Mastery).
 - **QBO + Resume Combo** (`silver_self_paced`): **Full toolkit access** — every student tool in the toolkit.
-- **Live Group Track (`gold_live`), Personalized Coaching Program (`vip`)**: full toolkit access.
-- **Any other, unknown, or legacy plan** (and every admin): full toolkit access.
+- **Personalized Coaching Program** (`vip`): **Full toolkit access** — every student tool in the toolkit.
+- **Admins, and legacy members with no plan key on file**: full toolkit access.
+- **A retired or unrecognized plan key** (e.g. a membership that is no longer sold): Home only. The member keeps their Dashboard and membership panel and is asked to renew or upgrade — it does NOT grant the full toolkit.
 
-Important nuance: the **Sampler Session costs more than QBO Mastery Only but unlocks
-LESS course content** — its ₱ price buys a live 1-on-1 coaching session, not more
-courses. Never assume a higher price means broader access.
+Important nuance: the **Sampler Session is the only plan with limited course access** —
+its ₱ price buys a live Zoom session and a 1-on-1 coaching booking, not the full course
+library. It opens QuickBooks Online **Essentials** only, not Mastery. Both other plans
+open every student tool.
 
 A tool outside the user's plan still shows a polite upgrade page if opened — nothing
 breaks. The assistant may navigate there and then suggest upgrading.

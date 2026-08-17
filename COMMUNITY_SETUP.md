@@ -118,17 +118,17 @@ migrations and **two** storage buckets, no env vars.
 Since [`db/2026-07-28-community-spaces-batches.sql`](db/2026-07-28-community-spaces-batches.sql)
 the community is split into **spaces**:
 
-- **General** — every active plan (Core / Sampler / Silver / Gold / VIP + legacy grandfathers).
+- **General** — every active plan (Sampler / Silver / VIP + legacy grandfathers).
   Members **post and react but cannot reply** (`community_spaces.member_comments = false`;
   historical replies stay readable). Admins can still reply (moderation, via `*_admin_all`).
-- **Gold — \<batch\>** and **VIP — \<batch\>** — one PRIVATE full-forum space per cohort
+- **VIP — \<batch\>** — the one PRIVATE full-forum space per batch
   (`batches` row, e.g. `2026-08` "August 2026"), auto-created when the batch is created.
-  Gold and VIP are never combined, and batches never see each other's private spaces.
+  VIP is the only premium segment (#39), and batches never see each other's private spaces.
 
 **How access derives (no membership table):** `my_community_space_ids()` reads the member's
 current valid subscription (active + date-valid incl. the 3-day grace) → General always, plus
-the premium space where `enrollment_plans.community_segment` (gold_live → `gold`, vip → `vip`)
-and `subscriptions.batch_id` match. Unknown/legacy plans and premium subs **without a batch**
+the premium space where `enrollment_plans.community_segment` (`vip` → `vip`; every other plan
+stays `general`) and `subscriptions.batch_id` match. Unknown/legacy plans and premium subs **without a batch**
 get General only (fail closed — those members appear in Admin → Batches → "Needs batch
 assignment"). Expiry, renewal, upgrade, and downgrade therefore apply on the very next query
 with nothing to sync or revoke. Every community policy (+ the `community-media` storage read)
@@ -137,23 +137,54 @@ take a `p_space_id`; the notify triggers drop cross-space mention uuids; posts/c
 trigger-stamped, frozen `space_id`. New attachment uploads use `<space_id>/<uid>/<uuid>-<name>`
 paths (legacy `<uid>/…` files keep working — read authorization is attachment-join based).
 
-**Where batches come from:** the paywall makes Gold/VIP students pick an OPEN batch at
+**Where batches come from:** the paywall makes VIP students pick an OPEN batch at
 checkout; the transactional `admin_finalize_enrollment()` RPC validates it (open status +
 optional per-segment capacity) at approval; imports carry an explicit `batch_code` column;
-and Admin → **Batches** manages cohorts (create/close/archive, capacities, bulk assignment —
+and Admin → **Batches** manages batches (create/edit/close/archive, capacities, bulk assignment —
 each change audited in `batch_events`).
 
 > **Capacity is enforced on two paths only** — approval (`admin_finalize_enrollment()`) and
 > bulk assignment (`admin_assign_batch()`), both under a batch row lock. **Bulk imports and
 > direct SQL grants do not consume seats**, so a premium import can push a batch past its
-> stated capacity. Check the counts in Admin → Batches after importing a cohort.
+> stated capacity. Check the counts in Admin → Batches after importing a batch.
 
 > **Archiving a batch also blocks its members' renewals and extensions** (the approval RPC
 > refuses an archived batch before the existing-member carve-out). It never revokes access
 > already granted. Use **Close** to stop new assignments while letting members renew.
 
+**Editing a batch, and when it stops being editable (#38).** Every batch whose period is
+current or upcoming has an **Edit batch** action: name, code, start/end dates, timezone and
+the VIP + total capacities. A batch becomes **read-only once its period has elapsed in its
+own timezone** — today-local later than `ends_on`, so it stays editable through its final local
+day. That lock is the calendar, *not* the status: a batch can be closed early or archived
+mid-month and still be editable, and an archived batch whose month has passed is not. Past
+batches keep only **Archive / Un-archive**.
+
+> **The code is the allocation order, not a label.** Seats are allocated from the registry in
+> `code` order, so a new code must keep the batch in the **same position** relative to the
+> others — otherwise the edit is refused (`BATCH_CODE_REORDER`) because it would reorder
+> members' already-purchased runs. Renaming a batch updates its VIP community
+> **name**; the **slug never changes**, so existing `?space=…` links and bookmarks keep
+> working. `update (code)` is revoked from `authenticated`, so there is no way around the RPC.
+
+**Automatic month-end closure (#38).** A pg_cron job, `close-due-batches`, runs hourly and
+closes every open batch whose local period has ended — status `closed`, never `archived`,
+with an `auto_close` row in `batch_events`. It is idempotent, so a late or repeated run is
+harmless. Existing members keep their seats, their private space and their history; only
+*new* assignments are blocked.
+
+- **Deploy step:** if #38's migration printed the pg_cron notice, open **Dashboard →
+  Integrations → Cron**, enable it, and run the `cron.schedule(...)` call it printed.
+  Verify with `select jobname, schedule from cron.job where jobname = 'close-due-batches';`
+  and, after the first hour, `select * from cron.job_run_details where jobname =
+  'close-due-batches' order by start_time desc limit 5;`.
+- **Recovery / testing:** Admin → Batches → **Run closures now** performs the same sweep on
+  demand. The page also warns when a batch is overdue but still open, and when **no** batch is
+  open for the current or an upcoming month — at which point VIP checkout loses its batch
+  picker and queued seats stop being allocated, so create the next batch.
+
 **Client:** a space switcher appears under the Community header once more than one space is
-accessible (`/community?space=<slug>&post=<id>` deep links; gold/vip members land in their
+accessible (`/community?space=<slug>&post=<id>` deep links; VIP members land in their
 private space by default; the last selection persists per user). On a pre-#32 database the
 client silently runs the old single-space forum and admins see a setup notice.
 
@@ -169,14 +200,14 @@ client silently runs the old single-space forum and admins see a setup notice.
 3. Run the forum upgrade migration **#24** (Step 2).
 4. If the bucket creation raised a NOTICE, create the two buckets by hand (Step 3).
 5. Run the write-gate migration **#28** ([`db/2026-07-26-community-write-gate.sql`](db/2026-07-26-community-write-gate.sql)) — closes an RLS gap so an expired member can't edit/soft-delete their own posts/comments via REST. Idempotent, policy-only. (A **fresh** install already has it from the bootstrap.)
-6. Run the spaces & batches migration **#32** ([`db/2026-07-28-community-spaces-batches.sql`](db/2026-07-28-community-spaces-batches.sql)) — the General + per-batch Gold/VIP model above. Needs #12 + #13 + #20 + #23/#24 + #30; run after #29/#31. Existing posts backfill into General; the August 2026 batch (`2026-08`) is seeded open. (A **fresh** install gets it from the bootstrap §19.)
+6. Run the spaces & batches migration **#32** ([`db/2026-07-28-community-spaces-batches.sql`](db/2026-07-28-community-spaces-batches.sql)) — the General + per-batch Gold/VIP model *(superseded by #39: VIP only)*. Needs #12 + #13 + #20 + #23/#24 + #30; run after #29/#31. Existing posts backfill into General; the August 2026 batch (`2026-08`) is seeded open. (A **fresh** install gets it from the bootstrap §19.)
 7. Run the batch hardening migration **#33** ([`db/2026-07-29-community-batch-hardening.sql`](db/2026-07-29-community-batch-hardening.sql)) — seat-occupancy capacity fix, attachment path binding, set-based mention search, notification column grant — **immediately followed by #34** ([`db/2026-07-29-batch-hardening-followup.sql`](db/2026-07-29-batch-hardening-followup.sql)), which corrects #33's copy of `admin_finalize_enrollment` and gates `community_media_delete`. Running #33 without #34 leaves the approval RPC missing its `updated_at`/`rejected_*` housekeeping. Both additive and idempotent. (A **fresh** install gets them from the bootstrap §20/§21.)
-8. **Deploy the matching client build.** Steps 2–5 were RLS-only and went live on refresh; **#32 is not** — see the callout above. Until the new build is deployed there is a known gap: General ships with member replies OFF, so the *old* client still renders reply composers whose inserts RLS now refuses. If that window will be long, soften it with one row:
-   ```sql
-   update public.community_spaces set member_comments = true where slug = 'general';
-   ```
-   and set it back to `false` in the same session as the deploy.
-9. Refresh the app — the forum goes live.
+8. **Deploy the matching client build.** Steps 2–5 were RLS-only and went live on refresh; **#32 is not** — see the callout above. Deploy the client build **before** running #36, so the app reads the new space flags and hides the compose controls instead of rendering buttons whose inserts RLS refuses.
+
+   > ⚠ **Do NOT "temporarily soften" General by flipping `member_comments` back on.** That instruction used to live here, it was followed, and it was never reverted — production ran for a week with every plan able to reply in General, which is the exact problem this feature exists to remove. Since **#36** the flags are pinned by a CHECK constraint (`community_spaces_general_announcement_only`), so reversing D2 now requires dropping a named constraint and recording it in `db/README.md`. That friction is deliberate.
+
+9. Run the entitlement + capability migrations **#35** ([`db/2026-07-30-batch-entitlements.sql`](db/2026-07-30-batch-entitlements.sql)) then **#36** ([`db/2026-07-31-community-plan-capabilities.sql`](db/2026-07-31-community-plan-capabilities.sql)). #35 is member-invisible (the cohort ledger). **#36 is the visible one:** it makes General announcement-only for every plan and removes posting/replying from every self-paced member. Announce it before you run it.
+10. Refresh the app — the forum goes live.
 
 ## Step 1 — Run the community migration (#23, required)
 
@@ -257,16 +288,18 @@ The object policies were already applied by the migration either way.
   cleanup if needed (Storage → browse the `<uid>/` folders).
 - **The space switcher never appears.** #32 isn't applied (the client runs legacy single-space
   mode — admins see the inline setup notice naming the migration), or the member genuinely has
-  only General (every non-Gold/VIP plan — the switcher hides with a single accessible space).
-- **A Gold/VIP member sees only General.** Their active subscription has no `batch_id` —
+  only General (every non-VIP plan — the switcher hides with a single accessible space).
+- **A VIP member sees only General.** Their active subscription has no `batch_id` —
   grants made outside `admin_finalize_enrollment()` (SQL editor, imports without a
   `batch_code`) land batch-less by design (fail closed). Assign them in Admin → **Batches** →
   "Needs batch assignment".
-- **A member asks why they can't reply in General.** By design (#32): General is
-  posts + reactions only (`community_spaces.member_comments = false`); replies live in the
-  premium batch communities. Flip it back anytime with
-  `update public.community_spaces set member_comments = true where slug = 'general';` —
-  no migration needed.
+- **A member asks why they can't post or reply in General.** By design (D2, #36): General is an
+  **announcement space** — admins post, everyone reads and reacts, nobody replies. That applies to
+  **every** plan, including VIP; VIP discussion happens in its own per-batch space.
+  The flags are pinned by the `community_spaces_general_announcement_only` CHECK, so reversing it is
+  a deliberate act: drop the constraint, change the flags, flip the plan capability columns, and
+  record it in `db/README.md`. Do not just run an UPDATE — an unrecorded UPDATE is how production
+  drifted from #32 in the first place.
 - **A mention doesn't autocomplete or notify in a private space.** The directory and the
   notify triggers are space-scoped: only currently-eligible members of THAT space match, and
   a cross-space uuid pasted into the body notifies nobody. Both are server-enforced.

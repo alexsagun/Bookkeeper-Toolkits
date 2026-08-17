@@ -1,0 +1,1082 @@
+<!-- ===================================================================
+     Get Hired With Alex — Bookkeeper Proposal Forge
+     Plain HTML/CSS/JS conversion of the original React component.
+
+     API: this file calls window.claude.complete(prompt) — your web app's
+     built-in API. No external keys or fetch calls are used. If your app
+     exposes the completion function under a different name, change the
+     single call inside generate() (search for "window.claude.complete").
+     ==================================================================== -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Get Hired With Alex</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Inter', sans-serif; }
+  @keyframes shimmer { 0% { background-position: 200% 0 } 100% { background-position: -200% 0 } }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.6 } }
+  input:focus, textarea:focus { outline: none; border-color: #3D8BFF !important; box-shadow: 0 0 0 3px rgba(61,139,255,0.15); }
+  #ghwa-root .skeleton-row {
+    border-radius: 10px;
+    margin-bottom: 14px;
+    background: linear-gradient(90deg,#EAF4FF 25%,#DCE9FF 50%,#EAF4FF 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.6s infinite;
+  }
+  #ghwa-root ::-webkit-scrollbar { height: 0; width: 0; }
+</style>
+</head>
+<body>
+<div id="ghwa-root"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ============================ DATA ============================ */
+
+  var INDUSTRIES = [
+    {
+      id: "general", label: "General Business",
+      pain: ["books are months behind and the owner has lost trust in the numbers", "bank reconciliations have not been touched in a while", "owner cannot confidently answer are we profitable this month without a panic spreadsheet"],
+      deliverables: ["clean catch-up and reconciliation within 3 weeks", "monthly close package delivered by the 7th every month", "clear P&L and balance sheet the owner can actually use to make decisions"],
+      tools: ["QuickBooks Online", "Xero", "Bill.com"],
+      sample: "Small business looking for a reliable remote bookkeeper. Our books are behind and we are not sure exactly how far. Bank rec has not been done in a while, expenses are mixed up, and we need someone to clean things up. We use QuickBooks Online."
+    },
+    {
+      id: "construction", label: "Construction",
+      pain: ["job cost reports are always late or wrong", "WIP schedules are a mess and retainage is never tracked", "progress billing disputes eat up PM time"],
+      deliverables: ["weekly job cost variance reports in 48 hrs", "clean WIP schedule updated every draw cycle", "progress billing reconciled against contract to the penny"],
+      tools: ["QuickBooks Contractor", "Buildertrend", "Procore"],
+      sample: "We are a mid-size GC doing 8 to 12M per year. Our current bookkeeper cannot keep up with job costing. We have 14 active projects and retainage is not tracked anywhere. We use QuickBooks Contractor and Buildertrend but they are not linked."
+    },
+    {
+      id: "realestate", label: "Real Estate",
+      pain: ["trust accounts out of balance and one audit away from disaster", "property-level P&L impossible to pull without days of work", "rent roll reconciliation done manually in Excel"],
+      deliverables: ["property-level P&L ready by the 5th of every month", "trust account three-way reconciliation monthly", "clean rent roll with variance flags auto-highlighted"],
+      tools: ["AppFolio", "Buildium", "Yardi"],
+      sample: "We manage 120 residential units across 6 properties. Our books are in AppFolio but nobody is reconciling the trust accounts. Each property needs its own P&L for lenders."
+    },
+    {
+      id: "ecommerce", label: "E-commerce",
+      pain: ["Shopify and Amazon payouts hit the bank but nobody knows what they mean", "sales tax nexus exposure growing every month unchecked", "COGS is guesswork with no landed cost tracking"],
+      deliverables: ["A2X-automated payout reconciliation within 2 days of each settlement", "multi-state sales tax nexus map with liability estimate", "COGS per SKU tracked monthly with landed cost baked in"],
+      tools: ["QuickBooks Online", "Xero", "A2X"],
+      sample: "7-figure Shopify and Amazon store. We are selling in 18 states and have no idea about sales tax exposure. A2X is installed but not configured. Need someone who lives in e-commerce accounting."
+    },
+    {
+      id: "healthcare", label: "Healthcare",
+      pain: ["insurance reimbursements sitting in A/R 90+ days with no follow-up", "patient A/R aging report has not been run in months", "HIPAA-compliant data handling non-negotiable but never verified"],
+      deliverables: ["insurance A/R aging report weekly, segmented by payer", "denial rate tracked monthly with root-cause flag", "month-end close done with HIPAA-safe data workflow throughout"],
+      tools: ["Kareo", "Athena", "DrChrono"],
+      sample: "We are a 3-provider physical therapy practice. Insurance reimbursements are all over the place. We use Kareo for billing but our bookkeeping is in QBO and nothing talks to each other."
+    },
+    {
+      id: "insurance", label: "Insurance",
+      pain: ["commission statements from carriers never match what is in the AMS", "chargeback reconciliation done once a year, not monthly", "agency management system and GL are two completely different stories"],
+      deliverables: ["monthly commission reconciliation to the carrier statement", "chargeback log maintained and reconciled every cycle", "AMS and GL in sync by the 10th of each month"],
+      tools: ["AMS360", "Applied Epic", "EZLynx"],
+      sample: "Independent insurance agency, 2.4M GWP. We get commission statements from 11 carriers and our AMS360 never matches what we deposited. Need a bookkeeper who understands insurance."
+    },
+    {
+      id: "accounting", label: "Accounting Firms",
+      pain: ["client cleanup jobs pile up and white-label capacity is always short", "month-end close gets pushed to the 20th because bandwidth is thin", "Karbon workflow is broken and client data sits in limbo"],
+      deliverables: ["full white-label cleanup delivered within agreed scope and deadline", "month-end close package ready by the 7th for every client", "Karbon tasks updated daily so you always know status"],
+      tools: ["QuickBooks Online", "Xero", "Karbon", "Keeper"],
+      sample: "CPA firm with 40 small business clients. We are drowning in cleanup work. Looking for a white-label bookkeeper who can take on 8-10 clients."
+    },
+    {
+      id: "lawfirm", label: "Law Firms",
+      pain: ["IOLTA trust account has not been three-way reconciled in 4 months", "matter-based billing does not match what is in the GL", "state bar audit risk is real and nobody is addressing it"],
+      deliverables: ["IOLTA three-way reconciliation done monthly", "matter-level P&L updated every billing cycle", "trust-to-operating transfer log maintained with zero errors"],
+      tools: ["Clio", "PCLaw", "CosmoLex"],
+      sample: "Boutique litigation firm, 6 attorneys. Our IOLTA account is a mess. We use Clio but the GL in PCLaw never matches."
+    },
+    {
+      id: "saas", label: "SaaS / Tech",
+      pain: ["MRR and ARR reported differently every month and nobody trusts the number", "deferred revenue not recognized under ASC 606", "Stripe payouts hit the bank and nobody reconciles them"],
+      deliverables: ["MRR/ARR dashboard updated by the 3rd, consistent methodology every month", "deferred revenue schedule maintained in compliance with ASC 606", "Stripe reconciled to the GL within 48 hrs of each payout"],
+      tools: ["Stripe", "QuickBooks Online", "Maxio"],
+      sample: "B2B SaaS, 1.8M ARR. Our investors keep asking for MRR and we give them a different number every time. Stripe payouts go into the bank but nobody is reconciling."
+    },
+    {
+      id: "restaurant", label: "Restaurants",
+      pain: ["daily sales reconciliation never done and POS and bank never match", "tip reporting is a liability waiting to happen", "food cost tracked monthly at best, never daily or weekly"],
+      deliverables: ["daily sales reconciliation from POS to bank", "tip reporting log maintained weekly, IRS-compliant", "food cost variance report every week, by category"],
+      tools: ["Toast", "Restaurant365", "Square"],
+      sample: "Fast-casual restaurant group, 3 locations. Our Toast POS reports never match the bank. Food cost is tracked monthly but we have no idea where waste is happening."
+    },
+    {
+      id: "agency", label: "Agencies",
+      pain: ["project profitability unknown until the invoice is sent", "1099 season is chaos because contractor payments were never tracked", "retainer vs project billing mixed up in QBO"],
+      deliverables: ["project-level P&L updated bi-weekly", "1099 tracker maintained monthly", "retainer and project billing separated in QBO from day one"],
+      tools: ["QuickBooks Online", "Harvest", "Productive"],
+      sample: "Digital marketing agency, 1.2M revenue. We have no idea which clients are actually profitable. Retainer income and project fees are mixed together in QBO."
+    }
+  ];
+
+  var PLATFORMS = [
+    { id: "onlinejobs", label: "OnlineJobs.ph", range: [50, 95], note: "conversational, PH timezone advantage mentioned once" },
+    { id: "upwork", label: "Upwork", range: [50, 96], note: "hook opener proving you read the post, concrete CTA" },
+    { id: "linkedin", label: "LinkedIn", range: [50, 150], note: "slightly more formal, connection-message friendly" },
+    { id: "coldemail", label: "Cold Email", range: [0, 100], note: "pattern-interrupt subject, hook + offer + CTA" }
+  ];
+
+  var INDUSTRY_SIGNATURES = {
+    construction: {
+      strong: ["job costing", "wip", "retainage", "progress billing", "buildertrend", "procore", "quickbooks contractor", "subcontractor", "change order", "draw schedule", "aia billing", "cost code"],
+      weak: ["general contractor", "construction", "contractor", "job cost", "building trades"]
+    },
+    realestate: {
+      strong: ["appfolio", "buildium", "yardi", "iolta", "rent roll", "trust account", "property management", "rental property", "tenant", "landlord"],
+      weak: ["real estate", "property", "rental", "leasing", "cap rate"]
+    },
+    ecommerce: {
+      strong: ["shopify", "amazon seller", "a2x", "sales tax nexus", "cogs", "landed cost", "sku", "fulfillment", "marketplace", "amazon fba", "ebay", "etsy"],
+      weak: ["e-commerce", "ecommerce", "online store", "d2c", "dtc"]
+    },
+    healthcare: {
+      strong: ["kareo", "athena", "drchrono", "hipaa", "insurance reimbursement", "patient a/r", "denial rate", "medical billing", "revenue cycle", "cpt code", "clinic", "medical practice", "physical therapy", "chiropractic", "dental"],
+      weak: ["healthcare", "medical", "patients", "providers"]
+    },
+    insurance: {
+      strong: ["ams360", "applied epic", "ezlynx", "commission statement", "chargeback", "insurance agency", "premium", "producer", "gwp", "captive agent", "independent agent"],
+      weak: ["insurance", "agency", "policy", "policies", "underwriter"]
+    },
+    accounting: {
+      strong: ["karbon", "keeper", "white-label", "white label", "cpa firm", "accounting firm", "client cleanup", "month-end close", "cas practice", "advisory services", "outsourced accounting"],
+      weak: ["cpa", "accountant", "accounting practice", "bookkeeping firm"]
+    },
+    lawfirm: {
+      strong: ["iolta", "clio", "pclaw", "cosmolex", "matter-based billing", "state bar", "three-way reconciliation", "law firm", "attorneys", "litigation"],
+      weak: ["legal", "attorney", "lawyer", "law practice"]
+    },
+    saas: {
+      strong: ["mrr", "arr", "asc 606", "deferred revenue", "stripe", "maxio", "chartmogul", "saas", "subscription revenue", "revenue recognition", "annual contracts", "arpu", "churn", "ltv", "cac"],
+      weak: ["software company", "tech startup", "b2b saas", "startup", "recurring revenue"]
+    },
+    restaurant: {
+      strong: ["toast", "restaurant365", "square pos", "tip reporting", "food cost", "prime cost", "daily sales", "pos reconciliation", "fast-casual", "menu engineering"],
+      weak: ["restaurant", "cafe", "coffee shop", "bar", "brewery", "hospitality", "food service"]
+    },
+    agency: {
+      strong: ["harvest", "productive", "project profitability", "retainer", "1099", "contractor payments", "agency accounting", "billable hours", "utilization", "project-based billing"],
+      weak: ["marketing agency", "creative agency", "digital agency", "ad agency", "consulting firm"]
+    }
+  };
+
+  /* ============================ HELPERS ============================ */
+
+  function wc(text) {
+    return text.trim().split(/\s+/).filter(Boolean).length;
+  }
+
+  function esc(s) {
+    if (s === null || s === undefined) return "";
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function detectIndustry(text) {
+    if (!text || text.trim().length < 30) return null;
+    var lower = text.toLowerCase();
+
+    function hasWord(kw) {
+      var escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, function (m) { return "\\" + m; });
+      var pattern = "(^|[^a-z0-9])" + escaped + "(?![a-z0-9])";
+      try {
+        return new RegExp(pattern, "i").test(lower);
+      } catch (e) {
+        return false;
+      }
+    }
+
+    var scores = {};
+    var ids = Object.keys(INDUSTRY_SIGNATURES);
+    for (var i = 0; i < ids.length; i++) {
+      var id = ids[i];
+      var sig = INDUSTRY_SIGNATURES[id];
+      var s = 0;
+      for (var j = 0; j < sig.strong.length; j++) {
+        if (hasWord(sig.strong[j])) s += 3;
+      }
+      for (var k = 0; k < sig.weak.length; k++) {
+        if (hasWord(sig.weak[k])) s += 1;
+      }
+      scores[id] = s;
+    }
+
+    var sorted = Object.keys(scores).map(function (key) { return [key, scores[key]]; }).sort(function (a, b) { return b[1] - a[1]; });
+    var topId = sorted[0][0];
+    var topScore = sorted[0][1];
+    var secondScore = sorted[1] ? sorted[1][1] : 0;
+    if (topScore >= 3 && topScore - secondScore >= 2) return topId;
+    return "general";
+  }
+
+  // Post-process AI output to strip em-dashes / en-dashes that slip through.
+  function scrubAiTells(text) {
+    if (!text || typeof text !== "string") return text;
+    var out = text;
+    out = out.replace(/\s*—\s*/g, ". ");
+    out = out.replace(/\s*–\s*/g, ". ");
+    out = out.replace(/\s*;\s*/g, ". ");
+    out = out.replace(/\.\s*\.\s*/g, ". ");
+    out = out.replace(/\. ([a-z])/g, function (m, c) { return ", " + c; });
+    return out;
+  }
+
+  function scrubVariation(v) {
+    if (!v) return v;
+    return {
+      label: v.label,
+      subject: scrubAiTells(v.subject),
+      body: scrubAiTells(v.body)
+    };
+  }
+
+  function scrubTmay(t) {
+    if (!t) return t;
+    return {
+      hook: scrubAiTells(t.hook),
+      credibility: scrubAiTells(t.credibility),
+      solution: scrubAiTells(t.solution),
+      proof: scrubAiTells(t.proof),
+      close: scrubAiTells(t.close),
+      deliveryTips: Array.isArray(t.deliveryTips) ? t.deliveryTips.map(scrubAiTells) : [],
+      totalDuration: t.totalDuration
+    };
+  }
+
+  function buildPromptText(st) {
+    var ind = st.ind;
+    var plat = st.plat;
+    var tone = st.tone;
+    var length = st.length;
+    var experience = st.experience;
+    var notes = st.notes;
+    var name = st.name;
+    var whatsapp = st.whatsapp;
+    var jd = st.jd;
+    var platform = st.platform;
+
+    var toneDesc;
+    if (tone < 30) toneDesc = "Very casual, contractions welcome, slight imperfection OK";
+    else if (tone > 70) toneDesc = "Professional and tight, no fluff";
+    else toneDesc = "Balanced, professional but not stiff";
+
+    var lengthDesc;
+    if (length < 30) lengthDesc = "Aim for the BOTTOM of the word range";
+    else if (length > 70) lengthDesc = "Aim for the TOP of the word range";
+    else lengthDesc = "Hit the MIDDLE of the word range";
+
+    var nameToUse = name || "[YOUR_NAME]";
+    var waToUse = whatsapp || "[WHATSAPP_NUMBER]";
+
+    var expContext;
+    if (experience === "none") {
+      expContext = "EXPERIENCE MODE - SOLUTION-FORWARD. Never describe the writer as new, newbie, entry-level, junior, aspiring, learning, inexperienced, or unfamiliar. Never say I have not worked in this industry, I am new, first time, starting out, or any variant. Never apologize for tenure. Lead entirely with the SOLUTION and OUTCOME. Show industry fluency by naming pain points and workflows accurately. Demonstrate tool mastery (" + ind.tools.join(", ") + ") as a matter of fact. Offer a paid trial week as confident risk reversal, not apology. Read like a capable operator.";
+    } else {
+      expContext = "EXPERIENCE MODE - WITH INDUSTRY TRACK RECORD. Lead with a specific past outcome tied to the OWNER relief. Reference industry workflows by name (e.g. " + ind.deliverables[0] + "). Speak like a seasoned partner. Include one proactive observation.";
+    }
+
+    var variationInstr;
+    if (experience === "none") {
+      variationInstr = "A. DIRECT. Open with the pain, then the fix. Concrete 30-day plan. Include one proactive offer. End body with: Open to a paid trial week to prove it? NEVER mention being new.\n\nB. STORY-DRIVEN. Open with a vivid scenario of the owner mess. Pivot to specific fix. Offer one week-one deliverable. End body with: Happy to prove it on a bounded task this week. NEVER mention lack of experience.\n\nC. CURIOUS. Open with a sharp owner-to-owner question. Position as calm partner. End body with: Reply sample and I will send a one-week reconciliation on your last bank month plus a health check. NEVER apologize or hedge.";
+    } else {
+      variationInstr = "A. DIRECT. Open with owner relief tied to past win. State offer plus one proactive thing. End body with: Worth a 15-min call Thursday or Friday?\n\nB. STORY-DRIVEN. Open with one-sentence case study anchored in OWNER relief. Connect to their situation. End body with: Same playbook fits your shop. Worth a 15-min call this week?\n\nC. CURIOUS. Open with sharp owner-to-owner question. Reference patterns from similar shops. End body with: Reply sample and I will send a one-week reconciliation on your last bank month plus a health check. No charge.";
+    }
+
+    var notesBlock = notes.trim().length > 0
+      ? "\n\nPERSONAL NOTES FROM THE WRITER (weave in naturally, do not list all in one place, do not invent):\n<<<NOTES_START>>>\n" + notes.trim() + "\n<<<NOTES_END>>>\n"
+      : "";
+
+    var parts = [];
+    parts.push("# YOUR TASK");
+    parts.push("You are writing 3 cold-outreach messages for a remote bookkeeper reaching out DIRECTLY TO A BUSINESS OWNER (not to a recruiter or hiring manager). Return output as JSON. No preamble, no explanation.");
+    parts.push("");
+    parts.push("# CRITICAL: WRITE LIKE A HUMAN, NOT AN AI");
+    parts.push("This is the most important rule. If the output sounds like ChatGPT wrote it, you have failed. A real remote bookkeeper typing this on their phone between calls would not write in perfectly balanced clauses. They would:");
+    parts.push("");
+    parts.push("HARD-BANNED PUNCTUATION:");
+    parts.push("- NEVER use em-dashes (—) or en-dashes (–). Use a period, a comma, or start a new sentence instead.");
+    parts.push("- NEVER use semicolons (;). Break into two sentences.");
+    parts.push("- NEVER use rhetorical parallel structures like 'not X, but Y' or 'not just X, but also Y'.");
+    parts.push("- NEVER use the 'three-item list with commas' pattern (X, Y, and Z) more than once per letter. Humans do not naturally structure speech this way.");
+    parts.push("");
+    parts.push("HARD-BANNED AI WORDS AND PHRASES (rewrite any sentence containing these):");
+    parts.push("- streamline, streamlined, streamlining");
+    parts.push("- ensure, ensuring");
+    parts.push("- utilize (say use)");
+    parts.push("- leverage (as a verb)");
+    parts.push("- optimize, optimization");
+    parts.push("- comprehensive");
+    parts.push("- delve into, dive deep");
+    parts.push("- unlock, unlocking");
+    parts.push("- elevate, elevated");
+    parts.push("- crafted, tailored (as an adjective)");
+    parts.push("- meticulous, meticulously");
+    parts.push("- foster, fostering");
+    parts.push("- pivotal");
+    parts.push("- realm");
+    parts.push("- landscape (as in 'the business landscape')");
+    parts.push("- journey (as in 'your business journey')");
+    parts.push("- empower, empowered");
+    parts.push("- navigate (as in 'navigate the complexities')");
+    parts.push("- align, alignment (as in 'align with your goals')");
+    parts.push("- game-changer, game-changing");
+    parts.push("- moving forward");
+    parts.push("- at the end of the day");
+    parts.push("- in today's world / in today's fast-paced");
+    parts.push("- I understand that");
+    parts.push("- I would love to");
+    parts.push("- I am confident that");
+    parts.push("- Furthermore, Moreover, Additionally, In conclusion");
+    parts.push("- 'That said,' as a transition");
+    parts.push("- 'Here's the thing:' as an opener");
+    parts.push("");
+    parts.push("HUMAN VOICE MARKERS TO USE INSTEAD:");
+    parts.push("- Fragments are fine. Real fragments. 'Sound familiar?' 'Not fun.' 'Fixable.'");
+    parts.push("- Start sentences with And, But, So. Real humans do this constantly.");
+    parts.push("- Contractions everywhere: don't, can't, won't, I'll, you'll, it's, that's, here's.");
+    parts.push("- Occasional colloquial words: yeah, honestly, look, thing is, catch, hassle, mess, headache, grind.");
+    parts.push("- Simple concrete verbs: fix, clean up, catch, spot, sort out, handle, take off your plate.");
+    parts.push("- Vary sentence length wildly. A very short one. Then one that stretches out because you have more to say. Then short again.");
+    parts.push("- Occasional imperfection is human. It's okay if a sentence ends slightly abruptly or if a thought trails.");
+    parts.push("");
+    parts.push("PUNCTUATION RULE: Use periods and commas only. If you feel the urge for an em-dash, use a period and start a new sentence instead. That is the single biggest AI tell and it must not appear.");
+    parts.push("");
+    parts.push("SENTENCE OPENING VARIETY: Do not start three sentences in a row the same way. Do not start every paragraph with 'I'. Mix it up: sometimes start with You, sometimes with the pain point, sometimes with a fragment.");
+    parts.push("");
+    parts.push("# CRITICAL FRAMING");
+    parts.push("This is NOT a job application. This is a business owner talking to another business owner. Voice inspiration: Alex Hormozi. Direct. Blunt about the problem. Obsessed with outcome. Talks about money, hours, stress in concrete terms.");
+    parts.push("");
+    parts.push("# CORE POSITIONING");
+    parts.push("The writer is NOT a VA or data-entry clerk. Their product is FREEDOM for the owner. Take the weight of the books off the owner shoulders. End the 11pm anxiety. Turn the P&L into a decision tool. Spot leaks and missed deductions BEFORE they cost money.");
+    parts.push("");
+    parts.push("# ABSOLUTE RULES");
+    parts.push("1. Write TO the business owner. Never hiring team or your company.");
+    parts.push("2. Lead with OUTCOME. Never I am a bookkeeper with X years.");
+    parts.push("3. Every message includes ONE proactive offer they did not ask for.");
+    parts.push("4. Use specific numbers.");
+    parts.push("5. Name the emotional cost ONCE, then offer the calm.");
+    parts.push("6. Stack: outcome + timeline + proactive extra + risk reversal.");
+    parts.push("7. BANNED WORDS: synergy, leverage, passionate, dynamic, results-driven, dedicated, hardworking, team player, value-add, robust, seamless, world-class, rockstar, ninja, guru.");
+    if (experience === "none") {
+      parts.push("7b. HARD-BANNED PHRASES: new to, newbie, starting out, aspiring, learning, building experience, first time, haven not worked in, entry-level, junior, inexperienced, unfamiliar with, while I haven, even though I am new, I am still building. Rewrite any sentence that contains these.");
+    }
+    parts.push("8. BANNED OPENINGS: Dear Hiring Manager, Dear Sir/Madam, I hope this email finds you well, My name is, I am writing to apply, I am reaching out, I came across your post, I saw your job posting.");
+    parts.push("9. Short sentences. Hormozi-style one-line paragraphs welcome.");
+    parts.push("10. No emojis. No bullet lists in body. Prose only.");
+    parts.push("11. Every tool in the JD must appear by name in every message.");
+    parts.push("");
+    parts.push("# INDUSTRY: " + ind.label);
+    parts.push("Pain points: " + ind.pain.join("; "));
+    parts.push("Deliverables: " + ind.deliverables.join("; "));
+    parts.push("Common tools: " + ind.tools.join(", "));
+    parts.push("");
+    parts.push("# " + expContext);
+    parts.push("");
+    parts.push("# PLATFORM: " + plat.label);
+    var wordTarget = plat.range[0] === 0 ? "under 100" : plat.range[0] + "-" + plat.range[1];
+    parts.push("Word target for BODY (excluding closing block): " + wordTarget + " words.");
+    parts.push("Rules: " + plat.note);
+    if (platform === "onlinejobs") parts.push("Mention Philippines timezone advantage once, briefly.");
+    if (platform === "coldemail") parts.push("Subject lines: 3-6 words, lowercase, human.");
+    parts.push("");
+    parts.push("# TONE / LENGTH");
+    parts.push("TONE: " + toneDesc);
+    parts.push("LENGTH: " + lengthDesc);
+    parts.push("");
+    parts.push("# MANDATORY OPENING GREETING");
+    parts.push("Every letter MUST start with a warm, human greeting on its own line, then a blank line before the body begins.");
+    parts.push("Rules for the greeting:");
+    parts.push("- If the JD contains the owner's or hiring person's first name, use it (e.g. Hi Sarah, or Hey Mike,).");
+    parts.push("- If no name is in the JD, use a warm generic that fits the platform: Hi there, / Hey, / Hi, / Good morning, / Hope your week is going well, / Quick note,");
+    parts.push("- VARY the greeting across the three variations. Do not use the same one twice.");
+    parts.push("- Never use: Dear Hiring Manager, To Whom It May Concern, Dear Sir/Madam, Greetings.");
+    parts.push("- The greeting must feel like a real person typed it, not a template. Slightly casual is fine.");
+    parts.push("- After the greeting, add a blank line, then start the body. Do not immediately follow the greeting with the first sentence on the same line.");
+    parts.push("");
+    parts.push("# THREE VARIATIONS");
+    parts.push(variationInstr);
+    parts.push("");
+    parts.push("# MANDATORY CLOSING BLOCK (every message MUST end with all 4 elements)");
+    parts.push("1. Resume mention (vary wording per variation). Example: Resume is attached if you want the full picture.");
+    parts.push("2. WhatsApp line. Example: Fastest way to reach me is WhatsApp: " + waToUse);
+    parts.push("3. Warm closing (not Best regards). Example: Talk soon. or Appreciate your time.");
+    parts.push("4. Name on its own line: " + nameToUse);
+    parts.push("REQUIRED in every variation. Do not omit.");
+    parts.push("");
+    parts.push("# SUBJECT LINES");
+    parts.push("3-7 words. Lowercase OK. Owner-to-owner. GOOD: quick thought on your books, your bank recs handled. BAD: Application for Bookkeeper Position.");
+    if (notesBlock) parts.push(notesBlock);
+    parts.push("");
+    parts.push("# JOB DESCRIPTION");
+    parts.push("<<<JD_START>>>");
+    parts.push(jd);
+    parts.push("<<<JD_END>>>");
+    parts.push("");
+    parts.push("# OUTPUT FORMAT");
+    parts.push("Return ONLY this JSON. No markdown fences. Use \\n for line breaks inside body strings.");
+    parts.push('{');
+    parts.push('  "variations": [');
+    parts.push('    {"label":"Direct","subject":"...","body":"full letter A INCLUDING closing block"},');
+    parts.push('    {"label":"Story-driven","subject":"...","body":"full letter B INCLUDING closing block"},');
+    parts.push('    {"label":"Curious","subject":"...","body":"full letter C INCLUDING closing block"}');
+    parts.push('  ],');
+    parts.push('  "tmayScript": {');
+    parts.push('    "hook": "opening line 5 to 10 seconds long that pattern-interrupts and names the problem or outcome (not a hi my name is opener)",');
+    parts.push('    "credibility": "10 to 15 seconds establishing why the writer is credible for THIS specific role, tailored to the JD and industry. If experience mode is No Experience, focus on tool mastery, methodology, and the systems they will bring — never mention being new",');
+    parts.push('    "solution": "15 to 20 seconds on the specific outcome the writer will deliver for this owner, tied to the pain points in the JD. Concrete and specific to this business.",');
+    parts.push('    "proof": "10 to 15 seconds with one concrete example, past win, or proactive offer (a free first-week audit, a cash flow snapshot, a missed deductions check). If no experience, use the proactive offer.",');
+    parts.push('    "close": "5 to 10 second CTA that feels warm and low friction. Owner-to-owner, not applicant-to-hirer.",');
+    parts.push('    "deliveryTips": [');
+    parts.push('      "one tip on pacing, tone, or body language specific to remote video introductions"');
+    parts.push('    ],');
+    parts.push('    "totalDuration": "e.g. 60 to 75 seconds"');
+    parts.push('  },');
+    parts.push('  "prep": {');
+    parts.push('    "painPoints": [');
+    parts.push('      {"pain": "specific pain point from the JD in the owner\'s own words or paraphrased", "why": "one sentence on why this actually costs the owner money, hours, or sleep"}');
+    parts.push('    ],');
+    parts.push('    "likelyQuestions": [');
+    parts.push('      {"question": "a question the owner is likely to ask on the call", "how": "one or two sentences on how to answer well without over-promising"}');
+    parts.push('    ],');
+    parts.push('    "researchBeforeCall": [');
+    parts.push('      "one specific thing to look up or verify before the interview so the student walks in prepared"');
+    parts.push('    ],');
+    parts.push('    "redFlags": [');
+    parts.push('      "one specific thing to watch out for during the call (unrealistic scope, unclear budget, unmanaged expectations, etc.)"');
+    parts.push('    ]');
+    parts.push('  }');
+    parts.push('}');
+    parts.push("");
+    parts.push("For prep.painPoints: extract 3 to 5 real pain points the owner mentioned or clearly implied in the JD. Rephrase into plain owner language, not corporate speak.");
+    parts.push("For prep.likelyQuestions: generate 4 to 6 questions the owner is likely to ask, with concrete guidance on how to answer them. Skip generic HR questions. Focus on domain-specific questions the owner will actually ask a bookkeeper.");
+    parts.push("For prep.researchBeforeCall: 3 to 5 concrete items the student should look up (the company, the industry, the tools mentioned, typical rates, etc.).");
+    parts.push("For prep.redFlags: 2 to 4 warning signs to watch for. Be direct.");
+    parts.push("");
+    parts.push("For tmayScript: this is a tell-me-about-yourself / video introduction script the student will record or say verbatim. Follow this proven framework:");
+    parts.push("HOOK (5 to 10 sec): Pattern-interrupt opener. Never Hi my name is. Start with the pain, the outcome, or a bold question. Example: Most " + ind.label + " owners burn 8 to 12 hours a month on books they still do not trust. I fix that.");
+    parts.push("CREDIBILITY (10 to 15 sec): Why the writer is credible for THIS role. In experience mode, cite past outcomes. In no-experience mode, cite tool mastery and methodology (" + ind.tools.join(", ") + ") without ever mentioning being new.");
+    parts.push("SOLUTION (15 to 20 sec): The concrete outcome tailored to THIS owner pain, referencing tools and workflows from the JD.");
+    parts.push("PROOF (10 to 15 sec): One example, past win, or proactive offer that lowers the risk of hiring.");
+    parts.push("CLOSE (5 to 10 sec): Warm, owner-to-owner CTA. Not thank you for your consideration.");
+    parts.push("Total should feel like 60 to 90 seconds when spoken naturally. Write it in first person, the way it will be SAID, not the way it will be read. Use contractions. Short sentences. One idea per sentence.");
+    parts.push("BANNED PHRASES for tmayScript same as body: never new to, newbie, aspiring, learning, first time, etc. ALSO SAME anti-AI rules apply: no em-dashes, no semicolons, no streamline, no leverage, no comprehensive.");
+
+    return parts.join("\n");
+  }
+
+  /* ============================ STATE ============================ */
+
+  var state = {
+    industry: "general",
+    showIndustryOverride: false,
+    platform: "onlinejobs",
+    experience: "with",
+    jd: "",
+    notes: "",
+    name: "",
+    whatsapp: "",
+    tone: 50,
+    length: 50,
+    loading: false,
+    variations: null,
+    tmay: null,
+    prep: null,
+    error: ""
+  };
+
+  function currentIndustry() {
+    return INDUSTRIES.find(function (i) { return i.id === state.industry; });
+  }
+  function currentPlatform() {
+    return PLATFORMS.find(function (p) { return p.id === state.platform; });
+  }
+
+  /* ============================ STATIC SHELL ============================ */
+
+  var root = document.getElementById("ghwa-root");
+
+  root.innerHTML =
+    '<div style="min-height:100vh;background:radial-gradient(60% 50% at 15% 0%, #E8F1FF 0%, transparent 60%), radial-gradient(70% 60% at 50% 100%, #EAF4FF 0%, transparent 70%), linear-gradient(180deg, #F7FAFF 0%, #FFFFFF 100%);padding:28px 16px 60px;font-family:\'Inter\', sans-serif;color:#0F1217;">' +
+      '<div style="max-width:720px;margin:0 auto;">' +
+
+        '<div id="top-of-form" style="text-align:center;margin-bottom:28px;scroll-margin-top:80px;">' +
+          '<div style="font-size:22px;font-weight:700;letter-spacing:-0.5px;">Winning <span style="background:linear-gradient(180deg, #3D8BFF 0%, #006FE6 70%, #0057B8 100%);-webkit-background-clip:text;background-clip:text;color:transparent;font-style:italic;">Cover Emails</span></div>' +
+          '<div style="font-size:13px;color:#5F6773;margin-top:3px;">Authentic, high-impact scripts that hook your client&#39;s attention from the very first line.</div>' +
+        '</div>' +
+
+        '<div style="background:rgba(255,255,255,0.65);border:0.5px solid rgba(255,255,255,0.9);border-radius:20px;padding:22px;box-shadow:0 8px 24px -8px rgba(15,30,60,0.10), 0 24px 64px -28px rgba(10,132,255,0.20);margin-bottom:20px;">' +
+
+          '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">' +
+            '<div style="font-size:11px;font-weight:600;letter-spacing:0.14em;text-transform:uppercase;color:#006FE6;">Job Description</div>' +
+            '<div style="display:flex;gap:12px;align-items:center;">' +
+              '<span id="jd-wc" style="font-family:monospace;font-size:11px;color:#8E96A3;display:none;"></span>' +
+              '<button id="load-sample" style="font-size:12px;color:#006FE6;font-weight:600;background:none;border:none;cursor:pointer;font-family:inherit;padding:0;">Load sample</button>' +
+            '</div>' +
+          '</div>' +
+          '<textarea id="jd-input" rows="5" placeholder="Paste the job description here (industry auto-detects as you type)" style="width:100%;border:0.5px solid rgba(255,255,255,0.9);border-radius:12px;padding:12px;font-family:inherit;font-size:13.5px;color:#0F1217;background:white;resize:vertical;line-height:1.55;"></textarea>' +
+
+          '<div style="margin-top:14px;padding:14px;background:rgba(234,244,255,0.55);border:0.5px solid rgba(10,132,255,0.15);border-radius:12px;">' +
+            '<div style="font-size:11px;font-weight:600;letter-spacing:0.14em;text-transform:uppercase;color:#006FE6;margin-bottom:4px;">Personal Notes <span style="margin-left:6px;padding:1px 7px;background:white;border-radius:99px;font-size:9px;color:#5F6773;text-transform:none;letter-spacing:0.04em;border:0.5px solid rgba(10,132,255,0.18);">Optional</span></div>' +
+            '<div style="font-size:11.5px;color:#5F6773;margin-bottom:8px;line-height:1.4;">Years of experience, tools you know, certifications, rate, availability.</div>' +
+            '<textarea id="notes-input" rows="3" placeholder="e.g. 3 years bookkeeping for US clients, QBO ProAdvisor, $12/hr, available 9AM-6PM EST" style="width:100%;border:0.5px solid rgba(255,255,255,0.9);border-radius:10px;padding:10px;font-family:inherit;font-size:12.5px;color:#0F1217;background:white;resize:vertical;line-height:1.5;"></textarea>' +
+            '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px;">' +
+              '<div>' +
+                '<div style="font-size:11px;font-weight:600;letter-spacing:0.14em;text-transform:uppercase;color:#006FE6;margin-bottom:4px;">Your Name</div>' +
+                '<input id="name-input" type="text" placeholder="Maria Santos" style="width:100%;border:0.5px solid rgba(255,255,255,0.9);border-radius:10px;padding:9px 12px;font-family:inherit;font-size:12.5px;color:#0F1217;background:white;" />' +
+              '</div>' +
+              '<div>' +
+                '<div style="font-size:11px;font-weight:600;letter-spacing:0.14em;text-transform:uppercase;color:#006FE6;margin-bottom:4px;">WhatsApp</div>' +
+                '<input id="whatsapp-input" type="text" placeholder="+63 917 123 4567" style="width:100%;border:0.5px solid rgba(255,255,255,0.9);border-radius:10px;padding:9px 12px;font-family:inherit;font-size:12.5px;color:#0F1217;background:white;" />' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+
+          '<div style="font-size:11px;font-weight:600;letter-spacing:0.14em;text-transform:uppercase;color:#006FE6;margin-top:18px;margin-bottom:8px;">Platform</div>' +
+          '<div id="platform-row" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px;"></div>' +
+
+          '<div style="font-size:11px;font-weight:600;letter-spacing:0.14em;text-transform:uppercase;color:#006FE6;margin-bottom:8px;">Detected Industry</div>' +
+          '<div id="industry-block" style="margin-bottom:18px;"></div>' +
+
+          '<div id="experience-label" style="font-size:11px;font-weight:600;letter-spacing:0.14em;text-transform:uppercase;color:#006FE6;margin-bottom:8px;"></div>' +
+          '<div id="experience-row" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:18px;"></div>' +
+
+          '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px;">' +
+            '<div>' +
+              '<div style="font-size:11px;font-weight:600;letter-spacing:0.14em;text-transform:uppercase;color:#006FE6;margin-bottom:6px;">Tone</div>' +
+              '<div style="display:flex;align-items:center;gap:8px;">' +
+                '<span style="font-size:11px;color:#5F6773;min-width:50px;text-align:right;">Casual</span>' +
+                '<input id="tone-input" type="range" min="0" max="100" value="50" style="flex:1;" />' +
+                '<span style="font-size:11px;color:#5F6773;min-width:56px;">Professional</span>' +
+              '</div>' +
+            '</div>' +
+            '<div>' +
+              '<div style="font-size:11px;font-weight:600;letter-spacing:0.14em;text-transform:uppercase;color:#006FE6;margin-bottom:6px;">Length</div>' +
+              '<div style="display:flex;align-items:center;gap:8px;">' +
+                '<span style="font-size:11px;color:#5F6773;min-width:50px;text-align:right;">Tight</span>' +
+                '<input id="length-input" type="range" min="0" max="100" value="50" style="flex:1;" />' +
+                '<span style="font-size:11px;color:#5F6773;min-width:56px;">Detailed</span>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+
+          '<div style="padding-top:18px;">' +
+            '<button id="generate-btn" style="width:100%;padding:14px;font-size:15px;font-weight:600;border-radius:12px;background:linear-gradient(180deg, #5AAEFF 0%, #3D8BFF 35%, #006FE6 100%);color:white;border:0;font-family:inherit;box-shadow:0 10px 22px -10px rgba(10,132,255,0.55);">Generate 3 Winning Letters</button>' +
+            '<div id="unlock-hint" style="text-align:center;margin-top:6px;font-size:11px;color:#8E96A3;display:none;">Paste a job description to unlock</div>' +
+          '</div>' +
+
+        '</div>' +
+
+        '<div id="results"></div>' +
+
+      '</div>' +
+    '</div>';
+
+  var jdInput = document.getElementById("jd-input");
+  var notesInput = document.getElementById("notes-input");
+  var nameInput = document.getElementById("name-input");
+  var whatsappInput = document.getElementById("whatsapp-input");
+  var toneInput = document.getElementById("tone-input");
+  var lengthInput = document.getElementById("length-input");
+  var generateBtn = document.getElementById("generate-btn");
+  var jdWcEl = document.getElementById("jd-wc");
+  var unlockHint = document.getElementById("unlock-hint");
+  var resultsEl = document.getElementById("results");
+
+  /* ============================ RENDERERS ============================ */
+
+  function renderJdMeta() {
+    var n = wc(state.jd);
+    if (n > 0) {
+      jdWcEl.style.display = "";
+      jdWcEl.textContent = n + " words";
+    } else {
+      jdWcEl.style.display = "none";
+    }
+  }
+
+  function renderPlatforms() {
+    var row = document.getElementById("platform-row");
+    row.innerHTML = "";
+    PLATFORMS.forEach(function (p) {
+      var active = state.platform === p.id;
+      var b = document.createElement("button");
+      b.textContent = p.label;
+      b.style.cssText = "padding:8px 14px;border-radius:99px;font-size:12.5px;font-weight:500;cursor:pointer;" +
+        "border:" + (active ? "0" : "0.5px solid rgba(255,255,255,0.9)") + ";" +
+        "background:" + (active ? "linear-gradient(180deg, #5AAEFF 0%, #3D8BFF 35%, #006FE6 100%)" : "rgba(255,255,255,0.65)") + ";" +
+        "color:" + (active ? "white" : "#5F6773") + ";" +
+        "font-family:inherit;white-space:nowrap;" +
+        "box-shadow:" + (active ? "0 6px 14px -6px rgba(10,132,255,0.55)" : "0 1px 0 rgba(15,30,60,0.04)") + ";";
+      b.addEventListener("click", function () {
+        state.platform = p.id;
+        renderPlatforms();
+      });
+      row.appendChild(b);
+    });
+  }
+
+  function renderIndustryBlock() {
+    var ind = currentIndustry();
+    var block = document.getElementById("industry-block");
+    var filled = state.jd.trim().length >= 30;
+
+    var html = '<div style="display:flex;align-items:center;gap:10px;padding:10px 14px;' +
+      'background:' + (filled ? 'linear-gradient(180deg, rgba(234,244,255,0.9), rgba(220,233,255,0.7))' : 'rgba(15,18,23,0.04)') + ';' +
+      'border:' + (filled ? '0.5px solid rgba(10,132,255,0.25)' : '0.5px dashed rgba(15,18,23,0.12)') + ';' +
+      'border-radius:12px;box-shadow:' + (filled ? 'inset 0 0.5px 0 rgba(255,255,255,0.95)' : 'none') + ';">' +
+        '<div style="width:8px;height:8px;border-radius:50%;background:' + (filled ? '#006FE6' : '#B7BEC9') + ';animation:' + (filled ? 'pulse 1.8s infinite' : 'none') + ';flex-shrink:0;"></div>' +
+        '<div style="flex:1;min-width:0;">' +
+          (filled
+            ? '<div style="font-size:13.5px;font-weight:600;color:#0F1217;letter-spacing:-0.005em;">' + esc(ind.label) + '</div><div style="font-size:10.5px;color:#5F6773;margin-top:1px;letter-spacing:0.01em;">Auto-detected from your JD</div>'
+            : '<div style="font-size:12.5px;color:#8E96A3;font-style:italic;">Paste a job description above to auto-detect the industry</div>') +
+        '</div>' +
+        '<button id="industry-toggle" style="font-size:11px;font-weight:600;color:#006FE6;background:rgba(255,255,255,0.7);border:0.5px solid rgba(10,132,255,0.2);border-radius:8px;padding:5px 10px;cursor:pointer;font-family:inherit;white-space:nowrap;">' +
+          (state.showIndustryOverride ? "Cancel" : "Change") +
+        '</button>' +
+      '</div>';
+
+    if (state.showIndustryOverride) {
+      html += '<div id="industry-override" style="margin-top:8px;display:flex;overflow-x:auto;gap:4px;padding:4px;background:rgba(15,18,23,0.04);border-radius:10px;"></div>';
+    }
+
+    block.innerHTML = html;
+
+    document.getElementById("industry-toggle").addEventListener("click", function () {
+      state.showIndustryOverride = !state.showIndustryOverride;
+      renderIndustryBlock();
+    });
+
+    if (state.showIndustryOverride) {
+      var ov = document.getElementById("industry-override");
+      INDUSTRIES.forEach(function (i) {
+        var active = state.industry === i.id;
+        var b = document.createElement("button");
+        b.textContent = i.label;
+        b.style.cssText = "padding:7px 11px;font-size:12px;font-weight:" + (active ? "600" : "500") + ";" +
+          "color:" + (active ? "#0F1217" : "#5F6773") + ";" +
+          "background:" + (active ? "white" : "transparent") + ";" +
+          "border:0;border-radius:8px;cursor:pointer;white-space:nowrap;flex-shrink:0;" +
+          "box-shadow:" + (active ? "0 1px 2px rgba(15,30,60,0.08)" : "none") + ";font-family:inherit;";
+        b.addEventListener("click", function () {
+          state.industry = i.id;
+          state.showIndustryOverride = false;
+          renderIndustryBlock();
+          renderExperience();
+        });
+        ov.appendChild(b);
+      });
+    }
+  }
+
+  function renderExperience() {
+    var ind = currentIndustry();
+    document.getElementById("experience-label").textContent = "Experience in " + ind.label;
+    var row = document.getElementById("experience-row");
+    row.innerHTML = "";
+    var opts = [
+      { val: "with", title: "With Experience", sub: "Lead with past wins" },
+      { val: "none", title: "No Experience", sub: "Solution-forward, no hedging" }
+    ];
+    opts.forEach(function (e) {
+      var active = state.experience === e.val;
+      var b = document.createElement("button");
+      b.innerHTML = '<div style="font-size:13px;font-weight:600;">' + esc(e.title) + '</div>' +
+        '<div style="font-size:11px;opacity:0.75;margin-top:2px;">' + esc(e.sub) + '</div>';
+      b.style.cssText = "padding:12px 14px;border-radius:12px;" +
+        "border:" + (active ? "0" : "0.5px solid rgba(255,255,255,0.9)") + ";" +
+        "background:" + (active ? "linear-gradient(180deg, #5AAEFF 0%, #3D8BFF 35%, #006FE6 100%)" : "rgba(255,255,255,0.65)") + ";" +
+        "color:" + (active ? "white" : "#5F6773") + ";text-align:left;cursor:pointer;font-family:inherit;" +
+        "box-shadow:" + (active ? "0 6px 14px -6px rgba(10,132,255,0.55)" : "none") + ";";
+      b.addEventListener("click", function () {
+        state.experience = e.val;
+        renderExperience();
+      });
+      row.appendChild(b);
+    });
+  }
+
+  function renderGenerateBtn() {
+    var canGenerate = state.jd.trim().length >= 20 && !state.loading;
+    generateBtn.textContent = state.loading ? "Writing your 3 letters..." : "Generate 3 Winning Letters";
+    generateBtn.disabled = !canGenerate;
+    generateBtn.style.cursor = canGenerate ? "pointer" : "not-allowed";
+    generateBtn.style.opacity = canGenerate ? "1" : "0.45";
+    generateBtn.style.animation = state.loading ? "pulse 1.4s infinite" : "none";
+    unlockHint.style.display = (state.jd.trim().length < 20 && state.jd.length > 0) ? "" : "none";
+  }
+
+  /* -------- Copy button helper (delegated) -------- */
+
+  function copyBtnHtml(copyId, small) {
+    return '<button class="copy-btn" data-copy="' + copyId + '" style="' +
+      'font-size:' + (small ? '10px' : '11px') + ';' +
+      'padding:' + (small ? '5px 10px' : '6px 14px') + ';' +
+      'background:rgba(255,255,255,0.65);color:#0057B8;' +
+      'border-radius:8px;border:0.5px solid rgba(255,255,255,0.9);' +
+      'font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap;">Copy</button>';
+  }
+
+  var copyTargets = {}; // copyId -> text
+
+  function doCopy(btn) {
+    var id = btn.getAttribute("data-copy");
+    var text = copyTargets[id] || "";
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text);
+    } else {
+      var ta = document.createElement("textarea");
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); } catch (e) {}
+      document.body.removeChild(ta);
+    }
+    btn.textContent = "✓ Copied";
+    btn.style.background = "linear-gradient(180deg,#E8FFF1,#D4F7E0)";
+    btn.style.color = "#15803d";
+    btn.style.borderColor = "#86efac";
+    setTimeout(function () {
+      btn.textContent = "Copy";
+      btn.style.background = "rgba(255,255,255,0.65)";
+      btn.style.color = "#0057B8";
+      btn.style.borderColor = "rgba(255,255,255,0.9)";
+    }, 1800);
+  }
+
+  /* -------- Results (variations / tmay / prep / loading / error) -------- */
+
+  function skeletonCardHtml() {
+    var rows = [28, 16, 48, 80];
+    var inner = rows.map(function (h, i) {
+      return '<div class="skeleton-row" style="height:' + h + 'px;width:' + (i === 1 ? "60%" : "100%") + ';"></div>';
+    }).join("");
+    return '<div style="background:rgba(255,255,255,0.55);border:0.5px solid rgba(255,255,255,0.9);border-radius:22px;padding:22px;box-shadow:0 8px 24px -8px rgba(15,30,60,0.10);">' + inner + '</div>';
+  }
+
+  function variationCardHtml(v, idx) {
+    var letters = ["A", "B", "C"];
+    var ids = ["letter-a", "letter-b", "letter-c"];
+    var fullId = "var-full-" + idx;
+    var subjId = "var-subj-" + idx;
+    copyTargets[fullId] = "Subject: " + v.subject + "\n\n" + v.body;
+    copyTargets[subjId] = v.subject;
+
+    return '<div id="' + ids[idx] + '" style="background:rgba(255,255,255,0.55);border:0.5px solid rgba(255,255,255,0.9);border-radius:22px;box-shadow:0 8px 24px -8px rgba(15,30,60,0.10), 0 24px 64px -28px rgba(10,132,255,0.20);overflow:hidden;scroll-margin-top:80px;">' +
+      '<div style="padding:16px 18px;border-bottom:0.5px solid rgba(15,18,23,0.08);display:flex;align-items:center;gap:12px;">' +
+        '<div style="width:36px;height:36px;border-radius:11px;flex-shrink:0;background:linear-gradient(180deg, #5AAEFF 0%, #3D8BFF 35%, #006FE6 100%);display:grid;place-items:center;color:white;font-weight:700;font-size:15px;box-shadow:0 6px 14px -6px rgba(10,132,255,0.55);">' + letters[idx] + '</div>' +
+        '<div style="flex:1;"><div style="font-weight:600;font-size:14px;color:#0F1217;">' + esc(v.label) + '</div></div>' +
+        copyBtnHtml(fullId, false) +
+      '</div>' +
+      '<div style="margin:14px 18px 0;background:linear-gradient(180deg, rgba(234,244,255,0.85), rgba(220,233,255,0.65));border:0.5px solid rgba(10,132,255,0.18);border-radius:12px;padding:12px 14px;">' +
+        '<div style="font-size:10px;font-weight:600;letter-spacing:0.14em;text-transform:uppercase;color:#006FE6;margin-bottom:5px;opacity:0.75;">Subject</div>' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">' +
+          '<div style="font-size:13.5px;font-weight:600;color:#0F1217;">' + esc(v.subject) + '</div>' +
+          copyBtnHtml(subjId, true) +
+        '</div>' +
+      '</div>' +
+      '<div style="padding:14px 18px 18px;font-size:14px;line-height:1.65;color:#2A2F39;white-space:pre-wrap;word-break:break-word;">' + esc(v.body) + '</div>' +
+    '</div>';
+  }
+
+  function tmaySectionHtml(tmay) {
+    var beats = [
+      { key: "hook", label: "Hook", sub: "5-10 seconds", color: "#DC2626", tint: "rgba(255,240,240,0.55)", border: "rgba(220,80,80,0.2)" },
+      { key: "credibility", label: "Credibility", sub: "10-15 seconds", color: "#006FE6", tint: "rgba(234,244,255,0.65)", border: "rgba(10,132,255,0.18)" },
+      { key: "solution", label: "Solution", sub: "15-20 seconds", color: "#0D9488", tint: "rgba(232,255,248,0.6)", border: "rgba(13,148,136,0.2)" },
+      { key: "proof", label: "Proof", sub: "10-15 seconds", color: "#7C3AED", tint: "rgba(248,240,255,0.6)", border: "rgba(124,58,237,0.18)" },
+      { key: "close", label: "Close", sub: "5-10 seconds", color: "#B45309", tint: "rgba(255,248,235,0.7)", border: "rgba(217,119,6,0.2)" }
+    ];
+
+    var fullScript = beats.map(function (b) { return tmay[b.key] ? tmay[b.key] : ""; }).filter(Boolean).join("\n\n");
+    copyTargets["tmay-full"] = fullScript;
+
+    var beatsHtml = beats.map(function (b) {
+      var text = tmay[b.key];
+      if (!text) return "";
+      return '<div style="display:flex;gap:12px;margin-bottom:14px;align-items:flex-start;">' +
+        '<div style="flex-shrink:0;width:90px;padding-top:2px;">' +
+          '<div style="font-size:10px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;color:' + b.color + ';line-height:1.3;">' + b.label + '</div>' +
+          '<div style="font-size:10px;color:#8E96A3;font-family:monospace;margin-top:2px;">' + b.sub + '</div>' +
+        '</div>' +
+        '<div style="flex:1;min-width:0;">' +
+          '<div style="padding:12px 14px;background:' + b.tint + ';border:0.5px solid ' + b.border + ';border-left:3px solid ' + b.color + ';border-radius:11px;font-size:13.5px;line-height:1.6;color:#2A2F39;letter-spacing:-0.005em;">' + esc(text) + '</div>' +
+        '</div>' +
+      '</div>';
+    }).join("");
+
+    var tips = Array.isArray(tmay.deliveryTips) ? tmay.deliveryTips : [];
+    var tipsHtml = "";
+    if (tips.length > 0) {
+      tipsHtml = '<div style="padding:16px 20px 20px;border-top:0.5px solid rgba(15,18,23,0.06);background:rgba(247,250,255,0.5);">' +
+        '<div style="font-size:10.5px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;color:#006FE6;margin-bottom:10px;">Delivery Tips</div>' +
+        '<div style="display:flex;flex-direction:column;gap:8px;">' +
+          tips.map(function (t, i) {
+            return '<div style="display:flex;gap:10px;align-items:flex-start;padding:9px 12px;background:rgba(255,255,255,0.7);border:0.5px solid rgba(15,18,23,0.06);border-radius:10px;">' +
+              '<div style="width:18px;height:18px;border-radius:6px;flex-shrink:0;display:grid;place-items:center;margin-top:1px;background:rgba(10,132,255,0.1);color:#006FE6;font-size:10.5px;font-weight:700;">' + (i + 1) + '</div>' +
+              '<div style="font-size:12.5px;color:#2A2F39;line-height:1.5;letter-spacing:-0.005em;">' + esc(t) + '</div>' +
+            '</div>';
+          }).join("") +
+        '</div>' +
+      '</div>';
+    }
+
+    return '<div id="tmay-section" style="background:rgba(255,255,255,0.55);border:0.5px solid rgba(255,255,255,0.9);border-radius:22px;box-shadow:0 8px 24px -8px rgba(15,30,60,0.10), 0 24px 64px -28px rgba(10,132,255,0.20);overflow:hidden;margin-top:20px;scroll-margin-top:80px;">' +
+      '<div style="padding:18px 20px 14px;border-bottom:0.5px solid rgba(15,18,23,0.08);background:linear-gradient(180deg, rgba(234,244,255,0.55), rgba(255,255,255,0.35));display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;">' +
+        '<div style="min-width:0;flex:1;">' +
+          '<div style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:99px;font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:white;background:linear-gradient(180deg, #5AAEFF 0%, #3D8BFF 35%, #006FE6 100%);box-shadow:0 4px 10px -4px rgba(10,132,255,0.55);margin-bottom:8px;">' +
+            '<span style="width:5px;height:5px;border-radius:50%;background:white;"></span>Video Introduction Script</div>' +
+          '<div style="font-size:16px;font-weight:700;color:#0F1217;letter-spacing:-0.015em;">Tell me about yourself, tailored</div>' +
+          '<div style="font-size:12.5px;color:#5F6773;margin-top:3px;letter-spacing:-0.005em;">Read it, record it, or say it live. Structured for ' + esc(tmay.totalDuration || "60 to 90 seconds") + ' of natural delivery.</div>' +
+        '</div>' +
+        copyBtnHtml("tmay-full", false) +
+      '</div>' +
+      '<div style="padding:20px 20px 8px;">' + beatsHtml + '</div>' +
+      tipsHtml +
+    '</div>';
+  }
+
+  function prepSectionHtml(prep) {
+    var painPoints = Array.isArray(prep.painPoints) ? prep.painPoints : [];
+    var likelyQuestions = Array.isArray(prep.likelyQuestions) ? prep.likelyQuestions : [];
+    var research = Array.isArray(prep.researchBeforeCall) ? prep.researchBeforeCall : [];
+    var redFlags = Array.isArray(prep.redFlags) ? prep.redFlags : [];
+
+    function subHeader(label, count) {
+      return '<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">' +
+        '<div style="font-size:10.5px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;color:#006FE6;">' + label + '</div>' +
+        '<div style="font-size:10px;font-weight:600;color:#5F6773;background:rgba(15,18,23,0.05);border-radius:99px;padding:1px 8px;">' + count + '</div>' +
+      '</div>';
+    }
+
+    var blockCss = "padding:18px 20px;border-top:0.5px solid rgba(15,18,23,0.06);";
+    var html = "";
+
+    if (painPoints.length > 0) {
+      html += '<div style="' + blockCss + '">' + subHeader("Pain Points from the JD", painPoints.length) +
+        '<div style="display:flex;flex-direction:column;gap:12px;">' +
+          painPoints.map(function (p) {
+            return '<div style="padding:12px 14px;background:rgba(255,240,240,0.5);border:0.5px solid rgba(220,80,80,0.15);border-radius:11px;border-left:3px solid rgba(220,80,80,0.5);">' +
+              '<div style="font-size:13px;font-weight:600;color:#0F1217;line-height:1.4;letter-spacing:-0.005em;">' + esc(p.pain) + '</div>' +
+              (p.why ? '<div style="font-size:12px;color:#5F6773;margin-top:5px;line-height:1.5;">' + esc(p.why) + '</div>' : '') +
+            '</div>';
+          }).join("") +
+        '</div></div>';
+    }
+
+    if (likelyQuestions.length > 0) {
+      html += '<div style="' + blockCss + '">' + subHeader("Likely Questions and How to Answer", likelyQuestions.length) +
+        '<div style="display:flex;flex-direction:column;gap:12px;">' +
+          likelyQuestions.map(function (q) {
+            return '<div style="padding:12px 14px;background:rgba(240,246,255,0.6);border:0.5px solid rgba(10,132,255,0.15);border-radius:11px;">' +
+              '<div style="display:flex;gap:8px;align-items:flex-start;">' +
+                '<div style="min-width:22px;height:22px;border-radius:7px;flex-shrink:0;background:linear-gradient(180deg, #5AAEFF, #006FE6);color:white;font-size:11px;font-weight:700;display:grid;place-items:center;box-shadow:0 2px 6px -2px rgba(10,132,255,0.5);">Q</div>' +
+                '<div style="font-size:13px;font-weight:600;color:#0F1217;line-height:1.4;letter-spacing:-0.005em;">' + esc(q.question) + '</div>' +
+              '</div>' +
+              (q.how ? '<div style="margin-top:8px;padding-left:30px;font-size:12px;color:#2A2F39;line-height:1.55;"><span style="font-weight:700;color:#006FE6;font-size:10.5px;letter-spacing:0.08em;text-transform:uppercase;margin-right:6px;">How</span>' + esc(q.how) + '</div>' : '') +
+            '</div>';
+          }).join("") +
+        '</div></div>';
+    }
+
+    if (research.length > 0) {
+      html += '<div style="' + blockCss + '">' + subHeader("Research Before the Call", research.length) +
+        '<div style="display:flex;flex-direction:column;gap:8px;">' +
+          research.map(function (r, i) {
+            return '<div style="display:flex;gap:10px;align-items:flex-start;padding:10px 12px;background:rgba(255,255,255,0.6);border:0.5px solid rgba(15,18,23,0.08);border-radius:10px;">' +
+              '<div style="width:18px;height:18px;border-radius:6px;flex-shrink:0;display:grid;place-items:center;margin-top:1px;background:rgba(10,132,255,0.1);color:#006FE6;font-size:11px;font-weight:700;">' + (i + 1) + '</div>' +
+              '<div style="font-size:12.5px;color:#2A2F39;line-height:1.5;letter-spacing:-0.005em;">' + esc(r) + '</div>' +
+            '</div>';
+          }).join("") +
+        '</div></div>';
+    }
+
+    if (redFlags.length > 0) {
+      html += '<div style="' + blockCss + '">' + subHeader("Red Flags to Watch For", redFlags.length) +
+        '<div style="display:flex;flex-direction:column;gap:8px;">' +
+          redFlags.map(function (r) {
+            return '<div style="display:flex;gap:10px;align-items:flex-start;padding:10px 12px;background:rgba(255,248,235,0.7);border:0.5px solid rgba(217,119,6,0.2);border-radius:10px;">' +
+              '<div style="width:18px;height:18px;border-radius:6px;flex-shrink:0;display:grid;place-items:center;margin-top:1px;background:rgba(217,119,6,0.15);color:#B45309;font-size:11px;font-weight:700;">!</div>' +
+              '<div style="font-size:12.5px;color:#78350F;line-height:1.5;letter-spacing:-0.005em;">' + esc(r) + '</div>' +
+            '</div>';
+          }).join("") +
+        '</div></div>';
+    }
+
+    return '<div id="prep-section" style="background:rgba(255,255,255,0.55);border:0.5px solid rgba(255,255,255,0.9);border-radius:22px;box-shadow:0 8px 24px -8px rgba(15,30,60,0.10), 0 24px 64px -28px rgba(10,132,255,0.20);overflow:hidden;margin-top:20px;scroll-margin-top:80px;">' +
+      '<div style="padding:18px 20px 14px;border-bottom:0.5px solid rgba(15,18,23,0.08);background:linear-gradient(180deg, rgba(234,244,255,0.55), rgba(255,255,255,0.35));">' +
+        '<div style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:99px;font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:white;background:linear-gradient(180deg, #5AAEFF 0%, #3D8BFF 35%, #006FE6 100%);box-shadow:0 4px 10px -4px rgba(10,132,255,0.55);margin-bottom:8px;">' +
+          '<span style="width:5px;height:5px;border-radius:50%;background:white;"></span>Interview Prep Guide</div>' +
+        '<div style="font-size:16px;font-weight:700;color:#0F1217;letter-spacing:-0.015em;">Get ready for the call</div>' +
+        '<div style="font-size:12.5px;color:#5F6773;margin-top:3px;letter-spacing:-0.005em;">If they respond, here is what to prepare. Read this before you get on the call.</div>' +
+      '</div>' + html +
+    '</div>';
+  }
+
+  function stickyNavHtml() {
+    var hasVar = !!state.variations, hasTmay = !!state.tmay, hasPrep = !!state.prep;
+    if (!hasVar && !hasTmay && !hasPrep) return "";
+
+    function btn(id, label, badge) {
+      return '<button class="nav-btn" data-target="' + id + '" style="display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border-radius:99px;font-size:12px;font-weight:600;color:#0F1217;background:rgba(255,255,255,0.7);border:0.5px solid rgba(255,255,255,0.9);box-shadow:inset 0 0.5px 0 rgba(255,255,255,0.95), 0 1px 2px rgba(15,30,60,0.06);cursor:pointer;font-family:inherit;letter-spacing:-0.005em;">' +
+        (badge ? '<span style="width:18px;height:18px;border-radius:5px;flex-shrink:0;background:linear-gradient(180deg, #5AAEFF, #006FE6);color:white;font-size:10px;font-weight:700;display:grid;place-items:center;box-shadow:0 2px 4px -1px rgba(10,132,255,0.5);">' + badge + '</span>' : '') +
+        label + '</button>';
+    }
+
+    var inner = "";
+    if (hasVar) inner += btn("letter-a", "Direct", "A") + btn("letter-b", "Story", "B") + btn("letter-c", "Curious", "C");
+    if (hasTmay) inner += btn("tmay-section", "TMAY Script", null);
+    if (hasPrep) inner += btn("prep-section", "Prep Guide", null);
+    inner += btn("top-of-form", "Top", null);
+
+    return '<div style="position:sticky;top:12px;z-index:50;display:flex;justify-content:center;margin-bottom:16px;pointer-events:none;">' +
+      '<div style="display:inline-flex;flex-wrap:wrap;gap:6px;padding:6px;background:rgba(255,255,255,0.75);border:0.5px solid rgba(255,255,255,0.9);border-radius:99px;backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);box-shadow:inset 0 0.5px 0 rgba(255,255,255,0.95), 0 4px 14px -4px rgba(15,30,60,0.12), 0 20px 40px -20px rgba(10,132,255,0.35);pointer-events:auto;max-width:100%;">' +
+      inner + '</div></div>';
+  }
+
+  function renderResults() {
+    copyTargets = {};
+    var html = "";
+
+    if ((state.variations || state.tmay || state.prep) && !state.loading) {
+      html += stickyNavHtml();
+    }
+
+    if (state.error && !state.loading) {
+      html += '<div style="background:#fff5f5;border:1px solid #fec5c5;border-radius:12px;padding:16px;color:#c0392b;font-size:13px;text-align:center;margin-bottom:16px;">' +
+        '<div style="margin-bottom:8px;">' + esc(state.error) + '</div>' +
+        '<button id="retry-btn" style="padding:8px 20px;font-size:13px;border-radius:10px;background:linear-gradient(180deg, #5AAEFF, #006FE6);color:white;border:0;font-weight:600;cursor:pointer;font-family:inherit;">Retry</button>' +
+      '</div>';
+    }
+
+    if (state.loading) {
+      html += '<div style="display:flex;flex-direction:column;gap:14px;">' + skeletonCardHtml() + skeletonCardHtml() + skeletonCardHtml() + '</div>';
+    }
+
+    if (state.variations && !state.loading) {
+      html += '<div style="display:flex;flex-direction:column;gap:14px;">' +
+        state.variations.map(function (v, idx) { return variationCardHtml(v, idx); }).join("") +
+      '</div>';
+    }
+
+    if (state.tmay && !state.loading) html += tmaySectionHtml(state.tmay);
+    if (state.prep && !state.loading) html += prepSectionHtml(state.prep);
+
+    resultsEl.innerHTML = html;
+
+    var retry = document.getElementById("retry-btn");
+    if (retry) retry.addEventListener("click", generate);
+  }
+
+  /* ============================ EVENTS ============================ */
+
+  jdInput.addEventListener("input", function (e) {
+    state.jd = e.target.value;
+    var detected = detectIndustry(state.jd);
+    if (detected) state.industry = detected;
+    renderJdMeta();
+    renderIndustryBlock();
+    renderExperience();
+    renderGenerateBtn();
+  });
+
+  notesInput.addEventListener("input", function (e) { state.notes = e.target.value; });
+  nameInput.addEventListener("input", function (e) { state.name = e.target.value; });
+  whatsappInput.addEventListener("input", function (e) { state.whatsapp = e.target.value; });
+  toneInput.addEventListener("input", function (e) { state.tone = +e.target.value; });
+  lengthInput.addEventListener("input", function (e) { state.length = +e.target.value; });
+
+  document.getElementById("load-sample").addEventListener("click", function () {
+    var ind = currentIndustry();
+    state.jd = ind.sample;
+    jdInput.value = ind.sample;
+    var detected = detectIndustry(ind.sample);
+    if (detected) state.industry = detected;
+    renderJdMeta();
+    renderIndustryBlock();
+    renderExperience();
+    renderGenerateBtn();
+  });
+
+  generateBtn.addEventListener("click", generate);
+
+  // Delegated clicks for copy buttons and sticky-nav scroll
+  document.addEventListener("click", function (e) {
+    var copyBtn = e.target.closest ? e.target.closest(".copy-btn") : null;
+    if (copyBtn) { doCopy(copyBtn); return; }
+    var navBtn = e.target.closest ? e.target.closest(".nav-btn") : null;
+    if (navBtn) {
+      var el = document.getElementById(navBtn.getAttribute("data-target"));
+      if (el) {
+        var y = el.getBoundingClientRect().top + window.pageYOffset - 80;
+        window.scrollTo({ top: y, behavior: "smooth" });
+      }
+    }
+  });
+
+  /* ============================ GENERATE ============================ */
+
+  async function generate() {
+    if (state.jd.trim().length < 20) return;
+    state.loading = true;
+    state.error = "";
+    state.variations = null;
+    state.tmay = null;
+    state.prep = null;
+    renderGenerateBtn();
+    renderResults();
+
+    try {
+      var prompt = buildPromptText({
+        ind: currentIndustry(), plat: currentPlatform(), tone: state.tone, length: state.length,
+        experience: state.experience, notes: state.notes, name: state.name,
+        whatsapp: state.whatsapp, jd: state.jd, platform: state.platform
+      });
+
+      // ---- Built-in web-app API call ----
+      if (!window.claude || typeof window.claude.complete !== "function") {
+        throw new Error("The completion API (window.claude.complete) is not available in this environment.");
+      }
+      var raw = await window.claude.complete(prompt);
+      // -----------------------------------
+
+      var first = raw.indexOf("{");
+      var last = raw.lastIndexOf("}");
+      if (first === -1 || last === -1) throw new Error("No JSON found in response. Try again.");
+      var parsed = JSON.parse(raw.slice(first, last + 1));
+      if (!parsed.variations || !Array.isArray(parsed.variations)) throw new Error("Unexpected response shape. Try again.");
+      state.variations = parsed.variations.map(scrubVariation);
+      if (parsed.tmayScript) state.tmay = scrubTmay(parsed.tmayScript);
+      if (parsed.prep) state.prep = parsed.prep;
+    } catch (e) {
+      state.error = (e && e.message) ? e.message : "Something went wrong. Please retry.";
+    } finally {
+      state.loading = false;
+      renderGenerateBtn();
+      renderResults();
+    }
+  }
+
+  /* ============================ INITIAL RENDER ============================ */
+
+  renderJdMeta();
+  renderPlatforms();
+  renderIndustryBlock();
+  renderExperience();
+  renderGenerateBtn();
+  renderResults();
+
+})();
+</script>
+</body>
+</html>
