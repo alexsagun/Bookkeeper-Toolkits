@@ -488,6 +488,42 @@ textarea.gh-input, select.gh-input {
 button { font-family: inherit; }
 ::selection { background: var(--primary-selection); color: var(--c-text); }
 
+/* ──────────────────────────────────────────────────────────
+   COVER LETTER GENERATOR (.cl-tool) — scoped a11y rules
+   ──────────────────────────────────────────────────────────
+   Scoped deliberately. No button anywhere in this app has a visible keyboard focus
+   style today (`:focus-visible` appears nowhere else in this file), which is a WCAG
+   2.4.7 failure — but fixing it app-wide touches ~64 elements across shipped screens
+   (36 .sheen-btn, 22 .gh-btn-ghost, 6 .gh-pill in Community) with no visual test
+   coverage. That is its own change. These rules fix the tool being built now.
+
+   The ring MUST be `outline`, not a box-shadow: .sheen-btn's whole appearance is four
+   stacked box-shadows, so a shadow ring would replace all of them and flatten it.
+
+   .gh-input is NOT excluded. It already paints a --focus-ring halo on :focus, but that
+   halo is rgba(10,132,255,0.18) — about 1.2:1 against the card, well under the 3:1
+   WCAG 2.2 SC 2.4.11 wants of a focus indicator. Leaving inputs out gave the tool's
+   primary controls the weakest indicator on the page. The larger offset puts the crisp
+   ring outside the soft halo instead of doubling it. */
+.cl-tool :focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+.cl-tool .gh-input:focus-visible { outline-offset: 4px; }
+/* .sheen-btn is itself a --c-primary gradient, so a primary ring on it is invisible.
+   --c-text reads against the gradient in both themes (near-black / near-white). */
+.cl-tool .sheen-btn:focus-visible { outline-color: var(--c-text); }
+/* .gh-pill animates `transition: all`, which would smear the outline over 200ms while
+   tabbing quickly. Focus rings should appear instantly. */
+.cl-tool .gh-pill { transition-property: background, color, border-color, box-shadow; }
+
+@media (prefers-reduced-motion: reduce) {
+  /* Only the skeleton. NOT a blanket `* { animation: none }` — that would stop
+     .animate-spin on the Loader2 in the generate button, making the loading state
+     visually identical to idle for exactly the users who opted out of motion. */
+  /* Also repaint: .shimmer's gradient frozen at position 0 is almost entirely
+     transparent, so `animation: none` alone would erase the skeleton rather than
+     still it, leaving these users with no loading affordance at all. */
+  .cl-tool .shimmer { animation: none; background: var(--wash-strong); }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    TAILWIND DARK COMPAT LAYER
    The codebase styles many neutral surfaces with plain Tailwind utilities
