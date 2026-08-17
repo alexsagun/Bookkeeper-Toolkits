@@ -9,9 +9,10 @@
 //   npm run ai:knowledge:push     → regenerate, then upload to the ElevenLabs KB
 //
 // HOW IT WORKS
-// Structured facts (routes, plan pricing, entitlement scopes, tool descriptions, tips)
-// are extracted from PURE module-scope literals in src/BookkeeperPro.jsx via an anchored
-// balanced-bracket scan + `new Function` evaluation. Prose sections (lifecycle rules,
+// Routes, tool descriptions and tips are extracted from PURE module-scope literals in
+// src/BookkeeperPro.jsx via an anchored balanced-bracket scan + `new Function` evaluation.
+// Plan pricing and entitlement scopes are IMPORTED from src/lib/planCatalog.js, which is a
+// plain ESM module — no extraction, no purity contract. Prose sections (lifecycle rules,
 // workflows, FAQs) are hand-authored in the TEMPLATE below with {{PLACEHOLDER}} slots.
 // If a literal moves, is renamed, or stops being a pure literal, this script FAILS LOUDLY
 // with an actionable message — fix the literal (or this script) and rerun.
@@ -21,6 +22,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ENROLLMENT_PLANS_FALLBACK, PLAN_ENTITLEMENTS } from '../src/lib/planCatalog.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SOURCE = join(ROOT, 'src', 'BookkeeperPro.jsx');
@@ -36,7 +38,7 @@ function fail(msg) {
 // Anchored on `const <name> = `, then a balanced [ ] / { } scan that honors string
 // literals (with escapes), template strings, and // + /* */ comments, so braces inside
 // any of those never unbalance the count. The snippet is evaluated with `new Function`,
-// optionally with injected identifiers (PLAN_ENTITLEMENTS references TRAINING_ONLY_TAB_IDS).
+// optionally with injected identifiers.
 function extractLiteral(src, name, inject = {}) {
   const anchor = `const ${name} = `;
   const at = src.indexOf(anchor);
@@ -100,10 +102,9 @@ const src = readFileSync(SOURCE, 'utf8');
 
 const TAB_ROUTES = extractLiteral(src, 'TAB_ROUTES');
 const VOICE_TAB_INFO = extractLiteral(src, 'VOICE_TAB_INFO');
-const ENROLLMENT_PLANS_FALLBACK = extractLiteral(src, 'ENROLLMENT_PLANS_FALLBACK');
-const TRAINING_ONLY_TAB_IDS = extractLiteral(src, 'TRAINING_ONLY_TAB_IDS');
-const PLAN_ENTITLEMENTS = extractLiteral(src, 'PLAN_ENTITLEMENTS', { TRAINING_ONLY_TAB_IDS });
 const TIPS = extractLiteral(src, 'TIPS');
+// ENROLLMENT_PLANS_FALLBACK + PLAN_ENTITLEMENTS are imported from src/lib/planCatalog.js
+// at the top of this file — they are a real module, so there is nothing to extract.
 
 // Cross-check: every route needs voice info and vice versa (mockinterview is an alias).
 const routeIds = Object.keys(TAB_ROUTES).filter((id) => id !== 'mockinterview');
@@ -117,7 +118,9 @@ for (const id of infoIds) {
 
 softAssert(src, 'daysLeft <= 3', 'red expiry warning threshold (≤3 days)');
 softAssert(src, 'daysLeft <= 5', 'amber expiry warning threshold (≤5 days)');
-softAssert(src, 'Math.max(60,', 'extension minimum (2 months / 60 days)');
+// extensionPrice() lives in src/lib/planCatalog.js, so this one reads that file.
+softAssert(readFileSync(join(ROOT, 'src', 'lib', 'planCatalog.js'), 'utf8'),
+  'Math.max(60,', 'extension minimum (2 months / 60 days)');
 if (existsSync(BOOTSTRAP_SQL)) {
   softAssert(readFileSync(BOOTSTRAP_SQL, 'utf8'), 'v_grace_days constant int := 3', 'grace period (3 days) in db bootstrap');
 }
@@ -163,11 +166,15 @@ for (const key of scopedKeys) {
     scopeSection += `- **${name}** (\`${key}\`): ${cfg.scopeLabel}. Can open: ${tabs}.${cfg.courseTier ? ` Within the QuickBooks catalog it can only open **${cfg.courseTier}-tier** courses (QuickBooks Online Essentials — NOT Mastery).` : ''}\n`;
   }
 }
+// Every sellable plan must carry an explicit PLAN_ENTITLEMENTS entry — an unlisted key
+// now resolves to the fail-closed branch, so a plan missing here would be locked out of
+// its own toolkit rather than quietly granted everything.
 const unscopedPlans = ENROLLMENT_PLANS_FALLBACK.filter((p) => !scopedKeys.includes(p.key));
 if (unscopedPlans.length) {
-  scopeSection += `- **${unscopedPlans.map((p) => `${p.name} (\`${p.key}\`)`).join(', ')}**: full toolkit access.\n`;
+  fail(`Plan(s) ${unscopedPlans.map((p) => p.key).join(', ')} are in ENROLLMENT_PLANS_FALLBACK but have no PLAN_ENTITLEMENTS entry. Add one in src/lib/planCatalog.js — an unlisted plan now FAILS CLOSED (Home only), it does not get full access.`);
 }
-scopeSection += '- **Any other, unknown, or legacy plan** (and every admin): full toolkit access.\n';
+scopeSection += '- **Admins, and legacy members with no plan key on file**: full toolkit access.\n';
+scopeSection += '- **A retired or unrecognized plan key** (e.g. a membership that is no longer sold): Home only. The member keeps their Dashboard and membership panel and is asked to renew or upgrade — it does NOT grant the full toolkit.\n';
 
 const tipsSection = TIPS.map((t) => `- ${t}`).join('\n');
 
@@ -229,9 +236,10 @@ ${plansTable}
 **What each plan can open (entitlement scope):**
 
 ${scopeSection}
-Important nuance: the **Sampler Session costs more than QBO Mastery Only but unlocks
-LESS course content** — its ₱ price buys a live 1-on-1 coaching session, not more
-courses. Never assume a higher price means broader access.
+Important nuance: the **Sampler Session is the only plan with limited course access** —
+its ₱ price buys a live Zoom session and a 1-on-1 coaching booking, not the full course
+library. It opens QuickBooks Online **Essentials** only, not Mastery. Both other plans
+open every student tool.
 
 A tool outside the user's plan still shows a polite upgrade page if opened — nothing
 breaks. The assistant may navigate there and then suggest upgrading.
