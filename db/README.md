@@ -9,14 +9,32 @@ All SQL for the app lives here. There are **two ways** to stand up the database 
   already-applied ones are no-ops.
 
 Every file is safe to re-run (`create … if not exists`, `create or replace`, `drop … if exists`, `on
-conflict`). None of them drop tables/columns or delete data. All SQL is pasted into **Supabase → SQL
-Editor → Run**. The Supabase Dashboard steps that are *not* SQL (creating storage buckets by hand, Google
-OAuth, email templates, the two `VITE_SUPABASE_*` env vars) live in the setup docs linked below.
+conflict`). None of them drop tables/columns or delete data. The Supabase Dashboard steps that are *not*
+SQL (creating storage buckets by hand, Google OAuth, email templates, the two `VITE_SUPABASE_*` env vars)
+live in the setup docs linked below.
+
+### How SQL reaches the live database
+
+Two paths, both fine:
+
+1. **Supabase → SQL Editor → Run** — paste the file, run it.
+2. **The Supabase MCP server** (`.mcp.json`, pinned to `project_ref=ifxcobxsjdjzlozagmls`) — an agent
+   runs the same SQL through `execute_sql`.
+
+> **Use `execute_sql`, never `apply_migration`.** `apply_migration` writes a row into Supabase's *own*
+> `supabase_migrations.schema_migrations` table, which nothing in this repo reads — so it would stand up
+> a second, competing apply-log beside `public.schema_migrations` and the two would drift apart. This
+> repo has exactly one authoritative log (#31), and `npm run db:audit` reads that one.
+
+Large files should be split into statements before sending either way: the Management API rejects very
+large bodies, and a failure in a 5,000-line script reports one opaque error instead of naming the
+statement that broke. `splitSqlStatements()` in
+[`../scripts/apply-db-files.mjs`](../scripts/apply-db-files.mjs) is the dollar-quote-aware splitter.
 
 > **Apply-log (#31):** the live project tracks applied files in **`public.schema_migrations`**. After
-> running any dated file, insert its row in the same SQL-editor session (pattern at the tail of
+> running any dated file, insert its row **in the same session** (pattern at the tail of
 > [`2026-07-26-schema-migrations-log.sql`](2026-07-26-schema-migrations-log.sql)); to audit for drift,
-> diff the table against `ls db/*.sql`. This exists because two applied-looking migrations (#20/#21)
+> run `npm run db:audit`. This exists because two applied-looking migrations (#20/#21)
 > turned out never to have run in prod — see the #31 row below.
 
 ### "Is my database up to date?" — run `npm run db:audit`
@@ -49,8 +67,14 @@ the #20/#21 incident. Full explanation and a per-tab inventory:
    (see [../AUTH_SETUP.md](../AUTH_SETUP.md)).
 2. Run **[`000_full_database_bootstrap.sql`](000_full_database_bootstrap.sql)** once. It creates the entire
    final schema (all tables, functions, RLS, indexes, all five storage buckets, realtime publication) in
-   the fully-gated state (approval + enrollment both ON), **through #37** — including the cohort-entitlement
-   ledger and the D2 announcement-only General space. Nothing else needs running afterwards; verify with
+   the fully-gated state (approval + enrollment both ON), **through #39** — including the cohort-entitlement
+   ledger, the D2 announcement-only General space, the batch past-lock + month-end sweep, and the
+   three-plan catalog (Sampler / Silver / VIP; VIP is the only cohort segment). One thing the
+   SQL cannot finish on its own: if #38's `do` block printed the pg_cron notice, enable
+   **Dashboard → Integrations → Cron** and run the `cron.schedule(...)` call it printed, or batches will
+   never close by themselves. **Do not rely on seeing that notice** — the Management API / MCP
+   `execute_sql` path discards `RAISE NOTICE` entirely. The authoritative check is the
+   `#38 the sweep is scheduled` line in `npm run db:audit`. Nothing else needs running afterwards; verify with
    `npm run db:audit`.
 3. **Storage buckets:** the bootstrap creates them via SQL. If your SQL role couldn't (you'll see a
    `NOTICE`), create them in **Dashboard → Storage**: `course-media` (**Public = ON**),
@@ -123,16 +147,20 @@ user-approval adds). Anything already applied no-ops. Hard ordering dependencies
 
 | 37 | [`2026-08-01-entitlement-hardening.sql`](2026-08-01-entitlement-hardening.sql) | **Code-review corrections to #35/#36.** ① Restores the three conjuncts #36 dropped from `community_attachments_own_insert` — `uploader_id = auth.uid()` (the column is NOT NULL and client-supplied, with no stamping trigger, so it was forgeable, and the own-DELETE policy keys on it), the `storage_path is null` branch (the table CHECK makes a LINK attachment's path NULL, so `foldername(NULL)[1] = uid` → NULL → **link attachments were impossible to create**), and the `[1] = p.space_id` binding on two-level paths. #36's `can_attach` gate is kept. ② Restores #33's uuid-shaped space check (and its regex guard, which turns a would-be 22P02 500 into a clean 403) on `community_media_own_insert`. ③ `revoke_batch_run` clears `subscriptions.batch_id` **only on a real revoke** — a segment-changing upgrade supersedes then re-grants, and clearing the cache in that window left every upgrade at `missing_cache` in the drift view forever, blocking the #39 gate. Safe because the bridge is disabled by ANY ledger row. ④ The FIFO binder is **forward-only within a run**, so a batch created for a PAST month (plausible during historical imports) can no longer absorb queued seats out of order and already-active. ⑤ `admin_grant_batch_run` raises `ALREADY_ENTITLED` instead of minting a duplicate run — the one-seat-per-cohort unique index only covers BOUND seats, so a repeat call fell through to the shortfall path. Also makes `my_community_spaces()`'s General `member_count` set-based (it was one SECDEF `user_is_enrolled()` call per profile, on every community load). Additive + idempotent. | #36 + #31 |
 
+| 37b | [`2026-08-05-lesson-zoom-replay.sql`](2026-08-05-lesson-zoom-replay.sql) | **A RECORDING, not a change — read the file header.** Adds `course_lessons.zoom_replay_url` (nullable text, no default, **no CHECK, no index**): the optional "Zoom Live Replay" supplementary link. The original ran against production on **2026-08-05 01:03 UTC** and wrote its own apply-log row, then was **never committed** — it is in git on no branch, and there are no commits at all between 2026-08-01 and 2026-08-10. `npm run db:audit` surfaced it on 2026-08-17 as *a log row with no file*: the exact mirror of the #20/#21 incident that motivated #31 (there a file claimed to have run and hadn't; here something ran and left no file). While the gap was open the **bootstrap could not reproduce production**, so a fresh install — and `db:shadow:verify` — differed by this column. Every statement is a no-op against prod; it matters for fresh installs and the shadow project. ★ **Schema only** — the client half named in the original's log notes (`src/lib/lessonReplay.js` https-only URL validation, the `COURSE_LESSON_SELECT` addition, the lesson-editor field, `LessonReplayLink`) was lost with it and is **not** restored, so the column is **dormant**: 0 of 143 lessons carry a value and nothing in `src/` reads it. ★ Uniquely in this directory its apply-log insert is `on conflict (filename) do nothing`, because prod already holds that row and `filename` is the PK. ★ **Renumbered:** the original called itself "#38"; `2026-08-16-batch-lifecycle.sql` independently claimed #38 eleven days later because the repo had no record of this one. Batch-lifecycle keeps #38 (already baked into prod's apply-log notes, `scripts/audit-db.mjs` labels and CLAUDE.md); this takes **#37b**, which is also chronologically honest. | #2 (`course_lessons`) — independent of #37/#38; touches an unrelated table |
 
-**Migration order in one line:** `#1 → #2 → #3 → #4 → #5 → #6 → #7 → #8 → #9 → #10 → #11 → #12 → #13 → #14 → #15 → #16 → #17 → #18 → #19 → #20 → #21 → #22 → #23 → #24 → #25 → #26 → #27 → #28 → #29 → #30 → #31 → #32 → #33 → #34`
-(feature-guides before user-approval; user-approval before enrollment; enrollment before subscription-lifecycle; the three 2026-07-08 files need enrollment/`is_enrolled()`; plan-course-access (#17) + subscription-grace (#18) both need subscription-lifecycle; sampler-essentials (#19) needs plan-course-access; account-membership-requests (#20) needs enrollment + `approve_subscription`; hardening (#21) replaces #20's `approve_extension`; sampler-support-60 (#22) + community (#23) both need subscription-lifecycle's columns/helpers; community-forum (#24) extends #23's tables; community-hardening (#25) extends #24's tables/policies; student-imports (#26) needs subscription-lifecycle; course-ai-trainer (#27) needs #13 + #17 + #19; community-write-gate (#28) gates the two community own-update policies, needs #23; rls-initplan-and-indexes (#29) re-asserts policies from the whole chain; backend-hardening (#30) builds on #29's wrapped baseline; schema-migrations-log (#31) is independent — run it everywhere and keep it current; community-spaces-batches (#32) needs #12 + #13 + #20 + #23/#24 + #30 and re-asserts the community policies space-aware, so run it after #29/#31; community-batch-hardening (#33) patches #32's approval RPC + policies, so it must run after #32 — and it guards on #31 because its own apply-log insert would otherwise abort the whole file; batch-hardening-followup (#34) corrects #33's copy of `admin_finalize_enrollment`, so **always run #34 immediately after #33** — #33 alone leaves the approval RPC missing its `updated_at`/`rejected_*` housekeeping).
+| 38 | [`2026-08-16-batch-lifecycle.sql`](2026-08-16-batch-lifecycle.sql) | **Editable batch records, a past-lock, and automatic month-end closure.** #32 shipped `batches.starts_on`/`ends_on`/`timezone` and nothing ever wrote them, so a batch never closed and a mis-typed code or name was permanent. But `code` is not a label — `grant_batch_run()` allocates `where b.code >= start order by b.code … for update` and `allocate_queued_entitlements()` refuses any cohort not strictly above the highest code a run already holds — so a careless re-code silently **reorders a member's already-purchased run**. This file therefore makes editing a guarded RPC and makes the direct path impossible: **`revoke update (code) on batches from authenticated`** (RLS has no column granularity; GRANT does), so a REST PATCH of `code` fails on privilege whatever the policy says. `admin_update_batch()` validates shape, uniqueness, **rank preservation** (the new code may not cross a sibling), period validity, timezone (`pg_timezone_names`) and capacity-vs-occupancy, then updates the row, the two space **names** (never their slugs — those are the permalinks in `?space=` deep links, and `pickInitialSpace()` falls back *silently* on an unknown slug), and re-stamps `activates_at` on seats that have **not yet started**, all audited as an `edit` event carrying before + after. `batch_is_past(ends_on, timezone)` is THE definition of past — today **in the batch's own timezone** > `ends_on`, so a batch stays editable through its final local day and a UTC comparison would lock an Asia/Manila batch up to 16 hours early; `batches_guard()` enforces it on UPDATE — and re-checks the code's shape and rank, because the column revoke stops `authenticated` but not `service_role` or the SQL editor — and fills the period from `code` on INSERT, so an SQL-editor insert is as reliable as the UI's. Break-glass for a past row is `set local app.batch_admin_override = 'on'` in a session running as the **table owner** (the SQL Editor / Management API); it is gated on ownership rather than `rolsuper`, because Supabase's `postgres` is not a superuser. A one-time backfill dates existing rows using **the same `to_date(code || '-01')` derivation the allocators already used as their fallback**, so allocation behaviour is provably unchanged. `close_due_batches()` closes (never archives) every open batch whose local period has ended, one `auto_close` event each, idempotent by its `status='open'` predicate — deliberately **without** an `is_admin()` guard, because that is exactly why `expire_overdue_subscriptions()` can never run under a scheduler; it is instead revoked from every client role and scheduled hourly by pg_cron, with `admin_close_due_batches()` as the admin/recovery path. Adds 7 error codes. Additive + idempotent; `admin_batch_overview()` is DROP+CREATEd (**re-grant included**). | #32 + #35 + #31 — **guard aborts if any is missing** |
+| 39 | [`2026-08-17-three-plan-catalog.sql`](2026-08-17-three-plan-catalog.sql) | **The three-plan catalog.** Deletes `core_self_paced` and `gold_live` (rows, not `active=false` — a deactivated plan is still extendable and still readable by every plan-scope helper) and the whole `gold` community segment with them: VIP becomes the only premium/private-batch segment. Silver → ₱2,999, VIP → ₱16,999, positions 1/2/3. `batches_create_spaces()` mints one VIP space; `batches.gold_capacity` is dropped; `admin_update_batch()` loses `p_gold_capacity` (**the 9-arg overload is DROPPED** — leaving both would let a client bind a different function depending on whether it sent the arg) and `admin_batch_overview()` loses its three `gold_*` OUT columns (**both re-granted after the DROP**); the `kind`/`community_segment`/`segment` CHECKs narrow to VIP; `plan_is_qbo_only()` is dropped after the 4 course-read policies + `course_object_allowed()` + the 2 trainer mirrors lose its conjunct — **sampler keeps its Essentials-only rule, which is now the only plan scope.** ★ Ordering: `batches_guard()` must be replaced BEFORE the column drop, or every `update batches` (including the hourly cron sweep) raises `record "new" has no field "gold_capacity"`. | #35 + #38 — run after both. **Deploy the matching client build with it**: the deployed Batches screen calls the 9-arg RPC and reads `gold_*`. |
+
+**Migration order in one line:** `#1 → #2 → #3 → #4 → #5 → #6 → #7 → #8 → #9 → #10 → #11 → #12 → #13 → #14 → #15 → #16 → #17 → #18 → #19 → #20 → #21 → #22 → #23 → #24 → #25 → #26 → #27 → #28 → #29 → #30 → #31 → #32 → #33 → #34 → #35 → #36 → #37 → #37b → #38 → #39`
+(feature-guides before user-approval; user-approval before enrollment; enrollment before subscription-lifecycle; the three 2026-07-08 files need enrollment/`is_enrolled()`; plan-course-access (#17) + subscription-grace (#18) both need subscription-lifecycle; sampler-essentials (#19) needs plan-course-access; account-membership-requests (#20) needs enrollment + `approve_subscription`; hardening (#21) replaces #20's `approve_extension`; sampler-support-60 (#22) + community (#23) both need subscription-lifecycle's columns/helpers; community-forum (#24) extends #23's tables; community-hardening (#25) extends #24's tables/policies; student-imports (#26) needs subscription-lifecycle; course-ai-trainer (#27) needs #13 + #17 + #19; community-write-gate (#28) gates the two community own-update policies, needs #23; rls-initplan-and-indexes (#29) re-asserts policies from the whole chain; backend-hardening (#30) builds on #29's wrapped baseline; schema-migrations-log (#31) is independent — run it everywhere and keep it current; community-spaces-batches (#32) needs #12 + #13 + #20 + #23/#24 + #30 and re-asserts the community policies space-aware, so run it after #29/#31; community-batch-hardening (#33) patches #32's approval RPC + policies, so it must run after #32 — and it guards on #31 because its own apply-log insert would otherwise abort the whole file; batch-hardening-followup (#34) corrects #33's copy of `admin_finalize_enrollment`, so **always run #34 immediately after #33** — #33 alone leaves the approval RPC missing its `updated_at`/`rejected_*` housekeeping; batch-entitlements (#35) needs #34 + #27 and asserts #27's helper bodies are unchanged; community-plan-capabilities (#36) needs #35; entitlement-hardening (#37) corrects #35/#36 and needs #36; lesson-zoom-replay (#37b) is a **reconstruction** of a file that ran in prod on 2026-08-05 and was never committed — it needs only #2, sits outside the batch chain, and can run at any point after it; batch-lifecycle (#38) needs #32's `batches` and #35's `app_error`/`batch_seat_holders`, and it **backfills before it guards** — the date backfill must run while past rows are still writable, which is why its statement order is not rearrangeable).
 
 ---
 
 ## How the bootstrap relates to the dated files
 
-`000_full_database_bootstrap.sql` is the **collapsed final state** of files #1–#37 (#33, #34, #35, #36
-and #37 are folded verbatim as §20–§24 — a fresh install must NOT re-run them). Where an object is
+`000_full_database_bootstrap.sql` is the **collapsed final state** of files #1–#39 (#33, #34, #35, #36,
+#37, #38 and #39 are folded verbatim as §20–§26 — a fresh install must NOT re-run them). Where an object is
 redefined across the dated chain, the bootstrap keeps only the **final** version, defined once —
 except the 2026-07-26 backend pass (#29/#30/#31), which is **folded verbatim as §18 at the tail**, and
 community-spaces-batches (#32), folded **verbatim as §19 after it** (deliberately LAST — §15b/§18
@@ -144,11 +172,16 @@ state exactly; when one of those files changes, re-fold it):
   simple `is_admin or is_paid` version from #12.
 - **`approve_subscription()`** — the #18 form with the grace knob `v_grace_days = 3` (every granted term
   gets `grace_ends_at = ends_at + 3 days`), not the #13 grace-off (`= 0`) version.
-- **`courses_read` / `modules_read` / `lessons_read`** — the #19 shape: `(select is_admin()) OR
-  (published AND (select is_approved()) AND (select is_enrolled()) AND (not (select plan_is_qbo_only())
-  OR slug like 'qbo-%') AND (not (select plan_is_sampler()) OR (slug like 'qbo-%' AND access_tier =
-  'essentials')))` (`(select …)`-wrapped for once-per-query InitPlans), never the intermediate
-  base/`is_approved()`-only/pre-plan-scope shapes.
+- **`courses_read` / `modules_read` / `lessons_read`** — the **#39** shape: `(select is_admin()) OR
+  (published AND (select is_approved()) AND (select is_enrolled()) AND (not (select plan_is_sampler())
+  OR (slug like 'qbo-%' AND access_tier = 'essentials')))` (`(select …)`-wrapped for once-per-query
+  InitPlans), never the intermediate base/`is_approved()`-only/pre-plan-scope shapes, and no longer
+  the #19 shape — #39 dropped the `plan_is_qbo_only()` conjunct with `core_self_paced`. §26 applies
+  that change on a fresh install, so §13b still creates `plan_is_qbo_only()` and §26 drops it.
+- **`enrollment_plans` seed** — the three final plans at their final prices and positions
+  (sampler ₱1,499 / silver ₱2,999 / vip ₱16,999), seeded that way **in place** in §9, so #39's
+  guarded UPDATEs and its DELETE match nothing on a fresh install. Same idiom as the Sampler
+  support-days fix below.
 - **`feature_guides_read`** — `is_approved() AND is_enrolled()`.
 - **`enrollment_receipts` delete** — admin-only (the #14 shape), not the original owner-or-admin delete.
 - **`course-videos`** — the #15 private bucket + `course_videos_*` policies, with `course_videos_read`

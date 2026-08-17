@@ -73,7 +73,7 @@ export function planBatchCount(accessDays, override) {
  * How many ADDITIONAL cohorts an extension buys (D9).
  *
  * Keyed on what was actually purchased (enrollment_requests.extension_days), not
- * on the plan's own run length — a 60-day top-up on a 180-day Gold plan must
+ * on the plan's own run length — a 60-day top-up on the 180-day VIP plan must
  * grant 2 more cohorts, not another 6. Getting this wrong was a critical review
  * finding: it would have minted six cohort months and burned six seats for a
  * two-month purchase.
@@ -102,14 +102,14 @@ const toTime = (v) => {
  *
  * @returns {'revoked'|'superseded'|'queued'|'expired'|'scheduled'|'active'|'unknown'}
  *   revoked    — explicitly withdrawn by an admin
- *   superseded — replaced by a later run (e.g. a gold→vip upgrade)
+ *   superseded — replaced by a later run (e.g. a silver→vip upgrade)
  *   queued     — paid for, but the cohort does not exist yet (batch_id null)
  *   expired    — the membership term (or its grace) has passed
  *   scheduled  — allocated to a cohort that has not started yet
  *   active     — currently grants access
  *
  * NOTE: this cannot see the member's LIVE plan segment, so it never reports the
- * segment-mismatch case (a downgraded member whose stamped gold seats stop
+ * segment-mismatch case (a downgraded member whose stamped VIP seats stop
  * resolving). That check lives in SQL, where the live plan is available — the
  * UI shows such rows as 'active' but the database refuses access. Deliberate:
  * a client-side helper must not be the thing that decides authorization.
@@ -195,19 +195,19 @@ export function describeSeat(row, batchesById, now = Date.now()) {
 
   switch (status) {
     case 'queued':
-      return `${reason} — seat reserved, assigned when the next cohort opens`;
+      return `${reason} — seat reserved, assigned when the next batch opens`;
     case 'scheduled':
-      return `${reason} — ${label || 'cohort'} starts soon`;
+      return `${reason} — ${label || 'batch'} starts soon`;
     case 'active':
-      return `${reason} — ${label || 'cohort'}`;
+      return `${reason} — ${label || 'batch'}`;
     case 'expired':
-      return `${reason} — ${label || 'cohort'} (access ended)`;
+      return `${reason} — ${label || 'batch'} (access ended)`;
     case 'revoked':
-      return `${label || 'Cohort'} — access withdrawn${row.revoke_reason ? `: ${row.revoke_reason}` : ''}`;
+      return `${label || 'Batch'} — access withdrawn${row.revoke_reason ? `: ${row.revoke_reason}` : ''}`;
     case 'superseded':
-      return `${label || 'Cohort'} — replaced by a later plan`;
+      return `${label || 'Batch'} — replaced by a later plan`;
     default:
-      return label || 'Cohort seat';
+      return label || 'Batch seat';
   }
 }
 

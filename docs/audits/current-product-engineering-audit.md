@@ -1,5 +1,13 @@
 # Product-Engineering Stabilization Audit — 2026-07-12
 
+> **HISTORICAL SNAPSHOT — do not read the plan/pricing sections as current behavior.** This audit
+> describes the app as of 2026-07-12, when the catalog had five plans. Migration **#39**
+> (2026-08-17) consolidated it to three — `sampler` ₱1,499, `silver_self_paced` ₱2,999,
+> `vip` ₱16,999 — and permanently removed `core_self_paced`, `gold_live`, and the whole `gold`
+> community segment. Anything below about Core, Gold, per-plan course scoping via
+> `plan_is_qbo_only()`, or five pricing cards is a record of what was true then. The current
+> behavior lives in `CLAUDE.md`, `db/README.md`, and `db/2026-08-17-three-plan-catalog.sql`.
+
 **Scope:** full-application audit + stabilization pass on branch `feat-plan-entitlements` (on top of the
 in-flight plan-entitlements feature, which ships in the same branch). Covered: UI components & states,
 auth, roles/permissions, subscription lifecycle, plan entitlements, upgrade/extension workflows, payment

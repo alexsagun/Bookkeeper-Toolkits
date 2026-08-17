@@ -17,7 +17,7 @@ in-app **Enrollments** admin tab. Approving one request **unlocks everything in 
 
 Since the **subscription lifecycle** upgrade ([`db/2026-07-04-subscription-lifecycle.sql`](db/2026-07-04-subscription-lifecycle.sql)),
 approval grants a **dated term**: each plan carries an `access_days` duration (60 for
-Core / Sampler / Silver, 180 for Gold / VIP), the subscription gets a real `ends_at`, the
+Sampler / Silver, 180 for VIP), the subscription gets a real `ends_at`, the
 student sees a **membership panel on the Dashboard** (plan, status, days remaining, renew
 button, warnings at 5 / 3 days + a **3-day grace period**), and when the term (plus grace)
 ends they're locked on a **Membership Expired** screen until an admin approves their
@@ -55,7 +55,7 @@ step per state):
 - **Grandfathering:** the migration's one-time backfill sets `is_paid = true` for every account
   that is already `approval_status = 'approved'` — **running it never locks out current users.**
   Only new/unpaid accounts see the paywall.
-- **Data:** `enrollment_plans` (the 5 seeded pricing cards — admin-editable rows; now with
+- **Data:** `enrollment_plans` (the 3 seeded pricing cards — admin-editable rows; now with
   `access_days` / `support_days` / `entitlement_summary`), `enrollment_requests` (one row per
   submission, append-only from the student side — renewals are just new rows),
   `subscriptions` (the plan record — now a dated **term** with `ends_at`, `grace_ends_at`,
@@ -77,7 +77,8 @@ step per state):
 Supabase Dashboard → **SQL Editor → New query** → paste **all** of
 [`db/2026-07-04-enrollment.sql`](db/2026-07-04-enrollment.sql) → **Run**. It is idempotent.
 
-It creates the four tables (with the 5 plans + your BPI / Security Bank / GCash details seeded),
+It creates the four tables (with the pricing plans + your BPI / Security Bank / GCash details
+seeded — the catalog was later consolidated to the **three** live plans by #39),
 the private `enrollment-receipts` bucket + storage policies, the `public.is_enrolled()` helper,
 Realtime on `enrollment_requests`, and runs the **one-time grandfather backfill** described above.
 
@@ -97,9 +98,10 @@ Same SQL Editor → paste **all** of
 Idempotent; safe to re-run. **Order:** `2026-06-29-user-approval.sql` → `2026-07-04-enrollment.sql`
 → **this file** (it stops with a clear exception if the enrollment tables don't exist yet).
 
-It adds `access_days` / `support_days` / `entitlement_summary` to `enrollment_plans` (seeding
-60 / 60+30 / 60 / 180 / 180 days for the five plans — only where still unset, so your in-app
-edits survive), adds `ends_at` / `grace_ends_at` / `renewed_from_subscription_id` / `updated_at`
+It adds `access_days` / `support_days` / `entitlement_summary` to `enrollment_plans` (seeding the
+per-plan durations — today **60** days for Sampler and Silver, **180** for VIP — only where still
+unset, so your in-app edits survive), adds `ends_at` / `grace_ends_at` /
+`renewed_from_subscription_id` / `updated_at`
 to `subscriptions`, rewrites **`public.is_enrolled()` to be date-aware**, creates the
 `approve_subscription()` and `expire_overdue_subscriptions()` admin functions, and adds
 `subscriptions` to Realtime.
@@ -119,7 +121,9 @@ It **requires the `subscriptions.ends_at` column** from the subscription-lifecyc
 
 It adds the `current_plan_key()` / `plan_is_qbo_only()` / `course_object_allowed()` helpers and
 re-applies `courses_read` / `modules_read` / `lessons_read` + the private `course_videos_read` policy
-with a plan predicate — so a `core_self_paced` member reads only `qbo-*` courses. For performance the
+with a plan predicate — scoping a `core_self_paced` member to `qbo-*` courses. **#39 retired that
+rule**: `core_self_paced` is gone and `plan_is_qbo_only()` is dropped, so the Sampler's
+Essentials-only rule (Step 1e) is now the only plan scope on courses. For performance the
 no-arg helpers are wrapped in `(select …)` so each is evaluated **once per query** (an InitPlan), and
 the plan check short-circuits so full-access members do zero per-row plan work. It only **adds** a
 conjunct; it never loosens the existing `is_approved()` / `is_enrolled()` / `published` checks, so
@@ -127,8 +131,9 @@ full-access members, admins, grandfathered users, and expired members are unaffe
 "Plan access scope (per-plan entitlements)" below.
 
 > **Deploy order doesn't matter** here either: the client's plan gating is independent of the SQL, and
-> the migration only tightens reads for `core_self_paced` members. Verify as a core member that a direct
-> `select` on a `resume-%` course (and a `course-videos` signed URL) is denied, while `qbo-%` still reads.
+> after #39 this migration tightens reads for nobody on its own — the live plan scope is the Sampler's
+> (Step 1e). Verify there as a Sampler member that a direct `select` on a `resume-%` course (and a
+> `course-videos` signed URL) is denied, while the Essentials `qbo-%` course still reads.
 
 ## Step 1d — Run the grace-period migration (turns the 3-day grace ON)
 
@@ -197,9 +202,10 @@ Idempotent; needs #13 + the community migrations (#23/#24) + backend-hardening (
 #29/#31. What it changes for **enrollment** (the community half is documented in
 [COMMUNITY_SETUP.md](COMMUNITY_SETUP.md)):
 
-- **Batches** — Gold/VIP are cohort plans now: `enrollment_plans.community_segment` marks
-  `gold_live` → `gold` and `vip` → `vip`; every premium subscription carries a `batch_id`
-  (e.g. the seeded open batch `2026-08` "August 2026"). The paywall requires Gold/VIP students
+- **Batches** — VIP is a cohort plan: `enrollment_plans.community_segment` marks `vip` → `vip`
+  (#39 removed the `gold` segment together with the `gold_live` plan, so VIP is the only segment
+  that needs a batch); every premium subscription carries a `batch_id`
+  (e.g. the seeded open batch `2026-08` "August 2026"). The paywall requires VIP students
   to pick an **open** batch at checkout (`enrollment_requests.batch_id`); the admin approve
   dialog shows/validates it; Admin → **Batches** manages cohorts + a "Needs batch assignment"
   queue for premium members granted without one.
@@ -210,7 +216,7 @@ Idempotent; needs #13 + the community migrations (#23/#24) + backend-hardening (
   `approve_extension()` (stacking/supersede/grace/clamps unchanged), stamps
   `subscriptions.batch_id`, patches the profile cache, and marks the request approved — **all
   or nothing**. Rules: renewal keeps the current batch by default; an **extension always keeps
-  plan + batch**; a gold↔vip upgrade keeps the batch when the target space exists there, else
+  plan + batch**; an upgrade into VIP keeps the batch when that batch has a VIP space, else
   the admin picks; approving onto a **general** plan clears the batch (downgrade drops private
   community visibility; posts are preserved). Closed batches reject **new** assignments but
   never evict existing members. If the migration is missing, Approve fails with explicit setup
@@ -218,18 +224,18 @@ Idempotent; needs #13 + the community migrations (#23/#24) + backend-hardening (
 
 ## Membership lifecycle & renewal
 
-- **Durations:** approval stamps `ends_at = start + access_days` (Core/Sampler/Silver **60
-  days**, Gold/VIP **180 days**; Sampler also records `support_days = 60`, shown to the student
+- **Durations:** approval stamps `ends_at = start + access_days` (Sampler/Silver **60
+  days**, VIP **180 days**; Sampler also records `support_days = 60`, shown to the student
   but not RLS-enforced). A plan with `access_days = NULL` never expires. Edit durations in the
   `enrollment_plans` table (no redeploy needed).
 - **Plan access scope:** a term's plan also decides *which* tools it unlocks (client
-  `PLAN_ENTITLEMENTS` + `db/2026-07-09-plan-course-access.sql` + `db/2026-07-11-sampler-essentials-access.sql`):
-  **`core_self_paced`** (QBO Mastery Only) unlocks Home + Training & Skills (both `qbo-*` courses);
+  `PLAN_ENTITLEMENTS` + `db/2026-07-11-sampler-essentials-access.sql`):
   **`sampler`** (Sampler Session) unlocks Home + the QuickBooks catalog's **Essentials** course only +
-  both 1-on-1 booking pages (₱1,499 buys coaching, not more courses — *more* restricted than core);
-  **`silver_self_paced`** (QBO + Resume Combo) and every other plan grant **full non-admin toolkit
-  access**. Silver is premium/full — not to be confused with the limited QBO-only plan. **Every
-  active plan** (core and sampler included) also unlocks the in-app **Community** feed
+  both 1-on-1 booking pages (₱1,499 buys coaching, not more courses — the cheapest plan is also the
+  most scoped); **`silver_self_paced`** (QBO + Resume Combo) and **`vip`** (Personalized Coaching
+  Program) grant **full non-admin toolkit access**. A plan key the catalog no longer recognizes
+  (a removed plan, a typo) **fails closed** to Home only. **Every active plan** (sampler included)
+  also unlocks the in-app **Community** feed
   ([COMMUNITY_SETUP.md](COMMUNITY_SETUP.md)) — group chat is part of all plans, and its access ends
   with the membership term automatically (the Sampler's 60-day group-chat support == its 60-day term).
 - **Renewal stacking:** approving a renewal **extends from the current expiry** when the term is
@@ -279,8 +285,9 @@ filter chips).
   days)**, maximum **12 months (365 days — enforced by `approve_extension()` after Step 1g; for longer
   access, renew or upgrade instead)**; options 2 / 3 / 6 months + a custom stepper (clamped 2–12). Price is pro-rated from the plan's
   own `price_php` / `access_days` (`dailyRate × months×30`), so a 60-day plan's 2-month top-up equals its
-  full price (₱999 / ₱1,499 / ₱1,999). On **Approve**, `approve_extension()` adds `extension_days` **from
-  the current expiry** while the term is still running, or **from the approval date** if it had already
+  full price (₱1,499 Sampler / ₱2,999 Silver), while the 180-day VIP's 2-month top-up is ₱5,666. On
+  **Approve**, `approve_extension()` adds `extension_days` **from the current expiry** while the term
+  is still running, or **from the approval date** if it had already
   expired (a 3-day grace follows). The member keeps full access while an extension is pending. An
   **expired** member (no sidebar) can still extend via **"Extend the same plan"** on the Membership
   Expired screen.
@@ -297,43 +304,43 @@ already pending.
 
 Membership is **not all-or-nothing**. Each plan unlocks a scope of the app:
 
-- **`core_self_paced` (QBO Mastery Only, ₱999 / 60 days)** → **Home + Training & Skills only**
-  (Accounting 101, QuickBooks Online Mastery, Industry Accounting, US Tax 101, ProAdvisor Chat,
-  Niche Selector Quiz) — and reads **both** `qbo-*` courses (Essentials + Mastery). Job Application and
-  Client Management & Delivery tools are **not** accessible.
 - **`sampler` (Sampler Session, ₱1,499 / 60 days)** → **Home + the QuickBooks catalog (Essentials
   course only) + both 1-on-1 booking pages** (Book 1-on-1 with Alex, Personalized Coaching With Alex).
   Inside the QuickBooks catalog the Sampler sees **only** the **QuickBooks Online Essentials** course
   (`access_tier='essentials'`) — the premium **Mastery** course is hidden. ⚠️ The ₱1,499 buys the
-  coaching session, **not** more course content, so Sampler is *more* restricted than the ₱999 core
-  plan — don't assume higher price ⇒ wider scope.
-- **All other plans** (`silver_self_paced`, `gold_live`, `vip`), unknown/legacy plans, and **admins**
-  → the **full toolkit** (no restrictions — we don't gate plans Alex hasn't defined finer entitlements
-  for yet).
+  coaching session, **not** more course content, so the **cheapest** plan is also the **most
+  scoped** one. Price implies nothing about scope in either direction — read `PLAN_ENTITLEMENTS`,
+  never the price tag.
+- **`silver_self_paced` (QBO + Resume Combo, ₱2,999 / 60 days)** and **`vip` (Personalized Coaching
+  Program, ₱16,999 / 180 days)** → the **full toolkit** (every non-admin tool). **Admins**, the
+  enrollment flag being off, and legacy grandfathered terms with no plan string also resolve to full
+  access.
+- **An unrecognized plan key** (a removed plan such as the retired Core/Gold, a typo, stale client
+  state) → **fails closed**: Home/Dashboard only, with a renew/upgrade prompt. It is never treated as
+  full access.
 
 How it's enforced (two halves that must stay in sync):
 
-- **Client (UI + deep links):** `PLAN_ENTITLEMENTS` in `src/BookkeeperPro.jsx` lists the tabs each
+- **Client (UI + deep links):** `PLAN_ENTITLEMENTS` in `src/lib/planCatalog.js` lists the tabs each
   scoped plan may open (and, via `courseTier`, which course tier inside a catalog). The sidebar and
   Dashboard tiles are filtered to that scope, and the render chokepoint shows a polished **"This tool
   isn't part of your plan"** screen (with an Upgrade → Dashboard CTA) for any restricted tab reached by
-  deep-link, back/forward, or a stale last-tab — so a core member can't reach `/proposal-generator`,
+  deep-link, back/forward, or a stale last-tab — so a Sampler member can't reach `/proposal-generator`,
   `/invoice-creator`, `/budgeting`, `/courses/resume-winning-strategy`, etc. The **CourseCatalog** hides
   course cards the plan can't open, and **CourseProgram** shows an upgrade panel on a restricted
   deep-link. The student sees their **access scope** on the Dashboard membership panel and in the
   sidebar ("Access until {date}"); admins see it on each Enrollments card + the approve modal.
-- **Server (RLS):** [`db/2026-07-09-plan-course-access.sql`](db/2026-07-09-plan-course-access.sql)
-  scopes a `core_self_paced` member to **`qbo-*` courses**, and
-  [`db/2026-07-11-sampler-essentials-access.sql`](db/2026-07-11-sampler-essentials-access.sql) adds
-  `courses.access_tier` + `plan_is_sampler()` to scope a `sampler` member to **`qbo-*` courses that are
-  `access_tier='essentials'`** (Essentials only). Both cover course/lesson reads + the private
+- **Server (RLS):** [`db/2026-07-11-sampler-essentials-access.sql`](db/2026-07-11-sampler-essentials-access.sql)
+  adds `courses.access_tier` + `plan_is_sampler()` to scope a `sampler` member to **`qbo-*` courses that are
+  `access_tier='essentials'`** (Essentials only) — the **one surviving** plan-scope rule, since #39
+  dropped `plan_is_qbo_only()` along with `core_self_paced`. It covers course/lesson reads + the private
   `course-videos` bucket, so the Mastery course, the Resume (`resume-*`)/Interview (`interview-*`)
   courses, and their private lesson videos are denied even via direct Supabase query.
 - **Admin sets a course's tier in-app:** open the course card **⋮ menu → "Sampler tier (Essentials)"**.
   New courses default to `'standard'` (premium); mark the Essentials course `'essentials'` and publish.
 
 **Changing entitlements:** edit both `PLAN_ENTITLEMENTS`/`courseTier` (client) *and* the
-`plan_is_qbo_only()` / `plan_is_sampler()` / `course_object_allowed()` rules + the policy slug/tier
+`plan_is_sampler()` / `course_object_allowed()` rules + the policy slug/tier
 predicates in the migrations (server) together — they encode the same policy at two layers.
 
 **Upgrading:** a member picks a higher plan from the same renewal paywall — via the Dashboard Renew
@@ -342,7 +349,7 @@ button **or the sidebar ⋮ account menu → Upgrade Plan** — uploads proof, a
 the subscription change / window focus). See "Extend access & upgrade" above.
 
 **Not scoped (documented residuals):** the MockInterviewSimulator `feature_guides` explainer video and
-the AI proxy stay `is_enrolled()`-gated (a core/sampler member could spend AI tokens via a hand-crafted
+the AI proxy stay `is_enrolled()`-gated (a Sampler member could spend AI tokens via a hand-crafted
 proxy call, but that reveals no stored higher-tier content). Tighten later if needed.
 
 ## Step 2 — Verify the receipts bucket is private
@@ -369,7 +376,7 @@ Sidebar → **Enrollments** (admin-only, with a pending-count badge; also at `/a
   "Nd left" / "ended Nd ago", and an Active / Expiring / Ended pill. Expand a card for the
   student's background and a private **admin note**.
 - **Approve & unlock** → one call to the transactional `admin_finalize_enrollment()` RPC (#32):
-  it validates the request + plan + batch (Gold/VIP — the dialog carries a **batch picker**,
+  it validates the request + plan + batch (VIP — the dialog carries a **batch picker**,
   preselected by the same precedence the RPC applies; extensions show the inherited batch
   read-only), grants the **dated subscription term** (wrapping `approve_subscription()` /
   `approve_extension()`), stamps `subscriptions.batch_id`, and updates the profile
@@ -527,7 +534,7 @@ already use the Supabase REST API, so they port directly.
 - **"email not configured / not sent" in a notice** — the review action still succeeded; email
   is best-effort (Step 4; remember `npm run dev` never sends email).
 - **A grandfathered user got locked out** — they weren't `approved` when Step 1 first ran. Fix:
-  `update public.profiles set is_paid = true, plan = 'core_self_paced' where email = '…';`
+  `update public.profiles set is_paid = true, plan = 'silver_self_paced' where email = '…';`
   (or just approve their next in-app submission).
 - **A member reports being expired too early / too late** — check their latest `subscriptions`
   row: `select plan_key, status, started_at, ends_at, grace_ends_at from public.subscriptions

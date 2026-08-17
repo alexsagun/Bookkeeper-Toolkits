@@ -61,6 +61,14 @@ export const APP_ERROR_CODES = [
   'ASSIGNMENT_CLOSED',
   'SUBMISSION_LOCKED',
   'COURSE_HAS_SUBMISSIONS',
+  // ── Batch lifecycle (#38) ──
+  'BATCH_PAST',
+  'BATCH_CODE_TAKEN',
+  'BATCH_CODE_REORDER',
+  'BATCH_PERIOD_PAST',
+  'BATCH_PERIOD_INVALID',
+  'BATCH_TIMEZONE_INVALID',
+  'BATCH_CAPACITY_BELOW_OCCUPANCY',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -107,7 +115,7 @@ const COPY = {
   RUN_LIMIT_EXCEEDED:
     'This member already holds the maximum number of upcoming batch seats. Revoke some before granting more.',
   SEGMENT_MISMATCH:
-    'This grant would mix Gold and VIP seats in one run. Revoke the current run first, then grant the new plan.',
+    'This grant would mix cohort segments in one run. Revoke the current run first, then grant the new plan.',
   INVALID_MEMBERSHIP_TRANSITION: 'That change is not allowed from the current membership state.',
   IMMUTABLE_ENTITLEMENT:
     'Batch entitlement history cannot be rewritten. Revoke the seat and grant a new one instead.',
@@ -121,6 +129,17 @@ const COPY = {
   SUBMISSION_LOCKED: 'This submission has been handed in and can no longer be edited.',
   COURSE_HAS_SUBMISSIONS:
     'This course has graded assignment work and cannot be deleted. Unpublish it instead.',
+  BATCH_PAST: 'This batch’s period has ended, so its details are locked. You can still archive it.',
+  BATCH_CODE_TAKEN: 'Another batch already uses that month code.',
+  BATCH_CODE_REORDER:
+    'That code would move the batch past another one, which reorders members’ cohort runs. '
+    + 'Pick a code that keeps the batch in the same position.',
+  BATCH_PERIOD_PAST:
+    'That period has already ended. A batch cannot be edited into the past.',
+  BATCH_PERIOD_INVALID: 'Check the start and end dates — a batch needs both, and it must end after it starts.',
+  BATCH_TIMEZONE_INVALID: 'That is not a timezone the server recognises. Pick one from the list.',
+  BATCH_CAPACITY_BELOW_OCCUPANCY:
+    'That capacity is below the seats already sold in this batch. Raise it, or move members first.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };

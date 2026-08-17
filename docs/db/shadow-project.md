@@ -128,8 +128,8 @@ Without a target the suite simply cannot start; with one it works again immediat
 42 tests across two files:
 
 - `test-db/entitlements.dbtest.mjs` — cohort runs, registry allocation, the FIFO queue, batch
-  isolation between cohorts and between Gold and VIP, live-plan reconciliation on downgrade, expiry
-  and grace, capacity, ledger forgery attempts, and history preservation.
+  isolation between cohorts and between VIP and the general segment, live-plan reconciliation on
+  downgrade, expiry and grace, capacity, ledger forgery attempts, and history preservation.
 - `test-db/communityRls.dbtest.mjs` — the D2 matrix (no plan posts or comments in General, every plan
   reacts), cohort-space separation, `author_id` / `space_id` / admin-tag forgery, the withdraw vs
   re-publish split, the mention directory gate, and anonymous access.

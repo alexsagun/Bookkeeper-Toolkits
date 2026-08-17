@@ -151,6 +151,11 @@ async function runSqlScalarSafe(sql) {
  * Seats are granted through grant_batch_run — the same allocator production
  * uses — rather than by inserting ledger rows, so a fixture can never create a
  * state the real code could not produce.
+ *
+ * ★ #39: only a VIP-segment plan may pass startBatchCode. grant_batch_run now
+ * refuses any other segment with INVALID_PLAN, so seeding a cohort seat on a
+ * general-segment plan (sampler, silver_self_paced) fails LOUDLY in the fixture
+ * instead of quietly producing a member the product cannot create.
  */
 export async function seedMember(persona, {
   planKey,
@@ -205,16 +210,37 @@ export async function seedMember(persona, {
   return persona;
 }
 
-/** Create a cohort. The #32 trigger spawns its Gold and VIP spaces. */
-export async function makeBatch(code, { name = null, status = 'open', goldCap = null, vipCap = null, totalCap = null, startsOn = null } = {}) {
+/**
+ * Create a batch. The #32 trigger spawns its cohort space — since #39 that is
+ * exactly ONE space per batch (vip-<code>), because VIP is the only segment.
+ *
+ * endsOn / timezone are #38: left null, batches_guard() fills the period from the
+ * code, which is exactly what production does — so the default fixture exercises
+ * that fill rather than papering over it.
+ */
+export async function makeBatch(code, {
+  name = null, status = 'open',
+  vipCap = null, totalCap = null,
+  startsOn = null, endsOn = null, timezone = null,
+} = {}) {
   await runSql(`
-    insert into public.batches (code, name, status, gold_capacity, vip_capacity, total_capacity, starts_on)
-    values (${lit(code)}, ${lit(name || `Cohort ${code}`)}, ${lit(status)},
-            ${goldCap ?? 'null'}, ${vipCap ?? 'null'}, ${totalCap ?? 'null'},
-            ${startsOn ? lit(startsOn) + '::date' : 'null'})
+    insert into public.batches (code, name, status, vip_capacity, total_capacity,
+                                starts_on, ends_on, timezone)
+    values (${lit(code)}, ${lit(name || `Batch ${code}`)}, ${lit(status)},
+            ${vipCap ?? 'null'}, ${totalCap ?? 'null'},
+            ${startsOn ? lit(startsOn) + '::date' : 'null'},
+            ${endsOn ? lit(endsOn) + '::date' : 'null'},
+            -- DEFAULT, not a literal: a fixture that hard-codes 'Asia/Manila' makes
+            -- any assertion about the column default trivially true.
+            ${timezone ? lit(timezone) : 'default'})
     on conflict (code) do update set status = excluded.status,
-      gold_capacity = excluded.gold_capacity, vip_capacity = excluded.vip_capacity,
-      total_capacity = excluded.total_capacity, starts_on = excluded.starts_on`);
+      vip_capacity = excluded.vip_capacity,
+      total_capacity = excluded.total_capacity, starts_on = excluded.starts_on
+    -- #38: three of those four columns are frozen once a batch's period has passed,
+    -- so re-calling makeBatch for a PAST code would raise BATCH_PAST from a FIXTURE
+    -- rather than from the code under test. Skip the update instead; the row the
+    -- caller wanted already exists.
+    where not public.batch_is_past(public.batches.ends_on, public.batches.timezone)`);
   return runSqlScalarSafe(`select id::text from public.batches where code = ${lit(code)}`);
 }
 

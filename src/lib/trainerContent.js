@@ -17,8 +17,10 @@
 
 export const TRAINER_MODES = ['explain', 'guided', 'quiz', 'practice', 'recap'];
 // Seeded enrollment plan keys (mirrors the enrollment_plans seed) — the admin
-// preview-as-plan selector validates against this list.
-export const ENROLLMENT_PLAN_KEYS = ['core_self_paced', 'sampler', 'silver_self_paced', 'gold_live', 'vip'];
+// preview-as-plan selector validates against this list, so a retired key (#39
+// removed core_self_paced + gold_live) is rejected with a 400 rather than
+// previewed. Keep in lockstep with src/lib/planCatalog.js.
+export const ENROLLMENT_PLAN_KEYS = ['sampler', 'silver_self_paced', 'vip'];
 export const TRAINER_CHUNK_MAX_CHARS = 1200;
 export const TRAINER_CHUNK_OVERLAP_CHARS = 150;
 export const TRAINER_MAX_CHUNKS = 6;
@@ -186,10 +188,13 @@ export function classifyCourseAccess({ ref, authorized, allPublished, readyCours
 }
 
 // Pure mirror of the SQL plan-scope truth table (courses_read §14 /
-// trainer_visible_courses #27). null/unknown plan = full access.
+// trainer_visible_courses #27). Sampler is the only scoped plan; every other plan
+// reads the whole published catalog. null/unknown plan = full access HERE because
+// this mirrors the SQL exactly — the real guard against a retired key is
+// subscriptions.plan_key's FK to enrollment_plans (ON DELETE RESTRICT), which makes
+// a deleted plan unreachable, plus ENROLLMENT_PLAN_KEYS on the admin preview path.
 export function planScopeAllows(planKey, { slug, access_tier } = {}) {
   const s = String(slug || '');
-  if (planKey === 'core_self_paced') return s.startsWith('qbo-');
   if (planKey === 'sampler') return s.startsWith('qbo-') && (access_tier || 'standard') === 'essentials';
   return true;
 }

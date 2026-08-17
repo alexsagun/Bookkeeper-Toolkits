@@ -108,12 +108,16 @@ test('parseEnrollmentsList + comboKeyOf is order-independent + deduped', () => {
   assert.deepEqual(parseEnrollmentsList(''), []);
 });
 
-test('suggestPlanForCombo only suggests core/silver, never sampler/gold/vip', () => {
+test('suggestPlanForCombo only ever suggests silver — never sampler or vip', () => {
   assert.equal(classifyCourse('QuickBooks Online Mastery - Jan 2026'), 'qbo');
   assert.equal(classifyCourse('Resume and Interview Mastery'), 'resume');
 
+  // #39: QBO-only history used to suggest core_self_paced. That plan is gone, and
+  // every remaining plan grants MORE than it did, so this must go to manual review
+  // rather than silently upselling an imported student.
   const qboOnly = suggestPlanForCombo(['QuickBooks Online Mastery - Jan 2026']);
-  assert.equal(qboOnly.suggested, 'core_self_paced');
+  assert.equal(qboOnly.suggested, null);
+  assert.match(qboOnly.reason, /manually|review/i);
 
   const combo = suggestPlanForCombo(['QuickBooks Online Mastery - Jan 2026', 'Resume and Interview Mastery']);
   assert.equal(combo.suggested, 'silver_self_paced');
@@ -122,9 +126,9 @@ test('suggestPlanForCombo only suggests core/silver, never sampler/gold/vip', ()
   // 'onboarding' alone is not QBO-course history → no confident suggestion
   assert.equal(unknown.suggested, null);
 
-  // Nothing ever auto-suggests the coaching tiers.
+  // Nothing ever auto-suggests the coaching tiers or a retired plan.
   for (const s of [qboOnly, combo, unknown]) {
-    assert.ok(!['sampler', 'gold_live', 'vip'].includes(s.suggested));
+    assert.ok(!['sampler', 'vip', 'core_self_paced', 'gold_live'].includes(s.suggested));
   }
 });
 
@@ -156,7 +160,7 @@ test('resolveMatchDecision covers every branch', () => {
 // ── Membership term computation ─────────────────────────────────────────────────
 test('preserve: active term keeps exact expiry + 3-day grace', () => {
   const endsAt = NOW + 30 * DAY_MS;
-  const t = computeImportTerm({ planKey: 'core_self_paced', accessDays: 60, endsAt, mode: 'preserve', now: NOW });
+  const t = computeImportTerm({ planKey: 'silver_self_paced', accessDays: 60, endsAt, mode: 'preserve', now: NOW });
   assert.equal(t.action, 'grant');
   assert.equal(t.status, 'active');
   assert.equal(t.ends_at, endsAt);
@@ -166,18 +170,18 @@ test('preserve: active term keeps exact expiry + 3-day grace', () => {
 
 test('preserve: past expiry → status expired (renewal screen)', () => {
   const endsAt = NOW - 10 * DAY_MS;
-  const t = computeImportTerm({ planKey: 'core_self_paced', accessDays: 60, endsAt, mode: 'preserve', now: NOW });
+  const t = computeImportTerm({ planKey: 'silver_self_paced', accessDays: 60, endsAt, mode: 'preserve', now: NOW });
   assert.equal(t.status, 'expired');
   assert.equal(t.action, 'grant');
 });
 
 test('preserve: missing expiry is blocked (never guessed)', () => {
-  const t = computeImportTerm({ planKey: 'core_self_paced', accessDays: 60, endsAt: null, mode: 'preserve', now: NOW });
+  const t = computeImportTerm({ planKey: 'silver_self_paced', accessDays: 60, endsAt: null, mode: 'preserve', now: NOW });
   assert.equal(t.action, 'block_missing_expiry');
 });
 
 test('fresh + lifetime + expired_history + profile_only modes', () => {
-  const fresh = computeImportTerm({ planKey: 'core_self_paced', accessDays: 60, mode: 'fresh', now: NOW });
+  const fresh = computeImportTerm({ planKey: 'silver_self_paced', accessDays: 60, mode: 'fresh', now: NOW });
   assert.equal(fresh.status, 'active');
   assert.equal(fresh.ends_at, NOW + 60 * DAY_MS);
 
@@ -185,35 +189,35 @@ test('fresh + lifetime + expired_history + profile_only modes', () => {
   assert.equal(life.ends_at, null);
   assert.equal(life.status, 'active');
 
-  const hist = computeImportTerm({ planKey: 'core_self_paced', endsAt: NOW - 5 * DAY_MS, mode: 'expired_history', now: NOW });
+  const hist = computeImportTerm({ planKey: 'silver_self_paced', endsAt: NOW - 5 * DAY_MS, mode: 'expired_history', now: NOW });
   assert.equal(hist.status, 'expired');
 
-  const po = computeImportTerm({ planKey: 'core_self_paced', mode: 'profile_only', now: NOW });
+  const po = computeImportTerm({ planKey: 'silver_self_paced', mode: 'profile_only', now: NOW });
   assert.equal(po.action, 'noop_profile_only');
   assert.equal(po.ends_at, null);
 });
 
 test('same-plan conflict: never shorten a longer existing term', () => {
-  const existing = { plan_key: 'core_self_paced', ends_at: NOW + 90 * DAY_MS, grace_ends_at: NOW + 93 * DAY_MS };
+  const existing = { plan_key: 'silver_self_paced', ends_at: NOW + 90 * DAY_MS, grace_ends_at: NOW + 93 * DAY_MS };
   // imported ends sooner → skip (preserve the longer live term)
-  const shorter = computeImportTerm({ planKey: 'core_self_paced', accessDays: 60, endsAt: NOW + 30 * DAY_MS, mode: 'preserve', existingActiveSub: existing, now: NOW });
+  const shorter = computeImportTerm({ planKey: 'silver_self_paced', accessDays: 60, endsAt: NOW + 30 * DAY_MS, mode: 'preserve', existingActiveSub: existing, now: NOW });
   assert.equal(shorter.action, 'skip_preserve_longer');
   // imported ends later → grant (extends)
-  const longer = computeImportTerm({ planKey: 'core_self_paced', accessDays: 60, endsAt: NOW + 200 * DAY_MS, mode: 'preserve', existingActiveSub: existing, now: NOW });
+  const longer = computeImportTerm({ planKey: 'silver_self_paced', accessDays: 60, endsAt: NOW + 200 * DAY_MS, mode: 'preserve', existingActiveSub: existing, now: NOW });
   assert.equal(longer.action, 'grant');
 });
 
 test('different-plan conflict defaults to manual review, overwrite is explicit', () => {
   const existing = { plan_key: 'silver_self_paced', ends_at: NOW + 90 * DAY_MS, grace_ends_at: NOW + 93 * DAY_MS };
-  const blocked = computeImportTerm({ planKey: 'core_self_paced', accessDays: 60, endsAt: NOW + 30 * DAY_MS, mode: 'preserve', existingActiveSub: existing, now: NOW });
+  const blocked = computeImportTerm({ planKey: 'sampler', accessDays: 60, endsAt: NOW + 30 * DAY_MS, mode: 'preserve', existingActiveSub: existing, now: NOW });
   assert.equal(blocked.action, 'block_conflict');
-  const over = computeImportTerm({ planKey: 'core_self_paced', accessDays: 60, endsAt: NOW + 30 * DAY_MS, mode: 'preserve', existingActiveSub: existing, conflictPolicy: 'overwrite', now: NOW });
+  const over = computeImportTerm({ planKey: 'sampler', accessDays: 60, endsAt: NOW + 30 * DAY_MS, mode: 'preserve', existingActiveSub: existing, conflictPolicy: 'overwrite', now: NOW });
   assert.equal(over.action, 'grant');
 });
 
 test('an expired-history import never disturbs a live active term', () => {
-  const existing = { plan_key: 'core_self_paced', ends_at: NOW + 90 * DAY_MS, grace_ends_at: NOW + 93 * DAY_MS };
-  const t = computeImportTerm({ planKey: 'core_self_paced', endsAt: NOW - 5 * DAY_MS, mode: 'expired_history', existingActiveSub: existing, now: NOW });
+  const existing = { plan_key: 'silver_self_paced', ends_at: NOW + 90 * DAY_MS, grace_ends_at: NOW + 93 * DAY_MS };
+  const t = computeImportTerm({ planKey: 'silver_self_paced', endsAt: NOW - 5 * DAY_MS, mode: 'expired_history', existingActiveSub: existing, now: NOW });
   assert.equal(t.action, 'skip_preserve_longer');
 });
 
@@ -299,11 +303,11 @@ test('decideOnboardingStep: a failed prior invite IS retried', () => {
 // ── computeImportTerm: never shorten an existing LIFETIME (ends_at = null) active term ──
 test('computeImportTerm: a finite preserve term never supersedes an existing lifetime active term', () => {
   const term = computeImportTerm({
-    planKey: 'core_self_paced',
+    planKey: 'silver_self_paced',
     accessDays: 60,
     endsAt: Date.UTC(2026, 8, 1),          // a finite future expiry
     mode: 'preserve',
-    existingActiveSub: { plan_key: 'core_self_paced', ends_at: null, grace_ends_at: null }, // lifetime
+    existingActiveSub: { plan_key: 'silver_self_paced', ends_at: null, grace_ends_at: null }, // lifetime
     now: NOW,
   });
   // The existing term is effectively Infinity → the finite candidate must not shorten it.
@@ -312,9 +316,9 @@ test('computeImportTerm: a finite preserve term never supersedes an existing lif
 
 test('computeImportTerm: a lifetime candidate over an existing lifetime term is left untouched', () => {
   const term = computeImportTerm({
-    planKey: 'core_self_paced',
+    planKey: 'silver_self_paced',
     mode: 'lifetime',
-    existingActiveSub: { plan_key: 'core_self_paced', ends_at: null, grace_ends_at: null },
+    existingActiveSub: { plan_key: 'silver_self_paced', ends_at: null, grace_ends_at: null },
     now: NOW,
   });
   // candidateEnd = Infinity, existingEnd = Infinity → not strictly greater → preserve existing.
@@ -323,7 +327,7 @@ test('computeImportTerm: a lifetime candidate over an existing lifetime term is 
 
 // ── batch_code (#32): template column + end-to-end proposal via proposeForRow ──
 // proposeForRow is the endpoint's exported pure resolver (the trainerOrchestration
-// pattern) — these pin the "gold/VIP rows need a confirmed OPEN batch" rule.
+// pattern) — these pin the "VIP rows need a confirmed OPEN batch" rule.
 import { IMPORT_TEMPLATE_COLUMNS } from '../src/lib/studentImport.js';
 import { proposeForRow } from '../api/admin/student-imports.js';
 
@@ -342,15 +346,14 @@ function proposalCtx(extra = {}) {
   return {
     bySourceMap: new Map(),
     byEmailMap: new Map(),
-    comboPlanMap: { 'QBO Mastery': 'gold_live', 'QBO Mastery | Resume': 'silver_self_paced' },
+    comboPlanMap: { 'QBO Mastery': 'vip', 'QBO Mastery | Resume': 'silver_self_paced' },
     planAccessDays: new Map([
-      ['core_self_paced', 60], ['sampler', 60], ['silver_self_paced', 60],
-      ['gold_live', 180], ['vip', 180],
+      ['sampler', 60], ['silver_self_paced', 60], ['vip', 180],
     ]),
     planRows: {
-      gold_live: { key: 'gold_live', community_segment: 'gold' },
       vip: { key: 'vip', community_segment: 'vip' },
       silver_self_paced: { key: 'silver_self_paced', community_segment: 'general' },
+      sampler: { key: 'sampler', community_segment: 'general' },
     },
     batchesByCode: BATCHES_BY_CODE,
     defaultTermMode: 'fresh',
@@ -359,40 +362,54 @@ function proposalCtx(extra = {}) {
   };
 }
 
-function goldRow(batchCode) {
+function vipRow(batchCode) {
   return {
     external_user_id: '9001',
-    email_normalized: 'synthetic.gold@example.com',
+    email_normalized: 'synthetic.vip@example.com',
     mapped: { combo_key: 'QBO Mastery', batch_code: batchCode },
     errors: [], warnings: [],
   };
 }
 
-test('proposeForRow: gold row with a confirmed open batch is ready and carries the batch id', () => {
-  const p = proposeForRow(goldRow('2026-08'), proposalCtx());
-  assert.equal(p.proposed_plan_key, 'gold_live');
+test('proposeForRow: VIP row with a confirmed open batch is ready and carries the batch id', () => {
+  const p = proposeForRow(vipRow('2026-08'), proposalCtx());
+  assert.equal(p.proposed_plan_key, 'vip');
   assert.equal(p.proposed_batch_id, 'b-aug');
   assert.equal(p.processing_status, 'ready');
 });
 
-test('proposeForRow: gold row without a batch_code is BLOCKED for manual review', () => {
-  const p = proposeForRow(goldRow(''), proposalCtx());
+test('proposeForRow: VIP row without a batch_code is BLOCKED for manual review', () => {
+  const p = proposeForRow(vipRow(''), proposalCtx());
   assert.equal(p.processing_status, 'blocked');
   assert.equal(p.intended_action, 'manual_review');
   assert.equal(p.proposed_batch_id, null);
   assert.ok(p.errors.some((e) => /Needs batch assignment/.test(e)));
 });
 
-test('proposeForRow: gold row into a CLOSED batch is BLOCKED (closed batches reject new assignments)', () => {
-  const p = proposeForRow(goldRow('2026-09'), proposalCtx());
+test('proposeForRow: VIP row into a CLOSED batch is BLOCKED (closed batches reject new assignments)', () => {
+  const p = proposeForRow(vipRow('2026-09'), proposalCtx());
   assert.equal(p.processing_status, 'blocked');
   assert.ok(p.errors.some((e) => /closed/.test(e)));
 });
 
-test('proposeForRow: gold row with an unknown batch_code is BLOCKED, never guessed', () => {
-  const p = proposeForRow(goldRow('2027-01'), proposalCtx());
+test('proposeForRow: VIP row with an unknown batch_code is BLOCKED, never guessed', () => {
+  const p = proposeForRow(vipRow('2027-01'), proposalCtx());
   assert.equal(p.processing_status, 'blocked');
   assert.ok(p.errors.some((e) => /Unknown batch_code/.test(e)));
+});
+
+// #39: a retired plan key must never survive the allowlist, even if a stale combo
+// map or a hand-edited CSV column still names it.
+test('proposeForRow: a retired plan key is refused, not granted', () => {
+  const row = {
+    external_user_id: '9003',
+    email_normalized: 'synthetic.legacy@example.com',
+    mapped: { combo_key: 'QBO Mastery', plan_key: 'core_self_paced', batch_code: '' },
+    errors: [], warnings: [],
+  };
+  const p = proposeForRow(row, proposalCtx());
+  assert.notEqual(p.proposed_plan_key, 'core_self_paced',
+    'a plan key absent from planAccessDays must not be accepted');
 });
 
 test('proposeForRow: general-plan row ignores a stray batch_code with a warning', () => {
@@ -409,7 +426,7 @@ test('proposeForRow: general-plan row ignores a stray batch_code with a warning'
   assert.ok(p.warnings.some((w) => /ignored/.test(w)));
 });
 
-test('suggestPlanForCombo still never suggests sampler, gold_live, or vip (re-pin for #32)', () => {
+test('suggestPlanForCombo never suggests sampler, vip, or a retired plan (re-pin for #39)', () => {
   const combos = [
     ['QuickBooks Online Mastery'],
     ['QuickBooks Online Mastery', 'Resume Winning Strategy'],
@@ -418,7 +435,8 @@ test('suggestPlanForCombo still never suggests sampler, gold_live, or vip (re-pi
   ];
   for (const c of combos) {
     const { suggested } = suggestPlanForCombo(c);
-    assert.ok(!['sampler', 'gold_live', 'vip'].includes(suggested),
-      `suggestPlanForCombo must never suggest a premium/sampler plan (got ${suggested})`);
+    assert.ok(!['sampler', 'vip', 'core_self_paced', 'gold_live'].includes(suggested),
+      `suggestPlanForCombo must never suggest a premium/sampler/retired plan (got ${suggested})`);
+    assert.ok(suggested === null || suggested === 'silver_self_paced');
   }
 });

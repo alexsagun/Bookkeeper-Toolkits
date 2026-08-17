@@ -19,8 +19,8 @@
 // The last three are already true of any space the server returned to us, so
 // the client-side job is the first two.
 //
-// D2: General is announcement-only. No plan — including Gold and VIP — may post
-// or comment there. Reactions stay on for everyone.
+// D2: General is announcement-only. No plan — not even VIP — may post or comment
+// there. Reactions stay on for everyone.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -32,15 +32,6 @@
  * write nothing.
  */
 export const PLAN_CAPABILITY_FALLBACK = {
-  core_self_paced: {
-    can_post_in_general: false,
-    can_comment_in_general: false,
-    can_react_in_general: true,
-    can_post_in_private: false,
-    can_comment_in_private: false,
-    can_react_in_private: true,
-    can_upload_attachments: false,
-  },
   sampler: {
     can_post_in_general: false,
     can_comment_in_general: false,
@@ -58,15 +49,6 @@ export const PLAN_CAPABILITY_FALLBACK = {
     can_comment_in_private: false,
     can_react_in_private: true,
     can_upload_attachments: false,
-  },
-  gold_live: {
-    can_post_in_general: false,
-    can_comment_in_general: false,
-    can_react_in_general: true,
-    can_post_in_private: true,
-    can_comment_in_private: true,
-    can_react_in_private: true,
-    can_upload_attachments: true,
   },
   vip: {
     can_post_in_general: false,

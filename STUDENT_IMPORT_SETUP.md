@@ -34,16 +34,16 @@ membership_started_at, membership_ends_at, payment_status, amount_paid, currency
 
 - `thinkific_user_id` — the Thinkific `ID` (kept as a string; leading zeros preserved). The match key.
 - `email` — required to create a new account.
-- `plan_key` — one of `core_self_paced`, `sampler`, `silver_self_paced`, `gold_live`, `vip` (read
+- `plan_key` — one of `sampler`, `silver_self_paced`, `vip` (read
   live from `enrollment_plans`; you also map course-combos → plan inside the tool). This is a
   **per-row override**: when present and a recognized plan, it **wins over** the course-combo map
   for that row; a blank or unrecognized value falls back to the combo mapping (never a silent grant).
 - `membership_started_at` / `membership_ends_at` — **ISO dates (UTC)**, e.g. `2026-07-20` or
   `2026-07-20T01:52:00Z`. `membership_ends_at` is the **exact** current expiry (required for the
   default *preserve* term mode).
-- `batch_code` (#32) — **required for `gold_live` / `vip` rows**: the cohort's code
+- `batch_code` (#32) — **required for `vip` rows** (VIP is the only cohort plan): the cohort's code
   (e.g. `2026-08`), which must match an existing **open** batch in Admin → Batches. It sets
-  `subscriptions.batch_id` and unlocks that batch's private Gold/VIP community. A premium row
+  `subscriptions.batch_id` and unlocks that batch's private VIP community. A premium row
   without a confirmed open batch is **blocked** (never guessed from course history, dates, or
   amounts). A blocked row is rejected **before** any account is created, so it produces no user,
   no profile and no subscription — it will **not** appear in Admin → Batches → "Needs batch
@@ -93,8 +93,9 @@ Health check: `GET /api/admin/student-imports` → `{ ok, configured, hasSecretK
    or email — to fill in the missing **email** and **exact dates**.
 4. **Map course-combos → plan** — each distinct `Enrollments - list` combination is shown with a row
    count; map it to a plan, to **"Profile only (no access)"**, or to **"Manual review."** Suggestions
-   are advisory only (QBO-only → *maybe* `core_self_paced`; QBO+Resume → *maybe* `silver_self_paced`;
-   Sampler/Gold/VIP are never inferred). Per-student overrides are allowed.
+   are advisory only (QBO+Resume → *maybe* `silver_self_paced`; a **QBO-only** history yields **no
+   suggestion at all** now that the QBO-only plan is retired — map it manually or send it to review;
+   Sampler and VIP are never inferred). Per-student overrides are allowed.
 5. **Validate & match** — the tool pre-checks client-side, then a **server dry-run** authoritatively
    matches each row (by Thinkific source link, then by normalized email — **never by name**).
 6. **Preview** — an editable table with search/filters, a row-detail panel, and summary counts
@@ -122,7 +123,7 @@ Health check: `GET /api/admin/student-imports` → `{ ok, configured, hasSecretK
   you choose per combo — never a hidden default.
 - Imported subscriptions are marked `grant_source='import'` and linked to their import row, so a
   migration grant is always distinguishable from a verified payment.
-- **Gold/VIP rows need a confirmed open `batch_code`** (#32) — blocked otherwise, and re-validated
+- **VIP rows need a confirmed open `batch_code`** (#32) — blocked otherwise, and re-validated
   at process time (a batch closed between dry-run and process re-blocks the row). Batch-less
   premium grants (e.g. rows imported before #32) surface in Admin → Batches → "Needs batch
   assignment" and can be bulk-assigned there (idempotent, audited).

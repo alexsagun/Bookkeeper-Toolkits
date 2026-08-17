@@ -62,6 +62,10 @@ test('appErrorCode maps PGRST202 to MIGRATION_MISSING', () => {
   assert.ok(!isMigrationMissing(pgErr({ hint: 'BATCH_FULL' })));
 });
 
+// These strings are HISTORICAL VERBATIM — they are what a pre-#35 database actually
+// raised, including plan and segment names that #39 has since removed. They stay as
+// written on purpose: the parser's whole job is recognising messages it did not
+// author, and rewriting the fixtures to today's vocabulary would stop testing that.
 test('appErrorCode recognises pre-#35 free-text raises', () => {
   const legacy = [
     ['admin_finalize_enrollment: batch 2026-08 is full for gold (10 of 10 seats)', 'BATCH_FULL'],

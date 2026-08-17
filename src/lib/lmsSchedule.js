@@ -81,7 +81,7 @@ export function isReleased(rule, now = Date.now()) {
 export function releaseLabel(rule, now = Date.now()) {
   const r = effectiveRelease(rule);
   if (r.undrippable) return null;
-  if (r.unknown) return 'Unlocks when your cohort starts';
+  if (r.unknown) return 'Unlocks when your batch starts';
   if (isReleased(rule, now)) return null;
   const d = new Date(r.at);
   return `Unlocks ${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}`;

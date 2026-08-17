@@ -9,7 +9,7 @@ aspiring and working **remote bookkeepers serving US clients**. It bundles ~60 f
 tools across three career stages:
 
 1. **Training & Skills** — Accounting 101 course, Industry Accounting playbooks, US Tax 101, ProAdvisor chat.
-2. **Job Application** — authentic branding, resume/LinkedIn optimizers, interview prep, mock-interview & discovery-call simulators, QuickBooks diagnostic, pain-points & proposal generators.
+2. **Job Application** — authentic branding, resume/LinkedIn optimizers, interview prep, mock-interview & discovery-call simulators, QuickBooks diagnostic, pain-points & cover-letter generators.
 3. **Client Management & Delivery** — engagement letters, onboarding, Chart of Accounts generator, invoice creator, bank-feed AI, statement→CSV converter, email templates, accounting calculators, monthly/year-end checklists, SOP generator, sales tax, budgeting & forecasting, plus growth tools (pricing, upsell, capacity, payment tracking).
 
 Many tools are **AI-assisted** (call Claude); the rest (calculators, checklists, Chart of Accounts,
@@ -51,7 +51,7 @@ npm run ai:knowledge       # regenerate docs/ai/toolkits-voice-agent-knowledge.m
 npm run ai:knowledge:check # rebuild the knowledge doc in memory + diff vs disk; exit 1 on drift (writes nothing)
 npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge base
 npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
-npm test                   # node --test — the pure-lib suites in test/ (studentImport, trainerToken, trainerContent, trainerAccess)
+npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, …)
 ```
 
 There is **no linter** — verify UI changes by running `npm run dev` and exercising the affected
@@ -90,6 +90,8 @@ The sanctioned exceptions to the single-file rule (same spirit as the `main.jsx`
 - `lib/supabase.js` — the single Supabase client, built from `VITE_SUPABASE_URL` /
   `VITE_SUPABASE_ANON_KEY` (public anon key; safe in the bundle — RLS is the real boundary).
 - `auth/AuthProvider.jsx` — the `AuthProvider` + `useAuth()` hook (see Authentication).
+- `src/lib/planCatalog.js` — the membership catalog + entitlement rules (pure; shared by the app,
+  the voice-knowledge generator, and `node --test`). See Plan-based access.
 - `src/index.css` — the **global theme-token layer** (all CSS custom properties for light + dark,
   the shared `.gh-app-bg`/glass/button/input classes, and the Tailwind dark compat layer). See
   Styling conventions.
@@ -123,10 +125,12 @@ directly; see the "Feature guides" subsection in [COURSE_SETUP.md](COURSE_SETUP.
   `comingSoonDesc`. Each prefix is its own namespace, so catalogs never see each other's courses.
   Catalogs reuse the `courses.slug` prefix + the `cover_path` / `position` / **`course_date`** /
   **`source_course_id`** columns (the last added for duplication — see COURSE_SETUP.md). **`course_date`**
-  is a date-only (`YYYY-MM-DD`) editable cohort/run date that **defaults to today** on create/duplicate;
-  the card renders an **auto-derived "Month Year" badge** from it via the `cohortLabel()` helper. The
-  older `month` text column is retained **only as a display fallback** for legacy rows with no
-  `course_date` (no backfill is run).
+  is a date-only (`YYYY-MM-DD`) editable **batch-run date** that **defaults to today** on
+  create/duplicate; the card renders an **auto-derived "Month Year" badge** from it via the
+  `batchRunLabel()` helper (named `cohortLabel()` before #38). ★ It is a **display label only** —
+  `courses` has no FK to `batches`, no function or policy reads `course_date`, and the UI copy says so
+  explicitly. Do not build a course→batch relationship on it. The older `month` text column is retained
+  **only as a display fallback** for legacy rows with no `course_date` (no backfill is run).
 
 Wrappers:
 - `QBOMastery()` — the `qbomastery` tab (Training & Skills) → **`<CourseCatalog />`** (defaults →
@@ -144,7 +148,7 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
 `<CourseCatalog prefix="…" …/>` with its own prefix + copy and wire the nav sync points. To add a
 *single-course* tab, write a `CourseProgram` wrapper with its own `slug` + labels.
 
-- **Tables:** `courses` (incl. `course_date` editable cohort date + legacy `month` label fallback + `source_course_id` lineage for duplicates + `access_tier` `'standard'`/`'essentials'` — the per-plan tier the Sampler gate reads; admin-set via the card ⋮ menu) →
+- **Tables:** `courses` (incl. `course_date` editable batch-run date — a label, never a batch link + legacy `month` label fallback + `source_course_id` lineage for duplicates + `access_tier` `'standard'`/`'essentials'` — the per-plan tier the Sampler gate reads; admin-set via the card ⋮ menu) →
   `course_modules` → `course_lessons` (`type` video/text, link or uploaded video), `lesson_progress`
   (per-user completion), `course_completions` (stamps the certificate date). All keyed by `course_id`,
   so one schema serves every course.
@@ -189,8 +193,8 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
 The in-app replacement for the Discord group chat, grown into a full forum: tab id
 `community`, route `/community` (+ **`?post=<id>` deep links** to a discussion — the
 CourseCatalog `?course=` idiom), sidebar Home → Community. **Every active paid plan includes
-it** (all plans advertise group chat) — the tab id is in `TRAINING_ONLY_TAB_IDS` + the
-sampler `tabIds` (full plans pass by default), and the **server gate is `is_approved()` +
+it** (all plans advertise group chat) — the tab id is in the sampler `tabIds` (silver and VIP are
+full-access plans, so they pass by default), and the **server gate is `is_approved()` +
 `is_enrolled()` RLS** (term + 3-day grace, mirroring course reads), so access ends with the
 membership automatically — **expired members are fully blocked — reads _and writes_** (#28 closed
 the own-update gap on posts/comments that #25 had left). The
@@ -198,17 +202,18 @@ Sampler Session's **60-day group chat support** == its 60-day `access_days` wind
 
 **Spaces & batches (#32, [db/2026-07-28-community-spaces-batches.sql](db/2026-07-28-community-spaces-batches.sql)):**
 the forum is segmented into **community_spaces** — one **General** space (every active plan) plus
-one PRIVATE full-forum **Gold** and
-**VIP** space per **batch** (cohort registry, code `YYYY-MM`; `batches_create_spaces()` trigger
-auto-creates both spaces + a `batch_events` audit row).
+one PRIVATE full-forum **VIP** space per **batch** (cohort registry, code `YYYY-MM`;
+`batches_create_spaces()` trigger auto-creates the space + a `batch_events` audit row). #32 also
+minted a Gold space per batch; **#39 removed the Gold plan and the `gold` space kind entirely**, so
+VIP is the only private segment and `community_spaces.kind` is now `('general','vip')`.
 
 **★ D2 (#36) — General is ANNOUNCEMENT-ONLY.** `member_posting = false` AND
-`member_comments = false`: **no member may post or comment there — not Core, not Sampler, not
-Silver, and NOT Gold or VIP.** Reactions stay ON for every plan, historical content stays readable,
+`member_comments = false`: **no member may post or comment there — not Sampler, not Silver, and
+NOT VIP.** Reactions stay ON for every plan, historical content stays readable,
 and an author can still WITHDRAW their own post (the read policies carry an author-owns-`deleted`
 branch, without which Postgres refuses the soft-delete outright — an UPDATE whose resulting row
 would be invisible to the writer fails 42501, which is why member soft-delete never actually worked
-before #36). Admins post the announcements. Gold/VIP discussion happens only in their own per-batch
+before #36). Admins post the announcements. VIP discussion happens only in its own per-batch
 space. The flags are pinned by the `community_spaces_general_announcement_only` CHECK — reversing
 D2 means dropping a named constraint, flipping the plan capability columns, and recording it in
 db/README.md. **Do not "temporarily" flip the flag**: that instruction used to live in
@@ -220,7 +225,7 @@ the space flags by `user_community_capabilities()` (#36) — the ONE resolver ev
 reads, consumed as an uncorrelated subquery so it InitPlans once per statement. Access is
 **DERIVED, never stored**:
 `user_community_space_ids(p_user)` / `my_community_space_ids()` (SECDEF) map the current valid
-subscription → `enrollment_plans.community_segment` (`gold_live`→gold, `vip`→vip, else general)
+subscription → `enrollment_plans.community_segment` (`vip`→vip, else general)
 + `subscriptions.batch_id` → spaces; unknown plans and batch-less premium subs fail closed to
 General (they surface in Admin → Batches → "Needs batch assignment"). Every community policy +
 the community-media storage read is scoped `space_id in (select my_community_space_ids())`;
@@ -230,7 +235,7 @@ channel can filter `space_id=eq.<id>`); notify triggers drop cross-space mention
 replaced their old signatures (default params keep old clients resolving). New media paths are
 `<space_id>/<uid>/<uuid>-<name>` (legacy `<uid>/…` reads keep working — authorization is
 attachment-join based). Client: `CommunityHub` gains a space engine (`my_community_spaces()`
-RPC → switcher pills + member counts, `?space=<slug>` beside `?post=`, gold/vip land in their
+RPC → switcher pills + member counts, `?space=<slug>` beside `?post=`, VIP lands in its
 private space by default, last selection in `window.storage` `community:lastSpace` — in
 `LEGACY_KEYS`); a pre-#32 DB degrades to legacy single-space mode + an admin notice — but that
 degrade is confirmed by **probing `community_spaces` for a missing-table code**, never by the RPC
@@ -243,12 +248,45 @@ feed load, the realtime subscription, the detail fetch, and every write.
 ↔ `user_community_space_ids()` ↔ `approvalBatchPreselect()` (the pure mirror of
 `admin_finalize_enrollment()`'s batch precedence) ↔ `batchGapForProcess()` (the import path's
 process-time re-validation) — all pinned by `test/communitySpaces.test.mjs`.
-Batch UI: paywall open-batch selector (gold/vip), approve-modal picker, `AdminBatches` tab
+Batch UI: paywall open-batch selector (VIP only), approve-modal picker, `AdminBatches` tab
 (`batches` route `/admin/batches`), import `batch_code` column. **Two batch facts that surprise
 people:** per-segment **capacity is enforced only on the two admin RPC paths** (approval +
 `admin_assign_batch`) — imports and direct SQL grants do not consume seats; and **archiving a batch
 blocks its existing members' renewals and extensions** (the RPC refuses `archived` before the
 existing-member carve-out), whereas **closing** it only stops new assignments.
+
+**Batch records are EDITABLE, but not by a client UPDATE (#38,
+[db/2026-08-16-batch-lifecycle.sql](db/2026-08-16-batch-lifecycle.sql)).** `batches.code` is the
+allocation ordering key — `grant_batch_run()` scans `where b.code >= start and status='open' order by
+b.code … for update` and `allocate_queued_entitlements()` refuses any cohort not strictly above the
+highest code a run already holds — so re-coding a batch silently **reorders a member's purchased run**.
+Therefore: **`update (code)` is REVOKED from `authenticated`** (RLS has no column granularity; GRANT
+does), and every field change goes through **`admin_update_batch()`**, which enforces
+**rank preservation** (the new code may not cross a sibling → `BATCH_CODE_REORDER`), uniqueness,
+period validity, `pg_timezone_names`, and capacity ≥ occupancy; it renames the two space **NAMES**
+but **never their slugs** — `community_spaces.slug` is a **permalink** (`?space=<slug>` links +
+`community:lastSpace`, and `pickInitialSpace()` falls back *silently* on an unknown slug), and it
+re-stamps `activates_at` only on seats that have **not yet started**. Audited as a `batch_events`
+`'edit'` row with before + after.
+**"Past" is a calendar question:** `batch_is_past(ends_on, timezone)` = today **in the batch's own
+timezone** > `ends_on`, so a batch stays editable through its final local day (a UTC comparison would
+lock an Asia/Manila batch up to 16 hours early). `batches_guard()` (BEFORE INSERT OR UPDATE) freezes
+every descriptive field once past — leaving only status/close/archive — and fills the period from
+`code` on INSERT so an SQL-editor insert is as reliable as the UI's. Break-glass for a past row:
+`set local app.batch_admin_override = 'on'` in a session running as the **`batches` table owner** (the
+Supabase SQL Editor / Management API). It is gated on ownership, **not `rolsuper`** — Supabase's
+`postgres` is not a superuser, so a superuser gate would be unreachable on the one database that needs
+it; PostgREST's `authenticator` is not a member of the owner, so the API can never reach it. Status is
+deliberately NOT the lock: a batch can be closed early or archived mid-month.
+**Closure is automatic:** `close_due_batches()` closes (never archives) every open batch whose local
+period has ended, one `auto_close` event each, idempotent via its `status='open'` predicate, scheduled
+**hourly by pg_cron** (`cron.schedule('close-due-batches', '0 * * * *', …)`; hourly because pg_cron is
+UTC and batches carry their own zones). It has **no `is_admin()` guard on purpose** — that guard is
+precisely why `expire_overdue_subscriptions()` can never run under a scheduler — and is instead
+revoked from every client role; `admin_close_due_batches()` is the admin/"Run closures now" path.
+Closing blocks *new* assignments only: `grant_batch_run`'s carve-out still lets an existing
+seat-holder renew, and no entitlement, space or history is touched. Client mirror:
+[src/lib/batchLifecycle.js](src/lib/batchLifecycle.js), pinned by `test/batchLifecycle.test.mjs`.
 
 - **Tables** ([db/2026-07-20-community.sql](db/2026-07-20-community.sql) #23 + the forum
   upgrade [db/2026-07-21-community-forum.sql](db/2026-07-21-community-forum.sql) #24, both
@@ -365,7 +403,7 @@ as the other admin tabs). Migration **#26**
   `normalizeEmail`/`parseExternalId`/`parseStrictDate` (strict UTC; rejects ambiguous),
   `sanitizeCsvCell`/`toCsv` (formula-injection-safe exports), `parseCsv` (BOM/quoted commas),
   `parseEnrollmentsList`/`comboKeyOf`/`suggestPlanForCombo` (advisory only — never auto-confirms;
-  never suggests sampler/gold/vip), `resolveMatchDecision`, and `computeImportTerm` (the
+  never suggests sampler/vip, and since #39 gives QBO-only history no suggestion at all), `resolveMatchDecision`, and `computeImportTerm` (the
   preserve/expired_history/fresh/lifetime + never-shorten-a-longer-active-term decision table).
 - **Onboarding gate:** an imported user (`profiles.account_origin='import'` + `onboarding_status !=
   'completed'`) is forced onto `SetPasswordScreen` (reuses `updatePassword` +
@@ -396,7 +434,12 @@ as the other admin tabs). Migration **#26**
 `BankFeed` 10466, `StatementConverter` 10665, `CommunityHub` ~12359 (the community forum — see the
 Community section above; the forum suite `MemberAvatar` 11151 → `useCommunityBell` 11848 →
 `CommunityPostCard` 12102 sits just above it), `ProChat` 13281,
-`AuthenticBranding` 14445, `ProposalGenerator` 14889, `EngagementLetter` 15168, `EmailTemplates` 15717,
+`AuthenticBranding` 14445, `CoverLetterGenerator` ~17900 (tab id `proposal`, route `/proposal-generator` —
+replaced the old 7-document-type `ProposalGenerator`; paste a job post → industry auto-detect → 3 letter
+variations + a timecoded video-intro script + an interview-prep pack from ONE `callClaude` call at
+`max_tokens: 8000`. Pure logic lives in `src/lib/coverLetterIndustry.js` (industry table + keyword
+detector) and `src/lib/partialJson.js` (tolerant JSON + truncated-prefix recovery), both covered by
+`npm test`), `EngagementLetter` 15168, `EmailTemplates` 15717,
 `PainPointsGenerator` 15970, `IndustryAccounting` 16330, `USTax101` 16466,
 `MonthlyWorkflow` 16560, `MonthEndChecklist` 16650, `InvoiceCreator` 16881, `CoachAlexChat` 17369,
 `CPAAIChat` 17399, `AccountingCalculators` 18201, `NicheSelectorQuiz` 18267,
@@ -533,7 +576,7 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   pending per user; resubmit inserts a new row; the only student UPDATE is self-expiring an
   overdue row); **Approve** (since #32) is ONE transactional admin-guarded RPC —
   `admin_finalize_enrollment(p_request_id, p_batch_id)` — that validates request status + plan +
-  batch (gold/vip need an open batch; capacity checked under a batch lock) and atomically grants
+  batch (VIP needs an open batch; capacity checked under a batch lock) and atomically grants
   the **dated subscription term** (wrapping `approve_subscription()`/`approve_extension()`),
   stamps `subscriptions.batch_id`, patches the profile cache, and marks the request approved.
   **The old client-side 3-step approve + its local-grant fallback are GONE** — a missing #32
@@ -567,8 +610,8 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   button, opt-in per autoplay policy).
 - **Subscription lifecycle (durations / expiry / renewal —
   [db/2026-07-04-subscription-lifecycle.sql](db/2026-07-04-subscription-lifecycle.sql), runs
-  AFTER the enrollment migration):** every plan carries `access_days` (60 Core/Sampler/Silver,
-  180 Gold/VIP; `support_days` informational; `entitlement_summary` jsonb chips) and every
+  AFTER the enrollment migration):** every plan carries `access_days` (60 Sampler/Silver,
+  180 VIP; `support_days` informational; `entitlement_summary` jsonb chips) and every
   `subscriptions` row is a dated **term** (`ends_at`, `grace_ends_at`, lineage via
   `renewed_from_subscription_id`; `ends_at IS NULL` = legacy no-expiry — grandfathered).
   **The date is the authority:** `public.is_enrolled()` is rewritten to require an active,
@@ -637,7 +680,7 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   `v_holds_seat` change, and gates `community_media_delete` to match
   `community_attachments_own_delete`; folded **verbatim as §21**. **Always run #34 with #33.**) →
   batch-entitlements (**#35**, the cohort-entitlement LEDGER — `batch_entitlements` replaces the single
-  mutable `subscriptions.batch_id`; one row = one seat in one cohort; a 180-day Gold plan grants SIX
+  mutable `subscriptions.batch_id`; one row = one seat in one cohort; the 180-day VIP plan grants SIX
   cohorts; runs are allocated from the batches REGISTRY in `code` order, never by calendar arithmetic;
   both predicates require the stamped `segment` to equal the member's LIVE plan segment, so a downgrade
   cuts access instantly; `grant_batch_run()` is the ONLY function that locks `batches`; adds
@@ -646,8 +689,25 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   **D2: General is announcement-only for EVERY plan** — posting and commenting off, reactions on — pinned
   by a CHECK; own-UPDATE split into withdraw vs keep-published; **fixes a latent bug where member
   soft-delete could never work**, because Postgres refuses an UPDATE whose resulting row would be
-  invisible to the writer and `community_posts_read` admitted only `status='active'`).
-  **Applied to production 2026-07-29; both verified against a disposable shadow project first — see
+  invisible to the writer and `community_posts_read` admitted only `status='active'`) →
+  entitlement-hardening (**#37**, code-review corrections to #35/#36 — restores the attachment
+  uploader/link/space binding, makes the FIFO binder forward-only within a run, and stops a
+  segment-changing upgrade stranding the `subscriptions.batch_id` cache) → batch-lifecycle
+  (**#38**, editable batch records + the past-lock + automatic month-end closure — see the batch
+  paragraphs in the Community section: `update (code)` revoked from `authenticated`,
+  `admin_update_batch()` with rank preservation, `batch_is_past()` in the batch's own timezone,
+  `batches_guard()`, and the hourly pg_cron `close_due_batches()` sweep. **Enabling pg_cron is a
+  manual deploy step** — the migration prints the `cron.schedule` call if it could not run it) →
+  three-plan-catalog (**#39**, [db/2026-08-17-three-plan-catalog.sql](db/2026-08-17-three-plan-catalog.sql)
+  — DELETES `core_self_paced` + `gold_live` and the whole `gold` community segment: one VIP space
+  per batch, `batches.gold_capacity` dropped, `admin_update_batch()` down to 8 args and
+  `admin_batch_overview()` minus its `gold_*` columns (both DROP+CREATE, **re-granted**), the three
+  segment CHECKs narrowed to VIP, and `plan_is_qbo_only()` dropped after the four course-read
+  policies + `course_object_allowed()` + the two trainer mirrors lose its conjunct. ★ ORDERING:
+  `batches_guard()` must be replaced BEFORE the column drop or every `update batches` — including
+  the hourly cron sweep — raises `record "new" has no field "gold_capacity"`. Folded verbatim as
+  §26; the §9 plan seed is corrected IN PLACE so a fresh install never creates the retired plans).
+  **#35/#36 applied to production 2026-07-29; both verified against a disposable shadow project first — see
   [docs/db/shadow-project.md](docs/db/shadow-project.md) and `npm run test:db`.**
   **Expiry-warning policy:** student-facing surfaces (menu pill, Dashboard `MembershipPanel`, the
   sidebar "Access until" line) turn amber ≤ 5 days / red ≤ 3 (+ the grace state); admin views
@@ -738,24 +798,31 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   posts/replies/mentions) renders through the shared **`MemberAvatar`** primitive
   (`<img>` with initials fallback; `resolveAvatarUrl` maps storage paths vs legacy OAuth
   URLs) — never hand-roll the initials circle again.
-- **Plan-based access (per-plan entitlements):** membership is no longer all-or-nothing. The
-  `core_self_paced` plan (QBO Mastery Only) unlocks **only Home + the Training & Skills stage** (and
-  reads **both** `qbo-*` courses); the `sampler` plan (Sampler Session, ₱1,499 / 60 days) is scoped
-  **tighter still** — Home + the QuickBooks catalog (`qbomastery`) but only its **Essentials** course
-  (`access_tier='essentials'`, NOT Mastery) + both 1-on-1 booking tabs (`linkedinopt`, `coachalex`).
-  ₱1,499 buys the coaching session, not more course content, so sampler is MORE restricted than the
-  ₱999 core plan — never assume price ⇒ scope. `silver_self_paced` (QBO + Resume Combo, ₱1,999 / 60
-  days) is listed **explicitly as full access** (`{ full: true }`) — premium/full non-admin toolkit,
-  NOT to be confused with the limited QBO-only plan — and every other/unknown/grandfathered plan and
-  admins also get the full toolkit. **The `community` tab is in EVERY plan's allowlist** (it's in
-  `TRAINING_ONLY_TAB_IDS` and the sampler `tabIds`; full plans pass by default) — all plans include
-  group chat, and its real gate is the `is_enrolled()` RLS on the `community_*` tables (see the
-  Community section). **Client model** (module scope in BookkeeperPro.jsx, next to
-  `subAccess`): `PLAN_ENTITLEMENTS` map (core = Training tabs + community; sampler = Training-QBO +
-  coaching + community + `courseTier:'essentials'`; silver = explicit `full:true`) → `planEntitlement(key)` (returns FULL for
-  any key not in the map OR an entry flagged `full:true`) → `{ full, label, scopeLabel, allowsStage(id),
-  allowsTab(id), allowsCourse(course) }` (`allowsCourse` gates individual courses **within** a catalog
-  by `course.access_tier` — the QBO Essentials/Mastery split); `FULL_ENTITLEMENT` is the default;
+- **Plan-based access (per-plan entitlements):** membership is no longer all-or-nothing. There are
+  **exactly three plans** (#39): `sampler` (Sampler Session, ₱1,499 / 60 days) is the ONE scoped
+  plan — Home + the QuickBooks catalog (`qbomastery`) but only its **Essentials** course
+  (`access_tier='essentials'`, NOT Mastery) + both 1-on-1 booking tabs (`linkedinopt`, `coachalex`)
+  + `community`. Its ₱1,499 buys the coaching session, not more course content, so the CHEAPEST
+  plan is also the most scoped — **never assume price ⇒ scope.** `silver_self_paced` (QBO + Resume
+  Combo, ₱2,999 / 60 days) and `vip` (Personalized Coaching Program, ₱16,999 / 180 days) are both
+  listed **explicitly as full access** (`{ full: true }`). VIP is additionally the only plan with a
+  cohort batch + private community. **The `community` tab is in EVERY plan's allowlist** — all plans
+  include group chat, and its real gate is the `is_enrolled()` RLS on the `community_*` tables (see
+  the Community section). **Client model** — all of it now lives in the pure, unit-tested
+  [src/lib/planCatalog.js](src/lib/planCatalog.js) (moved out of BookkeeperPro.jsx by #39 so the
+  fail-closed branch is testable and the knowledge generator can import it instead of regex-scraping
+  the JSX): `ENROLLMENT_PLANS_FALLBACK` + `PLAN_LABELS` + `extensionPrice()` +
+  `PLAN_ENTITLEMENTS` (sampler = Training-QBO + coaching + community + `courseTier:'essentials'`;
+  silver + vip = explicit `full:true`) → `planEntitlement(key)` → `{ full, label, scopeLabel,
+  allowsStage(id), allowsTab(id), allowsCourse(course) }` (`allowsCourse` gates individual courses
+  **within** a catalog by `course.access_tier` — the QBO Essentials/Mastery split).
+  ★ **`planEntitlement` is three-way and FAILS CLOSED.** A null/empty key → FULL (admins, flag off,
+  grandfathered terms with no plan string). A known key → its config. An **unknown non-null key**
+  (a deleted plan, a typo, stale local state) → **Home/Dashboard only**, labelled "Plan no longer
+  available", so RestrictedTab's "Upgrade or renew" is what they get — it no longer inherits the
+  whole toolkit. That means **every sellable plan MUST have an explicit `PLAN_ENTITLEMENTS` entry**;
+  `test/planCatalog.test.mjs` pins catalog↔entitlement parity precisely because an unlisted VIP
+  would now be locked out of what it paid for. `FULL_ENTITLEMENT` is the context default;
   `filterStagesForEntitlement()` drops disallowed stages/tabs; `EntitlementContext` shares it with
   Dashboard/RestrictedTab **and CourseCatalog/CourseProgram** (the catalog hides cards the plan can't
   open; CourseProgram has a deep-link guard). The root resolves `entitlement` once (memoized on
@@ -765,10 +832,11 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   `nav:lastTab`, programmatic `goto`) renders **`RestrictedTab`** (a polished upsell → Dashboard)
   instead of the tool. The sidebar (`visibleStages`, both passes) and Dashboard tiles are filtered
   cosmetically; the aspirational Career Roadmap strip stays full. **Server half** =
-  `db/2026-07-09-plan-course-access.sql` (`current_plan_key()` + `plan_is_qbo_only()` → core reads only
-  `qbo-*`) **+ `db/2026-07-11-sampler-essentials-access.sql`** (`courses.access_tier` +
-  `plan_is_sampler()` → sampler reads only `qbo-*` **AND** `access_tier='essentials'`), all wrapped
-  `(select …)` for once-per-query InitPlans; both scope course/lesson reads + the private
+  `db/2026-07-11-sampler-essentials-access.sql` (`courses.access_tier` + `plan_is_sampler()` →
+  sampler reads only `qbo-*` **AND** `access_tier='essentials'`), wrapped `(select …)` for
+  once-per-query InitPlans. (`plan_is_qbo_only()` from `db/2026-07-09-plan-course-access.sql`
+  existed only for `core_self_paced` and was **dropped by #39** along with its conjunct in the four
+  course-read policies and `course_object_allowed()`.) It scopes course/lesson reads + the private
   `course-videos` bucket via direct Supabase query. Admins set a course's tier in-app via the course
   card **⋮ menu → "Sampler tier (Essentials)"**. **Keep the client tab-allowlist + `courseTier` and the
   SQL `qbo-%` / `access_tier` rules in sync** when entitlements change. An admin's plan change (upgrade
@@ -885,8 +953,10 @@ setup/ops guide: [docs/ai/voice-agent-setup.md](docs/ai/voice-agent-setup.md).
   generator/provisioner exit 1 with an actionable message otherwise.
 - **Knowledge pipeline:** `npm run ai:knowledge` regenerates
   [docs/ai/toolkits-voice-agent-knowledge.md](docs/ai/toolkits-voice-agent-knowledge.md)
-  (deterministic — extracts `TAB_ROUTES`/`VOICE_TAB_INFO`/`ENROLLMENT_PLANS_FALLBACK`/
-  `PLAN_ENTITLEMENTS`/`TIPS` and fills a hand-authored template); `npm run ai:knowledge:push`
+  (deterministic — extracts `TAB_ROUTES`/`VOICE_TAB_INFO`/`TIPS` from the JSX, **imports**
+  `ENROLLMENT_PLANS_FALLBACK`/`PLAN_ENTITLEMENTS` from `src/lib/planCatalog.js` since #39, and fills
+  a hand-authored template; it now FAILS if a catalog plan has no entitlement entry);
+  `npm run ai:knowledge:push`
   additionally uploads it to the ElevenLabs knowledge base by name (idempotent, replaces the
   old copy, other KB docs untouched). There is **no auto-sync** — regenerate + push whenever
   tools/plans change (see Keeping docs current), and **`npm run ai:knowledge:check`** rebuilds
@@ -929,7 +999,7 @@ explain/quiz/practice/recap the Supabase-hosted courses. Full setup:
   returns a temporary-error envelope, never content. Retrieval-time joins (published +
   enabled + source `ready`/`included` + version match) make unpublished/stale content
   unretrievable on the very next call. When plan-scope rules change, `courses_read`, the
-  parameterized mirrors in #27, `PLAN_ENTITLEMENTS`, AND `planScopeAllows()` in
+  parameterized mirrors in #27, `PLAN_ENTITLEMENTS` (src/lib/planCatalog.js), AND `planScopeAllows()` in
   [src/lib/trainerContent.js](src/lib/trainerContent.js) must all change together (the
   `test/trainerAccess.test.mjs` truth table pins it).
 - **The token rides the `secret__trainer_token` dynamic variable** (headers-only — ElevenLabs
@@ -1101,16 +1171,29 @@ docs **in the same change**:
 - **Changing community write permissions** → four places move together: the `enrollment_plans`
   capability columns (#36) ↔ `user_community_capabilities()` ↔ the five community write policies ↔
   `capabilitiesFor()`/`effectiveCaps()` in `src/lib/communityCapabilities.js`
-  (`test/communityCapabilities.test.mjs` pins the 60-cell truth table).
+  (`test/communityCapabilities.test.mjs` pins the truth table — 3 plans x 2 space kinds x 4 actions
+  since #39; it was 5 x 3 x 4 under #36).
 - **Changing how many cohorts a plan grants** → `plan_batch_count()` ↔
   `enrollment_plans.eligible_batch_count` ↔ `planBatchCount()` in `src/lib/batchEntitlements.js`
   (`test/batchEntitlements.test.mjs` pins it).
-- **Adding an error code** → `app_error_catalog()` ↔ `APP_ERROR_CODES` in `src/lib/appErrors.js`.
-  Clients branch on `error.hint`, never on the HTTP status.
+- **Adding an error code** → `app_error_catalog()` ↔ `APP_ERROR_CODES` **and `APP_ERROR_COPY`** in
+  `src/lib/appErrors.js`. Clients branch on `error.hint`, never on the HTTP status.
+- **Changing when a batch locks, or what an admin may edit on it** → four places move together:
+  `batch_is_past()` ↔ `batches_guard()` ↔ `admin_update_batch()`'s validation chain ↔
+  `isPastBatch()`/`validateBatchEdit()` in `src/lib/batchLifecycle.js`
+  (`test/batchLifecycle.test.mjs` + `test-db/batchLifecycle.dbtest.mjs` pin both halves). If a new
+  editable column is added, it also needs a `grant update (…)` in #38's column-privilege block —
+  otherwise the write silently 42501s for every admin.
 - **Changing plan-scope rules** (which plan reads which courses) → four places move together:
   the `courses_read` RLS policy, the #27 parameterized mirrors (`trainer_visible_courses` /
-  `trainer_courses_for_plan`), `PLAN_ENTITLEMENTS`, and `planScopeAllows()` in
-  `src/lib/trainerContent.js` (pinned by `test/trainerAccess.test.mjs`).
+  `trainer_courses_for_plan`), `PLAN_ENTITLEMENTS` in `src/lib/planCatalog.js`, and
+  `planScopeAllows()` in `src/lib/trainerContent.js` (pinned by `test/trainerAccess.test.mjs`).
+- **Adding, removing, or repricing a PLAN** → `enrollment_plans` (a dated migration) ↔
+  `ENROLLMENT_PLANS_FALLBACK` ↔ `PLAN_ENTITLEMENTS` in `src/lib/planCatalog.js` ↔ the bootstrap §9
+  seed ↔ `ENROLLMENT_PLAN_KEYS` in `src/lib/trainerContent.js` (the admin trainer-preview allowlist)
+  ↔ `PLAN_ALLOWLIST_FALLBACK` in `api/admin/student-imports.js`, then re-run `npm run ai:knowledge`.
+  `test/planCatalog.test.mjs` pins the catalog and, critically, that **every** catalog key has an
+  explicit entitlement entry — an unlisted plan now fails CLOSED rather than getting full access.
 - **The trainer tool set or teaching-prompt behavior** → update `VOICE_SERVER_TOOL_SPECS`, the
   §3 system-prompt block + §4b in docs/ai/voice-agent-setup.md, and re-run `npm run ai:provision`.
 

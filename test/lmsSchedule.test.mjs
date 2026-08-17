@@ -56,7 +56,7 @@ test('★ an offset with NO cohort start date fails CLOSED', () => {
   assert.equal(r.unknown, true);
   assert.equal(r.at, null);
   assert.equal(isReleased(rule, NOW), false, 'locked, not open');
-  assert.equal(releaseLabel(rule, NOW), 'Unlocks when your cohort starts');
+  assert.equal(releaseLabel(rule, NOW), 'Unlocks when your batch starts');
 });
 
 test('offset 0 releases at the cohort start, not immediately', () => {

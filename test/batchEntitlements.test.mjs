@@ -26,15 +26,15 @@ const DAY = 24 * HOUR;
 const NOW = Date.parse('2026-08-15T12:00:00Z');
 const iso = (ms) => new Date(ms).toISOString();
 
-test('planBatchCount: the five live plans (D1 — derived from access_days)', () => {
-  // The decision that matters: gold_live and vip are 180-day plans, so each
-  // approval grants SIX monthly cohort seats.
-  assert.equal(planBatchCount(180, null), 6, 'gold_live / vip');
-  assert.equal(planBatchCount(60, null), 2, 'core_self_paced / sampler / silver_self_paced');
+test('planBatchCount: the three live plans (D1 — derived from access_days)', () => {
+  // The decision that matters: vip is the 180-day plan, so each approval grants
+  // SIX monthly cohort seats.
+  assert.equal(planBatchCount(180, null), 6, 'vip');
+  assert.equal(planBatchCount(60, null), 2, 'sampler / silver_self_paced');
 });
 
 test('planBatchCount: the override wins and is clamped', () => {
-  // Pinning Gold back to 2 is a one-row UPDATE, no migration.
+  // Pinning VIP back to 2 is a one-row UPDATE, no migration.
   assert.equal(planBatchCount(180, 2), 2);
   assert.equal(planBatchCount(60, 1), 1);
   assert.equal(planBatchCount(180, 999), MAX_OUTSTANDING_SEATS, 'a typo cannot mint 999 seats');
@@ -65,7 +65,7 @@ test('planBatchCount: rounds up and floors at 1', () => {
 
 test('runLengthForExtension is keyed on what was BOUGHT, not on the plan (D9)', () => {
   // The critical review finding: deriving this from the plan's access_days would
-  // give a 60-day top-up on Gold six cohorts instead of two.
+  // give a 60-day top-up on VIP six cohorts instead of two.
   assert.equal(runLengthForExtension(60), 2);
   assert.equal(runLengthForExtension(90), 3);
   assert.equal(runLengthForExtension(180), 6);
@@ -90,7 +90,7 @@ test('DAYS_PER_COHORT is the single source of the 30-day rule', () => {
 const seat = (over = {}) => ({
   status: 'active',
   batch_id: 'b-aug',
-  segment: 'gold',
+  segment: 'vip',
   batch_index: 0,
   run_id: 'run-1',
   run_length: 6,
@@ -148,11 +148,11 @@ test('seatStatusOf: superseded and malformed rows are reported honestly', () => 
 });
 
 test('seatStatusOf deliberately cannot see a plan downgrade', () => {
-  // A stamped gold seat still LOOKS active to the client after a downgrade; the
+  // A stamped VIP seat still LOOKS active to the client after a downgrade; the
   // live-segment conjunct in SQL is what refuses it. This test documents that
   // the client helper is not an authorization boundary.
-  const stampedGoldAfterDowngrade = seat({ segment: 'gold' });
-  assert.equal(seatStatusOf(stampedGoldAfterDowngrade, NOW), 'active');
+  const stampedVipAfterDowngrade = seat({ segment: 'vip' });
+  assert.equal(seatStatusOf(stampedVipAfterDowngrade, NOW), 'active');
 });
 
 // ── grouping / summarising ───────────────────────────────────────────────────
@@ -188,7 +188,7 @@ test('groupRunsByRunId ignores rows with no run_id and never throws on junk', ()
   assert.deepEqual(groupRunsByRunId([null, {}, { run_id: null }]), []);
 });
 
-test('summariseSeats counts a real six-cohort Gold run mid-term', () => {
+test('summariseSeats counts a real six-cohort VIP run mid-term', () => {
   // Aug started, Sep-Oct allocated but future, Nov-Jan still queued.
   const rows = [
     seat({ batch_index: 0, batch_id: 'aug', activates_at: iso(NOW - 14 * DAY) }),

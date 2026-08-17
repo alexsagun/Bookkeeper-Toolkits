@@ -97,7 +97,9 @@ const OBJECT_CHECKS = [
   ['#10    profiles in realtime publication', `select exists(select 1 from pg_publication_tables where pubname='supabase_realtime' and tablename='profiles') as ok`],
   ['#12    enrollment tables + is_enrolled()', `select to_regclass('public.enrollment_requests') is not null and to_regclass('public.subscriptions') is not null and to_regprocedure('public.is_enrolled()') is not null as ok`],
   ['#13    approve_subscription()', `select to_regprocedure('public.approve_subscription(uuid,text,uuid)') is not null as ok`],
-  ['#17    current_plan_key() / plan_is_qbo_only()', `select to_regprocedure('public.current_plan_key()') is not null and to_regprocedure('public.plan_is_qbo_only()') is not null as ok`],
+  // #39 DROPPED plan_is_qbo_only() with core_self_paced, so #17's own object is
+  // gone by design. current_plan_key() survives — it still feeds plan_is_sampler().
+  ['#17    current_plan_key()', `select to_regprocedure('public.current_plan_key()') is not null as ok`],
   ['#19    courses.access_tier + plan_is_sampler()', `select to_regprocedure('public.plan_is_sampler()') is not null and exists(select 1 from information_schema.columns where table_schema='public' and table_name='courses' and column_name='access_tier') as ok`],
   ['#20/#21 approve_extension()', `select to_regprocedure('public.approve_extension(uuid,uuid,integer)') is not null as ok`],
   ['#23/#24 community_posts + community_tags', `select to_regclass('public.community_posts') is not null and to_regclass('public.community_tags') is not null as ok`],
@@ -114,6 +116,43 @@ const OBJECT_CHECKS = [
   ['#37    attachment insert binds uploader + link + space', `select coalesce(bool_and(with_check ilike '%uploader_id =%' and with_check ilike '%storage_path IS NULL%' and with_check ilike '%(p.space_id)::text%'), false) as ok from pg_policies where policyname='community_attachments_own_insert'`],
   ['#37    only a revoke clears the batch_id cache', `select coalesce(bool_and(prosrc like '%revoked%then%'), false) as ok from pg_proc where proname='revoke_batch_run'`],
   ['#37    FIFO binder is forward-only within a run', `select coalesce(bool_and(prosrc like '%max(b2.code)%'), false) as ok from pg_proc where proname='allocate_queued_entitlements'`],
+  // #37b is a RECONSTRUCTION of a file that ran in prod and was never committed —
+  // found by this script's own "log rows with no file" check. The object check is
+  // what stops the same gap reopening silently if the file is ever lost again.
+  ['#37b   course_lessons.zoom_replay_url', `select exists(select 1 from information_schema.columns where table_schema='public' and table_name='course_lessons' and column_name='zoom_replay_url') as ok`],
+  // #38's real boundary is a COLUMN privilege, not a policy — and a later blanket
+  // `grant all on all tables in schema public to authenticated` would silently undo
+  // it while every policy still looked correct. That is exactly what this checks.
+  ['#38    batch code not writable over REST', `select not has_column_privilege('authenticated','public.batches','code','UPDATE') as ok`],
+  ['#38    batches_guard is armed', `select coalesce(bool_or(tgname='batches_guard'), false) as ok from pg_trigger where tgrelid='public.batches'::regclass and not tgisinternal`],
+  // CASE, not AND: Postgres does not promise left-to-right short-circuiting, and
+  // has_function_privilege() ERRORS on a function that does not exist — which would
+  // abort the whole audit instead of reporting one failed check.
+  ['#38    the month-end sweep exists and is client-unreachable', `select case when to_regprocedure('public.close_due_batches()') is null then false else not has_function_privilege('authenticated','public.close_due_batches()','execute') end as ok`],
+  ['#38    every batch has a period', `select coalesce(bool_and(starts_on is not null and ends_on is not null and coalesce(timezone,'') <> ''), true) as ok from public.batches`],
+  // The CASE guard that works for has_function_privilege() does NOT work here: a
+  // string argument is evaluated at runtime, but `from cron.job` is resolved during
+  // PARSE ANALYSIS, so the whole statement fails with "schema cron does not exist"
+  // before any branch is chosen — and #38 explicitly supports the install where
+  // pg_cron could not be created. query_to_xml() takes the query as TEXT, so the
+  // reference is only ever parsed when the CASE has already decided cron exists.
+  ['#38    the sweep is scheduled', `select coalesce((select (xpath('/row/ok/text()', x))[1]::text::boolean from query_to_xml(case when to_regclass('cron.job') is null then 'select false as ok' else 'select exists(select 1 from cron.job where jobname = ''close-due-batches'') as ok' end, false, true, '') as t(x)), false) as ok`],
+  // #39 is a REMOVAL, so its checks assert absence. A migration that only deletes
+  // has no new object to point at — the log row alone would not notice a re-created
+  // plan or a resurrected gold space.
+  ['#39    exactly three plans', `select count(*) = 3 as ok from public.enrollment_plans`],
+  ['#39    the retired plan keys are gone', `select not exists(select 1 from public.enrollment_plans where key in ('core_self_paced','gold_live')) as ok`],
+  ['#39    silver 2999 / vip 16999', `select coalesce(bool_and(case key when 'silver_self_paced' then price_php = 2999 when 'vip' then price_php = 16999 when 'sampler' then price_php = 1499 else true end), false) as ok from public.enrollment_plans`],
+  ['#39    the gold segment is gone', `select not exists(select 1 from public.community_spaces where kind='gold')
+      and not exists(select 1 from public.enrollment_plans where community_segment='gold')
+      and not exists(select 1 from public.batch_entitlements where segment <> 'vip')
+      and not exists(select 1 from information_schema.columns
+                      where table_schema='public' and table_name='batches' and column_name='gold_capacity') as ok`],
+  ['#39    plan_is_qbo_only is dropped', `select to_regprocedure('public.plan_is_qbo_only()') is null as ok`],
+  // Both overloads resolving would let a client silently bind a different function
+  // depending on whether it sent p_gold_capacity.
+  ['#39    admin_update_batch is 8-arg only', `select to_regprocedure('public.admin_update_batch(uuid,text,text,date,date,text,int,int)') is not null
+      and to_regprocedure('public.admin_update_batch(uuid,text,text,date,date,text,int,int,int)') is null as ok`],
 ];
 
 async function main() {

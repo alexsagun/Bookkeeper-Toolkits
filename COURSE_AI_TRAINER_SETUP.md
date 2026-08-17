@@ -13,7 +13,7 @@ haven't.
   and can open the exact lesson in the app.
 - **Server-side, fail-closed authorization on every request.** Course content is never in
   the ElevenLabs knowledge base; the four webhook tools re-check the learner's live
-  membership + plan scope (core → `qbo-*` only, Sampler → QBO Essentials only, full plans
+  membership + plan scope (Sampler → QBO Essentials only, full plans
   → everything) in Supabase before returning a single sentence. If the entitlement check
   is unavailable, the trainer returns a temporary error — never content.
 - A compact **AI Trainer** panel in the course builder: per-course enable switch,
@@ -197,7 +197,7 @@ Course-level **Trainer notes** (optional) work the same way — extra approved c
 | "The trainer is temporarily unavailable" | The entitlement check failed — this is the **fail-closed** path (Supabase down/misconfigured). Check Vercel logs for `[trainer]` lines (codes only, never content). |
 | Transcribe fails / times out | Very long videos can exceed the serverless window (300s). Retry, or paste the transcript manually — the manual path always works. Check `ELEVENLABS_API_KEY`. |
 | A course the learner should have is denied | It must be **published** + **AI Trainer enabled** + have ≥1 **Ready** source, and the learner's plan must include it — check the panel + Preview as plan. |
-| Learner asks about "Live Group Track" etc. | Membership names are plans, not courses — the trainer offers the actual courses their plan includes. Working as intended. |
+| Learner asks about "Personalized Coaching Program" etc. | Membership names are plans, not courses — the trainer offers the actual courses their plan includes. Working as intended. |
 
 ## Cost notes
 

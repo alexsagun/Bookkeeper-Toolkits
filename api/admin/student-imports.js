@@ -45,7 +45,7 @@ const BRAND = 'Toolkits by Alex';
 const SOURCE = 'thinkific';
 const MAX_BATCH = 25;
 const CHUNK = 200;                       // bulk .in() lookup chunk size
-const PLAN_ALLOWLIST_FALLBACK = ['core_self_paced', 'sampler', 'silver_self_paced', 'gold_live', 'vip'];
+const PLAN_ALLOWLIST_FALLBACK = ['sampler', 'silver_self_paced', 'vip'];   // #39: the three-plan catalog
 
 // ── Per-warm-instance burst guard (same best-effort pattern as the other endpoints) ──
 const RATE_WINDOW_MS = 60_000;
@@ -221,7 +221,7 @@ function proposeForRow(row, { bySourceMap, byEmailMap, comboPlanMap, planAccessD
     proposedStart = term.started_at;
     proposedEnds = term.ends_at;
 
-    // Batch resolution (#32): gold/vip rows need an explicit, confirmed OPEN
+    // Batch resolution (#32): VIP rows need an explicit, confirmed OPEN
     // batch_code — NEVER inferred from Thinkific history. resolveBatchForImport
     // blocks premium rows without one; general rows ignore a stray code.
     const batchRes = resolveBatchForImport({
@@ -254,7 +254,7 @@ function proposeForRow(row, { bySourceMap, byEmailMap, comboPlanMap, planAccessD
 
 // Throws on any failure other than "the #32 column isn't there yet". Degrading to the
 // hardcoded PLAN_SEGMENT_FALLBACK would classify every premium plan key that isn't
-// literally gold_live/vip as `general` — skipping the batch requirement and granting
+// literally `vip` as `general` — skipping the batch requirement and granting
 // batch-less access with no blocked row to show for it — and would also leave
 // access_days empty so every term lands with a null expiry. Segment and term length
 // must come from the live table or the run must stop.
