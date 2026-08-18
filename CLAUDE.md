@@ -51,7 +51,7 @@ npm run ai:knowledge       # regenerate docs/ai/toolkits-voice-agent-knowledge.m
 npm run ai:knowledge:check # rebuild the knowledge doc in memory + diff vs disk; exit 1 on drift (writes nothing)
 npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge base
 npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
-npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, …)
+npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, …)
 ```
 
 There is **no linter** — verify UI changes by running `npm run dev` and exercising the affected
@@ -164,8 +164,24 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
   `video_url`/`storage_path`/`cover_path` by reference (copy-on-write — no files copied) and setting
   `source_course_id`. The duplicate's `course_date` **defaults to today** (it is *not* copied from the
   source — so a new monthly re-run never inherits last month's date). Per-user
-  `lesson_progress`/`course_completions` are **not** copied. It then opens the copy in the builder with
-  a one-time success banner (`CourseProgram`'s `initialNotice` prop).
+  `lesson_progress`/`course_completions` are **not** copied. `zoom_replay_url` **is** copied (by value,
+  like every other content column — the copy is a draft the admin reviews, and a replay is often
+  evergreen). It then opens the copy in the builder with a one-time success banner (`CourseProgram`'s
+  `initialNotice` prop).
+- **Zoom Live Replay (#37b):** `course_lessons.zoom_replay_url` is an **optional supplementary** link
+  to the recording of a lesson's live session — one per lesson, nullable, **not** a fifth
+  `video_provider`. Admins set it in the lesson editor; learners get the `LessonReplayLink` card
+  rendered **below the lesson body and above the completion controls** (the placement is the column's
+  own `COMMENT`). It **never** replaces `video_url`/`video_provider`/`storage_path`, never satisfies the
+  empty-lesson save gate, never triggers storage cleanup, and never touches
+  `lesson_progress`/`course_completions`/certificates — clicking it does not mark anything complete.
+  Validation + host classification live in the pure **[src/lib/lessonReplay.js](src/lib/lessonReplay.js)**
+  (`parseReplayUrl()` → `kind: none|zoom|external|invalid`; absolute **https only**; boundary-safe Zoom
+  host match so `zoom.us.attacker.example` is never labelled Zoom; credentials/relative/`javascript:`
+  rejected; query tokens like `?pwd=` preserved). Zoom hosts are **linked, never embedded** — Zoom
+  recording pages send `X-Frame-Options`. A value that is invalid *in the database* (hand-edited row)
+  never becomes a clickable `href`: learners see nothing, admins see a warning strip. The column has
+  **no CHECK and no index** by design, so that module is the **only** enforcement point.
 - **In-app delete = data cleanup (reference-aware):** `CourseCatalog.deleteCourse()` deletes the row
   (FK cascade clears modules/lessons/progress/completions) then calls the module-level
   `removeMediaIfUnreferenced()` to purge the course's storage files **only when no other course still
@@ -1176,6 +1192,16 @@ docs **in the same change**:
 - **Changing how many cohorts a plan grants** → `plan_batch_count()` ↔
   `enrollment_plans.eligible_batch_count` ↔ `planBatchCount()` in `src/lib/batchEntitlements.js`
   (`test/batchEntitlements.test.mjs` pins it).
+- **Changing what a lesson replay link may be** → three places move together: the
+  `course_lessons.zoom_replay_url` **COMMENT** (in both `db/2026-08-05-lesson-zoom-replay.sql` and the
+  bootstrap) ↔ `parseReplayUrl()` / `ZOOM_HOST_SUFFIXES` in `src/lib/lessonReplay.js` ↔
+  `LessonReplayLink` + the lesson-editor field in BookkeeperPro.jsx (pinned by
+  `test/lessonReplay.test.mjs`). The column has **no CHECK by design** — the client module is the only
+  enforcement point, so a rule loosened there is loosened everywhere.
+- **Adding a column to the lesson model** → it must be added to **all** of: `COURSE_LESSON_SELECT`,
+  `lessonComparable()` (or the dirty check silently ignores it), `saveLesson()`'s `payload`, the lesson
+  editor UI, and `CourseCatalog.duplicateCourse()`'s lesson `.map()`. Each is an explicit allow-list;
+  missing one fails silently rather than loudly.
 - **Adding an error code** → `app_error_catalog()` ↔ `APP_ERROR_CODES` **and `APP_ERROR_COPY`** in
   `src/lib/appErrors.js`. Clients branch on `error.hint`, never on the HTTP status.
 - **Changing when a batch locks, or what an admin may edit on it** → four places move together:

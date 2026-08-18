@@ -45,6 +45,7 @@ import {
   COVER_INDUSTRIES, DEFAULT_INDUSTRY_ID, getIndustry, detectIndustry, scrubDashes,
 } from './lib/coverLetterIndustry';
 import { parseLooseJson } from './lib/partialJson';
+import { ZOOM_HOST_SUFFIXES, parseReplayUrl } from './lib/lessonReplay';
 
 const DEFAULT_APP_TAB = 'dashboard';
 
@@ -10845,7 +10846,36 @@ function certificateTitle(rawTitle = '') {
 
 const COURSE_ROW_SELECT = 'id,slug,title,subtitle,description,month,course_date,published,position,cover_path,source_course_id,access_tier,created_at,updated_at';
 const COURSE_MODULE_SELECT = 'id,course_id,title,position';
-const COURSE_LESSON_SELECT = 'id,module_id,course_id,title,type,video_url,video_provider,storage_path,text_content,duration_label,position';
+// zoom_replay_url (#37b) sits where the table puts it — after duration_label, before position.
+// load() and duplicateCourse()'s read both go through selectCourseLessons() below.
+const COURSE_LESSON_SELECT = 'id,module_id,course_id,title,type,video_url,video_provider,storage_path,text_content,duration_label,zoom_replay_url,position';
+// ★ The pre-#37b shape — FROZEN. A database that has not run that migration answers 42703 for the
+// WHOLE select, and load()'s not-configured branch reads "does not exist" as "the course tables are
+// missing" — which would blank the entire course platform for every user over one optional field.
+// So narrow and retry, the same 2-tier idiom PROFILE_SELECT uses in AuthProvider.
+//   Do NOT add future lesson columns to this constant. It is a historical snapshot, not a second
+//   copy of the select: adding to it makes both lists identical, the retry re-fails, and the
+//   fallback silently stops working. A future column needs its own tier, or none at all.
+const COURSE_LESSON_SELECT_LEGACY = 'id,module_id,course_id,title,type,video_url,video_provider,storage_path,text_content,duration_label,position';
+
+function isMissingColumnError(e) {
+  return e?.code === '42703' || e?.code === 'PGRST204' || /column .* does not exist/i.test(e?.message || '');
+}
+
+/** Run a course_lessons query, falling back to the pre-#37b column list on a missing column. */
+async function selectCourseLessons(build) {
+  const res = await build(COURSE_LESSON_SELECT);
+  if (res?.error && isMissingColumnError(res.error)) {
+    console.warn('[CourseProgram] course_lessons.zoom_replay_url is missing — run db/2026-08-05-lesson-zoom-replay.sql (#37b). Continuing without replay links.');
+    return build(COURSE_LESSON_SELECT_LEGACY);
+  }
+  return res;
+}
+
+/** True when loaded lesson rows came back without #37b's column, i.e. the DB predates it. */
+function lessonRowsArePreReplay(rows) {
+  return Array.isArray(rows) && rows.length > 0 && !('zoom_replay_url' in rows[0]);
+}
 // course_completions has only (user_id, course_id, completed_at) — composite PK, no id/created_at
 // columns (see COURSE_SETUP.md). Selecting non-existent columns returns a PostgREST 400, so request
 // only what the table actually has (the code only ever reads completed_at).
@@ -10885,6 +10915,65 @@ function SignedLessonVideo({ lesson }) {
     return <div className="rounded-xl bg-black/80 flex items-center justify-center text-white/70 text-sm" style={{ height: 240 }}>Loading video…</div>;
   }
   return <video key={lesson.id} controls className="w-full rounded-xl bg-black" style={{ maxHeight: 460 }} src={src} />;
+}
+
+// ── Learner: the optional "Zoom Live Replay" link on a lesson (#37b) ────────────
+// Supplementary content, rendered BELOW the lesson body and ABOVE the completion
+// controls — the placement contract recorded in course_lessons.zoom_replay_url's
+// COMMENT. It never replaces the lesson video, and clicking it never touches
+// lesson_progress: only "Mark complete" moves progress or unlocks the certificate.
+//
+// ★ The href binds to parseReplayUrl()'s `url` and to NOTHING else, and that field
+//   exists only for a value already proven to be an absolute https link. No branch
+//   below builds an href out of the raw `value`.
+// ★ Never embedded. Zoom recording pages send X-Frame-Options, so an iframe would
+//   render an empty box — the link opens in a new tab instead.
+function LessonReplayLink({ value, lessonTitle = '', isAdmin = false }) {
+  const r = parseReplayUrl(value);
+  if (r.kind === 'none') return null;
+
+  // A value only SQL could have produced (hand-edited row, restored dump). Students get
+  // silence — they can't fix it and a broken-content warning helps nobody. Admins get
+  // told, because otherwise the row is invisible until someone reopens the editor. The
+  // raw value renders as a text child, so React escapes it.
+  if (r.kind === 'invalid') {
+    if (!isAdmin) return null;
+    return (
+      <div className="mt-5 flex items-start gap-2.5 px-3.5 py-3 rounded-xl"
+        style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)' }}>
+        <AlertTriangle size={15} aria-hidden="true" className="flex-shrink-0 mt-0.5" style={{ color: 'var(--status-warn-fg)' }} />
+        <div className="min-w-0">
+          <div className="text-xs font-bold" style={{ color: 'var(--status-warn-fg)' }}>Replay link hidden — {r.message}</div>
+          <div className="mt-0.5 text-[11px] break-all" style={{ color: C.textSoft, fontFamily: fontMono }}>{value}</div>
+          <div className="mt-1 text-[11px]" style={{ color: C.textMute }}>Only admins see this. Students see nothing here — fix it in the lesson editor.</div>
+        </div>
+      </div>
+    );
+  }
+
+  // A non-Zoom https link is still a replay worth offering — it just doesn't get to
+  // borrow Zoom's name.
+  const label = r.kind === 'zoom' ? 'Zoom Live Replay' : 'Session replay';
+  return (
+    <div className="mt-5">
+      <a href={r.url} target="_blank" rel="noopener noreferrer"
+        aria-label={`${label}${lessonTitle ? ` for ${lessonTitle}` : ''} — opens ${r.host} in a new tab`}
+        className="group flex items-center gap-3 p-3 pl-3.5 rounded-xl no-underline transition-colors"
+        style={{ background: 'var(--primary-tint)', border: `1px solid ${GLASS.border}`, borderLeft: `3px solid ${C.primary}` }}>
+        <span className="flex-shrink-0 grid place-items-center rounded-lg text-white"
+          style={{ width: 34, height: 34, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: '0 4px 10px -3px var(--primary-glow-soft)' }}>
+          <Video size={16} aria-hidden="true" />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block text-[10px] font-bold uppercase tracking-[0.18em]" style={{ color: C.textSoft }}>Live session</span>
+          <span className="block text-sm font-bold leading-tight" style={{ fontFamily: fontDisplay, color: C.text }}>{label}</span>
+          {/* The host, never the full url — a Zoom share link carries an access token. */}
+          <span className="block mt-0.5 text-[11px] truncate" style={{ color: C.textSoft }}>{r.host} · opens in a new tab</span>
+        </span>
+        <ExternalLink size={15} aria-hidden="true" className="flex-shrink-0 transition-transform group-hover:translate-x-0.5" style={{ color: C.primary }} />
+      </a>
+    </div>
+  );
 }
 
 // ── Admin: AI Trainer panel inside the course builder ───────────────────────────
@@ -11361,6 +11450,13 @@ function CourseProgram({
   const [previewUrl, setPreviewUrl] = useState(null);        // local object URL while authoring
   const [metaBusy, setMetaBusy] = useState(false);           // saving course details / toggling publish
   const [structBusy, setStructBusy] = useState(false);       // adding a module or lesson
+  // Field-level error for the replay link. Deliberately NOT the shared `err`: the lesson
+  // editor is a fixed z-50 overlay rendered after the page error banner, so anything
+  // setErr() raises from inside it sits behind the scrim.
+  const [replayErr, setReplayErr] = useState('');
+  // The editor body scrolls (max-h-[88vh]) under a sticky footer, so the replay field can
+  // sit below the fold. Without this, a blocked save looks like a dead Save button.
+  const replayInputRef = useRef(null);
 
   // Certificate state
   const [studentName, setStudentName] = useState(
@@ -11430,7 +11526,7 @@ function CourseProgram({
 
       const [{ data: mods, error: mErr }, { data: lessons, error: lErr }] = await Promise.all([
         supabase.from('course_modules').select(COURSE_MODULE_SELECT).eq('course_id', courseRow.id).order('position'),
-        supabase.from('course_lessons').select(COURSE_LESSON_SELECT).eq('course_id', courseRow.id).order('position'),
+        selectCourseLessons(cols => supabase.from('course_lessons').select(cols).eq('course_id', courseRow.id).order('position')),
       ]);
       if (mErr) throw mErr;
       if (lErr) throw lErr;
@@ -11473,8 +11569,13 @@ function CourseProgram({
           const storedLessonDraft = await window.storage.get(lessonEditorDraftKey(courseRow.id));
           if (storedLessonDraft?.value) {
             const parsed = JSON.parse(storedLessonDraft.value);
-            if (parsed?.id && all.some(l => l.id === parsed.id)) {
-              setEditingLesson(parsed);
+            const target = parsed?.id ? all.find(l => l.id === parsed.id) : null;
+            if (target) {
+              // Layer the draft OVER the live row instead of replacing it. A draft written
+              // by an older build simply has no key for a newer column, and a wholesale
+              // restore would then save that column back as null. Keys the admin actually
+              // cleared are present-but-empty, so an intentional clear still wins.
+              setEditingLesson({ ...target, ...parsed });
               setNotice(n => n || 'Restored an unsaved lesson draft from this browser.');
             }
           }
@@ -11524,6 +11625,9 @@ function CourseProgram({
     storage_path: l.storage_path || null,
     text_content: l.text_content || '',
     duration_label: l.duration_label || '',
+    // Without this the replay link is invisible to the dirty check, so typing one and
+    // hitting Cancel discards it with no prompt and no beforeunload guard.
+    zoom_replay_url: l.zoom_replay_url || '',
   });
   const lessonDraftDirty = !!(isAdmin && editingLesson && originalEditingLesson &&
     JSON.stringify(lessonComparable(editingLesson)) !== JSON.stringify(lessonComparable(originalEditingLesson)));
@@ -11563,6 +11667,10 @@ function CourseProgram({
     if (!course?.id || !isAdmin || !editingLesson || typeof window === 'undefined' || !window.storage) return;
     window.storage.set(lessonEditorDraftKey(course.id), JSON.stringify(editingLesson)).catch(() => {});
   }, [course?.id, isAdmin, editingLesson]);
+
+  // Opening a different lesson (or closing the editor) must not inherit the last
+  // lesson's replay complaint.
+  useEffect(() => { setReplayErr(''); }, [editingLesson?.id]);
 
   useEffect(() => {
     if (!hasUnsavedCourseWork) return;
@@ -11713,10 +11821,14 @@ function CourseProgram({
   async function addLesson(m) {
     setStructBusy(true); setErr('');
     try {
+      // ★ Deliberately the LEGACY column list, and deliberately NOT wrapped in
+      // selectCourseLessons(): that helper retries by re-running its builder, which on an
+      // insert could commit a second row. A brand-new lesson has no replay link anyway, and
+      // the await load() below refetches every lesson with the full column list.
       const { data, error } = await supabase.from('course_lessons').insert({
         module_id: m.id, course_id: course.id, title: 'New lesson',
         type: 'video', position: (m.lessons?.length || 0),
-      }).select(COURSE_LESSON_SELECT).single();
+      }).select(COURSE_LESSON_SELECT_LEGACY).single();
       if (error) throw error;
       await load();
       setEditingLesson({ ...data });
@@ -11782,10 +11894,26 @@ function CourseProgram({
     const hasLink = isVideo && !isUpload && !!(d.video_url || '').trim();
     const hasText = !!(d.text_content || '').trim();
     // Don't let an empty lesson be saved (it would show "No video added yet" to students).
+    // ★ A replay link deliberately does NOT satisfy this gate: it renders below the player
+    // slot, so a replay-only lesson would still show students an empty video.
     if (isVideo && !isUpload && !hasLink && !hasText) {
       setErr('Add a video link, upload a file, or write some lesson notes before saving.'); return;
     }
     if (!isVideo && !hasText) { setErr('Add some lesson content before saving.'); return; }
+    // Supplementary replay link. Returning here leaves the modal open with the draft intact,
+    // because clearLessonDraft()/setEditingLesson(null) are further down.
+    const replay = parseReplayUrl(d.zoom_replay_url);
+    if (replay.kind === 'invalid') {
+      setReplayErr(replay.message);
+      // Bring the offending field (and its role="alert") into view — the message is useless
+      // if Save just appears to do nothing.
+      requestAnimationFrame(() => {
+        replayInputRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        replayInputRef.current?.focus({ preventScroll: true });
+      });
+      return;
+    }
+    setReplayErr('');
     setSavingLesson(true); setErr('');
     try {
       const oldPath = allLessons.find(x => x.id === d.id)?.storage_path; // for cleanup if the video changed
@@ -11798,6 +11926,11 @@ function CourseProgram({
         text_content: d.text_content || null,
         duration_label: (d.duration_label || '').trim() || null,
       };
+      // Not gated on isVideo — a text lesson may still have a recorded live Q&A. Stores the
+      // normalized href, so the value in the database is exactly what the learner clicks.
+      // Omitted entirely (not sent as undefined) when the DB predates #37b: postgrest-js
+      // unions Object.keys() into ?columns=, so even undefined would 42703 the whole update.
+      if (!lessonRowsArePreReplay(allLessons)) payload.zoom_replay_url = replay.kind === 'none' ? null : replay.url;
       const { error } = await supabase.from('course_lessons').update(payload).eq('id', d.id);
       if (error) throw error;
       // If a previously-uploaded file was replaced or removed, purge the old object — but only if no
@@ -11960,7 +12093,10 @@ function CourseProgram({
         {/* Player */}
         <div className="order-1 lg:order-2 lg:col-span-2">
           {activeLesson ? (
-            <div className="glass-card rounded-2xl p-5 sm:p-6" style={{ background: '#fff' }}>
+            // C.white (var(--surface-2)), not a literal '#fff': a hex here out-cascades both
+            // .glass-card and the dark compat layer, leaving the card white — and its
+            // text-slate-700 body copy illegible — in dark mode.
+            <div className="glass-card rounded-2xl p-5 sm:p-6" style={{ background: C.white }}>
               {renderVideo(activeLesson)}
               <div className="mt-5">
                 <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">{activeLesson.title}</div>
@@ -11969,6 +12105,9 @@ function CourseProgram({
                   <div className="mt-4 text-slate-700 whitespace-pre-line leading-relaxed text-[15px]">{activeLesson.text_content}</div>
                 )}
               </div>
+              {/* Below the lesson body, above the completion controls — the placement
+                  recorded in course_lessons.zoom_replay_url's COMMENT (#37b). */}
+              <LessonReplayLink value={activeLesson.zoom_replay_url} lessonTitle={activeLesson.title} isAdmin={isAdmin} />
               <div className="mt-5 pt-4 border-t border-slate-100">
                 <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-3">Lesson {activeIdx + 1} of {totalLessons}</div>
                 <div className="flex items-center justify-between gap-2 flex-wrap">
@@ -12098,6 +12237,11 @@ function CourseProgram({
   function renderLessonEditor() {
     const d = editingLesson;
     const detected = d.type === 'video' && d.video_provider !== 'upload' ? parseVideoUrl(d.video_url).provider : null;
+    const replay = parseReplayUrl(d.zoom_replay_url);
+    const replayOk = replay.kind === 'zoom' || replay.kind === 'external';
+    // saveLesson omits the column on a pre-#37b database, so offering the field there would
+    // accept a link, confirm "Detected: Zoom", and then silently discard it.
+    const preReplayDb = lessonRowsArePreReplay(allLessons);
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(15,18,23,0.45)' }} onClick={closeLessonEditor}>
         <div className="bg-white rounded-2xl w-full max-w-xl max-h-[88vh] overflow-y-auto shadow-2xl" onClick={e => e.stopPropagation()}>
@@ -12160,6 +12304,65 @@ function CourseProgram({
               <input value={d.duration_label || ''} onChange={e => setEditingLesson(s => ({ ...s, duration_label: e.target.value }))}
                 className="mt-1 w-40 px-3 py-2 rounded-lg border border-slate-200 text-sm" />
             </label>
+
+            {/* Supplementary replay link (#37b). Separate from the video controls above on
+                purpose: it never replaces the lesson's own content. Validated on blur and
+                again on save — a draft restored from window.storage is never blurred, so
+                blur alone would let a bad value through. */}
+            <div className="pt-3 border-t border-slate-100">
+              {preReplayDb ? (
+                <div className="flex items-start gap-2.5 px-3.5 py-3 rounded-xl"
+                  style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)' }}>
+                  <AlertTriangle size={15} aria-hidden="true" className="flex-shrink-0 mt-0.5" style={{ color: 'var(--status-warn-fg)' }} />
+                  <div className="min-w-0">
+                    <div className="text-xs font-bold" style={{ color: 'var(--status-warn-fg)' }}>Zoom Live Replay is unavailable on this database</div>
+                    <div className="mt-0.5 text-[11px]" style={{ color: C.textSoft }}>
+                      Migration #37b hasn’t been run here, so <code style={{ fontFamily: fontMono }}>course_lessons.zoom_replay_url</code> doesn’t
+                      exist. Everything else saves normally. Run <code style={{ fontFamily: fontMono }}>db/2026-08-05-lesson-zoom-replay.sql</code>,
+                      or <code style={{ fontFamily: fontMono }}>npm run db:audit</code> to see what else is missing.
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <label className="block">
+                    <span className="text-xs font-semibold text-slate-500 inline-flex items-center gap-1.5">
+                      <Video size={13} aria-hidden="true" /> Zoom Live Replay link (optional)
+                    </span>
+                    <input ref={replayInputRef} type="url" inputMode="url" value={d.zoom_replay_url || ''}
+                      placeholder="https://us02web.zoom.us/rec/share/…"
+                      onChange={e => { if (replayErr) setReplayErr(''); setEditingLesson(s => ({ ...s, zoom_replay_url: e.target.value })); }}
+                      onBlur={e => { const v = parseReplayUrl(e.target.value); setReplayErr(v.kind === 'invalid' ? v.message : ''); }}
+                      aria-invalid={replayErr ? true : undefined}
+                      aria-describedby={replayErr ? 'lesson-replay-err' : 'lesson-replay-hint'}
+                      className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm"
+                      style={replayErr ? { borderColor: 'var(--status-danger-bd)' } : undefined} />
+                  </label>
+                  {replayErr ? (
+                    <div id="lesson-replay-err" role="alert" className="mt-1.5 flex items-start gap-1.5 text-[11px]" style={{ color: 'var(--status-danger-fg)' }}>
+                      <AlertTriangle size={12} aria-hidden="true" className="flex-shrink-0 mt-px" /> {replayErr}
+                    </div>
+                  ) : replayOk ? (
+                    <div id="lesson-replay-hint" className="mt-1.5 flex items-center gap-2 flex-wrap text-[11px]" style={{ color: C.textSoft }}>
+                      <span>Detected: <strong style={{ color: C.text }}>{replay.kind === 'zoom' ? 'Zoom' : 'External link'}</strong> · {replay.host}</span>
+                      {/* Never opened automatically — the admin chooses to test it. */}
+                      <a href={replay.url} target="_blank" rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 font-semibold" style={{ color: C.primary }}>
+                        Test replay link <ExternalLink size={11} aria-hidden="true" />
+                      </a>
+                    </div>
+                  ) : (
+                    <div id="lesson-replay-hint" className="mt-1.5 text-[11px] text-slate-400">
+                      Paste the complete Zoom recording share link. Students open it in a new tab — Zoom
+                      privacy and passcode settings still apply. It appears below the lesson and above
+                      “Mark complete”, never replaces the video, and is not tracked for progress.
+                      Links on {ZOOM_HOST_SUFFIXES.join(', ')} are labelled a Zoom replay; any other
+                      https link is shown as a session replay.
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
           </div>
           <div className="px-5 py-4 border-t border-slate-100 flex justify-end gap-2 sticky bottom-0 bg-white">
             <button onClick={closeLessonEditor} disabled={savingLesson} className="px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 border border-slate-200">Cancel</button>
@@ -12643,7 +12846,7 @@ function CourseCatalog({
       const [{ data: src, error: e1 }, { data: mods, error: e2 }, { data: lessons, error: e3 }] = await Promise.all([
         supabase.from('courses').select(COURSE_ROW_SELECT).eq('id', c.id).single(),
         supabase.from('course_modules').select(COURSE_MODULE_SELECT).eq('course_id', c.id).order('position'),
-        supabase.from('course_lessons').select(COURSE_LESSON_SELECT).eq('course_id', c.id).order('position'),
+        selectCourseLessons(cols => supabase.from('course_lessons').select(cols).eq('course_id', c.id).order('position')),
       ]);
       if (e1) throw e1;
       if (e2 || e3) throw (e2 || e3);
@@ -12685,6 +12888,12 @@ function CourseCatalog({
       }
 
       // 5. Copy lessons under the remapped modules (reuse video/storage references verbatim).
+      // zoom_replay_url is copied like every other content column: unlike course_date (which
+      // resets to today) a replay is often evergreen, and the copy is born a draft the admin
+      // reviews — so carry it over and let them clear it if it was specific to that run. On a
+      // DB predating #37b the key is left OFF the payload entirely rather than sent as
+      // undefined, which postgrest-js would still union into ?columns= and 42703 the insert.
+      const preReplayDb = lessonRowsArePreReplay(lessons);
       const lessonPayloads = (lessons || [])
         .filter(l => moduleIdMap.has(l.module_id))
         .map(l => ({
@@ -12692,6 +12901,7 @@ function CourseCatalog({
           title: l.title, type: l.type, video_url: l.video_url, video_provider: l.video_provider,
           storage_path: l.storage_path, text_content: l.text_content,
           duration_label: l.duration_label, position: l.position,
+          ...(preReplayDb ? {} : { zoom_replay_url: l.zoom_replay_url ?? null }),
         }));
       if (lessonPayloads.length) {
         const { error } = await supabase.from('course_lessons').insert(lessonPayloads);

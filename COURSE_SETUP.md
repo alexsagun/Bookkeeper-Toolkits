@@ -46,7 +46,9 @@ by Row Level Security, not just the UI).
 > for lineage. Per-user data (progress, completions, certificates) is **not** copied. The duplicate's
 > **Course date / Batch run date** defaults to **today** (it is not copied from the source), so a new
 > monthly re-run never inherits last month's date. The copy opens straight in the builder so you can
-> rename it, adjust the course date if needed, tweak lessons, and publish. Because videos are shared until you change them, **storage deletes are
+> rename it, adjust the course date if needed, tweak lessons, and publish. **Zoom Live Replay links
+> are copied too** — if a recording was specific to that run rather than evergreen, clear it on the
+> copy before publishing. Because videos are shared until you change them, **storage deletes are
 > reference-aware**: replacing/deleting a lesson video or deleting a whole course only removes a file
 > when **no other course still references it**, so deleting one monthly edition never breaks another.
 >
@@ -345,7 +347,14 @@ In the app, open **Training & Skills → QuickBooks Online Mastering**, click **
 1. Add a **module** (e.g. "Getting Started in QBO").
 2. Add **lessons** to it — give each a title, pick **Video** or **Text**, and for video either paste a
    link or upload a file. Optionally add notes and a duration label.
-3. Reorder with the up/down arrows. Toggle the course **Published** when ready.
+3. Optionally paste a **Zoom Live Replay link** — the recording of that lesson's live session. It must
+   be a complete `https://` URL (paste the whole share link, including any `?pwd=` passcode). Students
+   see it as a card **below the lesson and above "Mark complete"**, and it opens in a **new tab** —
+   Zoom recording pages can't be embedded, and Zoom's own privacy/passcode settings still apply. It is
+   **supplementary**: it never replaces the lesson video, never counts as lesson content on its own,
+   and watching it does **not** mark the lesson complete. Clear the field and save to remove it. An
+   invalid link blocks the save with a message under the field; the rest of your edits are kept.
+4. Reorder with the up/down arrows. Toggle the course **Published** when ready.
 
 Students see published content immediately, complete lessons, and earn the certificate at 100%.
 
@@ -368,6 +377,17 @@ Students see published content immediately, complete lessons, and earn the certi
   read policy above exists; check the browser console for a CORS error.
 - **Writes rejected while authoring** — you're not an admin for the requesting session (RLS). Re-check
   Step 4.
+- **Zoom Live Replay link saved but students don't see it** — only absolute `https://` links are
+  accepted. `http://`, a bare `zoom.us/rec/…` with no scheme, and links carrying `user:pass@` are
+  rejected. If a bad value reached the row some other way (hand-edited SQL, a restored dump), students
+  see **nothing** and admins see a yellow *"Replay link hidden"* strip on the lesson explaining why —
+  fix it in the lesson editor. Non-Zoom `https://` links still work; they're just labelled
+  *"Session replay"* rather than *"Zoom Live Replay"*.
+- **The replay field is there but links never stick** — the database predates migration **#37b**, so
+  the column doesn't exist. Courses still load and everything else saves normally (the app detects
+  the older shape and drops the field), and the browser console carries
+  `course_lessons.zoom_replay_url is missing — run db/2026-08-05-lesson-zoom-replay.sql (#37b)`. Run
+  that file, or `npm run db:audit` to see everything else that's missing.
 
 ---
 

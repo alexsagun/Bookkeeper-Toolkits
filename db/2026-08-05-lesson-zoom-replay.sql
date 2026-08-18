@@ -31,6 +31,15 @@
 --   and nothing in src/ reads or writes it. Recording the schema and rebuilding
 --   the feature are separate decisions; this is only the first.
 --
+--   ADDENDUM 2026-08-18 — the second decision was taken. The client half was
+--   REWRITTEN (not recovered: git had it on no branch, in no stash and in no
+--   dangling object) from the contract preserved in the column COMMENT below, on
+--   branch feat/zoom-live-replay: src/lib/lessonReplay.js + test/lessonReplay.test.mjs,
+--   the COURSE_LESSON_SELECT addition, the lesson-editor field, and LessonReplayLink.
+--   The paragraph above stands as written — it is the record of what this FILE does,
+--   which is still only the column. What is now out of date is its last sentence:
+--   the column is no longer dormant, and src/ does read it.
+--
 -- WHY NO CHECK AND NO INDEX (preserved from the original's reasoning, which
 -- survives in the live column comment)
 --   The column is never queried BY VALUE — it is selected with the lesson row and
@@ -75,6 +84,18 @@ alter table public.course_lessons
 -- ───────────────────────────────────────────────────────────────────
 -- 2) The comment, restored verbatim from the live column except for the file
 --    reference, which pointed at "(#38)" — a number this file no longer uses.
+--
+--    ★ AMENDED 2026-08-18, and this is the ONE line of this file that is not a
+--      recording. The original's final sentence read "NOTE: as of 2026-08-17 the
+--      client half of this feature is not present in the repo; the column is
+--      dormant." That sentence is now false: the client half was rewritten from
+--      this very comment's contract (src/lib/lessonReplay.js + LessonReplayLink).
+--      It is replaced rather than left standing because a COMMENT is not history —
+--      it is the live, machine-readable contract of a column that deliberately has
+--      no CHECK, and it must match db/000_full_database_bootstrap.sql or the two
+--      disagree about what the column means. The header above, and every word of
+--      it about how the original was lost, is untouched: that IS the history.
+--      Re-running this file against production only rewrites a comment.
 -- ───────────────────────────────────────────────────────────────────
 comment on column public.course_lessons.zoom_replay_url is
   'Optional supplementary "Zoom Live Replay" link, rendered BELOW the lesson content and ABOVE the '
@@ -82,8 +103,8 @@ comment on column public.course_lessons.zoom_replay_url is
   'lesson_progress/course_completions/certificates. Validated and classified client-side by '
   'src/lib/lessonReplay.js (absolute https only; Zoom hosts are linked, never embedded, because Zoom '
   'recording pages set X-Frame-Options). Deliberately has no CHECK constraint and no index — see the '
-  'header of db/2026-08-05-lesson-zoom-replay.sql (#37b). NOTE: as of 2026-08-17 the client half of '
-  'this feature is not present in the repo; the column is dormant.';
+  'header of db/2026-08-05-lesson-zoom-replay.sql (#37b). Because there is no CHECK, that client '
+  'module is the ONLY enforcement point — keep this comment and it in lockstep.';
 
 -- ───────────────────────────────────────────────────────────────────
 -- 3) Refresh PostgREST so a fresh install exposes the column immediately.
@@ -92,12 +113,26 @@ notify pgrst, 'reload schema';
 
 -- ═══════════════════════════════════════════════════════════════════
 -- AFTER RUNNING
---   -- ① the column exists and is dormant
+--   -- ① the column exists (as of 2026-08-18 admins can populate it — see the addendum)
 --   select count(*) as lessons, count(zoom_replay_url) as with_link
 --     from public.course_lessons;
 --
 --   -- ② no orphan log rows remain
 --   npm run db:audit          -- "log rows with no file" must read: none
+--
+--   -- ③ ★ ONE MANUAL STEP ON AN ALREADY-MIGRATED DATABASE (incl. production).
+--   --   The apply-log insert below is `on conflict do nothing`, so re-running this
+--   --   file writes nothing, and db:audit only checks that the COLUMN exists — it
+--   --   does not compare comment text. A database that ran the original in 2026-08
+--   --   therefore still carries the superseded "the column is dormant" wording. That
+--   --   is now wrong, and this comment is the contract for a column with no CHECK.
+--   --   Fix it by running section 2 of this file on its own (metadata only, no lock
+--   --   of consequence, safe any time), then confirm:
+--   select col_description('public.course_lessons'::regclass,
+--            (select attnum from pg_attribute
+--              where attrelid = 'public.course_lessons'::regclass
+--                and attname = 'zoom_replay_url')) as live_comment;
+--   -- must NOT contain the word "dormant".
 -- ═══════════════════════════════════════════════════════════════════
 
 -- ★ ON CONFLICT DO NOTHING, unlike every other file in this directory.
@@ -111,6 +146,7 @@ insert into public.schema_migrations (filename, checksum, notes) values
   '"Zoom Live Replay" supplementary link. RECONSTRUCTED 2026-08-17 from the live schema after '
   'npm run db:audit found this apply-log row with no corresponding file: the original ran on '
   '2026-08-05 and was never committed to git. Schema only — the client half (src/lib/lessonReplay.js, '
-  'COURSE_LESSON_SELECT, LessonReplayLink) was lost with it and is NOT restored, so the column is '
-  'dormant. Renumbered #38 -> #37b because 2026-08-16-batch-lifecycle.sql independently claimed #38.')
+  'COURSE_LESSON_SELECT, LessonReplayLink) was lost with it and is NOT restored by this file; it was '
+  'rewritten separately on 2026-08-18 from the column COMMENT contract, so the column is live. '
+  'Renumbered #38 -> #37b because 2026-08-16-batch-lifecycle.sql independently claimed #38.')
 on conflict (filename) do nothing;
