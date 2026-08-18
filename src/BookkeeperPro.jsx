@@ -3341,8 +3341,12 @@ function SidePanel({ title, subtitle, icon: Icon, onClose, children, tone = 'pri
   }, []);
   useEffect(() => {
     const onKey = (e) => {
+      // Bail when the portal is suppressed (hidden keep-alive tab): the panel is unmounted but
+      // this window listener is not, so Escape pressed in an unrelated tool would otherwise
+      // close an invisible drawer — and pop its "Discard unsaved changes?" confirm.
+      if (!panelRef.current) return;
       if (e.key === 'Escape') { close(); return; }
-      if (e.key !== 'Tab' || !panelRef.current) return;
+      if (e.key !== 'Tab') return;
       const f = panelRef.current.querySelectorAll(
         'button:not([disabled]), [href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
       );
@@ -11664,10 +11668,12 @@ function CourseProgram({
   };
   const clearLessonDraft = () => course?.id && clearStoredValue(lessonEditorDraftKey(course.id));
   const closeLessonEditor = () => {
-    // Never close mid-flight. Saving: the result would land on a drawer that no longer exists.
-    // Uploading: the completion handler would write into a draft we just nulled — see the null
-    // guard in uploadVideo, which is the invariant this merely makes unreachable from the UI.
-    if (savingLesson || uploading) return;
+    // Blocked only while SAVING — a bounded DB write that always settles. Deliberately NOT
+    // blocked while uploading: supabase.storage.upload() has no timeout, so gating on it would
+    // strand the admin behind an un-closable full-screen drawer whose only exit is a reload
+    // (which then trips the beforeunload prompt). Closing mid-upload is already safe because
+    // uploadVideo's updater bails on a null draft — that guard is the real invariant here.
+    if (savingLesson) return;
     if (lessonDraftDirty && !window.confirm('Discard unsaved lesson changes?')) return;
     clearLessonDraft();
     if (previewUrl) { URL.revokeObjectURL(previewUrl); setPreviewUrl(null); }
@@ -12312,7 +12318,7 @@ function CourseProgram({
         subtitle={drawerSubtitle}
         icon={Edit3}
         maxW="sm:max-w-xl lg:max-w-2xl"
-        canClose={!lessonBusy}
+        canClose={!savingLesson}
         onClose={closeLessonEditor}
         closeLabel="Close lesson editor"
         footer={(
@@ -12333,7 +12339,7 @@ function CourseProgram({
               {lessonDraftDirty && !lessonBusy && (
                 <span className="mr-auto text-[11px]" style={{ color: C.textSoft }}>Unsaved changes</span>
               )}
-              <button type="button" onClick={closeLessonEditor} disabled={lessonBusy}
+              <button type="button" onClick={closeLessonEditor} disabled={savingLesson}
                 className="px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 border border-slate-200 disabled:opacity-60">Cancel</button>
               <button type="button" onClick={saveLesson} disabled={lessonBusy}
                 className="px-5 py-2 rounded-xl text-white text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-60"
