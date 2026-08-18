@@ -3325,15 +3325,9 @@ function AccountModal({ title, subtitle, icon: Icon, onClose, children, maxW = '
 // untouched. Full-width sheet on mobile → right drawer on sm+ (width via the `maxW` prop,
 // a static Tailwind class so the JIT sees it). Same a11y idiom as AccountModal (focus
 // move-in + restore, Escape, Tab focus-trap, role=dialog/aria-modal, backdrop click-to-close).
-//   canClose  gates Escape / backdrop / X while an action is in flight (AccountModal's contract).
-//   footer    optional action bar pinned BELOW the scrolling body. Header, body and footer are
-//             three rows of one flex column, so a drawer never needs `sticky top-0`/`sticky
-//             bottom-0` — those only ever worked by accident inside a single scroller.
 function SidePanel({ title, subtitle, icon: Icon, onClose, children, tone = 'primary',
-  closeLabel = 'Close', bodyClass = 'px-6 py-5', maxW = 'sm:max-w-md',
-  canClose = true, footer = null }) {
+  closeLabel = 'Close', bodyClass = 'px-6 py-5', maxW = 'sm:max-w-md' }) {
   const panelRef = useRef(null);
-  const close = () => { if (canClose) onClose?.(); };
   useEffect(() => {
     const opener = document.activeElement;
     panelRef.current?.focus();
@@ -3341,7 +3335,7 @@ function SidePanel({ title, subtitle, icon: Icon, onClose, children, tone = 'pri
   }, []);
   useEffect(() => {
     const onKey = (e) => {
-      if (e.key === 'Escape') { close(); return; }
+      if (e.key === 'Escape') { onClose?.(); return; }
       if (e.key !== 'Tab' || !panelRef.current) return;
       const f = panelRef.current.querySelectorAll(
         'button:not([disabled]), [href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
@@ -3353,15 +3347,13 @@ function SidePanel({ title, subtitle, icon: Icon, onClose, children, tone = 'pri
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-    // canClose is a dep because onKey closes over `close`, which closes over it — a stale
-    // closure would let Escape dismiss a drawer that is mid-save.
-  }, [canClose, onClose]);
+  }, [onClose]);
   const tile = MODAL_TONE_TILE[tone] || MODAL_TONE_TILE.primary;
   return (
     <OverlayPortal>
     {/* color: C.text — on document.body there is no app-shell div to inherit it from */}
     <div className="fixed inset-0 z-[70] flex justify-end"
-      style={{ background: 'rgba(15,18,23,0.45)', fontFamily: fontBody, color: C.text }} onClick={close}>
+      style={{ background: 'rgba(15,18,23,0.45)', fontFamily: fontBody, color: C.text }} onClick={() => onClose?.()}>
       <div ref={panelRef} tabIndex={-1}
         className={`absolute inset-y-0 right-0 w-full ${maxW} h-full shadow-2xl overflow-hidden flex flex-col outline-none`}
         style={{ background: C.white, borderLeft: `1px solid ${GLASS.border}` }}
@@ -3376,23 +3368,12 @@ function SidePanel({ title, subtitle, icon: Icon, onClose, children, tone = 'pri
             <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 16, color: C.text }}>{title}</div>
             {subtitle && <div className="mt-0.5" style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.45 }}>{subtitle}</div>}
           </div>
-          {/* disabled also drops it from the focus-trap selector (button:not([disabled])), so a
-              drawer that cannot be closed does not offer a dead tab stop. */}
-          <button onClick={close} aria-label={closeLabel} disabled={!canClose}
-            className="flex-shrink-0 p-1 rounded-lg transition hover:opacity-70 disabled:opacity-40" style={{ color: C.textMute }}>
+          <button onClick={() => onClose?.()} aria-label={closeLabel}
+            className="flex-shrink-0 p-1 rounded-lg transition hover:opacity-70" style={{ color: C.textMute }}>
             <X size={18} />
           </button>
         </div>
-        {/* overscroll-contain sits OUTSIDE bodyClass on purpose: a consumer overriding the
-            padding must not be able to switch off scroll containment. */}
-        <div className={`${bodyClass} overflow-y-auto overscroll-contain flex-1`}>{children}</div>
-        {footer && (
-          // flex-shrink-0: flex items shrink by default, so a tall footer (error alert + buttons)
-          // would compress instead of shortening the body. SHEEN + borderTop mirror the header.
-          <div className="px-6 py-4 flex-shrink-0" style={{ background: SHEEN, borderTop: `1px solid ${GLASS.borderSoft}` }}>
-            {footer}
-          </div>
-        )}
+        <div className={`${bodyClass} overflow-y-auto flex-1`}>{children}</div>
       </div>
     </div>
     </OverlayPortal>
@@ -11469,13 +11450,6 @@ function CourseProgram({
   const [previewUrl, setPreviewUrl] = useState(null);        // local object URL while authoring
   const [metaBusy, setMetaBusy] = useState(false);           // saving course details / toggling publish
   const [structBusy, setStructBusy] = useState(false);       // adding a module or lesson
-  // ── Errors raised from inside the lesson drawer ───────────────────────────────
-  // The drawer covers the page with a scrim, so the page-level `err` banner — which renders in
-  // the course canvas underneath — is invisible while it is open. Anything the drawer can raise
-  // therefore gets its own state and its own in-drawer alert: `replayErr` is field-level (wired
-  // to the replay input via aria-describedby), `lessonErr` is form-level and renders in the
-  // drawer footer beside Save. `err` stays the course canvas's banner.
-  const [lessonErr, setLessonErr] = useState('');
   // Field-level error for the replay link. Deliberately NOT the shared `err`: the lesson
   // editor is a fixed z-50 overlay rendered after the page error banner, so anything
   // setErr() raises from inside it sits behind the scrim.
@@ -11664,10 +11638,7 @@ function CourseProgram({
   };
   const clearLessonDraft = () => course?.id && clearStoredValue(lessonEditorDraftKey(course.id));
   const closeLessonEditor = () => {
-    // Never close mid-flight. Saving: the result would land on a drawer that no longer exists.
-    // Uploading: the completion handler would write into a draft we just nulled — see the null
-    // guard in uploadVideo, which is the invariant this merely makes unreachable from the UI.
-    if (savingLesson || uploading) return;
+    if (savingLesson) return;
     if (lessonDraftDirty && !window.confirm('Discard unsaved lesson changes?')) return;
     clearLessonDraft();
     if (previewUrl) { URL.revokeObjectURL(previewUrl); setPreviewUrl(null); }
@@ -11703,8 +11674,6 @@ function CourseProgram({
   // and the editor is the one place showing nothing wrong. Keyed on the lesson id, not the
   // field value, so this seeds once per lesson and never flashes while someone is typing.
   useEffect(() => {
-    // The form-level error is per-attempt, so it always clears here.
-    setLessonErr('');
     const stored = parseReplayUrl(editingLesson?.zoom_replay_url);
     setReplayErr(stored.kind === 'invalid' ? stored.message : '');
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -11899,16 +11868,13 @@ function CourseProgram({
 
   async function uploadVideo(file) {
     if (!file || !course) return;
-    // Every failure below is raised from inside the drawer, so it goes to lessonErr rather
-    // than the page banner the drawer covers. Cleared up front so a retry shows no stale text.
-    setLessonErr('');
     const MAX_MB = 50;
-    if (!/^video\//i.test(file.type)) { setLessonErr('Please choose a video file (MP4, MOV, WebM…), or paste a YouTube/Vimeo link instead.'); return; }
+    if (!/^video\//i.test(file.type)) { setErr('Please choose a video file (MP4, MOV, WebM…), or paste a YouTube/Vimeo link instead.'); return; }
     if (file.size > MAX_MB * 1024 * 1024) {
-      setLessonErr(`That video is ${(file.size / 1024 / 1024).toFixed(0)} MB — the upload limit is ${MAX_MB} MB. Compress it, or host it on YouTube/Vimeo and paste the link.`);
+      setErr(`That video is ${(file.size / 1024 / 1024).toFixed(0)} MB — the upload limit is ${MAX_MB} MB. Compress it, or host it on YouTube/Vimeo and paste the link.`);
       return;
     }
-    setUploading(true);
+    setUploading(true); setErr('');
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     setPreviewUrl(URL.createObjectURL(file));
     try {
@@ -11918,14 +11884,10 @@ function CourseProgram({
       const { error } = await supabase.storage.from(LESSON_VIDEO_BUCKET)
         .upload(path, file, { upsert: false, contentType: file.type || 'video/mp4' });
       if (error) throw error;
-      // ★ Bail if the drawer closed while this upload was in flight. Spreading a null draft
-      // ({ ...null }) yields a truthy, id-less object, which would re-satisfy the
-      // `editingLesson &&` render guard and reopen the drawer on a phantom lesson — and a
-      // later Save would run .eq('id', undefined). Returning `d` schedules no state update.
-      setEditingLesson(d => (d ? { ...d, storage_path: path, video_provider: 'upload', video_url: '' } : d));
+      setEditingLesson(d => ({ ...d, storage_path: path, video_provider: 'upload', video_url: '' }));
     } catch (e) {
       logDbError('[CourseProgram] video upload', e, { courseId: course.id });
-      setLessonErr(describeDbError(e, 'Video upload failed — check the file size and that you have admin access.'));
+      setErr(describeDbError(e, 'Video upload failed — check the file size and that you have admin access.'));
     } finally {
       setUploading(false);
     }
@@ -11933,9 +11895,6 @@ function CourseProgram({
 
   async function saveLesson() {
     if (!editingLesson) return;
-    // Cleared first: the gates below return early, and a stale message would otherwise sit
-    // alongside the new one, contradicting it.
-    setLessonErr('');
     const d = editingLesson;
     const isVideo = d.type === 'video';
     const isUpload = isVideo && d.video_provider === 'upload' && !!d.storage_path;
@@ -11945,9 +11904,9 @@ function CourseProgram({
     // ★ A replay link deliberately does NOT satisfy this gate: it renders below the player
     // slot, so a replay-only lesson would still show students an empty video.
     if (isVideo && !isUpload && !hasLink && !hasText) {
-      setLessonErr('Add a video link, upload a file, or write some lesson notes before saving.'); return;
+      setErr('Add a video link, upload a file, or write some lesson notes before saving.'); return;
     }
-    if (!isVideo && !hasText) { setLessonErr('Add some lesson content before saving.'); return; }
+    if (!isVideo && !hasText) { setErr('Add some lesson content before saving.'); return; }
     // Supplementary replay link. Returning here leaves the modal open with the draft intact,
     // because clearLessonDraft()/setEditingLesson(null) are further down.
     const replay = parseReplayUrl(d.zoom_replay_url);
@@ -11962,7 +11921,7 @@ function CourseProgram({
       return;
     }
     setReplayErr('');
-    setSavingLesson(true);
+    setSavingLesson(true); setErr('');
     try {
       const oldPath = allLessons.find(x => x.id === d.id)?.storage_path; // for cleanup if the video changed
       const payload = {
@@ -11992,7 +11951,7 @@ function CourseProgram({
       // reaches the trainer. The #27 trigger already marked the source stale, so
       // retrieval stays correct even if this fire-and-forget kick never lands.
       if (isAdmin && aiTrainerEnabled && course?.id) kickTrainerSync(course.id);
-    } catch (e) { logDbError('[CourseProgram] saveLesson', e, { courseId: course?.id, lessonId: d.id }); setLessonErr(describeDbError(e, 'Could not save lesson.')); }
+    } catch (e) { logDbError('[CourseProgram] saveLesson', e, { courseId: course?.id, lessonId: d.id }); setErr(describeDbError(e, 'Could not save lesson.')); }
     finally { setSavingLesson(false); }
   }
 
@@ -12251,12 +12210,12 @@ function CourseProgram({
           <div key={m.id} className="bg-white rounded-2xl border border-slate-200 p-4">
             <div className="flex items-center gap-2">
               <span className="text-[11px] font-bold tracking-wider uppercase text-blue-700 flex-shrink-0">Module {mi + 1}</span>
-              <input defaultValue={m.title} onBlur={e => renameModule(m, e.target.value)} aria-label={`Module ${mi + 1} title`}
+              <input defaultValue={m.title} onBlur={e => renameModule(m, e.target.value)}
                 className="flex-1 min-w-0 px-2 py-1.5 rounded-lg border border-transparent hover:border-slate-200 focus:border-slate-300 focus:outline-none font-bold text-[15px]"
                 style={{ fontFamily: fontDisplay, color: NAVY }} />
-              <button onClick={() => moveModule(mi, -1)} title={`Move module ${mi + 1} up`} aria-label={`Move module ${mi + 1} up`} disabled={mi === 0} className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 disabled:opacity-30"><ChevronUp size={16} /></button>
-              <button onClick={() => moveModule(mi, 1)} title={`Move module ${mi + 1} down`} aria-label={`Move module ${mi + 1} down`} disabled={mi === modules.length - 1} className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 disabled:opacity-30"><ChevronDown size={16} /></button>
-              <button onClick={() => deleteModule(m)} title={`Delete module ${mi + 1}: ${m.title || 'untitled'}`} aria-label={`Delete module ${mi + 1}: ${m.title || 'untitled'}`} className="p-1.5 rounded-lg text-red-400 hover:bg-red-50"><Trash2 size={16} /></button>
+              <button onClick={() => moveModule(mi, -1)} disabled={mi === 0} className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 disabled:opacity-30"><ChevronUp size={16} /></button>
+              <button onClick={() => moveModule(mi, 1)} disabled={mi === modules.length - 1} className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 disabled:opacity-30"><ChevronDown size={16} /></button>
+              <button onClick={() => deleteModule(m)} className="p-1.5 rounded-lg text-red-400 hover:bg-red-50"><Trash2 size={16} /></button>
             </div>
             <div className="mt-2 space-y-1.5">
               {(m.lessons || []).map((l, li) => (
@@ -12264,10 +12223,10 @@ function CourseProgram({
                   {l.type === 'video' ? <Play size={14} className="text-slate-400 flex-shrink-0" /> : <FileText size={14} className="text-slate-400 flex-shrink-0" />}
                   <span className="flex-1 min-w-0 text-sm font-medium text-slate-700 truncate">{l.title}</span>
                   {l.video_provider && <span className="text-[10px] uppercase font-bold text-slate-400 flex-shrink-0">{l.video_provider}</span>}
-                  <button onClick={() => moveLesson(m, li, -1)} title={`Move lesson up: ${l.title || 'untitled'}`} aria-label={`Move lesson up: ${l.title || 'untitled'}`} disabled={li === 0} className="p-1 rounded text-slate-400 hover:bg-slate-200 disabled:opacity-30"><ChevronUp size={14} /></button>
-                  <button onClick={() => moveLesson(m, li, 1)} title={`Move lesson down: ${l.title || 'untitled'}`} aria-label={`Move lesson down: ${l.title || 'untitled'}`} disabled={li === (m.lessons.length - 1)} className="p-1 rounded text-slate-400 hover:bg-slate-200 disabled:opacity-30"><ChevronDown size={14} /></button>
-                  <button onClick={() => setEditingLesson({ ...l })} title={`Edit lesson: ${l.title || 'untitled'}`} aria-label={`Edit lesson: ${l.title || 'untitled'}`} className="p-1 rounded text-blue-500 hover:bg-blue-50"><Edit3 size={14} /></button>
-                  <button onClick={() => deleteLesson(l)} title={`Delete lesson: ${l.title || 'untitled'}`} aria-label={`Delete lesson: ${l.title || 'untitled'}`} className="p-1 rounded text-red-400 hover:bg-red-50"><Trash2 size={14} /></button>
+                  <button onClick={() => moveLesson(m, li, -1)} disabled={li === 0} className="p-1 rounded text-slate-400 hover:bg-slate-200 disabled:opacity-30"><ChevronUp size={14} /></button>
+                  <button onClick={() => moveLesson(m, li, 1)} disabled={li === (m.lessons.length - 1)} className="p-1 rounded text-slate-400 hover:bg-slate-200 disabled:opacity-30"><ChevronDown size={14} /></button>
+                  <button onClick={() => setEditingLesson({ ...l })} className="p-1 rounded text-blue-500 hover:bg-blue-50"><Edit3 size={14} /></button>
+                  <button onClick={() => deleteLesson(l)} className="p-1 rounded text-red-400 hover:bg-red-50"><Trash2 size={14} /></button>
                 </div>
               ))}
               <button onClick={() => addLesson(m)} disabled={structBusy} className="mt-1 text-sm font-semibold text-blue-600 inline-flex items-center gap-1.5 px-3 py-1.5 hover:bg-blue-50 rounded-lg disabled:opacity-50"><Plus size={15} /> Add lesson</button>
@@ -12282,17 +12241,6 @@ function CourseProgram({
     );
   }
 
-  // ★ A METHOD, called as renderLessonEditor() — never an inline component. Declaring a component
-  // inside CourseProgram gives it a fresh type identity on every render, so React would unmount and
-  // remount the whole drawer on each keystroke: caret and focus lost in every field, and
-  // SidePanel's focus-restore effect firing continuously.
-  //
-  // The shell is SidePanel, which portals to document.body. It MUST be portaled: the active
-  // TabPanel carries .fade-in, whose keyframes end on transform: translateY(0) with
-  // animation-fill-mode: forwards — a permanent non-`none` transform, which makes that panel the
-  // containing block for every position:fixed descendant. This editor used to be a hand-rolled
-  // `fixed inset-0` overlay and therefore anchored to the course canvas (many viewports tall)
-  // rather than the window: it opened off-screen as soon as the builder was scrolled.
   function renderLessonEditor() {
     const d = editingLesson;
     const detected = d.type === 'video' && d.video_provider !== 'upload' ? parseVideoUrl(d.video_url).provider : null;
@@ -12301,182 +12249,137 @@ function CourseProgram({
     // saveLesson omits the column on a pre-#37b database, so offering the field there would
     // accept a link, confirm "Detected: Zoom", and then silently discard it.
     const preReplayDb = lessonRowsArePreReplay(allLessons);
-    // One busy flag, so the shell's close gate and the footer buttons can never disagree.
-    const lessonBusy = savingLesson || uploading;
-    const mIdx = modules.findIndex(m => m.id === d.module_id);
-    const moduleLabel = mIdx >= 0 ? `Module ${mIdx + 1} · ${modules[mIdx].title || 'Untitled module'}` : null;
-    const drawerSubtitle = [course?.title, moduleLabel].filter(Boolean).join(' — ') || undefined;
     return (
-      <SidePanel
-        title="Edit lesson"
-        subtitle={drawerSubtitle}
-        icon={Edit3}
-        maxW="sm:max-w-xl lg:max-w-2xl"
-        canClose={!lessonBusy}
-        onClose={closeLessonEditor}
-        closeLabel="Close lesson editor"
-        footer={(
-          <>
-            {/* The alert lives in the footer, not the top of the body: a save is usually attempted
-                from the bottom of a long form, and the footer is pinned — so the message always
-                lands beside the button that produced it, with no scroll plumbing. */}
-            {lessonErr && (
-              <div role="alert" className="mb-3 flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs"
-                style={{ background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)', color: 'var(--status-danger-fg)' }}>
-                <AlertTriangle size={14} aria-hidden="true" className="flex-shrink-0 mt-px" />
-                <span className="flex-1">{lessonErr}</span>
-                <button type="button" onClick={() => setLessonErr('')} aria-label="Dismiss error"
-                  className="flex-shrink-0 hover:opacity-70"><X size={13} /></button>
-              </div>
-            )}
-            <div className="flex items-center justify-end gap-2.5">
-              {lessonDraftDirty && !lessonBusy && (
-                <span className="mr-auto text-[11px]" style={{ color: C.textSoft }}>Unsaved changes</span>
-              )}
-              <button type="button" onClick={closeLessonEditor} disabled={lessonBusy}
-                className="px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 border border-slate-200 disabled:opacity-60">Cancel</button>
-              <button type="button" onClick={saveLesson} disabled={lessonBusy}
-                className="px-5 py-2 rounded-xl text-white text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-60"
-                style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
-                {lessonBusy ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />} {uploading ? 'Uploading…' : 'Save lesson'}
-              </button>
-            </div>
-          </>
-        )}>
-        <SettingsSectionLabel first>Lesson details</SettingsSectionLabel>
-        <div className="space-y-3">
-          <label className="block">
-            <span className="text-xs font-semibold text-slate-500">Lesson title</span>
-            <input value={d.title || ''} onChange={e => setEditingLesson(s => ({ ...s, title: e.target.value }))}
-              className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
-          </label>
-          <div className="flex gap-2">
-            {['video', 'text'].map(t => (
-              <button key={t} type="button" onClick={() => setEditingLesson(s => ({ ...s, type: t }))}
-                aria-pressed={d.type === t}
-                className="px-4 py-2 rounded-xl text-sm font-semibold capitalize inline-flex items-center gap-2"
-                style={d.type === t ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff' } : { background: 'var(--wash-strong)', color: C.textSoft }}>
-                {t === 'video' ? <Play size={14} /> : <FileText size={14} />} {t}
-              </button>
-            ))}
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(15,18,23,0.45)' }} onClick={closeLessonEditor}>
+        <div className="bg-white rounded-2xl w-full max-w-xl max-h-[88vh] overflow-y-auto shadow-2xl" onClick={e => e.stopPropagation()}>
+          <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between sticky top-0 bg-white">
+            <div style={{ fontFamily: fontDisplay, color: NAVY }} className="font-bold">Edit lesson</div>
+            <button onClick={closeLessonEditor} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
           </div>
-        </div>
+          <div className="p-5 space-y-4">
+            <label className="block">
+              <span className="text-xs font-semibold text-slate-500">Lesson title</span>
+              <input value={d.title || ''} onChange={e => setEditingLesson(s => ({ ...s, title: e.target.value }))}
+                className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+            </label>
+            <div className="flex gap-2">
+              {['video', 'text'].map(t => (
+                <button key={t} onClick={() => setEditingLesson(s => ({ ...s, type: t }))}
+                  className="px-4 py-2 rounded-xl text-sm font-semibold capitalize inline-flex items-center gap-2"
+                  style={d.type === t ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff' } : { background: 'var(--wash-strong)', color: C.textSoft }}>
+                  {t === 'video' ? <Play size={14} /> : <FileText size={14} />} {t}
+                </button>
+              ))}
+            </div>
 
-        {/* Gated by the same condition that already gated these controls, so a text lesson never
-            renders an empty "Primary content" heading. */}
-        {d.type === 'video' && (
-          <>
-            <SettingsSectionLabel>Primary content</SettingsSectionLabel>
-            <div className="space-y-3">
-              <label className="block">
-                <span className="text-xs font-semibold text-slate-500">Video link (YouTube, Vimeo, or MP4 URL)</span>
-                <input value={d.video_provider === 'upload' ? '' : (d.video_url || '')} placeholder="https://youtube.com/watch?v=…"
-                  onChange={e => setEditingLesson(s => ({ ...s, video_url: e.target.value, video_provider: parseVideoUrl(e.target.value).provider, storage_path: null }))}
-                  className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
-                {detected && d.video_url && <span className="text-[11px] text-slate-400 mt-1 inline-block">Detected: {detected}</span>}
-              </label>
-              <div className="flex items-center gap-2 text-xs text-slate-400"><div className="flex-1 h-px bg-slate-200" /> or upload a file <div className="flex-1 h-px bg-slate-200" /></div>
-              <div className="flex items-center">
-                {/* sr-only rather than `hidden`: display:none takes the input out of the tab order,
-                    which made this control mouse-only. focus-within surfaces the ring on the label. */}
-                <label className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border border-slate-200 text-sm font-semibold text-slate-600 cursor-pointer hover:bg-slate-50 focus-within:ring-2 focus-within:ring-[color:var(--focus-ring)]">
-                  <Upload size={15} /> {uploading ? 'Uploading…' : 'Choose video file'}
-                  <input type="file" accept="video/*" className="sr-only" disabled={uploading}
-                    onChange={e => { const f = e.target.files?.[0]; if (f) uploadVideo(f); e.target.value = ''; }} />
+            {d.type === 'video' && (
+              <>
+                <label className="block">
+                  <span className="text-xs font-semibold text-slate-500">Video link (YouTube, Vimeo, or MP4 URL)</span>
+                  <input value={d.video_provider === 'upload' ? '' : (d.video_url || '')} placeholder="https://youtube.com/watch?v=…"
+                    onChange={e => setEditingLesson(s => ({ ...s, video_url: e.target.value, video_provider: parseVideoUrl(e.target.value).provider, storage_path: null }))}
+                    className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+                  {detected && d.video_url && <span className="text-[11px] text-slate-400 mt-1 inline-block">Detected: {detected}</span>}
                 </label>
-                {uploading && <Loader2 size={16} className="animate-spin ml-2 text-blue-500" />}
-                {d.video_provider === 'upload' && d.storage_path && !uploading && <span className="text-[11px] text-green-600 ml-2 inline-flex items-center gap-1"><Check size={12} /> Uploaded</span>}
-              </div>
-              {/* Bounded by max-WIDTH, never max-height. renderVideo's YouTube/Vimeo branch is a
-                  56.25% padding-bottom aspect box whose height derives from its width, so a height
-                  clamp would do nothing there — and combined with this wrapper's overflow-hidden it
-                  would crop the player's control bar. Width governs the aspect box and <video> alike. */}
-              {(previewUrl || (d.video_provider && (d.video_url || d.storage_path))) && (
-                <div className="rounded-xl overflow-hidden max-w-md">
-                  {previewUrl
-                    ? <video controls src={previewUrl} className="w-full rounded-xl bg-black" style={{ maxHeight: 300 }} />
-                    : renderVideo(d)}
+                <div className="flex items-center gap-2 text-xs text-slate-400"><div className="flex-1 h-px bg-slate-200" /> or upload a file <div className="flex-1 h-px bg-slate-200" /></div>
+                <div className="flex items-center">
+                  <label className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border border-slate-200 text-sm font-semibold text-slate-600 cursor-pointer hover:bg-slate-50">
+                    <Upload size={15} /> {uploading ? 'Uploading…' : 'Choose video file'}
+                    <input type="file" accept="video/*" className="hidden" disabled={uploading}
+                      onChange={e => { const f = e.target.files?.[0]; if (f) uploadVideo(f); e.target.value = ''; }} />
+                  </label>
+                  {uploading && <Loader2 size={16} className="animate-spin ml-2 text-blue-500" />}
+                  {d.video_provider === 'upload' && d.storage_path && !uploading && <span className="text-[11px] text-green-600 ml-2 inline-flex items-center gap-1"><Check size={12} /> Uploaded</span>}
                 </div>
-              )}
-            </div>
-          </>
-        )}
+                {(previewUrl || (d.video_provider && (d.video_url || d.storage_path))) && (
+                  <div className="rounded-xl overflow-hidden">
+                    {previewUrl
+                      ? <video controls src={previewUrl} className="w-full rounded-xl bg-black" style={{ maxHeight: 220 }} />
+                      : renderVideo(d)}
+                  </div>
+                )}
+              </>
+            )}
 
-        {/* Heading flips for a text lesson: its main body is content, not "notes". */}
-        <SettingsSectionLabel>{d.type === 'video' ? 'Notes & metadata' : 'Content & metadata'}</SettingsSectionLabel>
-        <div className="space-y-3">
-          <label className="block">
-            <span className="text-xs font-semibold text-slate-500">{d.type === 'video' ? 'Lesson notes (optional)' : 'Lesson content'}</span>
-            <textarea value={d.text_content || ''} onChange={e => setEditingLesson(s => ({ ...s, text_content: e.target.value }))} rows={d.type === 'text' ? 6 : 3}
-              className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
-          </label>
-          <label className="block">
-            <span className="text-xs font-semibold text-slate-500">Duration label (optional, e.g. 8:32)</span>
-            <input value={d.duration_label || ''} onChange={e => setEditingLesson(s => ({ ...s, duration_label: e.target.value }))}
-              className="mt-1 w-40 px-3 py-2 rounded-lg border border-slate-200 text-sm" />
-          </label>
-        </div>
+            <label className="block">
+              <span className="text-xs font-semibold text-slate-500">{d.type === 'video' ? 'Lesson notes (optional)' : 'Lesson content'}</span>
+              <textarea value={d.text_content || ''} onChange={e => setEditingLesson(s => ({ ...s, text_content: e.target.value }))} rows={d.type === 'text' ? 6 : 3}
+                className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+            </label>
+            <label className="block">
+              <span className="text-xs font-semibold text-slate-500">Duration label (optional, e.g. 8:32)</span>
+              <input value={d.duration_label || ''} onChange={e => setEditingLesson(s => ({ ...s, duration_label: e.target.value }))}
+                className="mt-1 w-40 px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+            </label>
 
-        {/* Supplementary replay link (#37b). Separate from the video controls above on
-            purpose: it never replaces the lesson's own content. Validated on blur and
-            again on save — a draft restored from window.storage is never blurred, so
-            blur alone would let a bad value through. */}
-        <SettingsSectionLabel>Zoom Live Replay</SettingsSectionLabel>
-        <div>
-          {preReplayDb ? (
-            <div className="flex items-start gap-2.5 px-3.5 py-3 rounded-xl"
-              style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)' }}>
-              <AlertTriangle size={15} aria-hidden="true" className="flex-shrink-0 mt-0.5" style={{ color: 'var(--status-warn-fg)' }} />
-              <div className="min-w-0">
-                <div className="text-xs font-bold" style={{ color: 'var(--status-warn-fg)' }}>Zoom Live Replay is unavailable on this database</div>
-                <div className="mt-0.5 text-[11px]" style={{ color: C.textSoft }}>
-                  Migration #37b hasn’t been run here, so <code style={{ fontFamily: fontMono }}>course_lessons.zoom_replay_url</code> doesn’t
-                  exist. Everything else saves normally. Run <code style={{ fontFamily: fontMono }}>db/2026-08-05-lesson-zoom-replay.sql</code>,
-                  or <code style={{ fontFamily: fontMono }}>npm run db:audit</code> to see what else is missing.
-                </div>
-              </div>
-            </div>
-          ) : (
-            <>
-              <label className="block">
-                <span className="text-xs font-semibold text-slate-500 inline-flex items-center gap-1.5">
-                  <Video size={13} aria-hidden="true" /> Zoom Live Replay link (optional)
-                </span>
-                <input ref={replayInputRef} type="url" inputMode="url" value={d.zoom_replay_url || ''}
-                  placeholder="https://us02web.zoom.us/rec/share/…"
-                  onChange={e => { if (replayErr) setReplayErr(''); setEditingLesson(s => ({ ...s, zoom_replay_url: e.target.value })); }}
-                  onBlur={e => { const v = parseReplayUrl(e.target.value); setReplayErr(v.kind === 'invalid' ? v.message : ''); }}
-                  aria-invalid={replayErr ? true : undefined}
-                  aria-describedby={replayErr ? 'lesson-replay-err' : 'lesson-replay-hint'}
-                  className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm"
-                  style={replayErr ? { borderColor: 'var(--status-danger-bd)' } : undefined} />
-              </label>
-              {replayErr ? (
-                <div id="lesson-replay-err" role="alert" className="mt-1.5 flex items-start gap-1.5 text-[11px]" style={{ color: 'var(--status-danger-fg)' }}>
-                  <AlertTriangle size={12} aria-hidden="true" className="flex-shrink-0 mt-px" /> {replayErr}
-                </div>
-              ) : replayOk ? (
-                <div id="lesson-replay-hint" className="mt-1.5 flex items-center gap-2 flex-wrap text-[11px]" style={{ color: C.textSoft }}>
-                  <span>Detected: <strong style={{ color: C.text }}>{replay.kind === 'zoom' ? 'Zoom' : 'External link'}</strong> · {replay.host}</span>
-                  {/* Never opened automatically — the admin chooses to test it. */}
-                  <a href={replay.url} target="_blank" rel="noopener noreferrer"
-                    className="inline-flex items-center gap-1 font-semibold" style={{ color: C.primary }}>
-                    Test replay link <ExternalLink size={11} aria-hidden="true" />
-                  </a>
+            {/* Supplementary replay link (#37b). Separate from the video controls above on
+                purpose: it never replaces the lesson's own content. Validated on blur and
+                again on save — a draft restored from window.storage is never blurred, so
+                blur alone would let a bad value through. */}
+            <div className="pt-3 border-t border-slate-100">
+              {preReplayDb ? (
+                <div className="flex items-start gap-2.5 px-3.5 py-3 rounded-xl"
+                  style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)' }}>
+                  <AlertTriangle size={15} aria-hidden="true" className="flex-shrink-0 mt-0.5" style={{ color: 'var(--status-warn-fg)' }} />
+                  <div className="min-w-0">
+                    <div className="text-xs font-bold" style={{ color: 'var(--status-warn-fg)' }}>Zoom Live Replay is unavailable on this database</div>
+                    <div className="mt-0.5 text-[11px]" style={{ color: C.textSoft }}>
+                      Migration #37b hasn’t been run here, so <code style={{ fontFamily: fontMono }}>course_lessons.zoom_replay_url</code> doesn’t
+                      exist. Everything else saves normally. Run <code style={{ fontFamily: fontMono }}>db/2026-08-05-lesson-zoom-replay.sql</code>,
+                      or <code style={{ fontFamily: fontMono }}>npm run db:audit</code> to see what else is missing.
+                    </div>
+                  </div>
                 </div>
               ) : (
-                <div id="lesson-replay-hint" className="mt-1.5 text-[11px] text-slate-400">
-                  Paste the complete Zoom recording share link. Students open it in a new tab — Zoom
-                  privacy and passcode settings still apply. It appears below the lesson and above
-                  “Mark complete”, never replaces the video, and is not tracked for progress.
-                  Links on {ZOOM_HOST_SUFFIXES.join(', ')} are labelled a Zoom replay; any other
-                  https link is shown as a session replay.
-                </div>
+                <>
+                  <label className="block">
+                    <span className="text-xs font-semibold text-slate-500 inline-flex items-center gap-1.5">
+                      <Video size={13} aria-hidden="true" /> Zoom Live Replay link (optional)
+                    </span>
+                    <input ref={replayInputRef} type="url" inputMode="url" value={d.zoom_replay_url || ''}
+                      placeholder="https://us02web.zoom.us/rec/share/…"
+                      onChange={e => { if (replayErr) setReplayErr(''); setEditingLesson(s => ({ ...s, zoom_replay_url: e.target.value })); }}
+                      onBlur={e => { const v = parseReplayUrl(e.target.value); setReplayErr(v.kind === 'invalid' ? v.message : ''); }}
+                      aria-invalid={replayErr ? true : undefined}
+                      aria-describedby={replayErr ? 'lesson-replay-err' : 'lesson-replay-hint'}
+                      className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm"
+                      style={replayErr ? { borderColor: 'var(--status-danger-bd)' } : undefined} />
+                  </label>
+                  {replayErr ? (
+                    <div id="lesson-replay-err" role="alert" className="mt-1.5 flex items-start gap-1.5 text-[11px]" style={{ color: 'var(--status-danger-fg)' }}>
+                      <AlertTriangle size={12} aria-hidden="true" className="flex-shrink-0 mt-px" /> {replayErr}
+                    </div>
+                  ) : replayOk ? (
+                    <div id="lesson-replay-hint" className="mt-1.5 flex items-center gap-2 flex-wrap text-[11px]" style={{ color: C.textSoft }}>
+                      <span>Detected: <strong style={{ color: C.text }}>{replay.kind === 'zoom' ? 'Zoom' : 'External link'}</strong> · {replay.host}</span>
+                      {/* Never opened automatically — the admin chooses to test it. */}
+                      <a href={replay.url} target="_blank" rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 font-semibold" style={{ color: C.primary }}>
+                        Test replay link <ExternalLink size={11} aria-hidden="true" />
+                      </a>
+                    </div>
+                  ) : (
+                    <div id="lesson-replay-hint" className="mt-1.5 text-[11px] text-slate-400">
+                      Paste the complete Zoom recording share link. Students open it in a new tab — Zoom
+                      privacy and passcode settings still apply. It appears below the lesson and above
+                      “Mark complete”, never replaces the video, and is not tracked for progress.
+                      Links on {ZOOM_HOST_SUFFIXES.join(', ')} are labelled a Zoom replay; any other
+                      https link is shown as a session replay.
+                    </div>
+                  )}
+                </>
               )}
-            </>
-          )}
+            </div>
+          </div>
+          <div className="px-5 py-4 border-t border-slate-100 flex justify-end gap-2 sticky bottom-0 bg-white">
+            <button onClick={closeLessonEditor} disabled={savingLesson} className="px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 border border-slate-200">Cancel</button>
+            <button onClick={saveLesson} disabled={savingLesson} className="px-5 py-2 rounded-xl text-white text-sm font-semibold inline-flex items-center gap-2"
+              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+              {savingLesson ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />} Save lesson
+            </button>
+          </div>
         </div>
-      </SidePanel>
+      </div>
     );
   }
 
