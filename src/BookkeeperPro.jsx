@@ -11668,9 +11668,16 @@ function CourseProgram({
     window.storage.set(lessonEditorDraftKey(course.id), JSON.stringify(editingLesson)).catch(() => {});
   }, [course?.id, isAdmin, editingLesson]);
 
-  // Opening a different lesson (or closing the editor) must not inherit the last
-  // lesson's replay complaint.
-  useEffect(() => { setReplayErr(''); }, [editingLesson?.id]);
+  // Opening a different lesson (or closing the editor) must not inherit the last lesson's
+  // replay complaint — but a lesson whose STORED link is already invalid must say so on
+  // open, otherwise the learner-side warning tells an admin to "fix it in the lesson editor"
+  // and the editor is the one place showing nothing wrong. Keyed on the lesson id, not the
+  // field value, so this seeds once per lesson and never flashes while someone is typing.
+  useEffect(() => {
+    const stored = parseReplayUrl(editingLesson?.zoom_replay_url);
+    setReplayErr(stored.kind === 'invalid' ? stored.message : '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingLesson?.id]);
 
   useEffect(() => {
     if (!hasUnsavedCourseWork) return;
