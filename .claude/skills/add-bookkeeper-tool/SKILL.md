@@ -35,15 +35,6 @@ function MyNewTool() {
 If it deals with money, reuse the currency helpers: `const { currency, fxRate, ... } = useCurrency()`
 (~L712) and render `<CurrencyToggle ... />` (~L748; see existing calculators).
 
-**Dialogs & drawers:** never hand-roll a `fixed inset-0` overlay inside a tool. A tool renders inside
-a keep-alive `TabPanel` whose `.fade-in` class leaves a permanent `transform`, which makes that panel
-the containing block for `position: fixed` — so a hand-rolled overlay anchors to your tool's canvas
-rather than the viewport and opens off-screen once the page is scrolled. Use the shared
-`AccountModal` (centered dialog) or `SidePanel` (right-side drawer, and the right choice for a long
-editing form); both already portal to `document.body` and handle focus, Escape and backdrop-close.
-Raise errors from inside a dialog into a dialog-local alert — a page-level banner sits behind the
-scrim. See the **Modals** section of bookkeeper-conventions.
-
 **Auth & persistence:** the app is already behind a Supabase login gate, so a tool only ever renders
 for a signed-in user — no auth checks needed inside it. If the tool saves data, just use
 `window.storage` with plain keys (it auto-namespaces per user — see bookkeeper-conventions) and add any

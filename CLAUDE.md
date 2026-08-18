@@ -795,24 +795,7 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   for a **right-side drawer** use the sibling `SidePanel` shell (same a11y idiom + portal:
   focus move-in/restore, Escape, Tab focus-trap, role/aria-modal, backdrop-close;
   `absolute inset-y-0 right-0 w-full` + a `maxW` prop, default `sm:max-w-md`, full-width sheet on
-  mobile). It also takes **`canClose`** (the same in-flight gate as `AccountModal` — blocks Escape,
-  backdrop and the X, which is additionally `disabled` so it leaves the focus trap) and **`footer`**
-  (an action bar pinned *below* the scrolling body). Header, body and footer are three rows of one
-  flex column, so **a drawer never needs `sticky top-0`/`sticky bottom-0`** — the body alone is
-  `flex-1 overflow-y-auto overscroll-contain`. `SidePanel` is the preferred surface for a **long
-  editing form**. Consumers: `AccountSettingsPanel` (`sm:max-w-lg`) and the **course lesson editor**
-  (`CourseProgram.renderLessonEditor`, `sm:max-w-xl lg:max-w-2xl`, Cancel/Save in `footer`,
-  `canClose={!savingLesson && !uploading}`). ★ That editor was a hand-rolled `fixed inset-0` overlay
-  until 2026-08-18 and it anchored to the **course canvas, not the viewport**: `.fade-in`
-  (index.css:471) animates `transform` with `forwards`, so the active `TabPanel` keeps a non-`none`
-  transform permanently and is therefore the containing block for every `position:fixed` descendant.
-  **Any fixed overlay rendered inside a tab MUST go through `OverlayPortal`** — i.e. through
-  `AccountModal` or `SidePanel`. ★ A dialog also needs a **dialog-local** error surface: a page-level
-  banner renders in the canvas *behind* the scrim (`CourseProgram` keeps `lessonErr` + `replayErr`
-  for the drawer and `err` for the course page). ★ **No JS scroll lock is needed** behind a portaled
-  dialog — its DOM ancestors are body/html, which never scroll (the app root is
-  `h-screen … overflow-hidden`), and scroll chaining follows the DOM ancestor chain, not visual
-  stacking; `overscroll-contain` on the body is belt-and-braces. Both admin screens
+  mobile), e.g. `AccountSettingsPanel` (`sm:max-w-lg`). Both admin screens
   (`AccessRequests` + `AdminEnrollments`) are built from the shared module-scope kit right above them:
   `AdminNotice` (status-token banners), `AdminFilterChip`/`AdminFilterCaption` (labeled filter rows),
   `AdminListSkeleton` (first-load skeleton; refresh keeps the list), `AdminUserCell`

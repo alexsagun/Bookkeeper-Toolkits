@@ -42,10 +42,7 @@ Inline styles bypass the dark compat layer, so shell surfaces MUST use these var
 **Modals:** never hand-roll a `fixed inset-0` + `bg-white` overlay — use the shared `AccountModal`
 (dialog roles, Escape, backdrop-close, focus trap/restore; props `tone` 'primary'|'ok'|'danger',
 `canClose` to block closing mid-request, `headerAction`, `bodyClass`/`bodyStyle`, `maxW`), or the
-sibling `SidePanel` for a right-side drawer — `maxW` (default `sm:max-w-md`), plus `canClose` and
-`footer`, an action bar pinned under a `flex-1 overflow-y-auto overscroll-contain` body. Header,
-body and footer are three rows of one flex column, so a drawer never hand-rolls `sticky top-0` /
-`sticky bottom-0`; `SidePanel` is the preferred surface for a **long editing form**. Both shells
+sibling `SidePanel` for a right-side drawer (`maxW` prop, default `sm:max-w-md`). Both shells
 already render through `OverlayPortal` (`createPortal` → `document.body`, with a `[hidden]`-ancestor
 guard so a modal inside a hidden keep-alive tab stays hidden) — don't re-wrap them in a portal, and
 never render a hand-rolled fixed overlay as a *direct child* of a `gh-app-bg` element: the
@@ -55,17 +52,6 @@ either — `.gh-app-bg` sets `position: relative`, which out-cascades `.fixed` (
 `.gh-app-bg.fixed` carve-out guards it, but layer them: fixed wrapper > mesh-painting child). Admin
 lists reuse `AdminNotice`/`AdminFilterChip`/`AdminFilterCaption`/`AdminListSkeleton`/`AdminUserCell`
 so both admin screens stay one visual surface.
-★ Why the portal is non-negotiable *inside a tool*: `.fade-in` (index.css:471) ends on
-`transform: translateY(0)` with `animation-fill-mode: forwards`, so the active `TabPanel` carries a
-non-`none` transform permanently and becomes the containing block for every `position:fixed`
-descendant. A hand-rolled `fixed inset-0` overlay inside a tool therefore anchors to that tool's tall
-canvas rather than the viewport — it opens off-screen the moment the page is scrolled. That was the
-course lesson editor's bug (fixed 2026-08-18 by moving it onto `SidePanel`).
-★ Errors raised from inside a dialog need a **dialog-local** alert (`role="alert"` +
-`--status-danger-*`): a page-level banner renders behind the scrim where nobody can read it.
-★ You do **not** need a scroll lock behind a portaled dialog — its DOM ancestors are body/html, which
-never scroll (the app root is `h-screen … overflow-hidden`), and scroll chaining follows the DOM
-ancestor chain, not visual stacking.
 **Avatars:** every member/user avatar renders through the shared `MemberAvatar` primitive
 (beside the community block) with `resolveAvatarUrl(profile.avatar_url)` — an `<img>` from the
 public `avatars` bucket (or a legacy OAuth URL) with the initials-in-a-gradient-circle fallback.
