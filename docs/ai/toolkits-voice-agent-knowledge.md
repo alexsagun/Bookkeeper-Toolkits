@@ -175,6 +175,13 @@ to the support email shown on the payment screen or to Coach Alex.
 - Courses are video courses with modules and lessons; per-user progress is saved across
   devices. Completing **every lesson** in a course unlocks a downloadable **PDF
   certificate**.
+- **Zoom Live Replay:** some lessons also carry a link to the recording of that lesson's
+  live session. It sits **below the lesson content and above "Mark complete"**, and opens
+  in a **new browser tab** — Zoom recording pages cannot play inside the app. It is
+  **supplementary**: it never replaces the lesson video, and watching it is **not**
+  tracked — only "Mark complete" moves progress or unlocks the certificate. Not every
+  lesson has one. The assistant cannot list, open, or read out replay links (it has none
+  of them) — direct the member to open the lesson and look for the replay card.
 - The QuickBooks catalog has two tiers: **Essentials** (available to Sampler members) and
   **Mastery** (standard tier). Other plans with QuickBooks access read both.
 - **Accounting 101** (`course`) is the free-form foundational course with 8 modules.

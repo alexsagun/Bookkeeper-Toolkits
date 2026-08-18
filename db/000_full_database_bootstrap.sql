@@ -190,8 +190,9 @@ create table if not exists public.course_lessons (
   text_content   text,
   duration_label text,
   -- #37b, folded IN PLACE (db/2026-08-05-lesson-zoom-replay.sql). Optional
-  -- supplementary "Zoom Live Replay" link; dormant — the client half was lost
-  -- with the original migration and is not in the repo. See that file's header.
+  -- supplementary "Zoom Live Replay" link. The client half was lost with the
+  -- original migration and was rewritten from this column's COMMENT contract on
+  -- 2026-08-18 (src/lib/lessonReplay.js + LessonReplayLink). See that file's header.
   zoom_replay_url text,
   position       integer not null default 0,
   created_at     timestamptz not null default now()
@@ -204,8 +205,8 @@ comment on column public.course_lessons.zoom_replay_url is
   'lesson_progress/course_completions/certificates. Validated and classified client-side by '
   'src/lib/lessonReplay.js (absolute https only; Zoom hosts are linked, never embedded, because Zoom '
   'recording pages set X-Frame-Options). Deliberately has no CHECK constraint and no index — see the '
-  'header of db/2026-08-05-lesson-zoom-replay.sql (#37b). NOTE: as of 2026-08-17 the client half of '
-  'this feature is not present in the repo; the column is dormant.';
+  'header of db/2026-08-05-lesson-zoom-replay.sql (#37b). Because there is no CHECK, that client '
+  'module is the ONLY enforcement point — keep this comment and it in lockstep.';
 
 create table if not exists public.lesson_progress (
   user_id      uuid not null references auth.users(id) on delete cascade,
