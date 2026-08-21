@@ -638,3 +638,20 @@ button { font-family: inherit; }
 [data-theme="dark"] .bg-amber-50,
 [data-theme="dark"] .bg-amber-100,
 [data-theme="dark"] .hover\:bg-amber-200:hover { background-color: var(--status-warn-bg); }
+
+/* ──────────────────────────────────────────────────────────
+   ENROLLMENT INTAKE (.enroll-intake) — scoped a11y rules
+   ──────────────────────────────────────────────────────────
+   Scoped for the same reason as .cl-tool above: the app-wide focus pass is still
+   its own change. The enrollment form is worth doing now because every control on
+   it sits on the path to a payment, and because validateIntake's focusInvalid()
+   deliberately MOVES focus to whichever field failed. Moving focus to a target
+   with no visible indicator is worse than not moving it at all — the student is
+   told something is wrong and given no way to see where they now are.
+
+   The pill radios hide their <input> (opacity-0, zero-size) so the ring has to be
+   painted by the visible label on :focus-within. The upload zone is a role="button"
+   <div>, which the browser gives no indicator of its own. */
+.enroll-intake :focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+.enroll-intake .intake-pill:focus-within { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+.enroll-intake .intake-drop:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 3px; }

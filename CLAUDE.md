@@ -51,7 +51,7 @@ npm run ai:knowledge       # regenerate docs/ai/toolkits-voice-agent-knowledge.m
 npm run ai:knowledge:check # rebuild the knowledge doc in memory + diff vs disk; exit 1 on drift (writes nothing)
 npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge base
 npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
-npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, …)
+npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, trainingAgreement, …)
 ```
 
 There is **no linter** — verify UI changes by running `npm run dev` and exercising the affected
@@ -90,6 +90,14 @@ The sanctioned exceptions to the single-file rule (same spirit as the `main.jsx`
 - `lib/supabase.js` — the single Supabase client, built from `VITE_SUPABASE_URL` /
   `VITE_SUPABASE_ANON_KEY` (public anon key; safe in the bundle — RLS is the real boundary).
 - `auth/AuthProvider.jsx` — the `AuthProvider` + `useAuth()` hook (see Authentication).
+- `src/lib/enrollmentIntake.js` — the enrollment form's field registry + validation (pure).
+  ONE array (`INTAKE_FIELDS`) drives rendering *and* `validateIntake()`, so a field cannot be
+  shown without being checked — which is exactly how the Apps Script it replaces shipped a
+  resume field with a label, a drop zone and no `required` attribute. See Authentication →
+  "Enrollment intake form".
+- `src/lib/trainingAgreement.js` — the Training Agreement as data, not markup (pure).
+  `agreementModel(planKey, plans)` reads prices and durations from `enrollment_plans`, so a
+  signed document can never state a price the catalog does not charge.
 - `src/lib/planCatalog.js` — the membership catalog + entitlement rules (pure; shared by the app,
   the voice-knowledge generator, and `node --test`). See Plan-based access.
 - `src/index.css` — the **global theme-token layer** (all CSS custom properties for light + dark,
@@ -223,18 +231,53 @@ one PRIVATE full-forum **VIP** space per **batch** (cohort registry, code `YYYY-
 minted a Gold space per batch; **#39 removed the Gold plan and the `gold` space kind entirely**, so
 VIP is the only private segment and `community_spaces.kind` is now `('general','vip')`.
 
-**★ D2 (#36) — General is ANNOUNCEMENT-ONLY.** `member_posting = false` AND
-`member_comments = false`: **no member may post or comment there — not Sampler, not Silver, and
-NOT VIP.** Reactions stay ON for every plan, historical content stays readable,
-and an author can still WITHDRAW their own post (the read policies carry an author-owns-`deleted`
-branch, without which Postgres refuses the soft-delete outright — an UPDATE whose resulting row
-would be invisible to the writer fails 42501, which is why member soft-delete never actually worked
-before #36). Admins post the announcements. VIP discussion happens only in its own per-batch
-space. The flags are pinned by the `community_spaces_general_announcement_only` CHECK — reversing
-D2 means dropping a named constraint, flipping the plan capability columns, and recording it in
-db/README.md. **Do not "temporarily" flip the flag**: that instruction used to live in
-COMMUNITY_SETUP.md, it was followed, it was never reverted, and prod ran for a week with every plan
-able to reply in General.
+**Channels (#40, [db/2026-08-18-community-channels.sql](db/2026-08-18-community-channels.sql)):**
+the forum is grouped into **community_channel_categories** (organisation ONLY — never an
+authorization boundary) containing **community_channels**, which are the navigation surface AND the
+per-room audience/rights boundary. `community_tags` is untouched and still labels posts; a post has
+both a channel and a tag. `channel_id` rides on `community_posts`, `community_comments` (denormalized
+so a realtime filter can name it — the #32 `space_id` reason) and `community_notifications`.
+★ **Channels NARROW, never WIDEN**: `user_community_channel_ids()`/`my_community_channel_ids()` AND
+the audience test with `user_community_space_ids()`, so **L1 is untouched** and a channel-layer bug
+can hide content but can never expose a space. `audience_mode` ∈ `space` | `plans` | `batches` |
+`plans_and_batches` (an **intersection**) | `admins_only`; a mode that needs a mapping fails CLOSED
+on an empty one (an `EXISTS` over zero rows — not a defensive `if`), and batch **status is
+deliberately not consulted**, because closing or archiving a cohort must not revoke a paid seat.
+`user_community_channel_capabilities()` fuses **plan × space × channel** (a channel flag can only
+subtract), `my_community_sidebar()` is the ONE navigation call the client makes (bounded 100-cap
+unread; never a query per channel), `community_channel_write_denial()` explains a refusal, and
+`mark_community_channel_read()` writes `community_channel_reads`. An invisible channel reports
+**identically** to a nonexistent one. Every content policy and the community-media storage read are
+scoped `channel_id in (select my_community_channel_ids())`, keeping #29's uncorrelated InitPlan
+idiom; the notify triggers and `search_community_members(p_query, p_space_id, p_channel_id)` are
+channel-scoped so a mention can never reach someone who cannot open the room. Search is indexed
+(`community_posts.search_tsv` + GIN + `search_community_posts()` with **invoker rights**, so RLS is
+the authorization). Admin editor RPCs (`admin_community_config`, `admin_save_community_channel`,
+`admin_save_channel_category`, `admin_move_*`, `admin_set_community_channel_status`,
+`admin_channel_privacy_preview`) are the **only** writers — the tables carry no client write policy,
+so the `community_channel_events` audit row cannot be bypassed. `batches_create_spaces()` seeds a new
+cohort's `#lounge`/`#coaching-questions` in the same transaction as its space. Client: the channel
+rail + `SidePanel` admin editor in `CommunityHub`, `?channel=<slug>` beside `?space=`/`?post=`, last
+selection in `window.storage` (`community:lastChannel`, `community:railGroups` — both in
+`LEGACY_KEYS`), pure mirror in [src/lib/communityChannels.js](src/lib/communityChannels.js).
+
+**★ D2 CHANGED SHAPE IN #40 — read this before touching General.** #36 made General
+announcement-only for EVERY plan (`member_posting = false` AND `member_comments = false`), pinned by
+the `community_spaces_general_announcement_only` CHECK. That was a **space-wide** prohibition, so no
+General room could host a conversation at all. **#40 retires it deliberately and on the record**: the
+CHECK is dropped, the General space flags are flipped, and `can_post_in_general` /
+`can_comment_in_general` are enabled for all three plans. The intent survives **one level down**, per
+channel — `#announcements` is `kind='announcement'`, which makes `member_posting = false` true **by
+CHECK** rather than by policy prose, with `member_comments = false`. Reactions stay ON for every plan,
+historical content stays readable, and an author can still WITHDRAW their own post (the read policies
+carry an author-owns-`deleted` branch, without which Postgres refuses the soft-delete outright — an
+UPDATE whose resulting row would be invisible to the writer fails 42501, which is why member
+soft-delete never actually worked before #36). **`can_upload_attachments` was NOT relaxed** —
+sampler/silver stay false, VIP stays true. The standing rule is unchanged and is what the old CHECK
+was really protecting: **never hand-edit `member_posting`/`member_comments` to work around a
+permission question** — change the channel, or the plan capability columns, and record it. That
+instruction once lived in COMMUNITY_SETUP.md, it was followed, it was never reverted, and prod ran for
+a week with every plan able to reply in General.
 
 Per-plan rights come from **seven fail-closed capability columns on `enrollment_plans`** fused with
 the space flags by `user_community_capabilities()` (#36) — the ONE resolver every write policy
@@ -619,6 +662,45 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   (`AdminEnrollments`' `NotifyBadge`) so a misconfigured admin email isn't invisible. All best-effort
   (never blocks the response); older rows/installs without the migration just show no badge.
   See [db/2026-07-08-enrollment-notify-status.sql](db/2026-07-08-enrollment-notify-status.sql).
+  **Enrollment intake form (#42):** the paywall's `form` step is the Google Apps Script
+  enrollment form, ported. **15 required answers across 5 sections** (Personal · Professional ·
+  Program & Payment · Training Agreement · Final Questions) plus one optional resume upload —
+  the *only* field a student may skip. Everything is driven by `INTAKE_FIELDS` in
+  [src/lib/enrollmentIntake.js](src/lib/enrollmentIntake.js): the form renders from it and
+  `validateIntake()` checks it, so **rendered and validated can never diverge** (the source's
+  resume field was rendered with no `required` attribute for its whole life). Validation shows
+  *every* outstanding answer at once in a summary banner, each entry jumping to its field;
+  per-field errors appear on blur, never on first paint. The `programEnrolled` dropdown is gone —
+  the plan was already chosen on the pricing cards, so name and price render read-only and
+  `amountPaid` pre-fills from `price_php` (free text like `"₱16,999"` is read by
+  `parseAmountPaid()` because `amount_paid` is `numeric`). The **Training Agreement** is a
+  12-section document built by [src/lib/trainingAgreement.js](src/lib/trainingAgreement.js) with
+  **three tier columns** (sampler/silver/vip) whose prices and durations come from
+  `enrollment_plans` — never hardcoded, which is how the source came to print ₱15,999 on a
+  ₱16,999 sale. Students sign it on a `<canvas>`; `AGREEMENT_VERSION` is stamped on every
+  signature so an old one never appears to endorse new terms. A **second, offscreen copy** of the
+  document at a fixed 794px width is what html2canvas captures for the PDF, so the PDF is
+  identical on every device and works whether or not the panel was ever expanded — and because
+  that capture leaves the DOM, the document is styled with the frozen `INK`/`DOC` literals, not
+  `var()` tokens. Receipt, resume, signature PNG and agreement PDF all live in the existing
+  private `enrollment-receipts` bucket under `<uid>/{receipt,resume,signature,agreement}-…`, so
+  no new bucket and no new policy — #42 only widens it to 10 MB + doc/docx. `getCurrentBatch_()`
+  from the source is **deliberately not ported**: a derived `"August 2026 Batch"` string cannot
+  grant a cohort seat, so the real `batches` picker stays. ★ The source's separate **payment
+  reference** field is gone (the Apps Script never had one — the reference is legible on the
+  receipt screenshot), so `payment_reference` is now written empty by the paywall; Extend Access
+  still sets it — the admin alert therefore renders that row **conditionally**.
+  ★ **This form also serves renewals and upgrades**, not just new enrollments. A returning member's
+  answers **prefill** from their latest request via `intakeValuesFromRequest()` — registry-driven,
+  and never carrying `amountPaid` (a new term is a new payment), `email` (the account is the
+  authority) or files. The prefill source is the **`prefillFrom`** prop, deliberately separate from
+  `priorRequest`: the latter drives the rejected/expired notice step and is narrowed to those
+  statuses by callers, so wiring prefill to it fired only for members whose previous request had
+  been REJECTED. The agreement **is re-signed every term** (decision 2026-08-20) — prices and
+  clauses change between terms, so a signature has to match the document actually on screen.
+  ★ The signature can be **drawn or typed** (`agreement_snapshot.signature_method`); the typed name
+  is rendered into the same canvas, so both paths produce one PNG and one PDF layout. Draw-only
+  would make a mandatory gate impassable for keyboard-only users.
   Toggle with `REQUIRE_ENROLLMENT` (module const, default on;
   off via `VITE_REQUIRE_ENROLLMENT=false`). Enrollment state is server-side — **not** in
   `LEGACY_KEYS` (the one exception: the admin sound-alert pref `enroll:soundAlert`, which IS a
@@ -702,7 +784,7 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   cuts access instantly; `grant_batch_run()` is the ONLY function that locks `batches`; adds
   `app_error()` stable codes carried in `hint`) → community-plan-capabilities (**#36**, seven fail-closed
   capability booleans on `enrollment_plans` fused with the space flags by `user_community_capabilities()`;
-  **D2: General is announcement-only for EVERY plan** — posting and commenting off, reactions on — pinned
+  **D2: General is announcement-only for EVERY plan** *(retired by #40 - see the D2 paragraph in the Community section)* — posting and commenting off, reactions on — pinned
   by a CHECK; own-UPDATE split into withdraw vs keep-published; **fixes a latent bug where member
   soft-delete could never work**, because Postgres refuses an UPDATE whose resulting row would be
   invisible to the writer and `community_posts_read` admitted only `status='active'`) →
@@ -722,7 +804,28 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   policies + `course_object_allowed()` + the two trainer mirrors lose its conjunct. ★ ORDERING:
   `batches_guard()` must be replaced BEFORE the column drop or every `update batches` — including
   the hourly cron sweep — raises `record "new" has no field "gold_capacity"`. Folded verbatim as
-  §26; the §9 plan seed is corrected IN PLACE so a fresh install never creates the retired plans).
+  §26; the §9 plan seed is corrected IN PLACE so a fresh install never creates the retired plans) →
+  community-channels (**#40**,
+  [db/2026-08-18-community-channels.sql](db/2026-08-18-community-channels.sql) — categories +
+  channels + per-channel plan/batch audiences + read markers + an audit ledger; every content
+  policy, the community-media read/delete, the notify triggers and the mention directory move
+  from space scope to CHANNEL scope; indexed FTS; admin editor RPCs. ★ RETIRES D2 as a
+  space-wide rule — see the D2 paragraph in the Community section. ★ ORDERING: the guard
+  triggers must be replaced BEFORE channel_id goes NOT NULL, and the D2 CHECK dropped BEFORE
+  the flags flip. ★ Runs AFTER #39 — it writes `can_post_in_general` for exactly the three
+  surviving plan keys, and its preflight refuses to run while the retired keys still exist.
+  Folded verbatim as §27) → community-channel-rename-fixes (**#41**,
+  [db/2026-08-19-community-channel-rename-fixes.sql](db/2026-08-19-community-channel-rename-fixes.sql)
+  — a rename-only `admin_save_community_channel()` call no longer wipes the topic, no longer
+  aborts on plan/batch-scoped channels, and no longer writes a permissions audit row built
+  from raw arguments; ★ `p_topic` null now means *leave alone* and `''` means *clear*.
+  Folded verbatim as §28) → **enrollment-intake** (**#42**,
+  [db/2026-08-20-enrollment-intake.sql](db/2026-08-20-enrollment-intake.sql) — the full
+  full enrollment intake + the signed Training Agreement; see the "Enrollment intake
+  form" bullet in Authentication. Seven promoted columns + an `intake` jsonb + four
+  agreement columns + three file paths on `enrollment_requests`, the `enrollment-receipts`
+  bucket widened to 10 MB/doc/docx, and the plan `features` copy corrected. Folded
+  verbatim as §29).
   **#35/#36 applied to production 2026-07-29; both verified against a disposable shadow project first — see
   [docs/db/shadow-project.md](docs/db/shadow-project.md) and `npm run test:db`.**
   **Expiry-warning policy:** student-facing surfaces (menu pill, Dashboard `MembershipPanel`, the
@@ -1201,14 +1304,36 @@ docs **in the same change**:
   deployed) **in the same change**, so the voice assistant's knowledge never drifts from the app.
   `npm run ai:knowledge:check` must pass (it exits 1 when the committed doc no longer matches the
   code — run it before calling any tools/plans change done).
+- **Changing which channels a member can see** → four places move together:
+  `user_community_channel_ids()` ↔ `channelAudienceAllows()` in `src/lib/communityChannels.js`
+  ↔ `test/communityChannels.test.mjs` ↔ `test-db/communityChannels.dbtest.mjs`. The audience
+  modes fail CLOSED on an empty mapping and on an unknown mode — keep it that way.
+- **Changing what a member can DO in a channel** → `user_community_channel_capabilities()` ↔
+  the five channel-scoped write policies ↔ `effectiveChannelCaps()` ↔ both suites. The client
+  must consume the server-computed `can_*` verbatim and fail closed while they load — the
+  pre-#40 bug was a re-derivation from raw space flags that failed OPEN.
 - **Changing community write permissions** → four places move together: the `enrollment_plans`
-  capability columns (#36) ↔ `user_community_capabilities()` ↔ the five community write policies ↔
+  capability columns (#36) ↔ `user_community_capabilities()` ↔ the five community write policies ↔ the per-channel flags (#40) ↔
   `capabilitiesFor()`/`effectiveCaps()` in `src/lib/communityCapabilities.js`
   (`test/communityCapabilities.test.mjs` pins the truth table — 3 plans x 2 space kinds x 4 actions
   since #39; it was 5 x 3 x 4 under #36).
 - **Changing how many cohorts a plan grants** → `plan_batch_count()` ↔
   `enrollment_plans.eligible_batch_count` ↔ `planBatchCount()` in `src/lib/batchEntitlements.js`
   (`test/batchEntitlements.test.mjs` pins it).
+- **Adding, removing or renaming an enrollment intake question** → `INTAKE_FIELDS` in
+  `src/lib/enrollmentIntake.js` is the ONLY place that needs to change for it to render, be
+  required, and be flagged when blank. But if it must be *stored*, three more move with it:
+  a dated migration adding the column (or a key inside the `intake` jsonb), the row built in
+  `EnrollmentPaywall.submit()`, and `INTAKE_COLS` in `api/notify-enrollment.js` — the admin
+  alert selects an explicit column list, so a new column is silently `undefined` in the email
+  until it is listed there. `test/enrollmentIntake.test.mjs` pins the registry invariants.
+- **Changing the Training Agreement's wording** → bump `AGREEMENT_VERSION` in
+  `src/lib/trainingAgreement.js` in the same change. `enrollment_requests.agreement_version`
+  records which text each student accepted, so editing the document without bumping makes every
+  past signature appear to endorse the new terms. Repricing or renaming a plan is NOT a wording
+  change — prices are read from `enrollment_plans` at render time. `test/trainingAgreement.test.mjs`
+  pins section contiguity (the source silently dropped Section 4), the three tier columns, and
+  that no retired copy — Discord, Thinkific, a hardcoded extension price — creeps back in.
 - **Changing what a lesson replay link may be** → three places move together: the
   `course_lessons.zoom_replay_url` **COMMENT** (in both `db/2026-08-05-lesson-zoom-replay.sql` and the
   bootstrap) ↔ `parseReplayUrl()` / `ZOOM_HOST_SUFFIXES` in `src/lib/lessonReplay.js` ↔
@@ -1234,9 +1359,13 @@ docs **in the same change**:
 - **Adding, removing, or repricing a PLAN** → `enrollment_plans` (a dated migration) ↔
   `ENROLLMENT_PLANS_FALLBACK` ↔ `PLAN_ENTITLEMENTS` in `src/lib/planCatalog.js` ↔ the bootstrap §9
   seed ↔ `ENROLLMENT_PLAN_KEYS` in `src/lib/trainerContent.js` (the admin trainer-preview allowlist)
-  ↔ `PLAN_ALLOWLIST_FALLBACK` in `api/admin/student-imports.js`, then re-run `npm run ai:knowledge`.
+  ↔ `PLAN_ALLOWLIST_FALLBACK` in `api/admin/student-imports.js` ↔ **`TIER_BY_PLAN_KEY` in
+  `src/lib/trainingAgreement.js`** (#42), then re-run `npm run ai:knowledge`.
   `test/planCatalog.test.mjs` pins the catalog and, critically, that **every** catalog key has an
   explicit entitlement entry — an unlisted plan now fails CLOSED rather than getting full access.
+  `test/trainingAgreement.test.mjs` pins the agreement half the same way, and reads the REAL catalog
+  rather than a fixture: a plan with no agreement tier makes its buyer sign a document naming
+  neither their plan nor its price.
 - **The trainer tool set or teaching-prompt behavior** → update `VOICE_SERVER_TOOL_SPECS`, the
   §3 system-prompt block + §4b in docs/ai/voice-agent-setup.md, and re-run `npm run ai:provision`.
 

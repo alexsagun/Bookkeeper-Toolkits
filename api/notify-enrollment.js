@@ -39,12 +39,25 @@ const isEmail = (s) => typeof s === 'string' && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.tes
 const esc = (s) =>
   String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const ONBOARDING_VIDEO_ID = 'U78IBZwIr7U';
 const php = (n) => '₱' + Number(n || 0).toLocaleString('en-US');
 
 // Branded HTML mirroring api/notify-access.js / the auth-email template.
 // cta: optional { href, label } — a button after the rows table (intro is esc()'d,
 // so links can't ride along in the text).
-function emailHtml({ heading, intro, rows, reason, cta }) {
+// note: optional trailing paragraph (esc()'d). video: optional { id, label } — a
+// YouTube thumbnail that links to the watch page. An <img> is used rather than an
+// embed because no mail client plays an iframe, and a bare link gets ignored.
+function emailHtml({ heading, intro, rows, reason, cta, note, video }) {
+  const videoBlock = video?.id
+    ? `<div style="margin:0 0 20px;padding:14px;border:2px solid #2563eb;border-radius:14px;background:#f0f5ff;text-align:center;">
+        <div style="font-size:15px;font-weight:700;color:#1d4ed8;margin-bottom:10px;">▶ ${esc(video.label || 'Watch this first')}</div>
+        <a href="https://www.youtube.com/watch?v=${esc(video.id)}" style="display:inline-block;text-decoration:none;"><img src="https://img.youtube.com/vi/${esc(video.id)}/hqdefault.jpg" alt="${esc(video.label || 'Watch the video')}" width="420" style="max-width:100%;border-radius:12px;border:0;display:block;" /></a>
+      </div>`
+    : '';
+  const noteBlock = note
+    ? `<p style="font-size:12.5px;line-height:1.6;color:#48505e;margin:0 0 16px;padding:12px 14px;background:#f4f7fb;border-radius:10px;">${esc(note)}</p>`
+    : '';
   const rowsBlock = rows && rows.length
     ? `<table style="width:100%;border-collapse:collapse;margin:0 0 20px;font-size:13px;color:#1c2430;">
         ${rows.map(([k, v]) =>
@@ -68,9 +81,11 @@ function emailHtml({ heading, intro, rows, reason, cta }) {
     <div style="padding:28px;color:#1c2430;">
       <h2 style="font-size:18px;margin:0 0 8px;">${esc(heading)}</h2>
       <p style="font-size:14px;line-height:1.6;color:#48505e;margin:0 0 20px;">${esc(intro)}</p>
+      ${videoBlock}
       ${rowsBlock}
       ${reasonBlock}
       ${ctaBlock}
+      ${noteBlock}
       <p style="font-size:12px;color:#8a93a3;margin:8px 0 0;">Thank you,<br/>The ${esc(BRAND)} team</p>
     </div>
   </div>
@@ -140,9 +155,20 @@ function rateLimited(userId) {
 // so pre-#16 databases keep working (same column-resilience pattern as the client).
 const OWN_REQUEST_COLS =
   'id,user_id,plan_name,full_name,email,phone,city_country,amount_expected,amount_paid,payment_reference,created_at,status';
+// #42's intake + agreement columns. Selected on the top rung only, so a database
+// without the migration falls through to the shorter list rather than 400-ing —
+// which would silence the admin alert entirely, the one email that matters.
+const INTAKE_COLS =
+  'college_course,current_job,ph_experience,us_experience,currently_employed,prior_training,referred_by,intake,resume_path,agreement_version,agreement_tier';
 async function fetchOwnRequest(requestId, token) {
-  // batch_id (#32) rides the same resilience ladder as notify_status (#16).
-  for (const cols of [`${OWN_REQUEST_COLS},notify_status,batch_id`, `${OWN_REQUEST_COLS},notify_status`, OWN_REQUEST_COLS]) {
+  // batch_id (#32) and the intake columns (#42) ride the same resilience ladder
+  // as notify_status (#16).
+  for (const cols of [
+    `${OWN_REQUEST_COLS},notify_status,batch_id,${INTAKE_COLS}`,
+    `${OWN_REQUEST_COLS},notify_status,batch_id`,
+    `${OWN_REQUEST_COLS},notify_status`,
+    OWN_REQUEST_COLS,
+  ]) {
     try {
       const r = await fetch(
         `${SUPABASE_URL}/rest/v1/enrollment_requests?id=eq.${encodeURIComponent(requestId)}` +
@@ -372,16 +398,73 @@ export default async function handler(req, res) {
           ['Package', row.plan_name],
           ['Expected', php(row.amount_expected)],
           ['Paid / sent', php(row.amount_paid)],
-          ['Reference', row.payment_reference || '—'],
           ['Submitted', new Date(row.created_at).toUTCString()],
+          // The paywall no longer asks for a reference (it is legible on the receipt),
+          // but Extend Access still collects one — so show it when there is one
+          // rather than dropping the field for the path that still uses it.
+          ...(row.payment_reference ? [['Reference', row.payment_reference]] : []),
+          // #42 intake. Each line is omitted when absent, so a pre-intake row
+          // (or a partially migrated database) simply produces the shorter email
+          // it always did rather than a column of dashes.
+          ...(row.college_course ? [['Course', row.college_course]] : []),
+          ...(row.current_job ? [['Current role', row.current_job]] : []),
+          ...(row.ph_experience ? [['PH experience', row.ph_experience]] : []),
+          ...(row.us_experience ? [['US/AU/UK experience', row.us_experience]] : []),
+          ...(row.currently_employed ? [['Employed', row.currently_employed]] : []),
+          ...(row.prior_training ? [['Prior QBO/Xero training', row.prior_training]] : []),
+          ...(row.referred_by ? [['Referred by', row.referred_by]] : []),
+          ...(row.intake?.facebook_link ? [['Facebook', row.intake.facebook_link]] : []),
+          ...(row.intake?.struggles ? [['Three struggles', row.intake.struggles]] : []),
+          ...(row.agreement_version
+            ? [['Agreement', `Signed${row.agreement_tier ? ` as ${row.agreement_tier.toUpperCase()}` : ''} · v${row.agreement_version}`]]
+            : []),
+          ...(row.resume_path ? [['Resume', 'Attached — open it from Enrollments']] : []),
         ],
         cta: appUrl ? { href: `${appUrl}/admin/enrollments`, label: 'Review in Enrollments' } : undefined,
       }),
     };
+
+    // Student confirmation. Best-effort, and deliberately NOT recorded in
+    // notify_status — that column answers "was the admin alerted?", which is what
+    // decides whether a payment ever gets reviewed. Conflating the two would let a
+    // bounced student copy mark the admin alert failed and trigger a resend loop.
+    //
+    // ★ Sent AFTER the admin alert, and only once it has succeeded. Resend allows
+    //   2 requests/second, so two back-to-back sends from one invocation put the
+    //   429 risk on whichever goes second — and that must never be the admin one.
+    //   Gating on success also stops a retry after `provider_error` sending the
+    //   student a second "Enrollment received" for the same submission.
+    const sendStudentCopy = async () => {
+      if (!isEmail(row.email)) return;
+      const first = String(row.full_name || '').trim().split(/\s+/)[0] || 'future QBO pro';
+      try {
+        await sendResend(apiKey, from, row.email,
+          isRenewal ? 'Renewal received — Get Hired with Alex' : 'Enrollment received — Get Hired with Alex',
+          emailHtml({
+            heading: isRenewal ? `Thanks, ${first}` : `Welcome, ${first}`,
+            intro: isRenewal
+              ? 'Your renewal payment is in and Coach Alex is reviewing it now. Your access continues once it is verified — you will hear back within 24 hours.'
+              : 'Your enrollment is in, and Coach Alex is reviewing it now. You will hear back within 24 hours with your next steps and course access.',
+            // Onboarding instructions are for new students. Someone six months in
+            // does not need to be welcomed and told how to start.
+            ...(isRenewal ? {} : { video: { id: ONBOARDING_VIDEO_ID, label: 'Watch this first: your onboarding instructions' } }),
+            rows: [
+              ['Package', row.plan_name],
+              ['Amount sent', php(row.amount_paid)],
+              ...(row.agreement_version ? [['Training Agreement', 'Signed and on file']] : []),
+            ],
+            note: 'Enrollment and course access are granted between 9:00 AM and 5:00 PM PH time, Monday to Friday. Payments made on weekends or holidays are processed on the next business day.',
+          }));
+      } catch (studentErr) {
+        console.warn('[notify-enrollment] student confirmation failed:', String(studentErr));
+      }
+    };
+
     try {
       const out = await sendResend(apiKey, from, adminTo, subject, html);
       if (out.ok) {
         await recordNotify(requestId, u.token, 'sent', out.id ? `resend:${out.id}` : null);
+        await sendStudentCopy();
         return res.status(200).json(out);
       }
       await recordNotify(requestId, u.token, 'provider_error', out.detail || `status ${out.status}`);

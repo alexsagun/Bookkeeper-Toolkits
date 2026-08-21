@@ -222,6 +222,62 @@ Idempotent; needs #13 + the community migrations (#23/#24) + backend-hardening (
   never evict existing members. If the migration is missing, Approve fails with explicit setup
   guidance and **nothing is granted** — there is deliberately no client fallback anymore.
 
+## Step 1j — Run the enrollment intake migration (#42)
+
+Same SQL Editor → paste **all** of
+[`db/2026-08-20-enrollment-intake.sql`](db/2026-08-20-enrollment-intake.sql) → **Run**.
+Idempotent; needs #12 + #39 + #31, and its preflight aborts if any is missing or if the retired
+`core_self_paced` / `gold_live` plan keys still exist.
+
+This is what gives the **ported enrollment form** somewhere to land. Until now the intake was
+collected by a Google Apps Script web app outside this codebase — a full intake form plus a
+12-section Training Agreement signed on a canvas, written to a spreadsheet and two Drive folders —
+while the in-app form asked seven questions and validated five. After this migration the Apps
+Script and its spreadsheet can be retired.
+
+- **Seven promoted columns** on `enrollment_requests` — `college_course`, `current_job`,
+  `ph_experience`, `us_experience`, `currently_employed`, `prior_training`, `referred_by`. These
+  are the answers you filter or sort by while triaging, so they are real columns; the free prose
+  (`struggles`, `facebook_link`) goes in an **`intake` jsonb**. Putting everything in jsonb would
+  turn "show me every applicant with US experience" into a sequential scan.
+- **Four agreement columns** — `agreement_version`, `agreement_tier`, `agreement_signed_at`,
+  `agreement_snapshot`. The snapshot records **the prices that were on screen at signing**, which
+  is the detail a dispute actually turns on.
+- **Three file paths** — `resume_path`, `agreement_signature_path`, `agreement_pdf_path`. All in
+  the **existing** `enrollment-receipts` bucket under `<uid>/…`, so no new bucket and no new
+  policy. The migration widens that bucket to **10 MB** and adds **doc/docx**, because resumes
+  are routinely Word files the old mime list rejected.
+- **Every column is nullable on purpose.** Requests submitted before this migration must stay
+  valid, so the "no blanks" rule lives in `validateIntake()`
+  ([src/lib/enrollmentIntake.js](src/lib/enrollmentIntake.js)) — the only writer — while the
+  CHECKs still bind anything that IS written.
+- **Plan copy corrected** — VIP gains its *4 Live Group Resume & Interview Coaching Sessions*
+  (a separate inclusion from the 1-on-1 session), and Discord becomes Community everywhere, so
+  the pricing card and the agreement no longer describe the same benefit two different ways.
+
+**After running it**, re-run `npm run ai:knowledge` so the voice assistant follows the corrected
+plan copy, and deploy the matching client build — the form,
+`src/lib/enrollmentIntake.js` and `src/lib/trainingAgreement.js` ship together.
+
+### What the student now fills in
+
+Five sections and **15 required answers** — plus a signature and the disclaimer tick, which are
+gates rather than fields — and exactly one optional field (the resume). So 17 things must be done
+before the form will submit, or 18 for a VIP enrollment, which also requires picking a batch:
+
+| Section | Questions |
+|---|---|
+| 01 · Personal Information | Full name · Email *(read-only, from the account)* · Cellphone · City & country · College course |
+| 02 · Professional Background | Current job title · PH experience · US/AU/UK experience · Currently employed · Prior QBO/Xero training · **Resume (optional)** |
+| 03 · Program & Payment | Amount paid · Payment screenshot · Batch *(VIP only, when a batch is open)* |
+| 04 · Training Agreement | Read the 12-section agreement, then **draw your signature** |
+| 05 · Final Questions | Referred by · Facebook name or link · Three struggles · Disclaimer tick |
+
+A submit with anything blank is refused: the form lists every outstanding answer in a banner,
+each entry jumps to its field, and focus lands on the first one. There is no longer a separate
+"payment reference" box — the reference is legible on the receipt screenshot, which is why the
+Apps Script never asked for it.
+
 ## Membership lifecycle & renewal
 
 - **Durations:** approval stamps `ends_at = start + access_days` (Sampler/Silver **60

@@ -299,6 +299,8 @@ export async function resetShadow() {
     truncate table
       public.batch_entitlements,
       public.batch_events,
+      public.community_channel_events,
+      public.community_channel_reads,
       public.community_reactions,
       public.community_attachments,
       public.community_post_tags,
@@ -310,8 +312,43 @@ export async function resetShadow() {
       public.enrollment_requests
     restart identity cascade`);
   // Cohorts and their spaces: delete the batches, let the FK cascade take the
-  // spaces. General is seeded by #32 and must survive.
+  // spaces (and, since #40, their categories and channels). General is seeded
+  // by #32 and its channels by #40 — both must survive.
   await runSql(`delete from public.community_spaces where kind <> 'general'`);
+  // ★ #40 seed channels are MUTABLE: a test can rename, archive, re-audience or
+  //   re-categorise one, and slug-keyed lookups would then silently resolve to a
+  //   channel in a state nobody asked for - poisoning every later test AND every
+  //   other suite. Deleting General's channels + categories and re-seeding is the
+  //   only way back to a known state (seed_default_channels() early-returns if any
+  //   channel survives, so the delete has to come first).
+  await runSql(`delete from public.community_channels ch
+     using public.community_spaces sp
+     where sp.id = ch.space_id and sp.kind = 'general'`);
+  await runSql(`delete from public.community_channel_categories cat
+     using public.community_spaces sp
+     where sp.id = cat.space_id and sp.kind = 'general'`);
+  await runSql(`delete from public.community_settings`);
+  await runSql(`select public.seed_default_channels(id) from public.community_spaces where kind = 'general'`);
+  await runSql(`
+    insert into public.community_settings (id, community_name, description, welcome_message)
+    values (true, 'Community',
+            'Ask questions, share wins, and keep up with program news.',
+            'Welcome. Start in #general-discussion and say hello.')
+    on conflict (id) do nothing`);
+  await runSql(`
+    update public.community_settings s
+       set default_channel_id = (
+         select ch.id from public.community_channels ch
+         join public.community_spaces sp on sp.id = ch.space_id
+        where sp.kind = 'general' and ch.is_default limit 1)
+     where s.default_channel_id is null`);
+
+  // (legacy) leftover non-seed General channels from a pre-restore run
+  await runSql(`delete from public.community_channels ch
+     using public.community_spaces sp
+     where sp.id = ch.space_id and sp.kind = 'general'
+       and ch.slug not in ('announcements','community-guide','general-discussion',
+                           'quickbooks-help','job-search','client-work')`);
   await runSql(`delete from public.batches`);
   // plan and is_paid are NOT NULL with defaults ('free', false) — reset to the
   // defaults rather than to null.
@@ -324,6 +361,13 @@ export async function resetShadow() {
 /** Convenience for tests that need the General space id. */
 export async function generalSpaceId() {
   return runSqlScalarSafe(`select id::text from public.community_spaces where kind = 'general'`);
+}
+
+export async function channelIdFor(spaceSlug, channelSlug) {
+  return runSqlScalarSafe(`
+    select ch.id::text from public.community_channels ch
+      join public.community_spaces sp on sp.id = ch.space_id
+     where sp.slug = ${lit(spaceSlug)} and ch.slug = ${lit(channelSlug)}`);
 }
 
 export async function spaceIdFor(kind, batchCode) {

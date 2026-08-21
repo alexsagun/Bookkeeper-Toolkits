@@ -16,8 +16,9 @@ import {
   PanelLeftClose, PanelLeftOpen, RefreshCw, UserCheck, UserX, ShieldCheck, Hourglass, Bell, BellOff, Volume2,
   Sun, Moon, Monitor, CreditCard, ArrowUpCircle, CalendarPlus,
   MessagesSquare, ThumbsUp, PartyPopper, EyeOff,
-  Pin, AtSign, Megaphone, Link2, Unlock, CheckCheck, Camera, Paperclip,
-  UploadCloud, Users, Database, Filter, Pause, CircleOff
+  Pin, AtSign, Megaphone, Link2, Unlock, CheckCheck, Camera, Paperclip, Info,
+  UploadCloud, Users, Database, Filter, Pause, CircleOff,
+  Hash, Settings, Archive, RotateCcw, Pencil
 } from 'lucide-react';
 import { createPortal } from 'react-dom';
 import { useAuth } from './auth/AuthProvider.jsx';
@@ -32,11 +33,20 @@ import {
   approvalBatchPreselect, pickInitialSpace,
 } from './lib/communitySpaces';
 import {
+  accessDiff, channelAccessSummary, channelDenialCopy,
+  effectiveChannelCaps, groupChannelsByCategory, normalizeChannelSlug,
+  pickInitialChannel, unreadLabel, AUDIENCE_MODES,
+} from './lib/communityChannels';
+// ★ Until #40 this module was imported by NOTHING but its own test, while
+// CommunityHub re-derived rights from raw space flags and failed OPEN on an
+// unresolved space. effectiveCaps is the pre-#40 fallback path now.
+import { effectiveCaps } from './lib/communityCapabilities';
+import {
   BATCH_TIMEZONES, batchPeriodState, closureLabel, dueForAutoClose, editLockReason,
   formatBatchDate, hasUpcomingOpenBatch, isPastBatch, monthBounds, periodProgress,
   validateBatchEdit,
 } from './lib/batchLifecycle';
-import { appErrorCode, appErrorMessage } from './lib/appErrors';
+import { appErrorCode, appErrorMessage, isMigrationMissing } from './lib/appErrors';
 import {
   ENROLLMENT_PLANS_FALLBACK, PLAN_LABELS, PLAN_ENTITLEMENTS, planEntitlement,
   FULL_ENTITLEMENT, filterStagesForEntitlement, extensionPrice,
@@ -46,6 +56,12 @@ import {
 } from './lib/coverLetterIndustry';
 import { parseLooseJson } from './lib/partialJson';
 import { ZOOM_HOST_SUFFIXES, parseReplayUrl } from './lib/lessonReplay';
+import {
+  INTAKE_FIELDS, INTAKE_SECTIONS,
+  validateIntake, parseAmountPaid, normalizePhone, normalizeFacebook,
+  blankIntake, intakeField, fileTypeAllowed, contentTypeFor, intakeValuesFromRequest,
+} from './lib/enrollmentIntake';
+import { AGREEMENT_VERSION, agreementModel, agreementSnapshot } from './lib/trainingAgreement';
 
 const DEFAULT_APP_TAB = 'dashboard';
 
@@ -228,6 +244,7 @@ function tabHref(tabId, opts = {}) {
   if (opts.courseId) params.set('course', opts.courseId);
   if (opts.lessonId) params.set('lesson', opts.lessonId);
   if (tabId === 'community' && opts.space) params.set('space', opts.space);
+  if (tabId === 'community' && opts.channel) params.set('channel', opts.channel);
   if (tabId === 'community' && opts.postId) params.set('post', opts.postId);
   const qs = params.toString();
   return `${rawPath || '/'}${qs ? `?${qs}` : ''}`;
@@ -235,7 +252,7 @@ function tabHref(tabId, opts = {}) {
 
 function readAppRoute() {
   if (typeof window === 'undefined') {
-    return { tab: DEFAULT_APP_TAB, interviewSub: null, explicit: false, courseId: null, lessonId: null, postId: null, space: null, panel: null };
+    return { tab: DEFAULT_APP_TAB, interviewSub: null, explicit: false, courseId: null, lessonId: null, postId: null, space: null, channel: null, panel: null };
   }
   const path = normalizePath(window.location.pathname);
   const params = new URLSearchParams(window.location.search);
@@ -257,11 +274,12 @@ function readAppRoute() {
     tab: VALID_APP_TABS.has(tab) ? tab : DEFAULT_APP_TAB,
     interviewSub,
     explicit: path !== '/' || params.has('tab') || params.has('sub') || params.has('course') || params.has('lesson') || params.has('post') ||
-      params.has('space') || params.has('panel') || params.has('accountPanel') || params.has('account_panel') || params.has('account'),
+      params.has('space') || params.has('channel') || params.has('panel') || params.has('accountPanel') || params.has('account_panel') || params.has('account'),
     courseId: params.get('course') || null,
     lessonId: params.get('lesson') || null,
     postId: params.get('post') || null,
     space: params.get('space') || null,
+    channel: params.get('channel') || null,
     panel: readAccountPanelParam(params),
   };
 }
@@ -311,7 +329,7 @@ function shouldHandleInAppClick(e) {
 // same change (see "Keeping docs current" in CLAUDE.md).
 const VOICE_TAB_INFO = {
   dashboard:    { label: 'Dashboard', stage: 'Home', desc: 'Progress overview with career-stage tiles, membership status, and quick links to every tool.' },
-  community:    { label: 'Community', stage: 'Home', desc: 'Member forum split into spaces: a General space every active member can read and react to (announcements only — nobody replies there) plus a private per-batch VIP space with the full forum — search, free-form tags, image/video/link attachments, @mentions, reactions, pinned posts, and admin announcements with read-tracking, plus a notification bell. VIP members land in their own batch community; access follows the membership automatically.' },
+  community:    { label: 'Community', stage: 'Home', desc: 'Member forum organised into channels grouped by category, like a chat community. Text channels for discussion and announcement channels that are read-and-react only. Every member sees #announcements plus general channels for QuickBooks help, the job search and client work; VIP members also get their own private cohort channels. Channels can be limited to particular plans or batches, and members only ever see the channels they may open. Includes per-channel unread markers, search within a channel or across all of them, free-form tags, image/video/link attachments, @mentions, reactions, pinned posts and a notification bell. Admins create and organise channels from Manage community. Access follows the membership automatically.' },
   course:       { label: 'Accounting 101', stage: 'Training & Skills', desc: 'Self-paced foundational accounting course (8 modules).' },
   qbomastery:   { label: 'QuickBooks Online Mastery', stage: 'Training & Skills', desc: 'QuickBooks Online video-course catalog (Essentials and Mastery programs) with completion certificates.' },
   industryacc:  { label: 'Industry Accounting', stage: 'Training & Skills', desc: 'Accounting playbooks for 12 US industries with QuickBooks workflows.' },
@@ -2565,15 +2583,59 @@ function useEnrollmentGate(user, profile, profileReady) {
 // caller maps 23505 "already pending" / not-configured and shows the error); returns the
 // inserted row. The insert is column-resilient: if the #20 columns aren't present yet it
 // retries WITHOUT them, so the existing paywall never regresses before the migration runs.
+// Give an untyped file a content type the storage bucket will accept.
+//
+// ★ PASSING `contentType` TO supabase-js DOES NOTHING FOR A File OR Blob.
+//   `uploadOrUpdate` branches on the body: a Blob (a File is one) is posted as
+//   multipart FormData via `body.append("", fileBody)`, and the part's type comes
+//   from `blob.type` alone — `options.contentType` is only read in the non-Blob
+//   `else` branch, where it becomes a request header. So the option is inert here,
+//   and omitting it does not "let Supabase infer" either: the browser labels a
+//   file it could not type `application/octet-stream`, which is absent from the
+//   enrollment-receipts bucket's allowed_mime_types and 415s.
+//
+//   Rewrapping is therefore the only way to assert a type for these uploads. It
+//   copies no bytes — File and Blob wrap the same underlying data.
+function typedUploadBody(file) {
+  if (!file || file.type) return file;
+  const inferred = contentTypeFor(file);
+  if (!inferred) return file;
+  try {
+    return new File([file], file.name || 'upload', { type: inferred });
+  } catch {
+    // Some older WebViews expose Blob but not the File constructor.
+    return new Blob([file], { type: inferred });
+  }
+}
+
+// `extraPaths` are objects the CALLER already uploaded for this submission — the
+// signature PNG, the resume and the rendered agreement PDF (#42). They are cleaned
+// up here together with the receipt whenever the insert fails, because nothing else
+// will: without this, every failed attempt strands three files in a private bucket
+// with no row referencing them, and a student who retries three times leaves nine —
+// including three copies of their handwritten signature.
 async function submitSubscriptionRequest({
   user, planKey, planName, kind = 'new', extensionDays = null, batchId = null,
-  amountExpected, amountPaid, fields = {}, file,
+  amountExpected, amountPaid, fields = {}, file, intake = null, agreement = null,
+  extraPaths = [],
 }) {
   const safe = file.name.replace(/[^\w.\-]+/g, '_');
-  const path = `${user.id}/${crypto.randomUUID()}-${safe}`;
+  const path = `${user.id}/receipt-${crypto.randomUUID()}-${safe}`;
+
+  // ★ Declared BEFORE the receipt upload, deliberately. The receipt is the
+  // largest user-supplied file and the likeliest thing to fail mid-submit, and
+  // by the time it runs the caller has already uploaded the signature, resume
+  // and PDF. Defining this afterwards left that exact path stranding all three.
+  // `remove` tolerates keys that do not exist, so listing `path` before it is
+  // known to be written is safe.
+  const cleanupUploads = async () => {
+    const all = [path, ...extraPaths].filter(Boolean);
+    try { await supabase.storage.from('enrollment-receipts').remove(all); } catch { /* best-effort */ }
+  };
+
   const { error: upErr } = await supabase.storage.from('enrollment-receipts')
-    .upload(path, file, { upsert: false, contentType: file.type || 'application/octet-stream' });
-  if (upErr) throw upErr;
+    .upload(path, typedUploadBody(file), { upsert: false });
+  if (upErr) { await cleanupUploads(); throw upErr; }
 
   const baseRow = {
     user_id: user.id,
@@ -2591,20 +2653,50 @@ async function submitSubscriptionRequest({
   };
   const withKind = { ...baseRow, request_kind: kind, extension_days: kind === 'extension' ? extensionDays : null };
   const withBatch = { ...withKind, batch_id: batchId || null };
+  // #42's intake + agreement columns ride on the top rung. Extend Access and the
+  // other non-intake callers pass neither, so their insert is byte-identical to
+  // what it was before.
+  const withIntake = (intake || agreement)
+    ? { ...withBatch, ...(intake || {}), ...(agreement || {}) }
+    : withBatch;
 
-  // Column-resilience ladder: {base + kind + batch (#32)} → {base + kind (#20)} → {base}.
-  // A 42703/PGRST204 means the newest column isn't migrated yet — drop it and retry so
-  // submissions never regress on a partially-migrated database.
-  let res = await supabase.from('enrollment_requests').insert(withBatch).select().single();
-  if (res.error && (res.error.code === '42703' || res.error.code === 'PGRST204')) {
+  // Column-resilience ladder: {+ intake/agreement (#42)} → {base + kind + batch (#32)}
+  // → {base + kind (#20)} → {base}. A 42703/PGRST204 means the newest column isn't
+  // migrated yet — drop it and retry so submissions never regress on a partially
+  // migrated database. Dropping a rung costs DETAIL: batch_id can be assigned by an
+  // admin later, request_kind can be inferred from the plan.
+  //
+  // ★ THE AGREEMENT RUNG IS NOT DETAIL, SO IT DOES NOT DROP.
+  //   If this build ships before #42 is applied — which this repo has lived through,
+  //   #20/#21 sat unapplied in prod for two weeks — silently falling back would insert
+  //   a successful enrollment carrying no record that the student signed anything, no
+  //   version, and no price, while showing them a confirmation. The only trace would be
+  //   a console warning in their own browser. A visible, retryable failure is strictly
+  //   better than an enrollment whose legal record was discarded, so this rung throws.
+  const isMissingColumn = (e) => e && (e.code === '42703' || e.code === 'PGRST204');
+
+  let res = await supabase.from('enrollment_requests').insert(withIntake).select().single();
+  if (isMissingColumn(res.error) && agreement) {
+    console.error('[enroll] #42 not applied — refusing to store an enrollment without its signed agreement', res.error);
+    await cleanupUploads();
+    throw new Error(
+      'Enrollment is not finished being set up on the server, so your signed agreement could not be saved. ' +
+      'Nothing was charged or submitted — please tell Coach Alex’s team, then try again.'
+    );
+  }
+  if (isMissingColumn(res.error) && withIntake !== withBatch) {
+    console.warn('[enroll] intake columns missing — run db/2026-08-20-enrollment-intake.sql (#42)');
+    res = await supabase.from('enrollment_requests').insert(withBatch).select().single();
+  }
+  if (isMissingColumn(res.error)) {
     res = await supabase.from('enrollment_requests').insert(withKind).select().single();
   }
-  if (res.error && (res.error.code === '42703' || res.error.code === 'PGRST204')) {
+  if (isMissingColumn(res.error)) {
     res = await supabase.from('enrollment_requests').insert(baseRow).select().single();
   }
   const { data: row, error } = res;
   if (error) {
-    try { await supabase.storage.from('enrollment-receipts').remove([path]); } catch { /* best-effort */ }
+    await cleanupUploads();
     throw error;
   }
 
@@ -2669,12 +2761,642 @@ function BatchFactRow({ batchId, k = 'Batch' }) {
   return <FactRow k={k} v={`${row.name} (${row.code})`} />;
 }
 
+// ── Enrollment intake form primitives (#42) ──────────────────────────────────
+// The ported Google Apps Script enrollment form. Every input is driven by
+// INTAKE_FIELDS, so a field cannot be rendered without also being validated —
+// which is precisely how the source shipped a resume field with a label, a drop
+// zone and no `required` attribute for its entire life.
+
+// Matches the enrollment-receipts bucket, which #42 widened to 10 MB. A client
+// cap looser than the bucket's turns a rejected upload into an opaque storage
+// error instead of a sentence under the field.
+const MAX_INTAKE_FILE_BYTES = 10 * 1024 * 1024;
+
+// Labels for the three gates that are not text inputs, so the error summary can
+// name them the way the form does. Real fields resolve through intakeField().
+const INTAKE_GATE_LABELS = Object.freeze({
+  batchId: 'Batch (training month)',
+  agreementSignature: 'Training Agreement signature',
+  agreeCheck: 'Important Note & Disclaimer',
+});
+
+// One error sentence under one field. An icon carries the meaning alongside the
+// colour, so the state is legible without relying on red being perceivable.
+function FieldError({ text }) {
+  return (
+    <p className="mt-1.5 flex items-start gap-1.5" role="alert"
+      style={{ fontSize: 11.5, color: 'var(--status-danger-fg)', lineHeight: 1.45 }}>
+      <AlertCircle size={12} className="flex-shrink-0" style={{ marginTop: 1 }} />
+      <span>{text}</span>
+    </p>
+  );
+}
+
+// Coach Alex's commitment expectations, carried over from the Apps Script form.
+const ENROLL_DISCLAIMER_POINTS = Object.freeze([
+  'This program requires at least 3 hours of focused learning daily.',
+  "It also requires full commitment to job applications — even through rejections and intimidating job requirements. If you're not currently working, aim for 5–10 applications a day. If you have a full-time job, 2–3 a day is the target.",
+  'Accountability matters here. On the VIP Package, Coach Alex reviews your applications every Wednesday to check you are applying the strategies you set together.',
+  'Your progress, challenges and questions are discussed in the live Zoom sessions, so you get guided and stay on track.',
+  'Treat the training and the job hunt like a job. It takes your time, energy and full commitment to get results.',
+]);
+
+// Kept in the coach's own voice, Taglish and all — rewriting it into neutral
+// English would strip the register these students actually signed up for.
+const ENROLL_DISCLAIMER_NOTE = Object.freeze([
+  'For those attending na non-accounting graduates or sa mga walang accounting experience, I highly recommend na manood muna kayo ng basic Accounting 101 videos before the training.',
+  'Ituturo ko rin naman ito during the program, pero limited lang ang airtime natin because we want to focus more on the actual QuickBooks work, real client tasks, and practical application kaysa puro theories para sulit ang training ninyo.',
+  'Kapag may basic foundation na kayo before Day 1, mas magiging smooth ang learning experience ninyo, mas mabilis niyo mage-gets ang lessons, at mas confident kayo during hands-on activities.',
+  'Kung may accounting background ka na, no need na mag-watch ng fundamentals — ready ka na agad for the actual training.',
+  'Goal natin: pagdating ng training, ready na kayo, ahead of the game, at ma-maximize natin every minute ng training. See you soon, future QBO Pros.',
+]);
+
+const ENROLL_PREREAD_VIDEOS = Object.freeze([
+  { title: 'Accounting 101', sub: 'YouTube · English playlist',
+    href: 'https://www.youtube.com/watch?v=hTU6HE64Wd0&list=PLcRqJFBzcNZWNLjpu_iXI7MnzdoAQQ1yL' },
+  { title: 'Accounting 101 (Tagalog)', sub: 'YouTube · Tagalog playlist',
+    href: 'https://youtube.com/playlist?list=PLZS-ZAptkNy3inUCrYHLgO343WYBJjSVc' },
+]);
+
+// Frozen literals, NOT `C`/`var()` tokens. The agreement is captured by
+// html2canvas on its way to a PDF, and the styling conventions are explicit that
+// anything leaving the DOM uses INK — a var() that never resolves would print a
+// transparent hero and black-on-black clauses on a document someone signs.
+const DOC = Object.freeze({
+  ink: '#0F172A', body: '#334155', mute: '#64748B', line: '#E2E8F0',
+  navy: '#0A1F44', navyMid: '#11296B', blue: '#1E40AF', blueLo: '#2563EB',
+  wash: '#F8FAFC', washBlue: '#EFF6FF', edge: '#93C5FD',
+  ok: '#10B981', off: '#CBD5E1', warnBg: '#FEF2F2', warnEdge: '#DC2626', warnInk: '#7F1D1D',
+  white: '#FFFFFF',
+});
+
+const TIER_PILL_BG = Object.freeze({
+  sampler: 'linear-gradient(135deg,#60A5FA,#2563EB)',
+  silver: 'linear-gradient(135deg,#CBD5E1,#94A3B8)',
+  vip: 'linear-gradient(135deg,#FBBF24,#F59E0B)',
+});
+
+// Radio group rendered as pills. A native <input type="radio"> stays underneath
+// each label so keyboard and screen-reader behaviour is the browser's, not ours.
+function IntakePills({ field, value, onChange, invalid }) {
+  return (
+    <div className="flex flex-wrap gap-2" role="radiogroup" aria-labelledby={`intake-${field.key}-label`}
+      aria-invalid={invalid || undefined}>
+      {field.options.map(opt => {
+        const on = value === opt;
+        return (
+          <label key={opt}
+            className="intake-pill relative px-4 py-2.5 rounded-full cursor-pointer transition select-none"
+            style={on
+              ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff',
+                  border: '1px solid transparent', fontSize: 13, fontWeight: 600,
+                  boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -6px var(--primary-glow)` }
+              : { background: C.white, color: C.textSoft, border: `1px solid ${invalid ? 'var(--status-danger-bd)' : C.border}`,
+                  fontSize: 13, fontWeight: 500 }}>
+            <input type="radio" name={field.key} value={opt} checked={on}
+              onChange={() => onChange(opt)}
+              className="absolute opacity-0 w-0 h-0" />
+            {opt}
+          </label>
+        );
+      })}
+    </div>
+  );
+}
+
+// Click-or-drop upload. Rejects on size and reports it in-place rather than
+// letting the bucket refuse it later with a storage error nobody can action.
+function IntakeFileDrop({ field, file, onPick, onError, invalid }) {
+  const ref = useRef(null);
+  const take = (f) => {
+    if (!f) return;
+    // Both checks mirror the enrollment-receipts bucket. Failing here names the
+    // problem; failing at the bucket produces an opaque storage error mid-upload.
+    if (!fileTypeAllowed(field, f)) {
+      onError(field.key === 'paymentFile'
+        ? 'Upload your receipt as a PNG, JPG, WEBP or PDF.'
+        : 'Upload your resume as a PDF, Word document or image.');
+      return;
+    }
+    if (f.size > MAX_INTAKE_FILE_BYTES) {
+      onError(`That file is ${(f.size / 1024 / 1024).toFixed(1)} MB — the limit is 10 MB.`);
+      return;
+    }
+    onError('');
+    onPick(f);
+  };
+  return (
+    <div
+      role="button" tabIndex={0} aria-labelledby={`intake-${field.key}-label`}
+      onClick={() => ref.current?.click()}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); ref.current?.click(); } }}
+      onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
+      onDrop={(e) => { e.preventDefault(); e.stopPropagation(); take(e.dataTransfer.files?.[0]); }}
+      className="intake-drop rounded-2xl p-5 text-center cursor-pointer transition"
+      style={{
+        border: `2px dashed ${file ? 'var(--green-ring)' : invalid ? 'var(--status-danger-bd)' : 'rgba(10,132,255,0.30)'}`,
+        background: file ? 'var(--green-ring-faint)' : invalid ? 'var(--status-danger-bg)' : 'rgba(10,132,255,0.03)',
+      }}>
+      <input ref={ref} type="file" className="hidden" accept={field.accept}
+        onChange={(e) => { take(e.target.files?.[0]); e.target.value = ''; }} />
+      {file ? (
+        <div className="flex items-center justify-center gap-2 flex-wrap"
+          style={{ fontSize: 13, fontWeight: 600, color: 'var(--status-ok-fg)' }}>
+          <CheckCircle2 size={16} /> {file.name}
+          <span style={{ color: C.textMute, fontWeight: 500 }}>· {(file.size / 1024 / 1024).toFixed(1)} MB</span>
+        </div>
+      ) : (
+        <>
+          <Upload size={20} className="mx-auto" style={{ color: C.primary }} />
+          <div className="mt-1.5" style={{ fontSize: 13, fontWeight: 600, color: C.text }}>Click to upload or drag and drop</div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// Sign-to-accept pad: draw with a pointer, or type your name.
+//
+// ★ THE TYPED PATH IS NOT A CONVENIENCE, IT IS THE ONLY WAY SOME PEOPLE CAN ENROL.
+//   The signature is a mandatory gate (validateIntake → hasSignature), and a
+//   canvas you must draw on excludes keyboard-only users and anyone without a
+//   usable pointer — from a purchase flow, with no way round it. The Apps Script
+//   this replaces had the same hole. Typing renders the name into the SAME canvas
+//   in a script face, so both paths produce one PNG, one PDF layout, and one
+//   stored artefact; only `agreement_snapshot.signature_method` distinguishes them.
+//
+// ★ The canvas is sized ONCE and never resized. Resizing clears it, so an
+//   orientation change or an appearing scrollbar would silently erase a signature
+//   already drawn — the pad would look signed and submit nothing.
+//
+// ★ On remount (collapsing and reopening the agreement panel) the canvas comes
+//   back blank while `value` survives in the parent, so the header would read
+//   "✓ Signed" over an empty pad and invite a needless re-sign. `restore()`
+//   paints the stored PNG back.
+function SignaturePad({ onChange, value, disabled }) {
+  const canvasRef = useRef(null);
+  const stateRef = useRef({ drawing: false, ink: false, last: null, sized: false });
+  const [mode, setMode] = useState('draw');   // 'draw' | 'type'
+  const [typed, setTyped] = useState('');
+
+  const ctxOf = () => canvasRef.current?.getContext('2d') || null;
+
+  const size = useCallback(() => {
+    const canvas = canvasRef.current;
+    const st = stateRef.current;
+    if (!canvas || st.sized) return false;
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width) return false;
+    const ratio = window.devicePixelRatio || 1;
+    canvas.width = Math.round(rect.width * ratio);
+    canvas.height = Math.round(rect.height * ratio);
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.lineWidth = 2.2;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = DOC.ink;
+    st.sized = true;
+    return true;
+  }, []);
+
+  // Repaint an existing signature after a remount. Deliberately keyed on nothing
+  // but mount: `value` changing mid-session is this component's own doing.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      size();
+      const canvas = canvasRef.current;
+      if (!canvas || !value) return;
+      const img = new Image();
+      img.onload = () => {
+        const c = canvasRef.current;
+        if (!c) return;
+        const rect = c.getBoundingClientRect();
+        c.getContext('2d').drawImage(img, 0, 0, rect.width, rect.height);
+        stateRef.current.ink = true;
+      };
+      img.src = value;
+    }, 60);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const pointFrom = (e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  };
+
+  const start = (e) => {
+    if (disabled || mode !== 'draw') return;
+    size();
+    const st = stateRef.current;
+    st.drawing = true;
+    st.last = pointFrom(e);
+    canvasRef.current.setPointerCapture?.(e.pointerId);
+    e.preventDefault();
+  };
+
+  const move = (e) => {
+    const st = stateRef.current;
+    if (!st.drawing) return;
+    const ctx = ctxOf();
+    const p = pointFrom(e);
+    ctx.beginPath();
+    ctx.moveTo(st.last.x, st.last.y);
+    ctx.lineTo(p.x, p.y);
+    ctx.stroke();
+    st.last = p;
+    st.ink = true;
+    e.preventDefault();
+  };
+
+  // ★ Commits when the stroke ENDS, not only when the button is pressed.
+  //   Previously a student could draw their name, press Submit, and be told
+  //   "draw your signature" — which is exactly what they had just done — and any
+  //   stroke added after pressing the button was missing from the stored PNG.
+  const commit = (method = mode) => {
+    if (!stateRef.current.ink || !canvasRef.current) return;
+    onChange(canvasRef.current.toDataURL('image/png'), method);
+  };
+
+  // pointercancel fires instead of pointerup when the browser takes over the
+  // gesture (scroll, back-swipe) — without it the stroke never commits, on
+  // exactly the touch devices commit-on-end exists to serve.
+  const end = () => {
+    if (!stateRef.current.drawing) return;
+    stateRef.current.drawing = false;
+    commit('draw');
+  };
+
+  const wipe = () => {
+    const canvas = canvasRef.current;
+    const ctx = ctxOf();
+    if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    stateRef.current.ink = false;
+  };
+
+  const clear = () => {
+    wipe();
+    setTyped('');
+    onChange('', mode);
+  };
+
+  // Render a typed name into the same canvas, so the artefact is identical in
+  // shape to a drawn one and the PDF needs no second code path.
+  const renderTyped = (raw) => {
+    setTyped(raw);
+    if (!size() && !stateRef.current.sized) return;
+    const canvas = canvasRef.current;
+    const ctx = ctxOf();
+    if (!canvas || !ctx) return;
+    wipe();
+    const name = raw.trim();
+    if (!name) { onChange('', 'type'); return; }
+    const rect = canvas.getBoundingClientRect();
+    ctx.save();
+    ctx.fillStyle = DOC.ink;
+    ctx.textBaseline = 'middle';
+    // Shrink to fit rather than overflow — long names are common here.
+    let px = 46;
+    ctx.font = `italic ${px}px "Segoe Script","Brush Script MT","Snell Roundhand",cursive`;
+    while (px > 18 && ctx.measureText(name).width > rect.width - 36) {
+      px -= 2;
+      ctx.font = `italic ${px}px "Segoe Script","Brush Script MT","Snell Roundhand",cursive`;
+    }
+    ctx.fillText(name, 18, rect.height / 2);
+    ctx.restore();
+    stateRef.current.ink = true;
+    onChange(canvas.toDataURL('image/png'), 'type');
+  };
+
+  const switchMode = (next) => {
+    if (next === mode) return;
+    wipe();
+    setTyped('');
+    onChange('', next);
+    setMode(next);
+  };
+
+  const tab = (key, label) => (
+    <button type="button" onClick={() => switchMode(key)} aria-pressed={mode === key}
+      className="px-3 py-1.5 rounded-lg transition"
+      style={mode === key
+        ? { fontSize: 12, fontWeight: 700, color: '#fff', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, border: '1px solid transparent' }
+        : { fontSize: 12, fontWeight: 600, color: C.textSoft, background: C.white, border: `1px solid ${C.border}` }}>
+      {label}
+    </button>
+  );
+
+  return (
+    <div>
+      <div className="mb-2.5 flex items-center gap-2 flex-wrap">
+        {tab('draw', 'Draw it')}
+        {tab('type', 'Type it')}
+        <span style={{ fontSize: 11.5, color: C.textMute }}>
+          {mode === 'draw' ? 'Use a mouse, pen or finger.' : 'Your typed name is written into the signature line.'}
+        </span>
+      </div>
+
+      {mode === 'type' && (
+        <input type="text" value={typed} onChange={e => renderTyped(e.target.value)}
+          placeholder="Type your full name" maxLength={120} disabled={disabled}
+          aria-label="Type your full name to sign"
+          className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none mb-2.5"
+          style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+      )}
+
+      <div style={{ border: `1px dashed ${C.border}`, borderRadius: 10, background: '#fff', padding: 6 }}>
+        <canvas ref={canvasRef}
+          onPointerDown={start} onPointerMove={move} onPointerUp={end}
+          onPointerLeave={end} onPointerCancel={end}
+          aria-label={mode === 'draw' ? 'Signature pad — draw your signature here' : 'Signature preview'}
+          style={{ width: '100%', height: 170, display: 'block', touchAction: 'none',
+            cursor: disabled || mode !== 'draw' ? 'default' : 'crosshair', background: '#fff', borderRadius: 6 }} />
+      </div>
+
+      <div className="mt-2 flex items-center justify-between gap-3 flex-wrap">
+        <span style={{ fontSize: 12, color: value ? 'var(--status-ok-fg)' : C.textSoft, fontWeight: value ? 600 : 400 }}>
+          {value ? '✓ Signature captured' : 'Not signed yet'}
+        </span>
+        <div className="flex gap-2">
+          <button type="button" onClick={clear}
+            className="px-3 py-1.5 rounded-lg transition hover:opacity-90"
+            style={{ fontSize: 12, fontWeight: 600, color: C.textSoft, background: 'var(--wash)', border: `1px solid ${C.border}` }}>
+            Clear
+          </button>
+          {mode === 'draw' && (
+            <button type="button" onClick={() => commit('draw')}
+              className="px-3 py-1.5 rounded-lg transition hover:opacity-90"
+              style={value
+                ? { fontSize: 12, fontWeight: 700, color: 'var(--status-ok-fg)', background: 'var(--green-ring-faint)', border: '1px solid var(--green-ring)' }
+                : { fontSize: 12, fontWeight: 700, color: '#fff', background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, border: '1px solid transparent' }}>
+              {value ? '✓ Signature added' : 'Add signature'}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// The agreement itself. Rendered from the trainingAgreement model, so the copy a
+// student reads on screen and the copy captured into their PDF are one source.
+function AgreementDocInner({ model, signatureDataUrl, docRef }) {
+  const cell = (v) => {
+    if (v === true) return <span style={{ color: DOC.ok, fontWeight: 700 }}>✓</span>;
+    if (v === false) return <span style={{ color: DOC.off, fontWeight: 700 }}>—</span>;
+    return <span>{v}</span>;
+  };
+
+  const block = (b, i) => {
+    switch (b.type) {
+      case 'table':
+        return (
+          <div key={i} style={{ width: '100%', overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11.5, minWidth: 460 }}>
+              <thead>
+                <tr>
+                  <th />
+                  {model.columns.map(c => (
+                    <th key={c.key} style={{ padding: '6px 8px', background: DOC.line, fontSize: 11,
+                      color: DOC.ink, textAlign: 'center',
+                      outline: c.selected ? `2px solid ${DOC.blue}` : 'none', outlineOffset: 2, borderRadius: 3 }}>
+                      {c.label}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {model.rows.map((r, ri) => r.divider ? (
+                  <tr key={ri}>
+                    <td colSpan={model.columns.length + 1} style={{ background: DOC.ink, color: '#CBD5E1', fontWeight: 700,
+                      textTransform: 'uppercase', letterSpacing: '0.1em', fontSize: 10,
+                      padding: '5px 8px', textAlign: 'center' }}>
+                      — {r.divider} —
+                    </td>
+                  </tr>
+                ) : (
+                  <tr key={ri}>
+                    <td style={{ padding: '6px 8px', borderBottom: `1px solid ${DOC.line}`, fontWeight: 600, color: DOC.body }}>
+                      {r.feature}
+                    </td>
+                    {model.columns.map(c => (
+                      <td key={c.key} style={{ padding: '6px 8px', borderBottom: `1px solid ${DOC.line}`,
+                        textAlign: 'center', background: c.selected ? DOC.washBlue : 'transparent', color: DOC.body }}>
+                        {cell(r[c.key])}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p style={{ fontSize: 10.5, color: DOC.mute, fontStyle: 'italic', marginTop: 6 }}>{model.tableFootnote}</p>
+          </div>
+        );
+      case 'coverage':
+        return (
+          <ul key={i} style={{ columns: 2, columnGap: 24, margin: 0, paddingLeft: 16, fontSize: 12 }}>
+            {model.coverage.map((c, ci) => (
+              <li key={ci} style={{ margin: '0 0 5px', breakInside: 'avoid', color: DOC.body }}>{c}</li>
+            ))}
+          </ul>
+        );
+      case 'callouts':
+        return (
+          <div key={i} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 10 }}>
+            {b.items.map((c, ci) => (
+              <div key={ci} style={{ background: DOC.wash, borderLeft: `4px solid ${DOC.blueLo}`, borderRadius: 6, padding: '10px 13px' }}>
+                <h5 style={{ margin: '0 0 3px', fontSize: 12.5, color: DOC.ink, fontWeight: 700 }}>{c.title}</h5>
+                <p style={{ margin: 0, fontSize: 12, color: DOC.body, lineHeight: 1.5 }}>{c.body}</p>
+              </div>
+            ))}
+          </div>
+        );
+      case 'p':
+        return <p key={i} style={{ margin: '0 0 8px', fontSize: 12.5, lineHeight: 1.55, color: DOC.body }}>{b.text}</p>;
+      case 'warn':
+        return (
+          <div key={i} style={{ background: DOC.warnBg, borderLeft: `4px solid ${DOC.warnEdge}`, borderRadius: 6, padding: '12px 15px' }}>
+            <h5 style={{ margin: '0 0 3px', fontSize: 12.5, color: '#991B1B', fontWeight: 700 }}>{b.title}</h5>
+            <p style={{ margin: 0, fontSize: 12, color: DOC.warnInk, lineHeight: 1.5 }}>{b.text}</p>
+          </div>
+        );
+      case 'pledges':
+        return (
+          <div key={i} style={{ position: 'relative', background: `linear-gradient(135deg, ${DOC.washBlue}, #DBEAFE)`,
+            border: `1px solid ${DOC.edge}`, borderRadius: 12, padding: '24px 20px 18px', margin: '18px 0 8px' }}>
+            <span style={{ position: 'absolute', top: -12, left: 20, background: `linear-gradient(135deg, ${DOC.blueLo}, ${DOC.blue})`,
+              color: '#fff', fontSize: 10, fontWeight: 700, letterSpacing: '0.07em', textTransform: 'uppercase',
+              padding: '6px 14px', borderRadius: 999 }}>
+              ★ My promise as a student
+            </span>
+            <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>
+              {model.pledges.map((p, pi) => (
+                <li key={pi} style={{ margin: '0 0 7px', fontSize: 12.5, color: '#1E3A8A' }}>{p}</li>
+              ))}
+            </ul>
+          </div>
+        );
+      case 'commitments':
+        return (
+          <ul key={i} style={{ margin: 0, paddingLeft: 18 }}>
+            {model.coachCommitments.map((c, ci) => (
+              <li key={ci} style={{ margin: '0 0 6px', fontSize: 12.5, color: DOC.body }}>{c}</li>
+            ))}
+          </ul>
+        );
+      case 'policies':
+        return (
+          <ol key={i} style={{ paddingLeft: 20, margin: 0, fontSize: 11.5 }}>
+            {b.items.map((c, ci) => (
+              <li key={ci} style={{ margin: '0 0 8px', color: DOC.body }}>
+                <strong style={{ color: DOC.ink }}>{c.title}.</strong> {c.text}
+              </li>
+            ))}
+          </ol>
+        );
+      case 'tierGrid':
+        return (
+          <div key={i} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 9, margin: '12px 0' }}>
+            {model.columns.map(c => (
+              <div key={c.key} style={{ border: `1px solid ${c.selected ? DOC.blue : DOC.off}`, borderRadius: 10, padding: 11,
+                background: c.selected ? '#F8FBFF' : '#fff', textAlign: 'center',
+                display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'center',
+                boxShadow: c.selected ? `0 0 0 3px rgba(37,99,235,0.18)` : 'none' }}>
+                <span style={{ width: 18, height: 18, borderRadius: 5, display: 'inline-flex', alignItems: 'center',
+                  justifyContent: 'center', fontSize: 12, fontWeight: 800, color: '#fff',
+                  background: c.selected ? DOC.blueLo : '#fff', border: `2px solid ${c.selected ? DOC.blueLo : '#94A3B8'}` }}>
+                  {c.selected ? '✓' : ''}
+                </span>
+                <span style={{ display: 'inline-block', borderRadius: 999, color: '#fff', fontWeight: 700,
+                  textTransform: 'uppercase', fontSize: 10, letterSpacing: '0.05em', padding: '3px 11px',
+                  background: TIER_PILL_BG[c.key] }}>
+                  {c.label}
+                </span>
+                <span style={{ fontSize: 15, fontWeight: 700, color: DOC.ink }}>{c.priceLabel}</span>
+                <span style={{ fontSize: 10, color: DOC.mute }}>{c.format}</span>
+              </div>
+            ))}
+          </div>
+        );
+      case 'signatures':
+        return (
+          <div key={i} style={{ background: DOC.wash, borderRadius: 10, padding: 16, margin: '16px 0 4px',
+            display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14 }}>
+            {[
+              { role: 'Student', name: model.studentName, sig: signatureDataUrl },
+              { role: 'Coach', name: model.coachName, sig: null },
+            ].map(card => (
+              <div key={card.role} style={{ background: '#fff', borderRadius: 10, padding: '14px 16px', boxShadow: '0 1px 4px rgba(15,23,42,0.06)' }}>
+                <h6 style={{ margin: '0 0 12px', fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.07em', color: DOC.body, fontWeight: 700 }}>
+                  {card.role}
+                </h6>
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 10, color: DOC.mute, marginBottom: 10 }}>Full name</div>
+                  <div style={{ borderBottom: `1px solid #94A3B8`, fontSize: 12, color: DOC.ink, minHeight: 18 }}>{card.name || ' '}</div>
+                </div>
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 10, color: DOC.mute, marginBottom: 10 }}>Signature</div>
+                  <div style={{ borderBottom: `1px solid #94A3B8`, minHeight: 30, display: 'flex', alignItems: 'flex-end' }}>
+                    {card.sig
+                      ? <img src={card.sig} alt="" style={{ maxHeight: 46, maxWidth: '90%', display: 'block' }} />
+                      : <span>&nbsp;</span>}
+                  </div>
+                  {card.sig && (
+                    <div style={{ marginTop: 4, fontSize: 9.5, lineHeight: 1.35, color: DOC.blueLo, fontStyle: 'italic' }}>
+                      Signed electronically by {card.name || 'the student'}
+                    </div>
+                  )}
+                </div>
+                <div>
+                  <div style={{ fontSize: 10, color: DOC.mute, marginBottom: 10 }}>Date</div>
+                  <div style={{ borderBottom: `1px solid #94A3B8`, fontSize: 12, color: DOC.ink, minHeight: 18 }}>{model.signedOn || ' '}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        );
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <div ref={docRef} style={{ background: '#fff', color: DOC.ink, fontSize: 12.5 }}>
+      <div style={{ background: `linear-gradient(135deg, ${DOC.navy} 0%, ${DOC.navyMid} 50%, ${DOC.blue} 100%)`,
+        color: '#fff', padding: '22px 24px' }}>
+        <div style={{ color: '#22D3EE', fontSize: 10, fontWeight: 700, letterSpacing: '0.22em', textTransform: 'uppercase', marginBottom: 8 }}>
+          {model.eyebrow}
+        </div>
+        <div style={{ fontSize: 22, fontWeight: 700, lineHeight: 1.15 }}>{model.title}</div>
+        <div style={{ fontSize: 12.5, color: '#DBEAFE', marginTop: 4 }}>{model.subtitle}</div>
+      </div>
+
+      <div style={{ padding: '20px 24px 24px' }}>
+        <div style={{ background: DOC.wash, borderLeft: `4px solid ${DOC.blueLo}`, borderRadius: 6, padding: '10px 13px', marginBottom: 18 }}>
+          <p style={{ margin: 0, fontSize: 12, color: DOC.body, lineHeight: 1.6 }}>
+            <strong style={{ color: DOC.ink }}>Student:</strong> {model.studentName || '________________'}
+            {'  '}<strong style={{ color: DOC.ink }}>· Selected program:</strong> {model.planName || '—'}
+            {model.tierKey && (
+              <span style={{ display: 'inline-block', borderRadius: 999, color: '#fff', fontWeight: 700,
+                textTransform: 'uppercase', fontSize: 10, letterSpacing: '0.05em', padding: '2px 9px',
+                marginLeft: 6, background: TIER_PILL_BG[model.tierKey] }}>
+                {model.tierLabel}
+              </span>
+            )}
+            {'  '}<strong style={{ color: DOC.ink }}>· Investment:</strong>{' '}
+            {model.columns.find(c => c.selected)?.priceLabel || '—'}
+            {'  '}<strong style={{ color: DOC.ink }}>· Date:</strong> {model.signedOn || '—'}
+          </p>
+        </div>
+
+        {model.sections.map(s => (
+          <div key={s.n} style={{ marginTop: 22 }} data-agreement-section={s.n}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 11, marginBottom: 11 }}>
+              <div style={{ width: 26, height: 26, flex: '0 0 auto', borderRadius: 6, background: DOC.blue,
+                color: '#fff', fontSize: 14, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                {s.n}
+              </div>
+              <h4 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: DOC.ink }}>{s.title}</h4>
+            </div>
+            <div className="flex flex-col gap-2">{s.blocks.map(block)}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ background: DOC.navy, color: '#94A3B8', textAlign: 'center', fontSize: 11, padding: '12px 18px', letterSpacing: '0.03em' }}>
+        {model.footer}
+      </div>
+    </div>
+  );
+}
+
+// ★ Memoized, and it earns it. This tree is ~450 elements (19 comparison rows ×
+// 4 cells, 12 sections, 10 callouts, the tier grid, both signature cards) and it
+// is mounted TWICE for the whole form step — once on screen, once offscreen for
+// the PDF capture. Unmemoized, every keystroke in any of the 16 fields re-invoked
+// and reconciled both copies; React skipped the DOM writes because the output was
+// identical, so it cost nothing visible and everything in wasted work — worst on
+// the 4,000-character struggles textarea.
+//
+// All three props are already referentially stable: `model` comes from a useMemo,
+// `signatureDataUrl` is a string, `docRef` is a useRef. So memo cuts both trees
+// out of the typing path entirely, which is also what finally makes that useMemo
+// pay for itself.
+const AgreementDoc = React.memo(AgreementDocInner);
+
 // The paywall: pricing cards → manual payment instructions + proof-upload form.
 // Also hosts the "rejected / expired — resubmit" notice step (priorRequest present).
 // Renewal mode (renewal + currentSub): same flow reused for membership renewals —
 // a banner shows the current/previous term, cards mark the current plan, and an
 // optional onClose renders a Back pill (expired screen / in-app renew overlay).
-function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, onSignOut, renewal, currentSub, onClose, mode }) {
+// `priorRequest` and `prefillFrom` look similar and are deliberately separate.
+// `priorRequest` drives the rejected/expired NOTICE step and the overdue
+// self-expire, so callers narrow it to those statuses. `prefillFrom` is just a
+// source of answers and takes the latest request whatever its status. Conflating
+// them is why the renewal prefill originally fired only for members whose
+// previous request had been REJECTED — the one group least likely to be renewing.
+function EnrollmentPaywall({ user, profile, priorRequest, prefillFrom, overdue, onSubmitted, onSignOut, renewal, currentSub, onClose, mode }) {
   const isUpgrade = mode === 'upgrade';   // renewal-mode variant: "Upgrade your plan" copy + current-plan lock
   const showNotice = !!priorRequest;   // rejected, expired, or overdue-pending
   const [step, setStep] = useState(showNotice ? 'notice' : 'plans');   // notice | plans | form
@@ -2687,17 +3409,54 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
   const [openBatches, setOpenBatches] = useState(null);
   const [batchId, setBatchId] = useState(null);
 
-  const [fullName, setFullName] = useState(profile?.full_name || '');
-  const [phone, setPhone] = useState('');
-  const [cityCountry, setCityCountry] = useState('');
-  const [background, setBackground] = useState('');
-  const [amountPaid, setAmountPaid] = useState('');
-  const [reference, setReference] = useState('');
-  const [file, setFile] = useState(null);
+  // #42: the whole intake lives in one object keyed by INTAKE_FIELDS[].key, so
+  // adding a question needs no new useState — the registry drives state, render
+  // and validation together.
+  //
+  // A renewal, upgrade or resubmission prefills from the member's previous
+  // request — they answered these once already, and asking a paying member to
+  // retype their whole background to buy another term is friction pointed at
+  // exactly the wrong people. The agreement is still signed afresh each term
+  // (decision 2026-08-20): prices and clauses change between terms, so the
+  // signature has to match the document that was actually on screen.
+  const [values, setValues] = useState(() => ({
+    ...blankIntake(),
+    ...intakeValuesFromRequest(prefillFrom || priorRequest),
+    fullName: profile?.full_name || prefillFrom?.full_name || priorRequest?.full_name || '',
+    email: user?.email || '',
+  }));
+  const [receiptFile, setReceiptFile] = useState(null);
+  const [resumeFile, setResumeFile] = useState(null);
+  const [signature, setSignature] = useState('');      // PNG data URL, or ''
+  // How it was signed ('draw' | 'type') and WHEN. The instant is captured at the
+  // moment of signing rather than at submit: a form left open across midnight
+  // would otherwise stamp a date after the one printed on the document itself.
+  const [signatureMethod, setSignatureMethod] = useState('draw');
+  const [signedAt, setSignedAt] = useState(null);
   const [agree, setAgree] = useState(false);
+  const [agreementOpen, setAgreementOpen] = useState(false);
+  const [disclaimerOpen, setDisclaimerOpen] = useState(false);
+  // A field shows its error once it has been visited, or once a submit has been
+  // attempted — never on first paint, which would greet everyone with a wall of red.
+  const [touched, setTouched] = useState({});
+  const [submitTried, setSubmitTried] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [busyNote, setBusyNote] = useState('');
   const [err, setErr] = useState('');
-  const fileInputRef = useRef(null);
+  const [fileErr, setFileErr] = useState({});
+  const pdfDocRef = useRef(null);
+  // The last amount we auto-filled from the plan price; see the re-sync effect.
+  const autoAmountRef = useRef('');
+  const formRef = useRef(null);
+
+  const setValue = useCallback((key, v) => setValues(s => ({ ...s, [key]: v })), []);
+  const markTouched = useCallback((key) => setTouched(t => (t[key] ? t : { ...t, [key]: true })), []);
+
+  // Rendered on the signed document and stored with the signature. Fixed at mount
+  // so a form left open across midnight still signs with the date the student saw.
+  const signedOn = useMemo(() => new Date().toLocaleDateString('en-US', {
+    year: 'numeric', month: 'long', day: 'numeric',
+  }), []);
 
   useEffect(() => {
     let cancelled = false;
@@ -2724,44 +3483,146 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
   }, []);
 
   const selectPlan = (p) => {
-    setSelected(p);
-    setAmountPaid(String(p.price_php ?? ''));
+    const live = plans.find(x => x.key === p.key) || p;
+    setSelected(live);
+    autoAmountRef.current = String(live.price_php ?? '');
+    setValue('amountPaid', autoAmountRef.current);
     // VIP enrolls into a batch: preselect when exactly one is open.
-    setBatchId(isPremiumSegment(planSegment(p.key, { [p.key]: p })) && openBatches?.length === 1
+    setBatchId(isPremiumSegment(planSegment(live.key, { [live.key]: live })) && openBatches?.length === 1
       ? openBatches[0].id : null);
     setErr('');
     setStep('form');
   };
-  const selectedSegment = selected ? planSegment(selected.key, { [selected.key]: selected }) : 'general';
+
+  // ★ `selected` is the plan OBJECT captured when the card was clicked, and the
+  // catalog fetch can land AFTER that click — the cards paint from
+  // ENROLLMENT_PLANS_FALLBACK first. Reading price off the captured object while
+  // the agreement reads live `plans` is how a student ends up quoted one amount
+  // and signing another, which is the precise failure this whole port exists to
+  // stop. Everything price- or name-bearing reads `selectedPlan` instead.
+  const selectedPlan = useMemo(
+    () => (selected ? plans.find(p => p.key === selected.key) || selected : null),
+    [plans, selected],
+  );
+
+  // If the live price arrives (or changes) after selection, re-sync the amount —
+  // but never over a number the student typed. The guard compares against what we
+  // last auto-filled, so an edited field is left alone.
+  useEffect(() => {
+    const price = selectedPlan?.price_php;
+    if (price == null) return;
+    const next = String(price);
+    const prevAuto = autoAmountRef.current;
+    autoAmountRef.current = next;
+    setValues(s => (s.amountPaid === prevAuto || s.amountPaid === '' ? { ...s, amountPaid: next } : s));
+  }, [selectedPlan?.price_php]);
+
+  const selectedSegment = selectedPlan ? planSegment(selectedPlan.key, { [selectedPlan.key]: selectedPlan }) : 'general';
   // Require the picker only when open batches are actually listable — pre-#32
   // (openBatches null) or zero open batches degrade to admin-resolves-at-approval.
   const needsBatchPick = isPremiumSegment(selectedSegment) && Array.isArray(openBatches) && openBatches.length > 0;
 
-  const handleFile = (f) => {
-    setErr('');
-    if (!f) return;
-    if (!/^image\/(png|jpe?g|webp)$|^application\/pdf$/i.test(f.type)) {
-      setErr('Please upload your receipt as a PNG, JPG, WEBP or PDF file.');
-      return;
+  // ── #42 intake: validation, the live agreement, and submission ─────────────
+  // One call decides everything. The `required` attributes on the inputs are
+  // belt-and-braces; this is the gate.
+  const validation = validateIntake(values, {
+    plan: selectedPlan,
+    needsBatch: needsBatchPick,
+    batchId,
+    hasReceipt: !!receiptFile,
+    hasSignature: !!signature,
+    agreed: agree,
+  });
+  const errorFor = (key) => ((submitTried || touched[key]) ? validation.errors[key] : undefined);
+
+  // The document re-renders as the student types their name and picks a plan, so
+  // what they read is what they sign — and what the PDF captures.
+  const agreement = useMemo(() => agreementModel(selectedPlan?.key || null, plans, {
+    studentName: (values.fullName || '').trim(),
+    signedOn,
+  }), [selectedPlan?.key, plans, values.fullName, signedOn]);
+
+  const focusInvalid = (key) => {
+    // Open whichever collapsible holds the field first — otherwise focus lands on
+    // the accordion toggle (the first focusable inside the host) and the student
+    // is told to fix something they cannot see.
+    if (key === 'agreementSignature') setAgreementOpen(true);
+    if (key === 'agreeCheck') setDisclaimerOpen(true);
+    // Defer so the panel has rendered before we measure and focus.
+    requestAnimationFrame(() => {
+      const host = formRef.current?.querySelector(`[data-field="${key}"]`);
+      if (!host) return;
+      host.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const target = host.querySelector('input:not([type=hidden]):not([disabled]), textarea, select')
+        || host.querySelector('canvas, [role=button], button');
+      target?.focus?.({ preventScroll: true });
+    });
+  };
+
+  const uploadTo = async (prefix, blob, name, contentType) => {
+    const safe = String(name || 'file').replace(/[^\w.\-]+/g, '_');
+    const path = `${user.id}/${prefix}-${crypto.randomUUID()}-${safe}`;
+    // ★ The type must ride ON THE BODY, never in options: supabase-js posts a
+    // Blob as multipart FormData and takes the part's type from `blob.type`
+    // alone, ignoring `options.contentType` entirely. An untyped body therefore
+    // arrives as application/octet-stream, which this bucket rejects with a 415.
+    // See typedUploadBody() for the full explanation.
+    const type = contentType || blob?.type || contentTypeFor({ name, type: '' }) || '';
+    const body = blob?.type === type ? blob : new Blob([blob], { type });
+    const { error } = await supabase.storage.from('enrollment-receipts')
+      .upload(path, body, { upsert: false });
+    if (error) throw error;
+    return path;
+  };
+
+  const dataUrlToBlob = (dataUrl) => {
+    const [meta, b64] = String(dataUrl).split(',');
+    const mime = /:(.*?);/.exec(meta)?.[1] || 'image/png';
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+  };
+
+  // Captures the OFFSCREEN copy of the agreement, not the on-screen one: it is
+  // rendered at a fixed A4-ish width, so the PDF is identical whatever the
+  // student's viewport happens to be, and it does not matter whether they left
+  // the agreement panel collapsed.
+  const renderAgreementPdf = async () => {
+    const node = pdfDocRef.current;
+    if (!node) return null;
+    const [{ jsPDF }, h2c] = await Promise.all([import('jspdf'), import('html2canvas')]);
+    const html2canvas = h2c.default;
+    const canvas = await html2canvas(node, { scale: 2, backgroundColor: '#ffffff', useCORS: true });
+    const pdf = new jsPDF({ unit: 'pt', format: 'a4' });
+    const pageW = pdf.internal.pageSize.getWidth();
+    const pageH = pdf.internal.pageSize.getHeight();
+    const imgH = canvas.height * (pageW / canvas.width);
+    // JPEG, not PNG: a multi-page agreement as PNG runs to tens of megabytes and
+    // would exceed the bucket's own limit.
+    const img = canvas.toDataURL('image/jpeg', 0.92);
+    for (let offset = 0; offset < imgH; offset += pageH) {
+      if (offset > 0) pdf.addPage();
+      pdf.addImage(img, 'JPEG', 0, -offset, pageW, imgH);
     }
-    if (f.size > 5 * 1024 * 1024) {
-      setErr(`That file is ${(f.size / 1024 / 1024).toFixed(1)} MB — the receipt upload limit is 5 MB.`);
-      return;
-    }
-    setFile(f);
+    return pdf.output('blob');
   };
 
   const submit = async (e) => {
     e.preventDefault();
     if (busy) return;
     setErr('');
-    if (!selected) { setErr('Please choose a package first.'); setStep('plans'); return; }
-    if (!file) { setErr('Please upload a screenshot or PDF of your payment.'); return; }
-    const amt = Number(amountPaid);
-    if (!fullName.trim()) { setErr('Please enter your full name.'); return; }
-    if (!amt || amt <= 0) { setErr('Please enter the amount you sent.'); return; }
-    if (needsBatchPick && !batchId) { setErr('Please choose your batch (training month).'); return; }
-    if (!agree) { setErr('Please confirm the checkbox before submitting.'); return; }
+    setSubmitTried(true);
+    if (!selected) { setErr('Choose a package first.'); setStep('plans'); return; }
+    if (!validation.ok) {
+      const n = Object.keys(validation.errors).length;
+      setErr(n === 1
+        ? 'One answer still needs your attention — it is highlighted below.'
+        : `${n} answers still need your attention — they are highlighted below.`);
+      focusInvalid(validation.firstInvalid);
+      return;
+    }
+    const amt = parseAmountPaid(values.amountPaid);
 
     setBusy(true);
     try {
@@ -2785,15 +3646,93 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
       // In renewal mode, tag the request by the plan the member actually chose: the same
       // plan is a renewal, a different plan is an upgrade. Fresh signups are always 'new'.
       const kind = !renewal ? 'new'
-        : (currentSub?.plan_key && selected.key !== currentSub.plan_key) ? 'upgrade' : 'renewal';
+        : (currentSub?.plan_key && selectedPlan.key !== currentSub.plan_key) ? 'upgrade' : 'renewal';
 
+      // The signature, resume and PDF go up before the receipt + row insert, and
+      // every path lands in `uploaded` so submitSubscriptionRequest can remove them
+      // all if the insert fails. Without that list they would be stranded: the
+      // helper only ever knew about the receipt, so a failed insert left three
+      // unreferenced objects behind — nine after three retries, including three
+      // copies of the student's handwritten signature.
+      const uploaded = [];
+      setBusyNote('Saving your signed agreement…');
+      let signaturePath = null;
+      let resumePath = null;
+      let agreementPdfPath = null;
+      try {
+        signaturePath = await uploadTo('signature', dataUrlToBlob(signature), 'signature.png', 'image/png');
+        uploaded.push(signaturePath);
+      } catch (sigErr) {
+        console.error('[enroll] signature upload failed', sigErr);
+        throw new Error('We could not save your signature. Check your connection and submit again.');
+      }
+      // The resume is the one OPTIONAL field, so a failure here must not cost the
+      // student their enrollment — that is the whole reason its mime rule is narrow.
+      // Losing it is worth a warning, never a blocked submission.
+      if (resumeFile) {
+        try {
+          resumePath = await uploadTo('resume', resumeFile, resumeFile.name);
+          uploaded.push(resumePath);
+        } catch (resErr) {
+          console.warn('[enroll] resume upload skipped', resErr);
+          resumePath = null;
+        }
+      }
+      // The PDF is a convenience copy: agreement_version + agreement_snapshot
+      // already record what was agreed, so a rendering failure must not cost the
+      // student their enrollment.
+      try {
+        setBusyNote('Building your agreement PDF…');
+        const pdfBlob = await renderAgreementPdf();
+        if (pdfBlob) {
+          agreementPdfPath = await uploadTo('agreement', pdfBlob, 'training-agreement.pdf', 'application/pdf');
+          uploaded.push(agreementPdfPath);
+        }
+      } catch (pdfErr) {
+        console.warn('[enroll] agreement PDF skipped', pdfErr);
+      }
+
+      setBusyNote('Submitting your enrollment…');
       let row;
       try {
         row = await submitSubscriptionRequest({
-          user, planKey: selected.key, planName: selected.name, kind,
+          user, planKey: selectedPlan.key, planName: selectedPlan.name, kind,
           batchId: isPremiumSegment(selectedSegment) ? batchId : null,
-          amountExpected: Number(selected.price_php || 0), amountPaid: amt,
-          fields: { fullName, phone, cityCountry, background, reference }, file,
+          amountExpected: Number(selectedPlan.price_php || 0), amountPaid: amt,
+          fields: {
+            fullName: values.fullName,
+            phone: normalizePhone(values.cellphone),
+            cityCountry: values.cityCountry,
+            // Kept populated so the existing admin card keeps showing something
+            // useful; the structured answers live in their own columns below.
+            background: [values.collegeCourse, values.currentJob].map(s => (s || '').trim()).filter(Boolean).join(' · '),
+            reference: '',
+          },
+          file: receiptFile,
+          extraPaths: uploaded,
+          intake: {
+            college_course: (values.collegeCourse || '').trim(),
+            current_job: (values.currentJob || '').trim(),
+            ph_experience: values.phExperience,
+            us_experience: values.usExperience,
+            currently_employed: values.currentlyEmployed,
+            prior_training: (values.priorTraining || '').trim(),
+            referred_by: (values.referredBy || '').trim(),
+            resume_path: resumePath,
+            intake: {
+              _v: 1,
+              struggles: (values.struggles || '').trim(),
+              facebook_link: normalizeFacebook(values.facebookLink),
+            },
+          },
+          agreement: {
+            agreement_version: AGREEMENT_VERSION,
+            agreement_tier: agreement.tierKey,
+            agreement_signed_at: signedAt || new Date().toISOString(),
+            agreement_signature_path: signaturePath,
+            agreement_pdf_path: agreementPdfPath,
+            agreement_snapshot: { ...agreementSnapshot(agreement), signature_method: signatureMethod },
+          },
         });
       } catch (insErr) {
         // Double-submit (e.g. two tabs): a pending request already exists — just show it.
@@ -2808,6 +3747,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
       setErr(e2?.message || 'Could not submit your enrollment. Please try again.');
     } finally {
       setBusy(false);
+      setBusyNote('');
     }
   };
 
@@ -2821,6 +3761,72 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
     WebkitBackdropFilter: 'blur(28px) saturate(160%)',
     border: `1px solid ${GLASS.border}`,
     boxShadow: '0 20px 50px -16px rgba(10,30,80,0.18), inset 0 1px 0 rgba(255,255,255,0.6)',
+  };
+
+  // An invalid field is tinted, not just outlined — a red 1px border alone is easy
+  // to miss on a long form and invisible to anyone with a red/green deficiency.
+  const fieldStyle = (error, readOnly) => ({
+    ...inputStyle,
+    ...(readOnly ? { background: 'var(--wash)', color: C.textSoft } : null),
+    ...(error ? { border: '1px solid var(--status-danger-bd)', background: 'var(--status-danger-bg)' } : null),
+  });
+
+  // One renderer for every field, driven by its registry entry. This is what keeps
+  // "rendered" and "validated" from ever diverging.
+  const renderField = (f) => {
+    const error = errorFor(f.key);
+    // Width comes from the registry (`span`), never inferred from the field's
+    // type. Inferring it paired Full Name with Email and left College Course,
+    // Current Job Title and Amount Paid each alone in a half-width slot.
+    return (
+      <div key={f.key} data-field={f.key} className={f.span === 'half' ? undefined : 'sm:col-span-2'}>
+        {/* A <label for> only works against a labellable control. A pill group is a
+            radiogroup and a drop zone is a div, so those two get a plain <div>
+            carrying the id and are wired with aria-labelledby instead — five
+            labels here previously pointed at nothing and were inert to click. */}
+        {React.createElement(
+          f.type === 'choice' || f.type === 'file' ? 'div' : 'label',
+          f.type === 'choice' || f.type === 'file'
+            ? { className: labelCls, style: labelStyle, id: `intake-${f.key}-label` }
+            : { className: labelCls, style: labelStyle, htmlFor: `intake-${f.key}` },
+          <>
+            {f.label}{f.required ? <span style={{ color: C.primary }}> *</span> : <span style={{ color: C.textMute, textTransform: 'none', letterSpacing: 0 }}> · optional</span>}
+          </>,
+        )}
+        {f.hint && (
+          <p className="mb-1.5" style={{ fontSize: 11, color: C.textMute, marginTop: -4, lineHeight: 1.45 }}>{f.hint}</p>
+        )}
+
+        {f.type === 'choice' ? (
+          <IntakePills field={f} value={values[f.key]} invalid={!!error}
+            onChange={v => { setValue(f.key, v); markTouched(f.key); }} />
+        ) : f.type === 'file' ? (
+          <IntakeFileDrop field={f} invalid={!!error}
+            file={f.key === 'paymentFile' ? receiptFile : resumeFile}
+            onPick={file => {
+              if (f.key === 'paymentFile') setReceiptFile(file); else setResumeFile(file);
+              markTouched(f.key);
+            }}
+            onError={msg => setFileErr(s => ({ ...s, [f.key]: msg }))} />
+        ) : f.type === 'textarea' ? (
+          <textarea id={`intake-${f.key}`} rows={f.rows || 4} maxLength={f.maxLen}
+            className={inputCls + ' resize-none'} style={fieldStyle(error)}
+            value={values[f.key]} placeholder={f.placeholder} aria-invalid={!!error}
+            onChange={e => setValue(f.key, e.target.value)} onBlur={() => markTouched(f.key)} />
+        ) : (
+          <input id={`intake-${f.key}`} maxLength={f.maxLen}
+            type={f.type === 'email' ? 'email' : f.type === 'tel' ? 'tel' : 'text'}
+            autoComplete={f.key === 'fullName' ? 'name' : f.key === 'email' ? 'email' : f.key === 'cellphone' ? 'tel' : 'off'}
+            className={inputCls} style={fieldStyle(error, f.readOnly)}
+            value={values[f.key]} readOnly={f.readOnly} placeholder={f.placeholder} aria-invalid={!!error}
+            onChange={e => setValue(f.key, e.target.value)} onBlur={() => markTouched(f.key)} />
+        )}
+
+        {/* A rejected file and a "this is required" both describe the same empty
+            field, so show the more specific one rather than stacking both. */}
+        {(fileErr[f.key] || error) && <FieldError text={fileErr[f.key] || error} />}
+      </div>
+    );
   };
 
   const priorState = priorRequest ? (priorRequest.status === 'rejected' ? 'rejected' : 'expired') : null;
@@ -3028,115 +4034,309 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
           </div>
         )}
 
-        {/* Payment instructions + proof form */}
+        {/* Intake form — ONE column. The page shell stays max-w-5xl because the
+            plans step needs that width for three pricing cards, but a 1024px-wide
+            single-column form stretches every full-width input, so the form step
+            narrows to the source form's own 760px (html.index .forge-wrap). */}
         {step === 'form' && selected && (
-          <div className="mt-8">
+          <div className="mt-8 mx-auto w-full" style={{ maxWidth: 768 }}>
             <button onClick={() => { setStep('plans'); setErr(''); }}
               className="inline-flex items-center gap-1.5 text-xs font-semibold transition hover:opacity-80" style={{ color: C.primary }}>
               <ArrowLeft size={13} /> All packages
             </button>
 
-            <div className="mt-3 grid gap-5 lg:grid-cols-[1fr,360px] items-start">
-              {/* Form card */}
-              <form onSubmit={submit} className="rounded-3xl p-6 md:p-7" style={cardStyle}>
+            {/* Offscreen copy of the agreement, rendered at a fixed print width and
+                captured by html2canvas on submit. Separating it from the on-screen
+                copy means the PDF is identical on every device, and it works whether
+                or not the student ever expanded the panel — capturing a collapsed
+                node would otherwise yield a blank page.
+
+                ★ The 0×0 overflow:hidden wrapper is load-bearing, not tidiness. An
+                absolutely positioned element is out of FLOW but still contributes to
+                its ancestors' SCROLLABLE overflow, so this ~3,300px document was
+                adding that much dead scroll height beneath the form. overflow:hidden
+                establishes a clip, which ends that contribution, while the inner node
+                keeps its real 794px box — clipping is visual, so html2canvas still
+                measures and captures the document in full. */}
+            <div aria-hidden="true" style={{ position: 'absolute', width: 0, height: 0, overflow: 'hidden', pointerEvents: 'none' }}>
+              <div style={{ width: 794 }}>
+                <AgreementDoc model={agreement} signatureDataUrl={signature} docRef={pdfDocRef} />
+              </div>
+            </div>
+
+            <div className="mt-3">
+              <form ref={formRef} onSubmit={submit} noValidate className="enroll-intake rounded-3xl p-6 md:p-7" style={cardStyle}>
                 <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 16, color: C.text }}>Your enrollment details</div>
                 <p className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>
-                  Submit your payment proof and Coach Alex’s team will manually review your enrollment.
+                  Every question is required except your resume. Coach Alex’s team reviews each enrollment personally.
                 </p>
 
-                <div className="mt-5 grid gap-3.5 sm:grid-cols-2">
-                  <div>
-                    <label className={labelCls} style={labelStyle}>Full name *</label>
-                    <input className={inputCls} style={inputStyle} value={fullName} onChange={e => setFullName(e.target.value)} placeholder="Juan dela Cruz" required />
+                {/* Error summary. Appears only after a submit attempt, lists every
+                    outstanding answer, and each entry jumps to its field — so a long
+                    form never hides the one thing standing between you and submitting. */}
+                {submitTried && !validation.ok && (
+                  <div className="mt-4 rounded-xl px-4 py-3" role="alert"
+                    style={{ background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)' }}>
+                    <div className="flex items-center gap-2" style={{ fontSize: 12.5, fontWeight: 700, color: 'var(--status-danger-fg)' }}>
+                      <AlertTriangle size={14} />
+                      {Object.keys(validation.errors).length === 1
+                        ? 'One answer still needs your attention'
+                        : `${Object.keys(validation.errors).length} answers still need your attention`}
+                    </div>
+                    <ul className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
+                      {Object.keys(validation.errors).map(key => (
+                        <li key={key}>
+                          <button type="button" onClick={() => focusInvalid(key)}
+                            className="underline underline-offset-2 transition hover:opacity-80"
+                            style={{ fontSize: 12, color: 'var(--status-danger-fg)' }}>
+                            {intakeField(key)?.label || INTAKE_GATE_LABELS[key] || key}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
                   </div>
-                  <div>
-                    <label className={labelCls} style={labelStyle}>Email</label>
-                    <input className={inputCls} style={{ ...inputStyle, background: 'var(--wash)', color: C.textSoft }} value={user?.email || ''} readOnly />
-                  </div>
-                  <div>
-                    <label className={labelCls} style={labelStyle}>Phone</label>
-                    <input className={inputCls} style={inputStyle} value={phone} onChange={e => setPhone(e.target.value)} placeholder="09XX-XXX-XXXX" />
-                  </div>
-                  <div>
-                    <label className={labelCls} style={labelStyle}>City & country</label>
-                    <input className={inputCls} style={inputStyle} value={cityCountry} onChange={e => setCityCountry(e.target.value)} placeholder="Manila, Philippines" />
-                  </div>
-                  {isPremiumSegment(selectedSegment) && (
-                    <div className="sm:col-span-2">
-                      <label className={labelCls} style={labelStyle}>Batch (training month) {needsBatchPick ? '*' : ''}</label>
-                      {needsBatchPick ? (
-                        <select className={inputCls} style={inputStyle} value={batchId || ''} required
-                          onChange={e => setBatchId(e.target.value || null)}>
-                          <option value="">Choose your batch…</option>
-                          {openBatches.map(b => (
-                            <option key={b.id} value={b.id}>{b.name} ({b.code})</option>
-                          ))}
-                        </select>
-                      ) : (
-                        <div className="px-3.5 py-2.5 rounded-xl" style={{ background: 'var(--wash)', fontSize: 12.5, color: C.textSoft }}>
-                          No batch is open for self-enrollment right now — Coach Alex’s team will assign yours when your payment is verified.
+                )}
+
+                {INTAKE_SECTIONS.map((section, si) => {
+                  const sectionFields = INTAKE_FIELDS.filter(f => f.section === section.key);
+                  return (
+                    <div key={section.key} className={si === 0 ? 'mt-6' : 'mt-7 pt-6'}
+                      style={si === 0 ? undefined : { borderTop: `1px solid ${GLASS.borderSoft}` }}>
+                      <h3 style={{ fontFamily: fontDisplay, fontSize: 12, fontWeight: 700, letterSpacing: '0.12em',
+                        textTransform: 'uppercase', color: C.primary }}>
+                        <span style={{ fontFamily: fontMono, opacity: 0.55 }}>{section.eyebrow}</span>
+                        {'  '}{section.label}
+                      </h3>
+
+                      {/* Bank details live INSIDE section 03, directly above the
+                          amount and the receipt upload — which is where html.index
+                          puts its .pay-detail-card, and where they are actually
+                          needed. As a sibling column they forced a second column and
+                          sat far from the fields that use them. */}
+                      {section.key === 'payment' && (
+                        <div className="mt-4 rounded-2xl overflow-hidden"
+                          style={{ border: `1px solid ${GLASS.borderSoft}`, background: GLASS.card }}>
+                          <div className="px-4 py-3 flex items-baseline justify-between gap-x-4 gap-y-1 flex-wrap"
+                            style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+                            <span className="inline-flex items-center gap-2"
+                              style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 13.5, color: C.text }}>
+                              <Wallet size={14} style={{ color: C.primary }} /> How to pay
+                            </span>
+                            <span style={{ fontSize: 12, color: C.textSoft }}>
+                              Send <span style={{ fontWeight: 700, color: C.text, fontFamily: fontMono }}>{phpFmt(selectedPlan.price_php)}</span> to any account below.
+                            </span>
+                          </div>
+                          <div className="px-4 py-3">
+                            <div className="grid gap-x-6 sm:grid-cols-2">
+                              {[
+                                ['BPI', pay.bpi, Landmark],
+                                ['Security Bank', pay.security_bank, Landmark],
+                                ['GCash', pay.gcash, Phone],
+                                ['Account name', pay.account_name, Wallet],
+                              ].filter(([, v]) => v).map(([k, v, Icon]) => (
+                                <div key={k} className="flex items-center justify-between gap-3 py-2"
+                                  style={{ borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+                                  <span className="inline-flex items-center gap-2" style={{ fontSize: 12, color: C.textSoft }}>
+                                    <Icon size={13} style={{ color: C.textMute }} /> {k}
+                                  </span>
+                                  <span style={{ fontFamily: fontMono, fontSize: 12.5, fontWeight: 600, color: C.text }}>{v}</span>
+                                </div>
+                              ))}
+                            </div>
+                            {pay.note && (
+                              <div className="mt-3 px-3 py-2.5 rounded-xl"
+                                style={{ background: 'rgba(10,132,255,0.05)', border: '1px solid rgba(10,132,255,0.14)', fontSize: 12, color: C.textSoft, lineHeight: 1.5 }}>
+                                {pay.note}
+                              </div>
+                            )}
+                            {pay.notify_email && (
+                              <div className="mt-3 flex items-start gap-2" style={{ fontSize: 11.5, color: C.textMute, lineHeight: 1.5 }}>
+                                <Mail size={13} className="flex-shrink-0 mt-px" />
+                                <span>Optionally, also email your proof to <a href={`mailto:${pay.notify_email}`} style={{ color: C.primary, fontWeight: 600 }}>{pay.notify_email}</a>.</span>
+                              </div>
+                            )}
+                            <div className="mt-3 flex items-start gap-2 px-3 py-2.5 rounded-xl"
+                              style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', fontSize: 11.5, color: 'var(--status-warn-strong-fg)', lineHeight: 1.5 }}>
+                              <Clock size={13} className="flex-shrink-0 mt-px" />
+                              <span>Manual review — Coach Alex’s team verifies payments personally, usually within 24 hours.</span>
+                            </div>
+                          </div>
                         </div>
                       )}
-                      <p className="mt-1.5" style={{ fontSize: 11, color: C.textMute }}>
-                        Your batch is your live-training group — it also unlocks that batch’s private VIP community.
-                      </p>
+
+                      {sectionFields.length > 0 && (
+                        <div className="mt-4 grid gap-3.5 sm:grid-cols-2">
+                          {sectionFields.map(renderField)}
+                        </div>
+                      )}
+
+                      {/* Cohort pick — only for a plan that enrols into a batch, and
+                          only when open batches are actually listable. */}
+                      {section.key === 'payment' && isPremiumSegment(selectedSegment) && (
+                        <div className="mt-3.5" data-field="batchId">
+                          <label className={labelCls} style={labelStyle}>
+                            Batch (training month){needsBatchPick ? <span style={{ color: C.primary }}> *</span> : null}
+                          </label>
+                          {needsBatchPick ? (
+                            <select className={inputCls} style={fieldStyle(errorFor('batchId'))} value={batchId || ''}
+                              onChange={e => { setBatchId(e.target.value || null); markTouched('batchId'); }}
+                              onBlur={() => markTouched('batchId')}
+                              aria-invalid={!!errorFor('batchId')}>
+                              <option value="">Choose your batch…</option>
+                              {openBatches.map(b => (
+                                <option key={b.id} value={b.id}>{b.name} ({b.code})</option>
+                              ))}
+                            </select>
+                          ) : (
+                            <div className="px-3.5 py-2.5 rounded-xl" style={{ background: 'var(--wash)', fontSize: 12.5, color: C.textSoft }}>
+                              No batch is open for self-enrollment right now — Coach Alex’s team will assign yours when your payment is verified.
+                            </div>
+                          )}
+                          {errorFor('batchId') ? <FieldError text={errorFor('batchId')} /> : (
+                            <p className="mt-1.5" style={{ fontSize: 11, color: C.textMute }}>
+                              Your batch is your live-training group — it also unlocks that batch’s private VIP community.
+                            </p>
+                          )}
+                        </div>
+                      )}
+
+                      {/* The agreement: read it, then sign it. */}
+                      {section.key === 'agreement' && (
+                        <div className="mt-4" data-field="agreementSignature">
+                          <div className="rounded-2xl overflow-hidden" style={{ border: `1px solid ${errorFor('agreementSignature') ? 'var(--status-danger-bd)' : C.border}` }}>
+                            <button type="button" onClick={() => setAgreementOpen(o => !o)}
+                              aria-expanded={agreementOpen} aria-controls="ta-panel"
+                              className="w-full flex items-center justify-between gap-3 px-4 py-3.5 text-left transition"
+                              style={{ background: SHEEN }}>
+                              <span className="flex items-center gap-3 min-w-0">
+                                <span className="flex-shrink-0 grid place-items-center rounded-lg"
+                                  style={{ width: 34, height: 34, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff' }}>
+                                  <FileCheck2 size={16} />
+                                </span>
+                                <span className="min-w-0">
+                                  <span className="block truncate" style={{ fontFamily: fontDisplay, fontSize: 14, fontWeight: 700, color: C.text }}>
+                                    View and sign Training Agreement
+                                  </span>
+                                  <span className="block truncate" style={{ fontSize: 11.5, color: signature ? 'var(--status-ok-fg)' : C.textSoft, fontWeight: signature ? 600 : 400 }}>
+                                    {signature
+                                      ? `✓ Signed by ${(values.fullName || '').trim() || 'you'}`
+                                      : 'Required — read it, then draw your signature'}
+                                  </span>
+                                </span>
+                              </span>
+                              <ChevronDown size={18} style={{ color: C.primary, flexShrink: 0, transition: 'transform .2s', transform: agreementOpen ? 'rotate(180deg)' : 'none' }} />
+                            </button>
+
+                            {agreementOpen && (
+                              <div id="ta-panel" className="px-4 pb-4">
+                                <div className="rounded-xl overflow-auto overscroll-contain"
+                                  style={{ border: `1px solid ${C.border}`, maxHeight: '58vh', background: '#fff' }}>
+                                  <AgreementDoc model={agreement} signatureDataUrl={signature} />
+                                </div>
+
+                                <div className="mt-4 rounded-xl p-4" style={{ background: 'rgba(10,132,255,0.05)', border: '1px solid rgba(10,132,255,0.16)' }}>
+                                  <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: C.primary }}>
+                                    Electronic signature <span style={{ color: C.primary }}>*</span>
+                                  </div>
+                                  <p className="mt-1 mb-3" style={{ fontSize: 11.5, color: C.textSoft }}>
+                                    Drawing your signature here has the same effect as signing on paper. Dated {signedOn}.
+                                  </p>
+                                  <SignaturePad value={signature}
+                                    onChange={(v, method) => {
+                                      setSignature(v);
+                                      if (method) setSignatureMethod(method);
+                                      setSignedAt(v ? new Date().toISOString() : null);
+                                      markTouched('agreementSignature');
+                                    }} />
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                          {errorFor('agreementSignature') && <FieldError text={errorFor('agreementSignature')} />}
+                        </div>
+                      )}
+
+                      {/* Disclaimer + the confirmation tick. */}
+                      {section.key === 'final' && (
+                        <div className="mt-5 rounded-2xl p-5" data-field="agreeCheck"
+                          style={{ background: GLASS.card, border: `1px solid ${errorFor('agreeCheck') ? 'var(--status-danger-bd)' : GLASS.borderSoft}` }}>
+                          <button type="button" onClick={() => setDisclaimerOpen(o => !o)}
+                            aria-expanded={disclaimerOpen} className="w-full flex items-center gap-3 text-left">
+                            <span className="flex-shrink-0 grid place-items-center rounded-lg"
+                              style={{ width: 34, height: 34, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff' }}>
+                              <Info size={16} />
+                            </span>
+                            <span className="flex-1 min-w-0">
+                              <span className="block" style={{ fontFamily: fontDisplay, fontSize: 14, fontWeight: 700, color: C.text }}>
+                                Important note &amp; disclaimer
+                              </span>
+                              <span className="block" style={{ fontSize: 11.5, color: C.textSoft }}>Please read before you tick the box</span>
+                            </span>
+                            <ChevronDown size={16} style={{ color: C.textMute, flexShrink: 0, transition: 'transform .2s', transform: disclaimerOpen ? 'rotate(180deg)' : 'none' }} />
+                          </button>
+
+                          {disclaimerOpen && (
+                            <div className="mt-4">
+                              <ol className="flex flex-col gap-1.5">
+                                {ENROLL_DISCLAIMER_POINTS.map((point, i) => (
+                                  <li key={i} className="relative rounded-xl py-2.5 pr-3" style={{ paddingLeft: 42, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+                                    <span className="absolute grid place-items-center rounded-full"
+                                      style={{ left: 10, top: '50%', transform: 'translateY(-50%)', width: 24, height: 24,
+                                        fontFamily: fontMono, fontWeight: 700, fontSize: 11, color: '#fff',
+                                        background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+                                      {i + 1}
+                                    </span>
+                                    <span style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.55 }}>{point}</span>
+                                  </li>
+                                ))}
+                              </ol>
+
+                              <div className="mt-4 rounded-xl p-4" style={{ background: 'rgba(10,132,255,0.05)', border: '1px solid rgba(10,132,255,0.16)' }}>
+                                <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: C.primary }}>
+                                  For non-accounting backgrounds
+                                </div>
+                                {ENROLL_DISCLAIMER_NOTE.map((para, i) => (
+                                  <p key={i} className="mt-2" style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.6 }}>{para}</p>
+                                ))}
+                                <div className="mt-3 flex flex-col gap-2">
+                                  {ENROLL_PREREAD_VIDEOS.map(v => (
+                                    <a key={v.href} href={v.href} target="_blank" rel="noopener noreferrer"
+                                      className="flex items-center gap-2.5 px-3.5 py-2.5 rounded-xl transition hover:opacity-90"
+                                      style={{ background: C.white, border: `1px solid ${C.border}`, textDecoration: 'none' }}>
+                                      <span className="flex-shrink-0 grid place-items-center rounded-lg"
+                                        style={{ width: 26, height: 26, background: 'linear-gradient(180deg,#FF5C5C,#E13C3C)', color: '#fff' }}>
+                                        <Play size={11} />
+                                      </span>
+                                      <span className="min-w-0 flex-1">
+                                        <span className="block truncate" style={{ fontSize: 12.5, fontWeight: 600, color: C.text }}>{v.title}</span>
+                                        <span className="block" style={{ fontSize: 10.5, color: C.textMute }}>{v.sub}</span>
+                                      </span>
+                                      <ExternalLink size={13} style={{ color: C.primary, flexShrink: 0 }} />
+                                    </a>
+                                  ))}
+                                </div>
+                              </div>
+                            </div>
+                          )}
+
+                          <label className="mt-4 flex items-start gap-2.5 cursor-pointer select-none">
+                            <input type="checkbox" checked={agree} className="mt-0.5"
+                              onChange={e => { setAgree(e.target.checked); markTouched('agreeCheck'); }} />
+                            <span style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.5 }}>
+                              <strong style={{ color: C.text }}>I have read and understand the Important Note &amp; Disclaimer,</strong>{' '}
+                              including the commitment terms and the time, energy and effort this program requires.
+                            </span>
+                          </label>
+                          {errorFor('agreeCheck') && <FieldError text={errorFor('agreeCheck')} />}
+                        </div>
+                      )}
                     </div>
-                  )}
-                  <div className="sm:col-span-2">
-                    <label className={labelCls} style={labelStyle}>Course / background</label>
-                    <textarea className={inputCls + ' resize-none'} style={inputStyle} rows={2} value={background} onChange={e => setBackground(e.target.value)}
-                      placeholder="e.g. BS Accountancy · 3 yrs PH bookkeeping · currently an audit associate" />
-                  </div>
-                  <div>
-                    <label className={labelCls} style={labelStyle}>Amount paid / sent (₱) *</label>
-                    <input className={inputCls} style={{ ...inputStyle, fontFamily: fontMono }} type="number" min="1" step="any"
-                      value={amountPaid} onChange={e => setAmountPaid(e.target.value)} placeholder={String(selected.price_php)} required />
-                  </div>
-                  <div>
-                    <label className={labelCls} style={labelStyle}>Payment reference no.</label>
-                    <input className={inputCls} style={{ ...inputStyle, fontFamily: fontMono }} value={reference} onChange={e => setReference(e.target.value)} placeholder="e.g. GCash ref. 9001234567" />
-                  </div>
-                </div>
-
-                {/* Receipt upload */}
-                <div className="mt-4">
-                  <label className={labelCls} style={labelStyle}>Screenshot of payment *</label>
-                  <div
-                    role="button" tabIndex={0}
-                    aria-label="Upload payment screenshot or PDF"
-                    onClick={() => fileInputRef.current?.click()}
-                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInputRef.current?.click(); } }}
-                    onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
-                    onDrop={(e) => { e.preventDefault(); e.stopPropagation(); handleFile(e.dataTransfer.files?.[0]); }}
-                    className="rounded-2xl p-6 text-center cursor-pointer transition"
-                    style={{ border: `2px dashed ${file ? 'rgba(40,166,71,0.45)' : 'rgba(10,132,255,0.30)'}`, background: file ? 'rgba(40,166,71,0.05)' : 'rgba(10,132,255,0.03)' }}>
-                    <input ref={fileInputRef} type="file" className="hidden"
-                      accept=".pdf,.png,.jpg,.jpeg,.webp,application/pdf,image/png,image/jpeg,image/webp"
-                      onChange={(e) => { handleFile(e.target.files?.[0]); e.target.value = ''; }} />
-                    {file ? (
-                      <div className="flex items-center justify-center gap-2" style={{ fontSize: 13, fontWeight: 600, color: 'var(--status-ok-fg)' }}>
-                        <CheckCircle2 size={16} /> {file.name} <span style={{ color: C.textMute, fontWeight: 500 }}>· {(file.size / 1024 / 1024).toFixed(1)} MB</span>
-                      </div>
-                    ) : (
-                      <>
-                        <Upload size={22} className="mx-auto" style={{ color: C.primary }} />
-                        <div className="mt-2" style={{ fontSize: 13, fontWeight: 600, color: C.text }}>Click to upload or drag & drop</div>
-                        <div className="mt-0.5" style={{ fontSize: 11.5, color: C.textMute }}>Your GCash / BPI / Security Bank receipt · PDF, PNG, JPG or WEBP · up to 5 MB</div>
-                      </>
-                    )}
-                  </div>
-                </div>
-
-                {/* Confirmation */}
-                <label className="mt-4 flex items-start gap-2.5 cursor-pointer select-none">
-                  <input type="checkbox" checked={agree} onChange={e => setAgree(e.target.checked)} className="mt-0.5" />
-                  <span style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.5 }}>
-                    I confirm I sent <span style={{ fontWeight: 700, color: C.text }}>{phpFmt(Number(amountPaid) || selected.price_php)}</span> to one of the accounts listed here, and I understand access is granted after Coach Alex’s team manually verifies my payment.
-                  </span>
-                </label>
+                  );
+                })}
 
                 {err && (
-                  <div className="mt-4 flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs" style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: '1px solid rgba(208,35,35,0.18)' }}>
+                  <div className="mt-5 flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs"
+                    style={{ background: 'var(--status-danger-bg)', color: 'var(--status-danger-fg)', border: '1px solid var(--status-danger-bd)' }}>
                     <AlertTriangle size={14} className="flex-shrink-0 mt-px" /> <span>{err}</span>
                   </div>
                 )}
@@ -3145,52 +4345,12 @@ function EnrollmentPaywall({ user, profile, priorRequest, overdue, onSubmitted, 
                   className="mt-5 w-full py-3 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
                   style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
                   {busy ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
-                  {busy ? 'Submitting…' : 'Submit my enrollment'}
+                  {busy ? (busyNote || 'Submitting…') : 'Submit my enrollment'}
                 </button>
                 <p className="mt-2.5 text-center" style={{ fontSize: 11, color: C.textMute }}>
                   This is a manual review, not an online checkout — you’ll see a confirmation screen right after submitting.
                 </p>
               </form>
-
-              {/* Payment instructions card */}
-              <div className="rounded-3xl overflow-hidden" style={cardStyle}>
-                <div className="px-6 pt-5 pb-4" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
-                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 15, color: C.text }}>How to pay</div>
-                  <div className="mt-1" style={{ fontSize: 12, color: C.textSoft }}>
-                    Send <span style={{ fontWeight: 700, color: C.text }}>{phpFmt(selected.price_php)}</span> for <span style={{ fontWeight: 600 }}>{selected.name}</span> to any account below.
-                  </div>
-                </div>
-                <div className="px-6 py-5">
-                  {[
-                    ['BPI', pay.bpi, Landmark],
-                    ['Security Bank', pay.security_bank, Landmark],
-                    ['GCash', pay.gcash, Phone],
-                    ['Account name', pay.account_name, Wallet],
-                  ].filter(([, v]) => v).map(([k, v, Icon]) => (
-                    <div key={k} className="flex items-center justify-between gap-3 py-2.5" style={{ borderBottom: `1px solid ${GLASS.borderSoft}` }}>
-                      <span className="inline-flex items-center gap-2" style={{ fontSize: 12, color: C.textSoft }}>
-                        <Icon size={13} style={{ color: C.textMute }} /> {k}
-                      </span>
-                      <span style={{ fontFamily: fontMono, fontSize: 12.5, fontWeight: 600, color: C.text }}>{v}</span>
-                    </div>
-                  ))}
-                  {pay.note && (
-                    <div className="mt-3 px-3 py-2.5 rounded-xl" style={{ background: 'rgba(10,132,255,0.05)', border: '1px solid rgba(10,132,255,0.14)', fontSize: 12, color: C.textSoft, lineHeight: 1.5 }}>
-                      {pay.note}
-                    </div>
-                  )}
-                  {pay.notify_email && (
-                    <div className="mt-3 flex items-start gap-2" style={{ fontSize: 11.5, color: C.textMute, lineHeight: 1.5 }}>
-                      <Mail size={13} className="flex-shrink-0 mt-px" />
-                      <span>Optionally, also email your proof to <a href={`mailto:${pay.notify_email}`} style={{ color: C.primary, fontWeight: 600 }}>{pay.notify_email}</a>.</span>
-                    </div>
-                  )}
-                  <div className="mt-4 flex items-start gap-2 px-3 py-2.5 rounded-xl" style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', fontSize: 11.5, color: 'var(--status-warn-strong-fg)', lineHeight: 1.5 }}>
-                    <Clock size={13} className="flex-shrink-0 mt-px" />
-                    <span>Manual review — Coach Alex’s team verifies payments personally, usually within 24 hours.</span>
-                  </div>
-                </div>
-              </div>
             </div>
           </div>
         )}
@@ -6131,14 +7291,14 @@ export default function BookkeeperProToolkit() {
               onRefreshProfile={refreshProfile} onRefreshRequest={enroll.refresh} />;
           }
           return <EnrollmentPaywall user={user} profile={profile} renewal currentSub={enroll.sub}
-            priorRequest={prior} overdue={!!overdue} onClose={() => setRenewNow(false)}
+            priorRequest={prior} prefillFrom={r} overdue={!!overdue} onClose={() => setRenewNow(false)}
             onSubmitted={(row) => { setRenewNow(false); enroll.refresh(row); }} onSignOut={signOut} />;
         }
         case 'paywall':
         case 'paywall_notice':
           // No request yet, rejected, expired, or overdue-pending → paywall (with a resubmit
           // notice step when a prior request exists).
-          return <EnrollmentPaywall user={user} profile={profile} priorRequest={r} overdue={!!overdue}
+          return <EnrollmentPaywall user={user} profile={profile} priorRequest={r} prefillFrom={r} overdue={!!overdue}
             onSubmitted={enroll.refresh} onSignOut={signOut} />;
         case 'pass':
         default:
@@ -6875,6 +8035,7 @@ export default function BookkeeperProToolkit() {
               The paywall child paints the mesh itself; C.bg is the opaque fallback behind it. */}
           <div className="fixed inset-0 z-[70] overflow-y-auto" style={{ background: C.bg }}>
             <EnrollmentPaywall user={user} profile={profile} renewal mode="upgrade" currentSub={enroll.sub}
+              prefillFrom={enroll.latestReq}
               onClose={closeAccountSurface}
               onSubmitted={(row) => { closeAccountSurface(); enroll.refresh(row); }}
               onSignOut={signOut} />
@@ -6888,7 +8049,7 @@ export default function BookkeeperProToolkit() {
               The paywall child paints the mesh itself; C.bg is the opaque fallback behind it. */}
           <div className="fixed inset-0 z-[70] overflow-y-auto" style={{ background: C.bg }}>
             <EnrollmentPaywall user={user} profile={profile} renewal currentSub={enroll.sub}
-              priorRequest={renewPrior}
+              priorRequest={renewPrior} prefillFrom={enroll.latestReq}
               onClose={closeAccountSurface}
               onSubmitted={(row) => { closeAccountSurface(); enroll.refresh(row); }}
               onSignOut={signOut} />
@@ -8441,6 +9602,24 @@ function AdminEnrollments({ onCountChange }) {
 
   // Receipt preview — FIRST signed-URL use in the codebase: the bucket is private, so
   // getPublicUrl would 400. Images open in a modal; PDFs open in a new tab.
+  // #42: resume + signed-agreement PDF live in the same private bucket as the
+  // receipt, so they open the same way — a short-lived signed URL, never a public
+  // one. Both are always documents, so they open in a tab rather than the image
+  // lightbox the receipt uses.
+  const viewIntakeFile = async (path, label) => {
+    if (!path) return;
+    try {
+      const { data, error } = await supabase.storage
+        .from('enrollment-receipts').createSignedUrl(path, 600);
+      if (error) throw error;
+      if (!data?.signedUrl) throw new Error('Could not create a signed URL.');
+      window.open(data.signedUrl, '_blank', 'noopener');
+    } catch (e) {
+      console.error(`[enroll] ${label} preview failed`, e);
+      setErr(`Could not open the ${label}: ${e?.message || e}`);
+    }
+  };
+
   const viewReceipt = async (r) => {
     if (!r.receipt_path) { setErr('No receipt was uploaded with this request.'); return; }
     try {
@@ -8917,10 +10096,70 @@ function AdminEnrollments({ onCountChange }) {
                 {expanded && (
                   <div className="mt-3.5 pt-3.5 grid gap-3.5 md:grid-cols-2" style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
                     <div>
-                      <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: C.textMute }}>Background</div>
-                      <div className="mt-1.5" style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>
-                        {r.background || '—'}
-                      </div>
+                      {/* #42: the full intake. Rows submitted before the intake form
+                          shipped have none of these columns, so they fall back to the
+                          old single free-text background rather than showing dashes. */}
+                      {(r.ph_experience || r.college_course || r.current_job || r.intake?.struggles) ? (
+                        <>
+                          <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: C.textMute }}>Applicant intake</div>
+                          <div className="mt-2 grid gap-x-4 gap-y-1.5 sm:grid-cols-2" style={{ fontSize: 12 }}>
+                            {[
+                              ['Course', r.college_course],
+                              ['Current role', r.current_job],
+                              ['PH experience', r.ph_experience],
+                              ['US/AU/UK experience', r.us_experience],
+                              ['Employed', r.currently_employed],
+                              ['Prior QBO/Xero training', r.prior_training],
+                              ['Referred by', r.referred_by],
+                              ['Facebook', r.intake?.facebook_link],
+                            ].filter(([, v]) => v).map(([k, v]) => (
+                              <div key={k} className="flex gap-1.5 min-w-0">
+                                <span style={{ color: C.textMute, flexShrink: 0 }}>{k}:</span>
+                                <span className="truncate" style={{ color: C.textSoft, fontWeight: 600 }} title={v}>{v}</span>
+                              </div>
+                            ))}
+                          </div>
+                          {r.intake?.struggles && (
+                            <div className="mt-3">
+                              <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: C.textMute }}>Three struggles</div>
+                              <div className="mt-1.5" style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>
+                                {r.intake.struggles}
+                              </div>
+                            </div>
+                          )}
+                          {(r.resume_path || r.agreement_pdf_path || r.agreement_version) && (
+                            <div className="mt-3 flex items-center gap-2 flex-wrap">
+                              {r.resume_path && (
+                                <button onClick={() => viewIntakeFile(r.resume_path, 'resume')}
+                                  className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1.5 transition"
+                                  style={{ background: 'var(--primary-tint)', color: C.primary, border: '1px solid var(--primary-selection)' }}>
+                                  <FileText size={12} /> Resume
+                                </button>
+                              )}
+                              {r.agreement_pdf_path && (
+                                <button onClick={() => viewIntakeFile(r.agreement_pdf_path, 'agreement')}
+                                  className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1.5 transition"
+                                  style={{ background: 'var(--primary-tint)', color: C.primary, border: '1px solid var(--primary-selection)' }}>
+                                  <FileCheck2 size={12} /> Signed agreement
+                                </button>
+                              )}
+                              {r.agreement_version && (
+                                <span className="inline-flex items-center gap-1" style={{ fontSize: 10.5, color: C.textMute }}>
+                                  <ShieldCheck size={11} style={{ color: 'var(--status-ok-fg)' }} />
+                                  Signed {r.agreement_tier ? `as ${r.agreement_tier.toUpperCase()} ` : ''}· v{r.agreement_version}
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </>
+                      ) : (
+                        <>
+                          <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: C.textMute }}>Background</div>
+                          <div className="mt-1.5" style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>
+                            {r.background || '—'}
+                          </div>
+                        </>
+                      )}
                       {r.rejection_reason && r.status === 'rejected' && (
                         <div className="mt-3 px-3 py-2.5 rounded-xl" style={{ background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)', fontSize: 12, color: C.text }}>
                           <span style={{ fontWeight: 600 }}>Rejection reason: </span>{r.rejection_reason}
@@ -13942,6 +15181,12 @@ function timeAgo(iso) {
 }
 
 const COMMUNITY_PAGE_SIZE = 20;
+// Every column the feed and detail views actually read. Deliberately excludes
+// community_posts.search_tsv (a stored generated tsvector, #40) - it is index
+// input, never display data, and select('*') would ship it on every row.
+const COMMUNITY_POST_COLS = 'id,channel_id,space_id,author_id,author_name,author_avatar_url,'
+  + 'title,body,tag_slug,status,pinned,comments_locked,comment_count,'
+  + 'created_at,updated_at,last_activity_at';
 // Reaction set mirrors the community_reactions CHECK constraint — keep in sync.
 const COMMUNITY_REACTIONS = [
   { type: 'like',      label: 'Like',      icon: ThumbsUp },
@@ -14057,7 +15302,7 @@ function communitySchemaGap(e) {
 // avatar only, never email). Typing "@que" opens a keyboard-navigable picker; picking
 // inserts the @[Name](uuid) markup at the caret. When `onSubmitEnter` is set (the comment
 // composer), Enter sends — unless the picker is open, where Enter selects instead.
-function MentionTextarea({ value, onChange, placeholder, rows = 3, maxLength = 5000, className = '', disabled = false, onSubmitEnter = null, spaceId = null }) {
+function MentionTextarea({ value, onChange, placeholder, rows = 3, maxLength = 5000, className = '', disabled = false, onSubmitEnter = null, spaceId = null, channelId = null }) {
   const taRef = useRef(null);
   const [sugg, setSugg] = useState(null);        // { items, hi } | null
   const debRef = useRef(0);
@@ -14089,8 +15334,14 @@ function MentionTextarea({ value, onChange, placeholder, rows = 3, maxLength = 5
       try {
         // #32: scope the directory to the active space — only its eligible
         // members come back (server-enforced; null = pre-#32 signature).
-        const { data, error } = await supabase.rpc('search_community_members',
-          spaceId ? { p_query: t.query.trim(), p_space_id: spaceId } : { p_query: t.query.trim() });
+        // #40 made the directory CHANNEL-scoped: a call without p_channel_id
+        // returns nothing (fail-closed), so omitting it killed autocomplete
+        // everywhere. The 2-arg shape is kept for a pre-#40 database, whose
+        // function has no p_channel_id parameter and would reject it.
+        const args = channelId
+          ? { p_query: t.query.trim(), p_space_id: spaceId || null, p_channel_id: channelId }
+          : (spaceId ? { p_query: t.query.trim(), p_space_id: spaceId } : { p_query: t.query.trim() });
+        const { data, error } = await supabase.rpc('search_community_members', args);
         if (error) throw error;
         if (seq !== seqRef.current) return;
         const items = (data || []).slice(0, 8);
@@ -14355,27 +15606,739 @@ function CommunityCategoryRail({ tags, counts, activeTag, filter, onPick, totalC
 // any kind this build doesn't know, so a space that arrives before/after a schema
 // change still renders.
 const COMMUNITY_SPACE_ICONS = { general: Globe, vip: Sparkles };
-function CommunitySpaceSwitcher({ spaces, activeId, onSwitch }) {
-  if (!spaces || spaces.length < 2) return null;
+// ── Channel rail (#40) ───────────────────────────────────────────────────────
+// The navigation surface. Two facts are encoded in two different positions,
+// because they answer different questions: the LEADING glyph says what kind of
+// room this is (# text / megaphone announcement), the TRAILING lock says who may
+// be in it. Unread is carried by type WEIGHT rather than extra chrome, so a
+// glance down the rail reads as "these have something for me".
+//
+// Channel names are set in fontMono on purpose: a channel is an addressable
+// identifier, not prose — the same vernacular as the Chart of Accounts codes
+// this audience works in all day.
+const CommunityChannelRow = React.memo(function CommunityChannelRow({ row, active, onOpen }) {
+  const KindIcon = row.channel_kind === 'announcement' ? Megaphone : Hash;
+  const unread = unreadLabel(row.unread_count);
+  const hot = row.has_unread === true && !active;
   return (
-    <div className="mb-4 max-w-6xl mx-auto flex items-center gap-2 flex-wrap" role="tablist" aria-label="Community spaces">
-      {spaces.map(sp => {
-        const Icon = COMMUNITY_SPACE_ICONS[sp.kind] || MessagesSquare;
-        const active = sp.id === activeId;
+    <a
+      href={tabHref('community', { space: row.space_slug, channel: row.channel_slug })}
+      onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); onOpen(row); } }}
+      aria-current={active ? 'true' : undefined}
+      title={row.channel_topic || row.channel_name}
+      className="group flex items-center gap-2 pl-2 pr-2 py-1.5 rounded-lg text-sm no-underline"
+      style={{
+        background: active ? 'var(--primary-tint)' : 'transparent',
+        borderLeft: `2px solid ${active ? C.primary : 'transparent'}`,
+        color: active ? C.text : (hot ? C.text : C.textSoft),
+        fontWeight: hot ? 800 : (active ? 700 : 500),
+      }}
+    >
+      <KindIcon size={14} style={{ flexShrink: 0, opacity: active ? 1 : 0.75 }} />
+      <span className="truncate" style={{ fontFamily: fontMono, fontSize: 12.5 }}>{row.channel_name}</span>
+      <span className="ml-auto flex items-center gap-1.5" style={{ flexShrink: 0 }}>
+        {row.is_restricted && (
+          <Lock size={10} aria-label="Restricted channel" style={{ opacity: 0.55 }} />
+        )}
+        {unread && (
+          <span className="px-1.5 rounded-full gh-tnum"
+            style={{ background: C.primary, color: '#fff', fontSize: 10, fontWeight: 800, lineHeight: '16px' }}>
+            {unread}
+          </span>
+        )}
+      </span>
+    </a>
+  );
+});
+
+// Customize mode mirrors the sidebar's admin rename idiom exactly: a mode you
+// enter deliberately, inline inputs, Enter to confirm a field, Done to commit.
+// Only the DISPLAY name is editable — `slug` is the permalink that ?channel=
+// links and community:lastChannel resolve against, so the server freezes it.
+function CommunityRenameRow({ id, value, placeholder, mono, draft, onDraft, disabled = false, invalid = false }) {
+  const shown = draft[id] !== undefined ? draft[id] : value;
+  return (
+    <input
+      className="gh-input w-full py-1"
+      aria-label={`Rename ${value}`}
+      value={shown}
+      placeholder={placeholder}
+      disabled={disabled}
+      maxLength={60}
+      aria-invalid={invalid || undefined}
+      style={{
+        ...(mono ? { fontFamily: fontMono, fontSize: 12.5 } : { fontSize: 12.5 }),
+        ...(invalid ? { borderColor: 'var(--status-danger-fg)' } : {}),
+      }}
+      onChange={(e) => onDraft(id, e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); }
+        // stopPropagation matters: SidePanel listens for Escape on window, so in the
+        // mobile drawer this would revert one field AND close the drawer, losing
+        // every other draft.
+        if (e.key === 'Escape') {
+          e.preventDefault(); e.stopPropagation();
+          onDraft(id, undefined); e.currentTarget.blur();
+        }
+      }}
+    />
+  );
+}
+
+function CommunityChannelRail({
+  groups, activeId, collapsed, onToggleCat, onOpen, isAdmin, onManage,
+  editing = false, draftNames = {}, onDraftName, onToggleEditing, onSaveNames, renaming = false,
+  nameErrors = {},
+}) {
+  if (!groups.length) return null;
+  return (
+    <nav aria-label="Community channels" className="flex flex-col gap-3">
+      {editing && (
+        <p className="text-xs px-1" style={{ color: C.textMute }}>
+          Rename channels and categories. Their links keep working — only the label changes.
+        </p>
+      )}
+      {groups.map(g => {
+        const isOpen = !collapsed[g.key] || editing;
+        const groupUnread = g.channels.reduce((n, c) => n + (Number(c.unread_count) || 0), 0);
         return (
-          <button key={sp.id} role="tab" aria-selected={active} onClick={() => onSwitch(sp.slug)}
-            className={`gh-pill inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold${active ? ' is-active' : ''}`}
-            title={sp.kind === 'general' ? 'Open to every active member' : 'Private batch community'}>
-            <Icon size={13} /> {sp.name}
-            {sp.kind !== 'general' && <Lock size={10} style={{ opacity: 0.6 }} />}
-            <span className="px-1.5 py-0.5 rounded-full inline-flex items-center gap-1"
-              style={{ background: 'var(--wash)', fontSize: 10, fontWeight: 700, color: C.textMute }}>
-              <Users size={9} /> {Number(sp.member_count) || 0}
-            </span>
-          </button>
+          <div key={g.key}>
+            {editing && g.categoryId ? (
+              <div className="px-1 pb-1">
+                <CommunityRenameRow id={`cat:${g.categoryId}`} value={g.categoryName}
+                  placeholder="Category name" draft={draftNames} disabled={renaming}
+                  invalid={!!nameErrors[`cat:${g.categoryId}`]} onDraft={onDraftName} />
+              </div>
+            ) : (
+              <button
+                onClick={() => onToggleCat(g.key)}
+                aria-expanded={isOpen}
+                className="w-full flex items-center gap-1 px-1 py-1 rounded"
+                style={{ fontSize: 10.5, letterSpacing: '0.08em', textTransform: 'uppercase',
+                         fontWeight: 800, color: C.textMute }}
+              >
+                <ChevronDown size={12} style={{ transform: isOpen ? 'none' : 'rotate(-90deg)', transition: 'transform .15s' }} />
+                {g.isPrivate && <Lock size={10} style={{ opacity: 0.7 }} />}
+                <span className="truncate text-left">{g.categoryName}</span>
+                {!isOpen && groupUnread > 0 && (
+                  <span className="ml-auto px-1.5 rounded-full gh-tnum"
+                    style={{ background: C.primary, color: '#fff', fontSize: 9.5, fontWeight: 800 }}>
+                    {unreadLabel(groupUnread)}
+                  </span>
+                )}
+              </button>
+            )}
+            {isOpen && (
+              <div className="mt-0.5 flex flex-col gap-0.5">
+                {g.channels.map(c => (
+                  editing ? (
+                    <div key={c.channel_id} className="flex items-center gap-1.5 px-1">
+                      {c.channel_kind === 'announcement'
+                        ? <Megaphone size={13} style={{ flexShrink: 0, opacity: 0.7 }} />
+                        : <Hash size={13} style={{ flexShrink: 0, opacity: 0.7 }} />}
+                      <CommunityRenameRow id={`ch:${c.channel_id}`} value={c.channel_name}
+                        placeholder="Channel name" mono draft={draftNames} disabled={renaming}
+                        invalid={!!nameErrors[`ch:${c.channel_id}`]} onDraft={onDraftName} />
+                    </div>
+                  ) : (
+                    <CommunityChannelRow key={c.channel_id} row={c}
+                      active={c.channel_id === activeId} onOpen={onOpen} />
+                  )
+                ))}
+              </div>
+            )}
+          </div>
         );
       })}
-    </div>
+      {isAdmin && (
+        <div className="mt-1 flex flex-col gap-1.5">
+          {editing && onSaveNames ? (
+            <div className="flex items-center gap-1.5">
+              <button onClick={onSaveNames} disabled={renaming}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-bold text-white"
+                style={ADMIN_BTN_OK}>
+                {renaming ? 'Saving…' : 'Done'}
+              </button>
+              <button onClick={() => onToggleEditing(false)} disabled={renaming}
+                className="gh-btn-ghost px-2.5 py-1.5 text-xs font-bold">
+                Cancel
+              </button>
+            </div>
+          ) : (
+            onToggleEditing && (<button onClick={() => onToggleEditing(true)}
+              className="inline-flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-xs font-bold"
+              style={{ color: C.textSoft, background: 'var(--wash)' }}>
+              <Pencil size={13} /> Rename channels
+            </button>)
+          )}
+          <button onClick={onManage}
+            className="inline-flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-xs font-bold"
+            style={{ color: C.primary, background: 'var(--wash)' }}>
+            <Settings size={13} /> Manage community
+          </button>
+        </div>
+      )}
+    </nav>
+  );
+}
+
+// ── Admin community editor (#40) ─────────────────────────────────────────────
+// A long editing form, so it uses the portaled SidePanel shell (never a
+// hand-rolled fixed overlay — inside a keep-alive TabPanel that anchors to the
+// tab canvas, not the viewport). Reordering is accessible move up/down; no
+// drag-and-drop dependency is added for it.
+const AUDIENCE_LABELS = {
+  space: 'Everyone in this space',
+  plans: 'Selected plans',
+  batches: 'Selected batches',
+  plans_and_batches: 'Selected plans AND batches',
+  admins_only: 'Admins only',
+};
+
+function CommunityAdminEditor({ onClose, onSaved }) {
+  const [cfg, setCfg] = useState(null);
+  const [state, setState] = useState('loading');   // loading | ready | error
+  const [err, setErr] = useState('');
+  const [section, setSection] = useState('channels');
+  const [busy, setBusy] = useState(false);
+  const [draft, setDraft] = useState(null);        // channel being edited/created
+  const [confirm, setConfirm] = useState(null);    // { impact, onGo }
+  const [settingsDraft, setSettingsDraft] = useState(null);
+  const [newCatFor, setNewCatFor] = useState(null);   // space id the inline 'add category' row is open for
+  const [newCatName, setNewCatName] = useState('');
+  const [loadErr, setLoadErr] = useState(null);   // raw error, so the body can classify it
+
+  const load = useCallback(async () => {
+    setState('loading'); setErr(''); setLoadErr(null);
+    try {
+      const { data, error } = await supabase.rpc('admin_community_config');
+      if (error) throw error;
+      setCfg(data);
+      setSettingsDraft({ ...((data && data.settings) || {}) });
+      setState('ready');
+    } catch (e) {
+      setLoadErr(e);
+      setErr(appErrorMessage(e, 'Could not load the community settings.'));
+      setState('error');
+    }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const run = async (fn, failCopy) => {
+    setBusy(true); setErr('');
+    try { await fn(); await load(); onSaved?.(); return true; }
+    catch (e) { setErr(appErrorMessage(e, failCopy)); return false; }
+    finally { setBusy(false); }
+  };
+
+  const spaces = cfg?.spaces || [];
+  const categories = cfg?.categories || [];
+  const chans = cfg?.channels || [];
+  const plans = cfg?.plans || [];
+  const batches = cfg?.batches || [];
+  const settings = cfg?.settings || {};
+
+  const planName = (k) => (plans.find(p => p.key === k)?.name) || k;
+  const batchName = (id) => {
+    const b = batches.find(x => x.id === id);
+    return b ? (b.name || b.code) : 'a batch';
+  };
+
+  const addCategory = (spaceId) => {
+    const name = newCatName.trim();
+    if (!name) return;
+    run(async () => {
+      const { error } = await supabase.rpc('admin_save_channel_category', {
+        p_id: null, p_space_id: spaceId, p_name: name, p_status: 'active',
+      });
+      if (error) throw error;
+      setNewCatFor(null); setNewCatName('');
+    }, 'Could not create the category.');
+  };
+
+  const newChannel = (spaceId) => setDraft({
+    id: null, space_id: spaceId,
+    category_id: (categories.find(c => c.space_id === spaceId && c.status === 'active') || {}).id || null,
+    slug: '', name: '', topic: '', kind: 'text', audience_mode: 'space',
+    plan_keys: [], batch_ids: [],
+    member_posting: true, member_comments: true, member_reactions: true, member_attachments: true,
+  });
+
+  const saveChannel = async (d) => run(async () => {
+    const { error } = await supabase.rpc('admin_save_community_channel', {
+      p_id: d.id, p_space_id: d.space_id, p_category_id: d.category_id,
+      p_slug: d.id ? null : (normalizeChannelSlug(d.slug || d.name) || null),
+      // #41: null now means 'leave the topic alone'; '' is how you clear one.
+      p_name: d.name, p_topic: d.topic || '', p_kind: d.kind,
+      p_audience_mode: d.audience_mode,
+      p_plan_keys: d.plan_keys || [], p_batch_ids: d.batch_ids || [],
+      p_member_posting: d.member_posting, p_member_comments: d.member_comments,
+      p_member_reactions: d.member_reactions, p_member_attachments: d.member_attachments,
+    });
+    if (error) throw error;
+    setDraft(null);
+  }, 'Could not save the channel.');
+
+  // Privacy changes get a confirmation that names who gains and who loses, so an
+  // admin never widens a private room by accident.
+  // The preview runs OUTSIDE run(), so it needs its own in-flight guard:
+  // without it a double-click stacks two previews and two confirm dialogs, and
+  // the drawer stays closable mid-request.
+  const attemptSaveChannel = async (d) => {
+    if (busy) return;
+    const original = chans.find(c => c.id === d.id);
+    const audienceChanged = !original
+      || original.audience_mode !== d.audience_mode
+      || JSON.stringify([...(original.plan_keys || [])].sort()) !== JSON.stringify([...(d.plan_keys || [])].sort())
+      || JSON.stringify([...(original.batch_ids || [])].sort()) !== JSON.stringify([...(d.batch_ids || [])].sort());
+    if (!d.id || !audienceChanged) return saveChannel(d);
+    setBusy(true);
+    try {
+      const { data, error } = await supabase.rpc('admin_channel_privacy_preview', {
+        p_channel_id: d.id, p_audience_mode: d.audience_mode,
+        p_plan_keys: d.plan_keys || [], p_batch_ids: d.batch_ids || [],
+      });
+      if (error) throw error;
+      const impact = accessDiff({}, data || {});
+      if (!impact.changed) return saveChannel(d);
+      setConfirm({ impact, onGo: () => { setConfirm(null); saveChannel(d); } });
+    } catch (e) {
+      setErr(appErrorMessage(e, 'Could not work out who this change affects.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const body = () => {
+    if (state === 'loading') return <AdminListSkeleton rows={4} />;
+    if (state === 'error') {
+      // A missing migration is a SETUP state, not a failure — say which file to run
+      // rather than repeating a red banner. (The panel-level banner is suppressed
+      // while we're in this state, or the same sentence renders twice.)
+      const needsMigration = isMigrationMissing(loadErr);
+      return (
+        <div className="glass-card rounded-2xl p-5">
+          <div className="flex items-start gap-3">
+            <div className="p-2 rounded-xl" style={{ background: 'var(--wash-strong)' }}>
+              <Database size={18} style={{ color: needsMigration ? C.primary : 'var(--status-danger-fg)' }} />
+            </div>
+            <div className="min-w-0">
+              <h3 className="font-bold" style={{ fontFamily: fontDisplay, color: C.text }}>
+                {needsMigration ? 'Finish the channel setup' : 'Could not load the community settings'}
+              </h3>
+              <p className="text-sm mt-1" style={{ color: C.textSoft }}>
+                {needsMigration
+                  ? 'Channels need one database migration that has not been run yet. Nothing was changed.'
+                  : err}
+              </p>
+              {needsMigration && (
+                <p className="text-xs mt-2" style={{ color: C.textMute, fontFamily: fontMono }}>
+                  db/2026-08-18-community-channels.sql
+                </p>
+              )}
+              {needsMigration && (
+                <p className="text-xs mt-2" style={{ color: C.textMute }}>
+                  Run it in Supabase → SQL Editor, then reopen this panel. Setup steps are in
+                  COMMUNITY_SETUP.md.
+                </p>
+              )}
+              <button
+                className="mt-3 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold"
+                style={{ color: C.primary, background: 'var(--wash)', border: `1px solid ${GLASS.border}` }}
+                onClick={load}>
+                <RefreshCw size={13} /> Try again
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    if (draft) return renderChannelForm();
+    if (section === 'community') return renderCommunity();
+    if (section === 'categories') return renderCategories();
+    return renderChannels();
+  };
+
+  function renderCommunity() {
+    // Controlled inputs backed by state. The earlier draft mutated the settings
+    // object in place on blur, which silently lost every edit whenever the config
+    // had no settings row yet (`cfg?.settings || {}` builds a fresh literal each
+    // render, so the mutation landed on an object nothing ever read).
+    const s = settingsDraft || {};
+    const set = (patch) => setSettingsDraft({ ...s, ...patch });
+    return (
+      <div className="space-y-3">
+        <label className="block">
+          <span className="gh-label">Community name</span>
+          <input className="gh-input w-full" value={s.community_name || ''}
+            onChange={(e) => set({ community_name: e.target.value })} />
+        </label>
+        <label className="block">
+          <span className="gh-label">Description</span>
+          <textarea className="gh-input w-full" rows={2} value={s.description || ''}
+            onChange={(e) => set({ description: e.target.value })} />
+        </label>
+        <label className="block">
+          <span className="gh-label">Welcome message</span>
+          <textarea className="gh-input w-full" rows={2} value={s.welcome_message || ''}
+            onChange={(e) => set({ welcome_message: e.target.value })} />
+        </label>
+        <label className="block">
+          <span className="gh-label">Landing channel</span>
+          <select className="gh-input w-full" value={s.default_channel_id || ''}
+            onChange={(e) => set({ default_channel_id: e.target.value || null })}>
+            <option value="">No landing channel</option>
+            {chans.filter(c => c.status === 'active').map(c => (
+              <option key={c.id} value={c.id}>#{c.slug}</option>
+            ))}
+          </select>
+          <span className="text-xs" style={{ color: C.textMute }}>
+            Where members land when they open the community with no link of their own.
+          </span>
+        </label>
+        <button className="px-4 py-2 rounded-lg text-white text-sm font-bold" style={ADMIN_BTN_OK}
+          disabled={busy}
+          onClick={() => run(async () => {
+            const { error } = await supabase.rpc('admin_save_community_settings', {
+              p_name: s.community_name || 'Community',
+              p_description: s.description || null,
+              p_welcome: s.welcome_message || null,
+              p_default_channel_id: s.default_channel_id || null,
+            });
+            if (error) throw error;
+          }, 'Could not save the community settings.')}>
+          Save community
+        </button>
+      </div>
+    );
+  }
+
+  function renderCategories() {
+    return (
+      <div className="space-y-4">
+        {spaces.map(sp => (
+          <div key={sp.id}>
+            <div className="gh-label flex items-center gap-1.5">
+              {sp.kind !== 'general' && <Lock size={11} />}{sp.name}
+            </div>
+            <div className="mt-1 space-y-1">
+              {categories.filter(c => c.space_id === sp.id).map((cat, i, arr) => (
+                <div key={cat.id} className="flex items-center gap-2 p-2 rounded-lg"
+                  style={{ background: 'var(--wash)', opacity: cat.status === 'active' ? 1 : 0.55 }}>
+                  <input className="gh-input flex-1 py-1 text-sm" defaultValue={cat.name}
+                    aria-label={`Rename ${cat.name}`}
+                    onBlur={(e) => {
+                      const v = e.target.value.trim();
+                      if (v && v !== cat.name) {
+                        run(async () => {
+                          const { error } = await supabase.rpc('admin_save_channel_category', {
+                            p_id: cat.id, p_space_id: sp.id, p_name: v, p_status: cat.status,
+                          });
+                          if (error) throw error;
+                        }, 'Could not rename the category.');
+                      }
+                    }} />
+                  <button className="gh-btn-ghost p-1.5" aria-label={`Move ${cat.name} up`} disabled={busy || i === 0}
+                    onClick={() => run(async () => {
+                      const { error } = await supabase.rpc('admin_move_channel_category', { p_id: cat.id, p_delta: -1 });
+                      if (error) throw error;
+                    }, 'Could not move the category.')}><ChevronUp size={14} /></button>
+                  <button className="gh-btn-ghost p-1.5" aria-label={`Move ${cat.name} down`} disabled={busy || i === arr.length - 1}
+                    onClick={() => run(async () => {
+                      const { error } = await supabase.rpc('admin_move_channel_category', { p_id: cat.id, p_delta: 1 });
+                      if (error) throw error;
+                    }, 'Could not move the category.')}><ChevronDown size={14} /></button>
+                </div>
+              ))}
+              {newCatFor === sp.id ? (
+                <div className="flex items-center gap-2">
+                  <input className="gh-input flex-1 py-1 text-sm" autoFocus
+                    aria-label="New category name" value={newCatName}
+                    onChange={(e) => setNewCatName(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') addCategory(sp.id);
+                                        if (e.key === 'Escape') { setNewCatFor(null); setNewCatName(''); } }}
+                    placeholder="Category name" />
+                  <button className="gh-btn-ghost px-3 py-1.5 text-xs font-bold" disabled={busy}
+                    onClick={() => addCategory(sp.id)}>Add</button>
+                  <button className="gh-btn-ghost px-3 py-1.5 text-xs font-bold"
+                    onClick={() => { setNewCatFor(null); setNewCatName(''); }}>Cancel</button>
+                </div>
+              ) : (
+                <button className="gh-btn-ghost px-3 py-1.5 text-xs font-bold" disabled={busy}
+                  onClick={() => { setNewCatFor(sp.id); setNewCatName(''); }}>
+                  <Plus size={12} className="inline mr-1" />Add category
+                </button>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  function renderChannels() {
+    return (
+      <div className="space-y-4">
+        {spaces.map(sp => {
+          // ★ Group by CATEGORY, not by space. admin_move_community_channel swaps
+          //   positions WITHIN a category, and positions restart per category — so
+          //   a space-wide list makes "move up" look broken on the first channel of
+          //   every category but the first, and leaves the admin unable to see
+          //   which category a channel is even in.
+          const cats = categories.filter(c => c.space_id === sp.id);
+          return (
+            <div key={sp.id}>
+              <div className="gh-label flex items-center gap-1.5">
+                {sp.kind !== 'general' && <Lock size={11} />}{sp.name}
+              </div>
+              {cats.map(cat => {
+              const list = chans.filter(c => c.category_id === cat.id);
+              return (
+              <div key={cat.id} className="mt-2">
+                <div className="text-xs font-bold mb-1" style={{ color: C.textMute }}>
+                  {cat.name}{cat.status !== 'active' ? ' · archived' : ''}
+                </div>
+              <div className="mt-1 space-y-1">
+                {list.map((c, i, arr) => (
+                  <div key={c.id} className="flex items-center gap-2 p-2 rounded-lg"
+                    style={{ background: 'var(--wash)', opacity: c.status === 'active' ? 1 : 0.55 }}>
+                    {c.kind === 'announcement' ? <Megaphone size={13} /> : <Hash size={13} />}
+                    <button className="flex-1 text-left truncate" onClick={() => setDraft({ ...c })}>
+                      <span style={{ fontFamily: fontMono, fontSize: 12.5, fontWeight: 700 }}>{c.name}</span>
+                      <span className="block text-xs truncate" style={{ color: C.textMute }}>
+                        {AUDIENCE_LABELS[c.audience_mode]}
+                        {c.status !== 'active' ? ' · archived' : ''}
+                        {c.post_count ? ` · ${c.post_count} discussion${c.post_count === 1 ? '' : 's'}` : ''}
+                      </span>
+                    </button>
+                    {c.audience_mode !== 'space' && <Lock size={11} style={{ opacity: 0.6 }} />}
+                    <button className="gh-btn-ghost p-1.5" aria-label={`Move ${c.name} up`} disabled={busy || i === 0}
+                      onClick={() => run(async () => {
+                        const { error } = await supabase.rpc('admin_move_community_channel', { p_id: c.id, p_delta: -1 });
+                        if (error) throw error;
+                      }, 'Could not move the channel.')}><ChevronUp size={14} /></button>
+                    <button className="gh-btn-ghost p-1.5" aria-label={`Move ${c.name} down`} disabled={busy || i === arr.length - 1}
+                      onClick={() => run(async () => {
+                        const { error } = await supabase.rpc('admin_move_community_channel', { p_id: c.id, p_delta: 1 });
+                        if (error) throw error;
+                      }, 'Could not move the channel.')}><ChevronDown size={14} /></button>
+                    <button className="gh-btn-ghost p-1.5"
+                      aria-label={c.status === 'active' ? `Archive ${c.name}` : `Restore ${c.name}`}
+                      disabled={busy}
+                      onClick={() => run(async () => {
+                        const { error } = await supabase.rpc('admin_set_community_channel_status', {
+                          p_id: c.id, p_status: c.status === 'active' ? 'archived' : 'active',
+                        });
+                        if (error) throw error;
+                      }, 'Could not change the channel status.')}>
+                      {c.status === 'active' ? <Archive size={14} /> : <RotateCcw size={14} />}
+                    </button>
+                  </div>
+                ))}
+                {!list.length && (
+                  <p className="text-xs" style={{ color: C.textMute }}>No channels here yet.</p>
+                )}
+              </div>
+              </div>
+              );
+              })}
+              <div className="mt-2">
+                {cats.some(c => c.status === 'active') ? (
+                  <button className="gh-btn-ghost px-3 py-1.5 text-xs font-bold" onClick={() => newChannel(sp.id)}>
+                    <Plus size={12} className="inline mr-1" />New channel
+                  </button>
+                ) : (
+                  <p className="text-xs" style={{ color: C.textMute }}>
+                    Add a category first — every channel lives in one.
+                  </p>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  function renderChannelForm() {
+    const d = draft;
+    const set = (patch) => setDraft(prev => ({ ...prev, ...patch }));
+    const cats = categories.filter(c => c.space_id === d.space_id && c.status === 'active');
+    const summary = channelAccessSummary({
+      mode: d.audience_mode,
+      planLabels: (d.plan_keys || []).map(planName),
+      batchLabels: (d.batch_ids || []).map(batchName),
+      spaceKind: (spaces.find(s => s.id === d.space_id) || {}).kind,
+      spaceName: (spaces.find(s => s.id === d.space_id) || {}).name,
+      kind: d.kind,
+      memberPosting: d.member_posting, memberComments: d.member_comments,
+      memberReactions: d.member_reactions, memberAttachments: d.member_attachments,
+    });
+    return (
+      <div className="space-y-3">
+        <button className="gh-btn-ghost px-2 py-1 text-xs font-bold" onClick={() => setDraft(null)}>
+          <ArrowLeft size={12} className="inline mr-1" />All channels
+        </button>
+        <label className="block">
+          <span className="gh-label">Channel name</span>
+          <input className="gh-input w-full" value={d.name}
+            onChange={(e) => set({ name: e.target.value })} placeholder="wins-and-opportunities" />
+          <span className="text-xs" style={{ color: C.textMute }}>
+            {d.id
+              ? `Address: #${d.slug} (fixed — existing links keep working)`
+              : `Address: #${normalizeChannelSlug(d.slug || d.name) || '…'}`}
+          </span>
+        </label>
+        <label className="block">
+          <span className="gh-label">Topic</span>
+          <input className="gh-input w-full" value={d.topic || ''}
+            onChange={(e) => set({ topic: e.target.value })}
+            placeholder="What belongs in this channel" />
+        </label>
+        <div className="grid grid-cols-2 gap-2">
+          <label className="block">
+            <span className="gh-label">Category</span>
+            <select className="gh-input w-full" value={d.category_id || ''}
+              onChange={(e) => set({ category_id: e.target.value })}>
+              {cats.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+          </label>
+          <label className="block">
+            <span className="gh-label">Type</span>
+            <select className="gh-input w-full" value={d.kind}
+              onChange={(e) => set({
+                kind: e.target.value,
+                // An announcement channel is admin-post-only by constraint; mirror
+                // that here so the form cannot submit a state the DB rejects.
+                member_posting: e.target.value === 'announcement' ? false : d.member_posting,
+              })}>
+              <option value="text">Text channel</option>
+              <option value="announcement">Announcement channel</option>
+            </select>
+          </label>
+        </div>
+
+        <div className="pt-2" style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
+          <span className="gh-label">Who can see this channel</span>
+          <select className="gh-input w-full" value={d.audience_mode}
+            onChange={(e) => set({ audience_mode: e.target.value })}>
+            {AUDIENCE_MODES.map(m => <option key={m} value={m}>{AUDIENCE_LABELS[m]}</option>)}
+          </select>
+        </div>
+
+        {(d.audience_mode === 'plans' || d.audience_mode === 'plans_and_batches') && (
+          <div>
+            <span className="gh-label">Plans</span>
+            <div className="flex flex-wrap gap-1.5">
+              {plans.map(p => {
+                const on = (d.plan_keys || []).includes(p.key);
+                return (
+                  <button key={p.key} onClick={() => set({
+                    plan_keys: on ? d.plan_keys.filter(k => k !== p.key) : [...(d.plan_keys || []), p.key],
+                  })} className={`gh-pill px-3 py-1.5 text-xs font-bold${on ? ' is-active' : ''}`}
+                    aria-pressed={on}>{p.name}</button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+        {(d.audience_mode === 'batches' || d.audience_mode === 'plans_and_batches') && (
+          <div>
+            <span className="gh-label">Batches</span>
+            <div className="flex flex-wrap gap-1.5">
+              {batches.map(b => {
+                const on = (d.batch_ids || []).includes(b.id);
+                return (
+                  <button key={b.id} onClick={() => set({
+                    batch_ids: on ? d.batch_ids.filter(x => x !== b.id) : [...(d.batch_ids || []), b.id],
+                  })} className={`gh-pill px-3 py-1.5 text-xs font-bold${on ? ' is-active' : ''}`}
+                    aria-pressed={on}>{b.name || b.code}</button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        <div className="pt-2" style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
+          <span className="gh-label">What members can do</span>
+          {[
+            ['member_posting', 'Members can post', d.kind === 'announcement'],
+            ['member_comments', 'Members can reply', false],
+            ['member_reactions', 'Members can react', false],
+            ['member_attachments', 'Members can attach files', false],
+          ].map(([key, label, disabled]) => (
+            <label key={key} className="flex items-center gap-2 py-1 text-sm"
+              style={{ color: disabled ? C.textMute : C.text }}>
+              <input type="checkbox" checked={!!d[key]} disabled={disabled}
+                onChange={(e) => set({ [key]: e.target.checked })} />
+              {label}
+              {key === 'member_posting' && disabled && (
+                <span className="text-xs" style={{ color: C.textMute }}>(announcement channel)</span>
+              )}
+            </label>
+          ))}
+        </div>
+
+        <div className="p-3 rounded-lg text-xs" style={{
+          background: 'var(--status-info-bg)', border: `1px solid var(--status-info-bd)`,
+          color: 'var(--status-info-fg)',
+        }}>
+          {summary}
+        </div>
+
+        {err && <AdminNotice kind="danger">{err}</AdminNotice>}
+
+        <div className="flex gap-2">
+          <button className="px-4 py-2 rounded-lg text-white text-sm font-bold" style={ADMIN_BTN_OK}
+            disabled={busy} onClick={() => attemptSaveChannel(d)}>
+            {d.id ? 'Save channel' : 'Create channel'}
+          </button>
+          <button className="gh-btn-ghost px-4 py-2 text-sm font-bold" onClick={() => setDraft(null)}>Cancel</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {/* canClose also covers `confirm`: both shells listen on window for Escape
+          and SidePanel registered first, so without this Escape in the confirm
+          dialog would unmount the entire editor and lose the draft. */}
+      <SidePanel title="Manage community" subtitle="Channels, categories and access"
+        icon={Settings} onClose={onClose} maxW="sm:max-w-xl lg:max-w-2xl" canClose={!busy && !confirm}>
+        {!draft && state === 'ready' && (
+          <div className="flex gap-1.5 mb-4 flex-wrap">
+            {[['community', 'Community'], ['categories', 'Categories'], ['channels', 'Channels']].map(([k, label]) => (
+              <button key={k} onClick={() => setSection(k)} aria-pressed={section === k}
+                className={`gh-pill px-3 py-1.5 text-xs font-bold${section === k ? ' is-active' : ''}`}>
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
+        {/* In the error state the body already renders a full setup card saying
+            exactly this - without the state guard the same sentence appears twice. */}
+        {err && !draft && state !== 'error' && <AdminNotice kind="danger">{err}</AdminNotice>}
+        {body()}
+      </SidePanel>
+      {confirm && (
+        <AccountModal title="Change who can see this channel"
+          icon={confirm.impact.narrowed ? AlertCircle : Users}
+          tone={confirm.impact.narrowed ? 'danger' : 'primary'}
+          onClose={() => setConfirm(null)}>
+          <ul className="text-sm space-y-1.5 mb-4" style={{ color: C.textSoft }}>
+            {confirm.impact.notes.map((n, i) => <li key={i}>• {n}</li>)}
+          </ul>
+          <div className="flex gap-2">
+            <button className="px-4 py-2 rounded-lg text-white text-sm font-bold"
+              style={confirm.impact.narrowed ? ADMIN_BTN_DANGER : ADMIN_BTN_OK}
+              onClick={confirm.onGo}>Apply change</button>
+            <button className="gh-btn-ghost px-4 py-2 text-sm font-bold"
+              onClick={() => setConfirm(null)}>Keep as is</button>
+          </div>
+        </AccountModal>
+      )}
+    </>
   );
 }
 
@@ -14502,7 +16465,7 @@ function CommunityRightRail({ announcements, annReadIds, uid, topPosts, popularT
 // files first, then inserts the post row, then the attachment/tag child rows — a child
 // failure keeps the post and surfaces a warning (files without a post row are removed).
 // Edit mode updates title/body/category + replaces tags; attachments are immutable on edit.
-function CommunityComposer({ editPost, editTags, spaceId, spaceName, composerTags, uid, myName, myAvatar, onClose, onPublished, onSaved }) {
+function CommunityComposer({ editPost, editTags, spaceId, spaceName, channelId, channelName, canAttach = false, composerTags, uid, myName, myAvatar, onClose, onPublished, onSaved }) {
   const isEdit = !!editPost;
   const [title, setTitle] = useState(isEdit ? (editPost.title || '') : '');
   const [body, setBody] = useState(isEdit ? (editPost.body || '') : '');
@@ -14550,6 +16513,7 @@ function CommunityComposer({ editPost, editTags, spaceId, spaceName, composerTag
     const url = linkInput.trim();
     if (!url) return;
     if (!/^https?:\/\/\S+$/i.test(url)) { setErr('Links must start with http:// or https://'); return; }
+    if (!canAttach) { setErr('Your plan does not include attachments in this channel.'); return; }
     if (attachTotal >= COMMUNITY_MAX_ATTACHMENTS) { setErr(`Up to ${COMMUNITY_MAX_ATTACHMENTS} attachments per post.`); return; }
     setErr(''); setLinks(prev => [...prev, url]); setLinkInput(''); setShowLinkInput(false);
   }
@@ -14600,12 +16564,27 @@ function CommunityComposer({ editPost, editTags, spaceId, spaceName, composerTag
       }
       const row = {
         author_id: uid, author_name: myName, title: t.slice(0, 120), body: b.slice(0, 5000), tag_slug: tagSlug,
-        // #32: publish into the active space; omitted pre-#32 (the guard
-        // trigger fills General once the migration lands).
+        // #40: publish into the active CHANNEL. space_id is sent for pre-#40
+        // databases only — post-#40 community_posts_guard() DERIVES it from the
+        // channel and overwrites whatever we send, which is what makes a forged
+        // {private channel, General space} pair harmless.
         ...(spaceId ? { space_id: spaceId } : {}),
+        ...(channelId ? { channel_id: channelId } : {}),
       };
       const { data: post, error } = await supabase.from('community_posts').insert(row).select().single();
-      if (error) throw error;
+      if (error) {
+        // Same courtesy the reply box gets: ask the server WHY rather than
+        // showing the member a raw 42501.
+        if (channelId) {
+          try {
+            const d = await supabase.rpc('community_channel_write_denial',
+              { p_channel_id: channelId, p_kind: 'post' });
+            const why = d.error ? null : channelDenialCopy(d.data, 'post');
+            if (why) throw new Error(why);
+          } catch (inner) { if (inner instanceof Error && inner.message) throw inner; }
+        }
+        throw error;
+      }
       postCreated = true;
       const warns = [];
       const attachRows = [
@@ -14649,7 +16628,7 @@ function CommunityComposer({ editPost, editTags, spaceId, spaceName, composerTag
     <AccountModal title={isEdit ? 'Edit discussion' : 'Start a discussion'}
       subtitle={isEdit
         ? 'Update your post — attachments can’t be changed after publishing'
-        : (spaceName ? `Posting in ${spaceName}` : 'Ask a question, share a win, help another bookkeeper')}
+        : (channelName ? `Posting in #${channelName}` : spaceName ? `Posting in ${spaceName}` : 'Ask a question, share a win, help another bookkeeper')}
       icon={isEdit ? Edit3 : MessagesSquare} maxW="max-w-2xl" canClose={!posting} onClose={onClose}>
       <div className="flex items-start gap-3">
         <MemberAvatar name={myName} src={myAvatar} size={36} />
@@ -14658,7 +16637,7 @@ function CommunityComposer({ editPost, editTags, spaceId, spaceName, composerTag
             placeholder="Title — what’s this discussion about?"
             className="gh-input w-full px-3.5 py-2.5 rounded-xl text-sm" />
           <div className="mt-2">
-            <MentionTextarea value={body} onChange={setBody} rows={6} maxLength={5000} spaceId={spaceId}
+            <MentionTextarea value={body} onChange={setBody} rows={6} maxLength={5000} spaceId={spaceId} channelId={channelId}
               placeholder="Write your post… Type @ to mention a member."
               className="gh-input w-full px-3.5 py-2.5 rounded-xl text-sm resize-y" />
           </div>
@@ -14707,15 +16686,15 @@ function CommunityComposer({ editPost, editTags, spaceId, spaceName, composerTag
             <>
               <div className="mt-3" style={{ fontSize: 11, fontWeight: 700, color: C.textMute, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Attachments <span style={{ fontWeight: 500, textTransform: 'none', letterSpacing: 0 }}>(optional, up to {COMMUNITY_MAX_ATTACHMENTS})</span></div>
               <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">
-                <button type="button" onClick={() => imgInputRef.current?.click()} disabled={attachTotal >= COMMUNITY_MAX_ATTACHMENTS}
+                <button type="button" onClick={() => imgInputRef.current?.click()} disabled={!canAttach || attachTotal >= COMMUNITY_MAX_ATTACHMENTS}
                   className="gh-btn-ghost inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold disabled:opacity-50">
                   <ImageIcon size={13} /> Image <span style={{ color: C.textMute, fontWeight: 500 }}>≤{COMMUNITY_IMAGE_MAX_MB}MB</span>
                 </button>
-                <button type="button" onClick={() => vidInputRef.current?.click()} disabled={attachTotal >= COMMUNITY_MAX_ATTACHMENTS}
+                <button type="button" onClick={() => vidInputRef.current?.click()} disabled={!canAttach || attachTotal >= COMMUNITY_MAX_ATTACHMENTS}
                   className="gh-btn-ghost inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold disabled:opacity-50">
                   <Video size={13} /> Video <span style={{ color: C.textMute, fontWeight: 500 }}>≤{COMMUNITY_VIDEO_MAX_MB}MB</span>
                 </button>
-                <button type="button" onClick={() => setShowLinkInput(v => !v)} disabled={attachTotal >= COMMUNITY_MAX_ATTACHMENTS}
+                <button type="button" onClick={() => setShowLinkInput(v => !v)} disabled={!canAttach || attachTotal >= COMMUNITY_MAX_ATTACHMENTS}
                   className="gh-btn-ghost inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold disabled:opacity-50">
                   <Link2 size={13} /> Link
                 </button>
@@ -14844,7 +16823,11 @@ function useCommunityBell(uid, enabled) {
         if (!row || row.read_at) return;
         setNotifs(prev => (prev.some(n => n.id === row.id) ? prev : [row, ...prev].slice(0, 20)));
       })
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'community_posts' }, (payload) => {
+      // Filtered server-side to the ONLY rows this handler acts on. Unfiltered,
+      // Realtime runs the row's RLS per subscriber per insert - an entitlement
+      // walk for every online member on every post, to then ignore it.
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'community_posts',
+                                filter: `tag_slug=eq.${COMMUNITY_ANNOUNCEMENTS_SLUG}` }, (payload) => {
         const row = payload.new;
         if (row && row.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG && row.author_id !== uid && row.status === 'active') load();
       })
@@ -15045,7 +17028,7 @@ function NotificationBell({ bell, placement = 'card' }) {
 function CommunityPostCard({ post, tag, postTags, attachments, signedUrls, isAdmin, uid, myName, myAvatar,
   commentCount, reactions, commentsState, commentReacts, annUnread,
   canComment = true, canReact = true, spaceId = null,
-  menuOpen, onMenuToggle, onToggleReact, onToggleCommentReact, onAddComment, onEdit,
+  menuOpen, onMenuToggle, onToggleReact, onToggleCommentReact, onAddComment, onEdit, channelId, canPost = false,
   onModerate, onModerateComment, onAskDelete, onTogglePin, onToggleLock, onMarkAnnRead }) {
   const isOwn = post.author_id === uid;
   const hidden = post.status === 'hidden';
@@ -15125,7 +17108,7 @@ function CommunityPostCard({ post, tag, postTags, attachments, signedUrls, isAdm
             {menuOpen && (
               <div role="menu" className="absolute right-0 top-8 z-20 w-52 rounded-xl overflow-hidden py-1 shadow-lg"
                 style={{ background: C.white, border: `1px solid ${C.border}` }}>
-                {isOwn && post.status === 'active' && (
+                {isOwn && post.status === 'active' && (canPost || isAdmin) && (
                   <button role="menuitem" onClick={() => { onMenuToggle(); onEdit(post); }}
                     className="w-full text-left px-3.5 py-2 text-sm font-medium transition hover:opacity-75 flex items-center gap-2"
                     style={{ color: C.text }}>
@@ -15275,7 +17258,7 @@ function CommunityPostCard({ post, tag, postTags, attachments, signedUrls, isAdm
                 style={{ background: 'var(--status-neutral-bg)', border: '1px solid var(--status-neutral-bd)', color: 'var(--status-neutral-fg)' }}>
                 {isAnn ? <Megaphone size={13} /> : !canComment ? <ThumbsUp size={13} /> : <Lock size={13} />}
                 {isAnn ? 'Announcements are read-only — react above to acknowledge.'
-                  : !canComment ? 'This space is reactions-only — react above to respond.'
+                  : !canComment ? 'Replies are turned off in this channel — react above to respond.'
                   : 'Replies are locked on this discussion.'}
               </div>
             ) : (
@@ -15284,7 +17267,7 @@ function CommunityPostCard({ post, tag, postTags, attachments, signedUrls, isAdm
                 <div className="flex-1 min-w-0">
                   <div className="flex items-end gap-2">
                     <div className="flex-1 min-w-0">
-                      <MentionTextarea value={draft} onChange={setDraft} rows={1} maxLength={2000} spaceId={spaceId}
+                      <MentionTextarea value={draft} onChange={setDraft} rows={1} maxLength={2000} spaceId={spaceId} channelId={channelId}
                         placeholder="Write a reply… Type @ to mention. (Enter to send)"
                         onSubmitEnter={sendComment}
                         className="gh-input w-full px-3.5 py-2.5 rounded-xl text-sm resize-none" />
@@ -15353,6 +17336,44 @@ function CommunityHub() {
   const setSpacesReady = (v) => { spacesReadyRef.current = v; setSpacesReadyState(v); };
   const spacesRef = useRef([]);
   useEffect(() => { spacesRef.current = spaces; }, [spaces]);
+
+  // Channel engine (#40). my_community_sidebar() returns ONE row per channel the
+  // caller may read, already carrying the server-resolved can_* rights, so the
+  // client never re-derives permissions. `spaces` above is now derived from these
+  // rows: a space is an entitlement boundary, not something a member navigates.
+  //
+  // channelsReady mirrors spacesReady's contract exactly, and for the same
+  // reason: on 'error' we must refuse every write rather than fall through to an
+  // unscoped feed, because a post with no channel_id is defaulted to GENERAL by
+  // community_posts_guard() — a VIP member would publish a cohort post to
+  // everyone. 'legacy' means a pre-#40 database (no channels at all).
+  const [channels, setChannels] = useState([]);
+  const [channelId, setChannelId] = useState(null);
+  const [channelsReady, setChannelsReadyState] = useState(null);
+  const channelsReadyRef = useRef(null);
+  const setChannelsReady = (v) => { channelsReadyRef.current = v; setChannelsReadyState(v); };
+  const channelsRef = useRef([]);
+  useEffect(() => { channelsRef.current = channels; }, [channels]);
+  const channelIdRef = useRef(null);
+  const channelSlugRef = useRef(null);
+  // Deep-linked ?channel= slug, held until the sidebar RPC resolves.
+  const initialChannelSlugRef = useRef((() => {
+    const r = readAppRoute();
+    return r.tab === 'community' ? (r.channel || null) : null;
+  })());
+  // Collapsed rail categories, per user. Cosmetic only.
+  const [collapsedCats, setCollapsedCats] = useState({});
+  const [railOpen, setRailOpen] = useState(false);        // mobile channel drawer
+  const [searchScope, setSearchScope] = useState('channel'); // channel | all
+  const searchScopeRef = useRef('channel');
+  const [adminEditorOpen, setAdminEditorOpen] = useState(false);
+  // Rename ('Customize') mode on the rail — the sidebar's admin idiom, applied to
+  // channels. Drafts are held locally and committed on Done, so a rename is never
+  // one round trip per keystroke.
+  const [railEditing, setRailEditing] = useState(false);
+  const [draftNames, setDraftNames] = useState({});
+  const [renaming, setRenaming] = useState(false);
+  const [nameErrors, setNameErrors] = useState({});   // key -> why, marks the offending input
   // Detail view (?post=<id> deep link — the CourseCatalog ?course= idiom).
   const [selectedPostId, setSelectedPostId] = useState(() => {
     const r = readAppRoute();
@@ -15394,15 +17415,36 @@ function CommunityHub() {
   useEffect(() => { activeTagRef.current = activeTag; }, [activeTag]);
   useEffect(() => { filterRef.current = filter; }, [filter]);
   useEffect(() => { freeTagRef.current = freeTag; }, [freeTag]);
+  useEffect(() => { searchScopeRef.current = searchScope; }, [searchScope]);
   useEffect(() => { selectedPostIdRef.current = selectedPostId; }, [selectedPostId]);
   useEffect(() => { postsLenRef.current = posts.length; postIdsRef.current = new Set(posts.map(p => p.id)); }, [posts]);
 
   function buildFeedQuery({ tag, filter: filt, search, ids, from, limit = COMMUNITY_PAGE_SIZE }) {
+    // Cross-channel search goes through the indexed RPC (#40): a GIN/tsvector
+    // lookup over every channel the caller may read. It runs with INVOKER rights,
+    // so community_posts_read — not this client — decides what comes back, and
+    // "all accessible channels" can never widen into "all channels".
+    if (search && searchScopeRef.current === 'all') {
+      return supabase.rpc('search_community_posts', {
+        p_query: search,
+        p_channel_id: channelIdRef.current,
+        p_scope: 'all',
+        p_limit: limit,
+        p_offset: from,
+      });
+    }
     // RLS hides 'hidden' rows from members (admins see them, badged); 'deleted'
     // (author soft-deletes) is excluded for everyone, admins included.
-    let q = supabase.from('community_posts').select('*').neq('status', 'deleted');
-    // Space scoping (#32): null in legacy mode → unscoped, the pre-#32 feed.
-    if (spaceIdRef.current) q = q.eq('space_id', spaceIdRef.current);
+    // Explicit columns, NOT '*': #40 added a stored generated `search_tsv`, and
+    // PostgREST includes generated columns in select=*, so every row shipped a
+    // ~1-2 KB tsvector the client never reads. Keep this list in step with
+    // search_community_posts()'s return columns so both feed paths match.
+    let q = supabase.from('community_posts').select(COMMUNITY_POST_COLS).neq('status', 'deleted');
+    // Channel scoping (#40) supersedes space scoping: a channel already belongs to
+    // exactly one space, so scoping to it is strictly narrower. Falls back to the
+    // space (then unscoped) only on a pre-#40 database.
+    if (channelIdRef.current) q = q.eq('channel_id', channelIdRef.current);
+    else if (spaceIdRef.current) q = q.eq('space_id', spaceIdRef.current);
     if (filt === 'announcements') q = q.eq('tag_slug', COMMUNITY_ANNOUNCEMENTS_SLUG);
     else if (tag && tag !== 'all') q = q.eq('tag_slug', tag);
     if (filt === 'unanswered') q = q.eq('comment_count', 0);
@@ -15437,7 +17479,7 @@ function CommunityHub() {
     const now = Date.now();
     const need = [...new Set(paths)].filter(p => p && (!signedExpRef.current[p] || signedExpRef.current[p] < now + 5 * 60 * 1000));
     if (!need.length) return;
-    const sidAtCall = spaceIdRef.current;      // a switch mid-flight invalidates these
+    const sidAtCall = channelIdRef.current || spaceIdRef.current;   // #40: channels share a space      // a switch mid-flight invalidates these
     try {
       const { data, error } = await supabase.storage.from('community-media').createSignedUrls(need, 3600);
       if (error) throw error;
@@ -15466,8 +17508,8 @@ function CommunityHub() {
     // catches a space switch — which `seq` alone misses for callers that pass no seq
     // (the realtime single-post refresh), and that path is enough to merge a private
     // space's tag slugs into postTagsMeta, whose every value feeds the popular-tags rail.
-    const sidAtCall = spaceIdRef.current;
-    const fresh = () => (seq === null || seq === loadSeqRef.current) && sidAtCall === spaceIdRef.current;
+    const sidAtCall = channelIdRef.current || spaceIdRef.current;   // #40: channels share a space
+    const fresh = () => (seq === null || seq === loadSeqRef.current) && sidAtCall === (channelIdRef.current || spaceIdRef.current);
     try {
       // Only the ≤4-avatar participant strip needs these rows — the reply COUNT comes from
       // the denormalized post.comment_count (CommunityTopicRow prefers it; `total` here is a
@@ -15548,8 +17590,11 @@ function CommunityHub() {
       const want = Math.max(postsLenRef.current, COMMUNITY_PAGE_SIZE);
       const ids = ft ? await freeTagIds(ft) : null;
       const sid = spaceIdRef.current;
-      let annQ = supabase.from('community_posts').select('*').eq('tag_slug', COMMUNITY_ANNOUNCEMENTS_SLUG).eq('status', 'active');
-      if (sid) annQ = annQ.eq('space_id', sid);
+      let annQ = supabase.from('community_posts').select(COMMUNITY_POST_COLS).eq('tag_slug', COMMUNITY_ANNOUNCEMENTS_SLUG).eq('status', 'active');
+      // Follow the CHANNEL like the category counts do, or the right rail
+      // shows other rooms' announcements beside counts describing only this one.
+      if (channelIdRef.current) annQ = annQ.eq('channel_id', channelIdRef.current);
+      else if (sid) annQ = annQ.eq('space_id', sid);
       const [tagRes, postRes, cntRes, annRes, readRes] = await Promise.all([
         supabase.from('community_tags').select('*').order('position').order('label'),
         ids && !ids.length ? Promise.resolve({ data: [], error: null }) : buildFeedQuery({ tag, filter: filt, search: q, ids, from: 0, limit: want }),
@@ -15557,7 +17602,9 @@ function CommunityHub() {
         // active post's tag_slug to the browser. Missing RPC (pre-#25) → cntRes.error, and the
         // guard below just leaves the sidebar counts blank rather than erroring the whole feed.
         // #32: scoped to the active space (the RPC stays SECURITY INVOKER — RLS is the boundary).
-        sid ? supabase.rpc('community_category_counts', { p_space_id: sid }) : supabase.rpc('community_category_counts'),
+        channelIdRef.current
+          ? supabase.rpc('community_category_counts', { p_space_id: null, p_channel_id: channelIdRef.current })
+          : (sid ? supabase.rpc('community_category_counts', { p_space_id: sid }) : supabase.rpc('community_category_counts')),
         annQ.order('created_at', { ascending: false }).limit(3),
         supabase.from('community_announcement_reads').select('post_id').eq('user_id', uid),
       ]);
@@ -15645,15 +17692,25 @@ function CommunityHub() {
     resetAndLoad();
   }
 
-  // ── Space engine (#32) ────────────────────────────────────────────
-  // Hard view reset when the active space changes — feed, meta, filters, and
-  // any open detail all belong to the OLD space and must never flash into the
+  // ── Channel engine (#40, was the #32 space engine) ────────────────
+  // Hard view reset when the active CHANNEL changes — feed, meta, filters, and
+  // any open detail all belong to the OLD channel and must never flash into the
   // new one. keepPost=true (deep-link adoption) keeps the selected post.
-  function adoptSpace(sp, { keepPost = false, writeRoute = true, replace = false } = {}) {
-    if (!sp || sp.id === spaceIdRef.current) return;
-    spaceIdRef.current = sp.id;
-    spaceSlugRef.current = sp.slug;
-    setSpaceId(sp.id);
+  //
+  // The space follows the channel (never the other way round): a channel belongs
+  // to exactly one space, and community_posts_guard() derives space_id from
+  // channel_id server-side, so these two can never disagree.
+  function adoptChannel(ch, { keepPost = false, writeRoute = true, replace = false, markRead = true } = {}) {
+    if (!ch) return;
+    const chId = ch.channel_id || ch.id;
+    if (!chId || chId === channelIdRef.current) return;
+    channelIdRef.current = chId;
+    channelSlugRef.current = ch.channel_slug || ch.slug || null;
+    setChannelId(chId);
+    const sp = { id: ch.space_id, slug: ch.space_slug, name: ch.space_name, kind: ch.space_kind };
+    spaceIdRef.current = sp.id || null;
+    spaceSlugRef.current = sp.slug || null;
+    setSpaceId(sp.id || null);
     setPosts([]); setHasMore(false); setPendingNew(0); postsLenRef.current = 0;
     setCatCounts({}); setAnnPreview([]);
     setComments({}); setCommentReactMeta({});
@@ -15662,29 +17719,108 @@ function CommunityHub() {
     // row menu — nothing renders them once attachMeta is cleared, but holding
     // private-media URLs in memory after leaving the space is needless.
     setSignedUrls({}); signedExpRef.current = {}; setMenuOpenId(null);
+    setConfirmDel(null); setLoadingMore(false);
     setSearchInput(''); searchRef.current = '';
     setFreeTag(null); freeTagRef.current = null;
     setActiveTag('all'); activeTagRef.current = 'all';
-    // The Unanswered filter needs replies — a reactions-only space can't show it.
-    if (filterRef.current === 'unanswered' && sp.member_comments === false) {
+    // The Unanswered filter needs replies — a read-only channel can't show it.
+    if (filterRef.current === 'unanswered' && ch.can_comment === false) {
       setFilter('latest'); filterRef.current = 'latest';
     }
+    setSearchScope('channel');
     if (!keepPost && selectedPostIdRef.current) {
       setSelectedPostId(null); selectedPostIdRef.current = null;
       setDetailPost(null); setDetailState('idle'); detailSeenRef.current = null;
     }
     if (writeRoute) {
       writeAppRoute('community', {
-        space: sp.slug,
+        space: sp.slug || undefined,
+        channel: channelSlugRef.current || undefined,
         ...(keepPost && selectedPostIdRef.current ? { postId: selectedPostIdRef.current } : {}),
         replace,
       });
     }
-    window.storage.set('community:lastSpace', sp.slug).catch?.(() => {});
+    if (sp.slug) window.storage.set('community:lastSpace', sp.slug).catch?.(() => {});
+    if (channelSlugRef.current) {
+      window.storage.set('community:lastChannel', channelSlugRef.current).catch?.(() => {});
+    }
+    setRailOpen(false);
+    loadFeed(false);
+    // Mark read only AFTER the channel is actually open, never on hover, on a
+    // sidebar refresh, or when a bell link merely passes THROUGH the channel to
+    // one post — otherwise the badge clears for content nobody saw.
+    if (markRead) markChannelRead(chId);
+  }
+
+  function pickSearchScope(next) {
+    if (next === searchScopeRef.current) return;
+    setSearchScope(next); searchScopeRef.current = next;
+    setPosts([]); setHasMore(false); postsLenRef.current = 0;
     loadFeed(false);
   }
 
-  const switchSpace = (slug) => adoptSpace(spaces.find(s => s.slug === slug) || null);
+  const switchChannel = (slug) =>
+    adoptChannel(channelsRef.current.find(c => c.channel_slug === slug) || null);
+
+  // Rail activity refresh: ONE bounded RPC, never a per-channel query. Called
+  // after an admin edit and on the same focus throttle as the feed.
+  const lastSidebarRef = useRef(0);   // #41 perf: its own throttle, see onFocus
+  const refreshSidebar = useCallback(async () => {
+    lastSidebarRef.current = Date.now();
+    if (!uid || channelsReadyRef.current !== true) return;
+    try {
+      const { data, error } = await supabase.rpc('my_community_sidebar');
+      if (error) throw error;
+      const rows = data || [];
+      setChannels(rows);
+      // An admin can narrow a channel out from under the reader. Fall back rather
+      // than leaving stale content on screen.
+      if (channelIdRef.current && !rows.some(r => r.channel_id === channelIdRef.current)) {
+        const next = pickInitialChannel({ channels: rows, defaultChannelId: (rows.find(r => r.is_default) || {}).channel_id });
+        channelIdRef.current = null;
+        if (next) adoptChannel(next, { replace: true });
+        else {
+          // Clear the SPACE too. Leaving it set would let the realtime
+          // resubscribe and the focus refetch fall through to a space-wide feed
+          // presented as the channel view - the one thing this file must never do.
+          setChannelId(null); spaceIdRef.current = null; setSpaceId(null);
+          setChannelsReady('error');
+          setPosts([]); setErr('This channel is no longer available to you.');
+        }
+      }
+    } catch { /* the rail is navigation, not the boundary — never block on it */ }
+    // eslint-disable-next-line
+  }, [uid]);
+
+  const toggleCat = useCallback((key) => {
+    setCollapsedCats(prev => {
+      const next = { ...prev, [key]: !prev[key] };
+      window.storage.set('community:railGroups', next).catch?.(() => {});
+      return next;
+    });
+  }, []);
+
+  // Restore collapsed groups (cosmetic; failure just means everything expanded).
+  useEffect(() => {
+    if (!uid) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const v = (await window.storage.get('community:railGroups'))?.value;
+        if (!cancelled && v && typeof v === 'object') setCollapsedCats(v);
+      } catch { /* pref only */ }
+    })();
+    return () => { cancelled = true; };
+  }, [uid]);
+
+  async function markChannelRead(chId) {
+    if (!chId || !uid) return;
+    try {
+      await supabase.rpc('mark_community_channel_read', { p_channel_id: chId });
+      setChannels(prev => prev.map(c =>
+        (c.channel_id === chId ? { ...c, unread_count: 0, has_unread: false } : c)));
+    } catch { /* the badge is cosmetic; never block the feed on it */ }
+  }
 
   // Debounced search → applied value (refs first, then reload — the loadFeed idiom).
   useEffect(() => {
@@ -15797,10 +17933,28 @@ function CommunityHub() {
   }
 
   // Throws on failure — CommunityPostCard catches and shows an inline error.
+  // Ask the server WHY a write was refused, so the member gets a sentence rather
+  // than a raw 42501. Best-effort: if the diagnostic itself fails we fall back to
+  // the generic message rather than swallowing the original error.
+  async function explainRefusal(kind) {
+    if (!channelIdRef.current) return null;
+    try {
+      const { data, error } = await supabase.rpc('community_channel_write_denial', {
+        p_channel_id: channelIdRef.current, p_kind: kind,
+      });
+      if (error) return null;
+      return channelDenialCopy(data, kind);
+    } catch { return null; }
+  }
+
   async function addComment(postId, text) {
     const row = { post_id: postId, author_id: uid, author_name: myName, body: text.slice(0, 2000) };
     const { data, error } = await supabase.from('community_comments').insert(row).select().single();
-    if (error) throw error;
+    if (error) {
+      const why = await explainRefusal('comment');
+      if (why) { const e2 = new Error(why); e2.explained = true; throw e2; }
+      throw error;
+    }
     setComments(prev => ({ ...prev, [postId]: { rows: [...((prev[postId] || {}).rows || []), data], loading: false, err: '' } }));
     const bump = (p) => (p.id === postId
       ? { ...p, comment_count: (p.comment_count || 0) + 1, last_activity_at: data.created_at || p.last_activity_at }
@@ -15936,13 +18090,13 @@ function CommunityHub() {
     if (menuOpenId) setMenuOpenId(null);
     setDetailPost(post); setDetailState('idle');
     setSelectedPostId(post.id);
-    writeAppRoute('community', { space: spaceSlugRef.current || undefined, postId: post.id });
+    writeAppRoute('community', { space: spaceSlugRef.current || undefined, channel: channelSlugRef.current || undefined, postId: post.id });
   }
 
   function closePost() {
     setSelectedPostId(null); setDetailPost(null); setDetailState('idle');
     detailSeenRef.current = null;
-    writeAppRoute('community', { space: spaceSlugRef.current || undefined, replace: true });
+    writeAppRoute('community', { space: spaceSlugRef.current || undefined, channel: channelSlugRef.current || undefined, replace: true });
   }
 
   // Back/Forward + bell deep links re-sync the selection from the URL (the
@@ -15951,17 +18105,23 @@ function CommunityHub() {
     const sync = () => {
       const r = readAppRoute();
       if (r.tab !== 'community') return;
-      // Back/Forward across a space switch: re-adopt the URL's space (no route
-      // write — the URL is already right). A missing/foreign slug is ignored.
-      if (r.space && r.space !== spaceSlugRef.current) {
-        const sp = spacesRef.current.find(s => s.slug === r.space);
-        if (sp) {
-          // adoptSpace wipes `comments`/meta, so an entry that changes only ?space=
-          // while keeping ?post= must re-initialize the open detail (same reset the
-          // deep-link adoption does) or its replies stay blank with no reload.
+      // Back/Forward across a channel switch: re-adopt the URL's channel (no
+      // route write — the URL is already right). An unknown or inaccessible slug
+      // is ignored SILENTLY; telling the reader it exists would leak a private room.
+      if (r.channel && r.channel !== channelSlugRef.current) {
+        const ch = channelsRef.current.find(c => c.channel_slug === r.channel);
+        if (ch) {
+          // adoptChannel wipes `comments`/meta, so an entry that changes only the
+          // channel while keeping ?post= must re-initialize the open detail (the
+          // same reset the deep-link adoption does) or replies stay blank.
           detailSeenRef.current = null;
-          adoptSpace(sp, { keepPost: !!r.postId, writeRoute: false });
+          adoptChannel(ch, { keepPost: !!r.postId, writeRoute: false });
         }
+      } else if (!r.channel && r.space && r.space !== spaceSlugRef.current) {
+        // A pre-#40 link that names only a space: land in that space's default room.
+        const ch = channelsRef.current.find(c => c.space_slug === r.space && c.is_space_default)
+          || channelsRef.current.find(c => c.space_slug === r.space);
+        if (ch) { detailSeenRef.current = null; adoptChannel(ch, { keepPost: !!r.postId, writeRoute: false }); }
       }
       const next = r.postId || null;
       if (selectedPostIdRef.current === next) return;
@@ -15995,23 +18155,27 @@ function CommunityHub() {
     setDetailState('loading');
     (async () => {
       try {
-        const { data, error } = await supabase.from('community_posts').select('*')
+        const { data, error } = await supabase.from('community_posts').select(COMMUNITY_POST_COLS)
           .eq('id', selectedPostId).neq('status', 'deleted').maybeSingle();
         if (error) throw error;
         if (selectedPostIdRef.current !== selectedPostId) return;
         if (!data) { setDetailState('missing'); return; }
         setDetailPost(data); setDetailState('idle');
         markPostSeen(data);
-        // Deep link into a DIFFERENT accessible space (bell click, pasted URL):
-        // adopt that space so closing the post lands on the right feed. RLS
+        // Deep link into a DIFFERENT accessible channel (bell click, pasted URL):
+        // adopt that channel so closing the post lands on the right feed. RLS
         // already proved access (the row came back). detailSeenRef resets so
         // this effect re-initializes replies/meta after the adoption wipe.
-        if (data.space_id && data.space_id !== spaceIdRef.current) {
-          const sp = spacesRef.current.find(s => s.id === data.space_id);
-          if (sp) {
+        if (data.channel_id && data.channel_id !== channelIdRef.current) {
+          const ch = channelsRef.current.find(c => c.channel_id === data.channel_id);
+          if (ch) {
             detailSeenRef.current = null;
-            adoptSpace(sp, { keepPost: true, replace: true });
+            adoptChannel(ch, { keepPost: true, replace: true, markRead: false });
           }
+        } else if (!data.channel_id && data.space_id && data.space_id !== spaceIdRef.current) {
+          // Pre-#40 row with no channel: fall back to the #32 space behaviour.
+          const sp = spacesRef.current.find(s => s.id === data.space_id);
+          if (sp) { detailSeenRef.current = null; setSpaceId(sp.id); spaceIdRef.current = sp.id; }
         }
       } catch (e) {
         if (selectedPostIdRef.current !== selectedPostId) return;
@@ -16065,49 +18229,122 @@ function CommunityHub() {
 
   const openEdit = (post) => setEditTarget({ post, tags: postTagsMeta[post.id] || [] });
 
-  // Mount bootstrap: resolve the accessible spaces FIRST, pick the initial one
-  // (?space= deep link → last selection from window.storage → the RPC default:
-  // VIP lands in their private space), then load the scoped feed. A pre-#32
-  // DB (RPC missing → PGRST202/404) drops to legacy single-space mode.
+  // Mount bootstrap: resolve the accessible CHANNELS first (#40), pick the initial
+  // one (?channel= deep link → last selection from window.storage → the server
+  // default → first accessible), then load the scoped feed. A pre-#40 DB (RPC
+  // missing) degrades to the #32 space-scoped feed; a pre-#32 DB to legacy mode.
   useEffect(() => {
     if (!uid) return;
     let cancelled = false;
     (async () => {
       try {
-        const { data, error } = await supabase.rpc('my_community_spaces');
+        const { data, error } = await supabase.rpc('my_community_sidebar');
         if (error) throw error;
         if (cancelled) return;
         const rows = data || [];
-        // Post-#32 every gate-passing member resolves at least General, so zero rows
-        // means the General space is missing/deactivated — a misconfiguration, NOT a
-        // pre-#32 database. Falling through to unscoped mode here would be wrong.
+        // Post-#40 every gate-passing member resolves at least one General channel,
+        // so zero rows means the seed is missing — a misconfiguration, NOT a pre-#40
+        // database. Falling through to an unscoped feed here would be wrong.
         if (!rows.length) {
-          setSpacesReady('error');
-          setErr('No community spaces are available for your account. If this persists, contact support.');
+          setChannelsReady('error'); setSpacesReady('error');
+          setErr('No community channels are available for your account. If this persists, contact support.');
           setLoading(false);
           return;
         }
-        setSpaces(rows);
-        let stored = null;
+        setChannels(rows);
+        // Spaces are still derived, for the composer's upload path and the
+        // legacy ?space= link. They are no longer navigated directly.
+        const spaceRows = [];
+        const seen = new Set();
+        for (const r of rows) {
+          if (r.space_id && !seen.has(r.space_id)) {
+            seen.add(r.space_id);
+            spaceRows.push({ id: r.space_id, slug: r.space_slug, name: r.space_name, kind: r.space_kind });
+          }
+        }
+        setSpaces(spaceRows);
+
+        let storedChannel = null;
+        let storedSpace = null;
         // window.storage.get resolves to { value } — unwrap it or the stored slug
         // never matches and the last-selection preference is silently dead.
-        try { stored = (await window.storage.get('community:lastSpace'))?.value || null; } catch { /* pref only */ }
+        try { storedChannel = (await window.storage.get('community:lastChannel'))?.value || null; } catch { /* pref only */ }
+        try { storedSpace = (await window.storage.get('community:lastSpace'))?.value || null; } catch { /* pref only */ }
         if (cancelled) return;
-        const chosen = pickInitialSpace({ urlSlug: initialSpaceSlugRef.current, storedSlug: stored, spaces: rows });
+
+        // A legacy ?space=/stored space with no ?channel= resolves to that space's
+        // own default room, so old links keep landing somewhere sensible.
+        const spaceSlug = initialSpaceSlugRef.current || storedSpace;
+        const spaceFallback = spaceSlug
+          ? (rows.find(r => r.space_slug === spaceSlug && r.is_space_default)
+             || rows.find(r => r.space_slug === spaceSlug))
+          : null;
+        const serverDefault = rows.find(r => r.is_default) || null;
+        // An incoming ?space= link is an EXPLICIT request, so it outranks the
+        // reader's stored preference — otherwise a shared cohort link silently
+        // opens whatever room they happened to be in last.
+        const chosen = pickInitialChannel({
+          urlSlug: initialChannelSlugRef.current
+            || (initialSpaceSlugRef.current && spaceFallback ? spaceFallback.channel_slug : null),
+          storedSlug: storedChannel,
+          channels: rows,
+          defaultChannelId: (spaceFallback || serverDefault)?.channel_id || null,
+        });
         if (chosen) {
-          spaceIdRef.current = chosen.id;
-          spaceSlugRef.current = chosen.slug;
-          setSpaceId(chosen.id);
-          // Make the first history entry carry the space so Back restores it and the
-          // initial URL is shareable (the bootstrap previously left /community bare).
-          // Read the ref, not the render-scope value: the bell can open a post while this
-          // effect is still awaiting, and a stale capture would drop ?post= on replace.
-          writeAppRoute('community', { space: chosen.slug, postId: selectedPostIdRef.current || undefined, replace: true });
+          channelIdRef.current = chosen.channel_id;
+          channelSlugRef.current = chosen.channel_slug;
+          setChannelId(chosen.channel_id);
+          spaceIdRef.current = chosen.space_id;
+          spaceSlugRef.current = chosen.space_slug;
+          setSpaceId(chosen.space_id);
+          // Make the first history entry carry the channel so Back restores it and
+          // the initial URL is shareable. Read the ref, not the render-scope value:
+          // the bell can open a post while this effect is still awaiting, and a
+          // stale capture would drop ?post= on replace.
+          writeAppRoute('community', {
+            space: chosen.space_slug,
+            channel: chosen.channel_slug,
+            postId: selectedPostIdRef.current || undefined,
+            replace: true,
+          });
         }
-        setSpacesReady(true);
+        setChannelsReady(true); setSpacesReady(true);
         loadFeed(false);
+        if (chosen) markChannelRead(chosen.channel_id);
       } catch (e) {
         if (cancelled) return;
+        // A pre-#40 database still has the #32 space engine. Fall back to it rather
+        // than failing the tab outright — same "confirm against the schema, never
+        // trust the error code alone" discipline as the pre-#32 probe below.
+        const code40 = String(e?.code || '');
+        const msg40 = String(e?.message || '');
+        const maybePre40 = code40 === 'PGRST202'
+          || (/my_community_sidebar/i.test(msg40) && /does not exist|could not find/i.test(msg40));
+        if (maybePre40) {
+          const probe40 = await supabase.from('community_channels').select('id').limit(1);
+          if (cancelled) return;
+          if (probe40.error && ['42P01', 'PGRST205'].includes(String(probe40.error.code))) {
+            const legacy = await supabase.rpc('my_community_spaces');
+            if (cancelled) return;
+            if (!legacy.error && (legacy.data || []).length) {
+              const rows = legacy.data;
+              setSpaces(rows);
+              let stored = null;
+              try { stored = (await window.storage.get('community:lastSpace'))?.value || null; } catch { /* pref only */ }
+              if (cancelled) return;
+              const chosen = pickInitialSpace({ urlSlug: initialSpaceSlugRef.current, storedSlug: stored, spaces: rows });
+              if (chosen) {
+                spaceIdRef.current = chosen.id;
+                spaceSlugRef.current = chosen.slug;
+                setSpaceId(chosen.id);
+                writeAppRoute('community', { space: chosen.slug, postId: selectedPostIdRef.current || undefined, replace: true });
+              }
+              setChannelsReady('legacy'); setSpacesReady(true);
+              loadFeed(false);
+              return;
+            }
+          }
+        }
         // "Is this a pre-#32 database?" is a question about the SCHEMA, and an error code
         // alone cannot answer it — legacy mode leaves spaceId null, which is how a private
         // post gets filed into General, so a false positive here reopens the whole leak:
@@ -16126,11 +18363,11 @@ function CommunityHub() {
           if (cancelled) return;
           // Same missing-table codes AdminEnrollments uses for its pre-#32 sentinel.
           if (probe.error && ['42P01', 'PGRST205'].includes(String(probe.error.code))) {
-            setSpacesReady('legacy'); loadFeed(false); return;
+            setChannelsReady('legacy'); setSpacesReady('legacy'); loadFeed(false); return;
           }
         }
-        setSpacesReady('error');
-        setErr(describeDbError(e, 'Could not load your community spaces. Check your connection and retry.'));
+        setChannelsReady('error'); setSpacesReady('error');
+        setErr(describeDbError(e, 'Could not load your community channels. Check your connection and retry.'));
         setLoading(false);
       }
     })();
@@ -16157,18 +18394,25 @@ function CommunityHub() {
     // Wait for the bootstrap; and in 'error' never subscribe — the focus refetch it
     // registers would run loadFeed unscoped and wipe the error banner.
     if (!uid || spacesReady === null || spacesReady === 'error') return;
+    if (channelsReady === 'error') return;
     // #32: one channel per active space, filtered server-side (space_id rides on
     // posts AND comments — the comment denorm exists for exactly this filter).
     // The filter is efficiency, not the boundary: delivery already respects RLS.
     // Legacy mode (no spaceId) keeps the unfiltered pre-#32 channel.
+    // #40: scope to the SELECTED CHANNEL — one subscription, never one per
+    // channel. channel_id rides on posts AND comments for exactly this reason
+    // (postgres_changes filters can only name columns of the published table).
     const sid = spaceId || null;
-    const spaceFilter = sid ? { filter: `space_id=eq.${sid}` } : {};
+    const cid = channelId || null;
+    const scopeFilter = cid ? { filter: `channel_id=eq.${cid}` }
+      : (sid ? { filter: `space_id=eq.${sid}` } : {});
     const ch = supabase
-      .channel(sid ? `community-feed-${sid}` : 'community-feed')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'community_posts', ...spaceFilter }, (payload) => {
+      .channel(cid ? `community-feed-ch-${cid}` : (sid ? `community-feed-${sid}` : 'community-feed'))
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'community_posts', ...scopeFilter }, (payload) => {
         const row = payload.new;
         if (!row || row.author_id === uid || row.status !== 'active') return;   // own posts reload locally
-        if (spaceIdRef.current && row.space_id && row.space_id !== spaceIdRef.current) return;  // belt-and-braces
+        if (channelIdRef.current && row.channel_id && row.channel_id !== channelIdRef.current) return;  // belt-and-braces
+        if (!channelIdRef.current && spaceIdRef.current && row.space_id && row.space_id !== spaceIdRef.current) return;
         // Only count arrivals the CURRENT view could surface — a pill whose
         // refresh visibly changes nothing reads as broken. Search / #tag views
         // skip the pill; category + Announcements views require a tag match.
@@ -16177,7 +18421,7 @@ function CommunityHub() {
         if (filterRef.current === 'announcements' && row.tag_slug !== COMMUNITY_ANNOUNCEMENTS_SLUG) return;
         setPendingNew(n => n + 1);
       })
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'community_comments', ...spaceFilter }, (payload) => {
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'community_comments', ...scopeFilter }, (payload) => {
         const cm = payload.new;
         const pid = cm && cm.post_id;
         if (!pid || cm.author_id === uid) return;                              // own comments append locally
@@ -16196,23 +18440,152 @@ function CommunityHub() {
         if (selectedPostIdRef.current === pid) loadComments(pid);
       })
       .subscribe();
-    const onFocus = () => { if (Date.now() - lastLoadRef.current > 30000) loadFeed(true); };
+    const onFocus = () => {
+      if (Date.now() - lastLoadRef.current > 30000) loadFeed(true);
+      // Throttled separately from the feed: my_community_sidebar() does a bounded
+      // scan per channel, and this listener outlives the tab (keep-alive TabPanel
+      // is never unmounted), so an unthrottled call here fired on every alt-tab
+      // for the rest of the session - even from other tabs.
+      if (Date.now() - lastSidebarRef.current <= 30000) return;
+      // The rail's unread counts come from my_community_sidebar(), which the
+      // bootstrap runs exactly once. Without refreshing it here the badges
+      // freeze at page-load state for every channel except the one being read
+      // - which is most of the reason the rail exists.
+      refreshSidebar();
+    };
     window.addEventListener('focus', onFocus);
     return () => { supabase.removeChannel(ch); window.removeEventListener('focus', onFocus); };
     // eslint-disable-next-line
-  }, [uid, spaceId, spacesReady]);
+  }, [uid, spaceId, channelId, spacesReady, channelsReady]);
 
   const activeTags = tags.filter(t => t.active);
   const composerTags = activeTags.filter(t => isAdmin || !t.admin_only);   // Announcements chip = admins only
-  // #32 capability flags — legacy mode (no space) keeps today's full behavior.
-  // spacesReady === 'error' means we don't know the space: refuse every write
-  // rather than let it default into General (see the spacesReady comment above).
-  const spacesFailed = spacesReady === 'error';
+  // ── Effective rights (#40) ─────────────────────────────────────────
+  // ★ These come from the SERVER, verbatim. my_community_sidebar() has already
+  // fused plan x space x channel, so the client's only job is to render what it
+  // was told and to fail CLOSED when it was told nothing.
+  //
+  // This replaced a re-derivation from raw space flags that read
+  // `!currentSpace || member_posting !== false` — which fails OPEN before the
+  // space resolves, and ignored the plan dimension entirely. That is how a
+  // Sampler member got a New-discussion button whose submit then 42501'd.
+  const spacesFailed = spacesReady === 'error' || channelsReady === 'error';
   const currentSpace = spaceId ? (spaces.find(s => s.id === spaceId) || null) : null;
-  const memberCanComment = !currentSpace || currentSpace.member_comments !== false;
-  const canComment = !spacesFailed && (isAdmin || memberCanComment);  // admins moderate/answer everywhere (admin_all RLS)
-  const canPost = !spacesFailed && (isAdmin || !currentSpace || currentSpace.member_posting !== false);
-  const canReact = !spacesFailed && (isAdmin || !currentSpace || currentSpace.member_reactions !== false);
+  const currentChannel = channelId ? (channels.find(c => c.channel_id === channelId) || null) : null;
+  const channelCaps = effectiveChannelCaps(currentChannel);
+  // Pre-#40 databases have no channels; fall back to the #32 space capabilities,
+  // which are themselves server-resolved (and fail closed on a missing space).
+  // Two different legacy shapes, and they must not be conflated:
+  //   spacesReady === 'legacy'  -> pre-#32, ONE unscoped feed and no space rows
+  //                                at all. effectiveCaps(null) is all-false, so
+  //                                treating it like pre-#40 would brick a
+  //                                database that used to work fine.
+  //   channelsReady === 'legacy' -> pre-#40, spaces resolved: use the #32 caps.
+  const preSpaces = spacesReady === 'legacy';
+  const preChannels = channelsReady === 'legacy';
+  const FULL_LEGACY_CAPS = { canRead: true, canPost: true, canComment: true, canReact: true, canAttach: true };
+  const caps = preSpaces ? FULL_LEGACY_CAPS
+    : (preChannels ? effectiveCaps(currentSpace) : channelCaps);
+  // Admins moderate and answer everywhere (community_*_admin_all RLS).
+  const canComment = !spacesFailed && (isAdmin || caps.canComment);
+  const canPost = !spacesFailed && (isAdmin || caps.canPost);
+  const canReact = !spacesFailed && (isAdmin || caps.canReact);
+  const canAttach = !spacesFailed && (isAdmin || caps.canAttach);
+  const railGroups = useMemo(() => groupChannelsByCategory(channels), [channels]);
+  // Stable identities: the rail rows are memoized, and a callback minted inline
+  // per render would defeat that on every keystroke. Both read live state through
+  // refs, so an empty dep array is correct rather than merely convenient.
+  const handleOpenChannel = useCallback((row) => adoptChannel(row), []);
+  const handleManageOpen = useCallback(() => setAdminEditorOpen(true), []);
+
+  function draftName(key, value) {
+    setDraftNames(prev => {
+      const next = { ...prev };
+      if (value === undefined) delete next[key]; else next[key] = value;
+      return next;
+    });
+  }
+
+  function toggleRailEditing(on) {
+    setRailEditing(on);
+    if (!on) { setDraftNames({}); setNameErrors({}); }   // Cancel discards; Done clears after committing
+  }
+
+  // Commit ONLY the names that actually changed, and dispatch them together so
+  // wall-clock is one round trip rather than one per channel. Each call is
+  // independent, so a partial failure is recoverable — the drafts that failed stay
+  // on screen instead of being silently dropped.
+  async function saveRailNames() {
+    const byId = new Map();
+    channels.forEach(c => byId.set(`ch:${c.channel_id}`, c.channel_name));
+    railGroups.forEach(g => { if (g.categoryId) byId.set(`cat:${g.categoryId}`, g.categoryName); });
+
+    const entries = Object.entries(draftNames)
+      .map(([key, raw]) => ({ key, name: (raw || '').trim() }))
+      // A draft whose channel disappeared (another admin archived it while this
+      // one was editing) would otherwise fail forever with nothing on screen to
+      // point at, wedging edit mode until Cancel.
+      .filter(j => byId.has(j.key));
+
+    // Blank is a mistake, not an instruction. Dropping it silently would close the
+    // rail with the old name restored, which reads as a successful save.
+    const blanks = entries.filter(j => !j.name);
+    if (blanks.length) {
+      setNameErrors(Object.fromEntries(blanks.map(b => [b.key, 'empty'])));
+      setErr('Give every channel a name, or press Escape in that field to undo.');
+      return;
+    }
+
+    const jobs = entries.filter(j => j.name !== byId.get(j.key));
+    if (!jobs.length) { toggleRailEditing(false); return; }
+
+    setRenaming(true); setErr(''); setNameErrors({});
+    // Chunked: each RPC takes its own pooled transaction, and Customize mode can
+    // change every row in the rail. Unbounded parallelism here could exhaust a
+    // small Supavisor pool and stall member requests app-wide.
+    const runJob = async (j) => {
+      const [kind, id] = j.key.split(':');
+      try {
+        const { error } = kind === 'ch'
+          // Rename-only: every other argument is null, and the RPC preserves each
+          // one — including audience_mode, which must never reset to space-wide.
+          ? await supabase.rpc('admin_save_community_channel', {
+              p_id: id, p_space_id: null, p_category_id: null, p_slug: null,
+              p_name: j.name, p_topic: null, p_kind: null, p_audience_mode: null,
+              p_plan_keys: null, p_batch_ids: null, p_member_posting: null,
+              p_member_comments: null, p_member_reactions: null, p_member_attachments: null,
+            })
+          : await supabase.rpc('admin_save_channel_category', {
+              p_id: id, p_space_id: null, p_name: j.name, p_status: null,
+            });
+        return { ...j, ok: !error, error };
+      } catch (e) { return { ...j, ok: false, error: e }; }
+    };
+    const results = [];
+    for (let i = 0; i < jobs.length; i += 4) {
+      results.push(...await Promise.all(jobs.slice(i, i + 4).map(runJob)));
+    }
+    setRenaming(false);
+
+    const failed = results.filter(r => !r.ok);
+    // Reconcile rather than reset: an edit typed WHILE the save was in flight is
+    // still a real edit, and rebuilding the map from `failed` alone would bin it.
+    setDraftNames(prev => {
+      const next = { ...prev };
+      results.filter(r => r.ok).forEach(r => { if (prev[r.key] === r.name) delete next[r.key]; });
+      return next;
+    });
+    setNameErrors(Object.fromEntries(failed.map(f => [f.key, 'failed'])));
+    if (failed.length) {
+      // Name each failure. One shared sentence hides which of several rows was
+      // refused, and the rows are all still on screen.
+      setErr(`Could not rename ${failed.length} of ${jobs.length}: `
+        + failed.map(f => `"${f.name}" — ${appErrorMessage(f.error, 'unknown error')}`).join('; '));
+    } else {
+      setRailEditing(false);
+    }
+    await refreshSidebar();
+  }
   const tagBySlug = {};
   tags.forEach(t => { tagBySlug[t.slug] = t; });
   const detailRow = selectedPostId ? (posts.find(p => p.id === selectedPostId) || detailPost) : null;
@@ -16244,8 +18617,24 @@ function CommunityHub() {
           ? 'Post announcements, pin important discussions, and moderate the forum inline.'
           : 'A member forum — ask questions, share wins, discuss the courses, and follow announcements.'} gold />
 
-      {!schemaGap && (
-        <CommunitySpaceSwitcher spaces={spaces} activeId={spaceId} onSwitch={switchSpace} />
+      {/* The space switcher is retired (#40): spaces are an entitlement boundary,
+          not something a member navigates. The channel rail below is the
+          navigation, and a cohort's rooms appear under their own locked group. */}
+      {adminEditorOpen && (
+        <CommunityAdminEditor
+          onClose={() => setAdminEditorOpen(false)}
+          onSaved={() => refreshSidebar()} />
+      )}
+      {railOpen && (
+        <SidePanel title="Channels" subtitle="Jump to a conversation" icon={MessagesSquare}
+          onClose={() => setRailOpen(false)}>
+          <CommunityChannelRail groups={railGroups} activeId={channelId} collapsed={collapsedCats}
+            onToggleCat={toggleCat} onOpen={handleOpenChannel} isAdmin={isAdmin}
+            onManage={() => { setRailOpen(false); setAdminEditorOpen(true); }}
+            editing={railEditing} draftNames={draftNames} onDraftName={draftName}
+            onToggleEditing={toggleRailEditing} onSaveNames={saveRailNames} renaming={renaming}
+            nameErrors={nameErrors} />
+        </SidePanel>
       )}
 
       {spacesReady === 'legacy' && isAdmin && !schemaGap && (
@@ -16323,7 +18712,7 @@ function CommunityHub() {
               postTags={postTagsMeta[detailRow.id] || []}
               attachments={attachMeta[detailRow.id] || []}
               signedUrls={signedUrls}
-              canComment={canComment} canReact={canReact} spaceId={spaceId}
+              canComment={canComment} canReact={canReact} canPost={canPost} spaceId={spaceId} channelId={channelId}
               isAdmin={isAdmin} uid={uid} myName={myName} myAvatar={myAvatar}
               commentCount={typeof detailRow.comment_count === 'number' ? detailRow.comment_count : ((comments[detailRow.id] || {}).rows || []).filter(r => r.status === 'active').length}
               reactions={reactMeta[detailRow.id]}
@@ -16349,18 +18738,99 @@ function CommunityHub() {
         <div className="max-w-6xl mx-auto">
           <div className="lg:grid lg:grid-cols-[218px_minmax(0,1fr)] xl:grid-cols-[218px_minmax(0,1fr)_264px] lg:gap-5 lg:items-start">
             <div className="hidden lg:block">
-              <CommunityCategoryRail tags={activeTags} counts={catCounts} activeTag={activeTag}
-                filter={filter} onPick={pickCategory} totalCount={totalCount} />
+              {railGroups.length > 0 ? (
+                <CommunityChannelRail groups={railGroups} activeId={channelId} collapsed={collapsedCats}
+                  onToggleCat={toggleCat} onOpen={handleOpenChannel} isAdmin={isAdmin}
+                  onManage={handleManageOpen}
+                  editing={railEditing} draftNames={draftNames} onDraftName={draftName}
+                  onToggleEditing={toggleRailEditing} onSaveNames={saveRailNames} renaming={renaming}
+                  nameErrors={nameErrors} />
+              ) : (
+                <>
+                  {/* ★ The Manage button lives INSIDE the rail, so an admin who
+                      archives every channel would otherwise lose the only way back
+                      into the editor and need SQL to recover. */}
+                  {isAdmin && channelsReady !== null && (
+                    <button onClick={() => setAdminEditorOpen(true)}
+                      className="mb-3 inline-flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-xs font-bold"
+                      style={{ color: C.primary, background: 'var(--wash)' }}>
+                      <Settings size={13} /> Manage community
+                    </button>
+                  )}
+                  <CommunityCategoryRail tags={activeTags} counts={catCounts} activeTag={activeTag}
+                    filter={filter} onPick={pickCategory} totalCount={totalCount} />
+                </>
+              )}
             </div>
 
             <div className="min-w-0">
+              {/* Channel header: what room am I in, what belongs here, is it private */}
+              {railGroups.length > 0 && (
+                <div className="mb-3 flex items-start gap-2">
+                  <button className="lg:hidden gh-btn-ghost px-2.5 py-1.5 text-xs font-bold"
+                    onClick={() => setRailOpen(true)} aria-label="Browse channels"
+                    aria-expanded={railOpen}>
+                    <Menu size={14} />
+                  </button>
+                  <div className="min-w-0 flex-1">
+                  {currentChannel && (<>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      {currentChannel.channel_kind === 'announcement'
+                        ? <Megaphone size={16} style={{ color: C.primary }} />
+                        : <Hash size={16} style={{ color: C.primary }} />}
+                      <span style={{ fontFamily: fontMono, fontSize: 15, fontWeight: 800, color: C.text }}>
+                        {currentChannel.channel_name}
+                      </span>
+                      {currentChannel.is_restricted && (
+                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full"
+                          style={{ background: 'var(--status-neutral-bg)', border: '1px solid var(--status-neutral-bd)',
+                                   color: 'var(--status-neutral-fg)', fontSize: 10, fontWeight: 700 }}>
+                          <Lock size={9} /> Restricted
+                        </span>
+                      )}
+                    </div>
+                    {currentChannel.channel_topic && (
+                      <p className="text-xs mt-0.5" style={{ color: C.textMute }}>{currentChannel.channel_topic}</p>
+                    )}
+                  </>)}
+                  </div>
+                </div>
+              )}
+
               <CommunityFilterTabs filter={filter} onFilter={pickFilter}
                 searchInput={searchInput} onSearchInput={setSearchInput}
                 showUnanswered={canComment}
                 onNewTopic={canPost ? () => setComposerOpen(true) : null} />
 
-              {/* Category chips — the < lg fallback for the rail */}
-              <div className="lg:hidden mt-3 -mx-1 px-1 overflow-x-auto">
+              {/* Search scope. Only offered while a search is running — an idle
+                  toggle would just be chrome. */}
+              {searchInput.trim().length >= 2 && railGroups.length > 0 && (
+                <div className="mt-2 flex items-center gap-1.5 flex-wrap">
+                  <span className="text-xs" style={{ color: C.textMute }}>Searching</span>
+                  {[['channel', currentChannel ? `#${currentChannel.channel_name}` : 'this channel'],
+                    ['all', 'All channels']].map(([k, label]) => (
+                    <button key={k} onClick={() => pickSearchScope(k)} aria-pressed={searchScope === k}
+                      className={`gh-pill px-2.5 py-1 text-xs font-bold${searchScope === k ? ' is-active' : ''}`}>
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Channel rules, stated before composing rather than after a refusal */}
+              {currentChannel && !canPost && !isAdmin && channelsReady === true && (
+                <div className="mt-3 p-2.5 rounded-lg text-xs" style={{
+                  background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)',
+                  color: 'var(--status-info-fg)' }}>
+                  {currentChannel.channel_kind === 'announcement'
+                    ? 'Only admins post here. You can read and react.'
+                    : 'You can read and react in this channel.'}
+                </div>
+              )}
+
+              {/* Tag chips. The left rail now navigates CHANNELS, so tag filtering
+                  lives here at every width rather than only below lg. */}
+              <div className={`${railGroups.length ? '' : 'lg:hidden '}mt-3 -mx-1 px-1 overflow-x-auto`}>
                 <div className="flex items-center gap-1.5 w-max pb-1">
                   <button onClick={() => pickCategory('all')}
                     className={`gh-pill px-3.5 py-1.5 text-xs font-semibold${activeTag === 'all' && filter !== 'announcements' ? ' is-active' : ''}`}>
@@ -16446,6 +18916,8 @@ function CommunityHub() {
           editPost={editTarget ? editTarget.post : null}
           editTags={editTarget ? editTarget.tags : []}
           spaceId={spaceId} spaceName={currentSpace ? currentSpace.name : null}
+          channelId={channelId} channelName={currentChannel ? currentChannel.channel_name : null}
+          canAttach={canAttach}
           composerTags={composerTags} uid={uid} myName={myName} myAvatar={myAvatar}
           onClose={() => { setComposerOpen(false); setEditTarget(null); }}
           onPublished={handlePublished}

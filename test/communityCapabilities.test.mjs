@@ -1,11 +1,23 @@
-// test/communityCapabilities.test.mjs — the plan × space capability matrix (#36).
+// test/communityCapabilities.test.mjs — the plan × space capability matrix (#36, #40).
 //
 // The 24-cell truth table (3 plans × 2 space kinds × 4 actions) is the JS half of
-// a lockstep pair with public.user_community_capabilities(). It encodes D2:
+// a lockstep pair with public.user_community_capabilities().
 //
-//     General is an ANNOUNCEMENT space. No member posts or comments there —
-//     not Sampler, not Silver, and NOT VIP. Everyone reacts. VIP holds the full
-//     forum only inside its own per-batch space.
+// ★ D2 CHANGED SHAPE IN #40 and these fixtures changed with it — deliberately.
+//
+//   Under #36 this file encoded "General is an ANNOUNCEMENT space; no member
+//   posts or comments there, not even VIP", enforced by the General space flags
+//   plus can_post_in_general = false on every plan.
+//
+//   #40 makes General a space that CAN host conversation and moves the
+//   restriction down to the channel: #announcements is kind='announcement' with
+//   comments off, while #general-discussion is an ordinary room. So what this
+//   matrix now describes is the CEILING — what a plan may do in a kind of space
+//   before the channel narrows it. The channel half lives in
+//   test/communityChannels.test.mjs, and the two together are what the DB does.
+//
+//   If you are here because a cell flipped: that is the point. The cell counts
+//   below are asserted so a silent drift still fails.
 //
 // #39 removed the Gold plan and the whole 'gold' space kind, so the matrix is
 // 3 × 2 rather than the 5 × 3 it was under #36.
@@ -37,10 +49,12 @@ const PLAN_ROWS = {
   vip:               { community_segment: 'vip',     ...PLAN_CAPABILITY_FALLBACK.vip },
 };
 
-// The live community_spaces rows after #36's D2 flip.
+// The live community_spaces rows after #40 retired the space-wide D2 rule.
+// General now permits conversation; which General ROOMS accept it is a channel
+// setting (see test/communityChannels.test.mjs).
 const SPACES = {
-  general: { kind: 'general', member_posting: false, member_comments: false, member_reactions: true },
-  vip:     { kind: 'vip',     member_posting: true,  member_comments: true,  member_reactions: true },
+  general: { kind: 'general', member_posting: true, member_comments: true, member_reactions: true },
+  vip:     { kind: 'vip',     member_posting: true, member_comments: true, member_reactions: true },
 };
 
 const SELF_PACED = ['sampler', 'silver_self_paced'];
@@ -51,32 +65,41 @@ const SPACE_KINDS = ['general', 'vip'];
 const caps = (plan, spaceKind) =>
   capabilitiesFor(plan, PLAN_ROWS[plan], SPACES[spaceKind], false);
 
-test('D2: NO plan may post or comment in General — including VIP', () => {
+test('#40: the General CEILING now permits conversation for every plan', () => {
+  // The space no longer refuses on everyone's behalf. #announcements stays
+  // admin-only one level down, because it is kind='announcement'.
   for (const plan of ALL_PLANS) {
     const c = caps(plan, 'general');
-    assert.equal(c.canPost, false, `${plan} must not post in General`);
-    assert.equal(c.canComment, false, `${plan} must not comment in General`);
-    assert.equal(c.canAttach, false, `${plan} must not attach in General`);
+    assert.equal(c.canPost, true, `${plan} may post somewhere in General`);
+    assert.equal(c.canComment, true, `${plan} may comment somewhere in General`);
   }
 });
 
-test('D2: EVERY plan may react in General — reacting is not creating discussion', () => {
+test('#40 did NOT relax attachments — they stay a plan right', () => {
+  // Opening General for conversation must not quietly open the private bucket.
+  for (const plan of SELF_PACED) {
+    assert.equal(caps(plan, 'general').canAttach, false,
+      `${plan} must still not attach in General`);
+  }
+  assert.equal(caps('vip', 'general').canAttach, true, 'vip keeps its attachment right');
+});
+
+test('EVERY plan may react in General — reacting is not creating discussion', () => {
   for (const plan of ALL_PLANS) {
     assert.equal(caps(plan, 'general').canReact, true, `${plan} must be able to react in General`);
   }
 });
 
-test('the Discord problem: self-paced plans can never write, in any space', () => {
-  // This is the whole point of #36. Sampler/Silver read and react; the
-  // support load that made Discord unmanageable cannot reappear.
+test('self-paced plans still never write inside a COHORT space', () => {
+  // The Discord problem #36 solved: the cohort room is what members paid for,
+  // and a self-paced plan must not be able to write into it. #40 does not touch
+  // this — only the General ceiling moved.
   for (const plan of SELF_PACED) {
-    for (const kind of SPACE_KINDS) {
-      const c = caps(plan, kind);
-      assert.equal(c.canPost, false, `${plan} must not post in ${kind}`);
-      assert.equal(c.canComment, false, `${plan} must not comment in ${kind}`);
-      assert.equal(c.canAttach, false, `${plan} must not attach in ${kind}`);
-      assert.equal(c.canReact, true, `${plan} must still react in ${kind}`);
-    }
+    const c = caps(plan, 'vip');
+    assert.equal(c.canPost, false, `${plan} must not post in a cohort space`);
+    assert.equal(c.canComment, false, `${plan} must not comment in a cohort space`);
+    assert.equal(c.canAttach, false, `${plan} must not attach in a cohort space`);
+    assert.equal(c.canReact, true, `${plan} must still react in a cohort space`);
   }
 });
 
@@ -85,10 +108,15 @@ test('VIP holds the full forum inside its private cohort space', () => {
   assert.deepEqual(vip, { canPost: true, canComment: true, canReact: true, canAttach: true });
 });
 
-test('the full 24-cell matrix matches the #36 seed exactly', () => {
+test('the full 24-cell matrix matches the #40 seed exactly', () => {
   const expected = {};
-  for (const plan of ALL_PLANS) {
-    expected[`${plan}/general`] = { canPost: false, canComment: false, canReact: true, canAttach: false };
+  // General ceiling: everyone may write; only VIP carries the attachment right,
+  // and attaching also needs the right to create the parent.
+  for (const plan of SELF_PACED) {
+    expected[`${plan}/general`] = { canPost: true, canComment: true, canReact: true, canAttach: false };
+  }
+  for (const plan of COHORT) {
+    expected[`${plan}/general`] = { canPost: true, canComment: true, canReact: true, canAttach: true };
   }
   for (const plan of SELF_PACED) {
     expected[`${plan}/vip`] = { canPost: false, canComment: false, canReact: true, canAttach: false };
@@ -239,9 +267,19 @@ test('denialCopy never leaves a disabled control unexplained', () => {
 test('planCapabilities resolves a partial row without inventing permissions', () => {
   // A row from an older schema carries only some columns; the missing ones must
   // come from the fallback/default, never default to true.
+  // vip's own fallback fills the gaps, so the General columns come back true
+  // post-#40 — the point is that they come from the FALLBACK, not from a blanket
+  // "missing means allowed".
   const partial = { can_post_in_private: true };
   const p = planCapabilities('vip', partial);
   assert.equal(p.can_post_in_private, true);
-  assert.equal(p.can_post_in_general, false);
-  assert.equal(p.can_comment_in_general, false);
+  assert.equal(p.can_post_in_general, PLAN_CAPABILITY_FALLBACK.vip.can_post_in_general);
+  assert.equal(p.can_comment_in_general, PLAN_CAPABILITY_FALLBACK.vip.can_comment_in_general);
+
+  // An unknown plan has no fallback, so every gap resolves to the fail-closed
+  // default — this is the case that must never invent a permission.
+  const unknown = planCapabilities('not_a_plan', { can_post_in_private: true });
+  assert.equal(unknown.can_post_in_general, false);
+  assert.equal(unknown.can_comment_in_general, false);
+  assert.equal(unknown.can_upload_attachments, false);
 });

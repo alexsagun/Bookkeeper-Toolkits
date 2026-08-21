@@ -54,6 +54,15 @@ beforeEach(async () => {
 
 after(async () => { await resetShadow(); });
 
+/** The cohort lounge — the channel the mention/denial tests now scope to. */
+async function cohortLoungeId() {
+  return sqlScalar(`
+    select ch.id::text from public.community_channels ch
+      join public.community_spaces sp on sp.id = ch.space_id
+      join public.batches b on b.id = sp.batch_id
+     where b.code = '2026-08' and ch.slug = 'lounge'`);
+}
+
 /** Post an announcement into a space as the admin, returning its id. */
 async function adminPost(spaceId, title = 'Announcement') {
   return sqlScalar(`
@@ -71,34 +80,58 @@ const SELF_PACED = () => [
 
 // ── D2: nobody writes in General ─────────────────────────────────────────────
 
-test('D2: NO plan can create a post in General — not even VIP', async () => {
+// ★ RESTATED FOR #40, not deleted. Under #36 this asserted that NO plan could
+//   post in General, because D2 was a space-wide prohibition. #40 retired that
+//   and moved the rule onto the channel, so the honest assertion is now:
+//   General accepts posts, and #announcements still does not. The channel-level
+//   matrix lives in test-db/communityChannels.dbtest.mjs.
+test('#40: General accepts member posts, but #announcements still does not', async () => {
   const general = await generalSpaceId();
+  const ann = await sqlScalar(`
+    select ch.id::text from public.community_channels ch
+     where ch.space_id = '${general}'::uuid and ch.slug = 'announcements'`);
 
   for (const [name, who] of [...SELF_PACED(), ['vip', vip]]) {
+    // A post with no channel_id lands in the space default (#general-discussion).
+    const ok = await who.db.from('community_posts').insert({
+      author_id: who.id, space_id: general, title: 'Question!',
+      body: 'How do I reconcile this?', tag_slug: TAG, status: 'active',
+    }).select('id');
+    assert.equal(ok.error, null,
+      `${name} should be able to post in General since #40: ${ok.error && ok.error.message}`);
+
     await expectDenied(
       who.db.from('community_posts').insert({
-        author_id: who.id, space_id: general, title: 'Question!',
-        body: 'How do I reconcile this?', tag_slug: TAG, status: 'active',
-      }),
-      `${name} posting in General`,
+        author_id: who.id, channel_id: ann, title: 'Me too',
+        body: 'Adding to the announcement', tag_slug: TAG, status: 'active',
+      }).select('id'),
+      `${name} posting in #announcements`,
     );
   }
 
-  const n = await sqlScalar(
-    `select count(*)::int from public.community_posts where space_id = '${general}'::uuid`);
-  assert.equal(n, 0, 'not one member post landed in General');
+  assert.equal(
+    await sqlScalar(`select count(*)::int from public.community_posts where channel_id = '${ann}'::uuid`),
+    0, 'not one member post landed in #announcements');
 });
 
-test('D2: NO plan can reply in General, on an admin announcement — not even VIP', async () => {
+// Also restated: replies are refused because the ANNOUNCEMENT CHANNEL has them
+// off (and its posts are born comments_locked), not because the space is closed.
+test('#40: replies are still refused on an announcement, by the channel', async () => {
   const general = await generalSpaceId();
-  const postId = await adminPost(general, 'Welcome to August');
+  const ann = await sqlScalar(`
+    select ch.id::text from public.community_channels ch
+     where ch.space_id = '${general}'::uuid and ch.slug = 'announcements'`);
+  const postId = await sqlScalar(`
+    insert into public.community_posts (author_id, author_name, title, body, tag_slug, channel_id)
+    values ('${admin.id}', 'Alex Admin', 'Welcome to August', 'body', '${TAG}', '${ann}'::uuid)
+    returning id::text`);
 
   for (const [name, who] of [...SELF_PACED(), ['vip', vip]]) {
     await expectDenied(
       who.db.from('community_comments').insert({
         author_id: who.id, post_id: postId, body: 'Can you explain?', status: 'active',
-      }),
-      `${name} replying in General`,
+      }).select('id'),
+      `${name} replying to an announcement`,
     );
   }
 

@@ -69,6 +69,13 @@ export const APP_ERROR_CODES = [
   'BATCH_PERIOD_INVALID',
   'BATCH_TIMEZONE_INVALID',
   'BATCH_CAPACITY_BELOW_OCCUPANCY',
+  // ── Community channels (#40) ──
+  'CHANNEL_NOT_FOUND',
+  'CHANNEL_SLUG_TAKEN',
+  'CHANNEL_AUDIENCE_EMPTY',
+  'CHANNEL_ARCHIVED',
+  'CATEGORY_NOT_FOUND',
+  'CATEGORY_NOT_EMPTY',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -140,6 +147,17 @@ const COPY = {
   BATCH_TIMEZONE_INVALID: 'That is not a timezone the server recognises. Pick one from the list.',
   BATCH_CAPACITY_BELOW_OCCUPANCY:
     'That capacity is below the seats already sold in this batch. Raise it, or move members first.',
+  // A channel the caller cannot see reports exactly like one that does not
+  // exist — saying "you lack access" would confirm a private room is there.
+  CHANNEL_NOT_FOUND: 'That channel is not available.',
+  CHANNEL_SLUG_TAKEN:
+    'Another channel in this space already uses that address. Pick a different name.',
+  CHANNEL_AUDIENCE_EMPTY:
+    'Choose at least one plan or batch — as set up, nobody could see this channel.',
+  CHANNEL_ARCHIVED: 'This channel is archived, so it is read-only.',
+  CATEGORY_NOT_FOUND: 'That category is not available.',
+  CATEGORY_NOT_EMPTY:
+    'This category still holds active channels. Move or archive them first.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };

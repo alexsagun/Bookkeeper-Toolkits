@@ -1,5 +1,5 @@
 <!-- GENERATED FILE — do not hand-edit. Regenerate with `npm run ai:knowledge`
-     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-08-17 -->
+     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-08-20 -->
 
 # Toolkits by Alex — Voice Assistant Knowledge
 
@@ -44,7 +44,7 @@ paths never change.
 | Tool | Tab id | URL path | What it does |
 |---|---|---|---|
 | Dashboard | `dashboard` | `/` | Progress overview with career-stage tiles, membership status, and quick links to every tool. |
-| Community | `community` | `/community` | Member forum split into spaces: a General space every active member can read and react to (announcements only — nobody replies there) plus a private per-batch VIP space with the full forum — search, free-form tags, image/video/link attachments, @mentions, reactions, pinned posts, and admin announcements with read-tracking, plus a notification bell. VIP members land in their own batch community; access follows the membership automatically. |
+| Community | `community` | `/community` | Member forum organised into channels grouped by category, like a chat community. Text channels for discussion and announcement channels that are read-and-react only. Every member sees #announcements plus general channels for QuickBooks help, the job search and client work; VIP members also get their own private cohort channels. Channels can be limited to particular plans or batches, and members only ever see the channels they may open. Includes per-channel unread markers, search within a channel or across all of them, free-form tags, image/video/link attachments, @mentions, reactions, pinned posts and a notification bell. Admins create and organise channels from Manage community. Access follows the membership automatically. |
 
 ### Training & Skills
 
@@ -115,8 +115,8 @@ to USD.
 | Plan | Key | Price (PHP) | Access | Highlights |
 |---|---|---|---|---|
 | Sampler Session (Essentials) | `sampler` | ₱1,499 | 60 days | 1 Live Zoom Session (3 hours); 60-day course access; 60-day group chat support; Limited offer · 60-day support |
-| QBO + Resume Combo (Silver · Self-Paced) | `silver_self_paced` | ₱2,999 | 60 days | Simulated annual bookkeeping project for an NY-based construction company; 60-day QBO Mastery course access; 60-day Resume & Interview course access; Weekly Discord chat (Thu) |
-| Personalized Coaching Program (VIP Package) | `vip` | ₱16,999 (was ₱35,000) | 180 days | Simulated annual bookkeeping project for an NY-based construction company; 12 Live Group Zoom Trainings (MWF 9am to 11am PH Time); 1-on-1 Resume & Interview Coaching (1 session); Weekly group consult until hired; Discord chat support until and after hired; BEST SELLER · Limited to 10 slots per month |
+| QBO + Resume Combo (Silver · Self-Paced) | `silver_self_paced` | ₱2,999 | 60 days | Simulated annual bookkeeping project for an NY-based construction company; 60-day QBO Mastery course access; 60-day Resume & Interview course access; Weekly Community chat (Thu) |
+| Personalized Coaching Program (VIP Package) | `vip` | ₱16,999 (was ₱35,000) | 180 days | Simulated annual bookkeeping project for an NY-based construction company; 12 Live Group Zoom Trainings (MWF 9am to 11am PH Time); 4 Live Group Resume & Interview Coaching Sessions; 1-on-1 Resume & Interview Coaching (1 session); Weekly group consult until hired; Community chat support until and after hired; BEST SELLER · Limited to 10 slots per month |
 
 **What each plan can open (entitlement scope):**
 
