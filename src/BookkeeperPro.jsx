@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useContext } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useContext, useDeferredValue } from 'react';
 import {
   LayoutDashboard, BookOpen, FileSpreadsheet, Receipt, FileText,
   MessageCircle, FileCheck2, Percent, ClipboardList, Sparkles,
@@ -35,7 +35,7 @@ import {
 import {
   accessDiff, channelAccessSummary, channelDenialCopy,
   effectiveChannelCaps, groupChannelsByCategory, normalizeChannelSlug,
-  pickInitialChannel, unreadLabel, AUDIENCE_MODES,
+  pickInitialChannel, cohortLandingChannel, unreadLabel, AUDIENCE_MODES,
 } from './lib/communityChannels';
 // ★ Until #40 this module was imported by NOTHING but its own test, while
 // CommunityHub re-derived rights from raw space flags and failed OPEN on an
@@ -49,7 +49,7 @@ import {
 import { appErrorCode, appErrorMessage, isMigrationMissing } from './lib/appErrors';
 import {
   ENROLLMENT_PLANS_FALLBACK, PLAN_LABELS, PLAN_ENTITLEMENTS, planEntitlement,
-  FULL_ENTITLEMENT, filterStagesForEntitlement, extensionPrice,
+  FULL_ENTITLEMENT, filterStagesForEntitlement, extensionPrice, phpAmount,
 } from './lib/planCatalog';
 import {
   COVER_INDUSTRIES, DEFAULT_INDUSTRY_ID, getIndustry, detectIndustry, scrubDashes,
@@ -58,8 +58,8 @@ import { parseLooseJson } from './lib/partialJson';
 import { ZOOM_HOST_SUFFIXES, parseReplayUrl } from './lib/lessonReplay';
 import {
   INTAKE_FIELDS, INTAKE_SECTIONS,
-  validateIntake, parseAmountPaid, normalizePhone, normalizeFacebook,
-  blankIntake, intakeField, fileTypeAllowed, contentTypeFor, intakeValuesFromRequest,
+  validateIntake, parseAmountPaid, normalizePhone,
+  blankIntake, intakeField, fileTypeAllowed, contentTypeFor, intakeValuesFromRequest, intakePayload,
 } from './lib/enrollmentIntake';
 import { AGREEMENT_VERSION, agreementModel, agreementSnapshot } from './lib/trainingAgreement';
 
@@ -92,7 +92,10 @@ const REQUIRE_ENROLLMENT =
 // when the enrollment_plans table is missing/empty so the paywall never renders blank;
 // the live table (admin-editable) always wins when it loads. Prices are FIXED ₱ (PHP)
 // bank-transfer amounts — format with phpFmt, never useCurrency (no USD conversion).
-const phpFmt = (n) => '₱' + Number(n || 0).toLocaleString('en-US');
+// One implementation, shared with the Training Agreement and the admin alert
+// email: three separate formatters had already drifted into disagreeing about
+// what a price IS (see phpAmount's header).
+const phpFmt = phpAmount;
 
 // Manual-payment instructions shown on the paywall when payment_settings hasn't loaded
 // (mirrors the db seed; the admin-editable table wins once fetched).
@@ -2608,19 +2611,60 @@ function typedUploadBody(file) {
   }
 }
 
+// THE upload for every enrollment artefact — receipt, resume, signature PNG and
+// agreement PDF all land in the private `enrollment-receipts` bucket under the
+// `<uid>/` prefix its policies key on. One function, because there was briefly a
+// second copy inside EnrollmentPaywall and the two had already diverged: it
+// always rewrapped to a bare Blob and so discarded the filename, while this path
+// preserved it. Anything learned about the 415/octet-stream problem has to be
+// learned once.
+const ENROLLMENT_BUCKET = 'enrollment-receipts';
+async function uploadEnrollmentFile(uid, prefix, blob, name, contentType) {
+  const safe = String(name || 'file').replace(/[^\w.\-]+/g, '_');
+  const path = `${uid}/${prefix}-${crypto.randomUUID()}-${safe}`;
+  const type = contentType || blob?.type || contentTypeFor({ name, type: '' }) || '';
+  const body = blob?.type === type ? typedUploadBody(blob) : new Blob([blob], { type });
+  const { error } = await supabase.storage.from(ENROLLMENT_BUCKET).upload(path, body, { upsert: false });
+  if (error) throw error;
+  return path;
+}
+
+// Best-effort removal of artefacts orphaned by a failed submit.
+//
+// ★ This only works because #43 narrowed `enrollment_receipts_delete` from
+//   "admins only" to "admins, OR the owner while NO enrollment_requests row
+//   references the object". The evidence-integrity rule #14 established is
+//   intact — the moment a request row points at a file it is permanently
+//   undeletable by the student — but the pre-submit window is now cleanable.
+//   Before that narrowing this call was a guaranteed 403 that a bare `catch {}`
+//   swallowed, so every failed attempt stranded the receipt, the resume, the
+//   signature PNG and the agreement PDF, and three retries left twelve files.
+//   It stays best-effort: on a database without #43 it simply no-ops again, and
+//   an orphan is still admin-purgeable.
+async function cleanupEnrollmentUploads(paths) {
+  const all = (paths || []).filter(Boolean);
+  if (!all.length) return;
+  try { await supabase.storage.from(ENROLLMENT_BUCKET).remove(all); } catch { /* best-effort */ }
+}
+
 // `extraPaths` are objects the CALLER already uploaded for this submission — the
 // signature PNG, the resume and the rendered agreement PDF (#42). They are cleaned
 // up here together with the receipt whenever the insert fails, because nothing else
 // will: without this, every failed attempt strands three files in a private bucket
 // with no row referencing them, and a student who retries three times leaves nine —
 // including three copies of their handwritten signature.
+// `receiptPath` lets a caller that has ALREADY uploaded the receipt hand the key
+// straight in. The enrollment paywall does: its receipt is one of four files and
+// there is no ordering between them, so uploading here would re-serialize the
+// largest one behind the other three. Callers that pass only `file` (Extend
+// Access, Upgrade) are unchanged and still upload inside.
 async function submitSubscriptionRequest({
   user, planKey, planName, kind = 'new', extensionDays = null, batchId = null,
-  amountExpected, amountPaid, fields = {}, file, intake = null, agreement = null,
-  extraPaths = [],
+  amountExpected, amountPaid, fields = {}, file, receiptPath = null,
+  intake = null, agreement = null, extraPaths = [],
 }) {
-  const safe = file.name.replace(/[^\w.\-]+/g, '_');
-  const path = `${user.id}/receipt-${crypto.randomUUID()}-${safe}`;
+  const safe = String(file?.name || 'receipt').replace(/[^\w.\-]+/g, '_');
+  const path = receiptPath || `${user.id}/receipt-${crypto.randomUUID()}-${safe}`;
 
   // ★ Declared BEFORE the receipt upload, deliberately. The receipt is the
   // largest user-supplied file and the likeliest thing to fail mid-submit, and
@@ -2628,14 +2672,13 @@ async function submitSubscriptionRequest({
   // and PDF. Defining this afterwards left that exact path stranding all three.
   // `remove` tolerates keys that do not exist, so listing `path` before it is
   // known to be written is safe.
-  const cleanupUploads = async () => {
-    const all = [path, ...extraPaths].filter(Boolean);
-    try { await supabase.storage.from('enrollment-receipts').remove(all); } catch { /* best-effort */ }
-  };
+  const cleanupUploads = () => cleanupEnrollmentUploads([path, ...extraPaths]);
 
-  const { error: upErr } = await supabase.storage.from('enrollment-receipts')
-    .upload(path, typedUploadBody(file), { upsert: false });
-  if (upErr) { await cleanupUploads(); throw upErr; }
+  if (!receiptPath) {
+    const { error: upErr } = await supabase.storage.from(ENROLLMENT_BUCKET)
+      .upload(path, typedUploadBody(file), { upsert: false });
+    if (upErr) { await cleanupUploads(); throw upErr; }
+  }
 
   const baseRow = {
     user_id: user.id,
@@ -2933,7 +2976,7 @@ function IntakeFileDrop({ field, file, onPick, onError, invalid }) {
 //   back blank while `value` survives in the parent, so the header would read
 //   "✓ Signed" over an empty pad and invite a needless re-sign. `restore()`
 //   paints the stored PNG back.
-function SignaturePad({ onChange, value, disabled }) {
+function SignaturePad({ onChange, value, disabled, flushRef }) {
   const canvasRef = useRef(null);
   const stateRef = useRef({ drawing: false, ink: false, last: null, sized: false });
   const [mode, setMode] = useState('draw');   // 'draw' | 'type'
@@ -3041,6 +3084,35 @@ function SignaturePad({ onChange, value, disabled }) {
     onChange('', mode);
   };
 
+  // ── Typed-signature encode, coalesced ───────────────────────────────────────
+  // The canvas is repainted on every keystroke (instant feedback, and it is
+  // cheap), but turning it into a PNG is not: at devicePixelRatio 2 the backing
+  // store is ~1268x340, so toDataURL is a ~430k-pixel synchronous encode that
+  // then becomes a 5-20 KB base64 string in React state and re-renders the whole
+  // Training Agreement. Doing that per character cost a 15-letter name fifteen
+  // encodes mid-word, on the mid-range Android this enrollment flow actually
+  // runs on. Coalesce instead — but the encode is the LEGAL artefact, so it also
+  // has to be flushable on demand:
+  //   · on blur (clicking Submit blurs the field first),
+  //   · via flushRef, which submit() calls and which RETURNS the value, because
+  //     onChange only schedules a state update that submit's own tick cannot see.
+  const emitTimerRef = useRef(null);
+  const emitTyped = useCallback(() => {
+    if (emitTimerRef.current) { clearTimeout(emitTimerRef.current); emitTimerRef.current = null; }
+    const canvas = canvasRef.current;
+    if (!canvas || !stateRef.current.ink) return null;
+    const url = canvas.toDataURL('image/png');
+    onChange(url, 'type');
+    return url;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onChange]);
+  useEffect(() => {
+    if (!flushRef) return undefined;
+    flushRef.current = () => (emitTimerRef.current ? emitTyped() : null);
+    return () => { flushRef.current = null; };
+  }, [flushRef, emitTyped]);
+  useEffect(() => () => { if (emitTimerRef.current) clearTimeout(emitTimerRef.current); }, []);
+
   // Render a typed name into the same canvas, so the artefact is identical in
   // shape to a drawn one and the PDF needs no second code path.
   const renderTyped = (raw) => {
@@ -3051,7 +3123,13 @@ function SignaturePad({ onChange, value, disabled }) {
     if (!canvas || !ctx) return;
     wipe();
     const name = raw.trim();
-    if (!name) { onChange('', 'type'); return; }
+    // Clearing must be immediate — it re-closes a mandatory gate, and it costs
+    // nothing (no encode).
+    if (!name) {
+      if (emitTimerRef.current) { clearTimeout(emitTimerRef.current); emitTimerRef.current = null; }
+      onChange('', 'type');
+      return;
+    }
     const rect = canvas.getBoundingClientRect();
     ctx.save();
     ctx.fillStyle = DOC.ink;
@@ -3066,7 +3144,8 @@ function SignaturePad({ onChange, value, disabled }) {
     ctx.fillText(name, 18, rect.height / 2);
     ctx.restore();
     stateRef.current.ink = true;
-    onChange(canvas.toDataURL('image/png'), 'type');
+    if (emitTimerRef.current) clearTimeout(emitTimerRef.current);
+    emitTimerRef.current = setTimeout(emitTyped, 200);
   };
 
   const switchMode = (next) => {
@@ -3099,6 +3178,7 @@ function SignaturePad({ onChange, value, disabled }) {
 
       {mode === 'type' && (
         <input type="text" value={typed} onChange={e => renderTyped(e.target.value)}
+          onBlur={() => { if (emitTimerRef.current) emitTyped(); }}
           placeholder="Type your full name" maxLength={120} disabled={disabled}
           aria-label="Type your full name to sign"
           className="w-full px-3.5 py-2.5 rounded-xl text-sm outline-none mb-2.5"
@@ -3109,6 +3189,11 @@ function SignaturePad({ onChange, value, disabled }) {
         <canvas ref={canvasRef}
           onPointerDown={start} onPointerMove={move} onPointerUp={end}
           onPointerLeave={end} onPointerCancel={end}
+          // A canvas is not focusable by default, so validation could not move
+          // focus here — "you must sign" pointed at nothing. Keyboard-only users
+          // still sign by typing (the Type tab); this just makes the pad a real
+          // focus target so the error can land on it.
+          tabIndex={disabled ? -1 : 0}
           aria-label={mode === 'draw' ? 'Signature pad — draw your signature here' : 'Signature preview'}
           style={{ width: '100%', height: 170, display: 'block', touchAction: 'none',
             cursor: disabled || mode !== 'draw' ? 'default' : 'crosshair', background: '#fff', borderRadius: 6 }} />
@@ -3428,6 +3513,11 @@ function EnrollmentPaywall({ user, profile, priorRequest, prefillFrom, overdue, 
   const [receiptFile, setReceiptFile] = useState(null);
   const [resumeFile, setResumeFile] = useState(null);
   const [signature, setSignature] = useState('');      // PNG data URL, or ''
+  // The typed-signature encode is coalesced (see SignaturePad), so a student who
+  // types their name and immediately hits Submit could otherwise be inside the
+  // window. submit() calls this first and uses the RETURNED value: onChange only
+  // schedules a setState, which submit's own tick cannot observe.
+  const signFlushRef = useRef(null);
   // How it was signed ('draw' | 'type') and WHEN. The instant is captured at the
   // moment of signing rather than at submit: a form left open across midnight
   // would otherwise stamp a date after the one printed on the document itself.
@@ -3447,6 +3537,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, prefillFrom, overdue, 
   const pdfDocRef = useRef(null);
   // The last amount we auto-filled from the plan price; see the re-sync effect.
   const autoAmountRef = useRef('');
+  const autoPlanRef = useRef(null);   // which plan autoAmountRef's value belongs to
   const formRef = useRef(null);
 
   const setValue = useCallback((key, v) => setValues(s => ({ ...s, [key]: v })), []);
@@ -3485,8 +3576,12 @@ function EnrollmentPaywall({ user, profile, priorRequest, prefillFrom, overdue, 
   const selectPlan = (p) => {
     const live = plans.find(x => x.key === p.key) || p;
     setSelected(live);
-    autoAmountRef.current = String(live.price_php ?? '');
-    setValue('amountPaid', autoAmountRef.current);
+    // ★ The amount is NOT written here. It has exactly one writer — the effect
+    // below — because this eager write also moved autoAmountRef to the new
+    // price, so by the time the effect ran its "never over a number the student
+    // typed" guard was comparing the new price to itself and always overwrote.
+    // Concretely: pick VIP, type 17000 (a rounded transfer), press Back, re-pick
+    // VIP, and the payment record silently became 16999.
     // VIP enrolls into a batch: preselect when exactly one is open.
     setBatchId(isPremiumSegment(planSegment(live.key, { [live.key]: live })) && openBatches?.length === 1
       ? openBatches[0].id : null);
@@ -3510,12 +3605,26 @@ function EnrollmentPaywall({ user, profile, priorRequest, prefillFrom, overdue, 
   // last auto-filled, so an edited field is left alone.
   useEffect(() => {
     const price = selectedPlan?.price_php;
+    const key = selectedPlan?.key || null;
+    // Deliberately does NOT touch autoPlanRef: pressing Back leaves `selected`
+    // in place, so this branch is only reached before the first pick. Clearing
+    // it here would make a Back-then-repick look like a plan change and reset a
+    // typed amount — the very bug this rewrite removes.
     if (price == null) return;
     const next = String(price);
     const prevAuto = autoAmountRef.current;
+    const planChanged = autoPlanRef.current !== key;
     autoAmountRef.current = next;
-    setValues(s => (s.amountPaid === prevAuto || s.amountPaid === '' ? { ...s, amountPaid: next } : s));
-  }, [selectedPlan?.price_php]);
+    autoPlanRef.current = key;
+    // Two different events, two different rules:
+    //   · the student picked a DIFFERENT plan  -> they owe a different amount,
+    //     so the field follows the plan;
+    //   · the same plan's price arrived or changed (the live catalog landing
+    //     after ENROLLMENT_PLANS_FALLBACK painted the cards) -> never write over
+    //     a number the student typed.
+    setValues(s => (planChanged || s.amountPaid === prevAuto || s.amountPaid === ''
+      ? { ...s, amountPaid: next } : s));
+  }, [selectedPlan?.key, selectedPlan?.price_php]);
 
   const selectedSegment = selectedPlan ? planSegment(selectedPlan.key, { [selectedPlan.key]: selectedPlan }) : 'general';
   // Require the picker only when open batches are actually listable — pre-#32
@@ -3537,10 +3646,23 @@ function EnrollmentPaywall({ user, profile, priorRequest, prefillFrom, overdue, 
 
   // The document re-renders as the student types their name and picks a plan, so
   // what they read is what they sign — and what the PDF captures.
+  // ★ Keyed on a DEFERRED, TRIMMED name. The document is ~330 elements (the tier
+  // table alone is ~145 cells) and it is mounted TWICE — the panel copy and the
+  // offscreen 794px capture copy — so a fresh `model` identity on every
+  // keystroke of the very first field defeated React.memo on both and rebuilt
+  // roughly 9,200 elements to update two text nodes. useDeferredValue collapses
+  // a typing burst into one rebuild; trimming first means a trailing space no
+  // longer mints a byte-identical document.
+  //
+  // The offscreen copy deliberately stays MOUNTED for the whole form step rather
+  // than being mounted at capture time: the signature is a data-URL <img> the
+  // capture must find already decoded, and trading a guaranteed-correct legal
+  // PDF for ~350 idle DOM nodes is the wrong way round.
+  const deferredName = useDeferredValue((values.fullName || '').trim());
   const agreement = useMemo(() => agreementModel(selectedPlan?.key || null, plans, {
-    studentName: (values.fullName || '').trim(),
+    studentName: deferredName,
     signedOn,
-  }), [selectedPlan?.key, plans, values.fullName, signedOn]);
+  }), [selectedPlan?.key, plans, deferredName, signedOn]);
 
   const focusInvalid = (key) => {
     // Open whichever collapsible holds the field first — otherwise focus lands on
@@ -3553,27 +3675,34 @@ function EnrollmentPaywall({ user, profile, priorRequest, prefillFrom, overdue, 
       const host = formRef.current?.querySelector(`[data-field="${key}"]`);
       if (!host) return;
       host.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      const target = host.querySelector('input:not([type=hidden]):not([disabled]), textarea, select')
-        || host.querySelector('canvas, [role=button], button');
+      // Only focus something a human can actually see. Two real misses before:
+      //   · `input:not([type=hidden])` matched IntakeFileDrop's visually-hidden
+      //     <input type="file" class="hidden">, so .focus() was a silent no-op
+      //     and a missing receipt moved focus nowhere at all;
+      //   · the fallback returned the FIRST button in document order, which for
+      //     the signature is the accordion toggle — so the student's next
+      //     Space/Enter collapsed the very panel they were told to sign.
+      // The drop zone and the signature pad both carry role="button", so they
+      // are reachable; `offsetParent` filters out display:none without a layout
+      // read on the common path.
+      const visible = (el) => !!el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+      const pick = (sel) => [...host.querySelectorAll(sel)].find(visible) || null;
+      // Ordered, not one selector list: querySelectorAll returns DOCUMENT order,
+      // and inside the signature field the accordion toggle is the first button
+      // on the page. Ask for the control that actually collects the answer
+      // first, and only fall back to a plain button (the toggle) if the panel
+      // has not rendered yet.
+      const target = pick('input:not([type=hidden]):not([disabled]), textarea, select')
+        || pick('canvas')
+        || pick('[role="button"]')
+        || pick('button');
       target?.focus?.({ preventScroll: true });
     });
   };
 
-  const uploadTo = async (prefix, blob, name, contentType) => {
-    const safe = String(name || 'file').replace(/[^\w.\-]+/g, '_');
-    const path = `${user.id}/${prefix}-${crypto.randomUUID()}-${safe}`;
-    // ★ The type must ride ON THE BODY, never in options: supabase-js posts a
-    // Blob as multipart FormData and takes the part's type from `blob.type`
-    // alone, ignoring `options.contentType` entirely. An untyped body therefore
-    // arrives as application/octet-stream, which this bucket rejects with a 415.
-    // See typedUploadBody() for the full explanation.
-    const type = contentType || blob?.type || contentTypeFor({ name, type: '' }) || '';
-    const body = blob?.type === type ? blob : new Blob([blob], { type });
-    const { error } = await supabase.storage.from('enrollment-receipts')
-      .upload(path, body, { upsert: false });
-    if (error) throw error;
-    return path;
-  };
+  // One shared implementation with the receipt path — see uploadEnrollmentFile.
+  const uploadTo = (prefix, blob, name, contentType) =>
+    uploadEnrollmentFile(user.id, prefix, blob, name, contentType);
 
   const dataUrlToBlob = (dataUrl) => {
     const [meta, b64] = String(dataUrl).split(',');
@@ -3614,7 +3743,12 @@ function EnrollmentPaywall({ user, profile, priorRequest, prefillFrom, overdue, 
     setErr('');
     setSubmitTried(true);
     if (!selected) { setErr('Choose a package first.'); setStep('plans'); return; }
-    if (!validation.ok) {
+    // Land any typed signature still inside the coalescing window BEFORE the gate
+    // runs, or a student who types their name and submits by keyboard is told
+    // they have not signed. Blur covers the mouse path; this covers the rest.
+    const flushedSig = signFlushRef.current?.() || null;
+    const signatureDataUrl = flushedSig || signature;
+    if (!validation.ok && !(flushedSig && Object.keys(validation.errors).length === 1 && validation.errors.agreementSignature)) {
       const n = Object.keys(validation.errors).length;
       setErr(n === 1
         ? 'One answer still needs your attention — it is highlighted below.'
@@ -3659,37 +3793,74 @@ function EnrollmentPaywall({ user, profile, priorRequest, prefillFrom, overdue, 
       let signaturePath = null;
       let resumePath = null;
       let agreementPdfPath = null;
-      try {
-        signaturePath = await uploadTo('signature', dataUrlToBlob(signature), 'signature.png', 'image/png');
-        uploaded.push(signaturePath);
-      } catch (sigErr) {
-        console.error('[enroll] signature upload failed', sigErr);
-        throw new Error('We could not save your signature. Check your connection and submit again.');
-      }
+      // ★ CONCURRENT, not sequential. Nothing here depends on anything else here
+      // — only the row insert below needs all of them. Run serially this was the
+      // SUM of a signature upload, a resume of up to 10 MB, an html2canvas raster
+      // plus its PDF upload, and a receipt of up to 10 MB; on the ~1.5 Mbps PH
+      // mobile uplink this audience actually enrols over that is roughly two
+      // minutes of spinner at the single most abandonment-sensitive moment in the
+      // product. Overlapped it is roughly the slowest one, and the PDF raster
+      // hides entirely behind the uploads.
+      //
+      // The three failure policies are unchanged and are stated per-branch:
+      // signature fatal, resume and PDF best-effort.
+      const sigTask = (async () => {
+        try {
+          const p = await uploadTo('signature', dataUrlToBlob(signatureDataUrl), 'signature.png', 'image/png');
+          return { ok: true, path: p };
+        } catch (sigErr) {
+          console.error('[enroll] signature upload failed', sigErr);
+          return { ok: false };
+        }
+      })();
       // The resume is the one OPTIONAL field, so a failure here must not cost the
       // student their enrollment — that is the whole reason its mime rule is narrow.
       // Losing it is worth a warning, never a blocked submission.
-      if (resumeFile) {
-        try {
-          resumePath = await uploadTo('resume', resumeFile, resumeFile.name);
-          uploaded.push(resumePath);
-        } catch (resErr) {
-          console.warn('[enroll] resume upload skipped', resErr);
-          resumePath = null;
-        }
-      }
+      const resumeTask = resumeFile
+        ? (async () => {
+            try { return await uploadTo('resume', resumeFile, resumeFile.name); }
+            catch (resErr) { console.warn('[enroll] resume upload skipped', resErr); return null; }
+          })()
+        : Promise.resolve(null);
       // The PDF is a convenience copy: agreement_version + agreement_snapshot
       // already record what was agreed, so a rendering failure must not cost the
       // student their enrollment.
-      try {
-        setBusyNote('Building your agreement PDF…');
-        const pdfBlob = await renderAgreementPdf();
-        if (pdfBlob) {
-          agreementPdfPath = await uploadTo('agreement', pdfBlob, 'training-agreement.pdf', 'application/pdf');
-          uploaded.push(agreementPdfPath);
+      const pdfTask = (async () => {
+        try {
+          const pdfBlob = await renderAgreementPdf();
+          if (!pdfBlob) return null;
+          return await uploadTo('agreement', pdfBlob, 'training-agreement.pdf', 'application/pdf');
+        } catch (pdfErr) { console.warn('[enroll] agreement PDF skipped', pdfErr); return null; }
+      })();
+      // The receipt rides here too — it is the largest file and it is what the
+      // admin actually reviews, so leaving it inside submitSubscriptionRequest
+      // would have kept the single biggest upload strictly serial behind the
+      // other three. Fatal, like the signature.
+      const receiptTask = (async () => {
+        try {
+          const p = await uploadTo('receipt', receiptFile, receiptFile.name);
+          return { ok: true, path: p };
+        } catch (rcErr) {
+          console.error('[enroll] receipt upload failed', rcErr);
+          return { ok: false };
         }
-      } catch (pdfErr) {
-        console.warn('[enroll] agreement PDF skipped', pdfErr);
+      })();
+
+      const [sigRes, resumeRes, pdfRes, receiptRes] =
+        await Promise.all([sigTask, resumeTask, pdfTask, receiptTask]);
+      // Collect EVERY path that landed before deciding whether to fail, so the
+      // cleanup list is complete even when the fatal branch is the one that fired.
+      signaturePath = sigRes.ok ? sigRes.path : null;
+      resumePath = resumeRes;
+      agreementPdfPath = pdfRes;
+      const receiptUploadPath = receiptRes.ok ? receiptRes.path : null;
+      [signaturePath, resumePath, agreementPdfPath, receiptUploadPath]
+        .forEach(p => { if (p) uploaded.push(p); });
+      if (!sigRes.ok || !receiptRes.ok) {
+        await cleanupEnrollmentUploads(uploaded);
+        throw new Error(sigRes.ok
+          ? 'We could not upload your payment screenshot. Check your connection and submit again.'
+          : 'We could not save your signature. Check your connection and submit again.');
       }
 
       setBusyNote('Submitting your enrollment…');
@@ -3709,21 +3880,15 @@ function EnrollmentPaywall({ user, profile, priorRequest, prefillFrom, overdue, 
             reference: '',
           },
           file: receiptFile,
+          receiptPath: receiptUploadPath,   // already uploaded above, in parallel
           extraPaths: uploaded,
           intake: {
-            college_course: (values.collegeCourse || '').trim(),
-            current_job: (values.currentJob || '').trim(),
-            ph_experience: values.phExperience,
-            us_experience: values.usExperience,
-            currently_employed: values.currentlyEmployed,
-            prior_training: (values.priorTraining || '').trim(),
-            referred_by: (values.referredBy || '').trim(),
+            // Derived from INTAKE_FIELDS, never hand-listed: a field that
+            // renders and is required must be a field that is SAVED, and the
+            // registry is the only place that knows both. resume_path is the one
+            // addition, because a path exists only after the upload above.
+            ...intakePayload(values),
             resume_path: resumePath,
-            intake: {
-              _v: 1,
-              struggles: (values.struggles || '').trim(),
-              facebook_link: normalizeFacebook(values.facebookLink),
-            },
           },
           agreement: {
             agreement_version: AGREEMENT_VERSION,
@@ -4241,7 +4406,7 @@ function EnrollmentPaywall({ user, profile, priorRequest, prefillFrom, overdue, 
                                   <p className="mt-1 mb-3" style={{ fontSize: 11.5, color: C.textSoft }}>
                                     Drawing your signature here has the same effect as signing on paper. Dated {signedOn}.
                                   </p>
-                                  <SignaturePad value={signature}
+                                  <SignaturePad value={signature} flushRef={signFlushRef}
                                     onChange={(v, method) => {
                                       setSignature(v);
                                       if (method) setSignatureMethod(method);
@@ -5275,8 +5440,16 @@ function ExtendAccessModal({ user, profile, sub, latestReq, onClose, onSubmitted
   const handleFile = (f) => {
     setErr('');
     if (!f) return;
-    if (!/^image\/(png|jpe?g|webp)$|^application\/pdf$/i.test(f.type)) { setErr('Please upload your receipt as a PNG, JPG, WEBP or PDF file.'); return; }
-    if (f.size > 5 * 1024 * 1024) { setErr(`That file is ${(f.size / 1024 / 1024).toFixed(1)} MB — the receipt upload limit is 5 MB.`); return; }
+    // Reuse the registry's rule for the SAME field in the SAME bucket. This was a
+    // hand-written regex plus a hardcoded 5 MB, and #42 widened the
+    // enrollment-receipts bucket to 10 MB — so an extending member was refused
+    // client-side for a receipt the bucket would happily have taken.
+    if (!fileTypeAllowed(f, intakeField('paymentFile'))) {
+      setErr('Please upload your receipt as a PNG, JPG, WEBP or PDF file.'); return;
+    }
+    if (f.size > MAX_INTAKE_FILE_BYTES) {
+      setErr(`That file is ${(f.size / 1024 / 1024).toFixed(1)} MB — the receipt upload limit is ${MAX_INTAKE_FILE_BYTES / 1024 / 1024} MB.`); return;
+    }
     setFile(f);
   };
 
@@ -5432,7 +5605,7 @@ function ExtendAccessModal({ user, profile, sub, latestReq, onClose, onSubmitted
                 <>
                   <Upload size={20} className="mx-auto" style={{ color: C.primary }} />
                   <div className="mt-1.5" style={{ fontSize: 12.5, fontWeight: 600, color: C.text }}>Click to upload or drag & drop</div>
-                  <div className="mt-0.5" style={{ fontSize: 11, color: C.textMute }}>PDF, PNG, JPG or WEBP · up to 5 MB</div>
+                  <div className="mt-0.5" style={{ fontSize: 11, color: C.textMute }}>PDF, PNG, JPG or WEBP · up to 10 MB</div>
                 </>
               )}
             </div>
@@ -13249,13 +13422,17 @@ function CourseProgram({
       const [{ jsPDF }, h2c] = await Promise.all([import('jspdf'), import('html2canvas')]);
       const html2canvas = h2c.default;
       const canvas = await html2canvas(certRef.current, { scale: 2, backgroundColor: '#ffffff', useCORS: true });
-      const img = canvas.toDataURL('image/png');
+      // JPEG, not PNG. A scale-2 capture is several megapixels and a lossless PNG
+      // data URL of it runs to tens of megabytes — enough to fail outright on a
+      // mid-range phone. The agreement PDF path learned this; the certificate was
+      // left behind. 0.92 is visually indistinguishable for this artwork.
+      const img = canvas.toDataURL('image/jpeg', 0.92);
       const pdf = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
       const pw = pdf.internal.pageSize.getWidth();
       const ph = pdf.internal.pageSize.getHeight();
       const ratio = Math.min(pw / canvas.width, ph / canvas.height);
       const w = canvas.width * ratio, h = canvas.height * ratio;
-      pdf.addImage(img, 'PNG', (pw - w) / 2, (ph - h) / 2, w, h);
+      pdf.addImage(img, 'JPEG', (pw - w) / 2, (ph - h) / 2, w, h);
       downloadFile(pdf.output('blob'), certName, 'application/pdf');
     } catch (e) {
       console.error('[CourseProgram] certificate failed:', e);
@@ -15181,6 +15358,17 @@ function timeAgo(iso) {
 }
 
 const COMMUNITY_PAGE_SIZE = 20;
+// search_community_posts() clamps p_limit server-side (least(p_limit, 50)). The
+// client must know that number: a silent refresh re-requests EVERYTHING already
+// on screen, which after three "Load more" clicks is 80 rows, and a clamped
+// response would come back short — dropping cards mid-draft and setting
+// hasMore=false, stranding the rows it just discarded. searchViaRpc() pages in
+// chunks of this size instead of asking for more than the server will give.
+const COMMUNITY_SEARCH_RPC_MAX = 50;
+// Matches no row. `.in(col, [])` is a PostgREST syntax error, so an empty
+// allow-list needs a predicate that is false rather than an omitted filter —
+// omitting it would widen the query to everything.
+const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 // Every column the feed and detail views actually read. Deliberately excludes
 // community_posts.search_tsv (a stored generated tsvector, #40) - it is index
 // input, never display data, and select('*') would ship it on every row.
@@ -15472,9 +15660,11 @@ function AttachmentGallery({ items, signedUrls }) {
 // React.memo'd (custom comparator) so unrelated CommunityHub state churn — above all a
 // search keystroke — doesn't re-render + re-parse every visible row; onOpen's identity is
 // ignored because its behavior is constant (it always opens the row's own post).
-const CommunityTopicRow = React.memo(function CommunityTopicRow({ post, tag, postTags, isAdmin, participants, reactTotal, attachCount, annUnread, onOpen }) {
+const CommunityTopicRow = React.memo(function CommunityTopicRow({ post, tag, postTags, isAdmin, participants, reactTotal, attachCount, annUnread, isAnnouncement, onOpen }) {
   const hidden = post.status === 'hidden';
-  const isAnn = post.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG;
+  // #40 made the CHANNEL's kind the announcement switch; the tag is only the
+  // pre-#40 fallback for a database with no channels. See isAnnouncementPost().
+  const isAnn = isAnnouncement != null ? !!isAnnouncement : post.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG;
   const TagIcon = (tag && COMMUNITY_TAG_ICONS[tag.slug]) || MessageSquare;
   const stripped = stripCommunityMarkup(post.body);   // parse the body once (title + snippet reuse it)
   const titleText = (post.title || '').trim() || stripped.split('\n')[0];
@@ -15557,6 +15747,7 @@ const CommunityTopicRow = React.memo(function CommunityTopicRow({ post, tag, pos
   a.post === b.post && a.tag === b.tag && a.isAdmin === b.isAdmin
   && a.participants === b.participants && a.reactTotal === b.reactTotal
   && a.attachCount === b.attachCount && a.annUnread === b.annUnread
+  && a.isAnnouncement === b.isAnnouncement
   // postTagsMeta[id] keeps a stable ref when present; `|| []` only mints a fresh empty
   // array for tagless posts, so treat two empties as equal.
   && (a.postTags === b.postTags || ((a.postTags?.length || 0) === 0 && (b.postTags?.length || 0) === 0))
@@ -15599,13 +15790,6 @@ function CommunityCategoryRail({ tags, counts, activeTag, filter, onPick, totalC
   );
 }
 
-// Space switcher (#32) — compact pill row of the member's ACCESSIBLE spaces
-// (General + their private batch space, everything for admins) with the member
-// counts the server said they may see. Hidden when only one space is reachable.
-// Keyed by community_spaces.kind; the lookup below falls back to MessagesSquare for
-// any kind this build doesn't know, so a space that arrives before/after a schema
-// change still renders.
-const COMMUNITY_SPACE_ICONS = { general: Globe, vip: Sparkles };
 // ── Channel rail (#40) ───────────────────────────────────────────────────────
 // The navigation surface. Two facts are encoded in two different positions,
 // because they answer different questions: the LEADING glyph says what kind of
@@ -15900,7 +16084,14 @@ function CommunityAdminEditor({ onClose, onSaved }) {
       });
       if (error) throw error;
       const impact = accessDiff({}, data || {});
-      if (!impact.changed) return saveChannel(d);
+      // ★ AWAIT, don't return. `return saveChannel(d)` handed the promise back
+      // and let this function's `finally` run immediately — cancelling the
+      // setBusy(true) that saveChannel's own run() had just issued. The Save
+      // button re-enabled and the drawer became closable while the RPC was
+      // still in flight, so a double-click wrote the audience mappings twice
+      // (two audit rows, two delete+reinsert cycles) and closing mid-request
+      // unmounted the component before setDraft(null)/load() could run.
+      if (!impact.changed) { await saveChannel(d); return; }
       setConfirm({ impact, onGo: () => { setConfirm(null); saveChannel(d); } });
     } catch (e) {
       setErr(appErrorMessage(e, 'Could not work out who this change affects.'));
@@ -16208,9 +16399,15 @@ function CommunityAdminEditor({ onClose, onSaved }) {
             <select className="gh-input w-full" value={d.kind}
               onChange={(e) => set({
                 kind: e.target.value,
-                // An announcement channel is admin-post-only by constraint; mirror
-                // that here so the form cannot submit a state the DB rejects.
+                // An announcement channel is admin-post-only AND reply-locked by
+                // constraint (community_channels_announcement_no_member_posting
+                // is `kind = 'text' or (member_posting = false and
+                // member_comments = false)`). Mirror BOTH halves so the form
+                // cannot submit a state the DB silently rewrites — only posting
+                // was mirrored before, so replies stayed ticked and were then
+                // coerced off server-side with no explanation.
                 member_posting: e.target.value === 'announcement' ? false : d.member_posting,
+                member_comments: e.target.value === 'announcement' ? false : d.member_comments,
               })}>
               <option value="text">Text channel</option>
               <option value="announcement">Announcement channel</option>
@@ -16262,8 +16459,14 @@ function CommunityAdminEditor({ onClose, onSaved }) {
         <div className="pt-2" style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
           <span className="gh-label">What members can do</span>
           {[
+            // An announcement channel bars posting AND replies — the CHECK is
+            // `kind = 'text' or (member_posting = false and member_comments =
+            // false)`, and admin_save_community_channel coerces both. Leaving
+            // "Members can reply" enabled here let an admin tick it, save
+            // successfully, and find it silently unticked on reopen — while the
+            // summary box directly below already said "read and react".
             ['member_posting', 'Members can post', d.kind === 'announcement'],
-            ['member_comments', 'Members can reply', false],
+            ['member_comments', 'Members can reply', d.kind === 'announcement'],
             ['member_reactions', 'Members can react', false],
             ['member_attachments', 'Members can attach files', false],
           ].map(([key, label, disabled]) => (
@@ -16272,7 +16475,7 @@ function CommunityAdminEditor({ onClose, onSaved }) {
               <input type="checkbox" checked={!!d[key]} disabled={disabled}
                 onChange={(e) => set({ [key]: e.target.checked })} />
               {label}
-              {key === 'member_posting' && disabled && (
+              {disabled && (
                 <span className="text-xs" style={{ color: C.textMute }}>(announcement channel)</span>
               )}
             </label>
@@ -16771,6 +16974,10 @@ function useCommunityBell(uid, enabled) {
   const [notifs, setNotifs] = useState([]);
   const [annUnread, setAnnUnread] = useState([]);
   const [available, setAvailable] = useState(true);
+  // The announcement rooms this member can open, as a stable sorted key, so the
+  // realtime effect re-subscribes when the SET changes rather than on every load
+  // that happens to return the same rooms.
+  const [annChannelKey, setAnnChannelKey] = useState('');
   const lastRef = useRef(0);
   // Staleness guard (the loadFeed idiom): mark-read actions bump the seq so a
   // response fetched before them can't resurrect just-cleared items; a uid
@@ -16781,17 +16988,34 @@ function useCommunityBell(uid, enabled) {
     if (!uid || !enabled) return;
     const seq = ++seqRef.current;
     try {
-      const [nRes, aRes, rRes] = await Promise.all([
+      const [nRes, chRes, rRes] = await Promise.all([
         supabase.from('community_notifications').select('*')
           .eq('user_id', uid).is('read_at', null)
           .order('created_at', { ascending: false }).limit(20),
-        supabase.from('community_posts').select('id,title,body,author_id,author_name,created_at')
-          .eq('tag_slug', COMMUNITY_ANNOUNCEMENTS_SLUG).eq('status', 'active').neq('author_id', uid)
-          .order('created_at', { ascending: false }).limit(30),
+        // #40: which rooms are announcement rooms is a CHANNEL fact, enforced by
+        // a CHECK. Keying the bell on community_tags.slug instead meant an
+        // announcement posted with the composer's default tag notified nobody,
+        // while an ordinary post merely TAGGED Announcements rang every bell.
+        // community_channels_read already narrows this to rooms this member may
+        // open, so no extra scoping is needed. A pre-#40 database has no such
+        // table and falls back to the tag — the only answer it has.
+        supabase.from('community_channels').select('id')
+          .eq('kind', 'announcement').eq('status', 'active'),
         supabase.from('community_announcement_reads').select('post_id').eq('user_id', uid),
       ]);
       if (nRes.error) throw nRes.error;
       if (seq !== seqRef.current) return;   // superseded by a newer load or a mark-read
+      const legacyAnn = !!chRes.error;
+      const annIds = legacyAnn ? [] : (chRes.data || []).map(c => c.id);
+      let annQ = supabase.from('community_posts').select('id,title,body,author_id,author_name,created_at')
+        .eq('status', 'active').neq('author_id', uid)
+        .order('created_at', { ascending: false }).limit(30);
+      if (legacyAnn) annQ = annQ.eq('tag_slug', COMMUNITY_ANNOUNCEMENTS_SLUG);
+      else if (annIds.length) annQ = annQ.in('channel_id', annIds);
+      else annQ = annQ.eq('id', NIL_UUID);       // no announcement rooms => nothing, not everything
+      const aRes = await annQ;
+      if (seq !== seqRef.current) return;
+      setAnnChannelKey(annIds.slice().sort().join(','));
       // Announcements degrade quietly: without the reads table there is no unread state.
       const read = new Set((rRes.error ? [] : (rRes.data || [])).map(r => r.post_id));
       setNotifs(nRes.data || []);
@@ -16816,22 +17040,37 @@ function useCommunityBell(uid, enabled) {
 
   useEffect(() => {
     if (!uid || !enabled) return;
-    const ch = supabase
+    const annIds = annChannelKey ? annChannelKey.split(',') : [];
+    let ch = supabase
       .channel(`community-bell-${uid}`)
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'community_notifications', filter: `user_id=eq.${uid}` }, (payload) => {
         const row = payload.new;
         if (!row || row.read_at) return;
         setNotifs(prev => (prev.some(n => n.id === row.id) ? prev : [row, ...prev].slice(0, 20)));
-      })
-      // Filtered server-side to the ONLY rows this handler acts on. Unfiltered,
-      // Realtime runs the row's RLS per subscriber per insert - an entitlement
-      // walk for every online member on every post, to then ignore it.
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'community_posts',
-                                filter: `tag_slug=eq.${COMMUNITY_ANNOUNCEMENTS_SLUG}` }, (payload) => {
+      });
+    // Still filtered server-side to the ONLY rows this handler acts on — that
+    // property is why this is a subscription PER announcement room rather than
+    // one unfiltered listener. Unfiltered, Realtime runs the row's RLS per
+    // subscriber per insert: an entitlement walk for every online member on
+    // every post, to then ignore it. There is normally one announcement room
+    // per space, so this is one or two filters, not a fan-out.
+    // Pre-#40 (no channels resolved) keeps the tag filter it always had.
+    if (annIds.length) {
+      annIds.forEach((cid) => {
+        ch = ch.on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'community_posts',
+                                         filter: `channel_id=eq.${cid}` }, (payload) => {
+          const row = payload.new;
+          if (row && row.author_id !== uid && row.status === 'active') load();
+        });
+      });
+    } else {
+      ch = ch.on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'community_posts',
+                                       filter: `tag_slug=eq.${COMMUNITY_ANNOUNCEMENTS_SLUG}` }, (payload) => {
         const row = payload.new;
         if (row && row.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG && row.author_id !== uid && row.status === 'active') load();
-      })
-      .subscribe();
+      });
+    }
+    ch = ch.subscribe();
     const onFocus = () => { if (Date.now() - lastRef.current > 30000) load(); };
     const onPoke = () => load();
     window.addEventListener('focus', onFocus);
@@ -16841,7 +17080,7 @@ function useCommunityBell(uid, enabled) {
       window.removeEventListener('focus', onFocus);
       window.removeEventListener(COMMUNITY_BELL_POKE, onPoke);
     };
-  }, [uid, enabled, load]);
+  }, [uid, enabled, load, annChannelKey]);
 
   const markRead = useCallback(async (id) => {
     seqRef.current++;   // drop any in-flight load fetched before this action
@@ -17026,13 +17265,15 @@ function NotificationBell({ bell, placement = 'card' }) {
 // highlighted and comment-locked (react + mark-as-read only). Comment drafts are card-
 // local state (keep-alive preserves them).
 function CommunityPostCard({ post, tag, postTags, attachments, signedUrls, isAdmin, uid, myName, myAvatar,
-  commentCount, reactions, commentsState, commentReacts, annUnread,
+  commentCount, reactions, commentsState, commentReacts, annUnread, isAnnouncement,
   canComment = true, canReact = true, spaceId = null,
   menuOpen, onMenuToggle, onToggleReact, onToggleCommentReact, onAddComment, onEdit, channelId, canPost = false,
   onModerate, onModerateComment, onAskDelete, onTogglePin, onToggleLock, onMarkAnnRead }) {
   const isOwn = post.author_id === uid;
   const hidden = post.status === 'hidden';
-  const isAnn = post.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG;
+  // #40: the CHANNEL's kind decides, not the tag. Falls back to the tag only on
+  // a pre-#40 database, where there are no channels to ask.
+  const isAnn = isAnnouncement != null ? !!isAnnouncement : post.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG;
   // Replies close when the thread is locked OR the space is reactions-only for
   // members (#32 — General; admins keep the composer via admin_all RLS).
   const locked = !!post.comments_locked || !canComment;
@@ -17419,18 +17660,70 @@ function CommunityHub() {
   useEffect(() => { selectedPostIdRef.current = selectedPostId; }, [selectedPostId]);
   useEffect(() => { postsLenRef.current = posts.length; postIdsRef.current = new Set(posts.map(p => p.id)); }, [posts]);
 
-  function buildFeedQuery({ tag, filter: filt, search, ids, from, limit = COMMUNITY_PAGE_SIZE }) {
+  // Indexed search (#40's GIN/tsvector), paged around the server's own clamp.
+  // Returns the {data, error} shape the PostgREST builder resolves to, so
+  // loadFeed/loadMore treat both feed paths identically.
+  //
+  // Two things this fixes. (1) The clamp: asking for 80 and being given 50 used
+  // to look like "the feed ended", which truncated an already-paginated result
+  // on a background refresh. (2) The default scope: in-channel search ran an
+  // unindexed `title.ilike.%q%,body.ilike.%q%` OR-scan, so the index #40 built
+  // for exactly this was only ever reached by the opt-in "All channels" toggle.
+  async function searchViaRpc({ search, scope, tag, filt, from, limit, legacy }) {
+    const out = [];
+    let offset = from;
+    let remaining = limit;
+    while (remaining > 0) {
+      const take = Math.min(remaining, COMMUNITY_SEARCH_RPC_MAX);
+      const { data, error } = await supabase.rpc('search_community_posts', {
+        p_query: search,
+        p_channel_id: channelIdRef.current,
+        p_scope: scope,
+        p_limit: take,
+        p_offset: offset,
+        p_tag_slug: tag && tag !== 'all' ? tag : null,
+        p_unanswered: filt === 'unanswered',
+      });
+      if (error) {
+        // #43 widened this RPC's signature (p_tag_slug/p_unanswered). On a
+        // database that has not run it yet PostgREST cannot resolve the call at
+        // all, so fall back to the PostgREST feed query rather than showing an
+        // error — the search is slower there, never wrong. Only for a
+        // signature miss: a real failure must still surface.
+        if (['PGRST202', 'PGRST203', '42883'].includes(String(error.code)) && legacy) return legacy();
+        return { data: null, error };
+      }
+      const rows = data || [];
+      out.push(...rows);
+      if (rows.length < take) break;              // the server ran out — done
+      offset += rows.length;
+      remaining -= rows.length;
+    }
+    return { data: out, error: null };
+  }
+
+  function buildFeedQuery({ tag, filter: filt, search, ids, from, limit = COMMUNITY_PAGE_SIZE, noRpc = false }) {
     // Cross-channel search goes through the indexed RPC (#40): a GIN/tsvector
     // lookup over every channel the caller may read. It runs with INVOKER rights,
     // so community_posts_read — not this client — decides what comes back, and
     // "all accessible channels" can never widen into "all channels".
-    if (search && searchScopeRef.current === 'all') {
-      return supabase.rpc('search_community_posts', {
-        p_query: search,
-        p_channel_id: channelIdRef.current,
-        p_scope: 'all',
-        p_limit: limit,
-        p_offset: from,
+    // The RPC answers the whole question only for the orderings it produces
+    // (pinned -> last_activity -> id, i.e. 'latest'/'unanswered') and only when
+    // the free-#tag pre-filter isn't in play. 'new' sorts by created_at and the
+    // Announcements tab is a channel-kind question, so both keep the PostgREST
+    // path. Under 2 characters the RPC matches nothing by design, where ilike
+    // still would — so that stays on the old path too, rather than silently
+    // returning an empty feed.
+    const trimmed = (search || '').trim();
+    const rpcCanAnswer = !noRpc && trimmed.length >= 2 && !ids
+      && (filt === 'latest' || filt === 'unanswered');
+    if (trimmed && rpcCanAnswer) {
+      return searchViaRpc({
+        search: trimmed,
+        scope: searchScopeRef.current === 'all' ? 'all' : 'channel',
+        tag, filt, from, limit,
+        // Re-entering with the RPC disabled gives the PostgREST path below.
+        legacy: () => buildFeedQuery({ tag, filter: filt, search, ids, from, limit, noRpc: true }),
       });
     }
     // RLS hides 'hidden' rows from members (admins see them, badged); 'deleted'
@@ -17445,8 +17738,15 @@ function CommunityHub() {
     // space (then unscoped) only on a pre-#40 database.
     if (channelIdRef.current) q = q.eq('channel_id', channelIdRef.current);
     else if (spaceIdRef.current) q = q.eq('space_id', spaceIdRef.current);
-    if (filt === 'announcements') q = q.eq('tag_slug', COMMUNITY_ANNOUNCEMENTS_SLUG);
-    else if (tag && tag !== 'all') q = q.eq('tag_slug', tag);
+    if (filt === 'announcements') {
+      // #40: announcement-ness is the CHANNEL's kind. Scope to the announcement
+      // channels this member can actually open; an empty set must return nothing
+      // rather than everything, and `.in(col, [])` is a PostgREST syntax error.
+      const annIds = [...(annChannelIdsRef.current || [])];
+      if (annIds.length) q = q.in('channel_id', annIds);
+      else if (channelsReadyRef.current === 'legacy') q = q.eq('tag_slug', COMMUNITY_ANNOUNCEMENTS_SLUG);
+      else q = q.eq('id', NIL_UUID);
+    } else if (tag && tag !== 'all') q = q.eq('tag_slug', tag);
     if (filt === 'unanswered') q = q.eq('comment_count', 0);
     if (ids) q = q.in('id', ids);
     if (search) {
@@ -17483,7 +17783,12 @@ function CommunityHub() {
     try {
       const { data, error } = await supabase.storage.from('community-media').createSignedUrls(need, 3600);
       if (error) throw error;
-      if (sidAtCall !== spaceIdRef.current) return;   // adoptSpace already cleared the map
+      // Compare like for like. `sidAtCall` is a CHANNEL id whenever a channel is
+      // selected, so testing it against spaceIdRef alone was never equal — every
+      // signed URL was fetched and then thrown away, and the expiry cache never
+      // filled, so each load re-signed the same paths and the gallery showed
+      // placeholders forever. Same shape as loadMeta's fresh() below.
+      if (sidAtCall !== (channelIdRef.current || spaceIdRef.current)) return;   // a switch already cleared the map
       const add = {};
       (data || []).forEach((r, i) => {
         const p = r.path || need[i];
@@ -17580,7 +17885,12 @@ function CommunityHub() {
     // The space engine failed, so spaceIdRef is null and this query would run UNSCOPED —
     // a mixed cross-space feed presented as one space, and its success path would clear
     // the very error banner that says so. Refuse; the only way out is a reload/retry.
-    if (spacesReadyRef.current === 'error') return;
+    // #40: the CHANNEL engine can fail on its own — refreshSidebar() sets
+    // channelsReady='error' and nulls both refs when a reader loses a room out
+    // from under them. Without this arm, the next search keystroke or filter
+    // click ran the query below with no channel AND no space filter, and its
+    // success path cleared the very banner explaining what happened.
+    if (spacesReadyRef.current === 'error' || channelsReadyRef.current === 'error') return;
     const tag = activeTagRef.current, filt = filterRef.current, q = searchRef.current, ft = freeTagRef.current;
     const seq = ++loadSeqRef.current;
     if (!silent) { setLoading(true); setErr(''); }
@@ -17590,11 +17900,18 @@ function CommunityHub() {
       const want = Math.max(postsLenRef.current, COMMUNITY_PAGE_SIZE);
       const ids = ft ? await freeTagIds(ft) : null;
       const sid = spaceIdRef.current;
-      let annQ = supabase.from('community_posts').select(COMMUNITY_POST_COLS).eq('tag_slug', COMMUNITY_ANNOUNCEMENTS_SLUG).eq('status', 'active');
-      // Follow the CHANNEL like the category counts do, or the right rail
-      // shows other rooms' announcements beside counts describing only this one.
-      if (channelIdRef.current) annQ = annQ.eq('channel_id', channelIdRef.current);
-      else if (sid) annQ = annQ.eq('space_id', sid);
+      // #40: announcements live in announcement-KIND channels, so the rail reads
+      // those rooms rather than a tag. Scoped to the announcement channels this
+      // member can open — never the current channel, which is almost never one
+      // of them, and which used to make this rail permanently empty everywhere
+      // except inside #announcements itself.
+      const annIds = [...(annChannelIdsRef.current || [])];
+      let annQ = supabase.from('community_posts').select(COMMUNITY_POST_COLS).eq('status', 'active');
+      if (annIds.length) annQ = annQ.in('channel_id', annIds);
+      else if (channelsReadyRef.current === 'legacy') {
+        annQ = annQ.eq('tag_slug', COMMUNITY_ANNOUNCEMENTS_SLUG);
+        if (sid) annQ = annQ.eq('space_id', sid);
+      } else annQ = annQ.eq('id', NIL_UUID);
       const [tagRes, postRes, cntRes, annRes, readRes] = await Promise.all([
         supabase.from('community_tags').select('*').order('position').order('label'),
         ids && !ids.length ? Promise.resolve({ data: [], error: null }) : buildFeedQuery({ tag, filter: filt, search: q, ids, from: 0, limit: want }),
@@ -18069,7 +18386,7 @@ function CommunityHub() {
       await supabase.from('community_notifications').update({ read_at: new Date().toISOString() })
         .eq('user_id', uid).eq('post_id', post.id).is('read_at', null);
     } catch { /* pre-#24 database */ }
-    if (post.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG && post.author_id !== uid && !annReadIds.has(post.id)) {
+    if (isAnnouncementPost(post) && post.author_id !== uid && !annReadIds.has(post.id)) {
       await markAnnRead(post);
       return;                                                // markAnnRead already poked
     }
@@ -18288,7 +18605,10 @@ function CommunityHub() {
             || (initialSpaceSlugRef.current && spaceFallback ? spaceFallback.channel_slug : null),
           storedSlug: storedChannel,
           channels: rows,
-          defaultChannelId: (spaceFallback || serverDefault)?.channel_id || null,
+          // Cohort before the community-wide default: a VIP who has asked for
+          // nothing specific lands in their private room, which is what they
+          // paid for. An explicit ?space= (spaceFallback) still outranks it.
+          defaultChannelId: (spaceFallback || cohortLandingChannel(rows) || serverDefault)?.channel_id || null,
         });
         if (chosen) {
           channelIdRef.current = chosen.channel_id;
@@ -18313,56 +18633,46 @@ function CommunityHub() {
         if (chosen) markChannelRead(chosen.channel_id);
       } catch (e) {
         if (cancelled) return;
-        // A pre-#40 database still has the #32 space engine. Fall back to it rather
-        // than failing the tab outright — same "confirm against the schema, never
-        // trust the error code alone" discipline as the pre-#32 probe below.
-        const code40 = String(e?.code || '');
-        const msg40 = String(e?.message || '');
-        const maybePre40 = code40 === 'PGRST202'
-          || (/my_community_sidebar/i.test(msg40) && /does not exist|could not find/i.test(msg40));
-        if (maybePre40) {
-          const probe40 = await supabase.from('community_channels').select('id').limit(1);
+        // Degrade against the SCHEMA, never against the error code. An error code
+        // alone cannot separate "this database predates #40/#32" from "PostgREST's
+        // schema cache is momentarily stale" or "a nested helper is missing" — and
+        // a false positive is not cosmetic: legacy mode leaves spaceId null, the
+        // composer then omits space_id, and community_posts_guard() files the post
+        // into General, publishing a private cohort post to every plan.
+        //
+        // So ask the tables directly. This is an error path that runs once, where a
+        // round trip is free. (The code-sniffing ladder that used to precede these
+        // probes could not work: its pre-#32 test matched /my_community_spaces/
+        // against my_community_sidebar's error message, so it never fired, and what
+        // remained was the same PGRST202 check the pre-#40 hint already made.)
+        const missingTable = (r) => !!r.error && ['42P01', 'PGRST205'].includes(String(r.error.code));
+        const probe40 = await supabase.from('community_channels').select('id').limit(1);
+        if (cancelled) return;
+        if (missingTable(probe40)) {
+          // Pre-#40. The #32 space engine may still be there.
+          const legacy = await supabase.rpc('my_community_spaces');
           if (cancelled) return;
-          if (probe40.error && ['42P01', 'PGRST205'].includes(String(probe40.error.code))) {
-            const legacy = await supabase.rpc('my_community_spaces');
+          if (!legacy.error && (legacy.data || []).length) {
+            const rows = legacy.data;
+            setSpaces(rows);
+            let stored = null;
+            try { stored = (await window.storage.get('community:lastSpace'))?.value || null; } catch { /* pref only */ }
             if (cancelled) return;
-            if (!legacy.error && (legacy.data || []).length) {
-              const rows = legacy.data;
-              setSpaces(rows);
-              let stored = null;
-              try { stored = (await window.storage.get('community:lastSpace'))?.value || null; } catch { /* pref only */ }
-              if (cancelled) return;
-              const chosen = pickInitialSpace({ urlSlug: initialSpaceSlugRef.current, storedSlug: stored, spaces: rows });
-              if (chosen) {
-                spaceIdRef.current = chosen.id;
-                spaceSlugRef.current = chosen.slug;
-                setSpaceId(chosen.id);
-                writeAppRoute('community', { space: chosen.slug, postId: selectedPostIdRef.current || undefined, replace: true });
-              }
-              setChannelsReady('legacy'); setSpacesReady(true);
-              loadFeed(false);
-              return;
+            const chosen = pickInitialSpace({ urlSlug: initialSpaceSlugRef.current, storedSlug: stored, spaces: rows });
+            if (chosen) {
+              spaceIdRef.current = chosen.id;
+              spaceSlugRef.current = chosen.slug;
+              setSpaceId(chosen.id);
+              writeAppRoute('community', { space: chosen.slug, postId: selectedPostIdRef.current || undefined, replace: true });
             }
+            setChannelsReady('legacy'); setSpacesReady(true);
+            loadFeed(false);
+            return;
           }
-        }
-        // "Is this a pre-#32 database?" is a question about the SCHEMA, and an error code
-        // alone cannot answer it — legacy mode leaves spaceId null, which is how a private
-        // post gets filed into General, so a false positive here reopens the whole leak:
-        //   • my_community_spaces() calls user_community_space_ids(); if THAT helper is
-        //     missing, Postgres raises 42883 with "function … does not exist" — the outer
-        //     RPC exists and the DB is #32, but a code/message test says "pre-#32".
-        //   • PGRST202 is a schema-CACHE miss, not proof of absence (reload windows,
-        //     pool restarts).
-        // So treat those only as a hint, then confirm against the table itself.
-        const code = String(e?.code || '');
-        const msg = String(e?.message || '');
-        const maybePre32 = code === 'PGRST202'
-          || (/my_community_spaces/i.test(msg) && /does not exist|could not find/i.test(msg));
-        if (maybePre32) {
-          const probe = await supabase.from('community_spaces').select('id').limit(1);
+          // No channels AND no working space engine — confirm pre-#32 the same way.
+          const probe32 = await supabase.from('community_spaces').select('id').limit(1);
           if (cancelled) return;
-          // Same missing-table codes AdminEnrollments uses for its pre-#32 sentinel.
-          if (probe.error && ['42P01', 'PGRST205'].includes(String(probe.error.code))) {
+          if (missingTable(probe32)) {
             setChannelsReady('legacy'); setSpacesReady('legacy'); loadFeed(false); return;
           }
         }
@@ -18418,14 +18728,20 @@ function CommunityHub() {
         // skip the pill; category + Announcements views require a tag match.
         if (searchRef.current || freeTagRef.current) return;
         if (activeTagRef.current !== 'all' && row.tag_slug !== activeTagRef.current) return;
-        if (filterRef.current === 'announcements' && row.tag_slug !== COMMUNITY_ANNOUNCEMENTS_SLUG) return;
+        if (filterRef.current === 'announcements' && !(row.channel_id ? annChannelIdsRef.current.has(row.channel_id) : row.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG)) return;
         setPendingNew(n => n + 1);
       })
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'community_comments', ...scopeFilter }, (payload) => {
         const cm = payload.new;
         const pid = cm && cm.post_id;
         if (!pid || cm.author_id === uid) return;                              // own comments append locally
-        if (spaceIdRef.current && cm.space_id && cm.space_id !== spaceIdRef.current) return;    // belt-and-braces
+        // Belt-and-braces, mirroring the posts handler above. channel_id is
+        // denormalized onto comments precisely so this test is possible; without
+        // it the CHANNEL narrowing existed only in the server-side filter, so any
+        // future widening of that filter would silently start bumping counters
+        // for threads in rooms the reader is not looking at.
+        if (channelIdRef.current && cm.channel_id && cm.channel_id !== channelIdRef.current) return;
+        if (!channelIdRef.current && spaceIdRef.current && cm.space_id && cm.space_id !== spaceIdRef.current) return;
         if (cm.status === 'active') {
           const bump = (p) => (p.id === pid
             ? { ...p, comment_count: (p.comment_count || 0) + 1, last_activity_at: cm.created_at || p.last_activity_at }
@@ -18492,6 +18808,28 @@ function CommunityHub() {
   const canReact = !spacesFailed && (isAdmin || caps.canReact);
   const canAttach = !spacesFailed && (isAdmin || caps.canAttach);
   const railGroups = useMemo(() => groupChannelsByCategory(channels), [channels]);
+  // ── Announcements are a CHANNEL KIND (#40), not a tag ──────────────────────
+  // The rail, header and composer already keyed on community_channels.kind, but
+  // the bell, the unread badge, the read markers, the Announcements tab and the
+  // right rail still keyed on community_tags.slug = 'announcements'. The two
+  // disagreed in BOTH directions: a post in #announcements carrying the
+  // composer's default tag notified nobody and never appeared under the tab,
+  // while a post merely TAGGED Announcements inside an ordinary room fanned out
+  // a bell from a room it did not belong to. `kind` is the half a CHECK
+  // constraint enforces, so `kind` decides. community_tags keeps its own job —
+  // post taxonomy. A pre-#40 database has no channels to ask, so it falls back
+  // to the tag, which is the only answer available there.
+  const annChannelIds = useMemo(
+    () => new Set(channels.filter(c => c.channel_kind === 'announcement').map(c => c.channel_id)),
+    [channels],
+  );
+  const annChannelIdsRef = useRef(annChannelIds);
+  useEffect(() => { annChannelIdsRef.current = annChannelIds; }, [annChannelIds]);
+  const isAnnouncementPost = useCallback((post) => {
+    if (!post) return false;
+    if (preChannels || !post.channel_id) return post.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG;
+    return annChannelIds.has(post.channel_id);
+  }, [annChannelIds, preChannels]);
   // Stable identities: the rail rows are memoized, and a callback minted inline
   // per render would defeat that on every keystroke. Both read live state through
   // refs, so an empty dep array is correct rather than merely convenient.
@@ -18646,10 +18984,18 @@ function CommunityHub() {
         </div>
       )}
 
-      {spacesReady === true && currentSpace && currentSpace.member_comments === false && !selectedPostId && !schemaGap && (
+      {/* Replies-off notice. This used to read currentSpace.member_comments, but
+          post-#40 the space rows are synthesised from my_community_sidebar() and
+          carry only {id, slug, name, kind} — so the flag was always `undefined`,
+          never `false`, and a room where members may post but not reply showed no
+          explanation at all: the reply box simply vanished. Replies are a CHANNEL
+          fact now, and canComment is the server-computed answer. Posting-off is
+          already explained separately below the composer, so this fires only for
+          the can-post-but-cannot-reply combination. */}
+      {channelsReady === true && currentChannel && canPost && !canComment && !isAdmin && !selectedPostId && !schemaGap && (
         <div className="mb-4 max-w-6xl mx-auto inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold"
           style={{ background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)', color: 'var(--status-info-fg)' }}>
-          <ThumbsUp size={12} /> Reactions only — start discussions and react here; member replies are off in {currentSpace.name}.
+          <ThumbsUp size={12} /> Reactions only — start discussions and react here; member replies are off in #{currentChannel.channel_slug || currentChannel.channel_name}.
         </div>
       )}
 
@@ -18718,7 +19064,8 @@ function CommunityHub() {
               reactions={reactMeta[detailRow.id]}
               commentsState={comments[detailRow.id]}
               commentReacts={commentReactMeta}
-              annUnread={detailRow.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG && detailRow.author_id !== uid && !annReadIds.has(detailRow.id)}
+              isAnnouncement={isAnnouncementPost(detailRow)}
+              annUnread={isAnnouncementPost(detailRow) && detailRow.author_id !== uid && !annReadIds.has(detailRow.id)}
               menuOpen={menuOpenId === detailRow.id}
               onMenuToggle={() => setMenuOpenId(v => (v === detailRow.id ? null : detailRow.id))}
               onToggleReact={toggleReact}
@@ -18886,7 +19233,8 @@ function CommunityHub() {
                         participants={participantsMeta[post.id]}
                         reactTotal={Object.values((reactMeta[post.id] || {}).counts || {}).reduce((a, b) => a + b, 0)}
                         attachCount={(attachMeta[post.id] || []).length}
-                        annUnread={post.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG && post.author_id !== uid && !annReadIds.has(post.id)}
+                        isAnnouncement={isAnnouncementPost(post)}
+                        annUnread={isAnnouncementPost(post) && post.author_id !== uid && !annReadIds.has(post.id)}
                         onOpen={openPost} />
                     ))}
                     {hasMore && (

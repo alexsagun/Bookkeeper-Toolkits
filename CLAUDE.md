@@ -51,7 +51,7 @@ npm run ai:knowledge       # regenerate docs/ai/toolkits-voice-agent-knowledge.m
 npm run ai:knowledge:check # rebuild the knowledge doc in memory + diff vs disk; exit 1 on drift (writes nothing)
 npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge base
 npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
-npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, trainingAgreement, …)
+npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, …)
 ```
 
 There is **no linter** — verify UI changes by running `npm run dev` and exercising the affected
@@ -245,7 +245,10 @@ on an empty one (an `EXISTS` over zero rows — not a defensive `if`), and batch
 deliberately not consulted**, because closing or archiving a cohort must not revoke a paid seat.
 `user_community_channel_capabilities()` fuses **plan × space × channel** (a channel flag can only
 subtract), `my_community_sidebar()` is the ONE navigation call the client makes (bounded 100-cap
-unread; never a query per channel), `community_channel_write_denial()` explains a refusal, and
+unread — ONE statement, but its unread count is a `cross join lateral` correlated on the channel,
+so the accurate claim is **bounded work per channel**, not "never a query per channel"; the bound is
+the `limit 100` plus `community_posts_channel_unread_idx`), `community_channel_write_denial()`
+explains a refusal, and
 `mark_community_channel_read()` writes `community_channel_reads`. An invisible channel reports
 **identically** to a nonexistent one. Every content policy and the community-media storage read are
 scoped `channel_id in (select my_community_channel_ids())`, keeping #29's uncorrelated InitPlan
@@ -645,7 +648,11 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   (the app's **first** signed-URL use — everything else is public-bucket `getPublicUrl`). Emails
   via env-gated `api/notify-enrollment.js` (`RESEND_API_KEY`/`RESEND_FROM`, optional
   `NOTIFY_ADMIN_EMAIL` + `APP_URL` for the "Review in Enrollments" button; the submitted alert
-  carries a Type: Renewal/New row). Three actions: `submitted` (student→admin, JWT-ownership auth),
+  carries a Type: Renewal/New row). Three actions: `submitted` (**TWO emails** — the admin alert,
+  plus a student confirmation carrying the onboarding video `ONBOARDING_VIDEO_ID` and the
+  "enrollment and course access are granted 9–5 PH time, Mon–Fri" SLA; both are hardcoded module
+  consts in `api/notify-enrollment.js`, **not** admin-editable like the `payment_settings` copy on
+  the same screen — move them there if the SLA ever changes; JWT-ownership auth),
   `decision` (admin→student), `test` (admin-only diagnostic → the **"Test email"** button in the
   Enrollments toolbar; verifies the admin JWT server-side and reports sent/not-configured/provider
   error). The admin **recipient** resolves `NOTIFY_ADMIN_EMAIL` → the admin-editable
@@ -825,7 +832,25 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   form" bullet in Authentication. Seven promoted columns + an `intake` jsonb + four
   agreement columns + three file paths on `enrollment_requests`, the `enrollment-receipts`
   bucket widened to 10 MB/doc/docx, and the plan `features` copy corrected. Folded
-  verbatim as §29).
+  verbatim as §29) →
+  **community-channel-followup** (**#43**,
+  [db/2026-08-22-community-channel-followup.sql](db/2026-08-22-community-channel-followup.sql)
+  — full-code-review corrections to #40/#41. ★ Restores the
+  `is_approved()`+`is_enrolled()`+channel gate on `community_reactions_own_delete`, which #36 had
+  reduced to a bare `user_id = auth.uid()` and #40 skipped while re-scoping its two siblings —
+  reopening the expired-member write gap #28 closed. ★ Lets an uploader delete their OWN ORPHAN in
+  `community-media` and `enrollment-receipts`, so the clients' failed-submit cleanup stops being a
+  silent 403 (#14's payment-evidence rule is preserved exactly, via the SECDEF
+  `enrollment_file_is_referenced()`: once a request row cites a file it is permanently
+  student-undeletable). ★ `admin_save_channel_category`'s `p_status` default drops, so an omitted
+  argument can no longer un-archive. ★ `p_kind` joins #41's `v_touched` audit gate. ★ **The
+  performance one that mattered:** `community_posts_channel_feed_idx` loses #41's
+  `where status='active'` — RLS never implied it (its first disjunct is `is_admin()`) and the client
+  sends `status <> 'deleted'`, so the planner could not use the index AT ALL and every feed page was
+  a seq scan + sort. ★ `community_category_counts`/`search_community_posts` stop using
+  `($1 is null or col = $1)`; the latter gains `p_tag_slug`/`p_unanswered` so **in-channel** search
+  finally reaches the GIN index #40 built. ★ Plus the `profiles.full_name` trigram index and
+  `community_channel_reads(last_read_post_id)`. Needs #40+#41+#42. Folded verbatim as §30).
   **#35/#36 applied to production 2026-07-29; both verified against a disposable shadow project first — see
   [docs/db/shadow-project.md](docs/db/shadow-project.md) and `npm run test:db`.**
   **Expiry-warning policy:** student-facing surfaces (menu pill, Dashboard `MembershipPanel`, the
@@ -1304,6 +1329,15 @@ docs **in the same change**:
   deployed) **in the same change**, so the voice assistant's knowledge never drifts from the app.
   `npm run ai:knowledge:check` must pass (it exits 1 when the committed doc no longer matches the
   code — run it before calling any tools/plans change done).
+- **Deciding whether a post is an ANNOUNCEMENT** → the `community_channels.kind` of the channel it
+  is in, and nothing else (#43). The tag `community_tags.slug = 'announcements'` is post TAXONOMY
+  only. These were two disagreeing switches: the rail, header and composer read `kind` while the
+  bell, unread badge, read-markers, Announcements filter tab and right rail read `tag_slug`, so a
+  post made in `#announcements` with the composer's default tag notified nobody and never appeared
+  under the tab, while a post merely TAGGED Announcements in an ordinary room rang every bell.
+  Client-side the switch is `isAnnouncementPost()` in `CommunityHub` (plus `annChannelIds`, and
+  `useCommunityBell`'s own `community_channels` lookup); `COMMUNITY_ANNOUNCEMENTS_SLUG` survives
+  ONLY as the pre-#40 fallback for a database with no channels. Do not reintroduce a tag test.
 - **Changing which channels a member can see** → four places move together:
   `user_community_channel_ids()` ↔ `channelAudienceAllows()` in `src/lib/communityChannels.js`
   ↔ `test/communityChannels.test.mjs` ↔ `test-db/communityChannels.dbtest.mjs`. The audience
@@ -1322,11 +1356,21 @@ docs **in the same change**:
   (`test/batchEntitlements.test.mjs` pins it).
 - **Adding, removing or renaming an enrollment intake question** → `INTAKE_FIELDS` in
   `src/lib/enrollmentIntake.js` is the ONLY place that needs to change for it to render, be
-  required, and be flagged when blank. But if it must be *stored*, three more move with it:
-  a dated migration adding the column (or a key inside the `intake` jsonb), the row built in
-  `EnrollmentPaywall.submit()`, and `INTAKE_COLS` in `api/notify-enrollment.js` — the admin
-  alert selects an explicit column list, so a new column is silently `undefined` in the email
-  until it is listed there. `test/enrollmentIntake.test.mjs` pins the registry invariants.
+  required, be flagged when blank, prefill on renewal, **and be saved**. If it must be *stored*,
+  exactly ONE other thing moves with it: a dated migration adding the column (or nothing at all,
+  for a key inside the `intake` jsonb). ★ Since #43 the write side is registry-DERIVED — the row
+  comes from `intakePayload(values)` and the admin alert's select list from
+  `intakeSelectColumns()`. It used to be a hand-typed literal in `EnrollmentPaywall.submit()` plus
+  a hand-typed `INTAKE_COLS` string, which reproduced this module's founding bug on the write path:
+  a field could render with a red asterisk, block submit, prefill and pass every test while never
+  being saved — indistinguishable in review from a student who skipped a mandatory question.
+  Mark a field `base: true` if `submitSubscriptionRequest`'s own base row already writes it
+  (`full_name`/`email`/`phone`/`city_country`), or it will spread over that row — and `email` must
+  come from the ACCOUNT, not the form. `test/enrollmentIntake.test.mjs` pins the registry
+  invariants and the render↔validate↔persist parity;
+  `test/enrollmentIntakeSql.test.mjs` pins the option lists against the four SQL CHECK constraints
+  in **both** the dated migration and the bootstrap fold — a reworded option otherwise produces a
+  bare `23514` *after* all four files have uploaded, so no retry can ever succeed.
 - **Changing the Training Agreement's wording** → bump `AGREEMENT_VERSION` in
   `src/lib/trainingAgreement.js` in the same change. `enrollment_requests.agreement_version`
   records which text each student accepted, so editing the document without bumping makes every

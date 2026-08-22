@@ -28,6 +28,8 @@ import {
   intakeField,
   contentTypeFor,
   intakeValuesFromRequest,
+  intakePayload,
+  intakeSelectColumns,
 } from '../src/lib/enrollmentIntake.js';
 
 // A plan row shaped like public.enrollment_plans.
@@ -514,4 +516,98 @@ test('only single-line inputs are ever half width', () => {
     assert.ok(!['textarea', 'choice', 'file'].includes(f.type),
       `${f.key} is a ${f.type} — pills, textareas and drop zones need the full width`);
   }
+});
+
+// ── The write path is the registry too (#43) ────────────────────────────
+//
+// This module exists because the Apps Script form rendered a resume field with a
+// label, a drop zone and no `required` attribute — rendered and validated had
+// drifted. INTAKE_FIELDS fixed that by making one array drive both.
+//
+// The WRITE side had the same shape of hole: `column`/`json` were read-only
+// mappings, and submit() carried a hand-typed object literal. A new field could
+// render with a red asterisk, block submit until answered, prefill on renewal
+// and pass every test here — and never be saved, which looks in review exactly
+// like a student who skipped a mandatory question. intakePayload() closes it.
+
+const WRITE_VALUES = {
+  fullName: '  Juan dela Cruz  ',
+  email: 'typed@example.com',
+  cellphone: ' 0917 000 0000 ',
+  cityCountry: ' Manila, Philippines ',
+  collegeCourse: ' BS Accountancy ',
+  currentJob: ' Audit Associate ',
+  phExperience: '2-5 years',
+  usExperience: 'None',
+  currentlyEmployed: 'YES',
+  priorTraining: ' No ',
+  referredBy: ' A friend ',
+  facebookLink: ' facebook.com/juan ',
+  struggles: ' 1. one\n2. two\n3. three ',
+  amountPaid: '16,999',
+};
+
+test('every storable registry field reaches the payload', () => {
+  const row = intakePayload(WRITE_VALUES);
+  let checked = 0;
+  for (const f of INTAKE_FIELDS) {
+    if (f.type === 'file' || f.base || (!f.column && !f.json)) continue;
+    checked += 1;
+    const where = f.column ? row : row.intake;
+    const key = f.column || f.json;
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(where, key),
+      `${f.key} declares ${f.column ? 'column' : 'json'}:'${key}' but intakePayload never writes it — `
+      + 'it would render, be required, prefill, and silently not be saved',
+    );
+  }
+  assert.ok(checked >= 9, `expected at least 9 storable fields, saw ${checked}`);
+});
+
+test('the payload trims, normalizes, and stamps a version', () => {
+  const row = intakePayload(WRITE_VALUES);
+  assert.equal(row.college_course, 'BS Accountancy', 'trimmed');
+  assert.equal(row.currently_employed, 'YES', 'choice values pass through verbatim');
+  assert.equal(row.intake.facebook_link, 'facebook.com/juan', 'normalize runs when declared');
+  assert.equal(row.intake._v, 1, 'the jsonb shape is versioned');
+});
+
+test('the payload never carries a field the base row owns', () => {
+  const row = intakePayload(WRITE_VALUES);
+  // These are written by submitSubscriptionRequest's own base row, where `email`
+  // comes from the ACCOUNT. Spreading them here would let a typed address win
+  // over the authenticated one.
+  for (const col of ['full_name', 'email', 'phone', 'city_country']) {
+    assert.equal(row[col], undefined,
+      `${col} is the base row's to write — emitting it here would override the account`);
+  }
+});
+
+test('the payload never invents a file path', () => {
+  const row = intakePayload(WRITE_VALUES);
+  assert.equal(row.resume_path, undefined,
+    'a path exists only after an upload, so the caller supplies it');
+});
+
+test('a blank form still produces a well-formed row', () => {
+  const row = intakePayload(blankIntake());
+  assert.equal(typeof row.intake, 'object', 'intake is always an object, never null');
+  assert.equal(row.intake._v, 1);
+  assert.equal(row.college_course, '', 'empty, not undefined — the column is written');
+});
+
+test('intakePayload survives a missing values object', () => {
+  const row = intakePayload(null);
+  assert.equal(row.intake._v, 1, 'no crash, and still a versioned envelope');
+});
+
+test('the admin alert selects exactly the columns the payload writes', () => {
+  const cols = intakeSelectColumns();
+  const row = intakePayload(WRITE_VALUES);
+  for (const key of Object.keys(row)) {
+    if (key === 'intake') continue;
+    assert.ok(cols.includes(key),
+      `${key} is written but not selected by the admin alert — its row would render blank`);
+  }
+  assert.ok(cols.includes('intake'), 'the jsonb must be selected too');
 });

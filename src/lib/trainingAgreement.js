@@ -34,9 +34,14 @@
 //   Bump it whenever wording changes so an old signature never appears to
 //   endorse new terms. Adding a plan or repricing one is NOT a wording change.
 //
-// NO imports, NO side effects, NO DOM, NO network, NO clock — the signing date
-// is supplied by the caller so the same inputs always produce the same document.
+// NO side effects, NO DOM, NO network, NO clock — the signing date is supplied
+// by the caller so the same inputs always produce the same document. The single
+// import is the shared peso formatter, from the equally-pure planCatalog: the
+// price on the card and the price on the signed document MUST be produced by one
+// function, or they eventually disagree (they already had).
 // ─────────────────────────────────────────────────────────────────────────────
+
+import { phpAmount } from './planCatalog.js';
 
 /** Bump on any wording change. Recorded against every signature. */
 export const AGREEMENT_VERSION = '2026-08-20';
@@ -73,11 +78,17 @@ const TIER_META = Object.freeze({
   vip: { label: 'VIP', pill: 'p-vip', format: 'LIVE + Group' },
 });
 
-/** Deterministic peso formatting — no ICU, so tests and PDFs agree byte for byte. */
-function fmtPhp(n) {
-  if (n == null || !Number.isFinite(Number(n))) return '—';
-  return '₱' + String(Math.round(Number(n))).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-}
+/**
+ * Peso formatting for the signed document.
+ *
+ * ★ Shares ONE implementation with the pricing cards and the admin alert. The
+ * local copy this replaces rounded (`₱3,000` where the card said `₱2,999.5`), so
+ * the number a student read on the card and the number printed on the agreement
+ * they signed could differ — which is precisely the failure this module exists
+ * to prevent. Only the empty-value rendering differs, and deliberately: a legal
+ * document prints "—" for an unknown price rather than asserting ₱0.
+ */
+const fmtPhp = (n) => phpAmount(n, '—');
 
 /**
  * Human duration for an access window.

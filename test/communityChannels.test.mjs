@@ -21,6 +21,7 @@ import {
   channelAccessSummary,
   channelAudienceAllows,
   channelDenialCopy,
+  cohortLandingChannel,
   effectiveChannelCaps,
   groupChannelsByCategory,
   normalizeChannelSlug,
@@ -345,4 +346,66 @@ test('an unknown denial reason still produces a usable sentence per action', () 
   assert.match(channelDenialCopy({ allowed: false, reason: 'brand_new' }, 'comment'), /reply/i);
   assert.match(channelDenialCopy({ allowed: false, reason: 'brand_new' }, 'attach'), /attachment/i);
   assert.match(channelDenialCopy({ allowed: false, reason: 'brand_new' }, 'post'), /post/i);
+});
+
+// ── Where a member LANDS (#43) ──────────────────────────────────────────
+//
+// defaultSpaceOf() used to prefer a non-general space, so a VIP opening the
+// Community arrived in their private cohort room. That preference was lost when
+// space selection became channel selection in #40, and nothing replaced it:
+// my_community_sidebar() orders general first, and community_settings
+// .default_channel_id points into General, so EVERY remaining fallback led back
+// to the public room. A member who paid ₱16,999 for a cohort had no indication
+// their cohort room existed unless they scanned the rail.
+
+const RAIL = [
+  { channel_id: 'g1', channel_slug: 'general-discussion', space_kind: 'general', is_default: true, is_space_default: true },
+  { channel_id: 'g2', channel_slug: 'announcements', space_kind: 'general' },
+  { channel_id: 'v1', channel_slug: 'coaching-questions', space_kind: 'vip' },
+  { channel_id: 'v2', channel_slug: 'lounge', space_kind: 'vip', is_space_default: true },
+];
+
+test('the cohort landing room is that space own default, not merely its first row', () => {
+  assert.equal(cohortLandingChannel(RAIL).channel_id, 'v2',
+    'is_space_default wins over rail order inside the cohort space');
+});
+
+test('a member with no cohort space has no cohort landing room', () => {
+  const generalOnly = RAIL.filter(r => r.space_kind === 'general');
+  assert.equal(cohortLandingChannel(generalOnly), null,
+    'null, so the caller falls through to the community-wide default');
+  assert.equal(cohortLandingChannel([]), null, 'and an empty rail is not a crash');
+  assert.equal(cohortLandingChannel(null), null, 'nor is a missing one');
+});
+
+test('a cohort space with no marked default still yields a room', () => {
+  const rows = RAIL.filter(r => r.channel_id !== 'v2');
+  assert.equal(cohortLandingChannel(rows).channel_id, 'v1',
+    'first cohort row — landing somewhere private beats landing in General');
+});
+
+test('an explicit link still outranks the cohort preference', () => {
+  // The precedence this feeds is URL -> stored -> defaultChannelId -> is_default
+  // -> first, and the cohort room is supplied AS the defaultChannelId. So a
+  // shared ?channel= link must still win, or a cohort member cannot follow one.
+  const chosen = pickInitialChannel({
+    urlSlug: 'announcements',
+    channels: RAIL,
+    defaultChannelId: cohortLandingChannel(RAIL).channel_id,
+  });
+  assert.equal(chosen.channel_id, 'g2', 'the link the member actually clicked');
+
+  const stored = pickInitialChannel({
+    storedSlug: 'general-discussion',
+    channels: RAIL,
+    defaultChannelId: cohortLandingChannel(RAIL).channel_id,
+  });
+  assert.equal(stored.channel_id, 'g1', 'and a remembered choice is still a choice');
+
+  const fresh = pickInitialChannel({
+    channels: RAIL,
+    defaultChannelId: cohortLandingChannel(RAIL).channel_id,
+  });
+  assert.equal(fresh.channel_id, 'v2',
+    'but with nothing asked for, a VIP lands in their cohort — the #43 fix');
 });

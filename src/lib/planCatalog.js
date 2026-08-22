@@ -17,6 +17,36 @@
 // Prices are FIXED ₱ (PHP) bank-transfer amounts — never USD-converted.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * THE peso formatter. One rule, everywhere a price is shown.
+ *
+ * There were three: `phpFmt` on the pricing cards, `fmtPhp` inside the Training
+ * Agreement, and `php` in the admin alert email — and the first two DISAGREED.
+ * `2999.5` rendered as "₱2,999.5" on the card and "₱3,000" on the document the
+ * student legally signs, and a null price rendered as "₱0" against "—". Quoting
+ * one number and having someone sign another is the exact failure
+ * trainingAgreement.js exists to prevent (its predecessor printed ₱15,999 on a
+ * ₱16,999 sale), so the formatter cannot be the thing that reintroduces it.
+ *
+ * Deterministic on purpose — no `toLocaleString`, so a PDF, an email and a
+ * node:test assertion agree byte for byte on every platform and ICU build. The
+ * output matches `toLocaleString('en-US')` for the values this catalog holds.
+ *
+ * `fallback` is what a missing/unparseable amount renders as: a document says
+ * "—" because printing "₱0" would assert a price nobody agreed to; UI surfaces
+ * default to "₱0".
+ */
+export function phpAmount(n, fallback = '₱0') {
+  const v = Number(n);
+  if (n == null || n === '' || !Number.isFinite(v)) return fallback;
+  const abs = Math.abs(v);
+  const whole = Math.trunc(abs);
+  const cents = Math.round((abs - whole) * 100);
+  const grouped = String(whole).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  const dec = cents ? `.${String(cents).padStart(2, '0').replace(/0$/, '')}` : '';
+  return `${v < 0 ? '-₱' : '₱'}${grouped}${dec}`;
+}
+
 export const ENROLLMENT_PLANS_FALLBACK = [
   { key: 'sampler', name: 'Sampler Session', tagline: 'Essentials', price_php: 1499, compare_at_php: null, badge: null, limit_note: 'Limited offer', position: 1, access_days: 60, support_days: 60,
     features: ['1 Live Zoom Session (3 hours)', '60-day course access', '60-day group chat support'] },

@@ -20,6 +20,7 @@ import {
   extensionPrice,
   filterStagesForEntitlement,
   planEntitlement,
+  phpAmount,
 } from '../src/lib/planCatalog.js';
 
 const RETIRED = ['core_self_paced', 'gold_live'];
@@ -208,4 +209,68 @@ test('extension pricing never sells less than the 2-month minimum', () => {
   assert.equal(extensionPrice(byKey.silver_self_paced, 1).days, 60);
   assert.equal(extensionPrice(byKey.silver_self_paced, 0).days, 60);
   assert.equal(extensionPrice(null, 2).amount, 0, 'no plan row → no price invented');
+});
+
+// ── One peso formatter (#43) ────────────────────────────────────────────
+//
+// There were three: `phpFmt` on the pricing cards (toLocaleString), `fmtPhp`
+// inside the Training Agreement (Math.round + a manual grouping regex), and
+// `php` in the admin alert email. The first two DISAGREED — and they format the
+// same enrollment_plans.price_php, one onto the card a student reads and one
+// onto the document they legally sign. That is the exact failure
+// trainingAgreement.js was written to prevent: its predecessor printed ₱15,999
+// into a document while the catalog charged ₱16,999.
+//
+// It is deliberately ICU-free. A price is rendered into a PDF, into an email,
+// and into a node:test assertion; those must agree byte for byte on every
+// platform, and toLocaleString is a runtime-dependent way to promise that.
+
+test('the formatter groups thousands the way the pricing cards always did', () => {
+  assert.equal(phpAmount(16999), '₱16,999');
+  assert.equal(phpAmount(2999), '₱2,999');
+  assert.equal(phpAmount(1499), '₱1,499');
+  assert.equal(phpAmount(999), '₱999');
+  assert.equal(phpAmount(1000000), '₱1,000,000');
+});
+
+test('it matches toLocaleString(en-US) on every live catalog price', () => {
+  for (const p of ENROLLMENT_PLANS_FALLBACK) {
+    assert.equal(
+      phpAmount(p.price_php),
+      '₱' + Number(p.price_php).toLocaleString('en-US'),
+      `${p.key}: the deterministic formatter must render exactly what the old `
+      + 'toLocaleString card did, or repricing appears to change the price',
+    );
+  }
+});
+
+test('a fractional amount is NOT rounded away', () => {
+  // The agreement's old copy did Math.round, so ₱2,999.50 printed as ₱3,000 on
+  // the signed document while the card said ₱2,999.5. Whatever the number is,
+  // both surfaces must now say the same thing.
+  assert.equal(phpAmount(2999.5), '₱2,999.5');
+  assert.equal(phpAmount(2999.05), '₱2,999.05');
+  assert.equal(phpAmount(2999.5), '₱' + (2999.5).toLocaleString('en-US'));
+});
+
+test('the empty rendering is the callers choice, and defaults to zero', () => {
+  assert.equal(phpAmount(null), '₱0', 'UI surfaces show a real zero');
+  assert.equal(phpAmount(undefined), '₱0');
+  assert.equal(phpAmount(''), '₱0');
+  assert.equal(phpAmount('not a number'), '₱0');
+  // The signed document passes '—' instead: printing ₱0 would assert a price
+  // nobody agreed to.
+  assert.equal(phpAmount(null, '—'), '—');
+  assert.equal(phpAmount(NaN, '—'), '—');
+});
+
+test('a negative amount keeps its sign outside the symbol', () => {
+  assert.equal(phpAmount(-1499), '-₱1,499');
+});
+
+test('numeric strings are accepted, because price_php is a numeric column', () => {
+  // supabase-js hands back `numeric` as a string often enough that a formatter
+  // which only accepted numbers would render ₱0 for a real price.
+  assert.equal(phpAmount('16999'), '₱16,999');
+  assert.equal(phpAmount('2999.50'), '₱2,999.5');
 });

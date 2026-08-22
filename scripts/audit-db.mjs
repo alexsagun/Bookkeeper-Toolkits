@@ -141,6 +141,21 @@ const OBJECT_CHECKS = [
   ['#42    receipts bucket accepts a Word resume', `select coalesce(bool_and('application/vnd.openxmlformats-officedocument.wordprocessingml.document' = any(allowed_mime_types) and file_size_limit >= 10485760), false) as ok from storage.buckets where id='enrollment-receipts'`],
   ['#42    plan copy no longer promises Discord', `select coalesce(bool_and(features::text not ilike '%discord%'), false) as ok from public.enrollment_plans`],
   ['#40    post reads are channel-scoped', `select coalesce(bool_and(qual ilike '%my_community_channel_ids%'), false) as ok from pg_policies where schemaname='public' and policyname='community_posts_read'`],
+  // #43 — each line is one of the defects the review found. They are object
+  // checks, not log checks, because #36 proved a policy can be quietly reduced
+  // to a bare own-row test while every migration still claims to have run.
+  ['#43    reaction deletes are gated again', `select coalesce(bool_and(qual ilike '%is_enrolled%' and qual ilike '%my_community_channel_ids%'), false) as ok from pg_policies where schemaname='public' and policyname='community_reactions_own_delete'`],
+  ['#43    an uploader can clear their own orphan', `select coalesce(bool_and(qual ilike '%not (EXISTS%' or qual ilike '%NOT (EXISTS%'), false) as ok from pg_policies where schemaname='storage' and policyname='community_media_delete'`],
+  ['#43    a failed enrollment submit can clean up', `select coalesce(bool_and(qual ilike '%enrollment_file_is_referenced%'), false) as ok from pg_policies where schemaname='storage' and policyname='enrollment_receipts_delete'`],
+  ['#43    a category rename cannot un-archive', `select coalesce(bool_and(pg_get_expr(p.proargdefaults, 0) not ilike '%active%'), true) as ok from pg_proc p where p.proname='admin_save_channel_category'`],
+  ['#43    kind counts as a permissions change', `select coalesce(bool_and(prosrc like '%p_kind           is not null%'), false) as ok from pg_proc where proname='admin_save_community_channel'`],
+  // The one with real production blast radius: a partial predicate here is never
+  // implied by the feed query, so the index silently stops being used at all.
+  ['#43    the feed index is usable (not partial)', `select coalesce(bool_and(indexdef not ilike '%WHERE%'), false) as ok from pg_indexes where indexname='community_posts_channel_feed_idx'`],
+  ['#43    in-channel search can use the GIN index', `select to_regprocedure('public.search_community_posts(text,uuid,text,int,int,text,boolean)') is not null as ok`],
+  ['#43    category counts are sargable', `select coalesce(bool_and(prolang=(select oid from pg_language where lanname='plpgsql')), false) as ok from pg_proc where proname='community_category_counts'`],
+  ['#43    mention search has its trigram index', `select to_regclass('public.profiles_full_name_trgm_idx') is not null as ok`],
+  ['#43    channel read markers index their post fk', `select to_regclass('public.community_channel_reads_post_idx') is not null as ok`],
   ['#37    attachment insert binds uploader + link + space', `select coalesce(bool_and(with_check ilike '%uploader_id =%' and with_check ilike '%storage_path IS NULL%' and with_check ilike '%(p.space_id)::text%'), false) as ok from pg_policies where policyname='community_attachments_own_insert'`],
   ['#37    only a revoke clears the batch_id cache', `select coalesce(bool_and(prosrc like '%revoked%then%'), false) as ok from pg_proc where proname='revoke_batch_run'`],
   ['#37    FIFO binder is forward-only within a run', `select coalesce(bool_and(prosrc like '%max(b2.code)%'), false) as ok from pg_proc where proname='allocate_queued_entitlements'`],

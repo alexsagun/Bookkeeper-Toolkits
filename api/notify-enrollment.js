@@ -31,6 +31,9 @@
 //   reset) — NOT this function. These custom alerts need their own env vars above.
 //   `npm run dev` (Vite) does NOT run this function — email is exercised on Vercel only.
 
+import { phpAmount } from '../src/lib/planCatalog.js';
+import { intakeSelectColumns } from '../src/lib/enrollmentIntake.js';
+
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
 const SUPABASE_ANON = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
 
@@ -40,7 +43,10 @@ const esc = (s) =>
   String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const ONBOARDING_VIDEO_ID = 'U78IBZwIr7U';
-const php = (n) => '₱' + Number(n || 0).toLocaleString('en-US');
+// The SAME formatter the pricing cards and the signed agreement use. It used to
+// be a third private copy, and the three had already drifted (see phpAmount).
+// planCatalog.js is pure, dependency-free ESM specifically so api/ can import it.
+const php = (n) => phpAmount(n);
 
 // Branded HTML mirroring api/notify-access.js / the auth-email template.
 // cta: optional { href, label } — a button after the rows table (intro is esc()'d,
@@ -158,8 +164,14 @@ const OWN_REQUEST_COLS =
 // #42's intake + agreement columns. Selected on the top rung only, so a database
 // without the migration falls through to the shorter list rather than 400-ing —
 // which would silence the admin alert entirely, the one email that matters.
-const INTAKE_COLS =
-  'college_course,current_job,ph_experience,us_experience,currently_employed,prior_training,referred_by,intake,resume_path,agreement_version,agreement_tier';
+// DERIVED from INTAKE_FIELDS, not hand-listed. A hand-written select list is a
+// silent failure mode: a newly stored column simply reads as `undefined` here and
+// its row vanishes from the admin alert, which looks exactly like a student who
+// skipped a required question.
+const INTAKE_COLS = [
+  ...intakeSelectColumns(),
+  'resume_path', 'agreement_version', 'agreement_tier',
+].join(',');
 async function fetchOwnRequest(requestId, token) {
   // batch_id (#32) and the intake columns (#42) ride the same resilience ladder
   // as notify_status (#16).

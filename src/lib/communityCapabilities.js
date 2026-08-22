@@ -45,6 +45,19 @@
  * Every unknown plan resolves to the fail-closed default: read and react,
  * write nothing.
  */
+// ★ SCOPE NOTE (#40). Only `effectiveCaps` still runs in production, and only on
+//   the pre-#40 fallback branch in CommunityHub — post-#40 the client consumes
+//   the server-computed can_* from my_community_sidebar() via
+//   effectiveChannelCaps (src/lib/communityChannels.js), which is where a live
+//   permission question is answered.
+//
+//   Everything below — PLAN_CAPABILITY_FALLBACK, planCapabilities,
+//   capabilitiesFor, isAnnouncementSpace, denialCopy — is an EXECUTABLE SPEC of
+//   the SQL in #36, exercised only by test/communityCapabilities.test.mjs. It is
+//   kept deliberately: the truth table is the clearest statement in the repo of
+//   what each plan may do in each space kind. But do not fix a live permission
+//   bug here and expect it to change behaviour — the running client never calls
+//   it. Change the SQL, then update this to match.
 export const PLAN_CAPABILITY_FALLBACK = {
   sampler: {
     can_post_in_general: true,

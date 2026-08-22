@@ -18,12 +18,19 @@
 // code, month, price or date.
 
 export const AUDIENCE_MODES = ['space', 'plans', 'batches', 'plans_and_batches', 'admins_only'];
-export const CHANNEL_KINDS = ['text', 'announcement'];
-export const CHANNEL_STATUSES = ['active', 'archived'];
 
-/** Modes that are meaningless without a mapping — an empty one means "nobody". */
+/**
+ * Modes that are meaningless without a mapping — an empty one means "nobody".
+ *
+ * ★ These are READ by the two switches below rather than merely describing them.
+ * They previously named a rule that was hardcoded in both, which is the one
+ * arrangement guaranteed to drift: adding a mode would leave the constants
+ * silently stale while the switches kept working.
+ */
 export const MODES_NEEDING_PLANS = ['plans', 'plans_and_batches'];
 export const MODES_NEEDING_BATCHES = ['batches', 'plans_and_batches'];
+const needsPlans = (mode) => MODES_NEEDING_PLANS.indexOf(mode) !== -1;
+const needsBatches = (mode) => MODES_NEEDING_BATCHES.indexOf(mode) !== -1;
 
 const NO_CAPS = Object.freeze({
   canRead: false, canPost: false, canComment: false, canReact: false, canAttach: false,
@@ -52,6 +59,14 @@ export function normalizeChannelSlug(input) {
 /**
  * The audience CASE from user_community_channel_ids(), verbatim.
  *
+ * ★ THIS IS AN EXECUTABLE SPEC, NOT UI LOGIC. Nothing in the app calls it: the
+ * audience decision is made server-side and delivered by my_community_sidebar().
+ * It exists so the SQL rule can be unit-tested (test/communityChannels.test.mjs)
+ * and so a reader can see the rule without reading plpgsql — and CLAUDE.md names
+ * it as one of the four places that must move together when audience rules
+ * change. Keep it in lockstep or delete both halves; do not let it rot into a
+ * plausible-looking second opinion.
+ *
  * `inSpace` defaults to FALSE on purpose. This function answers "does the
  * audience admit this member", and the space conjunct is the caller's to supply;
  * defaulting it to true would let a forgetful caller widen access, which is
@@ -74,15 +89,16 @@ export function channelAudienceAllows(input) {
   const planMatch = () => !!memberPlanKey && planKeys.indexOf(memberPlanKey) !== -1;
   const batchMatch = () => memberBatchIds.some((b) => batchIds.indexOf(b) !== -1);
 
-  switch (o.mode) {
-    case 'space': return true;
-    case 'plans': return planMatch();
-    case 'batches': return batchMatch();
-    case 'plans_and_batches': return planMatch() && batchMatch();
-    case 'admins_only': return false;
-    // An unknown mode (a newer server, a typo, a truncated payload) is refused.
-    default: return false;
-  }
+  if (o.mode === 'space') return true;
+  if (o.mode === 'admins_only') return false;
+  // An unknown mode (a newer server, a typo, a truncated payload) is refused:
+  // neither list names it, so this is false before either match is consulted.
+  if (!needsPlans(o.mode) && !needsBatches(o.mode)) return false;
+  // An INTERSECTION when a mode needs both — mirroring the SQL, where each
+  // required mapping is its own EXISTS and an empty one is already false.
+  if (needsPlans(o.mode) && !planMatch()) return false;
+  if (needsBatches(o.mode) && !batchMatch()) return false;
+  return true;
 }
 
 /**
@@ -123,6 +139,25 @@ const idOf = (c) => (c ? c.channel_id || c.id || null : null);
  * through SILENTLY. Reporting "no such channel" would confirm that a private room
  * exists, so the member just lands somewhere they can actually read.
  */
+/**
+ * The room a member should land in when they have asked for nothing specific.
+ *
+ * A member who paid for a private cohort should arrive IN it, not in the room
+ * every plan shares. `defaultSpaceOf()` said exactly this before #40 — it looked
+ * for a non-general space before the general one — and the preference was lost
+ * when space selection became channel selection: `my_community_sidebar()` orders
+ * general first, and `community_settings.default_channel_id` points into
+ * General, so after #40 every remaining fallback led back to the public room and
+ * a VIP's first visit never showed them their cohort existed.
+ *
+ * Returns null when the member has no cohort room, which is the common case.
+ */
+export function cohortLandingChannel(rows) {
+  const cohort = asArray(rows).filter((c) => c && c.space_kind && c.space_kind !== 'general');
+  if (!cohort.length) return null;
+  return cohort.find((c) => c.is_space_default === true) || cohort[0];
+}
+
 export function pickInitialChannel(input) {
   const o = input || {};
   const list = asArray(o.channels);

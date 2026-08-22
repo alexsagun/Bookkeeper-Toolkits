@@ -28,13 +28,14 @@
 //   remain comparable. Rewording an option silently splits a bucket in two —
 //   change them only alongside a data migration.
 //
-// ★ `column` AND `json` ARE READ MAPPINGS ONLY — THEY DO NOT PERSIST ANYTHING.
-//   intakeValuesFromRequest() uses them to prefill a renewal FROM a stored row,
-//   but the write side is a hand-written object literal in EnrollmentPaywall's
-//   submit(). So a new field declaring `column: 'x'` will render, validate and
-//   prefill correctly while never being saved — and will look right in review.
-//   Adding a field that must be stored means touching four places: here, the
-//   migration, that literal, and INTAKE_COLS in api/notify-enrollment.js.
+// ★ `column` AND `json` DRIVE READS *AND* WRITES.
+//   intakeValuesFromRequest() prefills a renewal FROM a stored row;
+//   intakePayload() builds the row TO store; intakeSelectColumns() names what the
+//   admin alert must select. Adding a storable field is therefore two places —
+//   this registry and a dated migration adding the column — not four.
+//   It used to be four, and the write side was a hand-typed literal, which
+//   reintroduced this module's founding bug on the write path: a field could
+//   render, block submit, prefill and pass tests while never being saved.
 //
 // NO imports, NO side effects, NO DOM, NO network. Pinned by
 // test/enrollmentIntake.test.mjs.
@@ -88,14 +89,14 @@ export const INTAKE_SECTIONS = Object.freeze([
 export const INTAKE_FIELDS = Object.freeze([
   // ── 01 · Personal Information ──
   { key: 'fullName', section: 'personal', label: 'Full name', type: 'text', required: true,
-    placeholder: 'Juan dela Cruz', maxLen: 120, column: 'full_name' },
+    placeholder: 'Juan dela Cruz', maxLen: 120, column: 'full_name', base: true },
   { key: 'email', section: 'personal', label: 'Email', type: 'email', required: true,
     span: 'half', readOnly: true, hint: 'Taken from your account so your enrolment stays linked to it.',
-    maxLen: 254, column: 'email' },
+    maxLen: 254, column: 'email', base: true },
   { key: 'cellphone', section: 'personal', label: 'Cellphone number', type: 'tel', required: true,
-    span: 'half', placeholder: '09XX-XXX-XXXX', maxLen: 40, column: 'phone' },
+    span: 'half', placeholder: '09XX-XXX-XXXX', maxLen: 40, column: 'phone', base: true, normalize: normalizePhone },
   { key: 'cityCountry', section: 'personal', label: 'City and country', type: 'text', required: true,
-    span: 'half', placeholder: 'Manila, Philippines', maxLen: 120, column: 'city_country' },
+    span: 'half', placeholder: 'Manila, Philippines', maxLen: 120, column: 'city_country', base: true },
   { key: 'collegeCourse', section: 'personal', label: 'College course', type: 'text', required: true,
     span: 'half', placeholder: 'BS Accountancy', maxLen: 160, column: 'college_course' },
 
@@ -135,7 +136,7 @@ export const INTAKE_FIELDS = Object.freeze([
     column: 'referred_by' },
   { key: 'facebookLink', section: 'final', label: 'Facebook name or link', type: 'text', required: true,
     hint: 'Paste your profile link, or the name on your Facebook account.',
-    placeholder: 'e.g. facebook.com/yourname or Juan dela Cruz', maxLen: 300, json: 'facebook_link' },
+    placeholder: 'e.g. facebook.com/yourname or Juan dela Cruz', maxLen: 300, json: 'facebook_link', normalize: normalizeFacebook },
   { key: 'struggles', section: 'final',
     label: '3 struggles you are facing right now in landing your dream job', type: 'textarea',
     required: true, hint: 'Be specific — this is what Coach Alex tailors his guidance from.',
@@ -195,6 +196,56 @@ export function parseAmountPaid(raw) {
   if (!cleaned) return null;
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : null;
+}
+
+/** Bump when the shape of the `intake` jsonb changes. Stored as `_v`. */
+export const INTAKE_JSON_VERSION = 1;
+
+/**
+ * The `enrollment_requests` payload for one submission, DERIVED from the registry.
+ *
+ * ★ THIS IS WHY `column` AND `json` NOW PERSIST. They used to be read-only
+ *   mappings (prefill), while the write side was a hand-typed object literal in
+ *   EnrollmentPaywall.submit(). That reintroduced, on the write side, the exact
+ *   class of bug this module exists to prevent: a field declaring `column: 'x'`
+ *   would render with a red asterisk, block submit until answered, prefill on
+ *   renewal and pass every test — and never be saved. The admin would review an
+ *   enrollment where a mandatory answer was blank, and nothing anywhere errored.
+ *
+ * Fields marked `base: true` are deliberately excluded: full_name / email /
+ * phone / city_country are written by submitSubscriptionRequest's own base row,
+ * where `email` comes from the ACCOUNT rather than the form. Emitting them here
+ * would spread over that row and let a typed address win.
+ *
+ * `type: 'file'` fields are excluded too — a path is known only after upload, so
+ * the caller supplies resume_path itself.
+ */
+export function intakePayload(values) {
+  const v = values || {};
+  const row = {};
+  const json = { _v: INTAKE_JSON_VERSION };
+  for (const f of INTAKE_FIELDS) {
+    if (f.type === 'file' || f.base) continue;
+    if (!f.column && !f.json) continue;
+    const raw = v[f.key];
+    const out = f.normalize ? f.normalize(raw) : (typeof raw === 'string' ? raw.trim() : (raw ?? null));
+    if (f.column) row[f.column] = out;
+    else json[f.json] = out;
+  }
+  row.intake = json;
+  return row;
+}
+
+/**
+ * The stored column names an admin-facing reader must SELECT, derived from the
+ * same registry — so api/notify-enrollment.js can never omit a new column and
+ * silently render its row as blank in the admin alert.
+ */
+export function intakeSelectColumns() {
+  const cols = INTAKE_FIELDS
+    .filter(f => f.column && !f.base && f.type !== 'file')
+    .map(f => f.column);
+  return [...cols, 'intake'];
 }
 
 /** An empty value for every field, so every React input starts controlled. */
