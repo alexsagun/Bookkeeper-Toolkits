@@ -9,6 +9,11 @@ migrations and **two** storage buckets, no env vars.
 
 ## What you get
 
+- **Channels** — the community is grouped into categories of channels (#40): text channels
+  for discussion and announcement channels that are read-and-react only. A channel can be
+  limited to particular plans, particular batches, or both, and members only ever see the
+  channels they may open. Per-channel unread markers, search within one channel or across
+  all of them, and an admin editor for creating and organising them.
 - **A forum home** — category rail with per-category counts, filter tabs
   (Latest / New / Unanswered / Announcements), debounced search over titles + bodies,
   free-form `#tag` filtering, pinned-first ordering, a right rail (latest announcements ·
@@ -183,14 +188,80 @@ harmless. Existing members keep their seats, their private space and their histo
   open for the current or an upcoming month — at which point VIP checkout loses its batch
   picker and queued seats stop being allocated, so create the next batch.
 
-**Client:** a space switcher appears under the Community header once more than one space is
-accessible (`/community?space=<slug>&post=<id>` deep links; VIP members land in their
-private space by default; the last selection persists per user). On a pre-#32 database the
-client silently runs the old single-space forum and admins see a setup notice.
+**Client:** ★ **superseded by #40 — see the Channels section above.** The space switcher this
+section described was retired: a space is an entitlement boundary, not something a member
+navigates, so the channel rail is the navigation now and a cohort’s rooms sit under their own
+locked category. `/community?space=<slug>&post=<id>` links still resolve — they land in that
+space’s default channel. On a pre-#32 database the client silently runs the old single-space
+forum and admins see a setup notice.
 
 > **The client half of #32 ships in the app bundle, not in the SQL.** Running the migration
-> alone does not deliver the space switcher, the batch pickers, Admin → Batches, or the
-> single-RPC approve path — those need the matching build deployed.
+> alone does not deliver the batch pickers, Admin → Batches, or the single-RPC approve path —
+> those need the matching build deployed. The same is true of #40: the channel rail, the admin
+> editor and `?channel=` links all ship in the app bundle.
+
+## Channels (#40 — the navigation and access layer)
+
+Since **#40** the community is organised into **channels**, grouped into **categories**,
+inside the spaces that #32 established. A member sees one rail of every channel they may
+open; the space is invisible to them, and stays what it always was — the entitlement
+boundary underneath.
+
+**The hierarchy.** Space → category → channel → post → comment. Categories are
+organisation *only*; they never grant or withhold access. `community_tags` is unchanged and
+still labels posts — a post has both a channel and a tag.
+
+**Who can see a channel** is its `audience_mode`:
+
+| Mode | Reaches |
+|---|---|
+| `space` | everyone entitled to the parent space |
+| `plans` | parent space **and** the member's current plan is on the list |
+| `batches` | parent space **and** the member holds an active seat in a listed batch |
+| `plans_and_batches` | both of the above — an **intersection**, not a union |
+| `admins_only` | administrators only |
+
+Three properties are worth knowing because they are what make it safe:
+
+- **A channel can only narrow its space.** Access is `space membership AND audience match`,
+  so a mistake in a channel setting can hide a room, never expose one.
+- **An empty plan/batch list means nobody**, not everybody. The admin editor refuses to
+  create such a channel, and if a mapping is later emptied the room simply disappears for
+  members.
+- **Batch status is not consulted.** Closing or archiving a cohort does not revoke a seat a
+  member already paid for, so their channels keep working.
+
+**What members can do in a channel** is `plan capability × space flag × channel flag`.
+A channel's own toggles (post / reply / react / attach) can only take rights away, never add
+them — so a Sampler member does not gain attachments just because a channel allows them.
+
+**D2 changed shape here.** #36 made General announcement-only for every plan with a CHECK
+constraint. #40 retires that constraint, opens the General space, and moves the restriction
+onto the channel: `#announcements` is `kind='announcement'`, which makes `member_posting`
+false *by CHECK*, and its replies are off. Members can now talk in `#general-discussion`,
+`#quickbooks-help`, `#job-search` and `#client-work`. **Attachment rights were not
+relaxed** — they are still a plan capability (VIP only).
+
+**Seeded channels.** General gets *Start here* (`#announcements`, `#community-guide`) and
+*General community* (`#general-discussion` — the default landing room —, `#quickbooks-help`,
+`#job-search`, `#client-work`). Every cohort space gets `#lounge` (its default) and
+`#coaching-questions`, minted by the same trigger that creates the space, so a new batch can
+never exist with nowhere to talk.
+
+**Managing channels.** Admins open **Manage community** from the bottom of the channel rail:
+community name/description/welcome/landing channel, categories (create, rename, reorder,
+archive), and channels (create, edit, reorder, archive, restore) with the full access editor.
+Every change writes a row to `community_channel_events`, and because the tables carry no
+client write policy, that audit trail cannot be bypassed. Widening or narrowing a channel
+shows a confirmation naming how many members gain or lose access first.
+
+Channels are **archived, never deleted**, so their discussions survive and can be restored.
+
+**Client.** `/community?channel=<slug>` deep-links a channel and `&post=<id>` a discussion.
+Selection order is URL → last channel you opened → the admin's landing channel → the first
+channel you can read; an unknown or now-inaccessible slug falls back **silently**, because
+saying "no such channel" would confirm a private room exists. Old `?space=` links still
+resolve, landing in that space's default channel.
 
 ## Setup order at a glance
 
@@ -204,10 +275,11 @@ client silently runs the old single-space forum and admins see a setup notice.
 7. Run the batch hardening migration **#33** ([`db/2026-07-29-community-batch-hardening.sql`](db/2026-07-29-community-batch-hardening.sql)) — seat-occupancy capacity fix, attachment path binding, set-based mention search, notification column grant — **immediately followed by #34** ([`db/2026-07-29-batch-hardening-followup.sql`](db/2026-07-29-batch-hardening-followup.sql)), which corrects #33's copy of `admin_finalize_enrollment` and gates `community_media_delete`. Running #33 without #34 leaves the approval RPC missing its `updated_at`/`rejected_*` housekeeping. Both additive and idempotent. (A **fresh** install gets them from the bootstrap §20/§21.)
 8. **Deploy the matching client build.** Steps 2–5 were RLS-only and went live on refresh; **#32 is not** — see the callout above. Deploy the client build **before** running #36, so the app reads the new space flags and hides the compose controls instead of rendering buttons whose inserts RLS refuses.
 
-   > ⚠ **Do NOT "temporarily soften" General by flipping `member_comments` back on.** That instruction used to live here, it was followed, and it was never reverted — production ran for a week with every plan able to reply in General, which is the exact problem this feature exists to remove. Since **#36** the flags are pinned by a CHECK constraint (`community_spaces_general_announcement_only`), so reversing D2 now requires dropping a named constraint and recording it in `db/README.md`. That friction is deliberate.
+   > ⚠ **Do NOT "temporarily soften" General by flipping `member_comments` back on.** That instruction used to live here, it was followed, and it was never reverted — production ran for a week with every plan able to reply in General, which is the exact problem this feature exists to remove. Since **#36** the flags were pinned by a CHECK constraint (`community_spaces_general_announcement_only`), so reversing D2 required dropping a named constraint and recording it in `db/README.md`. That friction did its job: **#40 reversed it deliberately and on the record**, and replaced the blunt space-wide rule with per-channel settings. General now hosts conversation; `#announcements` stays admin-only because it is `kind=announcement`, which the database enforces with its own CHECK. The rule that has not changed: **do not hand-edit `member_posting`/`member_comments` to work around a permission question** — change the channel, or the plan capability columns, and record it.
 
 9. Run the entitlement + capability migrations **#35** ([`db/2026-07-30-batch-entitlements.sql`](db/2026-07-30-batch-entitlements.sql)) then **#36** ([`db/2026-07-31-community-plan-capabilities.sql`](db/2026-07-31-community-plan-capabilities.sql)). #35 is member-invisible (the cohort ledger). **#36 is the visible one:** it makes General announcement-only for every plan and removes posting/replying from every self-paced member. Announce it before you run it.
-10. Refresh the app — the forum goes live.
+10. Run the **channels** migration **#40** ([`db/2026-08-18-community-channels.sql`](db/2026-08-18-community-channels.sql)) — turns the single per-space feed into grouped channels, and **retires D2 as a space-wide rule** (see the callout above). Needs #32 + #35 + #36 + #37 + #39 + #31. Existing posts backfill automatically: General announcements into `#announcements`, everything else into `#general-discussion`. **Deploy the matching client build with it** — the channel rail, the admin editor and `?channel=` links ship in the app bundle.
+11. Refresh the app — the channel community goes live.
 
 ## Step 1 — Run the community migration (#23, required)
 
@@ -248,6 +320,25 @@ The object policies were already applied by the migration either way.
 
 ## Troubleshooting
 
+- **A member says a channel vanished.** Its audience was narrowed, or it was archived. Both
+  are admin actions and both are recorded in `community_channel_events` — check there first.
+- **A channel is invisible to everyone, including the admin who created it.** Its audience
+  mode needs a plan or batch list and the list is empty, which means *nobody* by design.
+  Open Manage community and choose at least one, or set it back to space-wide.
+- **A member asks why they cannot reply in #announcements.** By design. It is an announcement
+  channel: posting is off by CHECK constraint and replies are off by setting. Reactions work.
+- **Members can post in General now and you did not expect it.** That is #40 — D2 moved from
+  the space to the channel. If a particular room should be read-only, turn off "Members can
+  post" on that channel rather than changing the plan.
+- **Attachments are refused in a channel that allows them.** Attachment rights are a *plan*
+  capability (VIP only); a channel toggle can only take them away, never grant them.
+- **A VIP member can see another cohort's channel.** They should not — this would be a real
+  bug. Check `batch_entitlements` for a stray seat before suspecting the channel layer.
+- **The channel rail is empty and admins see a setup notice.** #40 has not run in this
+  project. Run it (step 10), then refresh.
+- **A member reports a channel link that does nothing.** An unknown or now-inaccessible
+  `?channel=` slug falls back silently to a channel they can read — deliberately, because an
+  error would confirm that a private channel exists.
 - **The Community tab shows "Finish backend setup" (admins) / "Community is coming soon"
   (members).** #23 hasn't run in this Supabase project — run Steps 1–2, then refresh.
 - **The tab says "The forum upgrade hasn't been applied yet."** #23 ran but #24 didn't (the
@@ -286,23 +377,27 @@ The object policies were already applied by the migration either way.
   `profiles`, so deleting the profile removes their posts/replies/reactions/notifications/
   read-markers. Their storage uploads (avatars + community-media) are removed by admin
   cleanup if needed (Storage → browse the `<uid>/` folders).
-- **The space switcher never appears.** #32 isn't applied (the client runs legacy single-space
-  mode — admins see the inline setup notice naming the migration), or the member genuinely has
-  only General (every non-VIP plan — the switcher hides with a single accessible space).
+- **The channel rail never appears.** #40 isn’t applied (the client falls back to the #32
+  single-feed view — admins see the inline setup notice naming the migration), or every channel
+  has been archived. The space switcher this entry used to describe was removed by #40.
 - **A VIP member sees only General.** Their active subscription has no `batch_id` —
   grants made outside `admin_finalize_enrollment()` (SQL editor, imports without a
   `batch_code`) land batch-less by design (fail closed). Assign them in Admin → **Batches** →
   "Needs batch assignment".
-- **A member asks why they can't post or reply in General.** By design (D2, #36): General is an
-  **announcement space** — admins post, everyone reads and reacts, nobody replies. That applies to
-  **every** plan, including VIP; VIP discussion happens in its own per-batch space.
-  The flags are pinned by the `community_spaces_general_announcement_only` CHECK, so reversing it is
-  a deliberate act: drop the constraint, change the flags, flip the plan capability columns, and
-  record it in `db/README.md`. Do not just run an UPDATE — an unrecorded UPDATE is how production
-  drifted from #32 in the first place.
-- **A mention doesn't autocomplete or notify in a private space.** The directory and the
-  notify triggers are space-scoped: only currently-eligible members of THAT space match, and
-  a cross-space uuid pasted into the body notifies nobody. Both are server-enforced.
+- **A member asks why they can’t post or reply in a particular General channel.** Since **#40**
+  this is a per-CHANNEL setting rather than the space-wide rule it was under #36, and the
+  `community_spaces_general_announcement_only` CHECK no longer exists. Open **Manage community**
+  and look at the channel: `#announcements` is an *announcement channel*, so member posting is off
+  by CHECK and replies are off by setting; any text channel can also have "Members can post" or
+  "Members can reply" turned off. Above that sit the plan capability columns
+  (`can_post_in_general` / `can_comment_in_general`), which are the ceiling. The rule that has NOT
+  changed: **do not work around a permission question with a hand-written UPDATE** to
+  `member_posting`/`member_comments` — change the channel, or the plan, and record it. An
+  unrecorded UPDATE is how production drifted from #32 in the first place.
+- **A mention doesn’t autocomplete or notify in a private channel.** Since #40 the directory and
+  the notify triggers are **channel-scoped**: only members who can open THAT channel match, and a
+  uuid pasted into the body notifies nobody who cannot reach the room. Both are server-enforced.
+  A member who cannot write in the channel gets an empty directory rather than a roster.
 - **Approvals fail with "Approvals need migration #32".** The single-RPC approve path
   (`admin_finalize_enrollment`) is deployed but the migration isn't — run
   `db/2026-07-28-community-spaces-batches.sql`, then click Approve again (nothing was granted).

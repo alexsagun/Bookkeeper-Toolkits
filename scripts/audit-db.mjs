@@ -112,7 +112,50 @@ const OBJECT_CHECKS = [
   ['#35    batch_entitlements ledger', `select to_regclass('public.batch_entitlements') is not null as ok`],
   ['#35    ledger not writable by authenticated', `select not has_table_privilege('authenticated','public.batch_entitlements','insert') as ok`],
   ['#36    user_community_capabilities()', `select to_regprocedure('public.user_community_capabilities(uuid)') is not null as ok`],
-  ['#36    General is announcement-only (D2)', `select coalesce(bool_and(not member_posting and not member_comments), false) as ok from public.community_spaces where kind='general'`],
+  // ★ #40 RETIRED the space-wide D2 rule. General now permits conversation and
+  // the restriction lives on the channel, so the #36 check is inverted on
+  // purpose: if the old CHECK constraint came back, every General channel would
+  // be silently unwritable again.
+  ['#40    D2 is no longer a space-wide rule', `select not exists (select 1 from pg_constraint where conname='community_spaces_general_announcement_only') as ok`],
+  ['#40    #announcements is admin-post-only', `select coalesce(bool_and(not member_posting and not member_comments), false) as ok from public.community_channels where slug='announcements'`],
+  ['#40    community_channels table', `select to_regclass('public.community_channels') is not null as ok`],
+  ['#40    channels not writable by authenticated', `select not has_table_privilege('authenticated','public.community_channels','update') as ok`],
+  ['#40    audience mappings not writable by authenticated', `select not has_table_privilege('authenticated','public.community_channel_plans','insert') as ok`],
+  ['#40    my_community_sidebar()', `select to_regprocedure('public.my_community_sidebar()') is not null as ok`],
+  ['#40    user_community_channel_ids() is revoked from clients', `select case when to_regprocedure('public.user_community_channel_ids(uuid)') is null then false else not has_function_privilege('authenticated','public.user_community_channel_ids(uuid)','execute') end as ok`],
+  ['#40    posts carry a channel', `select coalesce(bool_and(attnotnull), false) as ok from pg_attribute where attrelid='public.community_posts'::regclass and attname='channel_id'`],
+  ['#40    comments carry a channel', `select coalesce(bool_and(attnotnull), false) as ok from pg_attribute where attrelid='public.community_comments'::regclass and attname='channel_id'`],
+  ['#40    community-media reads are channel-scoped', `select coalesce(bool_and(qual ilike '%my_community_channel_ids%'), false) as ok from pg_policies where schemaname='storage' and policyname='community_media_read'`],
+  ['#40    community-media deletes match the row policy', `select coalesce(bool_and(qual ilike '%my_community_channel_ids%'), false) as ok from pg_policies where schemaname='storage' and policyname='community_media_delete'`],
+  ['#40    no ambiguous search_community_members overload', `select to_regprocedure('public.search_community_members(text,uuid)') is null as ok`],
+  ['#40    the superseded space-level denial fn is gone', `select to_regprocedure('public.community_write_denial(uuid,text)') is null as ok`],
+  ['#41    a rename preserves the channel topic', `select coalesce(bool_and(prosrc like '%when p_topic is null then topic%'), false) as ok from pg_proc where proname='admin_save_community_channel'`],
+  ['#41    audience checks are inside the audience guard', `select coalesce(bool_and(prosrc like '%if p_audience_mode is not null then%'), false) as ok from pg_proc where proname='admin_save_community_channel'`],
+  ['#41    the permissions audit row is conditional', `select coalesce(bool_and(prosrc like '%if v_touched then%'), false) as ok from pg_proc where proname='admin_save_community_channel'`],
+  ['#41    unread index carries author_id', `select coalesce(bool_and(indexdef like '%INCLUDE (author_id)%'), false) as ok from pg_indexes where indexname='community_posts_channel_unread_idx'`],
+  ['#42    intake columns exist', `select count(*) = 7 as ok from information_schema.columns where table_schema='public' and table_name='enrollment_requests' and column_name in ('college_course','current_job','ph_experience','us_experience','currently_employed','prior_training','referred_by')`],
+  ['#42    free-text intake lands in jsonb', `select coalesce(bool_and(data_type='jsonb' and is_nullable='NO'), false) as ok from information_schema.columns where table_schema='public' and table_name='enrollment_requests' and column_name='intake'`],
+  ['#42    the signature record is complete', `select count(*) = 4 as ok from information_schema.columns where table_schema='public' and table_name='enrollment_requests' and column_name in ('agreement_version','agreement_tier','agreement_signed_at','agreement_snapshot')`],
+  ['#42    experience answers are constrained', `select count(*) = 4 as ok from pg_constraint where conname in ('enrollment_requests_ph_experience_chk','enrollment_requests_us_experience_chk','enrollment_requests_currently_employed_chk','enrollment_requests_agreement_tier_chk')`],
+  ['#42    intake columns stayed nullable for legacy rows', `select coalesce(bool_and(is_nullable='YES'), false) as ok from information_schema.columns where table_schema='public' and table_name='enrollment_requests' and column_name in ('college_course','ph_experience','agreement_version')`],
+  ['#42    receipts bucket accepts a Word resume', `select coalesce(bool_and('application/vnd.openxmlformats-officedocument.wordprocessingml.document' = any(allowed_mime_types) and file_size_limit >= 10485760), false) as ok from storage.buckets where id='enrollment-receipts'`],
+  ['#42    plan copy no longer promises Discord', `select coalesce(bool_and(features::text not ilike '%discord%'), false) as ok from public.enrollment_plans`],
+  ['#40    post reads are channel-scoped', `select coalesce(bool_and(qual ilike '%my_community_channel_ids%'), false) as ok from pg_policies where schemaname='public' and policyname='community_posts_read'`],
+  // #43 — each line is one of the defects the review found. They are object
+  // checks, not log checks, because #36 proved a policy can be quietly reduced
+  // to a bare own-row test while every migration still claims to have run.
+  ['#43    reaction deletes are gated again', `select coalesce(bool_and(qual ilike '%is_enrolled%' and qual ilike '%my_community_channel_ids%'), false) as ok from pg_policies where schemaname='public' and policyname='community_reactions_own_delete'`],
+  ['#43    an uploader can clear their own orphan', `select coalesce(bool_and(qual ilike '%not (EXISTS%' or qual ilike '%NOT (EXISTS%'), false) as ok from pg_policies where schemaname='storage' and policyname='community_media_delete'`],
+  ['#43    a failed enrollment submit can clean up', `select coalesce(bool_and(qual ilike '%enrollment_file_is_referenced%'), false) as ok from pg_policies where schemaname='storage' and policyname='enrollment_receipts_delete'`],
+  ['#43    a category rename cannot un-archive', `select coalesce(bool_and(pg_get_expr(p.proargdefaults, 0) not ilike '%active%'), true) as ok from pg_proc p where p.proname='admin_save_channel_category'`],
+  ['#43    kind counts as a permissions change', `select coalesce(bool_and(prosrc like '%p_kind           is not null%'), false) as ok from pg_proc where proname='admin_save_community_channel'`],
+  // The one with real production blast radius: a partial predicate here is never
+  // implied by the feed query, so the index silently stops being used at all.
+  ['#43    the feed index is usable (not partial)', `select coalesce(bool_and(indexdef not ilike '%WHERE%'), false) as ok from pg_indexes where indexname='community_posts_channel_feed_idx'`],
+  ['#43    in-channel search can use the GIN index', `select to_regprocedure('public.search_community_posts(text,uuid,text,int,int,text,boolean)') is not null as ok`],
+  ['#43    category counts are sargable', `select coalesce(bool_and(prolang=(select oid from pg_language where lanname='plpgsql')), false) as ok from pg_proc where proname='community_category_counts'`],
+  ['#43    mention search has its trigram index', `select to_regclass('public.profiles_full_name_trgm_idx') is not null as ok`],
+  ['#43    channel read markers index their post fk', `select to_regclass('public.community_channel_reads_post_idx') is not null as ok`],
   ['#37    attachment insert binds uploader + link + space', `select coalesce(bool_and(with_check ilike '%uploader_id =%' and with_check ilike '%storage_path IS NULL%' and with_check ilike '%(p.space_id)::text%'), false) as ok from pg_policies where policyname='community_attachments_own_insert'`],
   ['#37    only a revoke clears the batch_id cache', `select coalesce(bool_and(prosrc like '%revoked%then%'), false) as ok from pg_proc where proname='revoke_batch_run'`],
   ['#37    FIFO binder is forward-only within a run', `select coalesce(bool_and(prosrc like '%max(b2.code)%'), false) as ok from pg_proc where proname='allocate_queued_entitlements'`],

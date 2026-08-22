@@ -262,6 +262,8 @@ async function main() {
   if (explicit.length) {
     files = explicit;
   } else if (args.includes('--all')) {
+    // The bootstrap already folds every dated file up to and including #40, so
+    // this only needs the ones folded VERBATIM at its tail (#35 onward).
     files = [BOOTSTRAP, ...datedSqlFiles().filter((f) => f >= 'db/2026-07-30')];
   } else {
     files = [BOOTSTRAP];

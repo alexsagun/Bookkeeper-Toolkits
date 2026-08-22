@@ -17,13 +17,43 @@
 // Prices are FIXED ₱ (PHP) bank-transfer amounts — never USD-converted.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * THE peso formatter. One rule, everywhere a price is shown.
+ *
+ * There were three: `phpFmt` on the pricing cards, `fmtPhp` inside the Training
+ * Agreement, and `php` in the admin alert email — and the first two DISAGREED.
+ * `2999.5` rendered as "₱2,999.5" on the card and "₱3,000" on the document the
+ * student legally signs, and a null price rendered as "₱0" against "—". Quoting
+ * one number and having someone sign another is the exact failure
+ * trainingAgreement.js exists to prevent (its predecessor printed ₱15,999 on a
+ * ₱16,999 sale), so the formatter cannot be the thing that reintroduces it.
+ *
+ * Deterministic on purpose — no `toLocaleString`, so a PDF, an email and a
+ * node:test assertion agree byte for byte on every platform and ICU build. The
+ * output matches `toLocaleString('en-US')` for the values this catalog holds.
+ *
+ * `fallback` is what a missing/unparseable amount renders as: a document says
+ * "—" because printing "₱0" would assert a price nobody agreed to; UI surfaces
+ * default to "₱0".
+ */
+export function phpAmount(n, fallback = '₱0') {
+  const v = Number(n);
+  if (n == null || n === '' || !Number.isFinite(v)) return fallback;
+  const abs = Math.abs(v);
+  const whole = Math.trunc(abs);
+  const cents = Math.round((abs - whole) * 100);
+  const grouped = String(whole).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  const dec = cents ? `.${String(cents).padStart(2, '0').replace(/0$/, '')}` : '';
+  return `${v < 0 ? '-₱' : '₱'}${grouped}${dec}`;
+}
+
 export const ENROLLMENT_PLANS_FALLBACK = [
   { key: 'sampler', name: 'Sampler Session', tagline: 'Essentials', price_php: 1499, compare_at_php: null, badge: null, limit_note: 'Limited offer', position: 1, access_days: 60, support_days: 60,
     features: ['1 Live Zoom Session (3 hours)', '60-day course access', '60-day group chat support'] },
   { key: 'silver_self_paced', name: 'QBO + Resume Combo', tagline: 'Silver · Self-Paced', price_php: 2999, compare_at_php: null, badge: null, limit_note: null, position: 2, access_days: 60, support_days: null,
-    features: ['Simulated annual bookkeeping project for an NY-based construction company', '60-day QBO Mastery course access', '60-day Resume & Interview course access', 'Weekly Discord chat (Thu)'] },
+    features: ['Simulated annual bookkeeping project for an NY-based construction company', '60-day QBO Mastery course access', '60-day Resume & Interview course access', 'Weekly Community chat (Thu)'] },
   { key: 'vip', name: 'Personalized Coaching Program', tagline: 'VIP Package', price_php: 16999, compare_at_php: 35000, badge: 'BEST SELLER', limit_note: 'Limited to 10 slots per month', position: 3, access_days: 180, support_days: null, community_segment: 'vip',
-    features: ['Simulated annual bookkeeping project for an NY-based construction company', '12 Live Group Zoom Trainings (MWF 9am to 11am PH Time)', '1-on-1 Resume & Interview Coaching (1 session)', 'Weekly group consult until hired', 'Discord chat support until and after hired'] },
+    features: ['Simulated annual bookkeeping project for an NY-based construction company', '12 Live Group Zoom Trainings (MWF 9am to 11am PH Time)', '4 Live Group Resume & Interview Coaching Sessions', '1-on-1 Resume & Interview Coaching (1 session)', 'Weekly group consult until hired', 'Community chat support until and after hired'] },
 ];
 
 export const PLAN_LABELS = ENROLLMENT_PLANS_FALLBACK.reduce((m, p) => { m[p.key] = p.name; return m; }, {});

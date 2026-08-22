@@ -19,8 +19,22 @@
 // The last three are already true of any space the server returned to us, so
 // the client-side job is the first two.
 //
-// D2: General is announcement-only. No plan — not even VIP — may post or comment
-// there. Reactions stay on for everyone.
+// ★ D2 CHANGED SHAPE IN #40. It used to read "General is announcement-only — no
+// plan, not even VIP, may post or comment there", pinned by the
+// community_spaces_general_announcement_only CHECK. That was a SPACE-wide
+// prohibition, so no General room could host a conversation at all.
+//
+// #40 retires the CHECK and enables can_post_in_general / can_comment_in_general
+// for every active plan. The intent survives ONE LEVEL DOWN, per channel:
+// #announcements is kind='announcement' (so member_posting is false by
+// constraint) with member_comments off. Which General rooms accept posts is now
+// a channel setting, not a plan setting.
+//
+// So this file still answers "what may this plan do in this KIND of space", and
+// the answer is now the CEILING that community_channels then narrows. See
+// src/lib/communityChannels.js for the channel half.
+//
+// Attachment rights were deliberately NOT relaxed by #40.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -31,10 +45,23 @@
  * Every unknown plan resolves to the fail-closed default: read and react,
  * write nothing.
  */
+// ★ SCOPE NOTE (#40). Only `effectiveCaps` still runs in production, and only on
+//   the pre-#40 fallback branch in CommunityHub — post-#40 the client consumes
+//   the server-computed can_* from my_community_sidebar() via
+//   effectiveChannelCaps (src/lib/communityChannels.js), which is where a live
+//   permission question is answered.
+//
+//   Everything below — PLAN_CAPABILITY_FALLBACK, planCapabilities,
+//   capabilitiesFor, isAnnouncementSpace, denialCopy — is an EXECUTABLE SPEC of
+//   the SQL in #36, exercised only by test/communityCapabilities.test.mjs. It is
+//   kept deliberately: the truth table is the clearest statement in the repo of
+//   what each plan may do in each space kind. But do not fix a live permission
+//   bug here and expect it to change behaviour — the running client never calls
+//   it. Change the SQL, then update this to match.
 export const PLAN_CAPABILITY_FALLBACK = {
   sampler: {
-    can_post_in_general: false,
-    can_comment_in_general: false,
+    can_post_in_general: true,
+    can_comment_in_general: true,
     can_react_in_general: true,
     can_post_in_private: false,
     can_comment_in_private: false,
@@ -42,8 +69,8 @@ export const PLAN_CAPABILITY_FALLBACK = {
     can_upload_attachments: false,
   },
   silver_self_paced: {
-    can_post_in_general: false,
-    can_comment_in_general: false,
+    can_post_in_general: true,
+    can_comment_in_general: true,
     can_react_in_general: true,
     can_post_in_private: false,
     can_comment_in_private: false,
@@ -51,8 +78,8 @@ export const PLAN_CAPABILITY_FALLBACK = {
     can_upload_attachments: false,
   },
   vip: {
-    can_post_in_general: false,
-    can_comment_in_general: false,
+    can_post_in_general: true,
+    can_comment_in_general: true,
     can_react_in_general: true,
     can_post_in_private: true,
     can_comment_in_private: true,

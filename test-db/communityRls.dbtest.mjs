@@ -7,8 +7,13 @@
 //   button is a UI nicety; these tests bypass the UI entirely and send the
 //   request supabase-js would send, as a real signed-in member.
 //
-// D2: General is announcement-only for EVERY plan — including VIP.
-//     Reactions stay on for everyone. The cohort plan discusses in its own space.
+// ★ D2 IS RETIRED AS A SPACE-WIDE RULE (#40). It used to read "General is
+//   announcement-only for EVERY plan — including VIP", pinned by a CHECK. #40
+//   dropped that deliberately and on the record, and moved the intent one level
+//   down: #announcements is kind='announcement', where member_posting=false is
+//   true BY CHECK rather than by policy prose. The tests below are restated for
+//   that, not deleted — General now accepts posts and #announcements still does
+//   not. Reactions stay on for everyone, as before.
 //
 // ★ #39 (three-plan catalog): the catalog is sampler / silver_self_paced / vip,
 //   and VIP is the only cohort segment. The Core and Gold personas are gone
@@ -54,6 +59,15 @@ beforeEach(async () => {
 
 after(async () => { await resetShadow(); });
 
+/** The cohort lounge — the channel the mention/denial tests now scope to. */
+async function cohortLoungeId() {
+  return sqlScalar(`
+    select ch.id::text from public.community_channels ch
+      join public.community_spaces sp on sp.id = ch.space_id
+      join public.batches b on b.id = sp.batch_id
+     where b.code = '2026-08' and ch.slug = 'lounge'`);
+}
+
 /** Post an announcement into a space as the admin, returning its id. */
 async function adminPost(spaceId, title = 'Announcement') {
   return sqlScalar(`
@@ -71,34 +85,58 @@ const SELF_PACED = () => [
 
 // ── D2: nobody writes in General ─────────────────────────────────────────────
 
-test('D2: NO plan can create a post in General — not even VIP', async () => {
+// ★ RESTATED FOR #40, not deleted. Under #36 this asserted that NO plan could
+//   post in General, because D2 was a space-wide prohibition. #40 retired that
+//   and moved the rule onto the channel, so the honest assertion is now:
+//   General accepts posts, and #announcements still does not. The channel-level
+//   matrix lives in test-db/communityChannels.dbtest.mjs.
+test('#40: General accepts member posts, but #announcements still does not', async () => {
   const general = await generalSpaceId();
+  const ann = await sqlScalar(`
+    select ch.id::text from public.community_channels ch
+     where ch.space_id = '${general}'::uuid and ch.slug = 'announcements'`);
 
   for (const [name, who] of [...SELF_PACED(), ['vip', vip]]) {
+    // A post with no channel_id lands in the space default (#general-discussion).
+    const ok = await who.db.from('community_posts').insert({
+      author_id: who.id, space_id: general, title: 'Question!',
+      body: 'How do I reconcile this?', tag_slug: TAG, status: 'active',
+    }).select('id');
+    assert.equal(ok.error, null,
+      `${name} should be able to post in General since #40: ${ok.error && ok.error.message}`);
+
     await expectDenied(
       who.db.from('community_posts').insert({
-        author_id: who.id, space_id: general, title: 'Question!',
-        body: 'How do I reconcile this?', tag_slug: TAG, status: 'active',
-      }),
-      `${name} posting in General`,
+        author_id: who.id, channel_id: ann, title: 'Me too',
+        body: 'Adding to the announcement', tag_slug: TAG, status: 'active',
+      }).select('id'),
+      `${name} posting in #announcements`,
     );
   }
 
-  const n = await sqlScalar(
-    `select count(*)::int from public.community_posts where space_id = '${general}'::uuid`);
-  assert.equal(n, 0, 'not one member post landed in General');
+  assert.equal(
+    await sqlScalar(`select count(*)::int from public.community_posts where channel_id = '${ann}'::uuid`),
+    0, 'not one member post landed in #announcements');
 });
 
-test('D2: NO plan can reply in General, on an admin announcement — not even VIP', async () => {
+// Also restated: replies are refused because the ANNOUNCEMENT CHANNEL has them
+// off (and its posts are born comments_locked), not because the space is closed.
+test('#40: replies are still refused on an announcement, by the channel', async () => {
   const general = await generalSpaceId();
-  const postId = await adminPost(general, 'Welcome to August');
+  const ann = await sqlScalar(`
+    select ch.id::text from public.community_channels ch
+     where ch.space_id = '${general}'::uuid and ch.slug = 'announcements'`);
+  const postId = await sqlScalar(`
+    insert into public.community_posts (author_id, author_name, title, body, tag_slug, channel_id)
+    values ('${admin.id}', 'Alex Admin', 'Welcome to August', 'body', '${TAG}', '${ann}'::uuid)
+    returning id::text`);
 
   for (const [name, who] of [...SELF_PACED(), ['vip', vip]]) {
     await expectDenied(
       who.db.from('community_comments').insert({
         author_id: who.id, post_id: postId, body: 'Can you explain?', status: 'active',
-      }),
-      `${name} replying in General`,
+      }).select('id'),
+      `${name} replying to an announcement`,
     );
   }
 
@@ -129,6 +167,36 @@ test('D2: EVERY plan can read General and react — and un-react', async () => {
   assert.equal(
     await sqlScalar(`select count(*)::int from public.community_reactions where post_id = '${postId}'::uuid`),
     0, 'every reaction was withdrawn cleanly');
+});
+
+// ★ REGRESSION (#43). community_reactions_own_delete was scoped by #33
+//   (approved + enrolled + space), reduced by #36 to a bare
+//   `user_id = auth.uid()`, and skipped by #40 while its two named siblings —
+//   community_post_tags_own_delete and community_attachments_own_delete — were
+//   moved to the channel model. Nothing in this suite noticed, because every
+//   other reaction test uses a CURRENT member, for whom the two versions behave
+//   identically. This is the case that separates them.
+test('#43: an EXPIRED member cannot delete a reaction they left while enrolled', async () => {
+  const general = await generalSpaceId();
+  const postId = await adminPost(general, 'Reactable');
+
+  // React while the term is live...
+  const { error: reactErr } = await silver.db.from('community_reactions')
+    .insert({ user_id: silver.id, post_id: postId, reaction_type: 'like' });
+  assert.equal(reactErr, null, `seeding the reaction failed: ${reactErr && reactErr.message}`);
+
+  // ...then let the term lapse past its grace window.
+  await seedMember(silver, { planKey: 'silver_self_paced', days: 60, expired: true });
+
+  await expectDenied(
+    silver.db.from('community_reactions').delete()
+      .eq('user_id', silver.id).eq('post_id', postId),
+    'an expired member deleting their own reaction',
+  );
+
+  assert.equal(
+    await sqlScalar(`select count(*)::int from public.community_reactions where post_id = '${postId}'::uuid`),
+    1, 'the reaction survives — an expired term is a read-only one, writes included');
 });
 
 test('the admin can still post announcements in General', async () => {
@@ -379,23 +447,55 @@ test('an anonymous visitor sees no community content and cannot write', async ()
     'anon posting');
 });
 
-test('community_write_denial explains a refusal without granting anything', async () => {
+// ★ This replaces a test that called the SPACE-level community_write_denial(),
+//   which #40 DROPped — `scripts/audit-db.mjs` even asserts it is gone. The old
+//   test did not merely stop testing anything: the RPC returned
+//   { data: null, error: PGRST202 } and `g.allowed` threw a TypeError, so the
+//   whole suite crashed before reaching everything after it. Its neighbours were
+//   restated for #40; this one was missed.
+//
+//   What it protects is worth having: community_channel_write_denial() is the
+//   source of every sentence a member reads after a 42501, and it must explain a
+//   refusal WITHOUT becoming an oracle for rooms they cannot see. An invisible
+//   channel must report exactly as a nonexistent one does.
+test('community_channel_write_denial explains a refusal without granting anything', async () => {
   const general = await generalSpaceId();
-  const vipSpace = await spaceIdFor('vip', '2026-08');
+  const chanIn = (slug) => sqlScalar(`
+    select ch.id::text from public.community_channels ch
+     where ch.space_id = '${general}'::uuid and ch.slug = '${slug}'`);
+  const ann = await chanIn('announcements');
+  const talk = await chanIn('general-discussion');
+  const vipLounge = await cohortLoungeId();
 
-  const { data: g } = await silver.db.rpc('community_write_denial',
-    { p_space_id: general, p_kind: 'post' });
-  assert.equal(g.allowed, false);
-  assert.equal(g.reason, 'announcement_space', 'the UI can say why, honestly');
+  const { data: annDenial, error: annErr } = await silver.db
+    .rpc('community_channel_write_denial', { p_channel_id: ann, p_kind: 'post' });
+  assert.equal(annErr, null, annErr && annErr.message);
+  assert.equal(annDenial.allowed, false, 'members cannot post in an announcement channel');
+  assert.equal(annDenial.reason, 'announcement_channel', 'and the UI can say why, honestly');
 
-  const { data: notMine } = await silver.db.rpc('community_write_denial',
-    { p_space_id: vipSpace, p_kind: 'post' });
-  assert.equal(notMine.allowed, false);
-  assert.equal(notMine.reason, 'not_a_member');
+  // A private cohort room the caller is not in must be indistinguishable from a
+  // channel that does not exist — naming it would confirm the cohort exists.
+  const { data: notMine } = await silver.db
+    .rpc('community_channel_write_denial', { p_channel_id: vipLounge, p_kind: 'post' });
+  assert.equal(notMine.allowed, false, 'silver cannot write in a VIP cohort room');
+  assert.equal(notMine.reason, 'no_such_channel',
+    'an invisible channel must report exactly as a nonexistent one does');
 
-  const { data: ok } = await vip.db.rpc('community_write_denial',
-    { p_space_id: vipSpace, p_kind: 'post' });
-  assert.equal(ok.allowed, true, 'and confirms the case that IS allowed');
+  const { data: nowhere } = await silver.db.rpc('community_channel_write_denial', {
+    p_channel_id: '00000000-0000-0000-0000-000000000000', p_kind: 'post',
+  });
+  assert.equal(nowhere.reason, notMine.reason,
+    'same reason for invisible and nonexistent — otherwise this is a membership oracle');
+
+  // And it must still confirm the cases that ARE allowed, or the client would
+  // show a denial banner over a working composer.
+  const { data: okGeneral } = await silver.db
+    .rpc('community_channel_write_denial', { p_channel_id: talk, p_kind: 'post' });
+  assert.equal(okGeneral.allowed, true, '#40 opened General to every plan');
+
+  const { data: okVip } = await vip.db
+    .rpc('community_channel_write_denial', { p_channel_id: vipLounge, p_kind: 'post' });
+  assert.equal(okVip.allowed, true, 'a VIP may write in their own cohort room');
 });
 
 test('my_community_spaces reports capabilities the database will actually honour', async () => {
