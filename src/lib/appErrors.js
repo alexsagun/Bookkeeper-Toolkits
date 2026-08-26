@@ -76,6 +76,22 @@ export const APP_ERROR_CODES = [
   'CHANNEL_ARCHIVED',
   'CATEGORY_NOT_FOUND',
   'CATEGORY_NOT_EMPTY',
+  // ── Course video, upload-only (#44) ──
+  'LESSON_VIDEO_UPLOAD_ONLY',
+  'LESSON_VIDEO_PATH_INVALID',
+  'COURSE_PUBLISH_BLOCKED',
+  // ── Staff authorization (#45) ──
+  'STAFF_LAST_SUPER_ADMIN',
+  'STAFF_NOT_FOUND',
+  'STAFF_ROLE_INVALID',
+  // ── Trainer course ownership (#46) ──
+  'COURSE_NOT_ASSIGNED',
+  'COURSE_PUBLISH_FORBIDDEN',
+  'COURSE_ASSIGNMENT_INVALID',
+  // ── Discretionary access changes (#47) ──
+  'SUBSCRIPTION_NOT_FOUND',
+  'EXTENSION_NOT_ALLOWED',
+  'EXTENSION_INVALID',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -158,6 +174,47 @@ const COPY = {
   CATEGORY_NOT_FOUND: 'That category is not available.',
   CATEGORY_NOT_EMPTY:
     'This category still holds active channels. Move or archive them first.',
+  // Written for the admin who hits it in the lesson editor, so each one names
+  // the single next action rather than restating the rule.
+  LESSON_VIDEO_UPLOAD_ONLY:
+    'Lesson videos must be uploaded, not linked. Upload the MP4 file — YouTube, Vimeo '
+    + 'and direct video links are no longer accepted as a lesson’s main content.',
+  LESSON_VIDEO_PATH_INVALID:
+    'That video file is not stored where lesson videos live. Upload it again from the '
+    + 'lesson editor.',
+  COURSE_PUBLISH_BLOCKED:
+    'Some video lessons still have no uploaded file. Open each one flagged below, upload '
+    + 'its video, then publish.',
+  // Staff authorization (#45). The first one is the only refusal in this product
+  // that tells an administrator to do something ELSE first, so it names it.
+  STAFF_LAST_SUPER_ADMIN:
+    'This is the last active Super Admin. Promote another Super Admin first — otherwise '
+    + 'nobody can manage staff, courses or settings.',
+  STAFF_NOT_FOUND:
+    'That account is not a staff member. Invite them from Team & Roles first.',
+  STAFF_ROLE_INVALID:
+    'That role, status or reason is not valid. Suspending or revoking access needs a reason.',
+  // Trainer course ownership (#46). Each names the person who can unblock it,
+  // because every one of these is a refusal the reader cannot lift themselves.
+  COURSE_NOT_ASSIGNED:
+    'You can edit courses, but this one isn’t assigned to you. Ask a Super Admin to add you '
+    + 'to it from the course’s Trainers list.',
+  COURSE_PUBLISH_FORBIDDEN:
+    'Publishing and withdrawing courses is a separate permission from editing them. Your work '
+    + 'is saved — ask a Super Admin to publish the course when it’s ready.',
+  COURSE_ASSIGNMENT_INVALID:
+    'That assignment can’t be made. The account needs a role that includes editing courses '
+    + 'before a course can be assigned to it.',
+  // Discretionary extensions (#47).
+  SUBSCRIPTION_NOT_FOUND:
+    'This member has no subscription yet, so there is no expiry to extend. Approve their '
+    + 'enrollment first.',
+  EXTENSION_NOT_ALLOWED:
+    'This membership never expires, so an extension could only ever shorten it. No change '
+    + 'was made.',
+  EXTENSION_INVALID:
+    'That extension can’t be applied. It must move the expiry forward, be between 1 and 365 '
+    + 'days, and carry a reason.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };

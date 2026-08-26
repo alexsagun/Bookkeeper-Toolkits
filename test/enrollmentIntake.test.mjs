@@ -28,6 +28,7 @@ import {
   intakeField,
   contentTypeFor,
   intakeValuesFromRequest,
+  ENROLLMENT_PROCESSING_NOTE,
   intakePayload,
   intakeSelectColumns,
 } from '../src/lib/enrollmentIntake.js';
@@ -610,4 +611,44 @@ test('the admin alert selects exactly the columns the payload writes', () => {
       `${key} is written but not selected by the admin alert — its row would render blank`);
   }
   assert.ok(cols.includes('intake'), 'the jsonb must be selected too');
+});
+
+// ── The processing-hours note ────────────────────────────────────────────────
+// One constant feeds two surfaces: the pending screen after submit, and the
+// student confirmation email. They used to be able to drift; a student reading
+// one promise on screen and a different one in their inbox is the failure this
+// whole port has been correcting. Each of the four promises is pinned
+// individually so a reword cannot quietly drop one.
+
+test('the processing note is four non-empty lines', () => {
+  assert.ok(Array.isArray(ENROLLMENT_PROCESSING_NOTE));
+  assert.equal(ENROLLMENT_PROCESSING_NOTE.length, 4);
+  for (const line of ENROLLMENT_PROCESSING_NOTE) {
+    assert.equal(typeof line, 'string');
+    assert.ok(line.trim().length > 0, 'a blank line would render as an empty bullet');
+  }
+});
+
+test('the note states the 24-hour turnaround', () => {
+  assert.ok(ENROLLMENT_PROCESSING_NOTE.some(l => /24 hours/i.test(l)));
+});
+
+test('the note states the daily processing window', () => {
+  // Anchor on the window LINE, not the joined text: "after 5:00 PM" on the next
+  // line would otherwise satisfy a /5:00 PM/ check even if this line said 4:00 PM.
+  // The colon is load-bearing: line 1 also contains the words 'processing hours',
+  // so anchoring without it finds the wrong line and asserts nothing.
+  const line = ENROLLMENT_PROCESSING_NOTE.find(l => /processing hours:/i.test(l));
+  assert.ok(line, 'one line names the processing-hours window');
+  assert.ok(/9:00\s*AM/i.test(line), 'the window opens at 9:00 AM');
+  assert.ok(/5:00\s*PM/i.test(line), 'the window closes at 5:00 PM');
+  assert.ok(/Monday\s+to\s+Friday/i.test(line));
+});
+
+test('the note covers BOTH after-hours and weekend/holiday sign-ups', () => {
+  const text = ENROLLMENT_PROCESSING_NOTE.join(' ');
+  assert.ok(/after 5:00\s*PM/i.test(text),
+    'the after-hours rule is the substantive addition — the email copy it replaces covered only weekends and holidays');
+  assert.ok(/weekend/i.test(text) && /holiday/i.test(text));
+  assert.ok(/next business day/i.test(text));
 });

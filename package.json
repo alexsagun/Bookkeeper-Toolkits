@@ -19,8 +19,11 @@
     "test:db": "node --test-concurrency=1 --test \"test-db/*.dbtest.mjs\"",
     "test:all": "npm test && npm run test:db",
     "db:audit": "node scripts/audit-db.mjs",
+    "staff:bootstrap": "node scripts/bootstrap-super-admin.mjs",
     "db:shadow:apply": "node scripts/apply-db-files.mjs",
-    "db:shadow:verify": "node scripts/apply-db-files.mjs --verify"
+    "db:shadow:verify": "node scripts/apply-db-files.mjs --verify",
+    "media:audit": "node scripts/migrate-lesson-videos.mjs",
+    "media:migrate": "node scripts/migrate-lesson-videos.mjs --apply"
   },
   "dependencies": {
     "@elevenlabs/client": "^1.15.1",
@@ -30,6 +33,7 @@
     "lucide-react": "^0.460.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "tus-js-client": "^4.3.1",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {

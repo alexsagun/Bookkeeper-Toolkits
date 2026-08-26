@@ -5,6 +5,7 @@
   ],
   "functions": {
     "api/elevenlabs/trainer.js": { "maxDuration": 60 },
-    "api/admin/course-trainer.js": { "maxDuration": 300 }
+    "api/admin/course-trainer.js": { "maxDuration": 300 },
+    "api/admin/staff.js": { "maxDuration": 30 }
   }
 }

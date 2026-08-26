@@ -174,6 +174,44 @@ don't need to add auth checks inside a tool. See the "Authentication" section in
 - **Images/PDF for Claude vision:** read the file to base64 and send as an `image`/`document` content
   block in `messages[].content` (see `StatementConverter`, ~L2411).
 
+## Uploading to Supabase Storage, and playing it back
+
+Two buckets, and which one a file goes in is a paywall decision. `course-videos` is **private** —
+paid lesson video, served only through short-lived signed URLs gated by RLS. `course-media` is
+**public** — covers and feature-guide videos. A public Supabase bucket serves every object to anyone
+with the URL and **bypasses RLS on read entirely**, so a public bucket cannot protect paid content.
+
+- **Never build a second set of video rules.** Everything about a course lesson video — MP4-only,
+  the 2 GiB cap, the 6 MiB TUS chunk size (Supabase requires exactly that; it is not a tuning knob),
+  the upload state machine, the path shape, publish readiness, the save payload, the playback
+  re-sign decision — lives in the pure [src/lib/courseVideo.js](../../../src/lib/courseVideo.js) and
+  is mirrored in `db/2026-08-24-course-video-upload-only.sql`. Change the module, the SQL, and
+  `test/courseVideo*.test.mjs` together.
+- **A large upload never goes through a serverless function.** Use resumable TUS
+  (`tus-js-client`, lazy `import()`) straight from the browser to
+  `https://<ref>.storage.supabase.co/storage/v1/upload/resumable`, forwarding the user's access
+  token. The token is transport; **Storage RLS is the authorization**. Never `x-upsert` unless a
+  reviewed requirement demands it — every upload gets its own uuid path, so overwriting is a bug.
+- ★ **"Storage accepted the bytes" is not "ready".** Prove the object exists, can be signed, and
+  loads as video metadata *from that signed URL* before you let anything be saved. The one edge into
+  `READY_TO_SAVE` comes from the verification state for exactly this reason.
+- ★ **Never fall back from a signed URL to a public one.** `SignedLessonVideo` used to, and that one
+  line was the whole bug: the fallback fired for *any* signing failure (RLS denial, expired session
+  — not just a genuine legacy object), and `getPublicUrl()` is a pure string builder that never
+  round-trips, so it always returned a truthy URL. The "unavailable" branch became dead code, the
+  real error was never logged, and the learner got a `<video>` at a 400 with no `onError`. Every
+  distinct failure looked identical, so nothing was diagnosable. Give a player named states, an
+  `onError`, and **one** re-sign — never on a DECODE error, which re-signing cannot fix.
+- **`supabase-js` returns storage failures as `{ data: null, error }` without throwing.** A bare
+  `try/catch` around `.remove()` or `.list()` swallows them silently. Inspect the result. And
+  `.list()` caps at 1000 with no total — paginate, or you under-collect and never know.
+- **Cleanup fails conservatively.** If references cannot be confirmed, keep the file. Course
+  duplication reuses `storage_path` by reference (copy-on-write), so a path is legitimately shared
+  across courses — that is what `removeMediaIfUnreferenced()` exists for. Never delete by prefix,
+  and never delete out of `storage.objects` directly.
+- **Revoke every object URL you create**, in a `finally`. A blob URL held open pins the whole file
+  in memory.
+
 ## Dates (timezone-safe, date-only)
 
 For date-only fields (e.g. the course platform's `course_date` batch-run date), reuse the module-level

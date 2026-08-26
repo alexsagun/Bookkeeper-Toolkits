@@ -51,7 +51,7 @@ npm run ai:knowledge       # regenerate docs/ai/toolkits-voice-agent-knowledge.m
 npm run ai:knowledge:check # rebuild the knowledge doc in memory + diff vs disk; exit 1 on drift (writes nothing)
 npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge base
 npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
-npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, …)
+npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, bootstrapFolds, courseVideo, courseVideoSql, …)
 ```
 
 There is **no linter** — verify UI changes by running `npm run dev` and exercising the affected
@@ -202,10 +202,55 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
   because a *public* Supabase bucket serves every object publicly and bypasses RLS on read, so a
   public bucket can't protect paid content. Course **covers** (`covers/{course.id}/…`) and
   feature-guide videos stay in the **public** `course-media` bucket (they're meant to be visible
-  while browsing). Playback uses the `SignedLessonVideo` component (private signed URL, with a
-  legacy `course-media` public-URL fallback for videos uploaded before the split). Write/delete on
-  both buckets is admin-only. Videos can also be YouTube/Vimeo/MP4 **links**. Uploads are guarded
-  client-side (video ≤ 50 MB; cover image ≤ 5 MB). See `db/2026-07-08-course-videos-private.sql`.
+  while browsing). Write/delete on both buckets is admin-only. Cover images are guarded at ≤ 5 MB.
+- **Lesson video is UPLOAD-ONLY (#44, `db/2026-08-24-course-video-upload-only.sql`).** A lesson's
+  primary content can no longer be a pasted YouTube/Vimeo/MP4 URL — not in the editor, and not
+  through a direct PostgREST call (`course_lessons_video_guard` refuses the transition INTO
+  link-backed, and is **monotonic on `video_url`, never on `video_provider`**, because
+  `saveLesson` used to re-derive the provider from the URL on every write). Every rule — MP4-only,
+  2 GiB, the 6 MiB TUS chunk size, the state machine, path shape, publish readiness, the save
+  payload, playback re-sign decisions — lives in the pure
+  [src/lib/courseVideo.js](src/lib/courseVideo.js), pinned by `test/courseVideo.test.mjs` and
+  `test/courseVideoSql.test.mjs` (which diffs the constants against the SQL in **both** the dated
+  file and the bootstrap fold). Uploads are **resumable (`tus-js-client`, lazy-`import()`ed into
+  its own chunk)** straight from the browser to `<ref>.storage.supabase.co` — never through Vercel.
+  `LessonVideoUploader` is **module scope**, not declared inside `CourseProgram`, or it would
+  remount and lose an upload on every keystroke elsewhere in the drawer.
+  ★ **"Storage accepted the bytes" is not "ready".** `READY_TO_SAVE` has exactly one inbound edge,
+  from `VERIFYING_PRIVATE_OBJECT`, where the app signs the object and loads its metadata from that
+  signed URL. Save is disabled until then.
+  ★ **`SignedLessonVideo` has NO public fallback, and removing it was the root-cause fix.** It used
+  to fall back to `getPublicUrl('course-media', path)` whenever `createSignedUrl` returned
+  anything falsy — an RLS denial and an expired session included — and `getPublicUrl` is a pure
+  string builder that never round-trips, so it always returned a truthy URL. The `failed` branch
+  was therefore dead code, the real signing error was never logged, and the learner got a
+  `<video>` pointed at a 400 with no `onError`. Every distinct failure looked identical. It now
+  has named states, re-signs **once** on a recoverable error (never on a DECODE error — re-signing
+  cannot fix a codec), preserves `currentTime`, and refreshes proactively before the TTL expires.
+  ★ **Storage authorization is REFERENCE-based, not path-based.** `course_video_object_readable()`
+  asks whether a *published lesson the caller's plan may read* cites that exact `storage_path`.
+  Its predecessor `course_object_allowed()` parsed `split_part(name,'/',2)::uuid` and failed
+  **open** three ways, ignored `courses.published`, and mis-authorized duplicated courses (which
+  share a `storage_path` by reference, so a duplicate's video lives in the SOURCE course's
+  folder). It is dropped by #44.
+  ★ **TEMPORARY:** `renderVideo` still plays pre-#44 link lessons from one clearly-marked block,
+  because on 2026-08-24 **101 of 102 live video lessons were YouTube links across three published
+  courses**. Authoring and playback were split deliberately so nothing went dark. **Removal
+  criterion: `npm run media:audit` reports 0 external links** — then delete the block.
+  `npm run media:audit` / `media:migrate` (`scripts/migrate-lesson-videos.mjs`) inventory the
+  four legacy categories and move pre-#15 objects out of the public bucket with a **server-side**
+  `copy({ destinationBucket })`, verifying the destination before deleting the source.
+  See `db/2026-07-08-course-videos-private.sql` and `db/2026-08-24-course-video-upload-only.sql`.
+- **Publishing is gated (#44).** `courses_publish_guard` refuses a false→true `published`
+  transition while any video lesson is link-backed or has no uploaded file, and
+  `course_publish_blockers(uuid)` feeds the client preflight that names them. ★ The trigger is
+  **delta-scoped by a `when (new.published and not old.published)` clause**. Scoping it on state
+  instead would refuse every unrelated write to an already-published course — `reorderCourse`
+  fires N updates in one `Promise.all`, plus cover upload, tier toggle, AI-trainer toggle and
+  metadata save all write to `courses` without touching `published`.
+- **Duplication refuses a legacy source (#44)**, naming the lessons — and that check runs **before
+  anything is inserted**, because `duplicateCourse`'s catch block deletes the half-built copy, so
+  a failure partway through would destroy the new course rather than explain itself.
 - **Certificate:** rendered from design tokens + `LOGO_DATA_URI`, downloaded as PDF via **lazy-loaded**
   `jspdf` + `html2canvas` (dynamic `import()` only on download — kept out of the main bundle); the PDF
   filename comes from the `certFileName` prop.
@@ -650,9 +695,13 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   `NOTIFY_ADMIN_EMAIL` + `APP_URL` for the "Review in Enrollments" button; the submitted alert
   carries a Type: Renewal/New row). Three actions: `submitted` (**TWO emails** — the admin alert,
   plus a student confirmation carrying the onboarding video `ONBOARDING_VIDEO_ID` and the
-  "enrollment and course access are granted 9–5 PH time, Mon–Fri" SLA; both are hardcoded module
-  consts in `api/notify-enrollment.js`, **not** admin-editable like the `payment_settings` copy on
-  the same screen — move them there if the SLA ever changes; JWT-ownership auth),
+  processing-hours SLA. `ONBOARDING_VIDEO_ID` is still a hardcoded module const in
+  `api/notify-enrollment.js`; the SLA is **not** — since 2026-08-23 it is
+  `ENROLLMENT_PROCESSING_NOTE`, **imported** from `src/lib/enrollmentIntake.js` so the pending
+  screen and the email physically cannot state different turnarounds (see "Changing the
+  enrollment processing-hours copy" below). Neither is admin-editable like the `payment_settings`
+  copy on the same screen — move them there if they must change without a deploy;
+  JWT-ownership auth),
   `decision` (admin→student), `test` (admin-only diagnostic → the **"Test email"** button in the
   Enrollments toolbar; verifies the admin JWT server-side and reports sent/not-configured/provider
   error). The admin **recipient** resolves `NOTIFY_ADMIN_EMAIL` → the admin-editable
@@ -850,7 +899,23 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   a seq scan + sort. ★ `community_category_counts`/`search_community_posts` stop using
   `($1 is null or col = $1)`; the latter gains `p_tag_slug`/`p_unanswered` so **in-channel** search
   finally reaches the GIN index #40 built. ★ Plus the `profiles.full_name` trigram index and
-  `community_channel_reads(last_read_post_id)`. Needs #40+#41+#42. Folded verbatim as §30).
+  `community_channel_reads(last_read_post_id)`. Needs #40+#41+#42. Folded verbatim as §30) →
+  **course-video-upload-only** (**#44**,
+  [db/2026-08-24-course-video-upload-only.sql](db/2026-08-24-course-video-upload-only.sql) — a
+  lesson video must be an UPLOADED file in the private bucket, and that bucket stops authorizing by
+  PATH. Replaces `course_object_allowed()` — which returned **true** on an unparseable path, on an
+  unknown course and for every non-sampler plan, never checked `courses.published`, and
+  mis-authorized duplicated courses that legitimately share a `storage_path` — with
+  reference-based `course_video_object_readable(text, boolean)`; adds the `is_approved()`
+  conjunct `course_videos_read` was the only content-read policy to lack; indexes
+  `course_lessons.storage_path`; adds `course_lessons_video_guard` and
+  `courses_publish_guard` + `course_publish_blockers()`; re-asserts the bucket at 2 GiB /
+  `video/mp4`, which #15's `do update set public = false` never could. ★ ORDERING: the new
+  function must exist BEFORE the `alter policy` names it, and `course_object_allowed` is
+  dropped AFTER — with NO CASCADE, so a policy that still depends on it errors the file instead
+  of being silently stripped. ★ The publish trigger is delta-scoped by a `WHEN` clause; the
+  lesson trigger is monotonic on `video_url` and published-gated on INSERT. Three new
+  `app_error` codes. Needs #39+#35+#31+#19+#15. Folded verbatim as §31).
   **#35/#36 applied to production 2026-07-29; both verified against a disposable shadow project first — see
   [docs/db/shadow-project.md](docs/db/shadow-project.md) and `npm run test:db`.**
   **Expiry-warning policy:** student-facing surfaces (menu pill, Dashboard `MembershipPanel`, the
@@ -1031,6 +1096,84 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   chokepoint** (see the "Plan-based access" bullet) — the `visitedTabs.map` render gates each tab by
   `entitlement.allowsTab(tabId)`. A future Stripe/Gumroad webhook could still flip `is_paid` +
   grant a subscription term server-side without manual review.
+
+## Staff authorization — Super Admin / Operations Admin / Trainer (#45–#47)
+
+Authorization used to be one boolean. `profiles.is_admin` drove `public.is_admin()` — ~74 RLS
+policies, 21 self-gating RPCs, 13 storage policies and 145 frontend checks — so every admin could
+approve payments, author and delete courses, manage cohorts, import students, moderate the community
+and edit global settings, and there was no way to hire a Trainer.
+
+**★ The design decision that makes the cutover safe, and the one thing to understand first.**
+#45 does **not** rewrite those references. It changes the MEANING of the column they read:
+
+> `profiles.is_admin` == "has an ACTIVE `super_admin` staff membership"
+
+and that column stops being an input. It is a **cache**, written only by the `staff_sync_is_admin`
+trigger, with `UPDATE` on `profiles` revoked from every client role. Every legacy `is_admin()` check
+therefore keeps working and silently narrows to Super-Admin-only — including the ~20 SECURITY
+DEFINER bodies that read the column directly. Operations Admins and Trainers carry
+`is_admin = false` and reach their features ONLY through `has_staff_permission()`. So a check we
+failed to find **under**-grants (a broken Ops feature, loud and reported) instead of over-granting.
+That direction is the whole safety argument. **Never repair a missed check by handing a non-super
+role `is_admin = true`.**
+
+- **Tables** (`db/2026-08-25-staff-authorization.sql`, #45): `staff_roles` / `staff_permissions` /
+  `staff_role_permissions` (the 18 × 3 matrix, **26 grants**) → `staff_memberships` (ONE row per
+  user, mutated in place; only `status='active'` confers authority, which is what makes a suspension
+  take effect on the next *request* rather than the next token refresh) → `staff_role_events`
+  (append-only; FKs `on delete set null` + denormalized email snapshots, so deleting an Auth account
+  never destroys the record of what it was granted).
+- **Helpers**, in the two-form split this repo uses everywhere: `user_has_staff_permission(uuid,text)`
+  and `user_can_manage_course(uuid,uuid)` answer about ANY user and are **revoked from every client
+  role**; `has_staff_permission(text)`, `is_super_admin()`, `can_manage_course(uuid)` and
+  `my_staff_context()` are pinned to `auth.uid()` and **granted to `authenticated`** — that grant is
+  not optional, because an RLS qual is evaluated AS THE QUERYING ROLE and without it every gated
+  read fails with "permission denied for function" instead of a clean denial.
+- **`my_staff_context()` is the ONE call** the client and the `api/` handlers make to learn who they
+  are: membership + effective permissions + assigned course ids, read LIVE on every request. Never
+  decoded from a JWT claim — that is why suspending someone is immediate.
+- **Section 15 of #45 is what makes the Operations Admin role real**, and the first draft of that file
+  missed it entirely: `admin_finalize_enrollment`, `approve_subscription`, `approve_extension`,
+  `expire_overdue_subscriptions` and the eight `admin_*` batch RPCs each opened with
+  `if not public.is_admin()`, and `auth.uid()` is unchanged inside a SECURITY DEFINER chain — so an
+  Ops Admin was refused at the FIRST line. The lesson: **when you widen who may do something, trace
+  the whole call path, not the first refusal you find.**
+- **Trainer ownership** (#46): `course_staff_assignments` + `can_manage_course()`. `courses.manage_all`
+  bypasses assignment; `courses.manage_assigned` needs a live row. Publishing and deleting are
+  **separate capabilities** — a Trainer authors, someone with `courses.publish` ships.
+  ★ **Storage WRITES are authorized by the course id parsed from the object path, and that is the
+  exact inverse of what #44 removed.** `course_object_course_id()` returns NULL for anything that is
+  not precisely `lessons/<uuid>/<file>` or `covers/<uuid>/<file>`, and
+  `user_can_manage_course(uid, NULL)` is false — so a malformed path **denies**. #44 deleted
+  `course_object_allowed()` because it path-parsed a **READ** and failed OPEN. Reads stay
+  reference-based via `course_video_object_readable()`. Do not blur those two.
+- **Discretionary extensions** (#47): `admin_grant_special_extension()` + the append-only
+  `student_access_events` ledger, gated on `students.extend_access` — a key **only `super_admin`
+  holds**, because a goodwill extension creates paid access with no payment behind it. It extends the
+  current term **in place** rather than superseding it: `batch_entitlements.source_subscription_id` is
+  frozen against re-pointing, so a superseding row would strand the member's cohort seats.
+- **Client**: [src/lib/staffRoles.js](src/lib/staffRoles.js) is the pure MIRROR (never the authority) —
+  `staffCan()`, `canManageCourseClient()`, `staffEntitlement()`, `ADMIN_TAB_PERMISSION`,
+  `lastSuperAdminGuard()`, and the fail-closed `EMPTY_STAFF_CONTEXT`. `AuthProvider` exposes
+  `staff / staffReady / staffDegraded / isSuperAdmin / can / refreshStaff`. **Absent permission data
+  means "no", not "yes"** — the pre-#40 community bug was a client that re-derived capabilities and
+  failed OPEN while they loaded.
+- **The chokepoint gained a role half.** `visitedTabs.map` used to test `entitlement.allowsTab(tabId)`
+  alone — but admin tabs are not in `DEFAULT_STAGES`, so `allowsTab` never had an opinion about them,
+  and a `full: true` student who typed `/admin/enrollments` **mounted the component and ran its
+  queries**. `adminTabAllowed()` now refuses first, gated on `staffReady`.
+- **Server**: [api/_lib/staffAuth.js](api/_lib/staffAuth.js) is the ONE gate for `api/admin/*` —
+  verify JWT → ask the database with the CALLER's JWT → only then may `service()` be constructed.
+  It **fails CLOSED**, deliberately unlike the fail-open `is_enrolled()` gates in `api/anthropic` and
+  `api/elevenlabs`, because what it protects is the service-role key. Its one legacy fallback applies
+  to a **missing** function only — answering a timeout by consulting a weaker check would convert an
+  outage into a privilege escalation.
+- **Break-glass**: `npm run staff:bootstrap -- --email you@… [--apply]`. It writes
+  `staff_memberships` + `staff_role_events` **directly** rather than calling
+  `admin_upsert_staff_membership()`, because the Management API runs as `postgres` with no JWT, so
+  `auth.uid()` is null and the RPC would 403 every time. It never sets `profiles.is_admin`.
+- Setup + the full permission matrix: **[STAFF_ROLES_SETUP.md](STAFF_ROLES_SETUP.md)**.
 
 ## AI / proxy pattern
 
@@ -1274,8 +1417,13 @@ explain/quiz/practice/recap the Supabase-hosted courses. Full setup:
   optionally overrides where "new enrollment submitted" alerts go (else the enrollment fn falls back
   to `payment_settings.notify_email`, then to `RESEND_FROM`); `APP_URL` sets the review-button origin.
   These are **this app's own** secrets — **Supabase Auth's SMTP/Resend settings are unrelated** and
-  only send Auth emails. All are non-fatal when unset, and none run under `npm run dev` (serverless
-  functions are Vercel-only). Diagnose from **Enrollments → "Test email"** or the GET health check.
+  only send Auth emails. All are non-fatal when unset. ★ **Both notify fns DO run under
+  `npm run dev`** since 2026-08-22 — `vite.config.js` registers `notifyDevApi` for
+  `/api/notify-enrollment` and `/api/notify-access`, mirroring the ElevenLabs/trainer middleware.
+  Before that they were the only `api/` handlers with no dev route, so localhost 404'd and no send
+  was ever attempted — which is why the enrollment confirmation email was repeatedly believed not
+  to exist. It did; it just could not run outside Vercel. Restart the dev server after adding keys
+  (Vite reads `.env` at startup). Diagnose from **Enrollments → "Test email"** or the GET health check.
 - **Voice assistant (server-only, optional):** `ELEVENLABS_API_KEY` + `ELEVENLABS_AGENT_ID` enable
   the in-app voice widget (`api/elevenlabs/signed-url.js` + the `ai:knowledge:push` / `ai:provision`
   scripts); optional `ELEVENLABS_SERVER_LOCATION` picks the ElevenLabs region, and `ELEVENLABS_VOICE_ID`
@@ -1371,6 +1519,18 @@ docs **in the same change**:
   `test/enrollmentIntakeSql.test.mjs` pins the option lists against the four SQL CHECK constraints
   in **both** the dated migration and the bootstrap fold — a reworded option otherwise produces a
   bare `23514` *after* all four files have uploaded, so no retry can ever succeed.
+- **Adding or re-folding a section of `db/000_full_database_bootstrap.sql`** → splice to the END
+  of the section you are replacing, **never to EOF**. On 2026-08-23 a re-fold of §29 (#42) ran to
+  end-of-file and silently deleted all 535 lines of §30 (#43) — a security policy, two storage
+  cleanup paths, an admin RPC contract and the feed index #43 exists to fix. `npm test` stayed
+  green, `npm run build` stayed green, and the truncated file ended on a tidy `AFTER RUNNING`
+  comment, so it read as a clean EOF. **`test/bootstrapFolds.test.mjs` now pins this**: § numbers
+  must be contiguous, each fold must contain the whole SQL body of the dated file it names (the
+  `do $pre$` preflight is the one documented omission), and every dated migration that records
+  itself in `schema_migrations` must be named somewhere in the bootstrap. That last check is the
+  one that catches an outright deletion. `npm run db:audit` would also have noticed — but it needs
+  credentials, and `db:shadow:verify --all` re-applies every dated file on top of the bootstrap,
+  which would re-apply the missing migration and **mask the gap entirely**.
 - **Changing the Training Agreement's wording** → bump `AGREEMENT_VERSION` in
   `src/lib/trainingAgreement.js` in the same change. `enrollment_requests.agreement_version`
   records which text each student accepted, so editing the document without bumping makes every
@@ -1378,6 +1538,30 @@ docs **in the same change**:
   change — prices are read from `enrollment_plans` at render time. `test/trainingAgreement.test.mjs`
   pins section contiguity (the source silently dropped Section 4), the three tier columns, and
   that no retired copy — Discord, Thinkific, a hardcoded extension price — creeps back in.
+- **Changing the enrollment processing-hours copy** → `ENROLLMENT_PROCESSING_NOTE` in
+  `src/lib/enrollmentIntake.js` is the ONE source. It is rendered on the pending screen
+  (`EnrollmentPendingScreen`, directly under the intro paragraph) AND passed as the `note` of the
+  student confirmation in `api/notify-enrollment.js` — which imports it, so the two physically
+  cannot drift. A student who reads one turnaround promise on screen and a different one in their
+  inbox has been told two things about when they get access, and the second arrives while they are
+  already waiting. `test/enrollmentIntake.test.mjs` pins each of the four promises separately (the
+  24-hour turnaround, the 9–5 window, the after-5PM rule, and weekends/holidays) so a reword cannot
+  silently drop one. `emailHtml`'s `note` accepts a string or an array of lines.
+- **Changing what a course lesson video may be** → the rules live in ONE pure module and are
+  mirrored in SQL. Move together: `src/lib/courseVideo.js` ↔ `course_lessons_video_guard()` /
+  `courses_publish_guard()` / `course_video_object_readable()` in
+  `db/2026-08-24-course-video-upload-only.sql` **and its verbatim bootstrap fold §31** ↔ the
+  `course-videos` bucket's `file_size_limit` / `allowed_mime_types` ↔
+  `test/courseVideo.test.mjs` + `test/courseVideoSql.test.mjs` + `test-db/courseVideos.dbtest.mjs`
+  ↔ the `#44` `OBJECT_CHECKS` in `scripts/audit-db.mjs`. The SQL-parity suite exists because a
+  client cap above the bucket's makes the browser promise a size Storage will 413 — after the file
+  has already spent ten minutes transferring.
+- **Changing who may READ a lesson video object** → `course_video_object_readable()` ↔ the
+  `course_videos_read` policy ↔ `courses_read` (it MIRRORS it — drift is a security bug) ↔ the
+  two #27 trainer mirrors ↔ `PLAN_ENTITLEMENTS` ↔ `planScopeAllows()`. Note `db:shadow:verify`
+  **cannot see this**: it snapshots `pg_policies` filtered to `schemaname='public'`, so storage
+  policies are never captured, and even for public ones it compares only tablename/policyname/cmd,
+  never `qual`. `db:audit`'s `pg_policies … qual ilike` checks are the only automated guard.
 - **Changing what a lesson replay link may be** → three places move together: the
   `course_lessons.zoom_replay_url` **COMMENT** (in both `db/2026-08-05-lesson-zoom-replay.sql` and the
   bootstrap) ↔ `parseReplayUrl()` / `ZOOM_HOST_SUFFIXES` in `src/lib/lessonReplay.js` ↔
@@ -1396,6 +1580,19 @@ docs **in the same change**:
   (`test/batchLifecycle.test.mjs` + `test-db/batchLifecycle.dbtest.mjs` pin both halves). If a new
   editable column is added, it also needs a `grant update (…)` in #38's column-privilege block —
   otherwise the write silently 42501s for every admin.
+- **Adding, removing or re-granting a STAFF PERMISSION** → four places move together:
+  the `staff_permissions` + `staff_role_permissions` seed in a dated migration ↔ the **bootstrap
+  fold** ↔ `STAFF_PERMISSIONS` / `ROLE_PERMISSIONS` in [src/lib/staffRoles.js](src/lib/staffRoles.js)
+  ↔ the policy or RPC that actually READS the key. `test/staffRolesSql.test.mjs` pins the first three
+  against each other in BOTH SQL files and counts the grants, so a silently-dropped cell fails — but
+  **nothing pins the fourth**. A key that exists and is granted and is read by nothing is a role that
+  looks real in the UI and refuses at the first server call; that is precisely what #45 shipped for
+  the Trainer and #46 had to repair. When you add a key, name the policy it gates in the same change.
+- **Changing who may edit a course** → `user_can_manage_course()` ↔ `canManageCourseClient()` ↔ the
+  `courses_staff_*` / `modules_staff_write` / `lessons_staff_write` policies ↔ the course storage
+  policies ↔ `test/courseStaffSql.test.mjs`. ★ And keep the read/write asymmetry: writes may parse the
+  object path (it fails CLOSED); **reads must stay reference-based** through
+  `course_video_object_readable()`, which is why #44 exists.
 - **Changing plan-scope rules** (which plan reads which courses) → four places move together:
   the `courses_read` RLS policy, the #27 parameterized mirrors (`trainer_visible_courses` /
   `trainer_courses_for_plan`), `PLAN_ENTITLEMENTS` in `src/lib/planCatalog.js`, and

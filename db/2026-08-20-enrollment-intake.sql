@@ -178,38 +178,69 @@ end $$;
 -- ═════════════════════════════════════════════════════════════════════════════
 -- 7) PLAN COPY — say what the agreement says
 -- ═════════════════════════════════════════════════════════════════════════════
--- Two corrections, both factual rather than editorial:
+-- Three corrections, all factual rather than editorial:
 --
---   a) VIP's group Resume & Interview coaching was missing. The Apps Script
---      agreement advertised "4 Live Session Zoom Group Resume & Interview
+--   a) VIP's resume/interview coaching is the FOUR group sessions. The Apps
+--      Script agreement advertised "4 Live Session Zoom Group Resume & Interview
 --      Coaching" while enrollment_plans listed only "1-on-1 … (1 session)", and
---      the two read as competing descriptions of one inclusion. They are two
---      separate things (confirmed 2026-08-20), so both are now listed in both
---      places and the agreement carries a row for each.
+--      the two read as competing descriptions of one inclusion. They were briefly
+--      treated as two distinct inclusions (2026-08-20) and both were listed; once
+--      that was seen rendered in the agreement, the 1-on-1 line was withdrawn
+--      (2026-08-22). Only the group sessions remain, here and in the client.
 --
 --   b) Discord is retired. The in-app Community replaced it, and a student who
 --      reads "Discord chat support" on the pricing card and then signs an
 --      agreement promising Community support has been told two different things
 --      about the same benefit, minutes apart.
 --
--- ★ LOCKSTEP: this seed, ENROLLMENT_PLANS_FALLBACK in src/lib/planCatalog.js and
---   the bootstrap §9 seed must agree — test/planCatalog.test.mjs pins the pair,
+--   c) The Sampler session is FOUR hours, not three (corrected 2026-08-22 after
+--      the agreement was reviewed on screen). #12's seed says three, so a database
+--      that has only ever run #12 still advertises the wrong length on the pricing
+--      card and — worse — inside the signed agreement's comparison table.
+--      ★ This assumes #22 has run: it writes '60-day group chat support' but does
+--        not touch support_days, so a #12-without-#22 database would show
+--        "60-day access · 30-day support" above a 60-day bullet. #22 is mandatory
+--        in the chain, so this is a note rather than a guard.
+--
+-- ★ Each predicate is `is distinct from` the target — the idiom #22 and #39 use.
+--   It no-ops on a fresh install (§9 already seeds the final text) AND converges
+--   from every other state. An earlier draft tested for the specific defects
+--   instead (`ilike '%discord%' or ilike '%1-on-1 Resume%'`), which declares any
+--   row missing those tokens finished — including one that is also missing the
+--   line the statement exists to install.
+--
+-- ★ LOCKSTEP: this seed, ENROLLMENT_PLANS_FALLBACK in src/lib/planCatalog.js, the
+--   bootstrap §9 seed, and the tier table in src/lib/trainingAgreement.js must all
+--   agree — test/planCatalog.test.mjs and test/trainingAgreement.test.mjs pin them,
 --   and `npm run ai:knowledge` must be re-run so the voice assistant follows.
-update public.enrollment_plans set features = to_jsonb(array[
+--   trainingAgreement.js matters most: it is the document a student signs, so
+--   drift there is contractual rather than cosmetic.
+with target as (select to_jsonb(array[
   'Simulated annual bookkeeping project for an NY-based construction company',
   '12 Live Group Zoom Trainings (MWF 9am to 11am PH Time)',
   '4 Live Group Resume & Interview Coaching Sessions',
-  '1-on-1 Resume & Interview Coaching (1 session)',
   'Weekly group consult until hired',
   'Community chat support until and after hired'
-]) where key = 'vip' and features::text not ilike '%4 Live Group Resume%';
+]) as f)
+update public.enrollment_plans p set features = target.f, updated_at = now()
+  from target where p.key = 'vip' and p.features is distinct from target.f;
 
-update public.enrollment_plans set features = to_jsonb(array[
+with target as (select to_jsonb(array[
   'Simulated annual bookkeeping project for an NY-based construction company',
   '60-day QBO Mastery course access',
   '60-day Resume & Interview course access',
   'Weekly Community chat (Thu)'
-]) where key = 'silver_self_paced' and features::text ilike '%discord%';
+]) as f)
+update public.enrollment_plans p set features = target.f, updated_at = now()
+  from target where p.key = 'silver_self_paced' and p.features is distinct from target.f;
+
+with target as (select to_jsonb(array[
+  '1 Live Zoom Session (4 hours)',
+  '60-day course access',
+  '60-day group chat support'
+]) as f)
+update public.enrollment_plans p set features = target.f, updated_at = now()
+  from target where p.key = 'sampler' and p.features is distinct from target.f;
 
 notify pgrst, 'reload schema';
 
@@ -227,8 +258,9 @@ insert into public.schema_migrations (filename, checksum, notes) values
   'already key on, so no bucket and no policy is added — but the bucket is widened to 10 MB '
   'and gains doc/docx, because a resume is routinely a Word file that the old mime list '
   'rejected. Every column is nullable: pre-existing rows must stay valid, and the requirement '
-  'lives in validateIntake(). Plan features corrected: VIP gains its 4 group Resume & '
-  'Interview sessions (separate from the 1-on-1), and Discord becomes Community everywhere. '
+  'lives in validateIntake(). Plan copy corrected to match the agreement: VIP states its '
+  '4 group Resume & Interview sessions and no 1-on-1 line, the Sampler session is 4 hours '
+  'not 3, and Discord becomes Community everywhere. '
   'Additive + idempotent; no row deleted, no policy changed. '
   'Deploy the matching client build: the new form, src/lib/enrollmentIntake.js and '
   'src/lib/trainingAgreement.js ship together.')
@@ -249,4 +281,5 @@ on conflict (filename) do nothing;
 --       where id = 'enrollment-receipts';
 -- 4) Plan copy agrees with the agreement:
 --      select key, features from public.enrollment_plans order by position;
---    Expect no 'Discord' anywhere, and both coaching lines on vip.
+--    Expect no 'Discord' anywhere; vip lists the 4 group sessions and NO '1-on-1 Resume'
+--    line; sampler says '(4 hours)', not '(3 hours)'.

@@ -491,6 +491,29 @@ adminRecipient }` (`adminRecipient` is env-only — `'none'` there can still res
 `payment_settings.notify_email`, which the unauthenticated health check can't read). No secret
 values are ever returned.
 
+### Testing email locally (`npm run dev`)
+
+Until 2026-08-22 the two notification endpoints were the only handlers in `api/` with **no dev
+middleware**, so under `npm run dev` `/api/notify-enrollment` simply 404'd and no send was ever
+attempted. Combined with a `.env` that carries no `RESEND_*` keys, that made the enrollment
+confirmation email look as though it had never been built — it had, it just could not run outside
+Vercel. `vite.config.js` now registers `notifyDevApi` for both routes.
+
+To exercise it locally, add to `.env`:
+
+```
+RESEND_API_KEY=re_…
+RESEND_FROM=Toolkits by Alex <noreply@yourdomain.com>
+NOTIFY_ADMIN_EMAIL=you@example.com   # optional; else payment_settings.notify_email, then RESEND_FROM
+```
+
+Then restart the dev server — Vite reads `.env` at startup, so a key added while it is running has
+no effect. Submit an enrollment and both emails send for real: the admin alert first (its outcome is
+what gets stamped onto `notify_status`), then the student confirmation.
+
+With no keys set the endpoint responds `{ ok: false, skipped: 'not-configured' }` and the student
+still enrolls normally — the send is best-effort and never blocks a submission.
+
 **Prove it works (≈2 minutes, after the vars are set + a redeploy):**
 1. Open `https://<your-deploy>/api/notify-enrollment` in a browser → expect
    `{ ok:true, hasKey:true, hasFrom:true, adminRecipient:"env" }` (or `"from"`).

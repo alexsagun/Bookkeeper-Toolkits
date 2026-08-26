@@ -12,10 +12,13 @@
 //   VITE_SUPABASE_URL     reused for admin verification (already set for the build)
 //   VITE_SUPABASE_ANON_KEY  reused for admin verification (already set for the build)
 //
-// NOTE: `npm run dev` (Vite) does NOT run this function — email is exercised on Vercel only.
+// NOTE: this DOES run under `npm run dev` — vite.config.js registers `notifyDevApi` for
+//   /api/notify-access. It still needs RESEND_* in .env (read at Vite startup).
 
-const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
-const SUPABASE_ANON = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
+// VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY are still required, but they are now
+// read inside api/_lib/staffAuth.js rather than here — this handler no longer
+// talks to Supabase itself.
+import { requireStaff } from './_lib/staffAuth.js';
 
 const BRAND = 'Toolkits by Alex';
 const isEmail = (s) => typeof s === 'string' && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(s);
@@ -64,30 +67,10 @@ function buildEmail(status, fullName, reason) {
   };
 }
 
-// Confirm the bearer token belongs to an admin (anon key + the caller's JWT; RLS own_profile_select
-// lets a user read their own is_admin). Returns the admin's user id, or null on any failure.
-async function callerAdminId(authHeader) {
-  if (!authHeader || !SUPABASE_URL || !SUPABASE_ANON) return null;
-  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-  if (!token) return null;
-  try {
-    const userRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
-      headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}` },
-    });
-    if (!userRes.ok) return null;
-    const u = await userRes.json();
-    if (!u?.id) return null;
-    const profRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(u.id)}&select=is_admin`,
-      { headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}` } }
-    );
-    if (!profRes.ok) return null;
-    const rows = await profRes.json();
-    return Array.isArray(rows) && rows[0]?.is_admin === true ? u.id : null;
-  } catch {
-    return null;
-  }
-}
+// The admin check moved to api/_lib/staffAuth.js in #45. It used to be a local
+// callerAdminId() that read profiles.is_admin — one of four byte-identical copies.
+// Reviewing an access request is now its own capability, so an Operations Admin
+// can work this queue without holding any other admin power.
 
 // Best-effort per-caller burst guard (per warm instance — the anthropic-proxy idiom).
 // 10 emails/min is far above any legit review pace; it stops a runaway loop or a
@@ -121,11 +104,12 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed. Use POST.' });
   }
 
-  // Only admins may trigger an email (prevents abuse of the endpoint).
-  const adminId = await callerAdminId(req.headers?.authorization);
-  if (!adminId) {
-    return res.status(403).json({ error: 'Admin authorization required.' });
+  // Only a reviewer may trigger an email (prevents abuse of the endpoint).
+  const gate = await requireStaff(req, { permission: 'access_requests.review' });
+  if (!gate.ok) {
+    return res.status(gate.status).json({ error: gate.error, code: gate.code });
   }
+  const adminId = gate.user.id;
   if (rateLimited(adminId)) {
     return res.status(429).json({ ok: false, error: 'Too many emails — wait a minute and try again.' });
   }

@@ -3,13 +3,21 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Holds the Supabase SERVICE-ROLE key + the ElevenLabs key. Every action:
 //   1. verifies the caller's Supabase Bearer JWT (against /auth/v1/user), AND
-//   2. independently confirms profiles.is_admin (read with the CALLER's JWT),
-//   BEFORE the service-role client is constructed.
+//   2. independently confirms the course_trainer.manage capability via
+//      my_staff_context() (read with the CALLER's JWT),
+//   BOTH BEFORE the service-role client is constructed. (#45)
+//
+//   3. THEN, for every action except 'preview', resolves the course the request
+//      will actually act on — from lesson_id / source_id, NOT from the caller's
+//      course_id — and confirms can_manage_course() on THAT. This step runs after
+//      service() because resolving a lesson or source to its course needs a
+//      privileged read. Constructing the client is not the danger; mutating an
+//      unauthorized row is, and no handler has run at that point.
 //
 // Actions (POST body.action):
 //   'status'             — { migrated, embeddings, pendingJobs, sourceCounts }
 //   'sync'               — bounded resumable (re)index of a course's sources
-//   'transcribe'         — Scribe v2 STT for ONE upload/mp4 lesson (→ pending review)
+//   'transcribe'         — Scribe v2 STT for ONE UPLOADED lesson video (→ pending review)
 //   'save-transcript'    — manual/edited transcript for a lesson (or course notes)
 //   'set-source-included'— include/exclude a source from retrieval
 //   'retry-source'       — reset a failed source + its job to re-run
@@ -22,7 +30,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import crypto from 'node:crypto';
-import { createClient } from '@supabase/supabase-js';
+import { requireStaff, callerCanManageCourse, service, serviceConfigured } from '../_lib/staffAuth.js';
+import { courseScopeVerdict } from '../../src/lib/staffRoles.js';
 import { elevenLabsApiBase } from '../elevenlabs/signed-url.js';
 import { chunkText, ENROLLMENT_PLAN_KEYS } from '../../src/lib/trainerContent.js';
 
@@ -52,38 +61,12 @@ function rateLimited(userId) {
   return false;
 }
 
-// ── Auth (never touches the service key) ──
-async function callerUser(authHeader) {
-  if (!authHeader || !SUPABASE_URL || !ANON_KEY) return null;
-  const token = String(authHeader).replace(/^Bearer\s+/i, '').trim();
-  if (!token) return null;
-  try {
-    const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
-      headers: { apikey: ANON_KEY, Authorization: `Bearer ${token}` },
-    });
-    if (!r.ok) return null;
-    const u = await r.json();
-    return u?.id ? { id: u.id, token } : null;
-  } catch { return null; }
-}
-async function callerIsAdmin(u) {
-  if (!u) return false;
-  try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(u.id)}&select=is_admin`,
-      { headers: { apikey: ANON_KEY, Authorization: `Bearer ${u.token}` } }
-    );
-    if (!r.ok) return false;
-    const rows = await r.json();
-    return Array.isArray(rows) && rows[0]?.is_admin === true;
-  } catch { return false; }
-}
-
-function service() {
-  return createClient(SUPABASE_URL, SERVICE_KEY, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
+// ── Auth ──
+// callerUser / callerIsAdmin / service all moved to api/_lib/staffAuth.js in #45.
+// They were one of four byte-identical copies of the same profiles.is_admin read,
+// and this endpoint now gates on the course_trainer.manage CAPABILITY plus a
+// per-course can_manage_course() check, so a Trainer can index their own course
+// without holding any other admin power.
 
 const sha256hex = (text) => crypto.createHash('sha256').update(String(text || ''), 'utf8').digest('hex');
 function isNotMigrated(err) {
@@ -131,6 +114,40 @@ async function edgeEmbedReachable() {
     });
     return r.ok;
   } catch { return false; } finally { clearTimeout(timer); }
+}
+
+/**
+ * Which course does this request actually ACT on?
+ *
+ * Not "which course did the caller claim" — which one will the handler mutate.
+ * `doTranscribe` and the lesson branch of `doSaveTranscript` resolve their target
+ * from `lesson_id`; `doSetIncluded` and `doRetrySource` from `source_id`. Each of
+ * those rows carries its own `course_id`, and THAT is the one authorization has to
+ * be checked against.
+ *
+ * Returns null when there is nothing to resolve — the caller then requires
+ * `courses.manage_all`, which is the correct fallback for an unscoped action.
+ */
+async function resolveTargetCourseId(admin, action, body) {
+  const lessonId = body?.lesson_id;
+  const sourceId = body?.source_id;
+
+  if (UUID_RE.test(lessonId || '')) {
+    const { data } = await admin.from('course_lessons')
+      .select('course_id').eq('id', lessonId).maybeSingle();
+    // A lesson id that resolves to nothing must not silently fall through to the
+    // caller-supplied course_id — that is the confused deputy again.
+    return data?.course_id || null;
+  }
+
+  if (UUID_RE.test(sourceId || '')) {
+    const { data } = await admin.from('course_ai_sources')
+      .select('course_id').eq('id', sourceId).maybeSingle();
+    return data?.course_id || null;
+  }
+
+  // Only now is the caller's own course_id the target (status / sync / notes).
+  return UUID_RE.test(body?.course_id || '') ? body.course_id : null;
 }
 
 // ── Actions (each returns { status, body }) ──────────────────────────────────
@@ -283,24 +300,30 @@ async function doTranscribe(admin, lessonId) {
     .select('id,course_id,title,video_provider,storage_path,video_url').eq('id', lessonId).maybeSingle();
   if (error) { if (isNotMigrated(error)) return { status: 200, body: { ok: false, migrated: false } }; throw error; }
   if (!lesson) return { status: 404, body: { error: 'Lesson not found.' } };
-  if (!['upload', 'mp4'].includes(lesson.video_provider)) {
-    return { status: 400, body: { error: 'Auto-transcription only works for uploaded videos or direct MP4 links. YouTube/Vimeo lessons need a manual transcript (never scraped).' } };
+  // ★ Upload-only since #44. The 'mp4' branch is gone with the direct-link lesson itself:
+  //   a lesson's primary content can no longer be an external URL, so there is no longer a
+  //   public MP4 to hand the transcription service. A legacy row that still carries one is
+  //   pointed at the manual transcript editor instead, which never leaves this app.
+  //   MIRRORED by CourseAiTrainerPanel's `canScribe` in src/BookkeeperPro.jsx — drift here is
+  //   a microphone button that 400s.
+  if (lesson.video_provider !== 'upload' || !lesson.storage_path) {
+    return { status: 400, body: { error: 'Auto-transcription needs an uploaded lesson video. Upload the MP4 for this lesson, or paste its transcript manually.' } };
   }
   // No concurrent transcribe job for this lesson.
   const { data: running } = await admin.from('course_ai_sources')
     .select('id,status,source_version').eq('lesson_id', lessonId).eq('kind', 'transcript').maybeSingle();
   if (running?.status === 'processing') return { status: 409, body: { error: 'A transcription is already running for this lesson.' } };
 
-  // Media URL.
-  let sourceUrl = '';
-  if (lesson.video_provider === 'upload') {
-    const { data: signed, error: serr } = await admin.storage.from('course-videos').createSignedUrl(lesson.storage_path, 3600);
-    if (serr || !signed?.signedUrl) return { status: 502, body: { error: 'Could not read the video file.' } };
-    sourceUrl = signed.signedUrl;
-  } else {
-    sourceUrl = lesson.video_url;
-    if (!/^https:\/\//i.test(sourceUrl || '')) return { status: 400, body: { error: 'The MP4 link must be a public https URL.' } };
+  // Media URL — a short-lived signed URL for the private object, minted server-side with the
+  // service role. The path is re-checked here rather than trusted: this endpoint signs
+  // whatever it is given, so a hand-edited row pointing outside the lesson namespace must not
+  // become a way to mint a signed URL for an arbitrary object in the bucket.
+  if (!/^lessons\/[0-9a-fA-F-]{36}\/.+/.test(lesson.storage_path)) {
+    return { status: 400, body: { error: 'This lesson’s video file is not where lesson videos are stored. Re-upload it from the lesson editor.' } };
   }
+  const { data: signed, error: serr } = await admin.storage.from('course-videos').createSignedUrl(lesson.storage_path, 3600);
+  if (serr || !signed?.signedUrl) return { status: 502, body: { error: 'Could not read the video file.' } };
+  const sourceUrl = signed.signedUrl;
 
   // Mark processing + a job row. NOTE: the (lesson_id, kind) unique index is PARTIAL
   // (where lesson_id is not null), which PostgREST's upsert onConflict cannot target —
@@ -478,9 +501,12 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'Server trainer admin is not configured (SUPABASE_SECRET_KEY missing).' });
   }
 
-  const u = await callerUser(req.headers?.authorization);
-  if (!u) return res.status(401).json({ error: 'Sign in as an admin.' });
-  if (!(await callerIsAdmin(u))) return res.status(403).json({ error: 'Admin authorization required.' });
+  // #45: a named capability instead of the blanket admin flag. A Trainer holds
+  // course_trainer.manage, so they can index their own course — but the
+  // per-course assignment check below is what makes it THEIR course.
+  const gate = await requireStaff(req, { permission: 'course_trainer.manage' });
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error, code: gate.code });
+  const u = gate.user;
   if (rateLimited(u.id)) return res.status(429).json({ error: 'Too many requests — wait a minute.' });
 
   if (Number(req.headers?.['content-length']) > MAX_BODY_BYTES) return res.status(413).json({ error: 'Request too large.' });
@@ -492,6 +518,53 @@ export default async function handler(req, res) {
   if (!body || typeof body !== 'object') body = {};
   const action = body.action;
   const admin = service();
+
+  // ── Per-course authorization (#45) ────────────────────────────────────────
+  // course_trainer.manage says "this person indexes courses". It does NOT say
+  // WHICH courses. A Trainer holds it and must only reach their own.
+  //
+  // ★ THE COURSE IS RESOLVED FROM THE TARGET, NOT FROM THE REQUEST BODY.
+  //   The first version of this block authorized `body.course_id` and then
+  //   dispatched to handlers that resolve their target from `lesson_id` or
+  //   `source_id` and ignore `course_id` entirely (doSetIncluded updates by
+  //   source_id alone; doRetrySource reads src.course_id from the row). That is a
+  //   confused deputy: send a course you own plus a source id from someone
+  //   else's course, and the service-role client happily mutates theirs. The
+  //   caller's `course_id` is a HINT for routing, never the thing authorized.
+  //
+  // ★ This runs AFTER service() because resolving a lesson or source to its
+  //   course needs a privileged read. Constructing the client is not the danger;
+  //   MUTATING an unauthorized row is, and nothing below has run yet.
+  //
+  // ★ `preview` is exempt: it renders the trainer response as a given PLAN would
+  //   see it, over already-published content, and has no course target.
+  if (action !== 'preview') {
+    let targetCourseId = null;
+    try {
+      targetCourseId = await resolveTargetCourseId(admin, action, body);
+    } catch {
+      return res.status(500).json({ error: 'Could not resolve the target course.' });
+    }
+
+    // `assignment` is tri-state: true / false / 'unavailable'. can_manage_course()
+    // is created by #46, so between #45 and #46 it does not exist — that must fall
+    // through to the capability check for a manage_all holder, not deny everyone.
+    let assignment = 'unavailable';
+    if (targetCourseId) assignment = await callerCanManageCourse(u, targetCourseId);
+
+    const scope = courseScopeVerdict({
+      context: gate.context,
+      legacy: gate.legacy,
+      courseId: targetCourseId,
+      assignment,
+    });
+    if (!scope.allow) {
+      return res.status(scope.status).json({
+        error: 'That course is not assigned to you.',
+        code: scope.code,
+      });
+    }
+  }
 
   try {
     let r;

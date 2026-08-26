@@ -439,7 +439,7 @@ create table if not exists public.enrollment_plans (
 insert into public.enrollment_plans
   (key, name, tagline, price_php, compare_at_php, badge, features, limit_note, position, access_days, support_days, entitlement_summary) values
   ('sampler', 'Sampler Session', 'Essentials', 1499, null, null,
-   '["1 Live Zoom Session (3 hours)","60-day course access","60-day group chat support"]'::jsonb,
+   '["1 Live Zoom Session (4 hours)","60-day course access","60-day group chat support"]'::jsonb,
    'Limited offer', 1, 60, 60,
    '["60-day course access","60-day group chat support","1 live Zoom session"]'::jsonb),
   ('silver_self_paced', 'QBO + Resume Combo', 'Silver · Self-Paced', 2999, null, null,
@@ -447,7 +447,7 @@ insert into public.enrollment_plans
    null, 2, 60, null,
    '["60-day QBO Mastery access","60-day Resume & Interview access"]'::jsonb),
   ('vip', 'Personalized Coaching Program', 'VIP Package', 16999, 35000, 'BEST SELLER',
-   '["Simulated annual bookkeeping project for an NY-based construction company","12 Live Group Zoom Trainings (MWF 9am to 11am PH Time)","4 Live Group Resume & Interview Coaching Sessions","1-on-1 Resume & Interview Coaching (1 session)","Weekly group consult until hired","Community chat support until and after hired"]'::jsonb,
+   '["Simulated annual bookkeeping project for an NY-based construction company","12 Live Group Zoom Trainings (MWF 9am to 11am PH Time)","4 Live Group Resume & Interview Coaching Sessions","Weekly group consult until hired","Community chat support until and after hired"]'::jsonb,
    'Limited to 10 slots per month', 3, 180, null,
    '["180-day full access","1-on-1 coaching","Weekly consult until hired"]'::jsonb)
 on conflict (key) do nothing;
@@ -11116,7 +11116,7 @@ on conflict (filename) do nothing;
 -- AFTER RUNNING (fresh install)
 --   1. If §5 / §14b raised a NOTICE (restricted role), create the buckets in
 --      Dashboard → Storage: course-media (Public ON), course-videos (Public OFF,
---      50 MB, video mimes), enrollment-receipts (Public OFF, 5 MB, png/jpeg/webp/pdf),
+--      2 GB, video/mp4 only — see §31), enrollment-receipts (Public OFF, 10 MB, png/jpeg/webp/pdf/doc/docx),
 --      avatars (Public ON, 5 MB, image mimes), community-media (Public OFF, 50 MB,
 --      image + video mimes).
 --   2. Sign in once with your owner account so a profiles row exists, then promote
@@ -13940,38 +13940,69 @@ end $$;
 -- ═════════════════════════════════════════════════════════════════════════════
 -- 7) PLAN COPY — say what the agreement says
 -- ═════════════════════════════════════════════════════════════════════════════
--- Two corrections, both factual rather than editorial:
+-- Three corrections, all factual rather than editorial:
 --
---   a) VIP's group Resume & Interview coaching was missing. The Apps Script
---      agreement advertised "4 Live Session Zoom Group Resume & Interview
+--   a) VIP's resume/interview coaching is the FOUR group sessions. The Apps
+--      Script agreement advertised "4 Live Session Zoom Group Resume & Interview
 --      Coaching" while enrollment_plans listed only "1-on-1 … (1 session)", and
---      the two read as competing descriptions of one inclusion. They are two
---      separate things (confirmed 2026-08-20), so both are now listed in both
---      places and the agreement carries a row for each.
+--      the two read as competing descriptions of one inclusion. They were briefly
+--      treated as two distinct inclusions (2026-08-20) and both were listed; once
+--      that was seen rendered in the agreement, the 1-on-1 line was withdrawn
+--      (2026-08-22). Only the group sessions remain, here and in the client.
 --
 --   b) Discord is retired. The in-app Community replaced it, and a student who
 --      reads "Discord chat support" on the pricing card and then signs an
 --      agreement promising Community support has been told two different things
 --      about the same benefit, minutes apart.
 --
--- ★ LOCKSTEP: this seed, ENROLLMENT_PLANS_FALLBACK in src/lib/planCatalog.js and
---   the bootstrap §9 seed must agree — test/planCatalog.test.mjs pins the pair,
+--   c) The Sampler session is FOUR hours, not three (corrected 2026-08-22 after
+--      the agreement was reviewed on screen). #12's seed says three, so a database
+--      that has only ever run #12 still advertises the wrong length on the pricing
+--      card and — worse — inside the signed agreement's comparison table.
+--      ★ This assumes #22 has run: it writes '60-day group chat support' but does
+--        not touch support_days, so a #12-without-#22 database would show
+--        "60-day access · 30-day support" above a 60-day bullet. #22 is mandatory
+--        in the chain, so this is a note rather than a guard.
+--
+-- ★ Each predicate is `is distinct from` the target — the idiom #22 and #39 use.
+--   It no-ops on a fresh install (§9 already seeds the final text) AND converges
+--   from every other state. An earlier draft tested for the specific defects
+--   instead (`ilike '%discord%' or ilike '%1-on-1 Resume%'`), which declares any
+--   row missing those tokens finished — including one that is also missing the
+--   line the statement exists to install.
+--
+-- ★ LOCKSTEP: this seed, ENROLLMENT_PLANS_FALLBACK in src/lib/planCatalog.js, the
+--   bootstrap §9 seed, and the tier table in src/lib/trainingAgreement.js must all
+--   agree — test/planCatalog.test.mjs and test/trainingAgreement.test.mjs pin them,
 --   and `npm run ai:knowledge` must be re-run so the voice assistant follows.
-update public.enrollment_plans set features = to_jsonb(array[
+--   trainingAgreement.js matters most: it is the document a student signs, so
+--   drift there is contractual rather than cosmetic.
+with target as (select to_jsonb(array[
   'Simulated annual bookkeeping project for an NY-based construction company',
   '12 Live Group Zoom Trainings (MWF 9am to 11am PH Time)',
   '4 Live Group Resume & Interview Coaching Sessions',
-  '1-on-1 Resume & Interview Coaching (1 session)',
   'Weekly group consult until hired',
   'Community chat support until and after hired'
-]) where key = 'vip' and features::text not ilike '%4 Live Group Resume%';
+]) as f)
+update public.enrollment_plans p set features = target.f, updated_at = now()
+  from target where p.key = 'vip' and p.features is distinct from target.f;
 
-update public.enrollment_plans set features = to_jsonb(array[
+with target as (select to_jsonb(array[
   'Simulated annual bookkeeping project for an NY-based construction company',
   '60-day QBO Mastery course access',
   '60-day Resume & Interview course access',
   'Weekly Community chat (Thu)'
-]) where key = 'silver_self_paced' and features::text ilike '%discord%';
+]) as f)
+update public.enrollment_plans p set features = target.f, updated_at = now()
+  from target where p.key = 'silver_self_paced' and p.features is distinct from target.f;
+
+with target as (select to_jsonb(array[
+  '1 Live Zoom Session (4 hours)',
+  '60-day course access',
+  '60-day group chat support'
+]) as f)
+update public.enrollment_plans p set features = target.f, updated_at = now()
+  from target where p.key = 'sampler' and p.features is distinct from target.f;
 
 notify pgrst, 'reload schema';
 
@@ -13989,8 +14020,9 @@ insert into public.schema_migrations (filename, checksum, notes) values
   'already key on, so no bucket and no policy is added — but the bucket is widened to 10 MB '
   'and gains doc/docx, because a resume is routinely a Word file that the old mime list '
   'rejected. Every column is nullable: pre-existing rows must stay valid, and the requirement '
-  'lives in validateIntake(). Plan features corrected: VIP gains its 4 group Resume & '
-  'Interview sessions (separate from the 1-on-1), and Discord becomes Community everywhere. '
+  'lives in validateIntake(). Plan copy corrected to match the agreement: VIP states its '
+  '4 group Resume & Interview sessions and no 1-on-1 line, the Sampler session is 4 hours '
+  'not 3, and Discord becomes Community everywhere. '
   'Additive + idempotent; no row deleted, no policy changed. '
   'Deploy the matching client build: the new form, src/lib/enrollmentIntake.js and '
   'src/lib/trainingAgreement.js ship together.')
@@ -14011,7 +14043,8 @@ on conflict (filename) do nothing;
 --       where id = 'enrollment-receipts';
 -- 4) Plan copy agrees with the agreement:
 --      select key, features from public.enrollment_plans order by position;
---    Expect no 'Discord' anywhere, and both coaching lines on vip.
+--    Expect no 'Discord' anywhere; vip lists the 4 group sessions and NO '1-on-1 Resume'
+--    line; sampler says '(4 hours)', not '(3 hours)'.
 
 
 -- ═════════════════════════════════════════════════════════════════════════════
@@ -14546,4 +14579,4074 @@ on conflict (filename) do nothing;
 --
 --   select pg_get_function_identity_arguments(oid)
 --     from pg_proc where proname = 'admin_save_channel_category';  -- p_status has no default value shown
+-- ─────────────────────────────────────────────────────────────────────────────
+
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- §31) FOLDED VERBATIM — 2026-08-24-course-video-upload-only.sql   (#44)
+-- ═════════════════════════════════════════════════════════════════════════════
+-- Course lesson video becomes upload-only, and the private bucket stops deriving
+-- authorization from the object path. Folded so a fresh install ends where a
+-- migrated database ends — §14b creates the course-videos bucket and its read
+-- policy, §26 (#39) alters that policy to the path-parsing form, and this section
+-- replaces it with the reference-based one. Last writer wins.
+-- ★ RE-FOLD whenever db/2026-08-24-course-video-upload-only.sql changes.
+-- ★ The preflight guard in that file is dropped here (the bootstrap creates every
+--   object it depends on, in order, above), and its schema_migrations insert is
+--   kept so a fresh install records the file as applied.
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- #44 — Course lesson video becomes UPLOAD-ONLY, and the private bucket stops
+--       deriving authorization from the object's PATH.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHY THIS EXISTS
+--   A lesson's primary content could be a pasted YouTube/Vimeo/direct-MP4 URL.
+--   parseVideoUrl() (src/BookkeeperPro.jsx) classified ANY unrecognised string
+--   as 'mp4', saveLesson() stored it verbatim, and renderVideo() bound it into
+--   <video src> — with no scheme check anywhere on that path. More to the point,
+--   a YouTube id in course_lessons.video_url is a permanent, public,
+--   un-revokable pointer to material a member paid for. Lesson video now lives
+--   only in the PRIVATE course-videos bucket, served through short-lived signed
+--   URLs gated by RLS.
+--
+-- WHAT THIS FIXES, in the order the sections appear.
+--
+--   1) SECURITY — course_object_allowed() authorised by parsing the object name.
+--      It read split_part(name,'/',2)::uuid and returned TRUE on an unparseable
+--      path, TRUE on an unknown course id, and TRUE for every non-sampler plan
+--      before it looked at anything. It never checked that segment 1 was
+--      literally 'lessons', and it never checked courses.published — so any
+--      enrolled member on a full-access plan could read an object belonging to
+--      an UNPUBLISHED course, or an orphan no lesson references at all.
+--      course_video_object_readable() replaces it and asks the only question
+--      that is actually true: does a PUBLISHED lesson this caller's plan may
+--      read reference this exact storage_path?
+--
+--   2) CORRECTNESS — the path parser was also WRONG for duplicated courses.
+--      CourseCatalog.duplicateCourse copies storage_path by reference
+--      (copy-on-write; no bytes are copied), so a duplicate's video physically
+--      lives in the SOURCE course's folder. A Sampler enrolled in an Essentials
+--      duplicate was denied their own video because the path named the standard
+--      -tier original. Reference-based lookup gets this right in both directions.
+--
+--   3) SECURITY — course_videos_read was the ONLY one of the four content-read
+--      policies with no is_approved() conjunct. Added.
+--
+--   4) ENFORCEMENT — course_lessons_video_guard() refuses to let a lesson
+--      BECOME link-backed. Removing the React input alone left a direct
+--      PostgREST call able to write a YouTube URL straight into video_url.
+--
+--   5) ENFORCEMENT — courses_publish_guard() refuses to publish a course whose
+--      video lessons are not upload-backed. togglePublished() flipped
+--      courses.published with zero validation.
+--
+--   6) OPS — the course-videos bucket's file_size_limit and allowed_mime_types
+--      are finally RE-ASSERTED. #15's `on conflict (id) do update set public =
+--      false` touched only `public`, so no file in this repo could correct a
+--      drifted bucket. Raised to 2 GiB and narrowed to video/mp4, in lockstep
+--      with src/lib/courseVideo.js.
+--
+-- ★ NOTHING HERE WIDENS ACCESS. Every change to a read path is a tightening:
+--   three fail-open branches become fail-closed, and one missing gate is added.
+--   Section 8 REMOVES a function; it adds none that anyone could call to see
+--   more than before.
+--
+-- ★ THIS FILE SUPERSEDES db/2026-08-17-three-plan-catalog.sql:221-290 for the
+--   private video bucket. That file is history and is deliberately left alone.
+--   Note the consequence for `npm run db:shadow:apply --all`: its filter picks
+--   up every dated file from db/2026-07-30 onward, so #39's dated copy runs
+--   AFTER this file's bootstrap fold and re-creates course_object_allowed() and
+--   reverts course_videos_read to its fail-open form — before this file's dated
+--   copy runs and puts both right again. The end state is correct, but there IS
+--   a window in the middle. That is acceptable on a shadow project and must
+--   never be how production is applied: in production, run dated files in
+--   #-order, once each.
+--
+-- Depends on: #2 (course platform), #9 (is_approved), #12/#13 (is_enrolled),
+--   #15 (the course-videos bucket), #19 (plan_is_sampler, courses.access_tier),
+--   #31 (schema_migrations), #35 (app_error), #39 (the current policy shape).
+-- HOW TO RUN: Supabase → SQL Editor → Run. IDEMPOTENT. Safe to re-run.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+
+-- == 1) Reference-based read authorization ===================================
+-- Replaces course_object_allowed()'s path parsing with the question that is
+-- actually true: is this object referenced by a PUBLISHED lesson the caller's
+-- plan may read? A malformed path, an orphan, and an object under a draft
+-- course now all resolve to FALSE structurally — an EXISTS over zero rows —
+-- rather than through a defensive branch someone can delete.
+--
+-- MIRRORS courses_read (db/2026-08-17-three-plan-catalog.sql:249-258). Drift
+-- here is a security bug. The policy keeps is_admin/is_approved/is_enrolled;
+-- this function owns `published` and the sampler tier rule.
+--
+-- SECURITY DEFINER is load-bearing, not stylistic: a sampler cannot SELECT the
+-- Mastery course row at all, so an invoker-rights version would find no row and
+-- fail OPEN — which is precisely how the function it replaces went wrong.
+--
+-- `language sql` because there is nothing to catch any more (the uuid cast that
+-- forced course_object_allowed into plpgsql is gone). Note it will NOT be
+-- inlined — SQL inlining requires prosecdef = false — so the gain is purely the
+-- per-call plpgsql executor setup, which matters if this is ever evaluated per
+-- row over a listing.
+--
+-- ★ p_is_sampler is a PERFORMANCE HINT the policy supplies so plan_is_sampler()
+--   is evaluated once per statement as an InitPlan instead of once per row. It
+--   defaults to NULL and coalesces to the real value, so a one-argument call is
+--   still correct. It is NOT an authorization input: the policy always passes
+--   the true value, so what a direct caller passes changes only what THAT
+--   caller is told, never what the policy computes.
+--
+-- ★ set search_path = public, pg_temp — naming pg_temp LAST is deliberate.
+--   When pg_temp is not named it is searched FIRST for relation names, so a
+--   user who can create a temp table could shadow an unqualified reference
+--   inside a SECURITY DEFINER body. Every reference below is schema-qualified
+--   as well, so this is belt and braces; keep both.
+create or replace function public.course_video_object_readable(
+  p_name       text,
+  p_is_sampler boolean default null
+)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select exists (
+    select 1
+      from public.course_lessons l
+      join public.courses c on c.id = l.course_id
+     where l.storage_path = p_name
+       and c.published = true
+       and ((not coalesce(p_is_sampler, public.plan_is_sampler()))
+            or (c.slug like 'qbo-%' and c.access_tier = 'essentials'))
+  )
+$fn$;
+
+comment on function public.course_video_object_readable(text, boolean) is
+  '#44: authorizes a course-videos object by REFERENCE, not by parsing its path. '
+  'True only when a published lesson the caller''s plan may read cites this exact '
+  'course_lessons.storage_path. Replaces course_object_allowed(), which failed OPEN '
+  'on an unparseable path, on an unknown course, and for every non-sampler plan, and '
+  'which mis-authorized duplicated courses because duplication reuses the SOURCE '
+  'course''s folder. MIRRORS courses_read — drift here is a security bug.';
+
+revoke all on function public.course_video_object_readable(text, boolean) from public, anon;
+-- Required, not optional: an RLS qual is evaluated AS THE QUERYING ROLE, so
+-- without this grant every non-admin read fails with "permission denied for
+-- function" rather than with a clean authorization denial.
+grant execute on function public.course_video_object_readable(text, boolean) to authenticated;
+
+
+-- == 2) The private-bucket read policy =======================================
+-- ALTER, not DROP+CREATE, for #39's reason: scripts/apply-db-files.mjs sends one
+-- statement per HTTP round trip, so a DROP+CREATE is a real window during which
+-- the private video bucket has NO read policy.
+--
+-- ★ is_approved() is ADDED here. course_videos_read was the only one of the four
+--   content-read policies without it. The tightening should be a no-op in
+--   practice — an unapproved member cannot read courses/modules/lessons, so they
+--   have no way to learn a storage_path — and the AFTER RUNNING block below has
+--   a query to confirm that before you rely on it.
+--
+-- ★ course_video_object_readable(name, ...) is deliberately NOT wrapped in
+--   (select ...). It takes a per-row argument, so a subselect would stay
+--   CORRELATED and become a per-row SubPlan — strictly worse, and it would
+--   destroy the OR short-circuit that lets an admin pay one is_admin() call for
+--   a whole listing. Same note as db/000_full_database_bootstrap.sql:2413.
+--   The zero-argument helpers around it ARE wrapped, so each is one InitPlan.
+alter policy course_videos_read on storage.objects
+  using (
+    bucket_id = 'course-videos'
+    and ((select public.is_admin())
+         or ((select public.is_approved())
+             and (select public.is_enrolled())
+             and public.course_video_object_readable(name, (select public.plan_is_sampler()))))
+  );
+
+comment on policy course_videos_read on storage.objects is
+  '#44: reference-based. An object is readable only while a published lesson the '
+  'caller may read cites its exact path. Orphans, malformed paths and draft-course '
+  'objects fail closed. Admins short-circuit before the per-object lookup.';
+
+
+-- == 3) The index that makes the lookup cheap ================================
+-- `storage_path = $1` implies `storage_path is not null` (the operator is
+-- strict), so the planner can prove the partial predicate is satisfied and will
+-- use this index. Contrast #43's lesson: community_posts_channel_feed_idx
+-- carried `where status='active'`, which the query did NOT imply, so the index
+-- was unusable and every feed page seq-scanned.
+create index if not exists course_lessons_storage_path_idx
+  on public.course_lessons (storage_path)
+  where storage_path is not null;
+
+comment on index public.course_lessons_storage_path_idx is
+  '#44: course_video_object_readable() and removeMediaIfUnreferenced() both look a '
+  'storage object up by its exact path. Partial because most lessons have none.';
+
+
+-- == 4) A lesson may not BECOME link-backed ==================================
+-- SECURITY DEFINER is mandatory, not stylistic: public.app_error is
+-- `revoke all ... from public, anon, authenticated` and is SECURITY INVOKER, so
+-- a definer-less trigger would fail with "permission denied for function
+-- app_error" on every refusal it tried to raise.
+create or replace function public.course_lessons_video_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+declare
+  v_new_link  boolean;
+  v_old_link  boolean;
+  v_override  boolean;
+  v_published boolean;
+begin
+  -- Break-glass, #38's shape. Gated on OWNERSHIP of course_lessons, not on
+  -- rolsuper: Supabase's `postgres` is not a superuser, so a superuser gate
+  -- would be unreachable on the one database that needs it. PostgREST connects
+  -- as `authenticator`, which is not a member of the owner, so the API can never
+  -- reach this — it only makes a deliberate hand-fix explicit.
+  --   begin;
+  --     set local app.lesson_video_override = 'on';
+  --     update public.course_lessons set ... where id = ...;
+  --   commit;
+  v_override := coalesce(current_setting('app.lesson_video_override', true), '') = 'on'
+    and pg_has_role(session_user,
+                    (select c.relowner from pg_class c
+                       join pg_namespace n on n.oid = c.relnamespace
+                      where n.nspname = 'public' and c.relname = 'course_lessons'),
+                    'member');
+  if v_override then
+    return new;
+  end if;
+
+  -- ★ "Link-backed" is derived from video_url, NEVER from video_provider.
+  --   CourseProgram.saveLesson re-derives the provider from the URL on every
+  --   save via parseVideoUrl(), whose YouTube pattern requires exactly 11 word
+  --   characters — so a legacy row it can no longer parse (youtube.com/live/...,
+  --   music.youtube.com, an extra path segment) silently flips 'youtube' to
+  --   'mp4' on a TITLE-ONLY edit. A provider-equality rule would refuse that
+  --   edit forever, from a guard that only ever meant to stop NEW links, and the
+  --   admin would have no way to fix it from the UI.
+  v_new_link := new.type = 'video'
+    and coalesce(new.video_provider, '') <> 'upload'
+    and nullif(btrim(coalesce(new.video_url, '')), '') is not null;
+
+  v_old_link := tg_op = 'UPDATE'
+    and old.type = 'video'
+    and coalesce(old.video_provider, '') <> 'upload'
+    and nullif(btrim(coalesce(old.video_url, '')), '') is not null;
+
+  -- MONOTONIC on video_url: refuse the transition INTO link-backed, and refuse
+  -- RE-POINTING an existing one at a different URL. Everything else a legacy row
+  -- needs stays legal — editing its title, letting video_provider drift (which
+  -- saveLesson used to do on every write), clearing the link, replacing it with an
+  -- upload, being reordered.
+  --
+  -- ★ The comparison is on video_url and NEVER on video_provider. saveLesson
+  --   re-derived the provider from the URL on every single save via parseVideoUrl(),
+  --   whose YouTube pattern requires exactly 11 word characters — so a stored
+  --   'youtube' row whose URL it no longer recognises (youtube.com/live/…, an extra
+  --   path segment) silently became 'mp4' on a TITLE-ONLY edit. Comparing providers
+  --   would have refused that edit forever, from a guard that only ever meant to
+  --   stop NEW links, and the admin would have had no way to fix it from the UI.
+  if v_new_link and (not v_old_link or new.video_url is distinct from old.video_url) then
+    if tg_op = 'UPDATE' then
+      perform public.app_error('LESSON_VIDEO_UPLOAD_ONLY',
+        'lesson videos must be uploaded to the private course-videos bucket — YouTube, Vimeo and direct-link lessons are no longer accepted',
+        409, jsonb_build_object('lesson_id', new.id, 'course_id', new.course_id));
+    else
+      -- ★ On INSERT this bites only a PUBLISHED course. It must not bite a draft,
+      --   because CourseCatalog.duplicateCourse bulk-inserts lessons copying
+      --   video_provider/video_url verbatim into a published:false copy — and its
+      --   catch block DELETES the half-built course. An unconditional INSERT
+      --   prohibition would therefore turn "duplicate a pre-#44 course" into
+      --   silent destruction of the admin's new course, its modules and every
+      --   lesson already copied. A link sitting in a draft harms nobody; section
+      --   5 is what stops it reaching a student.
+      select c.published into v_published from public.courses c where c.id = new.course_id;
+      if coalesce(v_published, false) then
+        perform public.app_error('LESSON_VIDEO_UPLOAD_ONLY',
+          'a published course cannot take a link-backed video lesson — upload the video file instead',
+          409, jsonb_build_object('lesson_id', new.id, 'course_id', new.course_id));
+      end if;
+    end if;
+  end if;
+
+  -- An upload-backed row must name a real lessons/<uuid>/<file> object.
+  -- ★ Checked ONLY when storage_path actually changes: CourseProgram.moveLesson
+  --   updates position alone, and in a BEFORE UPDATE trigger NEW still carries
+  --   the old path — so an unconditional check would make a legacy or
+  --   hand-repaired non-conforming row permanently unreorderable.
+  -- ★ The uuid is deliberately NOT pinned to new.course_id. Duplication is
+  --   copy-on-write and legitimately reuses the SOURCE course's folder, which is
+  --   the entire reason removeMediaIfUnreferenced() exists.
+  if new.video_provider = 'upload'
+     and (tg_op = 'INSERT' or new.storage_path is distinct from old.storage_path) then
+    if coalesce(new.storage_path, '') !~ '^lessons/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/.+' then
+      perform public.app_error('LESSON_VIDEO_PATH_INVALID',
+        'an uploaded lesson video must live at lessons/<course-uuid>/<file> in the course-videos bucket',
+        422, jsonb_build_object('lesson_id', new.id));
+    end if;
+  end if;
+
+  return new;
+end;
+$fn$;
+
+comment on function public.course_lessons_video_guard() is
+  '#44: a lesson may not BECOME link-backed. Monotonic on video_url — never on '
+  'video_provider, which saveLesson re-derives from the URL on every write. On INSERT '
+  'it fires only for a published course, so duplicating a pre-#44 course cannot trip '
+  'the client rollback that deletes the half-built copy.';
+
+drop trigger if exists course_lessons_video_guard on public.course_lessons;
+create trigger course_lessons_video_guard
+  before insert or update on public.course_lessons
+  for each row execute function public.course_lessons_video_guard();
+
+
+-- == 5) A course may not be PUBLISHED with unplayable video lessons ==========
+-- The preflight the UI calls before offering to publish. Admin-gated inside the
+-- body so a SECURITY DEFINER function cannot become a content oracle.
+--
+-- "video lesson" is NOT `type='video'` alone. saveLesson explicitly permits a
+-- video-typed lesson whose only content is text_content, written with all three
+-- video columns null; treating those as blockers would permanently un-publish
+-- every course containing one.
+create or replace function public.course_publish_blockers(p_course_id uuid)
+returns table (lesson_id uuid, module_id uuid, title text, reason text)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select l.id, l.module_id, l.title,
+         case when l.video_provider = 'upload' then 'upload_missing_file'
+              else 'external_link' end
+    from public.course_lessons l
+   where public.is_admin()
+     and l.course_id = p_course_id
+     and l.type = 'video'
+     and (
+       (coalesce(l.video_provider, '') <> 'upload'
+        and nullif(btrim(coalesce(l.video_url, '')), '') is not null)
+       or (l.video_provider = 'upload' and l.storage_path is null)
+     )
+   order by l.position, l.id
+$fn$;
+
+comment on function public.course_publish_blockers(uuid) is
+  '#44: the lessons stopping a course from being published — a link-backed video, or '
+  'an upload row with no file. Admin-gated inside the body. The UI preflight; '
+  'courses_publish_guard is the boundary.';
+
+revoke all on function public.course_publish_blockers(uuid) from public, anon;
+grant execute on function public.course_publish_blockers(uuid) to authenticated;
+
+create or replace function public.courses_publish_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+declare
+  v_n int;
+begin
+  -- No state test here on purpose: the trigger's WHEN clause has already
+  -- narrowed this to the false -> true transition. Testing state instead
+  -- (new.published = true) would refuse EVERY unrelated update on an
+  -- already-published course — reorderCourse (which fires N updates in a
+  -- Promise.all and would leave positions inconsistent on a partial failure),
+  -- uploadCover, setCourseTier, saveCourseMeta and the AI-trainer toggle all
+  -- write to a published row without touching `published`.
+  select count(*) into v_n
+    from public.course_lessons l
+   where l.course_id = new.id
+     and l.type = 'video'
+     and (
+       (coalesce(l.video_provider, '') <> 'upload'
+        and nullif(btrim(coalesce(l.video_url, '')), '') is not null)
+       or (l.video_provider = 'upload' and l.storage_path is null)
+     );
+  if v_n > 0 then
+    perform public.app_error('COURSE_PUBLISH_BLOCKED',
+      format('%s lesson(s) still play from an external link or have no uploaded file — upload their videos before publishing', v_n),
+      409, jsonb_build_object('course_id', new.id, 'blockers', v_n));
+  end if;
+  return new;
+end;
+$fn$;
+
+comment on function public.courses_publish_guard() is
+  '#44: refuses to publish a course with a link-backed or file-less video lesson. '
+  'SECURITY DEFINER so it counts lessons RLS would hide from it in a draft course.';
+
+drop trigger if exists courses_publish_guard on public.courses;
+create trigger courses_publish_guard
+  before update on public.courses
+  for each row
+  when (new.published and not old.published)
+  execute function public.courses_publish_guard();
+
+
+-- == 6) The error codes, re-listed in full ===================================
+-- app_error_catalog() is replaced wholesale every time, so every existing code
+-- must be repeated. Keep in lockstep with APP_ERROR_CODES and APP_ERROR_COPY in
+-- src/lib/appErrors.js. Copied from #40 plus the three #44 codes.
+create or replace function public.app_error_catalog()
+returns table (code text, http int, summary text)
+language sql
+immutable
+parallel safe
+set search_path = public
+as $cat$
+  select * from (values
+    ('BATCH_REQUIRED',               422, 'A VIP action needs an explicit batch; none was supplied.'),
+    ('BATCH_NOT_FOUND',              404, 'The batch id or month code does not exist.'),
+    ('BATCH_CLOSED',                 409, 'The batch is closed to new assignments, or archived.'),
+    ('BATCH_FULL',                   409, 'A cohort in the run has no seats left.'),
+    ('NO_SPACE_FOR_SEGMENT',         409, 'The batch has no active community space for that plan segment.'),
+    ('INVALID_BATCH_CODE',           422, 'Not a real YYYY-MM month.'),
+    ('ENTITLEMENT_EXPIRED',          403, 'The membership term (or its grace) has ended.'),
+    ('INVALID_PLAN',                 422, 'Unknown, inactive, or non-premium plan for this action.'),
+    ('ALREADY_ENTITLED',             409, 'The member already holds an outstanding seat in that cohort.'),
+    ('RUN_LIMIT_EXCEEDED',           409, 'Outstanding seats would exceed the per-member ceiling.'),
+    ('SEGMENT_MISMATCH',             409, 'The grant would mix cohort segments in one outstanding run.'),
+    ('INVALID_MEMBERSHIP_TRANSITION',409, 'The current membership state does not allow this transition.'),
+    ('IMMUTABLE_ENTITLEMENT',        409, 'An attempt to rewrite a frozen ledger column.'),
+    ('FORBIDDEN',                    403, 'Admin-only operation called by a non-admin.'),
+    ('REQUEST_NOT_FOUND',            404, 'The enrollment request does not exist.'),
+    ('COURSE_ACCESS_DENIED',         403, 'Course hidden by plan scope, publication, or cohort entitlement.'),
+    ('LESSON_NOT_RELEASED',          403, 'The cohort drip has not unlocked this lesson yet.'),
+    ('COMMUNITY_ACCESS_DENIED',      403, 'The community write was refused.'),
+    ('COMMENT_PERMISSION_DENIED',    403, 'Replies are off in this channel.'),
+    ('ASSIGNMENT_CLOSED',            409, 'Past the due date, or the assignment is unpublished.'),
+    ('SUBMISSION_LOCKED',            409, 'The submission is handed in or graded; edits refused.'),
+    ('COURSE_HAS_SUBMISSIONS',       409, 'The course has graded assignment work and cannot be deleted.'),
+    ('BATCH_PAST',                   409, 'The batch period has elapsed in its own timezone; it is read-only.'),
+    ('BATCH_CODE_TAKEN',             409, 'Another batch already uses that month code.'),
+    ('BATCH_CODE_REORDER',           409, 'The new code would move the batch past a sibling and reorder members'' runs.'),
+    ('BATCH_PERIOD_PAST',            422, 'The requested period has already ended; a batch cannot be edited into the past.'),
+    ('BATCH_PERIOD_INVALID',         422, 'The end date falls before the start date, or a date is missing.'),
+    ('BATCH_TIMEZONE_INVALID',       422, 'Not a timezone Postgres recognises (see pg_timezone_names).'),
+    ('BATCH_CAPACITY_BELOW_OCCUPANCY',409,'The new capacity is below the seats already sold in that segment.'),
+    ('CHANNEL_NOT_FOUND',            404, 'The channel does not exist, or is not available to you.'),
+    ('CHANNEL_SLUG_TAKEN',           409, 'Another channel in this space already uses that address.'),
+    ('CHANNEL_AUDIENCE_EMPTY',       422, 'The audience needs at least one plan or batch, or nobody could see it.'),
+    ('CHANNEL_ARCHIVED',             409, 'The channel is archived and accepts no new content.'),
+    ('CATEGORY_NOT_FOUND',           404, 'The channel category does not exist.'),
+    ('CATEGORY_NOT_EMPTY',           409, 'The category still holds active channels.'),
+    ('LESSON_VIDEO_UPLOAD_ONLY',     409, 'A lesson video must be an uploaded file in the private bucket; external links are no longer accepted.'),
+    ('LESSON_VIDEO_PATH_INVALID',    422, 'An uploaded lesson video must live at lessons/<course-uuid>/<file>.'),
+    ('COURSE_PUBLISH_BLOCKED',       409, 'The course still has video lessons with no uploaded file.')
+  ) as t(code, http, summary);
+$cat$;
+
+revoke all on function public.app_error_catalog() from public, anon;
+grant execute on function public.app_error_catalog() to authenticated;
+
+
+-- == 7) Re-assert the bucket =================================================
+-- ★ #15 wrote `on conflict (id) do update set public = false` and nothing else,
+--   so file_size_limit and allowed_mime_types have been write-once since the
+--   bucket was created and NO file in this repo could correct a drift. Every
+--   other bucket in the project (enrollment-receipts, community-media, avatars)
+--   re-asserts both. This one now does too.
+--
+-- ★ allowed_mime_types is consulted ONLY on upload (storage-api's
+--   validateMimeType, on the upload paths). GET /object, GET /object/sign,
+--   createSignedUrl, copy and move never consult it, so narrowing to video/mp4
+--   does NOT make an existing .mov or .webm object unreadable — it only refuses
+--   NEW non-MP4 uploads. That is exactly the intent, and it lands in the same
+--   change as the client's own mp4-only accept list (src/lib/courseVideo.js).
+--
+-- ★ file_size_limit is a CEILING, not a grant: storage-api enforces
+--   min(bucket limit, project-wide upload limit). Raising it here does nothing
+--   until the project limit is raised in Dashboard → Storage → Settings. See
+--   AFTER RUNNING.
+do $blk$
+begin
+  insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+  values ('course-videos', 'course-videos', false, 2147483648, array['video/mp4'])
+  on conflict (id) do update
+    set public             = false,
+        file_size_limit    = excluded.file_size_limit,
+        allowed_mime_types = excluded.allowed_mime_types;
+exception
+  when insufficient_privilege then
+    raise notice 'Could not update course-videos from SQL. In Dashboard → Storage → course-videos → Settings, set Public = OFF, the file size limit to 2 GB, and allowed MIME types to video/mp4.';
+end
+$blk$;
+
+
+-- == 8) Retire the fail-open path parser =====================================
+-- ★ AFTER section 2, and with NO CASCADE, on purpose. ALTER POLICY records a
+--   pg_depend entry on the function its USING clause names, so while
+--   course_videos_read still referenced course_object_allowed this DROP would
+--   ERROR and stop the file — rather than silently stripping a read policy.
+--   Same safety property #39 relies on when it drops plan_is_qbo_only().
+drop function if exists public.course_object_allowed(text);
+
+
+-- == 9) Refresh PostgREST ====================================================
+-- course_publish_blockers() is a new RPC the client calls by name.
+notify pgrst, 'reload schema';
+
+
+insert into public.schema_migrations (filename, checksum, notes) values
+ ('2026-08-24-course-video-upload-only.sql', null,
+  'course video upload-only (#44): replaces course_object_allowed() — which parsed '
+  'the object path and failed OPEN on an unparseable path, an unknown course and '
+  'every non-sampler plan, ignored courses.published, and mis-authorized duplicated '
+  'courses that share a storage_path — with reference-based '
+  'course_video_object_readable(); adds the missing is_approved() conjunct to '
+  'course_videos_read; indexes course_lessons.storage_path; adds '
+  'course_lessons_video_guard (a lesson may not BECOME link-backed, monotonic on '
+  'video_url and published-gated on INSERT so duplication cannot trip the client '
+  'rollback) and courses_publish_guard (delta-scoped by a WHEN clause so unrelated '
+  'updates to a published course still work) plus the course_publish_blockers() '
+  'preflight; re-asserts the course-videos bucket at 2 GiB / video/mp4, which #15 '
+  'never re-applied; three new app_error codes.')
+on conflict (filename) do nothing;
+
+-- ── AFTER RUNNING ────────────────────────────────────────────────────────────
+--   -- 1) The policy is reference-based and finally checks approval.
+--   select qual from pg_policies
+--    where schemaname='storage' and policyname='course_videos_read';
+--     -- expect course_video_object_readable + is_approved + is_enrolled
+--
+--   -- 2) The fail-open parser is gone.
+--   select to_regprocedure('public.course_object_allowed(text)') is null as dropped;
+--
+--   -- 3) The publish guard is DELTA-scoped, not state-scoped.
+--   select pg_get_triggerdef(oid) from pg_trigger
+--    where tgrelid='public.courses'::regclass and tgname='courses_publish_guard';
+--     -- expect a WHEN clause naming old.published
+--
+--   -- 4) Adding is_approved() to the storage policy should be a no-op. Confirm:
+--   select count(*) from public.profiles p
+--    where public.user_is_enrolled(p.id) and not public.user_is_approved(p.id);
+--     -- expect 0. A non-zero count means some enrolled members are unapproved;
+--     -- they could not read a lesson row anyway, but check before relying on it.
+--
+--   -- 5) LEGACY INVENTORY — read-only. Run all five BEFORE changing any data.
+--   --    (a) External-link lessons: what can no longer be published.
+--   select c.slug, c.published, l.title, l.video_provider, l.video_url
+--     from public.course_lessons l join public.courses c on c.id = l.course_id
+--    where l.type='video' and coalesce(l.video_provider,'') <> 'upload'
+--      and nullif(btrim(coalesce(l.video_url,'')),'') is not null
+--    order by c.published desc, c.slug;
+--
+--   --    (b) Upload lessons whose object is MISSING from the private bucket.
+--   select c.slug, c.published, l.title, l.storage_path,
+--          (o.id is not null) as object_present, o.metadata->>'mimetype' as mimetype
+--     from public.course_lessons l join public.courses c on c.id = l.course_id
+--     left join storage.objects o on o.bucket_id='course-videos' and o.name=l.storage_path
+--    where l.video_provider='upload' order by object_present, c.slug;
+--
+--   --    (c) Lessons still served from the PUBLIC course-media bucket. These are
+--   --        the ones SignedLessonVideo silently fell back to a public URL for,
+--   --        i.e. world-readable today. Move them before shipping the client.
+--   select c.slug, c.published, l.title, l.storage_path,
+--          (media.id is not null) as in_course_media
+--     from public.course_lessons l join public.courses c on c.id = l.course_id
+--     left join storage.objects media on media.bucket_id='course-media' and media.name=l.storage_path
+--     left join storage.objects vid   on vid.bucket_id='course-videos' and vid.name=l.storage_path
+--    where l.storage_path is not null and vid.id is null
+--    order by in_course_media desc, c.published desc;
+--
+--   --    (d) Paths shared by more than one course — the duplicate fan-out the
+--   --        new policy exists to authorize correctly.
+--   select l.storage_path, count(*) as refs,
+--          array_agg(distinct c.slug order by c.slug) as courses,
+--          array_agg(distinct c.access_tier) as tiers
+--     from public.course_lessons l join public.courses c on c.id = l.course_id
+--    where l.storage_path is not null
+--    group by l.storage_path having count(*) > 1 order by refs desc;
+--
+--   --    (e) Orphan objects — readable by any enrolled member before #44,
+--   --        unreadable by non-admins after it.
+--   select o.name, o.created_at, (o.metadata->>'size')::bigint as bytes
+--     from storage.objects o
+--    where o.bucket_id='course-videos'
+--      and not exists (select 1 from public.course_lessons l where l.storage_path=o.name)
+--    order by o.created_at;
+--
+--   -- 6) MANUAL, and the 2 GiB limit does nothing without it:
+--   --    Dashboard → Storage → Settings → raise the project-wide upload limit to
+--   --    at least 2 GB (needs a paid plan; the free tier caps at 50 MB).
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- §32) FOLDED VERBATIM — 2026-08-25-staff-authorization.sql   (#45)
+-- ═════════════════════════════════════════════════════════════════════════════
+-- Appended at the tail for the same reason as §19-§31: the earlier sections
+-- create the pre-#45 shapes, and this file's DROP+CREATE must win on a fresh
+-- install. The file is idempotent and self-guarded, so appending reproduces the
+-- live end state exactly. RE-FOLD whenever the dated file changes.
+--
+-- Its `do $pre$ … $pre$;` preflight is omitted: the bootstrap creates every
+-- dependency itself, above, in order.
+-- ═════════════════════════════════════════════════════════════════════════════
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- #45 — Staff authorization: Super Admin / Operations Admin / Trainer.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHAT THIS REPLACES
+--   Authorization in this product is one boolean. profiles.is_admin drives
+--   public.is_admin(), which appears 295 times in the bootstrap and across ~38
+--   dated migrations, plus 145 frontend checks and four hand-rolled copies of the
+--   same API gate. Every admin can therefore approve payments, author and delete
+--   courses, manage batches, import students, moderate the community and edit
+--   global settings. There is no way to hire a Trainer.
+--
+-- ★ THE DESIGN DECISION THAT MAKES THIS SAFE, AND THE ONE THING TO UNDERSTAND
+--   BEFORE EDITING ANYTHING BELOW.
+--
+--   This file does NOT rewrite those 295 references. is_admin() is left exactly
+--   as it was. What changes is the MEANING of the column it reads:
+--
+--       profiles.is_admin  ==  "has an ACTIVE super_admin staff membership"
+--
+--   and that column stops being an input. It becomes a cache, written only by the
+--   trigger in section 7, with UPDATE revoked from every client role in section
+--   10. Every legacy is_admin() check therefore keeps working and silently
+--   narrows to Super-Admin-only, including the ~20 SECURITY DEFINER bodies that
+--   read the p.is_admin COLUMN directly rather than calling the function
+--   (user_community_capabilities, trainer_visible_courses, my_community_sidebar,
+--   batch_entitlements_guard, search_community_members, …).
+--
+--   Operations Admins and Trainers carry is_admin = false and reach their
+--   features ONLY through has_staff_permission(). So a legacy check we failed to
+--   find UNDER-grants — a broken Ops feature, loud and reported — instead of
+--   over-granting. That direction is the entire safety argument. Do not "fix" a
+--   missed check by handing a non-super role is_admin = true.
+--
+-- ★ TWO PLACES REALLY DID NEED CHANGING, and both are fixed here.
+--
+--   Section 11 fixes batch_entitlements_guard(), which asserts "granted_by must
+--   be an admin" by reading profiles.is_admin. An Operations Admin approving a
+--   VIP enrollment has is_admin = false, so grant_batch_run(…, auth.uid(), true)
+--   — called from admin_finalize_enrollment — would fail with FORBIDDEN.
+--
+--   Section 15 fixes the larger one, which the first draft of this file missed
+--   entirely: admin_finalize_enrollment(), approve_subscription(),
+--   approve_extension(), expire_overdue_subscriptions() and the eight admin_*
+--   batch RPCs each opened with `if not public.is_admin()`. auth.uid() is
+--   unchanged inside a SECURITY DEFINER chain, so an Operations Admin was refused
+--   at the FIRST line and never reached section 11's fix at all. Section 15
+--   re-gates all eleven onto has_staff_permission(), along with the fourteen RLS
+--   policies and the one storage policy those same screens read.
+--
+-- ★ ONE THING IS DELIBERATELY NOT FIXED HERE, BECAUSE IT IS A CLIENT CHANGE.
+--   Section 10 drops profiles_admin_update and revokes UPDATE on profiles, but a
+--   pre-#45 Access Requests screen still issues a direct profiles.update().
+--   PostgREST answers a policy-filtered UPDATE with ZERO ROWS AND NO ERROR, so
+--   approving a signup would silently do nothing while reporting success.
+--   Sections 10 and 15d add admin_review_access_request() and
+--   admin_access_request_queue() to replace that write and its companion read.
+--   ⇒ DEPLOY THE MATCHING CLIENT BUILD IN THE SAME RELEASE AS THIS MIGRATION.
+--
+-- ORDERING INSIDE THIS FILE IS LOAD-BEARING:
+--   tables → seed → BACKFILL existing admins → ASSERT one survives → helpers →
+--   RLS → the is_admin cache trigger → guards → RPCs → the profiles lockdown.
+--   The backfill must precede the assert or the file fails on every real
+--   database; the assert must precede the lockdown or a mistake is unrecoverable
+--   from the client.
+--
+-- Depends on: #1 (profiles), #2 (is_admin), #9 (approval columns), #12/#13
+--   (enrollment + subscriptions), #31 (schema_migrations), #35 (app_error).
+--
+-- HOW TO RUN: paste into the Supabase dashboard → SQL Editor → Run.
+-- IDEMPOTENT (create … if not exists / create or replace / drop … if exists /
+--   on conflict) — safe to re-run.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+
+-- == 0) Preflight ============================================================
+-- schema_migrations first: without it the tail insert aborts the whole file.
+
+
+-- == 1) Tables ===============================================================
+-- Three lookup tables + one membership row per staff user + an append-only
+-- event ledger.
+--
+-- ★ ONE membership row per user (unique on user_id), mutated in place. History
+--   lives in staff_role_events, which is never updated or deleted. That keeps
+--   the hot authorization lookup a single indexed row rather than a
+--   "most recent row wins" scan inside every RLS evaluation.
+
+create table if not exists public.staff_roles (
+  key          text primary key,
+  label        text not null,
+  rank         integer not null,
+  is_protected boolean not null default false,
+  description  text,
+  created_at   timestamptz not null default now()
+);
+
+comment on table public.staff_roles is
+  '#45: fixed role templates. `rank` orders the UI and answers promotion-vs-demotion; '
+  'it is NEVER an authorization input — staff_role_permissions is. `is_protected` marks '
+  'the role the last-Super-Admin guard defends.';
+
+create table if not exists public.staff_permissions (
+  key         text primary key,
+  category    text not null,
+  label       text not null,
+  description text,
+  created_at  timestamptz not null default now()
+);
+
+comment on table public.staff_permissions is
+  '#45: the capability vocabulary. Mirrored by STAFF_PERMISSIONS in '
+  'src/lib/staffRoles.js and pinned by test/staffRolesSql.test.mjs.';
+
+create table if not exists public.staff_role_permissions (
+  role_key       text not null references public.staff_roles(key)       on delete cascade,
+  permission_key text not null references public.staff_permissions(key) on delete cascade,
+  primary key (role_key, permission_key)
+);
+
+comment on table public.staff_role_permissions is
+  '#45: THE matrix. has_staff_permission() reads this table, so an operator may grant '
+  'a capability here in SQL and the client will honour it (normalizeStaffContext prefers '
+  'the server''s permission list over its local copy).';
+
+create table if not exists public.staff_memberships (
+  id                uuid primary key default gen_random_uuid(),
+  user_id           uuid not null unique references auth.users(id) on delete cascade,
+  role_key          text not null references public.staff_roles(key),
+  status            text not null default 'invited'
+                    check (status in ('invited', 'active', 'suspended', 'revoked')),
+  display_title     text,
+  invited_by        uuid references auth.users(id) on delete set null,
+  invited_at        timestamptz,
+  activated_at      timestamptz,
+  suspended_at      timestamptz,
+  revoked_at        timestamptz,
+  suspension_reason text,
+  created_at        timestamptz not null default now(),
+  updated_at        timestamptz not null default now()
+);
+
+comment on table public.staff_memberships is
+  '#45: one row per staff user. ONLY status = ''active'' confers authority — '
+  '''invited'' (has not accepted yet), ''suspended'' and ''revoked'' confer none, which is '
+  'what makes a suspension take effect on the very next request rather than on the next '
+  'JWT refresh. No client write policy: every write goes through an admin_* RPC so the '
+  'staff_role_events row cannot be bypassed.';
+
+create table if not exists public.staff_role_events (
+  id             bigint generated always as identity primary key,
+  actor_user_id  uuid references auth.users(id) on delete set null,
+  actor_email    text,
+  target_user_id uuid references auth.users(id) on delete set null,
+  target_email   text,
+  action         text not null
+                 check (action in ('bootstrap', 'invite', 'assign', 'role_change',
+                                   'suspend', 'reactivate', 'revoke')),
+  from_role_key  text,
+  to_role_key    text,
+  from_status    text,
+  to_status      text,
+  reason         text,
+  source         text not null default 'admin_ui'
+                 check (source in ('admin_ui', 'bootstrap_script', 'migration', 'sql')),
+  metadata       jsonb not null default '{}'::jsonb,
+  created_at     timestamptz not null default now()
+);
+
+comment on table public.staff_role_events is
+  '#45: append-only audit ledger. The actor/target FKs are ON DELETE SET NULL and the '
+  'emails are denormalized SNAPSHOTS, so deleting an Auth user can never destroy the '
+  'record of what they were granted or who granted it. Never add an update or delete policy.';
+
+
+-- == 2) Seed the roles, permissions and the matrix ===========================
+-- ★ Mirrored EXACTLY by src/lib/staffRoles.js. test/staffRolesSql.test.mjs reads
+--   both files as text and fails on any divergence, in this file AND in the
+--   bootstrap fold. Change one, change all three.
+--
+-- ★ `on conflict do update` on the lookup rows so a re-run refreshes copy, but
+--   the matrix is `do nothing` and there is deliberately NO delete-what-is-not-
+--   seeded pass: an operator who grants a capability in SQL has made a decision,
+--   and re-running a migration must not silently revoke it.
+
+insert into public.staff_roles (key, label, rank, is_protected, description) values
+  ('super_admin',      'Super Admin',      100, true,  'Complete product authority, including staff management and the audit trail.'),
+  ('operations_admin', 'Operations Admin',  50, false, 'Reviews access requests and payment proofs, grants courses, and runs batches and imports.'),
+  ('trainer',          'Trainer',           20, false, 'Creates courses and edits the ones assigned to them. No access to payments or students.')
+on conflict (key) do update
+  set label = excluded.label,
+      rank = excluded.rank,
+      is_protected = excluded.is_protected,
+      description = excluded.description;
+
+insert into public.staff_permissions (key, category, label, description) values
+  ('staff.manage',             'Staff',     'Invite and manage staff',        'Invite staff, assign and change roles, suspend and revoke access.'),
+  ('staff.audit.read',         'Staff',     'View the staff audit trail',     'Read the full history of role assignments, suspensions and revocations.'),
+  ('access_requests.review',   'Students',  'Review account access requests', 'Approve or reject new account signups.'),
+  ('enrollments.review',       'Students',  'Review payment proofs',          'Approve or reject enrollment, renewal, upgrade and extension requests.'),
+  ('students.assign_courses',  'Students',  'Choose granted courses',         'Select which plan-eligible course programs an approval grants.'),
+  ('students.extend_access',   'Students',  'Grant special extensions',       'Extend a membership expiry outside the paid request flow. Always audited.'),
+  ('students.import',          'Students',  'Import students',                'Run the Thinkific migration wizard and issue invitations.'),
+  ('batches.manage',           'Students',  'Manage cohort batches',          'Create, edit, close and archive batches, and assign members to them.'),
+  ('courses.create',           'Courses',   'Create courses',                 'Create a new draft course and duplicate an existing one.'),
+  ('courses.manage_assigned',  'Courses',   'Edit assigned courses',          'Edit the modules, lessons and videos of courses assigned to you.'),
+  ('courses.manage_all',       'Courses',   'Edit every course',              'Edit any course, whether or not it is assigned to you.'),
+  ('courses.publish',          'Courses',   'Publish and unpublish courses',  'Make a course visible to students, or withdraw it.'),
+  ('courses.delete',           'Courses',   'Delete courses',                 'Permanently delete a course and its unreferenced media.'),
+  ('course_trainer.manage',    'Courses',   'Manage AI trainer indexing',     'Enable, sync, transcribe and preview the AI course trainer.'),
+  ('community.manage',         'Community', 'Configure the community',        'Create and edit channels, categories and audience rules.'),
+  ('community.moderate',       'Community', 'Moderate the community',         'Pin, lock, hide and hard-delete posts and replies.'),
+  ('sidebar.customize',        'Settings',  'Customize navigation labels',    'Rename stages, groups and tabs for every user in the app.'),
+  ('payment_settings.manage',  'Settings',  'Edit payment settings',          'Change the manual-payment instructions and the notification address.')
+on conflict (key) do update
+  set category = excluded.category,
+      label = excluded.label,
+      description = excluded.description;
+
+-- THE matrix: 18 + 5 + 3 = 26 grants.
+--
+-- ★ operations_admin deliberately does NOT hold students.extend_access. A
+--   discretionary extension creates paid access with no payment behind it, so it
+--   stays with the role that owns the money. Ops Admins extend access the normal
+--   way, by approving an extension REQUEST, which carries a receipt.
+-- ★ trainer deliberately does NOT hold courses.publish or courses.delete.
+--   Publishing exposes content to every paying student and is what #44's
+--   courses_publish_guard exists to gate; deleting removes storage objects that a
+--   DUPLICATED course may still reference by path, since duplication reuses the
+--   source course's files by reference rather than copying them.
+insert into public.staff_role_permissions (role_key, permission_key) values
+  ('super_admin', 'staff.manage'),
+  ('super_admin', 'staff.audit.read'),
+  ('super_admin', 'access_requests.review'),
+  ('super_admin', 'enrollments.review'),
+  ('super_admin', 'students.assign_courses'),
+  ('super_admin', 'students.extend_access'),
+  ('super_admin', 'students.import'),
+  ('super_admin', 'batches.manage'),
+  ('super_admin', 'courses.create'),
+  ('super_admin', 'courses.manage_assigned'),
+  ('super_admin', 'courses.manage_all'),
+  ('super_admin', 'courses.publish'),
+  ('super_admin', 'courses.delete'),
+  ('super_admin', 'course_trainer.manage'),
+  ('super_admin', 'community.manage'),
+  ('super_admin', 'community.moderate'),
+  ('super_admin', 'sidebar.customize'),
+  ('super_admin', 'payment_settings.manage'),
+  ('operations_admin', 'access_requests.review'),
+  ('operations_admin', 'enrollments.review'),
+  ('operations_admin', 'students.assign_courses'),
+  ('operations_admin', 'students.import'),
+  ('operations_admin', 'batches.manage'),
+  ('trainer', 'courses.create'),
+  ('trainer', 'courses.manage_assigned'),
+  ('trainer', 'course_trainer.manage')
+on conflict do nothing;
+
+
+-- == 3) Backfill: every existing admin becomes an active Super Admin =========
+-- ★ THIS IS THE LOCKOUT GUARD, and it must run before section 4.
+--   is_admin() still reads profiles.is_admin at this point, so nothing has
+--   changed behaviourally yet. What this does is give every account that
+--   currently HAS that flag a real membership, so that when section 7 makes the
+--   column a derived cache, the same people keep the same access.
+--
+--   Deliberately `do nothing` on conflict: on a re-run, an account that has since
+--   been demoted from the UI has is_admin = false and is not selected here, so a
+--   demotion is never silently undone.
+insert into public.staff_memberships (user_id, role_key, status, activated_at, invited_at)
+select p.id, 'super_admin', 'active', now(), now()
+  from public.profiles p
+ where p.is_admin = true
+on conflict (user_id) do nothing;
+
+insert into public.staff_role_events
+  (actor_user_id, target_user_id, target_email, action, to_role_key, to_status, reason, source)
+select null, m.user_id, p.email, 'bootstrap', 'super_admin', 'active',
+       'Migrated from profiles.is_admin by #45.', 'migration'
+  from public.staff_memberships m
+  join public.profiles p on p.id = m.user_id
+ where m.role_key = 'super_admin'
+   and not exists (
+     select 1 from public.staff_role_events e
+      where e.target_user_id = m.user_id and e.action = 'bootstrap'
+   );
+
+
+-- == 4) Refuse to continue with no active Super Admin ========================
+-- Super Admin is the only role that can create another Super Admin. If this file
+-- completed with zero of them, nobody could manage staff, courses or settings and
+-- the only way back would be the break-glass script. Fail loudly instead.
+--
+-- ★ GUARDED ON `profiles` BEING NON-EMPTY, and that is not a softening — it is
+--   what lets this file be folded into 000_full_database_bootstrap.sql verbatim.
+--   A fresh install runs the bootstrap against a database with no auth users at
+--   all, so section 3 has nothing to migrate and an unguarded assert would abort
+--   the entire bootstrap. The check exists to protect an EXISTING installation
+--   from losing its administrators; a database with no accounts has none to lose.
+--   On a real database with users but no admin flag it still raises, which is the
+--   case that matters.
+do $assert$
+begin
+  if exists (select 1 from public.profiles)
+     and not exists (
+       select 1 from public.staff_memberships
+        where role_key = 'super_admin' and status = 'active'
+     ) then
+    raise exception
+      '#45 refuses to continue: no active super_admin exists. Set profiles.is_admin = true '
+      'on the founder account (see db/README.md), then re-run this file. Running scripts/'
+      'bootstrap-super-admin.mjs afterwards is the other supported path.';
+  end if;
+end
+$assert$;
+
+
+-- == 5) Authorization helpers ================================================
+-- ★ TWO FORMS, and the split is the security boundary.
+--
+--   user_has_staff_permission(uuid, text) answers about ANY user. It is revoked
+--   from every client role and is callable only by other SECURITY DEFINER bodies
+--   running as the owner. This is the "internal user-specific helper" form.
+--
+--   has_staff_permission(text) / is_super_admin() / my_staff_context() answer
+--   about the CALLER only, are pinned to auth.uid() internally, and are granted
+--   to authenticated. Granting them is not optional: an RLS qual is evaluated AS
+--   THE QUERYING ROLE, so without the grant every gated read fails with
+--   "permission denied for function" instead of a clean authorization denial.
+--
+-- ★ set search_path = public, pg_temp — pg_temp LAST, deliberately. When pg_temp
+--   is not named it is searched FIRST for relation names, so a user who can
+--   create a temp table could shadow an unqualified reference inside a SECURITY
+--   DEFINER body. Every reference below is schema-qualified as well. Keep both.
+
+create or replace function public.user_has_staff_permission(p_user uuid, p_permission text)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select exists (
+    select 1
+      from public.staff_memberships m
+      join public.staff_role_permissions rp on rp.role_key = m.role_key
+     where m.user_id = p_user
+       and m.status = 'active'
+       and rp.permission_key = p_permission
+  )
+$fn$;
+
+comment on function public.user_has_staff_permission(uuid, text) is
+  '#45: INTERNAL. Answers about an arbitrary user, so it is revoked from anon and '
+  'authenticated and callable only from other SECURITY DEFINER bodies. Client code uses '
+  'has_staff_permission(text), which is pinned to auth.uid().';
+
+revoke all on function public.user_has_staff_permission(uuid, text) from public, anon, authenticated;
+
+create or replace function public.has_staff_permission(p_permission text)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select public.user_has_staff_permission((select auth.uid()), p_permission)
+$fn$;
+
+comment on function public.has_staff_permission(text) is
+  '#45: does the CALLER hold this capability? The one predicate every staff-gated RLS '
+  'policy and admin RPC reads. Wrap it as (select public.has_staff_permission(''x'')) in a '
+  'policy so Postgres evaluates it once per statement as an InitPlan, not once per row.';
+
+revoke all on function public.has_staff_permission(text) from public, anon;
+grant execute on function public.has_staff_permission(text) to authenticated;
+
+create or replace function public.is_super_admin()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select exists (
+    select 1 from public.staff_memberships m
+     where m.user_id = (select auth.uid())
+       and m.status = 'active'
+       and m.role_key = 'super_admin'
+  )
+$fn$;
+
+comment on function public.is_super_admin() is
+  '#45: the caller holds an ACTIVE super_admin membership. Equivalent to is_admin() by '
+  'construction — section 7 keeps profiles.is_admin as exactly this predicate''s cache — '
+  'but it reads the membership table directly, so it cannot drift.';
+
+revoke all on function public.is_super_admin() from public, anon;
+grant execute on function public.is_super_admin() to authenticated;
+
+create or replace function public.my_staff_context()
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select coalesce(
+    (select jsonb_build_object(
+       'is_staff',        true,
+       'role_key',        m.role_key,
+       'role_label',      r.label,
+       'status',          m.status,
+       'display_title',   m.display_title,
+       'is_super_admin',  (m.role_key = 'super_admin'),
+       'permissions',     coalesce(
+                            (select jsonb_agg(rp.permission_key order by rp.permission_key)
+                               from public.staff_role_permissions rp
+                              where rp.role_key = m.role_key),
+                            '[]'::jsonb),
+       -- #46 replaces this function to fill assigned_course_ids from
+       -- course_staff_assignments. Until then a Trainer has no assignments,
+       -- which is true rather than merely convenient.
+       'assigned_course_ids', '[]'::jsonb
+     )
+     from public.staff_memberships m
+     join public.staff_roles r on r.key = m.role_key
+    where m.user_id = (select auth.uid())),
+    jsonb_build_object('is_staff', false)
+  )
+$fn$;
+
+comment on function public.my_staff_context() is
+  '#45: the ONE call the client and the api/ handlers make to learn who they are. Returns '
+  'the caller''s membership plus its effective permissions, read LIVE from the database — '
+  'never decoded from a JWT claim, which is why suspending a staff member takes effect on '
+  'their next request instead of on their next token refresh. Note it returns a non-active '
+  'membership as-is: normalizeStaffContext() in src/lib/staffRoles.js is what refuses '
+  'authority for anything but ''active'', and the SQL predicates do the same independently.';
+
+revoke all on function public.my_staff_context() from public, anon;
+grant execute on function public.my_staff_context() to authenticated;
+
+create or replace function public.staff_role_permission_matrix()
+returns table (role_key text, role_label text, rank integer, permission_key text,
+               permission_label text, category text)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select r.key, r.label, r.rank, p.key, p.label, p.category
+    from public.staff_roles r
+    join public.staff_role_permissions rp on rp.role_key = r.key
+    join public.staff_permissions p on p.key = rp.permission_key
+   order by r.rank desc, p.category, p.key
+$fn$;
+
+comment on function public.staff_role_permission_matrix() is
+  '#45: the role-capability preview in Admin → Team & Roles. Not sensitive — it describes '
+  'the product''s role design, not who holds what.';
+
+revoke all on function public.staff_role_permission_matrix() from public, anon;
+grant execute on function public.staff_role_permission_matrix() to authenticated;
+
+
+-- == 6) RLS on the staff tables ==============================================
+-- ★ The three lookup tables are readable by any signed-in user: they describe the
+--   role model, not who holds it. staff_memberships and staff_role_events are not.
+--
+-- ★ staff_memberships_self_read uses a BARE user_id = auth.uid() with no function
+--   call. Calling has_staff_permission() there would re-enter this table's own
+--   policies and recurse. The manage-read branch is safe precisely because it
+--   goes through a SECURITY DEFINER helper, which bypasses RLS.
+--
+-- ★ No write policy on any of these tables, plus the explicit revoke below.
+--   Supabase's default grants survive a missing policy, so RLS alone is not
+--   enough — without the revoke, PostgREST would happily accept an INSERT and the
+--   staff_role_events row would never be written.
+
+alter table public.staff_roles            enable row level security;
+alter table public.staff_permissions      enable row level security;
+alter table public.staff_role_permissions enable row level security;
+alter table public.staff_memberships      enable row level security;
+alter table public.staff_role_events      enable row level security;
+
+drop policy if exists staff_roles_read on public.staff_roles;
+create policy staff_roles_read on public.staff_roles
+  for select to authenticated using (true);
+
+drop policy if exists staff_permissions_read on public.staff_permissions;
+create policy staff_permissions_read on public.staff_permissions
+  for select to authenticated using (true);
+
+drop policy if exists staff_role_permissions_read on public.staff_role_permissions;
+create policy staff_role_permissions_read on public.staff_role_permissions
+  for select to authenticated using (true);
+
+drop policy if exists staff_memberships_self_read on public.staff_memberships;
+create policy staff_memberships_self_read on public.staff_memberships
+  for select to authenticated
+  using (user_id = (select auth.uid()));
+
+drop policy if exists staff_memberships_manage_read on public.staff_memberships;
+create policy staff_memberships_manage_read on public.staff_memberships
+  for select to authenticated
+  using ((select public.has_staff_permission('staff.manage')));
+
+drop policy if exists staff_role_events_audit_read on public.staff_role_events;
+create policy staff_role_events_audit_read on public.staff_role_events
+  for select to authenticated
+  using ((select public.has_staff_permission('staff.audit.read')));
+
+revoke insert, update, delete, truncate on public.staff_roles            from authenticated, anon, public;
+revoke insert, update, delete, truncate on public.staff_permissions      from authenticated, anon, public;
+revoke insert, update, delete, truncate on public.staff_role_permissions from authenticated, anon, public;
+revoke insert, update, delete, truncate on public.staff_memberships      from authenticated, anon, public;
+revoke insert, update, delete, truncate on public.staff_role_events      from authenticated, anon, public;
+
+grant select on public.staff_roles            to authenticated;
+grant select on public.staff_permissions      to authenticated;
+grant select on public.staff_role_permissions to authenticated;
+grant select on public.staff_memberships      to authenticated;
+grant select on public.staff_role_events      to authenticated;
+
+
+-- == 7) profiles.is_admin becomes a derived cache ============================
+-- ★ THE HINGE OF THIS WHOLE MIGRATION. is_admin() is not modified; the column it
+--   reads is now written only here, in the same transaction as the membership
+--   change, so suspending a Super Admin revokes their access immediately rather
+--   than at their next token refresh.
+--
+--   Every legacy is_admin() call site and every direct p.is_admin column read
+--   therefore keeps working and now means "active Super Admin".
+
+create or replace function public.staff_sync_is_admin()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+declare
+  v_user uuid := coalesce(new.user_id, old.user_id);
+begin
+  update public.profiles p
+     set is_admin = exists (
+           select 1 from public.staff_memberships m
+            where m.user_id = v_user
+              and m.status = 'active'
+              and m.role_key = 'super_admin'
+         ),
+         updated_at = now()
+   where p.id = v_user;
+  return coalesce(new, old);
+end;
+$fn$;
+
+comment on function public.staff_sync_is_admin() is
+  '#45: keeps profiles.is_admin equal to "has an ACTIVE super_admin membership". That column '
+  'is a CACHE, not an input — 295 legacy is_admin() references and ~20 direct column reads '
+  'depend on it meaning exactly this. UPDATE on profiles is revoked from every client role '
+  'in section 10, so this trigger is the only writer.';
+
+revoke all on function public.staff_sync_is_admin() from public, anon, authenticated;
+
+drop trigger if exists staff_sync_is_admin on public.staff_memberships;
+create trigger staff_sync_is_admin
+  after insert or update or delete on public.staff_memberships
+  for each row execute function public.staff_sync_is_admin();
+
+-- One-time reconcile, so the column matches the table the moment the trigger
+-- exists. A no-op on a correct first run (section 3 gave every is_admin account a
+-- membership); on a re-run it clears the flag from anyone since demoted in the UI.
+update public.profiles p
+   set is_admin = exists (
+         select 1 from public.staff_memberships m
+          where m.user_id = p.id and m.status = 'active' and m.role_key = 'super_admin'
+       ),
+       updated_at = now()
+ where p.is_admin is distinct from exists (
+         select 1 from public.staff_memberships m
+          where m.user_id = p.id and m.status = 'active' and m.role_key = 'super_admin'
+       );
+
+
+-- == 8) The last-Super-Admin guard, as a trigger =============================
+-- ★ Enforced HERE and not only in the RPCs, so a direct SQL UPDATE or an
+--   auth.users deletion is caught too. staff_memberships.user_id is ON DELETE
+--   CASCADE from auth.users, so deleting the last Super Admin's Auth account
+--   fires this as a DELETE and the account deletion itself fails — which is the
+--   documented rule: promote a replacement first.
+--
+-- ★ SECURITY DEFINER is mandatory, not stylistic: public.app_error is SECURITY
+--   INVOKER and revoked from public, anon AND authenticated, so a definer-less
+--   trigger would fail with "permission denied for function app_error".
+
+create or replace function public.staff_memberships_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+declare
+  v_was_active_super boolean;
+  v_still_active_super boolean;
+begin
+  v_was_active_super := (old.role_key = 'super_admin' and old.status = 'active');
+  if not v_was_active_super then
+    return coalesce(new, old);
+  end if;
+
+  v_still_active_super := (tg_op = 'UPDATE'
+                           and new.role_key = 'super_admin'
+                           and new.status = 'active');
+  if v_still_active_super then
+    return new;
+  end if;
+
+  -- Anyone ELSE still holding the fort?
+  if not exists (
+    select 1 from public.staff_memberships m
+     where m.user_id <> old.user_id
+       and m.role_key = 'super_admin'
+       and m.status = 'active'
+  ) then
+    perform public.app_error('STAFF_LAST_SUPER_ADMIN',
+      'This is the last active Super Admin. Promote another Super Admin first — otherwise '
+      'nobody can manage staff, courses or settings.', 409,
+      jsonb_build_object('user_id', old.user_id));
+  end if;
+
+  return coalesce(new, old);
+end;
+$fn$;
+
+comment on function public.staff_memberships_guard() is
+  '#45: there must always be at least one ACTIVE super_admin, because super_admin is the '
+  'only role that can create another. Mirrored client-side by lastSuperAdminGuard() in '
+  'src/lib/staffRoles.js for the confirm dialog; THIS is the boundary.';
+
+revoke all on function public.staff_memberships_guard() from public, anon, authenticated;
+
+drop trigger if exists staff_memberships_guard on public.staff_memberships;
+create trigger staff_memberships_guard
+  before update or delete on public.staff_memberships
+  for each row execute function public.staff_memberships_guard();
+
+drop trigger if exists staff_memberships_touch_updated_at on public.staff_memberships;
+create trigger staff_memberships_touch_updated_at
+  before update on public.staff_memberships
+  for each row execute function public.touch_updated_at();
+
+
+-- == 9) Staff-management RPCs ================================================
+-- All gated on staff.manage; all write a staff_role_events row in the same
+-- transaction as the membership change. The tables carry no client write policy,
+-- so these are the only writers and the audit row cannot be bypassed.
+
+create or replace function public.admin_upsert_staff_membership(
+  p_user_id       uuid,
+  p_role_key      text,
+  p_display_title text default null,
+  p_reason        text default null,
+  p_status        text default 'active'
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+declare
+  v_old public.staff_memberships%rowtype;
+  v_new public.staff_memberships%rowtype;
+  v_action text;
+begin
+  if not public.has_staff_permission('staff.manage') then
+    perform public.app_error('FORBIDDEN', 'admin_upsert_staff_membership: staff.manage required', 403, null);
+  end if;
+  if not exists (select 1 from public.staff_roles where key = p_role_key) then
+    perform public.app_error('STAFF_ROLE_INVALID', format('unknown role %s', p_role_key), 422,
+      jsonb_build_object('role_key', p_role_key));
+  end if;
+  if p_status not in ('invited', 'active', 'suspended', 'revoked') then
+    perform public.app_error('STAFF_ROLE_INVALID', format('unknown status %s', p_status), 422, null);
+  end if;
+  if not exists (select 1 from public.profiles where id = p_user_id) then
+    perform public.app_error('STAFF_NOT_FOUND', 'no profile for that user id', 404,
+      jsonb_build_object('user_id', p_user_id));
+  end if;
+
+  select * into v_old from public.staff_memberships where user_id = p_user_id for update;
+
+  insert into public.staff_memberships
+    (user_id, role_key, status, display_title, invited_by, invited_at, activated_at)
+  values
+    (p_user_id, p_role_key, p_status, p_display_title, auth.uid(), now(),
+     case when p_status = 'active' then now() else null end)
+  on conflict (user_id) do update
+    set role_key = excluded.role_key,
+        status = excluded.status,
+        display_title = coalesce(excluded.display_title, public.staff_memberships.display_title),
+        activated_at = case
+                         when excluded.status = 'active' and public.staff_memberships.activated_at is null
+                           then now()
+                         else public.staff_memberships.activated_at
+                       end,
+        suspended_at = case when excluded.status = 'suspended' then now() else null end,
+        revoked_at   = case when excluded.status = 'revoked'   then now() else null end,
+        updated_at = now()
+  returning * into v_new;
+
+  v_action := case
+                when v_old.user_id is null then 'assign'
+                when v_old.role_key is distinct from v_new.role_key then 'role_change'
+                else 'assign'
+              end;
+
+  insert into public.staff_role_events
+    (actor_user_id, actor_email, target_user_id, target_email, action,
+     from_role_key, to_role_key, from_status, to_status, reason, source)
+  select auth.uid(),
+         (select email from public.profiles where id = auth.uid()),
+         p_user_id,
+         (select email from public.profiles where id = p_user_id),
+         v_action, v_old.role_key, v_new.role_key, v_old.status, v_new.status,
+         p_reason, 'admin_ui';
+
+  return jsonb_build_object('ok', true, 'user_id', p_user_id,
+                            'role_key', v_new.role_key, 'status', v_new.status);
+end;
+$fn$;
+
+revoke all on function public.admin_upsert_staff_membership(uuid, text, text, text, text) from public, anon;
+grant execute on function public.admin_upsert_staff_membership(uuid, text, text, text, text) to authenticated;
+
+create or replace function public.admin_set_staff_status(
+  p_user_id uuid,
+  p_status  text,
+  p_reason  text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+declare
+  v_old public.staff_memberships%rowtype;
+  v_action text;
+begin
+  if not public.has_staff_permission('staff.manage') then
+    perform public.app_error('FORBIDDEN', 'admin_set_staff_status: staff.manage required', 403, null);
+  end if;
+  if p_status not in ('invited', 'active', 'suspended', 'revoked') then
+    perform public.app_error('STAFF_ROLE_INVALID', format('unknown status %s', p_status), 422, null);
+  end if;
+
+  select * into v_old from public.staff_memberships where user_id = p_user_id for update;
+  if v_old.user_id is null then
+    perform public.app_error('STAFF_NOT_FOUND', 'that account is not staff', 404,
+      jsonb_build_object('user_id', p_user_id));
+  end if;
+
+  -- A reason is required for anything that TAKES access away. The guard trigger
+  -- independently refuses the last-Super-Admin case.
+  if p_status in ('suspended', 'revoked') and coalesce(btrim(p_reason), '') = '' then
+    perform public.app_error('STAFF_ROLE_INVALID',
+      'a reason is required when suspending or revoking staff access', 422, null);
+  end if;
+
+  update public.staff_memberships
+     set status = p_status,
+         suspension_reason = case when p_status = 'suspended' then p_reason else null end,
+         suspended_at = case when p_status = 'suspended' then now() else null end,
+         revoked_at   = case when p_status = 'revoked'   then now() else null end,
+         activated_at = case when p_status = 'active' and activated_at is null then now() else activated_at end,
+         updated_at = now()
+   where user_id = p_user_id;
+
+  v_action := case p_status
+                when 'suspended' then 'suspend'
+                when 'revoked'   then 'revoke'
+                when 'active'    then 'reactivate'
+                else 'assign'
+              end;
+
+  insert into public.staff_role_events
+    (actor_user_id, actor_email, target_user_id, target_email, action,
+     from_role_key, to_role_key, from_status, to_status, reason, source)
+  select auth.uid(),
+         (select email from public.profiles where id = auth.uid()),
+         p_user_id,
+         (select email from public.profiles where id = p_user_id),
+         v_action, v_old.role_key, v_old.role_key, v_old.status, p_status, p_reason, 'admin_ui';
+
+  return jsonb_build_object('ok', true, 'user_id', p_user_id, 'status', p_status);
+end;
+$fn$;
+
+revoke all on function public.admin_set_staff_status(uuid, text, text) from public, anon;
+grant execute on function public.admin_set_staff_status(uuid, text, text) to authenticated;
+
+create or replace function public.admin_staff_directory()
+returns table (
+  user_id uuid, email text, full_name text, avatar_url text,
+  role_key text, role_label text, rank integer, status text, display_title text,
+  invited_by uuid, invited_by_email text, invited_at timestamptz,
+  activated_at timestamptz, suspended_at timestamptz, revoked_at timestamptz,
+  suspension_reason text, updated_at timestamptz
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select m.user_id, p.email, p.full_name, p.avatar_url,
+         m.role_key, r.label, r.rank, m.status, m.display_title,
+         m.invited_by, ip.email, m.invited_at,
+         m.activated_at, m.suspended_at, m.revoked_at, m.suspension_reason, m.updated_at
+    from public.staff_memberships m
+    join public.staff_roles r on r.key = m.role_key
+    left join public.profiles p on p.id = m.user_id
+    left join public.profiles ip on ip.id = m.invited_by
+   where public.has_staff_permission('staff.manage')
+   order by r.rank desc, p.full_name nulls last, p.email
+$fn$;
+
+comment on function public.admin_staff_directory() is
+  '#45: the Team & Roles list. The permission check is IN THE WHERE CLAUSE — a caller '
+  'without staff.manage gets zero rows rather than an error, which is the same shape '
+  'course_publish_blockers() uses. It reads profiles for other users, which ordinary RLS '
+  'forbids, so SECURITY DEFINER is load-bearing here.';
+
+revoke all on function public.admin_staff_directory() from public, anon;
+grant execute on function public.admin_staff_directory() to authenticated;
+
+create or replace function public.admin_staff_events(
+  p_user_id uuid default null,
+  p_limit   integer default 100
+)
+returns table (
+  id bigint, actor_user_id uuid, actor_email text,
+  target_user_id uuid, target_email text, action text,
+  from_role_key text, to_role_key text, from_status text, to_status text,
+  reason text, source text, created_at timestamptz
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select e.id, e.actor_user_id, e.actor_email, e.target_user_id, e.target_email, e.action,
+         e.from_role_key, e.to_role_key, e.from_status, e.to_status, e.reason, e.source, e.created_at
+    from public.staff_role_events e
+   where public.has_staff_permission('staff.audit.read')
+     and (p_user_id is null or e.target_user_id = p_user_id)
+   order by e.created_at desc, e.id desc
+   limit greatest(1, least(coalesce(p_limit, 100), 500))
+$fn$;
+
+revoke all on function public.admin_staff_events(uuid, integer) from public, anon;
+grant execute on function public.admin_staff_events(uuid, integer) to authenticated;
+
+
+-- == 10) The profiles lockdown ===============================================
+-- ★ profiles_admin_update was `for all to authenticated using (is_admin()) with
+--   check (is_admin())` over the WHOLE ROW, so any admin could set is_admin = true
+--   on any profile. With three staff tiers that is a privilege-escalation
+--   primitive, and it is also the mechanism section 7 has just made a cache.
+--
+-- ★ The revoke is TABLE-level and that is not a stylistic choice: a column-level
+--   REVOKE does not override a table-level grant. #38 hit exactly this with
+--   batches.code and had to revoke the whole UPDATE privilege and re-grant per
+--   column. Here nothing needs re-granting — after this file, `authenticated`
+--   holds NO update privilege on profiles at all, and every legitimate write
+--   goes through a SECURITY DEFINER RPC that runs as the owner:
+--     set_my_avatar, complete_import_onboarding, admin_finalize_enrollment,
+--     approve_subscription/approve_extension, staff_sync_is_admin,
+--     and admin_review_access_request below.
+
+drop policy if exists profiles_admin_update on public.profiles;
+
+revoke update on public.profiles from authenticated, anon;
+
+comment on table public.profiles is
+  '#45: profiles is READ-ONLY over PostgREST. `authenticated` holds no UPDATE privilege; '
+  'every write goes through a SECURITY DEFINER RPC. is_admin in particular is a CACHE of '
+  '"has an active super_admin membership", written only by staff_sync_is_admin().';
+
+-- The Access Requests screen used to UPDATE profiles directly. It cannot any
+-- more, so its decision becomes a purpose-built transactional RPC.
+create or replace function public.admin_review_access_request(
+  p_user_id  uuid,
+  p_decision text,
+  p_reason   text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+declare
+  v_prev text;
+begin
+  if not public.has_staff_permission('access_requests.review') then
+    perform public.app_error('FORBIDDEN',
+      'admin_review_access_request: access_requests.review required', 403, null);
+  end if;
+  if p_decision not in ('approved', 'rejected', 'pending') then
+    perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+      format('unknown decision %s', p_decision), 422, null);
+  end if;
+
+  select approval_status into v_prev from public.profiles where id = p_user_id for update;
+  if v_prev is null then
+    perform public.app_error('STAFF_NOT_FOUND', 'no profile for that user id', 404,
+      jsonb_build_object('user_id', p_user_id));
+  end if;
+
+  update public.profiles
+     set approval_status = p_decision,
+         approved_at  = case when p_decision = 'approved' then now() else null end,
+         approved_by  = case when p_decision = 'approved' then auth.uid() else null end,
+         rejected_at  = case when p_decision = 'rejected' then now() else null end,
+         rejected_by  = case when p_decision = 'rejected' then auth.uid() else null end,
+         rejection_reason = case when p_decision = 'rejected' then p_reason else null end,
+         updated_at = now()
+   where id = p_user_id;
+
+  return jsonb_build_object('ok', true, 'user_id', p_user_id,
+                            'approval_status', p_decision, 'previous', v_prev);
+end;
+$fn$;
+
+comment on function public.admin_review_access_request(uuid, text, text) is
+  '#45: replaces the AccessRequests screen''s direct UPDATE on profiles, which relied on '
+  'profiles_admin_update — the policy this file drops. Gated on access_requests.review, so '
+  'an Operations Admin can work the queue without holding any other admin power.';
+
+revoke all on function public.admin_review_access_request(uuid, text, text) from public, anon;
+grant execute on function public.admin_review_access_request(uuid, text, text) to authenticated;
+
+
+-- == 11) batch_entitlements_guard: let an Operations Admin grant a seat ======
+-- ★ THE ONE CONFIRMED BLOCKER. The INSERT branch asserts "granted_by must be an
+--   admin" by reading profiles.is_admin. After this migration an Operations Admin
+--   has is_admin = false, so admin_finalize_enrollment → grant_batch_run(…,
+--   auth.uid(), true) would fail with FORBIDDEN on every VIP approval.
+--
+--   Everything else in this function is #35's body verbatim (as restated by #39).
+--   Only the granted_by predicate changes.
+
+create or replace function public.batch_entitlements_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_seg_ok boolean;
+begin
+  if tg_op = 'INSERT' then
+    -- A bound seat must have a real, active space for its segment. This is what
+    -- makes "granted into a cohort with no space" impossible rather than merely
+    -- unlikely.
+    if new.batch_id is not null then
+      select exists (
+        select 1 from public.community_spaces sp
+         where sp.batch_id = new.batch_id and sp.kind = new.segment and sp.active
+      ) into v_seg_ok;
+      if not v_seg_ok then
+        perform public.app_error('NO_SPACE_FOR_SEGMENT',
+          format('batch has no active %s space', new.segment), 409,
+          jsonb_build_object('batch_id', new.batch_id, 'segment', new.segment));
+      end if;
+    end if;
+
+    -- valid_until may never outlive the source term.
+    if new.valid_until is not null and new.source_subscription_id is not null then
+      if exists (
+        select 1 from public.subscriptions s
+         where s.id = new.source_subscription_id
+           and s.ends_at is not null
+           and new.valid_until > coalesce(s.grace_ends_at, s.ends_at) + interval '1 minute'
+      ) then
+        perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+          'entitlement would outlive its source subscription term', 409,
+          jsonb_build_object('source_subscription_id', new.source_subscription_id));
+      end if;
+    end if;
+
+    -- granted_by, when set, must be someone allowed to approve enrollments.
+    -- ★ #45: was `profiles.is_admin`, which now means Super Admin ONLY. An
+    --   Operations Admin holds enrollments.review and is_admin = false, so the
+    --   old predicate refused every VIP approval they made.
+    if new.granted_by is not null
+       and not coalesce((select p.is_admin from public.profiles p where p.id = new.granted_by), false)
+       and not public.user_has_staff_permission(new.granted_by, 'enrollments.review') then
+      perform public.app_error('FORBIDDEN',
+        'granted_by must be an admin or hold enrollments.review', 403, null);
+    end if;
+
+    if new.batch_index >= new.run_length then
+      perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+        'batch_index must be inside the run', 409,
+        jsonb_build_object('batch_index', new.batch_index, 'run_length', new.run_length));
+    end if;
+
+    return new;
+  end if;
+
+  -- ── UPDATE ────────────────────────────────────────────────────────
+  -- Frozen identity/provenance columns. Rewriting any of these would destroy
+  -- the audit answer to "why did this member have access?".
+  if new.user_id     is distinct from old.user_id
+     or new.segment      is distinct from old.segment
+     or new.batch_index  is distinct from old.batch_index
+     or new.run_id       is distinct from old.run_id
+     or new.run_length   is distinct from old.run_length
+     or new.grant_reason is distinct from old.grant_reason
+     or new.granted_at   is distinct from old.granted_at
+     or new.created_at   is distinct from old.created_at then
+    perform public.app_error('IMMUTABLE_ENTITLEMENT',
+      'batch entitlement identity columns are frozen', 409, null);
+  end if;
+
+  -- ★ Provenance FKs and granted_by may transition to NULL. That is Postgres
+  -- executing ON DELETE SET NULL / ON UPDATE CASCADE, which arrives here as an
+  -- UPDATE. Freezing them outright would make every referenced profile,
+  -- request, subscription and plan key permanently undeletable — a reviewer
+  -- found exactly this. Reject only non-null → a DIFFERENT non-null.
+  if (old.source_subscription_id is not null and new.source_subscription_id is not null
+      and new.source_subscription_id is distinct from old.source_subscription_id)
+     or (old.source_plan_key is not null and new.source_plan_key is not null
+         and new.source_plan_key is distinct from old.source_plan_key)
+     or (old.source_request_id is not null and new.source_request_id is not null
+         and new.source_request_id is distinct from old.source_request_id)
+     or (old.source_import_row_id is not null and new.source_import_row_id is not null
+         and new.source_import_row_id is distinct from old.source_import_row_id)
+     or (old.granted_by is not null and new.granted_by is not null
+         and new.granted_by is distinct from old.granted_by) then
+    perform public.app_error('IMMUTABLE_ENTITLEMENT',
+      'batch entitlement provenance cannot be re-pointed', 409, null);
+  end if;
+
+  -- batch_id: NULL → a real id exactly once (allocation). Never re-pointed,
+  -- never cleared. Moving a member between cohorts revokes and re-grants, so
+  -- the old seat stays in the record.
+  if old.batch_id is not null and new.batch_id is distinct from old.batch_id then
+    perform public.app_error('IMMUTABLE_ENTITLEMENT',
+      'an allocated seat cannot be moved - revoke it and grant a new one', 409,
+      jsonb_build_object('batch_id', old.batch_id));
+  end if;
+
+  -- status: queued → active → {revoked|superseded}, both terminal.
+  if old.status <> new.status then
+    if old.status in ('revoked', 'superseded') then
+      perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+        format('%s is a terminal entitlement status', old.status), 409, null);
+    end if;
+    if old.status = 'active' and new.status = 'queued' then
+      perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+        'an allocated seat cannot return to the queue', 409, null);
+    end if;
+  end if;
+
+  -- valid_until is forward-only. Clearing it (→ NULL) would silently grant
+  -- perpetual access; shortening it is a revoke, which has its own path.
+  if old.valid_until is not null
+     and (new.valid_until is null or new.valid_until < old.valid_until)
+     and new.status not in ('revoked', 'superseded') then
+    perform public.app_error('IMMUTABLE_ENTITLEMENT',
+      'valid_until only moves forward - revoke the seat to end it early', 409, null);
+  end if;
+
+  return new;
+end;
+$$;
+
+revoke all on function public.batch_entitlements_guard() from public, anon, authenticated;
+
+drop trigger if exists batch_entitlements_guard_trg on public.batch_entitlements;
+create trigger batch_entitlements_guard_trg
+  before insert or update on public.batch_entitlements
+  for each row execute function public.batch_entitlements_guard();
+
+
+-- == 12) Gate-helper EXECUTE hygiene + four unpinned policies ================
+-- ★ is_admin() / is_approved() / is_enrolled() are the ONLY SECURITY DEFINER
+--   family in this repo with no REVOKE anywhere. Postgres grants EXECUTE to
+--   PUBLIC on every new function, so anon can call all three over PostgREST.
+--   They return false for anon (auth.uid() is null), so nothing leaks today —
+--   but it contradicts #30's own "Function EXECUTE hygiene" pass, which stripped
+--   anon from every other member/admin RPC. Closing it here.
+revoke execute on function public.is_admin() from public, anon;
+grant execute on function public.is_admin() to authenticated;
+
+revoke execute on function public.is_approved() from public, anon;
+grant execute on function public.is_approved() to authenticated;
+
+revoke execute on function public.is_enrolled() from public, anon;
+grant execute on function public.is_enrolled() to authenticated;
+
+-- ★ Four policies were created with no TO clause, so they apply to PUBLIC, which
+--   in Supabase includes anon. All four are auth.uid()-keyed and therefore leak
+--   nothing, but a policy that names its role is a policy a reviewer can check.
+do $pin$
+begin
+  if exists (select 1 from pg_policies where schemaname = 'public'
+              and tablename = 'profiles' and policyname = 'own_profile_select') then
+    drop policy own_profile_select on public.profiles;
+    create policy own_profile_select on public.profiles
+      for select to authenticated using ((select auth.uid()) = id);
+  end if;
+
+  if exists (select 1 from pg_policies where schemaname = 'public'
+              and tablename = 'subscriptions' and policyname = 'subscriptions_own_select') then
+    drop policy subscriptions_own_select on public.subscriptions;
+    create policy subscriptions_own_select on public.subscriptions
+      for select to authenticated using (user_id = (select auth.uid()));
+  end if;
+
+  if exists (select 1 from pg_policies where schemaname = 'public'
+              and tablename = 'enrollment_requests' and policyname = 'enroll_req_own_select') then
+    drop policy enroll_req_own_select on public.enrollment_requests;
+    create policy enroll_req_own_select on public.enrollment_requests
+      for select to authenticated using (user_id = (select auth.uid()));
+  end if;
+
+  if exists (select 1 from pg_policies where schemaname = 'public'
+              and tablename = 'enrollment_requests' and policyname = 'enroll_req_own_expire') then
+    drop policy enroll_req_own_expire on public.enrollment_requests;
+    create policy enroll_req_own_expire on public.enrollment_requests
+      for update to authenticated
+      using (user_id = (select auth.uid()) and status = 'pending_review' and expires_at < now())
+      with check (user_id = (select auth.uid()) and status = 'expired');
+  end if;
+end
+$pin$;
+
+
+-- == 13) Error codes, re-listed in full ======================================
+-- app_error_catalog() is replaced wholesale every time, so every existing code
+-- must be repeated. Keep in lockstep with APP_ERROR_CODES and APP_ERROR_COPY in
+-- src/lib/appErrors.js. Copied from #44 plus the three #45 codes.
+create or replace function public.app_error_catalog()
+returns table (code text, http int, summary text)
+language sql
+immutable
+parallel safe
+set search_path = public
+as $cat$
+  select * from (values
+    ('BATCH_REQUIRED',               422, 'A VIP action needs an explicit batch; none was supplied.'),
+    ('BATCH_NOT_FOUND',              404, 'The batch id or month code does not exist.'),
+    ('BATCH_CLOSED',                 409, 'The batch is closed to new assignments, or archived.'),
+    ('BATCH_FULL',                   409, 'A cohort in the run has no seats left.'),
+    ('NO_SPACE_FOR_SEGMENT',         409, 'The batch has no active community space for that plan segment.'),
+    ('INVALID_BATCH_CODE',           422, 'Not a real YYYY-MM month.'),
+    ('ENTITLEMENT_EXPIRED',          403, 'The membership term (or its grace) has ended.'),
+    ('INVALID_PLAN',                 422, 'Unknown, inactive, or non-premium plan for this action.'),
+    ('ALREADY_ENTITLED',             409, 'The member already holds an outstanding seat in that cohort.'),
+    ('RUN_LIMIT_EXCEEDED',           409, 'Outstanding seats would exceed the per-member ceiling.'),
+    ('SEGMENT_MISMATCH',             409, 'The grant would mix cohort segments in one outstanding run.'),
+    ('INVALID_MEMBERSHIP_TRANSITION',409, 'The current membership state does not allow this transition.'),
+    ('IMMUTABLE_ENTITLEMENT',        409, 'An attempt to rewrite a frozen ledger column.'),
+    ('FORBIDDEN',                    403, 'Admin-only operation called by a non-admin.'),
+    ('REQUEST_NOT_FOUND',            404, 'The enrollment request does not exist.'),
+    ('COURSE_ACCESS_DENIED',         403, 'Course hidden by plan scope, publication, or cohort entitlement.'),
+    ('LESSON_NOT_RELEASED',          403, 'The cohort drip has not unlocked this lesson yet.'),
+    ('COMMUNITY_ACCESS_DENIED',      403, 'The community write was refused.'),
+    ('COMMENT_PERMISSION_DENIED',    403, 'Replies are off in this channel.'),
+    ('ASSIGNMENT_CLOSED',            409, 'Past the due date, or the assignment is unpublished.'),
+    ('SUBMISSION_LOCKED',            409, 'The submission is handed in or graded; edits refused.'),
+    ('COURSE_HAS_SUBMISSIONS',       409, 'The course has graded assignment work and cannot be deleted.'),
+    ('BATCH_PAST',                   409, 'The batch period has elapsed in its own timezone; it is read-only.'),
+    ('BATCH_CODE_TAKEN',             409, 'Another batch already uses that month code.'),
+    ('BATCH_CODE_REORDER',           409, 'The new code would move the batch past a sibling and reorder members'' runs.'),
+    ('BATCH_PERIOD_PAST',            422, 'The requested period has already ended; a batch cannot be edited into the past.'),
+    ('BATCH_PERIOD_INVALID',         422, 'The end date falls before the start date, or a date is missing.'),
+    ('BATCH_TIMEZONE_INVALID',       422, 'Not a timezone Postgres recognises (see pg_timezone_names).'),
+    ('BATCH_CAPACITY_BELOW_OCCUPANCY',409,'The new capacity is below the seats already sold in that segment.'),
+    ('CHANNEL_NOT_FOUND',            404, 'The channel does not exist, or is not available to you.'),
+    ('CHANNEL_SLUG_TAKEN',           409, 'Another channel in this space already uses that address.'),
+    ('CHANNEL_AUDIENCE_EMPTY',       422, 'The audience needs at least one plan or batch, or nobody could see it.'),
+    ('CHANNEL_ARCHIVED',             409, 'The channel is archived and accepts no new content.'),
+    ('CATEGORY_NOT_FOUND',           404, 'The channel category does not exist.'),
+    ('CATEGORY_NOT_EMPTY',           409, 'The category still holds active channels.'),
+    ('LESSON_VIDEO_UPLOAD_ONLY',     409, 'A lesson video must be an uploaded file in the private bucket; external links are no longer accepted.'),
+    ('LESSON_VIDEO_PATH_INVALID',    422, 'An uploaded lesson video must live at lessons/<course-uuid>/<file>.'),
+    ('COURSE_PUBLISH_BLOCKED',       409, 'The course still has video lessons with no uploaded file.'),
+    ('STAFF_LAST_SUPER_ADMIN',       409, 'That change would leave no active Super Admin. Promote a replacement first.'),
+    ('STAFF_NOT_FOUND',              404, 'That account is not staff, or has no profile.'),
+    ('STAFF_ROLE_INVALID',           422, 'Unknown staff role or status, or a required reason was missing.')
+  ) as t(code, http, summary);
+$cat$;
+
+revoke all on function public.app_error_catalog() from public, anon;
+grant execute on function public.app_error_catalog() to authenticated;
+
+
+-- == 14) Indexes =============================================================
+-- user_id is already unique (the membership lookup). These cover the directory
+-- sort and the audit reads.
+create index if not exists staff_memberships_role_status_idx
+  on public.staff_memberships (role_key, status);
+
+comment on index public.staff_memberships_role_status_idx is
+  '#45: the last-Super-Admin guard counts active super_admins on every membership '
+  'UPDATE and DELETE; without this it scans the whole table each time.';
+
+create index if not exists staff_role_events_target_idx
+  on public.staff_role_events (target_user_id, created_at desc);
+
+create index if not exists staff_role_events_created_idx
+  on public.staff_role_events (created_at desc);
+
+
+
+
+-- == 15) Re-gate the operations surface ======================================
+-- ★ WITHOUT THIS SECTION THE OPERATIONS ADMIN ROLE IS DECORATIVE, and sections
+--   1-14 are an elaborate way of granting nothing.
+--
+--   Sections 1-11 install the role model and hand Operations Admins
+--   `enrollments.review`, `batches.manage`, `students.import` and
+--   `students.assign_courses`. But every server-side path those names describe is
+--   still gated on `public.is_admin()` — which section 7 has just narrowed to mean
+--   *active Super Admin*. `admin_finalize_enrollment` refuses an Ops Admin at its
+--   FIRST line, so they never reach the enrollment they are supposed to approve,
+--   and never reach section 11's `batch_entitlements_guard` fix either.
+--
+--   The first draft of this migration missed that entirely. Its header called the
+--   guard in section 11 "THE ONE CONFIRMED BLOCKER"; it was not, because nothing
+--   could get that far. The lesson worth keeping: when you widen who may do
+--   something, trace the WHOLE call path, not the first refusal you happen to
+--   find. A guard you fix behind a guard you did not is dead code.
+--
+-- ★ WHY `has_staff_permission(...)` AND NOT `is_admin() or has_staff_permission(...)`.
+--   super_admin holds every permission in the section-2 matrix, so
+--   `has_staff_permission('enrollments.review')` is already true for a Super
+--   Admin. The single-predicate form is therefore a strict generalisation — no
+--   Super Admin loses anything — and it keeps exactly one authorization question
+--   per guard instead of two that can drift apart.
+--
+-- ★ EVERY FUNCTION BELOW IS THE LIVE BODY WITH ONE LINE CHANGED, and it was
+--   EXTRACTED MECHANICALLY, not retyped. Hand-restating a long SECURITY DEFINER
+--   body is how #33 dropped three statements from `admin_finalize_enrollment`
+--   (fixed by #34), and how this very migration's first draft dropped the
+--   `valid_until is null` branch from `batch_entitlements_guard` — which would
+--   have let a cohort seat be cleared to NULL and become permanent. #43 wrote the
+--   lesson down: rebuild from the live definition rather than restating it.
+--   test/staffRolesSql.test.mjs diffs each body against its previous definition
+--   and fails on any line that is not the guard.
+--
+-- ★ NOT re-gated here, deliberately: the community admin RPCs
+--   (`admin_save_community_channel`, `admin_community_config`, …) and the
+--   `payment_settings` / `sidebar_settings` policies. Only super_admin holds
+--   `community.manage`, `payment_settings.manage` and `sidebar.customize`, so
+--   `is_admin()` and `has_staff_permission(...)` are equivalent for them today.
+--   Leaving them alone keeps this section's blast radius to the roles that
+--   actually gained a capability.
+
+
+-- ── 15a/15b) The enrollment and cohort RPCs, live bodies, one line changed ──
+
+create or replace function public.admin_finalize_enrollment(p_request_id uuid, p_batch_id uuid default null)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_req          public.enrollment_requests%rowtype;
+  v_prev         public.subscriptions%rowtype;
+  v_new          public.subscriptions%rowtype;
+  v_plan         public.enrollment_plans%rowtype;
+  v_kind         text;
+  v_eff_plan     text;
+  v_segment      text;
+  v_prev_segment text;
+  v_batch        uuid;
+  v_batch_row    public.batches%rowtype;
+  v_count        int;
+  v_valid_until  timestamptz;
+  v_run          jsonb := null;
+begin
+  if not public.has_staff_permission('enrollments.review') then
+    perform public.app_error('FORBIDDEN', 'admin_finalize_enrollment: admin only', 403, null);
+  end if;
+
+  select * into v_req from public.enrollment_requests
+   where id = p_request_id for update;
+  if v_req.id is null then
+    perform public.app_error('REQUEST_NOT_FOUND', 'admin_finalize_enrollment: request not found', 404,
+      jsonb_build_object('request_id', p_request_id));
+  end if;
+
+  -- Idempotency: re-approving an approved request is a no-op.
+  if v_req.status = 'approved' then
+    return jsonb_build_object('ok', true, 'already', true);
+  end if;
+  if v_req.status <> 'pending_review' then
+    perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+      format('admin_finalize_enrollment: request is %s - only pending_review can be approved', v_req.status),
+      409, jsonb_build_object('status', v_req.status));
+  end if;
+
+  v_kind := coalesce(v_req.request_kind, 'new');
+
+  select * into v_prev from public.subscriptions
+   where user_id = v_req.user_id
+   order by created_at desc limit 1;
+
+  -- Effective plan: extensions stay on the member's CURRENT plan.
+  v_eff_plan := case when v_kind = 'extension'
+                     then coalesce(v_prev.plan_key, v_req.plan_key)
+                     else v_req.plan_key end;
+
+  select * into v_plan from public.enrollment_plans where key = v_eff_plan;
+  if v_plan.key is null then
+    perform public.app_error('INVALID_PLAN', format('admin_finalize_enrollment: unknown plan %s', v_eff_plan),
+      422, jsonb_build_object('plan_key', v_eff_plan));
+  end if;
+  -- New sales require a sellable plan; extensions may continue a retired one.
+  if v_kind <> 'extension' and not v_plan.active then
+    perform public.app_error('INVALID_PLAN', format('admin_finalize_enrollment: plan %s is inactive', v_eff_plan),
+      422, jsonb_build_object('plan_key', v_eff_plan));
+  end if;
+
+  v_segment := coalesce(v_plan.community_segment, 'general');
+  if v_prev.plan_key is not null then
+    select coalesce(ep.community_segment, 'general') into v_prev_segment
+      from public.enrollment_plans ep where ep.key = v_prev.plan_key;
+  end if;
+
+  if v_segment is distinct from 'vip' then
+    v_batch := null;
+  else
+    if v_kind in ('renewal', 'extension') then
+      v_batch := coalesce(p_batch_id, v_prev.batch_id, v_req.batch_id);
+      if v_kind = 'extension' and p_batch_id is not null
+         and v_prev.batch_id is not null and p_batch_id <> v_prev.batch_id then
+        perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+          'admin_finalize_enrollment: an extension keeps the current batch - use the batch manager to move members',
+          409, jsonb_build_object('current_batch_id', v_prev.batch_id));
+      end if;
+      -- A renewal may arrive after every held seat lapsed; fall back to the
+      -- member's most recent cohort so the run continues from the right place.
+      if v_batch is null then
+        select e.batch_id into v_batch
+          from public.batch_entitlements e
+         where e.user_id = v_req.user_id and e.batch_id is not null
+         order by e.granted_at desc, e.batch_index desc
+         limit 1;
+      end if;
+    elsif v_kind = 'upgrade' then
+      v_batch := p_batch_id;
+      if v_batch is null and v_prev.batch_id is not null
+         and exists (select 1 from public.community_spaces sp
+                      where sp.kind = v_segment and sp.batch_id = v_prev.batch_id and sp.active) then
+        v_batch := v_prev.batch_id;
+      end if;
+      if v_batch is null then v_batch := v_req.batch_id; end if;
+    else
+      v_batch := coalesce(p_batch_id, v_req.batch_id);
+    end if;
+
+    if v_batch is null then
+      perform public.app_error('BATCH_REQUIRED',
+        format('admin_finalize_enrollment: %s needs a batch - pick an open batch in the approve dialog', v_eff_plan),
+        422, jsonb_build_object('plan_key', v_eff_plan, 'segment', v_segment));
+    end if;
+
+    -- Read-only validation for a precise error. The LOCK belongs to
+    -- grant_batch_run, which takes every batch lock in code order.
+    select * into v_batch_row from public.batches where id = v_batch;
+    if v_batch_row.id is null then
+      perform public.app_error('BATCH_NOT_FOUND', 'admin_finalize_enrollment: batch not found', 404,
+        jsonb_build_object('batch_id', v_batch));
+    end if;
+  end if;
+
+  -- Grant the term through the EXISTING functions (stacking / supersede / grace /
+  -- the 60-365 clamp / the legacy-lifetime guard all live there).
+  if v_kind = 'extension' then
+    if v_req.extension_days is null or v_req.extension_days <= 0 then
+      perform public.app_error('INVALID_MEMBERSHIP_TRANSITION',
+        'admin_finalize_enrollment: extension request has no extension_days', 409, null);
+    end if;
+    v_new := public.approve_extension(v_req.user_id, v_req.id, v_req.extension_days);
+  else
+    v_new := public.approve_subscription(v_req.user_id, v_req.plan_key, v_req.id);
+  end if;
+
+  update public.subscriptions
+     set batch_id = v_batch, updated_at = now()
+   where id = v_new.id;
+
+  -- ── Materialise the cohort run (L1) ───────────────────────────────
+  if v_segment = 'vip' then
+    v_valid_until := coalesce(v_new.grace_ends_at, v_new.ends_at);
+
+    -- Every outstanding seat rides the new expiry. Forward-only, enforced by the
+    -- guard trigger. Without this an extension would leave already-held seats
+    -- expiring on the old date.
+    update public.batch_entitlements e
+       set valid_until = v_valid_until, updated_at = now()
+     where e.user_id = v_req.user_id
+       and e.status in ('queued', 'active')
+       and v_valid_until is not null
+       and (e.valid_until is null or e.valid_until < v_valid_until);
+
+    -- A segment change must not leave seats from two segments coexisting.
+    if v_prev_segment is not null and v_prev_segment <> v_segment then
+      perform public.revoke_batch_run(v_req.user_id, null,
+        format('upgrade %s -> %s', v_prev_segment, v_segment), auth.uid(), 'superseded');
+    end if;
+
+    v_count := case
+                 when v_kind = 'extension'
+                   then greatest(1, least(12, ceil(v_req.extension_days / 30.0)::int))   -- D9
+                 else public.plan_batch_count(v_plan.access_days, v_plan.eligible_batch_count)
+               end;
+
+    if v_count is null then
+      perform public.app_error('INVALID_PLAN',
+        format('plan %s has no access_days and no eligible_batch_count - cannot size the cohort run', v_eff_plan),
+        422, jsonb_build_object('plan_key', v_eff_plan));
+    end if;
+
+    v_run := public.grant_batch_run(
+      v_req.user_id, v_segment, v_batch, v_count,
+      case when v_kind = 'new' then 'approval' else v_kind end,
+      v_new.id, v_eff_plan, v_req.id, null, v_valid_until, auth.uid(), true);
+  end if;
+
+  -- Profile cache (mirrors the old client step 2).
+  update public.profiles
+     set is_paid = true,
+         plan = v_eff_plan,
+         approval_status = 'approved',
+         approved_at = now(),
+         approved_by = auth.uid(),
+         rejected_at = null,
+         rejected_by = null,
+         rejection_reason = null,
+         updated_at = now()
+   where id = v_req.user_id;
+
+  -- Request row (mirrors the old client step 3) + the resolved batch.
+  update public.enrollment_requests
+     set status = 'approved',
+         rejection_reason = null,
+         reviewed_at = now(),
+         reviewed_by = auth.uid(),
+         batch_id = v_batch,
+         updated_at = now()
+   where id = v_req.id;
+
+  return jsonb_build_object(
+    'ok', true,
+    'subscription_id', v_new.id,
+    'ends_at', v_new.ends_at,
+    'batch_id', v_batch,
+    'batch_code', (select code from public.batches where id = v_batch),
+    'run', v_run
+  );
+end;
+$$;
+
+create or replace function public.approve_subscription(
+  p_user_id    uuid,
+  p_plan_key   text,
+  p_request_id uuid
+)
+returns public.subscriptions
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_grace_days constant int := 3;   -- grace knob. 3 = access continues 3 days past ends_at.
+  v_days   int;
+  v_prev   public.subscriptions%rowtype;
+  v_base   timestamptz;
+  v_ends   timestamptz;
+  v_grace  timestamptz;
+  v_new    public.subscriptions%rowtype;
+begin
+  if not public.has_staff_permission('enrollments.review') then
+    raise exception 'approve_subscription: admin only';
+  end if;
+
+  select access_days into v_days from public.enrollment_plans where key = p_plan_key;
+
+  select * into v_prev
+    from public.subscriptions
+    where user_id = p_user_id
+    order by created_at desc
+    limit 1
+    for update;
+
+  -- Renewal stacking: extend from current expiry if still running, else from now.
+  if v_prev.id is not null and v_prev.status = 'active'
+     and v_prev.ends_at is not null and v_prev.ends_at > now() then
+    v_base := v_prev.ends_at;
+  else
+    v_base := now();
+  end if;
+
+  v_ends  := case when v_days is null then null else v_base + make_interval(days => v_days) end;
+  v_grace := case when v_ends is null or v_grace_days = 0 then null
+                  else v_ends + make_interval(days => v_grace_days) end;
+
+  update public.subscriptions
+     set status = 'expired', updated_at = now()
+   where user_id = p_user_id and status = 'active';
+
+  insert into public.subscriptions
+    (user_id, plan_key, status, started_at, ends_at, grace_ends_at,
+     approved_by, request_id, renewed_from_subscription_id)
+  values
+    (p_user_id, p_plan_key, 'active', now(), v_ends, v_grace,
+     auth.uid(), p_request_id, v_prev.id)
+  returning * into v_new;
+
+  return v_new;
+end;
+$$;
+
+create or replace function public.approve_extension(
+  p_user_id    uuid,
+  p_request_id uuid,
+  p_days       int
+)
+returns public.subscriptions
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_grace_days constant int := 3;
+  v_prev   public.subscriptions%rowtype;
+  v_base   timestamptz;
+  v_ends   timestamptz;
+  v_grace  timestamptz;
+  v_new    public.subscriptions%rowtype;
+begin
+  if not public.has_staff_permission('enrollments.review') then
+    raise exception 'approve_extension: admin only';
+  end if;
+  if p_days is null or p_days < 60 then
+    raise exception 'approve_extension: minimum extension is 60 days (2 months)';
+  end if;
+  if p_days > 365 then
+    raise exception 'approve_extension: maximum extension is 365 days (12 months)';
+  end if;
+
+  select * into v_prev
+    from public.subscriptions
+    where user_id = p_user_id
+    order by created_at desc
+    limit 1
+    for update;
+
+  if v_prev.id is null then
+    raise exception 'approve_extension: no subscription to extend for this user';
+  end if;
+  -- Idempotency + never shorten a legacy no-expiry term.
+  if v_prev.status = 'active' and v_prev.request_id = p_request_id then return v_prev; end if;
+  if v_prev.status = 'active' and v_prev.ends_at is null then return v_prev; end if;
+
+  if v_prev.status = 'active' and v_prev.ends_at is not null and v_prev.ends_at > now() then
+    v_base := v_prev.ends_at;
+  else
+    v_base := now();
+  end if;
+
+  v_ends  := v_base + make_interval(days => p_days);
+  v_grace := case when v_grace_days = 0 then null else v_ends + make_interval(days => v_grace_days) end;
+
+  update public.subscriptions
+     set status = 'expired', updated_at = now()
+   where user_id = p_user_id and status = 'active';
+
+  insert into public.subscriptions
+    (user_id, plan_key, status, started_at, ends_at, grace_ends_at,
+     approved_by, request_id, renewed_from_subscription_id)
+  values
+    (p_user_id, v_prev.plan_key, 'active', now(), v_ends, v_grace,
+     auth.uid(), p_request_id, v_prev.id)
+  returning * into v_new;
+
+  return v_new;
+end;
+$$;
+
+create or replace function public.expire_overdue_subscriptions()
+returns int
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_count int;
+begin
+  if not public.has_staff_permission('enrollments.review') then
+    raise exception 'expire_overdue_subscriptions: admin only';
+  end if;
+
+  update public.subscriptions
+     set status = 'expired', updated_at = now()
+   where status = 'active'
+     and ends_at is not null
+     and coalesce(grace_ends_at, ends_at) < now();
+
+  get diagnostics v_count = row_count;
+  return v_count;
+end;
+$$;
+
+create or replace function public.admin_assign_batch(p_user_ids uuid[], p_batch_id uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_uid       uuid;
+  v_sub       public.subscriptions%rowtype;
+  v_segment   text;
+  v_count     int;
+  v_assigned  int := 0;
+  v_skipped   jsonb := '[]'::jsonb;
+  v_batch     public.batches%rowtype;
+  v_held      boolean;
+  v_hint      text;
+begin
+  if not public.has_staff_permission('batches.manage') then
+    perform public.app_error('FORBIDDEN', 'admin_assign_batch: admin only', 403, null);
+  end if;
+
+  select * into v_batch from public.batches where id = p_batch_id;
+  if v_batch.id is null then
+    perform public.app_error('BATCH_NOT_FOUND', 'admin_assign_batch: batch not found', 404,
+      jsonb_build_object('batch_id', p_batch_id));
+  end if;
+  if v_batch.status <> 'open' then
+    perform public.app_error('BATCH_CLOSED',
+      format('admin_assign_batch: batch %s is %s', v_batch.code, v_batch.status), 409,
+      jsonb_build_object('batch_code', v_batch.code, 'status', v_batch.status));
+  end if;
+
+  foreach v_uid in array coalesce(p_user_ids, array[]::uuid[]) loop
+    begin
+      select * into v_sub from public.subscriptions s
+       where s.user_id = v_uid and s.status = 'active'
+         and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+       order by s.created_at desc limit 1;
+
+      if v_sub.id is null then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'no_active_subscription');
+        continue;
+      end if;
+
+      select coalesce(ep.community_segment, 'general') into v_segment
+        from public.enrollment_plans ep where ep.key = v_sub.plan_key;
+      if v_segment is distinct from 'vip' then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'not_a_premium_plan');
+        continue;
+      end if;
+
+      select exists (select 1 from public.batch_entitlements e
+                      where e.user_id = v_uid and e.batch_id = p_batch_id
+                        and e.status in ('queued', 'active')) into v_held;
+      if v_held then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'already_assigned');
+        continue;
+      end if;
+
+      if not exists (select 1 from public.community_spaces sp
+                      where sp.batch_id = p_batch_id and sp.kind = v_segment and sp.active) then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'no_space_for_segment');
+        continue;
+      end if;
+
+      v_count := public.plan_eligible_batch_count(v_sub.plan_key);
+      if v_count is null then
+        v_skipped := v_skipped || jsonb_build_object('user_id', v_uid, 'reason', 'no_run_length');
+        continue;
+      end if;
+
+      -- Move, do not destroy: supersede the outstanding run, then grant a new
+      -- one from the chosen cohort. Both remain in the ledger.
+      perform public.revoke_batch_run(v_uid, null,
+        format('reassigned to %s', v_batch.code), auth.uid(), 'superseded');
+
+      perform public.grant_batch_run(
+        v_uid, v_segment, p_batch_id, v_count, 'admin_manual',
+        v_sub.id, v_sub.plan_key, null, null,
+        coalesce(v_sub.grace_ends_at, v_sub.ends_at), auth.uid(), true);
+
+      update public.subscriptions set batch_id = p_batch_id, updated_at = now() where id = v_sub.id;
+
+      insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+      values (p_batch_id, v_uid, auth.uid(),
+              case when v_sub.batch_id is null then 'assign' else 'reassign' end,
+              jsonb_build_object('subscription_id', v_sub.id, 'segment', v_segment,
+                                 'from_batch_id', v_sub.batch_id, 'to_batch_id', p_batch_id));
+      v_assigned := v_assigned + 1;
+
+    exception
+      -- Only OUR refusals become a per-user skip. A deadlock or serialization
+      -- failure must surface, not masquerade as "this member was skipped" —
+      -- that would silently under-assign a bulk operation.
+      when sqlstate 'PT409' or sqlstate 'PT422' or sqlstate 'PT403' or sqlstate 'PT404' then
+        get stacked diagnostics v_hint = pg_exception_hint;
+        v_skipped := v_skipped || jsonb_build_object(
+          'user_id', v_uid,
+          'reason', lower(coalesce(nullif(v_hint, ''), 'run_conflict')));
+    end;
+  end loop;
+
+  return jsonb_build_object('ok', true, 'assigned', v_assigned,
+                            'skipped', v_skipped, 'batch_code', v_batch.code);
+end;
+$$;
+
+create or replace function public.admin_update_batch(
+  p_batch_id uuid, p_code text, p_name text,
+  p_starts_on date, p_ends_on date, p_timezone text,
+  p_vip_capacity int, p_total_capacity int)          -- ★ still NO DEFAULTS (#38's reasoning)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_old      public.batches%rowtype;
+  v_code     text;
+  v_name     text;
+  v_tz       text;
+  v_clash    text;
+  v_old_act  timestamptz;
+  v_new_act  timestamptz;
+  v_spaces   int := 0;
+  v_shifted  int := 0;
+  v_used     int;
+begin
+  if not public.has_staff_permission('batches.manage') then
+    perform public.app_error('FORBIDDEN', 'admin_update_batch: admin only', 403, null);
+  end if;
+
+  select * into v_old from public.batches where id = p_batch_id for update;
+  if v_old.id is null then
+    perform public.app_error('BATCH_NOT_FOUND', 'admin_update_batch: batch not found', 404,
+      jsonb_build_object('batch_id', p_batch_id));
+  end if;
+
+  if public.batch_is_past(v_old.ends_on, v_old.timezone) then
+    perform public.app_error('BATCH_PAST',
+      format('batch %s ended on %s (%s) and is read-only',
+             v_old.code, v_old.ends_on, v_old.timezone), 409,
+      jsonb_build_object('batch_code', v_old.code, 'ends_on', v_old.ends_on,
+                         'timezone', v_old.timezone));
+  end if;
+
+  -- ── Name ──
+  v_name := nullif(btrim(coalesce(p_name, '')), '');
+  if v_name is null then
+    perform public.app_error('BATCH_PERIOD_INVALID', 'a batch needs a display name', 422, null);
+  end if;
+
+  -- ── Code: shape, uniqueness, and RANK ──
+  v_code := lower(btrim(coalesce(p_code, '')));
+  if v_code !~ '^\d{4}-(0[1-9]|1[0-2])$' then
+    perform public.app_error('INVALID_BATCH_CODE',
+      format('%s is not a real YYYY-MM month', coalesce(p_code, 'null')), 422,
+      jsonb_build_object('code', p_code));
+  end if;
+
+  if v_code <> v_old.code then
+    if exists (select 1 from public.batches b where b.code = v_code and b.id <> p_batch_id) then
+      perform public.app_error('BATCH_CODE_TAKEN',
+        format('another batch already uses %s', v_code), 409,
+        jsonb_build_object('code', v_code));
+    end if;
+
+    -- ★ RANK PRESERVATION. grant_batch_run() allocates `order by b.code` from a
+    -- start batch, and allocate_queued_entitlements() refuses any cohort not
+    -- strictly above the highest code a run already holds. A code that crosses a
+    -- sibling therefore reorders somebody's paid run — silently, and only
+    -- visibly months later. Refuse it; a same-position correction is allowed.
+    select b.code into v_clash
+      from public.batches b
+     where b.id <> p_batch_id
+       and ((b.code < v_old.code) is distinct from (b.code < v_code))
+     order by b.code
+     limit 1;
+    if v_clash is not null then
+      perform public.app_error('BATCH_CODE_REORDER',
+        format('%s would move this batch past %s and reorder members'' cohort runs',
+               v_code, v_clash), 409,
+        jsonb_build_object('code', v_code, 'from_code', v_old.code, 'crosses', v_clash));
+    end if;
+  end if;
+
+  -- ── Timezone + period ──
+  v_tz := coalesce(nullif(btrim(coalesce(p_timezone, '')), ''), 'Asia/Manila');
+  if not exists (select 1 from pg_timezone_names z where z.name = v_tz) then
+    perform public.app_error('BATCH_TIMEZONE_INVALID',
+      format('%s is not a timezone Postgres recognises', v_tz), 422,
+      jsonb_build_object('timezone', v_tz));
+  end if;
+
+  if p_starts_on is null or p_ends_on is null then
+    perform public.app_error('BATCH_PERIOD_INVALID',
+      'a batch needs both a start and an end date', 422, null);
+  end if;
+  if p_starts_on > p_ends_on then
+    perform public.app_error('BATCH_PERIOD_INVALID',
+      'the end date falls before the start date', 422,
+      jsonb_build_object('starts_on', p_starts_on, 'ends_on', p_ends_on));
+  end if;
+  if public.batch_is_past(p_ends_on, v_tz) then
+    perform public.app_error('BATCH_PERIOD_PAST',
+      format('that period has already ended in %s', v_tz), 422,
+      jsonb_build_object('ends_on', p_ends_on, 'timezone', v_tz));
+  end if;
+
+  -- ── Capacity may not fall below seats already sold ──
+  -- batch_seat_holders() is the OCCUPANCY predicate (it ignores activates_at, so
+  -- a seat in a future cohort still counts — it was paid for).
+  select count(*) into v_used from public.batch_seat_holders(p_batch_id, 'vip');
+  if p_vip_capacity is not null and p_vip_capacity < v_used then
+    perform public.app_error('BATCH_CAPACITY_BELOW_OCCUPANCY',
+      format('%s VIP seat(s) are already sold in %s', v_used, v_old.code), 409,
+      jsonb_build_object('segment', 'vip', 'used', v_used, 'requested', p_vip_capacity));
+  end if;
+
+  if p_total_capacity is not null and p_total_capacity < v_used then
+    perform public.app_error('BATCH_CAPACITY_BELOW_OCCUPANCY',
+      format('%s seat(s) are already sold in %s', v_used, v_old.code), 409,
+      jsonb_build_object('segment', 'total', 'used', v_used, 'requested', p_total_capacity));
+  end if;
+
+  -- ── Write ──
+  update public.batches
+     set code           = v_code,
+         name           = v_name,
+         starts_on      = p_starts_on,
+         ends_on        = p_ends_on,
+         timezone       = v_tz,
+         vip_capacity   = p_vip_capacity,
+         total_capacity = p_total_capacity,
+         updated_at     = now()
+   where id = p_batch_id;
+
+  -- Dependent DISPLAY data, same transaction. The slug is NOT touched: it is a
+  -- permalink (see its column comment). Only what a member reads follows.
+  if v_name <> v_old.name then
+    update public.community_spaces sp
+       set name = 'VIP - ' || v_name,
+           updated_at = now()
+     where sp.batch_id = p_batch_id
+       and sp.kind = 'vip';
+    get diagnostics v_spaces = row_count;
+  end if;
+
+  -- A corrected start date moves seats that have NOT started yet. Already-active
+  -- seats and revoked/superseded history are never rewritten — this can delay or
+  -- advance a future cohort, never retract access somebody already has.
+  v_old_act := coalesce(v_old.starts_on::timestamptz,
+                        to_date(v_old.code || '-01', 'YYYY-MM-DD')::timestamptz);
+  v_new_act := coalesce(p_starts_on::timestamptz,
+                        to_date(v_code || '-01', 'YYYY-MM-DD')::timestamptz);
+  if v_new_act is distinct from v_old_act then
+    update public.batch_entitlements e
+       set activates_at = v_new_act, updated_at = now()
+     where e.batch_id = p_batch_id
+       and e.status in ('queued', 'active')
+       and e.activates_at is not null
+       and e.activates_at > now();
+    get diagnostics v_shifted = row_count;
+  end if;
+
+  insert into public.batch_events (batch_id, user_id, actor_id, action, detail)
+  values (p_batch_id, null, auth.uid(), 'edit',
+          jsonb_build_object(
+            'before', jsonb_build_object(
+              'code', v_old.code, 'name', v_old.name,
+              'starts_on', v_old.starts_on, 'ends_on', v_old.ends_on,
+              'timezone', v_old.timezone,
+              'vip_capacity', v_old.vip_capacity, 'total_capacity', v_old.total_capacity),
+            'after', jsonb_build_object(
+              'code', v_code, 'name', v_name,
+              'starts_on', p_starts_on, 'ends_on', p_ends_on,
+              'timezone', v_tz,
+              'vip_capacity', p_vip_capacity, 'total_capacity', p_total_capacity),
+            'spaces_renamed', v_spaces,
+            'activations_shifted', v_shifted));
+
+  return jsonb_build_object(
+    'ok', true,
+    'batch_id', p_batch_id,
+    'code', v_code,
+    'code_changed', v_code <> v_old.code,
+    'name', v_name,
+    'spaces_renamed', v_spaces,
+    'activations_shifted', v_shifted);
+end;
+$$;
+
+-- ★ THIS ONE IS THE #39 BODY, NOT A PRE-#39 ONE, AND THE DIFFERENCE ABORTS THE
+--   WHOLE MIGRATION. An earlier draft of this section restated a version that
+--   still returned gold_active / gold_capacity and grouped on
+--   ep.community_segment = 'gold'. #39 deleted the gold segment AND dropped
+--   batches.gold_capacity, so that body would have failed twice over — first with
+--   42P13 "cannot change return type of existing function" (10 OUT columns where
+--   the live one has 15), and then, if forced past that, on a column that no
+--   longer exists. It is exactly the failure this section's own header warns
+--   about: rebuild from the live definition, never restate from memory.
+--   The ONLY change from the live body is the guard in the WHERE clause.
+create or replace function public.admin_batch_overview()
+returns table (
+  batch_id uuid, code text, name text, status text,
+  starts_on date, ends_on date, timezone text,
+  closed_at timestamptz, close_reason text, is_past boolean,
+  vip_capacity integer, total_capacity integer,
+  vip_active bigint, total_active bigint, vip_queued bigint
+)
+language sql stable security definer set search_path = public
+as $$
+  select b.id, b.code, b.name, b.status,
+         b.starts_on, b.ends_on, b.timezone,
+         b.closed_at, b.close_reason,
+         public.batch_is_past(b.ends_on, b.timezone) as is_past,
+         b.vip_capacity, b.total_capacity,
+         (select count(*) from public.batch_seat_holders(b.id, 'vip')) as vip_active,
+         -- total_active is retained (equal to vip_active while VIP is the only
+         -- cohort segment) so the Batches screen keeps one row shape whether or
+         -- not another segment is ever added.
+         (select count(*) from public.batch_seat_holders(b.id, 'vip')) as total_active,
+         -- Committed demand: seats already sold that no cohort has absorbed yet.
+         -- Alex needs this BEFORE setting a capacity, because queued seats are
+         -- never retro-refused (they were paid for). Deliberately NOT correlated
+         -- to b.id — a queued row has no batch_id, so this is a registry-wide
+         -- total repeated on every row.
+         (select count(*) from public.batch_entitlements e
+           where e.status = 'queued' and e.segment = 'vip'
+             and (e.valid_until is null or e.valid_until > now()))       as vip_queued
+    from public.batches b
+   where public.has_staff_permission('batches.manage')
+   order by b.code desc;
+$$;
+
+create or replace function public.admin_grant_batch_run(
+  p_user_id uuid, p_batch_id uuid, p_count integer default null, p_force boolean default false)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_sub         public.subscriptions%rowtype;
+  v_segment     text;
+  v_count       int;
+  v_outstanding int;
+begin
+  if not public.has_staff_permission('batches.manage') then
+    perform public.app_error('FORBIDDEN', 'admin_grant_batch_run: admin only', 403, null);
+  end if;
+
+  select * into v_sub from public.subscriptions s
+   where s.user_id = p_user_id and s.status = 'active'
+     and (s.ends_at is null or coalesce(s.grace_ends_at, s.ends_at) > now())
+   order by s.created_at desc limit 1;
+  if v_sub.id is null then
+    perform public.app_error('ENTITLEMENT_EXPIRED',
+      'member has no active membership term to attach a cohort seat to', 403,
+      jsonb_build_object('user_id', p_user_id));
+  end if;
+
+  select coalesce(ep.community_segment, 'general') into v_segment
+    from public.enrollment_plans ep where ep.key = v_sub.plan_key;
+  if v_segment is distinct from 'vip' then
+    perform public.app_error('INVALID_PLAN',
+      format('plan %s is not a cohort plan', v_sub.plan_key), 422,
+      jsonb_build_object('plan_key', v_sub.plan_key, 'segment', v_segment));
+  end if;
+
+  v_count := coalesce(p_count, public.plan_eligible_batch_count(v_sub.plan_key), 1);
+
+  -- ★ #37: idempotency. The one-seat-per-cohort unique index only protects
+  -- BOUND seats, so a repeat call on a member who already holds every open
+  -- cohort fell through to the shortfall path and minted a second full run of
+  -- queued seats — sold, capacity-exempt, and auto-bound later by the binder.
+  if not p_force then
+    select count(*) into v_outstanding
+      from public.batch_entitlements e
+     where e.user_id = p_user_id and e.status in ('queued', 'active');
+    if v_outstanding >= v_count then
+      perform public.app_error('ALREADY_ENTITLED',
+        format('member already holds %s outstanding cohort seat(s); pass p_force to stack another run',
+               v_outstanding), 409,
+        jsonb_build_object('outstanding', v_outstanding, 'requested', v_count));
+    end if;
+  end if;
+
+  return public.grant_batch_run(
+    p_user_id, v_segment, p_batch_id, v_count, 'admin_manual',
+    v_sub.id, v_sub.plan_key, null, null,
+    coalesce(v_sub.grace_ends_at, v_sub.ends_at), auth.uid(), not p_force);
+end;
+$$;
+
+create or replace function public.admin_revoke_batch_run(
+  p_user_id uuid,
+  p_run_id  uuid default null,
+  p_reason  text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare v_n int;
+begin
+  if not public.has_staff_permission('batches.manage') then
+    perform public.app_error('FORBIDDEN', 'admin_revoke_batch_run: admin only', 403, null);
+  end if;
+  v_n := public.revoke_batch_run(p_user_id, p_run_id, p_reason, auth.uid(), 'revoked');
+  return jsonb_build_object('ok', true, 'revoked', v_n);
+end;
+$fn$;
+
+create or replace function public.admin_reconcile_queued_entitlements(p_batch_id uuid default null)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+declare v_n int;
+begin
+  if not public.has_staff_permission('batches.manage') then
+    perform public.app_error('FORBIDDEN', 'admin_reconcile_queued_entitlements: admin only', 403, null);
+  end if;
+  v_n := public.allocate_queued_entitlements(p_batch_id);
+  return jsonb_build_object('ok', true, 'allocated', v_n);
+end;
+$fn$;
+
+create or replace function public.admin_close_due_batches()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $fn$
+begin
+  if not public.has_staff_permission('batches.manage') then
+    perform public.app_error('FORBIDDEN', 'admin_close_due_batches: admin only', 403, null);
+  end if;
+  return public.close_due_batches();
+end;
+$fn$;
+
+
+-- ── 15c) The RLS policies those screens read ────────────────────────────────
+-- ALTER, not DROP+CREATE, for #39's reason: scripts/apply-db-files.mjs sends one
+-- statement per HTTP round trip, so a DROP+CREATE is a real window during which
+-- the table has NO policy for that command.
+--
+-- ★ profiles_admin_select is the one that makes `access_requests.review` mean
+--   anything. Before this, an Operations Admin could call
+--   admin_review_access_request() on a p_user_id they had no way to DISCOVER:
+--   the pending-signup query returns zero rows because that policy still says
+--   is_admin(). A permission to decide, over a queue you cannot read, is not a
+--   permission.
+alter policy profiles_admin_select on public.profiles
+  using ((select public.is_admin())
+         or (select public.has_staff_permission('access_requests.review'))
+         or (select public.has_staff_permission('enrollments.review')));
+
+alter policy enroll_req_admin_all on public.enrollment_requests
+  using ((select public.has_staff_permission('enrollments.review')))
+  with check ((select public.has_staff_permission('enrollments.review')));
+
+alter policy subscriptions_admin_all on public.subscriptions
+  using ((select public.has_staff_permission('enrollments.review')))
+  with check ((select public.has_staff_permission('enrollments.review')));
+
+alter policy batches_admin_all on public.batches
+  using ((select public.has_staff_permission('batches.manage')))
+  with check ((select public.has_staff_permission('batches.manage')));
+
+alter policy batch_events_admin_select on public.batch_events
+  using ((select public.has_staff_permission('batches.manage')));
+
+alter policy batch_events_admin_insert on public.batch_events
+  with check ((select public.has_staff_permission('batches.manage')));
+
+alter policy community_spaces_admin_all on public.community_spaces
+  using ((select public.has_staff_permission('batches.manage')))
+  with check ((select public.has_staff_permission('batches.manage')));
+
+-- The Enrollments membership strip reads the cohort ledger.
+alter policy batch_entitlements_read on public.batch_entitlements
+  using (user_id = (select auth.uid())
+         or (select public.has_staff_permission('enrollments.review')));
+
+-- Student imports: the wizard reads these tables from the BROWSER (the service
+-- role is only used by api/admin/student-imports.js for the writes), so an
+-- Operations Admin needs read/write here or the screen is empty.
+alter policy student_import_jobs_admin_all on public.student_import_jobs
+  using ((select public.has_staff_permission('students.import')))
+  with check ((select public.has_staff_permission('students.import')));
+
+alter policy student_import_rows_admin_all on public.student_import_rows
+  using ((select public.has_staff_permission('students.import')))
+  with check ((select public.has_staff_permission('students.import')));
+
+alter policy student_import_events_admin_select on public.student_import_events
+  using ((select public.has_staff_permission('students.import')));
+
+alter policy student_import_events_admin_insert on public.student_import_events
+  with check ((select public.has_staff_permission('students.import')));
+
+alter policy student_external_accounts_admin_all on public.student_external_accounts
+  using ((select public.has_staff_permission('students.import')))
+  with check ((select public.has_staff_permission('students.import')));
+
+-- Receipt preview. An Ops Admin who may approve a payment must be able to LOOK
+-- at the payment. Storage policies are invisible to db:shadow:verify, so this one
+-- is pinned by an OBJECT_CHECKS entry in scripts/audit-db.mjs instead.
+alter policy enrollment_receipts_select on storage.objects
+  using (bucket_id = 'enrollment-receipts'
+         and ((storage.foldername(name))[1] = (select auth.uid())::text
+              or (select public.has_staff_permission('enrollments.review'))));
+
+
+-- ── 15d) The access-request queue an Ops Admin can actually read ────────────
+-- profiles_admin_select above widens the row filter, but the client's pending
+-- query also selects columns and orders them; giving the screen a purpose-built
+-- SECDEF reader keeps the permission check in ONE place and mirrors
+-- admin_staff_directory(), which exists for exactly the same reason.
+--
+-- The permission test is in the WHERE clause, so a caller without it gets zero
+-- rows rather than an error — the same shape as course_publish_blockers().
+create or replace function public.admin_access_request_queue(
+  p_status text default 'pending',
+  p_limit  integer default 500
+)
+returns table (
+  id uuid, email text, full_name text, avatar_url text,
+  approval_status text, rejection_reason text,
+  approved_at timestamptz, rejected_at timestamptz,
+  created_at timestamptz, updated_at timestamptz
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select p.id, p.email, p.full_name, p.avatar_url,
+         p.approval_status, p.rejection_reason,
+         p.approved_at, p.rejected_at, p.created_at, p.updated_at
+    from public.profiles p
+   where public.has_staff_permission('access_requests.review')
+     and (p_status is null or p.approval_status = p_status)
+   order by p.created_at desc
+   limit greatest(1, least(coalesce(p_limit, 500), 1000))
+$fn$;
+
+comment on function public.admin_access_request_queue(text, integer) is
+  '#45: the Access Requests queue, gated on access_requests.review. Exists because '
+  'profiles_admin_select alone left an Operations Admin able to DECIDE on a signup '
+  'they could not DISCOVER. Mirrors admin_staff_directory(): SECURITY DEFINER so it '
+  'can read other people''s profiles, permission test in the WHERE clause so a '
+  'caller without it gets zero rows rather than an error.';
+
+revoke all on function public.admin_access_request_queue(text, integer) from public, anon;
+grant execute on function public.admin_access_request_queue(text, integer) to authenticated;
+
+notify pgrst, 'reload schema';
+
+insert into public.schema_migrations (filename, checksum, notes) values
+ ('2026-08-25-staff-authorization.sql', null,
+  'staff authorization (#45): staff_roles / staff_permissions / staff_role_permissions / '
+  'staff_memberships / staff_role_events, seeded with the 18-permission x 3-role matrix; '
+  'backfills every profiles.is_admin account to an active super_admin membership and refuses '
+  'to complete with none; turns profiles.is_admin into a trigger-maintained cache of "active '
+  'super_admin" so all 295 legacy is_admin() references narrow to Super-Admin-only rather than '
+  'breaking; drops profiles_admin_update and revokes UPDATE on profiles from authenticated '
+  '(whole-row admin update was a privilege-escalation primitive); adds '
+  'admin_review_access_request() to replace the AccessRequests direct UPDATE; adds the '
+  'last-Super-Admin guard trigger; teaches batch_entitlements_guard() to accept an Operations '
+  'Admin as granted_by (it read profiles.is_admin, which would have refused every VIP approval '
+  'they made); revokes anon EXECUTE on is_admin/is_approved/is_enrolled and pins four '
+  'no-TO-clause policies to authenticated. Section 15 then RE-GATES THE OPERATIONS SURFACE, '
+  'without which the Operations Admin role is decorative: admin_finalize_enrollment, '
+  'approve_subscription, approve_extension, expire_overdue_subscriptions and the eight admin_* '
+  'batch RPCs move from is_admin() to has_staff_permission(), as do fourteen RLS policies and '
+  'the enrollment_receipts_select storage policy, and admin_access_request_queue() is added so '
+  'an Ops Admin can DISCOVER the signups they are allowed to decide on. Section 14 indexes the '
+  'membership lookup and the audit ledger. ★ Requires the matching client build: this file '
+  'revokes UPDATE on profiles, which a pre-#45 Access Requests screen still relies on.')
+on conflict (filename) do nothing;
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- §33) FOLDED VERBATIM — 2026-08-26-course-staff-assignments.sql   (#46)
+-- ═════════════════════════════════════════════════════════════════════════════
+-- Appended at the tail for the same reason as §19-§32: the earlier sections
+-- create the pre-#46 shapes, and this file's DROP+CREATE must win on a fresh
+-- install. The file is idempotent and self-guarded, so appending reproduces the
+-- live end state exactly. RE-FOLD whenever the dated file changes.
+--
+-- Its `do $pre$ … $pre$;` preflight is omitted: the bootstrap creates every
+-- dependency itself, above, in order.
+-- ═════════════════════════════════════════════════════════════════════════════
+-- ─────────────────────────────────────────────────────────────────────────────
+-- #46 — Trainer course ownership: course_staff_assignments + can_manage_course().
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHAT THIS FIXES
+--   #45 installed the role model and, in its section 15, made the OPERATIONS
+--   surface real. It left the TRAINER surface entirely decorative: six permission
+--   keys — courses.create, courses.manage_assigned, courses.manage_all,
+--   courses.publish, courses.delete, course_trainer.manage — were seeded into the
+--   matrix and then consumed by NOTHING. Every course policy still read
+--   is_admin(), which #45 narrowed to "active Super Admin", so a Trainer could not
+--   create a course, edit a lesson, upload a video, or open the AI-trainer panel.
+--
+--   #45 also left a dangling reference in the other direction:
+--   api/_lib/staffAuth.js:callerCanManageCourse() already calls
+--   `rpc/can_manage_course`, and my_staff_context() already returns an
+--   `assigned_course_ids` key hardcoded to '[]' with a comment saying "#46
+--   replaces this function". Both are honoured here.
+--
+-- ★ THE ASYMMETRY THAT MATTERS: PATHS AUTHORIZE WRITES, NEVER READS.
+--   #44 deleted course_object_allowed() because it authorized READS by parsing
+--   the object path, and failed OPEN three ways — an unparseable name, an unknown
+--   course, and every non-sampler plan all returned true. Reads are still
+--   reference-based (course_video_object_readable asks whether a published lesson
+--   the caller may read cites that exact storage_path) and this file does not
+--   touch that.
+--
+--   WRITES are the opposite question. "Which course does this new object belong
+--   to?" has only one honest answer — the folder the writer chose — and the
+--   failure mode is inverted: course_object_course_id() returns NULL for anything
+--   that is not exactly `lessons/<uuid>/…` or `covers/<uuid>/…`, and
+--   user_can_manage_course(uid, NULL) is false. A malformed path therefore denies
+--   the write instead of allowing it. That is why the same technique that was a
+--   security bug for reads is the correct one here, and why it is written as a
+--   strict regex with no fallback branch.
+--
+-- ★ DUPLICATION SHARES FILES BY REFERENCE, AND THAT IS PRESERVED.
+--   CourseCatalog.duplicateCourse() copies storage_path by value, so a duplicate's
+--   video physically lives in the SOURCE course's folder. A Trainer assigned only
+--   to the duplicate therefore cannot DELETE that file — correct, it is not theirs
+--   — while still being able to read it (reads are reference-based) and to upload
+--   NEW files into their own course's folder. removeMediaIfUnreferenced() already
+--   fails conservatively when it cannot confirm, so nothing breaks.
+--
+-- ORDERING INSIDE THIS FILE IS LOAD-BEARING:
+--   table → helpers → my_staff_context() → write policies → read policies →
+--   storage → publish guard → RPCs → catalog → indexes.
+--   can_manage_course() must exist before any policy names it.
+--
+-- Depends on: #2 (courses), #19 (access_tier/plan_is_sampler), #27 (course_ai_*),
+--   #31 (schema_migrations), #35 (app_error), #44 (the publish guard this extends),
+--   #45 (the staff model). Run #45 and its client build FIRST.
+--
+-- HOW TO RUN: paste into the Supabase dashboard → SQL Editor → Run.
+-- IDEMPOTENT (create … if not exists / create or replace / drop … if exists /
+--   on conflict) — safe to re-run.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+
+-- == 0) Preflight ============================================================
+
+
+-- == 1) Course ownership =====================================================
+-- ★ ONE ROW PER (course, staff member) while active, mutated in place; history
+--   lives in the revoked_at column and in staff_role_events-style provenance.
+--   assignment_role is 'owner' or 'editor'. Today they confer the SAME rights —
+--   the distinction exists so "who is responsible for this course?" has an answer
+--   in the UI without inventing a second table later. Do NOT start reading
+--   assignment_role for authorization without changing user_can_manage_course()
+--   and saying so here.
+
+alter table public.courses
+  add column if not exists created_by uuid references auth.users(id) on delete set null;
+
+comment on column public.courses.created_by is
+  '#46: who created this course. Provenance only — authorization is '
+  'course_staff_assignments, because a creator can be reassigned and an owner can '
+  'be someone who did not create it.';
+
+create table if not exists public.course_staff_assignments (
+  id              uuid primary key default gen_random_uuid(),
+  course_id       uuid not null references public.courses(id) on delete cascade,
+  staff_user_id   uuid not null references auth.users(id) on delete cascade,
+  assignment_role text not null default 'editor'
+                  check (assignment_role in ('owner', 'editor')),
+  assigned_by     uuid references auth.users(id) on delete set null,
+  assigned_at     timestamptz not null default now(),
+  revoked_at      timestamptz,
+  revoke_reason   text,
+  created_at      timestamptz not null default now()
+);
+
+comment on table public.course_staff_assignments is
+  '#46: which staff member may edit which course. A row with revoked_at IS NULL is '
+  'live; revoking sets the timestamp rather than deleting, so "who could edit this '
+  'course in March?" stays answerable. No client write policy — every write goes '
+  'through admin_assign_course_staff() / admin_revoke_course_staff().';
+
+-- One LIVE assignment per person per course. Partial, so a revoked row never
+-- blocks a re-assignment.
+create unique index if not exists course_staff_assignments_live_idx
+  on public.course_staff_assignments (course_id, staff_user_id)
+  where revoked_at is null;
+
+-- THE hot path: user_can_manage_course() asks "does this person hold a live
+-- assignment on this course?" on every policy evaluation.
+create index if not exists course_staff_assignments_user_idx
+  on public.course_staff_assignments (staff_user_id)
+  where revoked_at is null;
+
+create index if not exists course_staff_assignments_course_idx
+  on public.course_staff_assignments (course_id);
+
+create index if not exists courses_created_by_idx
+  on public.courses (created_by) where created_by is not null;
+
+
+-- == 2) Authorization helpers ================================================
+-- ★ Same two-form split as #45: the parameterised user_*(uuid, …) form answers
+--   about ANY user and is revoked from every client role; the caller-pinned form
+--   is granted to authenticated because an RLS qual is evaluated AS THE QUERYING
+--   ROLE — without the grant, every gated write fails with "permission denied for
+--   function" instead of a clean authorization denial.
+
+create or replace function public.user_can_manage_course(p_user uuid, p_course_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select case
+    -- A NULL course id is what course_object_course_id() returns for a path it
+    -- does not recognise. Answering "false" here is what makes a malformed
+    -- storage path deny the write rather than allow it.
+    when p_user is null or p_course_id is null then false
+    when public.user_has_staff_permission(p_user, 'courses.manage_all') then true
+    when not public.user_has_staff_permission(p_user, 'courses.manage_assigned') then false
+    else exists (
+      select 1 from public.course_staff_assignments a
+       where a.course_id = p_course_id
+         and a.staff_user_id = p_user
+         and a.revoked_at is null
+    )
+  end
+$fn$;
+
+comment on function public.user_can_manage_course(uuid, uuid) is
+  '#46: INTERNAL. courses.manage_all bypasses assignment; courses.manage_assigned '
+  'requires a live row in course_staff_assignments. A null course id is false, which '
+  'is what makes the storage-path form fail closed.';
+
+revoke all on function public.user_can_manage_course(uuid, uuid) from public, anon, authenticated;
+
+create or replace function public.can_manage_course(p_course_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select public.user_can_manage_course((select auth.uid()), p_course_id)
+$fn$;
+
+comment on function public.can_manage_course(uuid) is
+  '#46: may the CALLER edit this course? The one predicate every course write policy '
+  'reads, and the same question api/_lib/staffAuth.js:callerCanManageCourse() asks over '
+  'PostgREST — so the API and the database cannot drift. Takes a per-row argument, so it '
+  'is deliberately NOT wrapped in (select …): a subselect would make it a correlated '
+  'SubPlan and defeat the short-circuit in front of it (the #44 note on '
+  'course_video_object_readable, for the same reason).';
+
+revoke all on function public.can_manage_course(uuid) from public, anon;
+grant execute on function public.can_manage_course(uuid) to authenticated;
+
+-- The strict path parser. See the header: this authorizes WRITES only.
+create or replace function public.course_object_course_id(p_name text)
+returns uuid
+language sql
+immutable
+parallel safe
+set search_path = public, pg_temp
+as $fn$
+  select case
+    when p_name ~ '^(lessons|covers)/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/.+'
+      then nullif(split_part(p_name, '/', 2), '')::uuid
+    else null
+  end
+$fn$;
+
+comment on function public.course_object_course_id(text) is
+  '#46: the course a course-media/course-videos object belongs to, from its path. '
+  'Returns NULL for anything that is not exactly lessons/<uuid>/<file> or '
+  'covers/<uuid>/<file>, and every caller treats NULL as "deny". This is the WRITE '
+  'side only — reads stay reference-based via course_video_object_readable(), because '
+  'path-parsing a read is exactly what #44 removed for failing open.';
+
+revoke all on function public.course_object_course_id(text) from public, anon;
+grant execute on function public.course_object_course_id(text) to authenticated;
+
+
+-- == 3) my_staff_context() fills assigned_course_ids =========================
+-- #45 shipped this with '[]'::jsonb and a comment naming this file. The client
+-- uses it for canManageCourseClient() — deciding what to RENDER. The policies
+-- below re-decide every actual write.
+create or replace function public.my_staff_context()
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select coalesce(
+    (select jsonb_build_object(
+       'is_staff',        true,
+       'role_key',        m.role_key,
+       'role_label',      r.label,
+       'status',          m.status,
+       'display_title',   m.display_title,
+       'is_super_admin',  (m.role_key = 'super_admin'),
+       'permissions',     coalesce(
+                            (select jsonb_agg(rp.permission_key order by rp.permission_key)
+                               from public.staff_role_permissions rp
+                              where rp.role_key = m.role_key),
+                            '[]'::jsonb),
+       -- #46: the courses this person holds a LIVE assignment on. Only meaningful
+       -- for a manage_assigned holder; a manage_all holder edits everything and
+       -- the client's canManageCourseClient() short-circuits on that permission
+       -- before it ever looks at this list.
+       'assigned_course_ids', coalesce(
+                                (select jsonb_agg(distinct a.course_id)
+                                   from public.course_staff_assignments a
+                                  where a.staff_user_id = m.user_id
+                                    and a.revoked_at is null),
+                                '[]'::jsonb)
+     )
+     from public.staff_memberships m
+     join public.staff_roles r on r.key = m.role_key
+    where m.user_id = (select auth.uid())),
+    jsonb_build_object('is_staff', false)
+  )
+$fn$;
+
+comment on function public.my_staff_context() is
+  '#45/#46: the ONE call the client and the api/ handlers make to learn who they are. '
+  'Membership + effective permissions + assigned course ids, read LIVE from the database '
+  'on every request — never decoded from a JWT claim, which is why suspending a staff '
+  'member takes effect immediately instead of at their next token refresh. '
+  'normalizeStaffContext() in src/lib/staffRoles.js refuses authority for anything but '
+  'status = ''active''; the SQL predicates do the same independently.';
+
+revoke all on function public.my_staff_context() from public, anon;
+grant execute on function public.my_staff_context() to authenticated;
+
+
+-- == 4) Course write policies ================================================
+-- ★ courses_admin_write was a single FOR ALL policy, so splitting it into three
+--   verbs REQUIRES drop-then-create. Unlike a READ policy, the window between
+--   those two statements fails CLOSED: RLS is enabled and a table with no
+--   matching policy refuses the write. Nobody gains anything mid-flight.
+--
+-- ★ Creating a course is courses.create; editing one is can_manage_course();
+--   deleting one is courses.delete AND can_manage_course(). Publishing is neither
+--   — it is a trigger, in section 7, because `published` is a column on a row you
+--   are otherwise allowed to update.
+
+alter table public.course_staff_assignments enable row level security;
+
+drop policy if exists course_staff_assignments_read on public.course_staff_assignments;
+create policy course_staff_assignments_read on public.course_staff_assignments
+  for select to authenticated
+  using (
+    staff_user_id = (select auth.uid())
+    or (select public.has_staff_permission('courses.manage_all'))
+    or (select public.has_staff_permission('staff.manage'))
+  );
+
+revoke insert, update, delete, truncate on public.course_staff_assignments from authenticated, anon, public;
+grant select on public.course_staff_assignments to authenticated;
+
+drop policy if exists courses_admin_write on public.courses;
+
+drop policy if exists courses_staff_insert on public.courses;
+create policy courses_staff_insert on public.courses
+  for insert to authenticated
+  with check ((select public.has_staff_permission('courses.create')));
+
+drop policy if exists courses_staff_update on public.courses;
+create policy courses_staff_update on public.courses
+  for update to authenticated
+  using (public.can_manage_course(id))
+  with check (public.can_manage_course(id));
+
+drop policy if exists courses_staff_delete on public.courses;
+create policy courses_staff_delete on public.courses
+  for delete to authenticated
+  using ((select public.has_staff_permission('courses.delete')) and public.can_manage_course(id));
+
+drop policy if exists modules_admin_write on public.course_modules;
+drop policy if exists modules_staff_write on public.course_modules;
+create policy modules_staff_write on public.course_modules
+  for all to authenticated
+  using (public.can_manage_course(course_id))
+  with check (public.can_manage_course(course_id));
+
+drop policy if exists lessons_admin_write on public.course_lessons;
+drop policy if exists lessons_staff_write on public.course_lessons;
+create policy lessons_staff_write on public.course_lessons
+  for all to authenticated
+  using (public.can_manage_course(course_id))
+  with check (public.can_manage_course(course_id));
+
+
+-- == 5) Course read policies: a Trainer can preview their own draft ==========
+-- ★ ALTER, never DROP+CREATE. These are READ policies, and one statement per HTTP
+--   round trip makes a drop/create pair a real window in which the course
+--   catalogue is invisible to every student (#39's rule, restated by #44).
+--
+--   The new branch is a pure ADDITION to the existing predicate: nothing a
+--   student could read before becomes unreadable.
+
+alter policy courses_read on public.courses
+  using (
+    (select public.is_admin())
+    or public.can_manage_course(id)
+    or (published = true
+        and (select public.is_approved())
+        and (select public.is_enrolled())
+        and ((not (select public.plan_is_sampler()))
+             or (slug like 'qbo-%' and access_tier = 'essentials')))
+  );
+
+alter policy modules_read on public.course_modules
+  using (
+    (select public.is_admin())
+    or public.can_manage_course(course_modules.course_id)
+    or ((select public.is_approved()) and (select public.is_enrolled())
+        and exists (
+          select 1 from public.courses c
+           where c.id = course_modules.course_id
+             and c.published = true
+             and ((not (select public.plan_is_sampler()))
+                  or (c.slug like 'qbo-%' and c.access_tier = 'essentials'))))
+  );
+
+alter policy lessons_read on public.course_lessons
+  using (
+    (select public.is_admin())
+    or public.can_manage_course(course_lessons.course_id)
+    or ((select public.is_approved()) and (select public.is_enrolled())
+        and exists (
+          select 1 from public.courses c
+           where c.id = course_lessons.course_id
+             and c.published = true
+             and ((not (select public.plan_is_sampler()))
+                  or (c.slug like 'qbo-%' and c.access_tier = 'essentials'))))
+  );
+
+
+-- == 6) Storage ==============================================================
+-- Writes are path-authorized (see the header). Reads keep #44's reference-based
+-- predicate untouched, plus a manage branch so a Trainer can play back the video
+-- they just uploaded into a course that is still a draft — the reference form
+-- requires c.published, which a draft is not.
+
+alter policy course_videos_admin_write on storage.objects
+  with check (bucket_id = 'course-videos'
+              and public.can_manage_course(public.course_object_course_id(name)));
+
+alter policy course_videos_admin_update on storage.objects
+  using (bucket_id = 'course-videos'
+         and public.can_manage_course(public.course_object_course_id(name)));
+
+alter policy course_videos_admin_delete on storage.objects
+  using (bucket_id = 'course-videos'
+         and public.can_manage_course(public.course_object_course_id(name)));
+
+alter policy course_videos_read on storage.objects
+  using (
+    bucket_id = 'course-videos'
+    and ((select public.is_admin())
+         or public.can_manage_course(public.course_object_course_id(name))
+         or ((select public.is_approved())
+             and (select public.is_enrolled())
+             and public.course_video_object_readable(name, (select public.plan_is_sampler()))))
+  );
+
+alter policy course_media_admin_write on storage.objects
+  with check (bucket_id = 'course-media'
+              and public.can_manage_course(public.course_object_course_id(name)));
+
+alter policy course_media_admin_update on storage.objects
+  using (bucket_id = 'course-media'
+         and public.can_manage_course(public.course_object_course_id(name)));
+
+alter policy course_media_admin_delete on storage.objects
+  using (bucket_id = 'course-media'
+         and public.can_manage_course(public.course_object_course_id(name)));
+
+-- course-media is a PUBLIC bucket, so this policy governs the authenticated
+-- object listing only — the CDN serves the bytes to anyone with the URL either
+-- way. Widened so a Trainer's own cover upload is listable to them.
+alter policy course_media_read on storage.objects
+  using (bucket_id = 'course-media'
+         and ((select public.is_admin())
+              or public.can_manage_course(public.course_object_course_id(name))));
+
+
+-- == 7) Publishing is its own capability =====================================
+-- ★ Publishing exposes content to every paying student, so it is deliberately NOT
+--   part of courses.manage_assigned. A Trainer authors; someone with
+--   courses.publish ships. #44 already had a guard here for the "unplayable video"
+--   case — this extends the SAME trigger rather than adding a second one, so there
+--   is one place to read.
+--
+-- ★ The WHEN clause stays DELTA-scoped. #44's note is still load-bearing:
+--   reorderCourse fires N updates on published rows in one Promise.all, and cover
+--   upload, tier toggle, AI-trainer toggle and metadata save all write to courses
+--   without touching `published`. Scoping on state instead of on the transition
+--   would refuse every one of them. Widened from "turning on" to "changing", so
+--   UNpublishing needs the capability too — withdrawing a live course from every
+--   student is not a lesser act than publishing it.
+
+create or replace function public.courses_publish_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+declare
+  v_n int;
+begin
+  if not public.has_staff_permission('courses.publish') then
+    perform public.app_error('COURSE_PUBLISH_FORBIDDEN',
+      case when new.published
+        then 'Publishing a course needs the "Publish and unpublish courses" permission. Ask a Super Admin to publish it.'
+        else 'Withdrawing a published course needs the "Publish and unpublish courses" permission.'
+      end, 403, jsonb_build_object('course_id', new.id));
+  end if;
+
+  -- Only the false → true direction can be blocked by unplayable video: pulling a
+  -- broken course DOWN must always remain possible.
+  if new.published then
+    select count(*) into v_n
+      from public.course_lessons l
+     where l.course_id = new.id
+       and l.type = 'video'
+       and (
+         (coalesce(l.video_provider, '') <> 'upload'
+          and nullif(btrim(coalesce(l.video_url, '')), '') is not null)
+         or (l.video_provider = 'upload' and l.storage_path is null)
+       );
+    if v_n > 0 then
+      perform public.app_error('COURSE_PUBLISH_BLOCKED',
+        format('%s lesson(s) still play from an external link or have no uploaded file — upload their videos before publishing', v_n),
+        409, jsonb_build_object('course_id', new.id, 'blockers', v_n));
+    end if;
+  end if;
+
+  return new;
+end;
+$fn$;
+
+revoke all on function public.courses_publish_guard() from public, anon, authenticated;
+
+drop trigger if exists courses_publish_guard on public.courses;
+create trigger courses_publish_guard
+  before update on public.courses
+  for each row
+  when (new.published is distinct from old.published)
+  execute function public.courses_publish_guard();
+
+-- INSERT needs its own trigger: a WHEN clause on an INSERT trigger cannot
+-- reference OLD, so the transition test above is not expressible there.
+drop trigger if exists courses_publish_insert_guard on public.courses;
+create trigger courses_publish_insert_guard
+  before insert on public.courses
+  for each row
+  when (new.published)
+  execute function public.courses_publish_guard();
+
+-- The UI preflight. Widened from is_admin() so the person who will hit the guard
+-- is the person who can see what is blocking them.
+create or replace function public.course_publish_blockers(p_course_id uuid)
+returns table (lesson_id uuid, module_id uuid, title text, reason text)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select l.id, l.module_id, l.title,
+         case when l.video_provider = 'upload' then 'upload_missing_file'
+              else 'external_link' end
+    from public.course_lessons l
+   where public.can_manage_course(p_course_id)
+     and l.course_id = p_course_id
+     and l.type = 'video'
+     and ( (coalesce(l.video_provider,'') <> 'upload' and nullif(btrim(coalesce(l.video_url,'')),'') is not null)
+        or (l.video_provider = 'upload' and l.storage_path is null) )
+   order by l.position, l.id
+$fn$;
+
+revoke all on function public.course_publish_blockers(uuid) from public, anon;
+grant execute on function public.course_publish_blockers(uuid) to authenticated;
+
+
+-- == 8) A creator owns what they create ======================================
+-- Without this a Trainer could create a course (courses.create) and then be
+-- unable to edit it (no assignment) — a dead end that looks exactly like a bug.
+create or replace function public.courses_stamp_creator()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+begin
+  -- ★ auth.uid() OVERRIDES whatever the client sent, rather than only filling a
+  --   NULL. created_by decides who gets the owner assignment in the AFTER trigger
+  --   below, so a client that could choose it could hand ownership of a course it
+  --   just created to somebody else — or, more usefully to an attacker, keep
+  --   creating courses owned by a Trainer who then finds work they never did.
+  --   When auth.uid() IS null there is no caller to attribute it to (a migration,
+  --   a seed, the service role), so whatever was supplied stands.
+  if auth.uid() is not null then
+    new.created_by := auth.uid();
+  end if;
+  return new;
+end;
+$fn$;
+
+revoke all on function public.courses_stamp_creator() from public, anon, authenticated;
+
+drop trigger if exists courses_stamp_creator on public.courses;
+create trigger courses_stamp_creator
+  before insert on public.courses
+  for each row execute function public.courses_stamp_creator();
+
+create or replace function public.courses_assign_creator()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+begin
+  -- auth.uid() is null for a migration, a seed or the service role: there is no
+  -- person to assign, and inventing one would put a NULL in a not-null column.
+  if new.created_by is not null then
+    insert into public.course_staff_assignments (course_id, staff_user_id, assignment_role, assigned_by)
+    values (new.id, new.created_by, 'owner', new.created_by)
+    on conflict do nothing;
+  end if;
+  return new;
+end;
+$fn$;
+
+revoke all on function public.courses_assign_creator() from public, anon, authenticated;
+
+drop trigger if exists courses_assign_creator on public.courses;
+create trigger courses_assign_creator
+  after insert on public.courses
+  for each row execute function public.courses_assign_creator();
+
+
+-- == 9) Assignment RPCs ======================================================
+-- The tables carry no client write policy, so these are the only writers.
+
+create or replace function public.admin_assign_course_staff(
+  p_course_id uuid,
+  p_user_id   uuid,
+  p_role      text default 'editor'
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+declare
+  v_id uuid;
+begin
+  -- Handing out authority over a course is a manage_all act, not a
+  -- manage_assigned one: otherwise a Trainer could assign their own colleagues.
+  if not public.has_staff_permission('courses.manage_all') then
+    perform public.app_error('FORBIDDEN',
+      'admin_assign_course_staff: courses.manage_all required', 403, null);
+  end if;
+  if p_role not in ('owner', 'editor') then
+    perform public.app_error('COURSE_ASSIGNMENT_INVALID',
+      format('unknown assignment role %s', p_role), 422, null);
+  end if;
+  if not exists (select 1 from public.courses where id = p_course_id) then
+    perform public.app_error('COURSE_ACCESS_DENIED', 'no such course', 404,
+      jsonb_build_object('course_id', p_course_id));
+  end if;
+  -- Assigning a course to somebody who cannot edit courses at all would create a
+  -- row that grants nothing and reads as though it does.
+  if not public.user_has_staff_permission(p_user_id, 'courses.manage_assigned')
+     and not public.user_has_staff_permission(p_user_id, 'courses.manage_all') then
+    perform public.app_error('COURSE_ASSIGNMENT_INVALID',
+      'that account holds no course-editing permission, so an assignment would grant nothing', 422,
+      jsonb_build_object('user_id', p_user_id));
+  end if;
+
+  insert into public.course_staff_assignments
+    (course_id, staff_user_id, assignment_role, assigned_by)
+  values (p_course_id, p_user_id, p_role, auth.uid())
+  on conflict (course_id, staff_user_id) where revoked_at is null
+  do update set assignment_role = excluded.assignment_role
+  returning id into v_id;
+
+  return jsonb_build_object('ok', true, 'id', v_id,
+                            'course_id', p_course_id, 'user_id', p_user_id, 'role', p_role);
+end;
+$fn$;
+
+revoke all on function public.admin_assign_course_staff(uuid, uuid, text) from public, anon;
+grant execute on function public.admin_assign_course_staff(uuid, uuid, text) to authenticated;
+
+create or replace function public.admin_revoke_course_staff(
+  p_course_id uuid,
+  p_user_id   uuid,
+  p_reason    text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+begin
+  if not public.has_staff_permission('courses.manage_all') then
+    perform public.app_error('FORBIDDEN',
+      'admin_revoke_course_staff: courses.manage_all required', 403, null);
+  end if;
+
+  update public.course_staff_assignments
+     set revoked_at = now(), revoke_reason = p_reason
+   where course_id = p_course_id
+     and staff_user_id = p_user_id
+     and revoked_at is null;
+
+  return jsonb_build_object('ok', true, 'course_id', p_course_id, 'user_id', p_user_id);
+end;
+$fn$;
+
+revoke all on function public.admin_revoke_course_staff(uuid, uuid, text) from public, anon;
+grant execute on function public.admin_revoke_course_staff(uuid, uuid, text) to authenticated;
+
+-- Who is assigned to this course? Readable by anyone who may manage it, so the
+-- course builder can show it, plus staff.manage for the Team & Roles screen.
+create or replace function public.course_staff_for(p_course_id uuid)
+returns table (
+  user_id uuid, email text, full_name text, avatar_url text,
+  assignment_role text, assigned_at timestamptz
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select a.staff_user_id, p.email, p.full_name, p.avatar_url, a.assignment_role, a.assigned_at
+    from public.course_staff_assignments a
+    left join public.profiles p on p.id = a.staff_user_id
+   where a.revoked_at is null
+     and a.course_id = p_course_id
+     and (public.can_manage_course(p_course_id)
+          or public.has_staff_permission('staff.manage'))
+   order by a.assignment_role, p.full_name nulls last, p.email
+$fn$;
+
+revoke all on function public.course_staff_for(uuid) from public, anon;
+grant execute on function public.course_staff_for(uuid) to authenticated;
+
+
+-- == 10) AI course trainer ===================================================
+-- course_trainer.manage plus the assignment: indexing a course is editing it.
+alter policy course_ai_sources_admin_all on public.course_ai_sources
+  using ((select public.has_staff_permission('course_trainer.manage'))
+         and public.can_manage_course(course_id))
+  with check ((select public.has_staff_permission('course_trainer.manage'))
+              and public.can_manage_course(course_id));
+
+alter policy course_ai_chunks_admin_read on public.course_ai_chunks
+  using ((select public.has_staff_permission('course_trainer.manage')));
+
+alter policy course_ai_index_jobs_admin_all on public.course_ai_index_jobs
+  using ((select public.has_staff_permission('course_trainer.manage')))
+  with check ((select public.has_staff_permission('course_trainer.manage')));
+
+-- Usage is billing-shaped data about STUDENTS, not course content, so it stays
+-- with the roles that own students rather than the role that authors courses.
+alter policy ai_training_usage_admin_read on public.ai_training_usage
+  using ((select public.is_admin())
+         or (select public.has_staff_permission('enrollments.review')));
+
+
+-- == 11) Error codes, re-listed in full ======================================
+-- app_error_catalog() is replaced wholesale every time, so every existing code
+-- must be repeated. Keep in lockstep with APP_ERROR_CODES and APP_ERROR_COPY in
+-- src/lib/appErrors.js. Copied from #45 plus the three #46 codes.
+create or replace function public.app_error_catalog()
+returns table (code text, http int, summary text)
+language sql
+immutable
+parallel safe
+set search_path = public
+as $cat$
+  select * from (values
+    ('BATCH_REQUIRED',               422, 'A VIP action needs an explicit batch; none was supplied.'),
+    ('BATCH_NOT_FOUND',              404, 'The batch id or month code does not exist.'),
+    ('BATCH_CLOSED',                 409, 'The batch is closed to new assignments, or archived.'),
+    ('BATCH_FULL',                   409, 'A cohort in the run has no seats left.'),
+    ('NO_SPACE_FOR_SEGMENT',         409, 'The batch has no active community space for that plan segment.'),
+    ('INVALID_BATCH_CODE',           422, 'Not a real YYYY-MM month.'),
+    ('ENTITLEMENT_EXPIRED',          403, 'The membership term (or its grace) has ended.'),
+    ('INVALID_PLAN',                 422, 'Unknown, inactive, or non-premium plan for this action.'),
+    ('ALREADY_ENTITLED',             409, 'The member already holds an outstanding seat in that cohort.'),
+    ('RUN_LIMIT_EXCEEDED',           409, 'Outstanding seats would exceed the per-member ceiling.'),
+    ('SEGMENT_MISMATCH',             409, 'The grant would mix cohort segments in one outstanding run.'),
+    ('INVALID_MEMBERSHIP_TRANSITION',409, 'The current membership state does not allow this transition.'),
+    ('IMMUTABLE_ENTITLEMENT',        409, 'An attempt to rewrite a frozen ledger column.'),
+    ('FORBIDDEN',                    403, 'Admin-only operation called by a non-admin.'),
+    ('REQUEST_NOT_FOUND',            404, 'The enrollment request does not exist.'),
+    ('COURSE_ACCESS_DENIED',         403, 'Course hidden by plan scope, publication, or cohort entitlement.'),
+    ('LESSON_NOT_RELEASED',          403, 'The cohort drip has not unlocked this lesson yet.'),
+    ('COMMUNITY_ACCESS_DENIED',      403, 'The community write was refused.'),
+    ('COMMENT_PERMISSION_DENIED',    403, 'Replies are off in this channel.'),
+    ('ASSIGNMENT_CLOSED',            409, 'Past the due date, or the assignment is unpublished.'),
+    ('SUBMISSION_LOCKED',            409, 'The submission is handed in or graded; edits refused.'),
+    ('COURSE_HAS_SUBMISSIONS',       409, 'The course has graded assignment work and cannot be deleted.'),
+    ('BATCH_PAST',                   409, 'The batch period has elapsed in its own timezone; it is read-only.'),
+    ('BATCH_CODE_TAKEN',             409, 'Another batch already uses that month code.'),
+    ('BATCH_CODE_REORDER',           409, 'The new code would move the batch past a sibling and reorder members'' runs.'),
+    ('BATCH_PERIOD_PAST',            422, 'The requested period has already ended; a batch cannot be edited into the past.'),
+    ('BATCH_PERIOD_INVALID',         422, 'The end date falls before the start date, or a date is missing.'),
+    ('BATCH_TIMEZONE_INVALID',       422, 'Not a timezone Postgres recognises (see pg_timezone_names).'),
+    ('BATCH_CAPACITY_BELOW_OCCUPANCY',409,'The new capacity is below the seats already sold in that segment.'),
+    ('CHANNEL_NOT_FOUND',            404, 'The channel does not exist, or is not available to you.'),
+    ('CHANNEL_SLUG_TAKEN',           409, 'Another channel in this space already uses that address.'),
+    ('CHANNEL_AUDIENCE_EMPTY',       422, 'The audience needs at least one plan or batch, or nobody could see it.'),
+    ('CHANNEL_ARCHIVED',             409, 'The channel is archived and accepts no new content.'),
+    ('CATEGORY_NOT_FOUND',           404, 'The channel category does not exist.'),
+    ('CATEGORY_NOT_EMPTY',           409, 'The category still holds active channels.'),
+    ('LESSON_VIDEO_UPLOAD_ONLY',     409, 'A lesson video must be an uploaded file in the private bucket; external links are no longer accepted.'),
+    ('LESSON_VIDEO_PATH_INVALID',    422, 'An uploaded lesson video must live at lessons/<course-uuid>/<file>.'),
+    ('COURSE_PUBLISH_BLOCKED',       409, 'The course still has video lessons with no uploaded file.'),
+    ('STAFF_LAST_SUPER_ADMIN',       409, 'That change would leave no active Super Admin. Promote a replacement first.'),
+    ('STAFF_NOT_FOUND',              404, 'That account is not staff, or has no profile.'),
+    ('STAFF_ROLE_INVALID',           422, 'Unknown staff role or status, or a required reason was missing.'),
+    ('COURSE_NOT_ASSIGNED',          403, 'You can edit courses, but not this one — nobody has assigned it to you.'),
+    ('COURSE_PUBLISH_FORBIDDEN',     403, 'Publishing or withdrawing a course needs its own permission.'),
+    ('COURSE_ASSIGNMENT_INVALID',    422, 'Unknown assignment role, or the target account cannot edit courses at all.')
+  ) as t(code, http, summary);
+$cat$;
+
+revoke all on function public.app_error_catalog() from public, anon;
+grant execute on function public.app_error_catalog() to authenticated;
+
+
+notify pgrst, 'reload schema';
+
+insert into public.schema_migrations (filename, checksum, notes) values
+ ('2026-08-26-course-staff-assignments.sql', null,
+  'trainer course ownership (#46): course_staff_assignments + courses.created_by, '
+  'user_can_manage_course()/can_manage_course() and the strict WRITE-side path parser '
+  'course_object_course_id(); replaces my_staff_context() to fill assigned_course_ids (the '
+  'placeholder #45 shipped). Splits courses_admin_write into insert/update/delete gated on '
+  'courses.create / can_manage_course / courses.delete, moves modules+lessons writes onto '
+  'can_manage_course, and adds an assigned-draft branch to the three read policies so a '
+  'Trainer can preview their own unpublished course. Storage writes on course-videos and '
+  'course-media are authorized by the course id parsed from the object path — which fails '
+  'CLOSED on anything malformed, the inverse of the read-side parser #44 removed for failing '
+  'open; reads stay reference-based. Publishing becomes its own capability: courses_publish_guard '
+  'now checks courses.publish and fires on BOTH directions of the published transition (still '
+  'delta-scoped by a WHEN clause, plus a separate INSERT trigger because a WHEN clause on INSERT '
+  'cannot reference OLD). A creator is auto-assigned as owner, or courses.create would be a dead '
+  'end. Adds admin_assign_course_staff/admin_revoke_course_staff/course_staff_for and three '
+  'app_error codes; course_ai_* moves to course_trainer.manage + assignment.')
+on conflict (filename) do nothing;
+
+
+-- ── AFTER RUNNING ────────────────────────────────────────────────────────────
+--   -- 1) The Trainer keys are finally load-bearing (expect > 0):
+--   select count(*) from pg_policies
+--    where schemaname in ('public','storage') and qual ilike '%can_manage_course%';
+--
+--   -- 2) The FOR ALL course policy is gone, replaced by three verbs:
+--   select policyname, cmd from pg_policies
+--    where schemaname='public' and tablename='courses' order by policyname;
+--     -- expect courses_read, courses_staff_delete, courses_staff_insert, courses_staff_update
+--
+--   -- 3) The publish guard fires on BOTH directions now:
+--   select pg_get_triggerdef(oid) from pg_trigger
+--    where tgrelid='public.courses'::regclass and tgname='courses_publish_guard';
+--     -- expect: WHEN ((new.published IS DISTINCT FROM old.published))
+--
+--   -- 4) The write-side path parser refuses anything malformed:
+--   select public.course_object_course_id('lessons/not-a-uuid/x.mp4') is null as denies_bad_path,
+--          public.course_object_course_id('lessons/00000000-0000-0000-0000-000000000000/x.mp4')
+--            is not null as accepts_good_path;
+--
+--   -- 5) assigned_course_ids is no longer a placeholder (run as a Trainer):
+--   select public.my_staff_context() -> 'assigned_course_ids';
+--
+--   -- 6) Nobody was orphaned: every course a Super Admin could edit, they still can.
+--   select count(*) from public.courses c
+--    where not exists (select 1 from public.course_staff_assignments a
+--                       where a.course_id = c.id and a.revoked_at is null);
+--     -- expect: all pre-#46 courses, which is fine — courses.manage_all bypasses assignment.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- §34) FOLDED VERBATIM — 2026-08-27-special-extension.sql   (#47)
+-- ═════════════════════════════════════════════════════════════════════════════
+-- Appended at the tail for the same reason as §19-§32: the earlier sections
+-- create the pre-#47 shapes, and this file's DROP+CREATE must win on a fresh
+-- install. The file is idempotent and self-guarded, so appending reproduces the
+-- live end state exactly. RE-FOLD whenever the dated file changes.
+--
+-- Its `do $pre$ … $pre$;` preflight is omitted: the bootstrap creates every
+-- dependency itself, above, in order.
+-- ═════════════════════════════════════════════════════════════════════════════
+-- ─────────────────────────────────────────────────────────────────────────────
+-- #47 — The Super Admin special extension, and the ledger that records it.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHAT THIS ADDS
+--   A discretionary, audited way to extend a member's expiry when there is no
+--   payment behind it: a goodwill week after an outage, a coaching call that had
+--   to be rescheduled, a student whose receipt was genuinely lost.
+--
+--   Today the ONLY way to move an expiry is approve_extension(), which requires an
+--   enrollment_requests row — and that table's extension_days column carries
+--   `check (extension_days between 60 and 365)`. A 7-day goodwill grant is
+--   therefore not merely inconvenient to express, it is refused by a CHECK. The
+--   alternative people reach for is editing subscriptions.ends_at by hand in the
+--   SQL editor, which leaves no actor, no reason and no record.
+--
+-- ★ WHY THIS EXTENDS IN PLACE INSTEAD OF SUPERSEDING, WHICH IS THE OPPOSITE OF
+--   WHAT approve_subscription() AND approve_extension() DO.
+--   Those two insert a NEW subscriptions row and expire the old one, and that is
+--   right for a purchase: a new term is a new thing, with its own request and its
+--   own money. A goodwill extension is not a new term — it is the SAME term,
+--   lasting longer. Two concrete consequences make superseding actively wrong here:
+--
+--     1. batch_entitlements.source_subscription_id is FROZEN by
+--        batch_entitlements_guard against non-null → a DIFFERENT non-null. A
+--        superseding row would leave every cohort seat pointing at the dead term,
+--        and the guard would refuse to re-point them. The member would keep their
+--        expiry and lose their cohort.
+--     2. subscriptions_one_active is a partial unique index on (user_id) where
+--        status = 'active'. Superseding means expire-then-insert, which is a real
+--        window with no active row — for a member who never stopped being active.
+--
+--   History is preserved by the LEDGER instead: student_access_events records the
+--   old and new expiry, the actor, the reason and the amount, and is append-only.
+--   "What was this term before?" is answerable; it just is not answered by a
+--   second subscriptions row.
+--
+-- ★ THE IDEMPOTENCY KEY IS NOT DECORATION. Without it, a double-clicked button or
+--   a retried request grants the days TWICE, and the second grant is
+--   indistinguishable from a deliberate one. The unique index on the ledger is
+--   what makes the retry safe, and the RPC returns the ORIGINAL result rather
+--   than raising, so the caller cannot tell a retry from a first attempt.
+--
+-- Depends on: #12/#13 (subscriptions), #31 (schema_migrations), #35 (app_error +
+--   batch_entitlements), #45 (students.extend_access).
+--
+-- HOW TO RUN: paste into the Supabase dashboard → SQL Editor → Run.
+-- IDEMPOTENT — safe to re-run.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+
+-- == 0) Preflight ============================================================
+
+
+-- == 1) The ledger ===========================================================
+-- ★ APPEND-ONLY, and the FKs are ON DELETE SET NULL with denormalized email
+--   snapshots for the same reason staff_role_events is: deleting an Auth account
+--   must never destroy the record of what was granted to them, or by whom.
+
+create table if not exists public.student_access_events (
+  id                     bigint generated always as identity primary key,
+  actor_user_id          uuid references auth.users(id) on delete set null,
+  actor_email            text,
+  target_user_id         uuid references auth.users(id) on delete set null,
+  target_email           text,
+  subscription_id        uuid references public.subscriptions(id) on delete set null,
+  action                 text not null default 'special_extension'
+                         check (action in ('special_extension')),
+  source                 text not null default 'manual_exception'
+                         check (source in ('manual_exception')),
+  plan_key               text,
+  old_ends_at            timestamptz,
+  new_ends_at            timestamptz,
+  old_grace_ends_at      timestamptz,
+  new_grace_ends_at      timestamptz,
+  days_granted           integer,
+  reason                 text not null,
+  idempotency_key        text,
+  created_at             timestamptz not null default now()
+);
+
+comment on table public.student_access_events is
+  '#47: append-only record of every discretionary access change. A paid extension is '
+  'NOT recorded here — that already has an enrollment_requests row and a receipt. This '
+  'exists for the grants that have no payment behind them, which are exactly the ones '
+  'that need an actor and a reason attached. Never add an update or delete policy.';
+
+-- The retry guard. Partial, so rows written without a key (none today, but the
+-- column is nullable for future sources) never collide with each other.
+create unique index if not exists student_access_events_idem_idx
+  on public.student_access_events (idempotency_key)
+  where idempotency_key is not null;
+
+create index if not exists student_access_events_target_idx
+  on public.student_access_events (target_user_id, created_at desc);
+
+alter table public.student_access_events enable row level security;
+
+drop policy if exists student_access_events_read on public.student_access_events;
+create policy student_access_events_read on public.student_access_events
+  for select to authenticated
+  using (
+    -- The member can see what was granted to them; it is their access.
+    target_user_id = (select auth.uid())
+    or (select public.has_staff_permission('students.extend_access'))
+    or (select public.has_staff_permission('enrollments.review'))
+  );
+
+revoke insert, update, delete, truncate on public.student_access_events from authenticated, anon, public;
+grant select on public.student_access_events to authenticated;
+
+
+-- == 2) The grant ============================================================
+-- ★ Gated on students.extend_access, which by #45's matrix ONLY super_admin holds.
+--   That omission is deliberate and documented there: a discretionary extension
+--   creates paid access with no payment behind it, so it stays with the role that
+--   owns the money. An Operations Admin extends access the normal way — by
+--   approving an extension REQUEST, which carries a receipt.
+
+create or replace function public.admin_grant_special_extension(
+  p_user_id         uuid,
+  p_mode            text default 'days',      -- 'days' | 'until'
+  p_days            integer default null,
+  p_new_ends_at     timestamptz default null,
+  p_reason          text default null,
+  p_idempotency_key text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+declare
+  v_sub    public.subscriptions%rowtype;
+  v_prior  public.student_access_events%rowtype;
+  v_grace  int := 3;                          -- the same cushion approve_subscription uses
+  v_target timestamptz;
+  v_days   int;
+  v_new_grace timestamptz;
+begin
+  if not public.has_staff_permission('students.extend_access') then
+    perform public.app_error('FORBIDDEN',
+      'admin_grant_special_extension: students.extend_access required', 403, null);
+  end if;
+
+  -- A reason is the entire point of routing this through an RPC instead of an
+  -- UPDATE, so it is required before anything else is looked at.
+  if coalesce(btrim(p_reason), '') = '' then
+    perform public.app_error('EXTENSION_INVALID',
+      'a reason is required — this grant has no payment behind it, so the reason is the only record of why',
+      422, null);
+  end if;
+
+  -- ── Idempotency, BEFORE the lock. A retry must return the original answer,
+  --    not queue behind it and then grant a second time.
+  if p_idempotency_key is not null then
+    select * into v_prior from public.student_access_events
+     where idempotency_key = p_idempotency_key;
+    if v_prior.id is not null then
+      return jsonb_build_object(
+        'ok', true, 'replayed', true,
+        'subscription_id', v_prior.subscription_id,
+        'old_ends_at', v_prior.old_ends_at,
+        'new_ends_at', v_prior.new_ends_at,
+        'days_granted', v_prior.days_granted);
+    end if;
+  end if;
+
+  -- The member's current term. FOR UPDATE so a concurrent approval or renewal
+  -- cannot interleave between the read and the write.
+  select * into v_sub from public.subscriptions
+   where user_id = p_user_id
+   order by created_at desc
+   limit 1
+   for update;
+
+  if v_sub.id is null then
+    perform public.app_error('SUBSCRIPTION_NOT_FOUND',
+      'that member has no subscription to extend', 404,
+      jsonb_build_object('user_id', p_user_id));
+  end if;
+
+  -- ★ A legacy no-expiry term is ALREADY unlimited. Writing a date onto it would
+  --   SHORTEN their access to whatever we picked — the one outcome this function
+  --   must never produce. approve_extension() guards the same case by returning
+  --   the row untouched; here it is a loud refusal, because someone typed a date
+  --   on purpose and deserves to know it did nothing.
+  if v_sub.ends_at is null then
+    perform public.app_error('EXTENSION_NOT_ALLOWED',
+      'this membership never expires, so an extension would only ever shorten it', 409,
+      jsonb_build_object('subscription_id', v_sub.id));
+  end if;
+
+  -- ── Work out the new expiry.
+  if p_mode = 'until' then
+    if p_new_ends_at is null then
+      perform public.app_error('EXTENSION_INVALID', 'mode "until" needs a date', 422, null);
+    end if;
+    v_target := p_new_ends_at;
+  elsif p_mode = 'days' then
+    if p_days is null or p_days < 1 or p_days > 365 then
+      perform public.app_error('EXTENSION_INVALID',
+        'an extension is between 1 and 365 days', 422,
+        jsonb_build_object('days', p_days));
+    end if;
+    -- ★ An EXPIRED term extends from NOW, not from its old end date. Extending
+    --   from a date in the past would hand back fewer days than the number typed,
+    --   silently — "14 days" on a term that ended 10 days ago would be 4.
+    v_target := greatest(v_sub.ends_at, now()) + make_interval(days => p_days);
+  else
+    perform public.app_error('EXTENSION_INVALID',
+      format('unknown mode %s — expected days or until', p_mode), 422, null);
+  end if;
+
+  -- Forward-only, always. This is the invariant the whole function exists to keep.
+  if v_target <= v_sub.ends_at then
+    perform public.app_error('EXTENSION_INVALID',
+      'that date is not later than the current expiry — an extension may never shorten access',
+      422, jsonb_build_object('current_ends_at', v_sub.ends_at, 'requested', v_target));
+  end if;
+
+  v_new_grace := v_target + make_interval(days => v_grace);
+  v_days := greatest(1, ceil(extract(epoch from (v_target - greatest(v_sub.ends_at, now()))) / 86400.0)::int);
+
+  -- ★ Reviving a lapsed term has to respect subscriptions_one_active, a PARTIAL
+  --   unique index on (user_id) where status = 'active'. The invariant says at
+  --   most one row is active, but this function must not be the thing that
+  --   discovers the invariant was already broken: flipping to 'active' while
+  --   another active row exists would abort with a unique violation and take the
+  --   whole grant down with it. So the revival is conditional on there being
+  --   nobody else, and if there IS somebody else we simply extend the dates and
+  --   leave the status alone — the member keeps working either way, because
+  --   is_enrolled() reads the OTHER active row.
+  update public.subscriptions
+     set ends_at = v_target,
+         grace_ends_at = v_new_grace,
+         status = case
+                    when status = 'expired'
+                     and not exists (select 1 from public.subscriptions s2
+                                      where s2.user_id = p_user_id
+                                        and s2.status = 'active'
+                                        and s2.id <> v_sub.id)
+                      then 'active'
+                    else status
+                  end,
+         updated_at = now()
+   where id = v_sub.id;
+
+  -- ★ Carry the cohort seats forward. batch_entitlements_guard enforces
+  --   "valid_until may never outlive its source term" on INSERT and forward-only
+  --   on UPDATE, so widening them here is both permitted and required — leaving
+  --   them behind would extend the membership while its VIP community access
+  --   quietly expired on the old date.
+  update public.batch_entitlements e
+     set valid_until = v_new_grace, updated_at = now()
+   where e.user_id = p_user_id
+     and e.status in ('queued', 'active')
+     and (e.valid_until is null or e.valid_until < v_new_grace);
+
+  -- Profile cache, so the member's own gate agrees immediately.
+  update public.profiles
+     set is_paid = true, updated_at = now()
+   where id = p_user_id;
+
+  insert into public.student_access_events
+    (actor_user_id, actor_email, target_user_id, target_email, subscription_id,
+     action, source, plan_key, old_ends_at, new_ends_at,
+     old_grace_ends_at, new_grace_ends_at, days_granted, reason, idempotency_key)
+  select auth.uid(),
+         (select email from public.profiles where id = auth.uid()),
+         p_user_id,
+         (select email from public.profiles where id = p_user_id),
+         v_sub.id, 'special_extension', 'manual_exception', v_sub.plan_key,
+         v_sub.ends_at, v_target, v_sub.grace_ends_at, v_new_grace,
+         v_days, btrim(p_reason), p_idempotency_key;
+
+  return jsonb_build_object(
+    'ok', true, 'replayed', false,
+    'subscription_id', v_sub.id,
+    'old_ends_at', v_sub.ends_at,
+    'new_ends_at', v_target,
+    'grace_ends_at', v_new_grace,
+    'days_granted', v_days);
+end;
+$fn$;
+
+comment on function public.admin_grant_special_extension(uuid, text, integer, timestamptz, text, text) is
+  '#47: the discretionary expiry extension. Super-Admin-only by the #45 matrix. Extends the '
+  'CURRENT term in place — superseding would strand the member''s cohort seats, whose '
+  'source_subscription_id is frozen by batch_entitlements_guard — and records the before/after '
+  'in student_access_events. Forward-only, 1-365 days, reason required, idempotent by key, and '
+  'it refuses a legacy no-expiry term outright rather than silently shortening it.';
+
+revoke all on function public.admin_grant_special_extension(uuid, text, integer, timestamptz, text, text) from public, anon;
+grant execute on function public.admin_grant_special_extension(uuid, text, integer, timestamptz, text, text) to authenticated;
+
+-- The member-facing / admin-facing history for one student.
+create or replace function public.student_access_history(p_user_id uuid, p_limit integer default 50)
+returns table (
+  id bigint, actor_email text, action text, source text,
+  old_ends_at timestamptz, new_ends_at timestamptz, days_granted integer,
+  reason text, created_at timestamptz
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $fn$
+  select e.id, e.actor_email, e.action, e.source,
+         e.old_ends_at, e.new_ends_at, e.days_granted, e.reason, e.created_at
+    from public.student_access_events e
+   where e.target_user_id = p_user_id
+     and (e.target_user_id = (select auth.uid())
+          or public.has_staff_permission('students.extend_access')
+          or public.has_staff_permission('enrollments.review'))
+   order by e.created_at desc
+   limit greatest(1, least(coalesce(p_limit, 50), 200))
+$fn$;
+
+revoke all on function public.student_access_history(uuid, integer) from public, anon;
+grant execute on function public.student_access_history(uuid, integer) to authenticated;
+
+
+-- == 3) Error codes, re-listed in full =======================================
+-- Copied from #46 plus the three #47 codes.
+create or replace function public.app_error_catalog()
+returns table (code text, http int, summary text)
+language sql
+immutable
+parallel safe
+set search_path = public
+as $cat$
+  select * from (values
+    ('BATCH_REQUIRED',               422, 'A VIP action needs an explicit batch; none was supplied.'),
+    ('BATCH_NOT_FOUND',              404, 'The batch id or month code does not exist.'),
+    ('BATCH_CLOSED',                 409, 'The batch is closed to new assignments, or archived.'),
+    ('BATCH_FULL',                   409, 'A cohort in the run has no seats left.'),
+    ('NO_SPACE_FOR_SEGMENT',         409, 'The batch has no active community space for that plan segment.'),
+    ('INVALID_BATCH_CODE',           422, 'Not a real YYYY-MM month.'),
+    ('ENTITLEMENT_EXPIRED',          403, 'The membership term (or its grace) has ended.'),
+    ('INVALID_PLAN',                 422, 'Unknown, inactive, or non-premium plan for this action.'),
+    ('ALREADY_ENTITLED',             409, 'The member already holds an outstanding seat in that cohort.'),
+    ('RUN_LIMIT_EXCEEDED',           409, 'Outstanding seats would exceed the per-member ceiling.'),
+    ('SEGMENT_MISMATCH',             409, 'The grant would mix cohort segments in one outstanding run.'),
+    ('INVALID_MEMBERSHIP_TRANSITION',409, 'The current membership state does not allow this transition.'),
+    ('IMMUTABLE_ENTITLEMENT',        409, 'An attempt to rewrite a frozen ledger column.'),
+    ('FORBIDDEN',                    403, 'Admin-only operation called by a non-admin.'),
+    ('REQUEST_NOT_FOUND',            404, 'The enrollment request does not exist.'),
+    ('COURSE_ACCESS_DENIED',         403, 'Course hidden by plan scope, publication, or cohort entitlement.'),
+    ('LESSON_NOT_RELEASED',          403, 'The cohort drip has not unlocked this lesson yet.'),
+    ('COMMUNITY_ACCESS_DENIED',      403, 'The community write was refused.'),
+    ('COMMENT_PERMISSION_DENIED',    403, 'Replies are off in this channel.'),
+    ('ASSIGNMENT_CLOSED',            409, 'Past the due date, or the assignment is unpublished.'),
+    ('SUBMISSION_LOCKED',            409, 'The submission is handed in or graded; edits refused.'),
+    ('COURSE_HAS_SUBMISSIONS',       409, 'The course has graded assignment work and cannot be deleted.'),
+    ('BATCH_PAST',                   409, 'The batch period has elapsed in its own timezone; it is read-only.'),
+    ('BATCH_CODE_TAKEN',             409, 'Another batch already uses that month code.'),
+    ('BATCH_CODE_REORDER',           409, 'The new code would move the batch past a sibling and reorder members'' runs.'),
+    ('BATCH_PERIOD_PAST',            422, 'The requested period has already ended; a batch cannot be edited into the past.'),
+    ('BATCH_PERIOD_INVALID',         422, 'The end date falls before the start date, or a date is missing.'),
+    ('BATCH_TIMEZONE_INVALID',       422, 'Not a timezone Postgres recognises (see pg_timezone_names).'),
+    ('BATCH_CAPACITY_BELOW_OCCUPANCY',409,'The new capacity is below the seats already sold in that segment.'),
+    ('CHANNEL_NOT_FOUND',            404, 'The channel does not exist, or is not available to you.'),
+    ('CHANNEL_SLUG_TAKEN',           409, 'Another channel in this space already uses that address.'),
+    ('CHANNEL_AUDIENCE_EMPTY',       422, 'The audience needs at least one plan or batch, or nobody could see it.'),
+    ('CHANNEL_ARCHIVED',             409, 'The channel is archived and accepts no new content.'),
+    ('CATEGORY_NOT_FOUND',           404, 'The channel category does not exist.'),
+    ('CATEGORY_NOT_EMPTY',           409, 'The category still holds active channels.'),
+    ('LESSON_VIDEO_UPLOAD_ONLY',     409, 'A lesson video must be an uploaded file in the private bucket; external links are no longer accepted.'),
+    ('LESSON_VIDEO_PATH_INVALID',    422, 'An uploaded lesson video must live at lessons/<course-uuid>/<file>.'),
+    ('COURSE_PUBLISH_BLOCKED',       409, 'The course still has video lessons with no uploaded file.'),
+    ('STAFF_LAST_SUPER_ADMIN',       409, 'That change would leave no active Super Admin. Promote a replacement first.'),
+    ('STAFF_NOT_FOUND',              404, 'That account is not staff, or has no profile.'),
+    ('STAFF_ROLE_INVALID',           422, 'Unknown staff role or status, or a required reason was missing.'),
+    ('COURSE_NOT_ASSIGNED',          403, 'You can edit courses, but not this one — nobody has assigned it to you.'),
+    ('COURSE_PUBLISH_FORBIDDEN',     403, 'Publishing or withdrawing a course needs its own permission.'),
+    ('COURSE_ASSIGNMENT_INVALID',    422, 'Unknown assignment role, or the target account cannot edit courses at all.'),
+    ('SUBSCRIPTION_NOT_FOUND',       404, 'That member has no subscription to act on.'),
+    ('EXTENSION_NOT_ALLOWED',        409, 'This membership never expires, so an extension could only shorten it.'),
+    ('EXTENSION_INVALID',            422, 'The requested extension is out of range, backwards, or missing its reason.')
+  ) as t(code, http, summary);
+$cat$;
+
+revoke all on function public.app_error_catalog() from public, anon;
+grant execute on function public.app_error_catalog() to authenticated;
+
+
+notify pgrst, 'reload schema';
+
+insert into public.schema_migrations (filename, checksum, notes) values
+ ('2026-08-27-special-extension.sql', null,
+  'special extension (#47): student_access_events, an append-only ledger of discretionary '
+  'access changes, plus admin_grant_special_extension() gated on students.extend_access '
+  '(super_admin only by the #45 matrix). Extends the CURRENT term IN PLACE rather than '
+  'superseding it — a superseding row would strand the member''s cohort seats, whose '
+  'source_subscription_id batch_entitlements_guard freezes against re-pointing, and would open '
+  'a window with no active row under subscriptions_one_active. Forward-only, 1-365 days, reason '
+  'required, idempotent by key (a retry returns the original result instead of granting twice), '
+  'refuses a legacy no-expiry term rather than silently shortening it, extends an EXPIRED term '
+  'from now() rather than from its old end date, and carries batch_entitlements.valid_until '
+  'forward so community access does not expire on the old date. Adds student_access_history() '
+  'and three app_error codes. Deliberately NOT routed through enrollment_requests, whose '
+  'extension_days CHECK (60-365) cannot express a goodwill week and would need a fake receipt.')
+on conflict (filename) do nothing;
+
+
+-- ── AFTER RUNNING ────────────────────────────────────────────────────────────
+--   -- 1) The ledger exists and is append-only over PostgREST:
+--   select to_regclass('public.student_access_events') is not null as tbl,
+--          not has_table_privilege('authenticated','public.student_access_events','insert') as no_insert;
+--
+--   -- 2) Only students.extend_access can grant (super_admin holds it; nobody else does):
+--   select r.key, bool_or(rp.permission_key = 'students.extend_access') as may_extend
+--     from public.staff_roles r
+--     left join public.staff_role_permissions rp on rp.role_key = r.key
+--    group by r.key order by r.key;
+--     -- expect true for super_admin only
+--
+--   -- 3) The retry guard is real:
+--   select indexdef from pg_indexes where indexname = 'student_access_events_idem_idx';
+--
+--   -- 4) Try it on a test account (as a Super Admin), then read it back:
+--   -- select public.admin_grant_special_extension(
+--   --   '<uuid>', 'days', 7, null, 'Goodwill: rescheduled coaching call.', 'demo-key-1');
+--   -- select * from public.student_access_history('<uuid>');
+--   -- Re-running the SAME call with the SAME key must return replayed = true and
+--   -- must NOT move the expiry a second time.
 -- ─────────────────────────────────────────────────────────────────────────────
