@@ -53,6 +53,28 @@ export const EXPERIENCE_OPTIONS = Object.freeze([
 export const EMPLOYED_OPTIONS = Object.freeze(['YES', 'NO']);
 
 /**
+ * The enrollment processing-hours note.
+ *
+ * ★ ONE CONSTANT, TWO SURFACES. This is rendered on the pending screen the moment
+ * a student submits, AND in the confirmation email api/notify-enrollment.js sends
+ * them. That module already imports from this file, so the copy physically cannot
+ * diverge — which matters more than it sounds: a student who reads one promise on
+ * screen and a different one in their inbox has been told two things about when
+ * they get access, and the second one arrives when they are already waiting.
+ *
+ * Each line is a distinct promise, pinned individually in
+ * test/enrollmentIntake.test.mjs so a reword cannot quietly drop one. The
+ * after-5PM rule is the substantive addition over the copy this replaced, which
+ * covered weekends and holidays but left the daily cutoff unstated.
+ */
+export const ENROLLMENT_PROCESSING_NOTE = Object.freeze([
+  'Your course access is sent within 24 hours during processing hours.',
+  '⏰ Enrollment processing hours: 9:00 AM to 5:00 PM, Monday to Friday.',
+  'Sign-ups received after 5:00 PM are processed the next business day.',
+  '📅 Enrolled on a weekend or Philippine holiday? Your access is processed on the next business day.',
+]);
+
+/**
  * Form sections, in render order. `key` is what INTAKE_FIELDS points at; the
  * numbering in `eyebrow` mirrors the source form's "01 · Personal Information".
  */

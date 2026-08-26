@@ -1,5 +1,5 @@
 <!-- GENERATED FILE — do not hand-edit. Regenerate with `npm run ai:knowledge`
-     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-08-20 -->
+     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-08-25 -->
 
 # Toolkits by Alex — Voice Assistant Knowledge
 
@@ -12,7 +12,7 @@ paths never change.
 
 ## 1. App overview
 
-- The toolkit bundles **35 tools** across three career stages: **01 Training &
+- The toolkit bundles **36 tools** across three career stages: **01 Training &
   Skills** (build your foundation), **02 Job Application** (land US clients), and
   **03 Client Management & Delivery** (onboard, operate, close the year), plus a Home
   dashboard.
@@ -100,6 +100,7 @@ paths never change.
 | Access Requests | `accessrequests` | `/admin/access-requests` | Admin screen: approve or reject new signups. |
 | Enrollments | `enrollments` | `/admin/enrollments` | Admin screen: review payment receipts, approve subscriptions, and manage renewals. |
 | Student Imports | `studentimports` | `/admin/student-imports` | Admin screen: migrate legacy Thinkific students — validate, map course-combos to plans, dry-run, and import accounts + memberships. |
+| Team & Roles | `staffroles` | `/admin/team` | Admin screen: invite staff and manage who they are — assign the Super Admin, Operations Admin and Trainer roles, suspend or revoke access, and read the audit trail of every role change. Super Admin only. |
 | Batches | `batches` | `/admin/batches` | Admin screen: manage the VIP batches — create a monthly batch, edit its name, code, dates, timezone and seat capacities while the batch is current or upcoming, close or archive it, and assign members to their private batch communities. A batch closes automatically once its month ends, and a batch whose period has passed becomes read-only. |
 
 Special sub-sections of Job Interview Mastery (tab `interview`): winning-strategy
@@ -114,9 +115,9 @@ to USD.
 
 | Plan | Key | Price (PHP) | Access | Highlights |
 |---|---|---|---|---|
-| Sampler Session (Essentials) | `sampler` | ₱1,499 | 60 days | 1 Live Zoom Session (3 hours); 60-day course access; 60-day group chat support; Limited offer · 60-day support |
+| Sampler Session (Essentials) | `sampler` | ₱1,499 | 60 days | 1 Live Zoom Session (4 hours); 60-day course access; 60-day group chat support; Limited offer · 60-day support |
 | QBO + Resume Combo (Silver · Self-Paced) | `silver_self_paced` | ₱2,999 | 60 days | Simulated annual bookkeeping project for an NY-based construction company; 60-day QBO Mastery course access; 60-day Resume & Interview course access; Weekly Community chat (Thu) |
-| Personalized Coaching Program (VIP Package) | `vip` | ₱16,999 (was ₱35,000) | 180 days | Simulated annual bookkeeping project for an NY-based construction company; 12 Live Group Zoom Trainings (MWF 9am to 11am PH Time); 4 Live Group Resume & Interview Coaching Sessions; 1-on-1 Resume & Interview Coaching (1 session); Weekly group consult until hired; Community chat support until and after hired; BEST SELLER · Limited to 10 slots per month |
+| Personalized Coaching Program (VIP Package) | `vip` | ₱16,999 (was ₱35,000) | 180 days | Simulated annual bookkeeping project for an NY-based construction company; 12 Live Group Zoom Trainings (MWF 9am to 11am PH Time); 4 Live Group Resume & Interview Coaching Sessions; Weekly group consult until hired; Community chat support until and after hired; BEST SELLER · Limited to 10 slots per month |
 
 **What each plan can open (entitlement scope):**
 

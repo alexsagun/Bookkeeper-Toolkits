@@ -211,19 +211,18 @@ test('all three tiers earn a Certificate of Completion', () => {
   }
 });
 
-test('VIP resume coaching is two separate inclusions, not one contradictory row', () => {
+test('VIP resume/interview coaching is the four group sessions, and only that', () => {
   const rows = model().rows.filter(r => !r.divider && /resume\s*&?\s*interview coaching/i.test(r.feature));
-  assert.equal(rows.length, 2,
-    'the source had "4 Live Group" and "1-on-1 (1 session)" competing as one row; they are two things');
-
-  const group = rows.find(r => /group/i.test(r.feature));
-  const oneOnOne = rows.find(r => /1-on-1|one-on-one/i.test(r.feature));
-  assert.ok(group && oneOnOne, 'one group row and one 1-on-1 row');
-  for (const row of rows) {
-    assert.equal(row.vip, true, 'VIP receives both');
-    assert.equal(row.silver, false);
-    assert.equal(row.sampler, false);
-  }
+  assert.equal(rows.length, 1,
+    'a separate 1-on-1 row was added 2026-08-20 and withdrawn 2026-08-22 once it was seen rendered — one row only');
+  assert.ok(/4 Live Group/i.test(rows[0].feature), 'the surviving row is the four group sessions');
+  assert.equal(rows[0].vip, true);
+  assert.equal(rows[0].silver, false);
+  assert.equal(rows[0].sampler, false);
+  // The 1-on-1 also had a Section 3 callout. Guarding only the row above would let
+  // the callout come back alone — the document would promise what the table denies.
+  assert.ok(!/1-on-1 Resume/i.test(asText(model())),
+    'the 1-on-1 Resume & Interview line is gone from the prose too, not just the table');
 });
 
 test('Sampler gets the Essentials course only, never Mastery', () => {
@@ -241,10 +240,34 @@ test('Sampler gets no Resume & Interview course', () => {
   assert.equal(row.vip, true);
 });
 
-test('Sampler has its own live-session row', () => {
+test('Sampler has its own live-session row, and it is FOUR hours', () => {
   const row = model().rows.find(r => !r.divider && /1 Live Zoom Session/i.test(r.feature));
   assert.ok(row, 'the ₱1,499 buys one live coaching session — that is the whole product');
   assert.equal(row.sampler, true);
+  // Corrected 3 -> 4 on 2026-08-22. Matching only /1 Live Zoom Session/ let the old
+  // duration come back with every test still green.
+  assert.ok(row.feature.includes('(4 hours)'),
+    'the session is four hours — the agreement is where a student reads this before signing');
+});
+
+test('the agreement and the plan catalog state the SAME session length', () => {
+  // Two independent copies of this string with nothing comparing them is the exact
+  // drift this port exists to correct: the catalog feeds the pricing card, the
+  // agreement row feeds the signed document, and a student sees both.
+  const row = model().rows.find(r => !r.divider && /1 Live Zoom Session/i.test(r.feature));
+  const sampler = ENROLLMENT_PLANS_FALLBACK.find(p => p.key === 'sampler');
+  const fromCatalog = (sampler.features || []).find(f => /1 Live Zoom Session/i.test(f));
+  assert.ok(fromCatalog, 'the sampler plan still advertises its live session');
+  // Digit-slice rather than a regex; the two strings are authored independently,
+  // so the point is that they agree, not how the number is spelled.
+  const hours = (s) => {
+    const open = s.indexOf('(');
+    const stop = s.indexOf(' hour', open);
+    return open >= 0 && stop > open ? s.slice(open + 1, stop).trim() : null;
+  };
+  assert.ok(hours(fromCatalog), 'the catalog states a duration');
+  assert.equal(hours(row.feature), hours(fromCatalog),
+    'pricing card and signed agreement must state the same number of hours');
 });
 
 // ── Stale copy from the source must not survive the port ─────────────────────

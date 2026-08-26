@@ -29,10 +29,13 @@
 //
 // NOTE: Supabase Auth's SMTP/Resend settings power ONLY Supabase Auth emails (confirm,
 //   reset) — NOT this function. These custom alerts need their own env vars above.
-//   `npm run dev` (Vite) does NOT run this function — email is exercised on Vercel only.
+//   This DOES run under `npm run dev` — vite.config.js registers `notifyDevApi` for
+//   /api/notify-enrollment. It still needs RESEND_* in .env, and Vite reads .env at
+//   startup, so restart the dev server after adding keys.
 
 import { phpAmount } from '../src/lib/planCatalog.js';
-import { intakeSelectColumns } from '../src/lib/enrollmentIntake.js';
+import { intakeSelectColumns, ENROLLMENT_PROCESSING_NOTE } from '../src/lib/enrollmentIntake.js';
+import { requireStaff } from './_lib/staffAuth.js';
 
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
 const SUPABASE_ANON = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
@@ -51,7 +54,8 @@ const php = (n) => phpAmount(n);
 // Branded HTML mirroring api/notify-access.js / the auth-email template.
 // cta: optional { href, label } — a button after the rows table (intro is esc()'d,
 // so links can't ride along in the text).
-// note: optional trailing paragraph (esc()'d). video: optional { id, label } — a
+// note: optional trailing block — a string, or an ARRAY rendered one line per
+// line. Each line is esc()'d. video: optional { id, label } — a
 // YouTube thumbnail that links to the watch page. An <img> is used rather than an
 // embed because no mail client plays an iframe, and a bare link gets ignored.
 function emailHtml({ heading, intro, rows, reason, cta, note, video }) {
@@ -62,7 +66,7 @@ function emailHtml({ heading, intro, rows, reason, cta, note, video }) {
       </div>`
     : '';
   const noteBlock = note
-    ? `<p style="font-size:12.5px;line-height:1.6;color:#48505e;margin:0 0 16px;padding:12px 14px;background:#f4f7fb;border-radius:10px;">${esc(note)}</p>`
+    ? `<p style="font-size:12.5px;line-height:1.6;color:#48505e;margin:0 0 16px;padding:12px 14px;background:#f4f7fb;border-radius:10px;">${(Array.isArray(note) ? note : [note]).map(esc).join("<br>")}</p>`
     : '';
   const rowsBlock = rows && rows.length
     ? `<table style="width:100%;border-collapse:collapse;margin:0 0 20px;font-size:13px;color:#1c2430;">
@@ -115,23 +119,14 @@ async function callerUser(authHeader) {
   }
 }
 
-// Same admin check as api/notify-access.js (RLS own_profile_select reads own is_admin).
-// Returns the admin's user id (for the burst guard), or null.
-async function callerAdminId(authHeader) {
-  const u = await callerUser(authHeader);
-  if (!u) return null;
-  try {
-    const profRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(u.id)}&select=is_admin`,
-      { headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${u.token}` } }
-    );
-    if (!profRes.ok) return null;
-    const rows = await profRes.json();
-    return Array.isArray(rows) && rows[0]?.is_admin === true ? u.id : null;
-  } catch {
-    return null;
-  }
-}
+// The admin check moved to api/_lib/staffAuth.js in #45. It was a local
+// callerAdminId() reading profiles.is_admin — one of four byte-identical copies —
+// and reviewing payment proofs is now its own capability (enrollments.review), so
+// an Operations Admin can work the queue without holding any other admin power.
+//
+// callerUser() above is KEPT and still used by the 'submitted' action, which is a
+// STUDENT action: it proves ownership by re-fetching the request row with the
+// caller's own JWT under RLS, and must not require any staff permission at all.
 
 // Best-effort per-caller burst guard (per warm instance — the anthropic-proxy idiom).
 // Legit traffic is ~1 email per human action, so 10/min stops a runaway loop or a
@@ -455,8 +450,8 @@ export default async function handler(req, res) {
           emailHtml({
             heading: isRenewal ? `Thanks, ${first}` : `Welcome, ${first}`,
             intro: isRenewal
-              ? 'Your renewal payment is in and Coach Alex is reviewing it now. Your access continues once it is verified — you will hear back within 24 hours.'
-              : 'Your enrollment is in, and Coach Alex is reviewing it now. You will hear back within 24 hours with your next steps and course access.',
+              ? 'Your renewal payment is in and Coach Alex is reviewing it now. Your access continues once it is verified — see the processing hours below.'
+              : 'Your enrollment is in, and Coach Alex is reviewing it now. You will hear back with your next steps and course access — see the processing hours below.',
             // Onboarding instructions are for new students. Someone six months in
             // does not need to be welcomed and told how to start.
             ...(isRenewal ? {} : { video: { id: ONBOARDING_VIDEO_ID, label: 'Watch this first: your onboarding instructions' } }),
@@ -465,7 +460,9 @@ export default async function handler(req, res) {
               ['Amount sent', php(row.amount_paid)],
               ...(row.agreement_version ? [['Training Agreement', 'Signed and on file']] : []),
             ],
-            note: 'Enrollment and course access are granted between 9:00 AM and 5:00 PM PH time, Monday to Friday. Payments made on weekends or holidays are processed on the next business day.',
+            // The SAME constant the pending screen renders, so what a student
+            // reads on screen and what lands in their inbox cannot diverge.
+            note: ENROLLMENT_PROCESSING_NOTE,
           }));
       } catch (studentErr) {
         console.warn('[notify-enrollment] student confirmation failed:', String(studentErr));
@@ -490,10 +487,11 @@ export default async function handler(req, res) {
 
   if (action === 'decision') {
     // Admin → student. Same gate as notify-access.js.
-    const adminId = await callerAdminId(req.headers?.authorization);
-    if (!adminId) {
-      return res.status(403).json({ error: 'Admin authorization required.' });
+    const gate = await requireStaff(req, { permission: 'enrollments.review' });
+    if (!gate.ok) {
+      return res.status(gate.status).json({ error: gate.error, code: gate.code });
     }
+    const adminId = gate.user.id;
     if (rateLimited(adminId)) {
       return res.status(429).json({ ok: false, error: 'Too many emails — wait a minute and try again.' });
     }
@@ -520,17 +518,20 @@ export default async function handler(req, res) {
     // admin can confirm email works end-to-end. Strictly admin-gated: a non-admin can't
     // even discover the recipient address. Returns { to, source } so the UI can show where
     // the alert would land, plus a provider `detail` on failure to aid diagnosis.
-    const adminId = await callerAdminId(req.headers?.authorization);
-    if (!adminId) {
-      return res.status(403).json({ error: 'Admin authorization required.' });
+    const gate = await requireStaff(req, { permission: 'enrollments.review' });
+    if (!gate.ok) {
+      return res.status(gate.status).json({ error: gate.error, code: gate.code });
     }
+    const adminId = gate.user.id;
     if (rateLimited(adminId)) {
       return res.status(429).json({ ok: false, error: 'Too many emails — wait a minute and try again.' });
     }
     if (!apiKey) return res.status(200).json({ ok: false, skipped: 'email_not_configured' });
     if (!from) return res.status(200).json({ ok: false, skipped: 'email_from_not_configured' });
 
-    const u = await callerUser(req.headers?.authorization);
+    // requireStaff already verified this token — reuse its user instead of
+    // re-fetching /auth/v1/user a second time for the same request.
+    const u = gate.user;
     const { to: adminTo, source } = await resolveAdminRecipient(u?.token);
     if (!isEmail(adminTo)) return res.status(200).json({ ok: false, skipped: 'admin_email_invalid' });
 

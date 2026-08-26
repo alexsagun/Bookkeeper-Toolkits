@@ -27,7 +27,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { readFileSync, readdirSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -87,7 +87,7 @@ async function q(sql, token) {
  * has what the file promised. Keep one entry per meaningful migration — when a
  * new dated file lands, add the object it is known for.
  */
-const OBJECT_CHECKS = [
+export const OBJECT_CHECKS = [
   ['#1/#2  profiles + is_admin()', `select to_regclass('public.profiles') is not null and to_regprocedure('public.is_admin()') is not null as ok`],
   ['#2     courses / modules / lessons', `select to_regclass('public.courses') is not null and to_regclass('public.course_lessons') is not null as ok`],
   ['#5     sidebar_settings', `select to_regclass('public.sidebar_settings') is not null as ok`],
@@ -196,6 +196,278 @@ const OBJECT_CHECKS = [
   // depending on whether it sent p_gold_capacity.
   ['#39    admin_update_batch is 8-arg only', `select to_regprocedure('public.admin_update_batch(uuid,text,text,date,date,text,int,int)') is not null
       and to_regprocedure('public.admin_update_batch(uuid,text,text,date,date,text,int,int,int)') is null as ok`],
+
+  // #42/#43 both failed silently when their bootstrap fold went missing on
+  // 2026-08-23 — a policy that returns fewer rows, an index the planner ignores and
+  // a 403 swallowed by a .catch() all look exactly like nothing happening. These
+  // three turn that into a red line in `npm run db:audit`.
+  ['#42    plan copy matches the agreement', `select
+      not exists(select 1 from public.enrollment_plans where features::text ilike '%discord%')
+      and not exists(select 1 from public.enrollment_plans where key='vip' and features::text ilike '%1-on-1 Resume%')
+      and exists(select 1 from public.enrollment_plans where key='sampler' and features::text ilike '%4 hours%') as ok`],
+  // #41 made this partial on status='active' believing RLS pinned it. It does not,
+  // so the planner could not use the index AT ALL and every feed page was a seq
+  // scan + sort. If the predicate is ever back, so is the regression.
+  ['#43    feed index is NOT partial', `select coalesce(bool_and(indexdef not ilike '%where%'), false) as ok
+      from pg_indexes where indexname = 'community_posts_channel_feed_idx'`],
+  // Without this an uploader's failed-submit cleanup 403s, stranding up to four
+  // private files per failed enrollment where admin hard-delete cannot reach them.
+  ['#43    enrollment_file_is_referenced exists', `select to_regprocedure('public.enrollment_file_is_referenced(text)') is not null as ok`],
+  // ── #44, course video upload-only ─────────────────────────────────────────
+  // db:shadow:verify CANNOT see any of this: SNAPSHOT_SQL filters pg_policies to
+  // schemaname='public' (so storage policies are never snapshotted at all) and
+  // even there compares only tablename/policyname/cmd, never qual. These checks
+  // are therefore the ONLY automated proof that the private video bucket is
+  // still gated the way #44 left it.
+  ['#44    video reads are authorized by reference, not by path', `select coalesce(bool_and(qual ilike '%course_video_object_readable%'), false) as ok
+      from pg_policies where schemaname='storage' and policyname='course_videos_read'`],
+  ['#44    video reads finally require approval', `select coalesce(bool_and(qual ilike '%is_approved%' and qual ilike '%is_enrolled%'), false) as ok
+      from pg_policies where schemaname='storage' and policyname='course_videos_read'`],
+  // The whole point of #44. This helper returned TRUE on an unparseable path, on
+  // an unknown course, and for every non-sampler plan, and it never checked
+  // courses.published. Assert it is GONE, the way #39 asserts plan_is_qbo_only is.
+  ['#44    the fail-open path parser is dropped', `select to_regprocedure('public.course_object_allowed(text)') is null as ok`],
+  // CASE, not AND: has_function_privilege() ERRORS on a function that does not
+  // exist, which aborts the whole audit instead of failing one line.
+  ['#44    members can execute the readability helper', `select case
+      when to_regprocedure('public.course_video_object_readable(text,boolean)') is null then false
+      else has_function_privilege('authenticated','public.course_video_object_readable(text,boolean)','execute') end as ok`],
+  ['#44    anon cannot execute the readability helper', `select case
+      when to_regprocedure('public.course_video_object_readable(text,boolean)') is null then false
+      else not has_function_privilege('anon','public.course_video_object_readable(text,boolean)','execute') end as ok`],
+  // Unlike #43's original feed index, this partial predicate IS implied by the
+  // query (storage_path = $1 implies storage_path is not null), so it is usable.
+  ['#44    lesson storage_path is indexed', `select to_regclass('public.course_lessons_storage_path_idx') is not null as ok`],
+  ['#44    the lesson video guard is armed', `select coalesce(bool_or(tgname='course_lessons_video_guard'), false) as ok
+      from pg_trigger where tgrelid='public.course_lessons'::regclass and not tgisinternal`],
+  ['#44    the publish guard is armed', `select coalesce(bool_or(tgname='courses_publish_guard'), false) as ok
+      from pg_trigger where tgrelid='public.courses'::regclass and not tgisinternal`],
+  // DELTA, not state. Re-scoping this guard to fire on new.published alone would
+  // refuse EVERY unrelated update to a published course: reorderCourse (N updates
+  // in one Promise.all), uploadCover, setCourseTier, saveCourseMeta, the AI-trainer
+  // toggle. The WHEN clause is what keeps them working, so assert it is still there.
+  ['#44    the publish guard fires on the transition only', `select coalesce(bool_and(
+        pg_get_triggerdef(oid) ilike '%when%' and pg_get_triggerdef(oid) ilike '%old.published%'), false) as ok
+      from pg_trigger where tgrelid='public.courses'::regclass and tgname='courses_publish_guard'`],
+  // saveLesson re-derives video_provider from the URL on every write, so keying
+  // the grandfather rule on the provider would refuse title-only edits to legacy
+  // rows forever, with no way to fix it from the UI.
+  ['#44    grandfathering keys off video_url, not the re-derived provider', `select coalesce(bool_and(
+        prosrc like '%v_old_link%' and prosrc not like '%old.video_provider is distinct from new.video_provider%'), false) as ok
+      from pg_proc where proname='course_lessons_video_guard'`],
+  ['#44    the publish preflight RPC exists', `select to_regprocedure('public.course_publish_blockers(uuid)') is not null as ok`],
+  // #15 wrote `on conflict (id) do update set public = false` and nothing else, so
+  // these two settings were write-once from creation and NO file in this repo could
+  // correct a drift. #44 re-asserts them; this is what notices if they drift again.
+  ['#44    the video bucket is private and capped at 2 GiB', `select coalesce(bool_and(
+        not public and file_size_limit >= 2147483648), false) as ok
+      from storage.buckets where id='course-videos'`],
+  ['#44    the video bucket accepts mp4 and nothing else', `select coalesce(bool_and(
+        allowed_mime_types = array['video/mp4']), false) as ok
+      from storage.buckets where id='course-videos'`],
+  // Assert ABSENCE, the #39 idiom. A published course playing from an external
+  // link is exactly the state #44 exists to eliminate, and nothing else in the
+  // repo would notice it drifting back.
+  ['#44    no published course plays from an external link', `select not exists (
+      select 1 from public.course_lessons l join public.courses c on c.id = l.course_id
+       where c.published and l.type='video'
+         and coalesce(l.video_provider,'') <> 'upload'
+         and nullif(btrim(coalesce(l.video_url,'')),'') is not null) as ok`],
+
+  // ── #45, staff authorization ──────────────────────────────────────────────
+  // The role model replaces one boolean with a permission matrix, and it does so
+  // by REDEFINING profiles.is_admin as a trigger-maintained cache of "has an
+  // active super_admin membership". Two classes of thing therefore need proving:
+  // that the model exists and is locked down, and that the cache still agrees
+  // with the table it caches. Drift between those two is invisible until an
+  // administrator silently loses — or silently gains — every legacy is_admin()
+  // surface at once.
+  ['#45    staff tables exist', `select coalesce(bool_and(t is not null), false) as ok from (values
+      (to_regclass('public.staff_roles')), (to_regclass('public.staff_permissions')),
+      (to_regclass('public.staff_role_permissions')), (to_regclass('public.staff_memberships')),
+      (to_regclass('public.staff_role_events'))) as v(t)`],
+  ['#45    the role x permission matrix is seeded', `select count(*) = 26 as ok
+      from public.staff_role_permissions`],
+  ['#45    all 18 permissions are seeded', `select count(*) = 18 as ok from public.staff_permissions`],
+  // The caller-scoped helpers MUST be executable by authenticated: an RLS qual is
+  // evaluated AS THE QUERYING ROLE, so without the grant every gated read fails
+  // with "permission denied for function" instead of a clean authorization denial.
+  ['#45    members can execute the caller-scoped helpers', `select case
+      when to_regprocedure('public.has_staff_permission(text)') is null then false
+      when to_regprocedure('public.my_staff_context()') is null then false
+      when to_regprocedure('public.is_super_admin()') is null then false
+      else has_function_privilege('authenticated','public.has_staff_permission(text)','execute')
+       and has_function_privilege('authenticated','public.my_staff_context()','execute')
+       and has_function_privilege('authenticated','public.is_super_admin()','execute') end as ok`],
+  // The parameterised form answers about ANY user, so it is the one that must NOT
+  // be reachable from a client — the same split #27 uses for its trainer mirrors.
+  ['#45    the per-user helper is NOT client-executable', `select case
+      when to_regprocedure('public.user_has_staff_permission(uuid,text)') is null then false
+      else not has_function_privilege('authenticated','public.user_has_staff_permission(uuid,text)','execute')
+       and not has_function_privilege('anon','public.user_has_staff_permission(uuid,text)','execute') end as ok`],
+  ['#45    staff tables are not writable over PostgREST', `select coalesce(bool_and(
+        not has_table_privilege('authenticated', t, 'insert')
+        and not has_table_privilege('authenticated', t, 'update')
+        and not has_table_privilege('authenticated', t, 'delete')), false) as ok
+      from (values ('public.staff_memberships'), ('public.staff_roles'),
+                   ('public.staff_permissions'), ('public.staff_role_permissions'),
+                   ('public.staff_role_events')) as v(t)`],
+  // The privilege-escalation primitive #45 exists to remove: a whole-row admin
+  // UPDATE on profiles let any admin set is_admin = true on any account.
+  ['#45    profiles is read-only over PostgREST', `select not has_table_privilege(
+      'authenticated','public.profiles','update') as ok`],
+  ['#45    the blanket admin profile UPDATE policy is gone', `select not exists (
+      select 1 from pg_policies where schemaname='public' and tablename='profiles'
+        and policyname='profiles_admin_update') as ok`],
+  ['#45    the is_admin cache trigger is armed', `select coalesce(bool_or(tgname='staff_sync_is_admin'), false) as ok
+      from pg_trigger where tgrelid='public.staff_memberships'::regclass and not tgisinternal`],
+  ['#45    the last-Super-Admin guard is armed', `select coalesce(bool_or(tgname='staff_memberships_guard'), false) as ok
+      from pg_trigger where tgrelid='public.staff_memberships'::regclass and not tgisinternal`],
+  // The invariant that trigger exists to maintain. If these ever disagree, every
+  // legacy is_admin() check in the product is answering from a stale cache.
+  ['#45    profiles.is_admin agrees with the membership table', `select not exists (
+      select 1 from public.profiles p
+       where p.is_admin <> exists (
+         select 1 from public.staff_memberships m
+          where m.user_id = p.id and m.status='active' and m.role_key='super_admin')) as ok`],
+  ['#45    at least one active Super Admin exists', `select exists (
+      select 1 from public.staff_memberships
+       where role_key='super_admin' and status='active') as ok`],
+  ['#45    the access-request RPCs exist and are client-callable', `select case
+      when to_regprocedure('public.admin_review_access_request(uuid,text,text)') is null then false
+      when to_regprocedure('public.admin_access_request_queue(text,integer)') is null then false
+      else has_function_privilege('authenticated','public.admin_review_access_request(uuid,text,text)','execute')
+       and has_function_privilege('authenticated','public.admin_access_request_queue(text,integer)','execute')
+       and not has_function_privilege('anon','public.admin_review_access_request(uuid,text,text)','execute') end as ok`],
+  // Section 15. An Operations Admin who cannot pass this is a role that exists on
+  // paper and refuses at the first server call it makes.
+  ['#45    the operations RPCs are gated on capability, not is_admin()', `select coalesce(bool_and(
+        prosrc like '%has_staff_permission%' and prosrc not like '%if not public.is_admin() then%'), false) as ok
+      from pg_proc where pronamespace='public'::regnamespace and proname in (
+        'admin_finalize_enrollment','approve_subscription','approve_extension',
+        'expire_overdue_subscriptions','admin_assign_batch','admin_update_batch',
+        'admin_batch_overview','admin_grant_batch_run','admin_revoke_batch_run',
+        'admin_reconcile_queued_entitlements','admin_close_due_batches')`],
+  ['#45    enrollment + import + batch policies read the capability', `select coalesce(bool_and(
+        qual ilike '%has_staff_permission%'), false) as ok
+      from pg_policies where schemaname='public' and policyname in (
+        'enroll_req_admin_all','subscriptions_admin_all','batches_admin_all',
+        'student_import_jobs_admin_all','student_import_rows_admin_all',
+        'student_external_accounts_admin_all','profiles_admin_select')`],
+  // db:shadow:verify filters pg_policies to schemaname='public', so a STORAGE
+  // policy is invisible to it. The migration's own comment (section 15c) says
+  // this line is where enrollment_receipts_select gets pinned — so here it is.
+  ['#45    an Ops Admin can open the receipt they are approving', `select coalesce(bool_and(
+        qual ilike '%has_staff_permission%' and qual ilike '%enrollments.review%'), false) as ok
+      from pg_policies where schemaname='storage' and policyname='enrollment_receipts_select'`],
+  ['#45    the batch ledger guard accepts an Operations Admin', `select coalesce(bool_and(
+        prosrc like '%user_has_staff_permission%'), false) as ok
+      from pg_proc where pronamespace='public'::regnamespace and proname='batch_entitlements_guard'`],
+  ['#45    the gate helpers are no longer world-executable', `select coalesce(bool_and(
+        not has_function_privilege('anon', f, 'execute')), false) as ok
+      from (values ('public.is_admin()'), ('public.is_approved()'), ('public.is_enrolled()')) as v(f)`],
+
+  // ── #46, trainer course ownership ─────────────────────────────────────────
+  ['#46    course_staff_assignments exists', `select to_regclass('public.course_staff_assignments') is not null as ok`],
+  ['#46    assignments are not writable over PostgREST', `select case
+      when to_regclass('public.course_staff_assignments') is null then false
+      else not has_table_privilege('authenticated','public.course_staff_assignments','insert')
+       and not has_table_privilege('authenticated','public.course_staff_assignments','update')
+       and not has_table_privilege('authenticated','public.course_staff_assignments','delete') end as ok`],
+  ['#46    one LIVE assignment per person per course', `select to_regclass(
+      'public.course_staff_assignments_live_idx') is not null as ok`],
+  ['#46    can_manage_course is callable, its per-user form is not', `select case
+      when to_regprocedure('public.can_manage_course(uuid)') is null then false
+      when to_regprocedure('public.user_can_manage_course(uuid,uuid)') is null then false
+      else has_function_privilege('authenticated','public.can_manage_course(uuid)','execute')
+       and not has_function_privilege('authenticated','public.user_can_manage_course(uuid,uuid)','execute') end as ok`],
+  // ★ Actually EXERCISE the parser rather than asserting it exists. This is the
+  //   function that decides who may write into a course's storage folder, and the
+  //   whole design rests on it returning NULL — which denies — for anything it does
+  //   not recognise. #44 removed its read-side predecessor for failing OPEN.
+  ['#46    the storage path parser fails closed', `select
+        public.course_object_course_id('lessons/not-a-uuid/x.mp4') is null
+    and public.course_object_course_id('lessons/') is null
+    and public.course_object_course_id('../etc/passwd') is null
+    and public.course_object_course_id('lessons/11111111-1111-1111-1111-111111111111') is null
+    and public.course_object_course_id('lessons/11111111-1111-1111-1111-111111111111/a.mp4')
+          = '11111111-1111-1111-1111-111111111111'::uuid
+    and public.course_object_course_id('covers/11111111-1111-1111-1111-111111111111/a.png')
+          = '11111111-1111-1111-1111-111111111111'::uuid as ok`],
+  ['#46    the blanket FOR ALL course policy is split into three verbs', `select
+      not exists (select 1 from pg_policies where schemaname='public'
+                   and tablename='courses' and policyname='courses_admin_write')
+      and (select count(*) = 3 from pg_policies where schemaname='public' and tablename='courses'
+            and policyname in ('courses_staff_insert','courses_staff_update','courses_staff_delete')) as ok`],
+  ['#46    module and lesson writes are assignment-scoped', `select coalesce(bool_and(
+        qual ilike '%can_manage_course%'), false) as ok
+      from pg_policies where schemaname='public'
+       and policyname in ('modules_staff_write','lessons_staff_write')`],
+  ['#46    a Trainer can preview their own draft', `select coalesce(bool_and(
+        qual ilike '%can_manage_course%'), false) as ok
+      from pg_policies where schemaname='public'
+       and policyname in ('courses_read','modules_read','lessons_read')`],
+  ['#46    course storage writes are assignment-scoped', `select coalesce(bool_and(
+        coalesce(qual, with_check) ilike '%can_manage_course%'), false) as ok
+      from pg_policies where schemaname='storage' and policyname in (
+        'course_videos_admin_write','course_videos_admin_update','course_videos_admin_delete',
+        'course_media_admin_write','course_media_admin_update','course_media_admin_delete')`],
+  // Reads must NOT have moved to the path parser — that is the #44 regression.
+  ['#46    video READS are still reference-based, not path-based', `select coalesce(bool_and(
+        qual ilike '%course_video_object_readable%'), false) as ok
+      from pg_policies where schemaname='storage' and policyname='course_videos_read'`],
+  ['#46    publishing is its own capability', `select coalesce(bool_and(
+        prosrc like '%courses.publish%'), false) as ok
+      from pg_proc where pronamespace='public'::regnamespace and proname='courses_publish_guard'`],
+  ['#46    the publish guard covers BOTH directions, still delta-scoped', `select coalesce(bool_and(
+        pg_get_triggerdef(oid) ilike '%is distinct from%'
+        and pg_get_triggerdef(oid) ilike '%old.published%'), false) as ok
+      from pg_trigger where tgrelid='public.courses'::regclass and tgname='courses_publish_guard'`],
+  ['#46    a course creator is auto-assigned as owner', `select coalesce(bool_or(
+        tgname='courses_assign_creator'), false) as ok
+      from pg_trigger where tgrelid='public.courses'::regclass and not tgisinternal`],
+  ['#46    my_staff_context reports real assignments, not a placeholder', `select coalesce(bool_and(
+        prosrc like '%course_staff_assignments%'), false) as ok
+      from pg_proc where pronamespace='public'::regnamespace and proname='my_staff_context'`],
+  ['#46    AI trainer indexing is a course capability', `select coalesce(bool_and(
+        qual ilike '%course_trainer.manage%'), false) as ok
+      from pg_policies where schemaname='public'
+       and policyname in ('course_ai_sources_admin_all','course_ai_index_jobs_admin_all')`],
+
+  // ── #47, the discretionary expiry extension ───────────────────────────────
+  ['#47    the access ledger exists and is append-only', `select case
+      when to_regclass('public.student_access_events') is null then false
+      else not has_table_privilege('authenticated','public.student_access_events','insert')
+       and not has_table_privilege('authenticated','public.student_access_events','update')
+       and not has_table_privilege('authenticated','public.student_access_events','delete') end as ok`],
+  // Without this index a double-clicked button grants the days twice, and the
+  // second grant is indistinguishable from a deliberate one.
+  ['#47    the idempotency guard is a real unique index', `select coalesce(bool_and(
+        indexdef ilike '%unique%'), false) as ok
+      from pg_indexes where indexname='student_access_events_idem_idx'`],
+  ['#47    the extension RPC exists and anon cannot call it', `select case
+      when to_regprocedure('public.admin_grant_special_extension(uuid,text,integer,timestamptz,text,text)') is null then false
+      else has_function_privilege('authenticated','public.admin_grant_special_extension(uuid,text,integer,timestamptz,text,text)','execute')
+       and not has_function_privilege('anon','public.admin_grant_special_extension(uuid,text,integer,timestamptz,text,text)','execute') end as ok`],
+  ['#47    granting access is gated on students.extend_access', `select coalesce(bool_and(
+        prosrc like '%students.extend_access%'), false) as ok
+      from pg_proc where pronamespace='public'::regnamespace
+       and proname='admin_grant_special_extension'`],
+  // The invariant the whole function exists to keep. A body that lost this could
+  // shorten a member's access while reporting success.
+  ['#47    an extension can never move an expiry backwards', `select coalesce(bool_and(
+        prosrc like '%may never shorten access%'), false) as ok
+      from pg_proc where pronamespace='public'::regnamespace
+       and proname='admin_grant_special_extension'`],
+  ['#47    a no-expiry term is refused, not silently shortened', `select coalesce(bool_and(
+        prosrc like '%EXTENSION_NOT_ALLOWED%'), false) as ok
+      from pg_proc where pronamespace='public'::regnamespace
+       and proname='admin_grant_special_extension'`],
+  // Only super_admin may hold the key. If another role ever gains it, that is a
+  // deliberate product decision and this line is where it gets noticed.
+  ['#47    only Super Admin may grant a discretionary extension', `select coalesce(bool_and(
+        role_key = 'super_admin'), false) as ok
+      from public.staff_role_permissions where permission_key='students.extend_access'`],
 ];
 
 async function main() {
@@ -255,7 +527,13 @@ async function main() {
   process.exit(clean ? 0 : 1);
 }
 
-main().catch((e) => {
+// Only run the audit when this file is the entry point. Exporting OBJECT_CHECKS
+// lets a dry-run harness assert the SAME checks inside a rolled-back transaction,
+// which is the only way to prove a not-yet-applied migration satisfies them.
+const INVOKED_DIRECTLY = process.argv[1]
+  && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (INVOKED_DIRECTLY) main().catch((e) => {
   console.error(`\naudit failed: ${e.message}\n`);
   process.exit(2);
 });

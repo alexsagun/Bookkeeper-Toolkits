@@ -22,7 +22,9 @@ env vars — **no new environment variables are needed.**
 - **Students** (any signed-in user) see the published curriculum, watch video lessons, and their
   progress is saved server-side — so it survives reloads **and follows them across devices**.
 - **You (the owner/admin)** get an in-app **"Edit course"** builder: create modules, add lessons,
-  paste a YouTube/Vimeo/MP4 link **or upload a video file**, then publish.
+  **upload each lesson's video file**, then publish. Lesson videos are **upload-only** — external
+  YouTube/Vimeo/MP4 links are not accepted as a lesson's main content, in the editor or through the
+  API (`db/2026-08-24-course-video-upload-only.sql`, #44).
 - On 100% completion, students download a **branded PDF certificate**.
 
 Authoring is gated by a new `profiles.is_admin` flag — only admins can write course content (enforced
@@ -41,8 +43,11 @@ by Row Level Security, not just the UI).
 > see it.
 >
 > **Duplicate course (monthly re-runs).** **⋮ → Duplicate course** clones a course's structure +
-> lessons into a **new independent DRAFT** ("Copy of …"), reusing the original's video links/uploads
-> and cover **by reference** (no files are copied — copy-on-write), and stamping `source_course_id`
+> lessons into a **new independent DRAFT** ("Copy of …"), reusing the original's **uploaded videos**
+> and cover **by reference** (no files are copied — copy-on-write), and stamping `source_course_id`.
+> ★ It **refuses** a source that still has external-link lessons, naming them — upload those first.
+> That check runs BEFORE anything is inserted, because the rollback path deletes a half-built copy,
+> so a failure partway through would destroy the new course rather than explain itself
 > for lineage. Per-user data (progress, completions, certificates) is **not** copied. The duplicate's
 > **Course date / Batch run date** defaults to **today** (it is not copied from the source), so a new
 > monthly re-run never inherits last month's date. The copy opens straight in the builder so you can
@@ -150,6 +155,11 @@ create table if not exists public.course_lessons (
   type           text not null default 'video' check (type in ('video','text')),
   video_url      text,
   video_provider text check (video_provider in ('youtube','vimeo','mp4','upload')),
+  --   ★ The CHECK still lists the three link providers, and is deliberately NOT narrowed:
+  --     doing so would require validating every existing row and would break the pre-#44
+  --     lessons that legitimately still carry one. "Upload only" is enforced by
+  --     course_lessons_video_guard (#44), which refuses the TRANSITION into link-backed
+  --     rather than the value — so a legacy row stays editable while no new one can appear.
   storage_path   text,
   text_content   text,
   duration_label text,
@@ -239,10 +249,38 @@ on conflict (slug) do nothing;
 
 ---
 
-## Step 2 — Create the media bucket
+## Step 2 — Create the two media buckets
 
-Uploaded videos and cover images are streamed straight from Supabase Storage, so the bucket must be
-**public-read**.
+Course media lives in **two** buckets, and which one a file goes in is a paywall decision, not a
+filing preference:
+
+| Bucket | Public? | Holds | Served as |
+|---|---|---|---|
+| `course-videos` | **OFF — private** | lesson videos (`lessons/<course-id>/…`) | short-lived **signed URLs**, authorized per request by RLS |
+| `course-media` | ON — public | course covers (`covers/<course-id>/…`) and feature-guide videos | plain public URLs |
+
+> **Why the split.** A *public* Supabase bucket serves every object to anyone with the URL and
+> **bypasses RLS on read entirely**, so a public bucket cannot protect paid content — the paywall
+> would end at the first copied link. Lesson videos were moved to the private bucket by
+> `db/2026-07-08-course-videos-private.sql` (#15). Covers are meant to be visible while browsing,
+> so they stay public.
+
+### 2a. `course-videos` (private — the paid lesson videos)
+
+Created for you by `db/2026-08-24-course-video-upload-only.sql` (#44), which also sets its size
+limit and format restriction. If your SQL role could not write `storage.buckets`, the migration
+prints a NOTICE and you create it by hand instead:
+
+1. **Supabase Dashboard → Storage → New bucket.**
+2. Name **`course-videos`**. **Public bucket = OFF.**
+3. **Settings →** file size limit **2 GB**, allowed MIME types **`video/mp4`**.
+
+> ★ **The bucket limit is a ceiling, not a grant.** Supabase enforces
+> *min(bucket limit, project-wide upload limit)*, and the project-wide limit is a separate
+> setting (**Storage → Settings**) that defaults to **50 MB** on the free tier. Until you raise
+> that too, uploads will fail partway through with a 413 no matter what the bucket says.
+
+### 2b. `course-media` (public — covers and feature guides)
 
 1. **Supabase Dashboard → Storage → New bucket.**
 2. Name: **`course-media`**. Toggle **Public bucket = ON**. Create.
@@ -266,17 +304,49 @@ create policy course_media_admin_delete on storage.objects for delete to authent
   using (bucket_id = 'course-media' and public.is_admin());
 ```
 
-> **File size:** the standard Supabase tier caps uploads (commonly **50 MB** per file). For longer
-> videos, either raise the limit in **Storage → Settings**, or just paste a **YouTube / Vimeo link**
-> in the lesson editor instead of uploading — both work.
+> **File size:** the project-wide upload limit (**Storage → Settings**) caps every bucket, and
+> defaults to **50 MB** on the free tier. Lesson videos need it raised to **2 GB**. There is no
+> longer a link fallback for a lesson that is too large — see *Lesson video format and limits*
+> below.
+
+### Lesson video format and limits
+
+| | |
+|---|---|
+| **Format** | **MP4 — H.264 video, AAC audio.** Nothing else is accepted. |
+| **Maximum size** | **2 GB** per lesson |
+| **Transfer** | Resumable (TUS), direct browser → Storage. Pause, resume and cancel are supported; an interrupted upload picks up from where it stopped when you choose the same file again. |
+| **Where it goes** | `course-videos/lessons/<course-id>/<uuid>-<filename>.mp4` — private |
+| **How students get it** | A signed URL minted per view and refreshed before it expires |
+
+**Why MP4/H.264 only.** Supabase Storage stores bytes; it does **not** transcode. Whatever you
+upload has to decode in the student's browser exactly as it is, and MP4/H.264+AAC is the only
+combination that plays everywhere, including older iOS Safari. The uploader checks three things
+before it will let you save: the file is an MP4 within the size limit, **your own browser can
+decode it**, and the uploaded object can be signed and read back as video. Only then does Save
+become available — "Storage accepted the bytes" is not the same as "a student can watch it".
+
+If a file is refused, convert it first with [HandBrake](https://handbrake.fr/) (free, desktop;
+preset *Fast 1080p30*) or CloudConvert, then upload the MP4.
+
+**Honest limits of the protection.** A signed URL is short-lived and per-request, so a copied link
+stops working — but until it expires it *is* a working link, and no web application can prevent a
+screen recording. This raises the cost of casual copying; it is not DRM, and it is not described as
+such anywhere in the product.
 
 ---
 
 ## Step 3 — (Optional) Seed a starter module
 
-So the course isn't blank on first load, run this to add one module with three sample lessons (two
-video, one text). It's guarded with `not exists`, so it's safe to run once and won't duplicate on
-re-run. You can edit or delete everything later in the in-app builder.
+So the course isn't blank on first load, run this to add one module with three sample lessons. It's
+guarded with `not exists`, so it's safe to run once and won't duplicate on re-run. You can edit or
+delete everything later in the in-app builder.
+
+> ★ **The two video lessons are seeded EMPTY**, with no video attached. They used to carry a
+> placeholder YouTube URL, which `course_lessons_video_guard` (#44) now refuses outright on a
+> published course — and which taught a workflow that no longer exists. Open each one in the builder
+> and upload its MP4. Until you do, the course cannot be published: `courses_publish_guard` counts
+> a video lesson with no uploaded file as a blocker, and the editor lists them by name.
 
 ```sql
 with c as (
@@ -307,14 +377,13 @@ insert into public.course_lessons
 select t.id, t.course_id, v.title, v.type, v.video_provider, v.video_url, v.text_content, v.duration_label, v.position
 from target t
 cross join (values
-  -- NOTE: the two video lessons use a PLACEHOLDER YouTube URL just to prove playback works.
-  -- Swap them for your real lesson videos in the builder (or edit the URLs below before running).
-  ('Welcome & What You''ll Learn', 'video', 'youtube',
-     'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
-     'A quick tour of the programme and how to get the most out of it.', '3:40', 0),
-  ('Navigating the QBO Dashboard', 'video', 'youtube',
-     'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
-     'Where everything lives: the left nav, the gear menu, and the + New button.', '6:15', 1),
+  -- The two video lessons are created with NO video (video_provider null). Upload each one's
+  -- MP4 in the builder. A link cannot be seeded here any more: since #44 a lesson may not be
+  -- given a YouTube/Vimeo/MP4 URL, and the guard enforces that against direct SQL too.
+  ('Welcome & What You''ll Learn', 'video', null, null,
+     'A quick tour of the programme and how to get the most out of it.', null, 0),
+  ('Navigating the QBO Dashboard', 'video', null, null,
+     'Where everything lives: the left nav, the gear menu, and the + New button.', null, 1),
   ('Chart of Accounts Basics', 'text', null, null,
      E'The Chart of Accounts is the backbone of the books.\n\n• Five buckets: Assets, Liabilities, Equity, Income, Expenses\n• Keep it lean — add detail only when it earns its keep\n• Map every bank and credit-card account to the right COA entry',
      null, 2)
@@ -345,8 +414,10 @@ their writes even if they tried to bypass the UI.
 In the app, open **Training & Skills → QuickBooks Online Mastering**, click **Edit course**, then:
 
 1. Add a **module** (e.g. "Getting Started in QBO").
-2. Add **lessons** to it — give each a title, pick **Video** or **Text**, and for video either paste a
-   link or upload a file. Optionally add notes and a duration label.
+2. Add **lessons** to it — give each a title, pick **Video** or **Text**, and for video **upload the
+   MP4 file**. The uploader shows progress and can be paused, resumed or cancelled; the lesson can
+   only be saved once the upload has finished *and* been verified as playable. The duration label
+   fills itself in from the file. Optionally add notes.
 3. Optionally paste a **Zoom Live Replay link** — the recording of that lesson's live session. It must
    be a complete `https://` URL (paste the whole share link, including any `?pwd=` passcode). Students
    see it as a card **below the lesson and above "Mark complete"**, and it opens in a **new tab** —
@@ -373,8 +444,29 @@ Students see published content immediately, complete lessons, and earn the certi
   column is `true` and the module/lesson `position` values are set (the seed/editor handle this).
 - **Edit toggle missing** — your `profiles.is_admin` isn't `true`, or you didn't re-sign-in after
   setting it.
-- **Uploaded video won't play** — confirm the `course-media` bucket is **public** and the storage
-  read policy above exists; check the browser console for a CORS error.
+- **Uploaded video won't play.** The player now tells you *which* failure it is, so read it first:
+  - *"could not be authorized"* — a signing/RLS failure. Confirm the `course-videos` bucket exists
+    and is **private**, that #44 ran (`select qual from pg_policies where policyname =
+    'course_videos_read'` should mention `course_video_object_readable`), and that the course is
+    published for the plan you are testing with. A **Sampler** account can only open
+    `qbo-*` courses whose tier is *Essentials*.
+  - *"can't decode this file"* — the object is fine and the permissions are fine; the file is not
+    MP4/H.264+AAC. Re-export it and upload again. Re-signing will never fix this, and the player
+    deliberately does not retry.
+  - *file is missing from the bucket* — the row points at an object that is not there. Run
+    `npm run media:audit`; if it reports the file is still in `course-media`, run
+    `npm run media:migrate` to move it into the private bucket.
+- **Upload fails partway with a 413.** The project-wide upload limit is below the file size. Raise
+  it in **Storage → Settings** (the per-bucket limit alone is not enough — Supabase enforces the
+  smaller of the two).
+- **"Lesson videos must be uploaded, not linked."** Something tried to write a YouTube/Vimeo/MP4
+  URL into a lesson. That is refused by `course_lessons_video_guard`, not just hidden in the UI.
+- **"Some video lessons still have no uploaded file."** `courses_publish_guard` is refusing to
+  publish. The editor lists the offending lessons by name; upload each one's video.
+- **Unused video files.** An upload that finishes but is never saved leaves an object nothing
+  references. Those are unreadable by members (authorization is reference-based), but they still
+  cost storage. The course builder has an **Unused video files → Check** control that lists them
+  and deletes only the ones no course still uses.
 - **Writes rejected while authoring** — you're not an admin for the requesting session (RLS). Re-check
   Step 4.
 - **Zoom Live Replay link saved but students don't see it** — only absolute `https://` links are

@@ -30,7 +30,7 @@
 // vite.config.js), so the same auth gate is exercised locally.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { createClient } from '@supabase/supabase-js';
+import { requireStaff, service } from '../_lib/staffAuth.js';
 import {
   normalizeEmail, isValidEmail,
   resolveMatchDecision, computeImportTerm, decideOnboardingStep,
@@ -60,38 +60,11 @@ function rateLimited(userId) {
   return false;
 }
 
-// ── Auth helpers (reuse the notify-*/proxy idiom; never touch the service key here) ──
-async function callerUser(authHeader) {
-  if (!authHeader || !SUPABASE_URL || !ANON_KEY) return null;
-  const token = String(authHeader).replace(/^Bearer\s+/i, '').trim();
-  if (!token) return null;
-  try {
-    const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
-      headers: { apikey: ANON_KEY, Authorization: `Bearer ${token}` },
-    });
-    if (!r.ok) return null;
-    const u = await r.json();
-    return u?.id ? { id: u.id, token } : null;
-  } catch { return null; }
-}
-async function callerIsAdmin(u) {
-  if (!u) return false;
-  try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(u.id)}&select=is_admin`,
-      { headers: { apikey: ANON_KEY, Authorization: `Bearer ${u.token}` } }
-    );
-    if (!r.ok) return false;
-    const rows = await r.json();
-    return Array.isArray(rows) && rows[0]?.is_admin === true;
-  } catch { return false; }
-}
-
-function service() {
-  return createClient(SUPABASE_URL, SERVICE_KEY, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
+// ── Auth ──
+// callerUser / callerIsAdmin / service moved to api/_lib/staffAuth.js in #45.
+// They were one of four byte-identical copies of the same profiles.is_admin read.
+// This endpoint now gates on the students.import CAPABILITY, so an Operations
+// Admin can run a migration without holding course, staff or settings authority.
 
 // ── Redacted audit event (IDs + safe codes only — never PII/links) ───────────────
 async function logEvent(admin, { jobId, rowId, actorId, kind, status, detail }) {
@@ -756,10 +729,13 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'Server import is not configured (SUPABASE_SECRET_KEY missing).' });
   }
 
-  // Auth: valid JWT + independently-confirmed admin, BEFORE the service client exists.
-  const u = await callerUser(req.headers?.authorization);
-  if (!u) return res.status(401).json({ error: 'Sign in as an admin.' });
-  if (!(await callerIsAdmin(u))) return res.status(403).json({ error: 'Admin authorization required.' });
+  // Auth: valid JWT + independently-confirmed capability, BEFORE the service
+  // client exists. #45 moved the check into api/_lib/staffAuth.js and made it a
+  // named permission — importing students is Operations work, not a blanket
+  // admin power.
+  const gate = await requireStaff(req, { permission: 'students.import' });
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error, code: gate.code });
+  const u = gate.user;
   if (rateLimited(u.id)) return res.status(429).json({ error: 'Too many requests — wait a minute.' });
 
   let body = req.body;

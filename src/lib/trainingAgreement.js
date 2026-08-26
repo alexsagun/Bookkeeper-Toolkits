@@ -44,7 +44,7 @@
 import { phpAmount } from './planCatalog.js';
 
 /** Bump on any wording change. Recorded against every signature. */
-export const AGREEMENT_VERSION = '2026-08-20';
+export const AGREEMENT_VERSION = '2026-08-22';
 
 /** Comparison columns, cheapest first — the order the pricing page uses. */
 export const AGREEMENT_TIERS = Object.freeze(['sampler', 'silver', 'vip']);
@@ -148,10 +148,15 @@ function buildRows(priceOf, daysOf) {
     { divider: 'Core Inclusions' },
     { feature: 'Learning Format', sampler: TIER_META.sampler.format, silver: TIER_META.silver.format, vip: TIER_META.vip.format },
     { feature: 'Investment (PHP)', sampler: fmtPhp(priceOf('sampler')), silver: fmtPhp(priceOf('silver')), vip: fmtPhp(priceOf('vip')) },
-    { feature: '1 Live Zoom Session (3 hours)', sampler: true, silver: false, vip: false },
+    { feature: '1 Live Zoom Session (4 hours)', sampler: true, silver: false, vip: false },
     { feature: '12 Live Zoom Group Trainings', sampler: false, silver: false, vip: true },
+    // ★ VIP's resume/interview coaching is the FOUR group sessions and nothing
+    // else. A separate "1-on-1 Resume & Interview Coaching (1 session)" row was
+    // added on 2026-08-20 on the understanding that the two were distinct
+    // inclusions; seeing it rendered, that was withdrawn on 2026-08-22. Do not
+    // reinstate it without checking the plan features and the DB seed, which
+    // dropped it in the same change.
     { feature: '4 Live Group Resume & Interview Coaching Sessions', sampler: false, silver: false, vip: true },
-    { feature: '1-on-1 Resume & Interview Coaching (1 session)', sampler: false, silver: false, vip: true },
     { feature: '1-on-1 QBO Coaching (30 min, post-hire)', sampler: false, silver: false, vip: true },
     { feature: 'QBO Mastery Course', sampler: 'Essentials only', silver: true, vip: true },
     { feature: 'Access to Resume & Interview Course', sampler: false, silver: true, vip: true },
@@ -194,7 +199,6 @@ function buildSections() {
       callout('Live Zoom Sessions', 'Camera ON with an approved virtual background for every session.'),
       callout('ProAdvisor Certification', 'Achieve QuickBooks Online ProAdvisor Certification by Week 2.'),
       callout('Group Resume & Interview Coaching', 'VIP only — four live group sessions during Weeks 2–4.'),
-      callout('1-on-1 Resume & Interview Coaching', 'VIP only — one private session covering your own resume and interview answers.'),
       callout('Post-Employment QBO Coaching', 'VIP only — one 30-minute session within 6 months of getting hired.'),
     ] }] },
     // ★ Section 4 — the one the source computed and threw away.

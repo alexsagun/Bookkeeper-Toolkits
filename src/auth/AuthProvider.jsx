@@ -7,7 +7,19 @@
 //
 //   const { session, user, profile, loading, profileReady, recovery, configured,
 //           signUp, signIn, signInWithGoogle, signOut, resetPassword,
-//           resendConfirmation, updatePassword, clearRecovery, refreshProfile } = useAuth();
+//           resendConfirmation, updatePassword, clearRecovery, refreshProfile,
+//           staff, staffReady, staffDegraded, staffMissing, isSuperAdmin, can,
+//           refreshStaff } = useAuth();
+//
+// STAFF AUTHORITY (#45). `can('enrollments.review')` is the one predicate admin
+// surfaces should ask; `profile.is_admin` now means "active Super Admin" and
+// nothing else. `staff` is the normalized context from my_staff_context(), read
+// live from the database on every session change rather than decoded from a JWT
+// claim — which is why suspending a staff member takes effect on their next
+// request instead of on their next token refresh. Both start EMPTY and stay EMPTY
+// unless the server says otherwise: absent permission data means "no", not "yes".
+// Wait on `staffReady` before rendering anything privileged, the same way the gate
+// waits on `profileReady`.
 //
 // Responsibilities:
 //  1. Track the Supabase session (initial load + live changes), and server-validate
@@ -22,8 +34,9 @@
 //  4. One-time adopt any pre-auth ("legacy") global localStorage data into the
 //     first signed-in user's namespace.
 // ---------------------------------------------------------------------------
-import React, { createContext, useContext, useEffect, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import { supabase, supabaseConfigured } from '../lib/supabase';
+import { EMPTY_STAFF_CONTEXT, staffCan, staffContextFromRpc } from '../lib/staffRoles.js';
 
 const AuthContext = createContext(null);
 
@@ -139,6 +152,25 @@ const withTimeout = (promise, ms, fallback) =>
 // rejection (401/403); network/other failures — including a stalled endpoint (the
 // timeout resolves to a no-error fallback) — return false so we fail open and
 // don't sign out an offline user who is actually still valid.
+/**
+ * Ask the database who the caller is allowed to be. (#45)
+ *
+ * Raced against the same 8s fail-open timeout as the session and profile calls,
+ * for the same reason: a stalled endpoint must not strand the app. Note what
+ * "fail open" means here — the CALL gives up, and staffContextFromRpc() resolves
+ * the result to the EMPTY context. Availability fails open; authority never does.
+ */
+async function fetchStaffContext() {
+  if (!supabaseConfigured) return { context: EMPTY_STAFF_CONTEXT, degraded: false, missing: false };
+  const TIMEOUT = { data: null, error: new Error('staff context fetch timed out (8s)') };
+  try {
+    const res = await withTimeout(supabase.rpc('my_staff_context'), AUTH_CALL_TIMEOUT_MS, TIMEOUT);
+    return staffContextFromRpc(res);
+  } catch (e) {
+    return staffContextFromRpc({ data: null, error: e });
+  }
+}
+
 async function accountRevoked() {
   try {
     const { error } = await withTimeout(supabase.auth.getUser(), AUTH_CALL_TIMEOUT_MS, { error: null });
@@ -156,6 +188,22 @@ export function AuthProvider({ children }) {
   // and stays set across refreshProfile() refetches (profile is non-null then, so no flash).
   const [profileFetchedFor, setProfileFetchedFor] = useState(null);
   const [loading, setLoading] = useState(true);
+  // Staff authority (#45). Starts EMPTY and stays EMPTY unless the server says
+  // otherwise — absent permission data means "no", never "yes".
+  const [staff, setStaff] = useState(EMPTY_STAFF_CONTEXT);
+  const [staffFetchedFor, setStaffFetchedFor] = useState(null);
+  // True when we could not reach my_staff_context() at all. Lets an admin screen
+  // show setup guidance instead of pretending the account simply has no role.
+  const [staffDegraded, setStaffDegraded] = useState(false);
+  // ★ NARROWER, and the distinction is load-bearing: `missing` means the function
+  //   is not in this database (a pre-#45 install), which is ACTIONABLE — run the
+  //   migration. `degraded` also covers a timeout or a network blip, which is
+  //   TRANSIENT — retry. staffContextFromRpc() has always told the two apart;
+  //   until now this provider threw that apart away, so a dropped packet and an
+  //   un-migrated database produced the same screen. A caller that knows the model
+  //   is absent can also skip a request that cannot possibly succeed, which is
+  //   what was turning "not installed yet" into a 500 in the console.
+  const [staffMissing, setStaffMissing] = useState(false);
   // True after the user returns from a password-reset email link, until they set
   // a new password. The reset link signs them in with a recovery session, so the
   // app must show a "set new password" screen instead of the toolkit (see the gate).
@@ -269,6 +317,67 @@ export function AuthProvider({ children }) {
     };
   }, [session?.user?.id]);
 
+  // ── Staff context (#45) ────────────────────────────────────────────────────
+  // Who is this person allowed to be in the admin surfaces? Fetched from
+  // my_staff_context() IN PARALLEL with the profile above — its own effect on the
+  // same [uid] dependency, deliberately not chained after the profile fetch,
+  // because startup was explicitly parallelised once already and re-serialising it
+  // would add a round trip to every sign-in.
+  //
+  // ★ NOT a profiles column, and that is deliberate. fetchProfileRow's four-tier
+  //   fallback ladder narrows the select on a missing-column error, so a new
+  //   column on a not-yet-migrated database silently disappears and reads as
+  //   `undefined` — indistinguishable from "no role". An RPC either answers or
+  //   fails loudly enough for staffContextFromRpc() to classify it.
+  //
+  // ★ Authority is read LIVE from the database on every session change, never
+  //   decoded from a JWT claim. That is what makes suspending a staff member take
+  //   effect on their next request instead of on their next token refresh.
+  useEffect(() => {
+    const uid = session?.user?.id;
+    if (!uid) {
+      setStaff(EMPTY_STAFF_CONTEXT);
+      setStaffDegraded(false);
+      setStaffMissing(false);
+      setStaffFetchedFor(null);
+      return;
+    }
+    let active = true;
+    (async () => {
+      const res = await fetchStaffContext();
+      if (!active) return;
+      setStaff(res.context);
+      setStaffDegraded(res.degraded);
+      setStaffMissing(res.missing);
+      if (res.degraded && !res.missing) {
+        console.warn('[auth] staff context unavailable — treating this account as non-staff');
+      }
+      // Mark settled even on failure. The gate waits on this to avoid flashing an
+      // admin screen, and an unavailable check already resolved to EMPTY, so
+      // holding the splash forever would strand the app for a decision already made.
+      setStaffFetchedFor(uid);
+    })();
+    return () => {
+      active = false;
+    };
+  }, [session?.user?.id]);
+
+  // THE capability predicate every consumer should use. Memoized on the context
+  // identity so passing it down does not defeat React.memo on TabPanel — the
+  // keep-alive tree re-renders app-wide if any of its props changes identity.
+  const can = useMemo(() => (key) => staffCan(staff, key), [staff]);
+
+  // Re-read staff authority on demand — after accepting an invitation, after a
+  // Super Admin changes someone's role, or when a screen wants to be sure.
+  async function refreshStaff() {
+    if (!session?.user?.id) return EMPTY_STAFF_CONTEXT;
+    const res = await fetchStaffContext();
+    setStaff(res.context);
+    setStaffDegraded(res.degraded);
+    setStaffMissing(res.missing);
+    return res.context;
+  }
+
   // Re-read the profile on demand (e.g. the Pending Approval screen's "Check status" button /
   // poll). Keeps profileFetchedFor unchanged (same uid), so the existing profile stays visible
   // and the gate doesn't flash a splash while refreshing.
@@ -293,6 +402,24 @@ export function AuthProvider({ children }) {
     // The gate waits on this so it never renders the app/approval screens with a stale null profile.
     profileReady: !session?.user || profileFetchedFor === session?.user?.id,
     refreshProfile,
+
+    // ── Staff authority (#45) ──
+    // `staff` is the normalized context; `can(key)` is what callers should use.
+    // Both are EMPTY until the server answers, so a screen that renders before
+    // staffReady shows nothing privileged rather than flashing an admin surface.
+    staff,
+    // True once the first staff lookup for the current user has settled (or there
+    // is no user). The gate waits on this exactly as it waits on profileReady.
+    staffReady: !session?.user || staffFetchedFor === session?.user?.id,
+    staffDegraded,
+    // Narrower than staffDegraded: the role model is not in this database at all.
+    // A screen that knows this can render setup guidance WITHOUT firing a request
+    // that cannot succeed — which is what was surfacing a missing migration as a
+    // 500 in the browser console.
+    staffMissing,
+    isSuperAdmin: staff.isSuperAdmin,
+    can,
+    refreshStaff,
     recovery,
     configured: supabaseConfigured,
     signUp: (email, password, fullName) =>

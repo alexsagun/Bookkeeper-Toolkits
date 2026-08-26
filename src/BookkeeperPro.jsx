@@ -48,6 +48,11 @@ import {
 } from './lib/batchLifecycle';
 import { appErrorCode, appErrorMessage, isMigrationMissing } from './lib/appErrors';
 import {
+  ADMIN_TAB_PERMISSION, STAFF_PERMISSIONS, STAFF_ROLES, STAFF_STATUSES,
+  canManageCourseClient, lastSuperAdminGuard, permissionsForRole,
+  staffEntitlement, staffRole, staffStatusLabel,
+} from './lib/staffRoles';
+import {
   ENROLLMENT_PLANS_FALLBACK, PLAN_LABELS, PLAN_ENTITLEMENTS, planEntitlement,
   FULL_ENTITLEMENT, filterStagesForEntitlement, extensionPrice, phpAmount,
 } from './lib/planCatalog';
@@ -57,9 +62,17 @@ import {
 import { parseLooseJson } from './lib/partialJson';
 import { ZOOM_HOST_SUFFIXES, parseReplayUrl } from './lib/lessonReplay';
 import {
+  LESSON_VIDEO_BUCKET, LESSON_VIDEO_ACCEPT, LESSON_VIDEO_MAX_BYTES, LESSON_VIDEO_MIME,
+  LESSON_VIDEO_CHUNK_BYTES, LESSON_VIDEO_RETRY_DELAYS, LESSON_VIDEO_SIGN_TTL_SECONDS,
+  UPLOAD_STATES, UPLOAD_EVENTS, nextUploadState, isUploadInFlight, hasUnfinishedUpload,
+  blocksLessonSave, needsCloseConfirmation, sanitizeVideoFileName, buildLessonVideoPath,
+  isLessonVideoPath, validateVideoFile, classifyLessonVideo, coursePublishBlockers,
+  lessonVideoPayload, shouldResignPlayback, describeUploadError, formatBytes, formatMediaDuration,
+} from './lib/courseVideo';
+import {
   INTAKE_FIELDS, INTAKE_SECTIONS,
   validateIntake, parseAmountPaid, normalizePhone,
-  blankIntake, intakeField, fileTypeAllowed, contentTypeFor, intakeValuesFromRequest, intakePayload,
+  blankIntake, intakeField, fileTypeAllowed, contentTypeFor, intakeValuesFromRequest, intakePayload, ENROLLMENT_PROCESSING_NOTE,
 } from './lib/enrollmentIntake';
 import { AGREEMENT_VERSION, agreementModel, agreementSnapshot } from './lib/trainingAgreement';
 
@@ -115,6 +128,7 @@ const TAB_ROUTES = {
   enrollments: '/admin/enrollments',
   studentimports: '/admin/student-imports',
   batches: '/admin/batches',
+  staffroles: '/admin/team',
   course: '/courses/accounting-101',
   qbomastery: '/courses/quickbooks-online-mastery',
   industryacc: '/industry-accounting',
@@ -166,7 +180,7 @@ const VALID_APP_TABS = new Set(Object.keys(TAB_ROUTES));
 // admin-only screens, the member community (a space, not a tool), and the legacy
 // mockinterview alias (a redirect, not a tool). Derived so the number can never drift
 // from the actual toolkit again.
-const NON_TOOL_TAB_IDS = new Set(['dashboard', 'community', 'accessrequests', 'enrollments', 'studentimports', 'batches', 'mockinterview']);
+const NON_TOOL_TAB_IDS = new Set(['dashboard', 'community', 'accessrequests', 'enrollments', 'studentimports', 'batches', 'staffroles', 'mockinterview']);
 const TOOL_COUNT = Object.keys(TAB_ROUTES).filter((id) => !NON_TOOL_TAB_IDS.has(id)).length;
 const INTERVIEW_SUBTAB_IDS = new Set(['winstrat', 'mock', 'common', 'accounting', 'body', 'jdgen', 'salary']);
 const APP_ROUTE_CHANGE_EVENT = 'bookkeeper:route-change';
@@ -368,6 +382,7 @@ const VOICE_TAB_INFO = {
   accessrequests: { label: 'Access Requests', stage: 'Admin', desc: 'Admin screen: approve or reject new signups.', adminOnly: true },
   enrollments:  { label: 'Enrollments', stage: 'Admin', desc: 'Admin screen: review payment receipts, approve subscriptions, and manage renewals.', adminOnly: true },
   studentimports: { label: 'Student Imports', stage: 'Admin', desc: 'Admin screen: migrate legacy Thinkific students — validate, map course-combos to plans, dry-run, and import accounts + memberships.', adminOnly: true },
+  staffroles: { label: 'Team & Roles', stage: 'Admin', desc: 'Admin screen: invite staff and manage who they are — assign the Super Admin, Operations Admin and Trainer roles, suspend or revoke access, and read the audit trail of every role change. Super Admin only.', adminOnly: true },
   batches: { label: 'Batches', stage: 'Admin', desc: 'Admin screen: manage the VIP batches — create a monthly batch, edit its name, code, dates, timezone and seat capacities while the batch is current or upcoming, close or archive it, and assign members to their private batch communities. A batch closes automatically once its month ends, and a batch whose period has passed becomes read-only.', adminOnly: true },
 };
 
@@ -2879,6 +2894,54 @@ const TIER_PILL_BG = Object.freeze({
   vip: 'linear-gradient(135deg,#FBBF24,#F59E0B)',
 });
 
+// Column count for the agreement's callout grids. `auto-fit` picks three at the
+// captured 794px whatever the card count, which strands a lone card beside a gap
+// on any count that is one more than a multiple of three.
+const calloutColumns = (n) => (n <= 2 ? Math.max(n, 1) : n % 3 === 1 ? 2 : 3);
+
+// ── The signature script face, in one place ─────────────────────────────────
+// Shared by SignaturePad's typed path and the agreement's coach counter-signature
+// so both names on one document are drawn in the same face at the same weight.
+// Kept as a function of size because the fit loop rewrites it per step.
+const SIGNATURE_FONT = (px) => `italic ${px}px "Segoe Script","Brush Script MT","Snell Roundhand",cursive`;
+
+// Paints `name` into an existing 2D context, shrinking to fit rather than
+// overflowing — long names are common here. Returns false if there was nothing
+// to draw, so callers can treat an empty name as "not signed".
+function paintTypedSignature(ctx, name, width, height) {
+  const text = String(name || '').trim();
+  if (!text) return false;
+  ctx.save();
+  ctx.fillStyle = DOC.ink;
+  ctx.textBaseline = 'middle';
+  let px = 46;
+  ctx.font = SIGNATURE_FONT(px);
+  while (px > 18 && ctx.measureText(text).width > width - 36) {
+    px -= 2;
+    ctx.font = SIGNATURE_FONT(px);
+  }
+  ctx.fillText(text, 18, height / 2);
+  ctx.restore();
+  return true;
+}
+
+// Standalone PNG of a typed signature, for a signatory who is not at the pad —
+// currently the coach, whose box was printing as a bare rule beside the student's
+// signed one. Returns '' when there is no name, so the caller renders nothing
+// rather than an empty image.
+function typedSignatureDataUrl(name, width = 420, height = 110) {
+  if (!String(name || '').trim() || typeof document === 'undefined') return '';
+  const canvas = document.createElement('canvas');
+  const ratio = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return '';
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  if (!paintTypedSignature(ctx, name, width, height)) return '';
+  return canvas.toDataURL('image/png');
+}
+
 // Radio group rendered as pills. A native <input type="radio"> stays underneath
 // each label so keyboard and screen-reader behaviour is the browser's, not ours.
 function IntakePills({ field, value, onChange, invalid }) {
@@ -3131,18 +3194,9 @@ function SignaturePad({ onChange, value, disabled, flushRef }) {
       return;
     }
     const rect = canvas.getBoundingClientRect();
-    ctx.save();
-    ctx.fillStyle = DOC.ink;
-    ctx.textBaseline = 'middle';
-    // Shrink to fit rather than overflow — long names are common here.
-    let px = 46;
-    ctx.font = `italic ${px}px "Segoe Script","Brush Script MT","Snell Roundhand",cursive`;
-    while (px > 18 && ctx.measureText(name).width > rect.width - 36) {
-      px -= 2;
-      ctx.font = `italic ${px}px "Segoe Script","Brush Script MT","Snell Roundhand",cursive`;
-    }
-    ctx.fillText(name, 18, rect.height / 2);
-    ctx.restore();
+    // Shared with the agreement's coach counter-signature, so the two names on a
+    // signed document are drawn in one face at one weight.
+    paintTypedSignature(ctx, name, rect.width, rect.height);
     stateRef.current.ink = true;
     if (emitTimerRef.current) clearTimeout(emitTimerRef.current);
     emitTimerRef.current = setTimeout(emitTyped, 200);
@@ -3227,6 +3281,11 @@ function SignaturePad({ onChange, value, disabled, flushRef }) {
 // The agreement itself. Rendered from the trainingAgreement model, so the copy a
 // student reads on screen and the copy captured into their PDF are one source.
 function AgreementDocInner({ model, signatureDataUrl, docRef }) {
+  // One canvas encode per coach name, not one per render: this component is
+  // memoized precisely because re-rendering it is expensive, and an unmemoized
+  // toDataURL here would hand it a new src string every time and defeat that.
+  const coachSignature = useMemo(() => typedSignatureDataUrl(model.coachName), [model.coachName]);
+
   const cell = (v) => {
     if (v === true) return <span style={{ color: DOC.ok, fontWeight: 700 }}>✓</span>;
     if (v === false) return <span style={{ color: DOC.off, fontWeight: 700 }}>—</span>;
@@ -3242,10 +3301,15 @@ function AgreementDocInner({ model, signatureDataUrl, docRef }) {
               <thead>
                 <tr>
                   <th />
+                  {/* A FILL, not an outline. html2canvas has no outline support at
+                      all, so the 2px marker on the bought tier was simply never
+                      drawn — the printed table showed no selected column. The body
+                      cells already tint with washBlue, so the column now reads as
+                      one highlighted unit from header to footnote. */}
                   {model.columns.map(c => (
-                    <th key={c.key} style={{ padding: '6px 8px', background: DOC.line, fontSize: 11,
-                      color: DOC.ink, textAlign: 'center',
-                      outline: c.selected ? `2px solid ${DOC.blue}` : 'none', outlineOffset: 2, borderRadius: 3 }}>
+                    <th key={c.key} style={{ padding: '6px 8px', fontSize: 11, textAlign: 'center', borderRadius: 3,
+                      background: c.selected ? DOC.blue : DOC.line,
+                      color: c.selected ? '#fff' : DOC.ink }}>
                       {c.label}
                     </th>
                   ))}
@@ -3287,8 +3351,11 @@ function AgreementDocInner({ model, signatureDataUrl, docRef }) {
           </ul>
         );
       case 'callouts':
+        // Balanced columns instead of auto-fit. At the captured 794px auto-fit
+        // always yields three, so Section 3's four cards (five before the 1-on-1
+        // was withdrawn) printed as 3 + 1 with a hole beside the orphan.
         return (
-          <div key={i} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 10 }}>
+          <div key={i} style={{ display: 'grid', gridTemplateColumns: `repeat(${calloutColumns(b.items.length)}, 1fr)`, gap: 10 }}>
             {b.items.map((c, ci) => (
               <div key={ci} style={{ background: DOC.wash, borderLeft: `4px solid ${DOC.blueLo}`, borderRadius: 6, padding: '10px 13px' }}>
                 <h5 style={{ margin: '0 0 3px', fontSize: 12.5, color: DOC.ink, fontWeight: 700 }}>{c.title}</h5>
@@ -3344,22 +3411,30 @@ function AgreementDocInner({ model, signatureDataUrl, docRef }) {
         return (
           <div key={i} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 9, margin: '12px 0' }}>
             {model.columns.map(c => (
+              // Block flow with explicit margins, not a flex column with `gap`.
+              // In the shipped PDF the checkbox and the pill collided here while
+              // looking correct on screen; html2canvas 1.4.1 parses neither flex
+              // alignment nor gap, so the column is restated as plain block flow
+              // it cannot get wrong. Identical rendering in a real browser.
               <div key={c.key} style={{ border: `1px solid ${c.selected ? DOC.blue : DOC.off}`, borderRadius: 10, padding: 11,
                 background: c.selected ? '#F8FBFF' : '#fff', textAlign: 'center',
-                display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'center',
                 boxShadow: c.selected ? `0 0 0 3px rgba(37,99,235,0.18)` : 'none' }}>
-                <span style={{ width: 18, height: 18, borderRadius: 5, display: 'inline-flex', alignItems: 'center',
-                  justifyContent: 'center', fontSize: 12, fontWeight: 800, color: '#fff',
-                  background: c.selected ? DOC.blueLo : '#fff', border: `2px solid ${c.selected ? DOC.blueLo : '#94A3B8'}` }}>
-                  {c.selected ? '✓' : ''}
-                </span>
-                <span style={{ display: 'inline-block', borderRadius: 999, color: '#fff', fontWeight: 700,
-                  textTransform: 'uppercase', fontSize: 10, letterSpacing: '0.05em', padding: '3px 11px',
-                  background: TIER_PILL_BG[c.key] }}>
-                  {c.label}
-                </span>
-                <span style={{ fontSize: 15, fontWeight: 700, color: DOC.ink }}>{c.priceLabel}</span>
-                <span style={{ fontSize: 10, color: DOC.mute }}>{c.format}</span>
+                <div style={{ marginBottom: 6 }}>
+                  <span style={{ display: 'inline-block', width: 18, height: 18, borderRadius: 5,
+                    lineHeight: '14px', textAlign: 'center', fontSize: 12, fontWeight: 800, color: '#fff',
+                    background: c.selected ? DOC.blueLo : '#fff', border: `2px solid ${c.selected ? DOC.blueLo : '#94A3B8'}` }}>
+                    {c.selected ? '✓' : ''}
+                  </span>
+                </div>
+                <div style={{ marginBottom: 6 }}>
+                  <span style={{ display: 'inline-block', borderRadius: 999, color: '#fff', fontWeight: 700,
+                    textTransform: 'uppercase', fontSize: 10, letterSpacing: '0.05em', padding: '3px 11px',
+                    background: TIER_PILL_BG[c.key] }}>
+                    {c.label}
+                  </span>
+                </div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: DOC.ink, marginBottom: 4 }}>{c.priceLabel}</div>
+                <div style={{ fontSize: 10, color: DOC.mute }}>{c.format}</div>
               </div>
             ))}
           </div>
@@ -3370,7 +3445,10 @@ function AgreementDocInner({ model, signatureDataUrl, docRef }) {
             display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14 }}>
             {[
               { role: 'Student', name: model.studentName, sig: signatureDataUrl },
-              { role: 'Coach', name: model.coachName, sig: null },
+              // The coach counter-signs every agreement, so a bare rule beside the
+              // student's signed box read as an unfinished document. Rendered from
+              // the name through the same painter the typed student path uses.
+              { role: 'Coach', name: model.coachName, sig: coachSignature },
             ].map(card => (
               <div key={card.role} style={{ background: '#fff', borderRadius: 10, padding: '14px 16px', boxShadow: '0 1px 4px rgba(15,23,42,0.06)' }}>
                 <h6 style={{ margin: '0 0 12px', fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.07em', color: DOC.body, fontWeight: 700 }}>
@@ -3382,14 +3460,14 @@ function AgreementDocInner({ model, signatureDataUrl, docRef }) {
                 </div>
                 <div style={{ marginBottom: 12 }}>
                   <div style={{ fontSize: 10, color: DOC.mute, marginBottom: 10 }}>Signature</div>
-                  <div style={{ borderBottom: `1px solid #94A3B8`, minHeight: 30, display: 'flex', alignItems: 'flex-end' }}>
+                  <div style={{ borderBottom: `1px solid #94A3B8`, minHeight: 30 }}>
                     {card.sig
                       ? <img src={card.sig} alt="" style={{ maxHeight: 46, maxWidth: '90%', display: 'block' }} />
                       : <span>&nbsp;</span>}
                   </div>
                   {card.sig && (
                     <div style={{ marginTop: 4, fontSize: 9.5, lineHeight: 1.35, color: DOC.blueLo, fontStyle: 'italic' }}>
-                      Signed electronically by {card.name || 'the student'}
+                      Signed electronically by {card.name || card.role.toLowerCase()}
                     </div>
                   )}
                 </div>
@@ -3436,15 +3514,35 @@ function AgreementDocInner({ model, signatureDataUrl, docRef }) {
         </div>
 
         {model.sections.map(s => (
-          <div key={s.n} style={{ marginTop: 22 }} data-agreement-section={s.n}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 11, marginBottom: 11 }}>
-              <div style={{ width: 26, height: 26, flex: '0 0 auto', borderRadius: 6, background: DOC.blue,
-                color: '#fff', fontSize: 14, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div key={s.n} style={{ marginTop: 22 }} data-agreement-section={s.n} data-agreement-break="">
+            {/* No flex here. html2canvas positions text from the element box rather
+                than the flex line box, so a digit centred by alignItems sat low in
+                its square and 10/12 overflowed it. lineHeight === height centres
+                the same way in a real browser, so the on-screen copy is unmoved. */}
+            <div style={{ marginBottom: 11 }}>
+              <span style={{ display: 'inline-block', verticalAlign: 'middle', width: 26, height: 26,
+                lineHeight: '26px', textAlign: 'center', borderRadius: 6, background: DOC.blue,
+                color: '#fff', fontSize: 14, fontWeight: 700, marginRight: 11 }}>
                 {s.n}
-              </div>
-              <h4 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: DOC.ink }}>{s.title}</h4>
+              </span>
+              <h4 style={{ display: 'inline', verticalAlign: 'middle', margin: 0, fontSize: 15, fontWeight: 700, color: DOC.ink }}>{s.title}</h4>
             </div>
-            <div className="flex flex-col gap-2">{s.blocks.map(block)}</div>
+            {/* Was `flex flex-col gap-2`. html2canvas 1.4.1 carries no handling for
+                gap/rowGap/columnGap, so block spacing is stated as margins that it
+                definitely paints. (Its GRID gaps do come out right in the captured
+                PDF, so the grids elsewhere in this document are left alone — this
+                is about not depending on the fragile path, not a blanket ban.) */}
+            <div>
+              {s.blocks.map((b, i) => (
+                // Safe break points, and only these: a page may end between two
+                // blocks but never inside one. The FIRST block is deliberately not
+                // one, so a heading can never be stranded at the foot of a page.
+                <div key={i} style={{ marginBottom: i === s.blocks.length - 1 ? 0 : 8 }}
+                  {...(i > 0 ? { 'data-agreement-break': '' } : {})}>
+                  {block(b, i)}
+                </div>
+              ))}
+            </div>
           </div>
         ))}
       </div>
@@ -3717,6 +3815,17 @@ function EnrollmentPaywall({ user, profile, priorRequest, prefillFrom, overdue, 
   // rendered at a fixed A4-ish width, so the PDF is identical whatever the
   // student's viewport happens to be, and it does not matter whether they left
   // the agreement panel collapsed.
+  // Page breaks land BETWEEN sections, never through one.
+  //
+  // This used to walk the canvas in fixed page-height steps — `offset += pageH`,
+  // redrawing the whole image at a negative offset. Nothing consulted the content,
+  // so a break fell wherever the arithmetic put it: through a heading, a table row,
+  // or a signature box. It was luck that only one heading was ever reported.
+  //
+  // AgreementDocInner stamps data-agreement-section on every section, so the
+  // candidate break points are already in the DOM. Each page takes as many whole
+  // sections as fit; a section taller than one page still gets cut, because the
+  // alternative is a page that renders nothing.
   const renderAgreementPdf = async () => {
     const node = pdfDocRef.current;
     if (!node) return null;
@@ -3726,13 +3835,80 @@ function EnrollmentPaywall({ user, profile, priorRequest, prefillFrom, overdue, 
     const pdf = new jsPDF({ unit: 'pt', format: 'a4' });
     const pageW = pdf.internal.pageSize.getWidth();
     const pageH = pdf.internal.pageSize.getHeight();
-    const imgH = canvas.height * (pageW / canvas.width);
+
+    // Real page margins. The image used to be drawn full-bleed at (0, -offset), so
+    // the only margin was the document's own 24px padding — about 18pt, which is
+    // why a signed contract printed looking cramped. These also give the page
+    // number somewhere to sit that is not on top of a clause.
+    const MX = 32;                        // left / right
+    const MY = 30;                        // top / bottom
+    const contentW = pageW - MX * 2;
+    const contentH = pageH - MY * 2;
+    const imgH = canvas.height * (contentW / canvas.width);
+
+    // DOM pixels → PDF points. offsetTop is relative to the offsetParent, so
+    // measure against the container's own top rather than assuming they share one.
+    const nodeTop = node.getBoundingClientRect().top;
+    // Divide by the bounding rect, not scrollHeight: html2canvas sizes the canvas
+    // from the rect, and scrollHeight is integer-rounded and excludes the border.
+    const scale = imgH / node.getBoundingClientRect().height;
+    // ★ Safe stops, not forbidden zones. Every section start is one, and so is
+    //   every block within a section EXCEPT its first — which is what keeps a
+    //   heading from being stranded at the foot of a page, and keeps the Section 1
+    //   table with its "All times are in Philippine Time" footnote. Whatever lies
+    //   between two consecutive stops is atomic by construction, so there is no
+    //   interval arithmetic to get wrong. Previously only the twelve section tops
+    //   were registered, which is why every observed cut was intra-section.
+    const breaks = Array.from(node.querySelectorAll('[data-agreement-break]'))
+      .map(el => (el.getBoundingClientRect().top - nodeTop) * scale)
+      .filter(y => y > 0 && y < imgH)
+      .sort((a, b) => a - b);
+
     // JPEG, not PNG: a multi-page agreement as PNG runs to tens of megabytes and
     // would exceed the bucket's own limit.
     const img = canvas.toDataURL('image/jpeg', 0.92);
-    for (let offset = 0; offset < imgH; offset += pageH) {
-      if (offset > 0) pdf.addPage();
-      pdf.addImage(img, 'JPEG', 0, -offset, pageW, imgH);
+
+    // ★ addImage draws the WHOLE image at y = MY - offset and the page box clips
+    //   it, so every page *displays* a full contentH band no matter where we
+    //   advance to. Breaking on a stop therefore does nothing on its own — the
+    //   band between the stop and the page bottom renders here AND again at the
+    //   top of the next page, and the extra bands add whole pages (a 3-page
+    //   agreement became 5, signature block printed twice). White out both
+    //   margins so each page shows only the band it claims.
+    let offset = 0;
+    let page = 0;
+    while (offset < imgH - 1) {
+      if (page > 0) pdf.addPage();
+      // Stops that fit on this page. Anything in the first 15% is ignored — a stub
+      // block above an over-page one would otherwise emit a near-empty page.
+      const fits = breaks.filter(y => y > offset + contentH * 0.15 && y <= offset + contentH);
+      // Whatever is left fits? Take all of it. Otherwise stop at the furthest safe
+      // point, or hard-cut when a single block is taller than a page — the
+      // alternative there is a page that renders nothing.
+      const next = (imgH - offset <= contentH) ? imgH
+        : (fits.length ? fits[fits.length - 1] : offset + contentH);
+      const drawn = next - offset;
+      pdf.addImage(img, 'JPEG', MX, MY - offset, contentW, imgH);
+      pdf.setFillColor(255, 255, 255);
+      pdf.rect(0, 0, pageW, MY, 'F');                                  // above the band
+      pdf.rect(0, MY + drawn, pageW, pageH - MY - drawn, 'F');         // below it
+      offset = next;
+      page += 1;
+      if (page > 40) {
+        // Unreachable for this document (~3,300px); if measurement ever goes wrong
+        // we truncate rather than spin — say so instead of silently shipping it.
+        console.warn('[agreement] pagination guard hit — PDF may be truncated');
+        break;
+      }
+    }
+
+    // "Page N of M" needs M, so it is a second pass once the count is known.
+    const total = pdf.getNumberOfPages();
+    for (let p = 1; p <= total; p += 1) {
+      pdf.setPage(p);
+      pdf.setFontSize(8);
+      pdf.setTextColor(148, 163, 184);
+      pdf.text(`Page ${p} of ${total}`, pageW / 2, pageH - MY / 2, { align: 'center' });
     }
     return pdf.output('blob');
   };
@@ -5752,6 +5928,40 @@ function EnrollmentPendingScreen({ request, finalizing, renewal, email, uid, onS
               : <>Thanks{firstName ? <span style={{ fontWeight: 600, color: C.text }}>, {firstName}</span> : ''} — we received your enrollment request. Your payment is now <span style={{ fontWeight: 600, color: C.text }}>pending manual review</span> by Coach Alex’s team. You’ll be let in automatically the moment it’s verified.</>}
           </p>
 
+          {/* Processing-hours note. Sits directly under the intro paragraph — the
+              paragraph confirms the submit landed, this answers "when does that
+              actually happen", which is the natural next beat after "let in
+              automatically the moment it's verified". Placed AFTER the
+              finalizing/renewal conditional so it shows for every variant except
+              the finalizing one, where access is already being unlocked and a
+              turnaround promise would be stale. Same constant the confirmation
+              email uses, so the two can never drift. */}
+          {!finalizing && (
+            <div className="mt-4 rounded-xl px-4 py-3" style={{
+              background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)',
+            }}>
+              <div className="flex items-center gap-2" style={{
+                fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase',
+                color: 'var(--status-warn-strong-fg)',
+              }}>
+                <Clock size={13} /> When you&rsquo;ll get access
+              </div>
+              {/* Strip the leading emoji: only two of the four lines carry one, so
+                  they render as a ragged list here — and the card header already
+                  has a Clock, making the line's own clock a second one. They stay
+                  in the constant because the email has no icon system and reads
+                  better with them. */}
+              <ul className="mt-2 flex flex-col gap-1.5">
+                {ENROLLMENT_PROCESSING_NOTE.map((line, i) => (
+                  <li key={i} className="flex gap-2" style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.55 }}>
+                    <span aria-hidden="true" style={{ color: 'var(--status-warn-strong-fg)' }}>&bull;</span>
+                    <span>{line.slice(Math.max(0, line.search(/[A-Za-z]/)))}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           {request && (
             <div className="mt-4 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
               {[['Package', request.plan_name || PLAN_LABELS[request.plan_key] || request.plan_key],
@@ -6536,6 +6746,7 @@ function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImport
     case 'enrollments': return <AdminEnrollments onCountChange={onEnrollCount} />;
     case 'studentimports': return <StudentImports onCountChange={onImportCount} />;
     case 'batches': return <AdminBatches />;
+    case 'staffroles': return <AdminStaffRoles />;
     case 'coa': return <CoaGenerator />;
     case 'course': return <Course />;
     case 'qbomastery': return <QBOMastery />;
@@ -6584,7 +6795,14 @@ const TabPanel = React.memo(function TabPanel({ tabId, active, goto, onAccessCou
 });
 
 export default function BookkeeperProToolkit() {
-  const { user, profile, loading, profileReady, recovery, signOut, refreshProfile } = useAuth();
+  const {
+    user, profile, loading, profileReady, recovery, signOut, refreshProfile,
+    // #45 staff authority. `can(key)` is the ONE question every admin surface asks;
+    // `staff` carries the role label and the Trainer's assigned course ids. Both are
+    // EMPTY until my_staff_context() answers, and `staffReady` says when that is —
+    // so a screen never flashes an admin control it is about to take away.
+    staff, staffReady, staffDegraded, can, isSuperAdmin,
+  } = useAuth();
   // Theme runs above the auth gate so pre-auth screens are themed too
   // (the data-theme attribute lives on <html>, not on this component's DOM).
   const { pref: themePref, cycleTheme } = useTheme(user?.id);
@@ -6604,14 +6822,53 @@ export default function BookkeeperProToolkit() {
   // wins over `profile.plan` — the dated subscription is the authoritative term.
   // The gate holds AuthSplash until enroll.ready and only 'pass' reaches the shell, so
   // enroll.sub is already loaded here — the sidebar never flashes the full nav.
+  // Plan entitlement, then staff reach layered on top.
+  //
+  // ★ staffEntitlement() is a UNION, not a replacement. A staff account is not a paid
+  //   account, so it must not be held on the paywall — but "not paywalled" must not
+  //   silently mean "gets the whole toolkit". It returns whatever the person's own plan
+  //   entitles them to PLUS the tabs their permissions actually require, so an Ops Admin
+  //   who also bought VIP keeps their VIP tabs and a Trainer gets the course catalogs and
+  //   nothing else. A Super Admin resolves to the base entitlement unchanged, which for
+  //   the admin branch is FULL — exactly the pre-#45 behaviour for is_admin accounts.
   const entitlement = useMemo(
-    () => (enroll.active ? planEntitlement(enroll.sub?.plan_key || profile?.plan || null) : FULL_ENTITLEMENT),
-    [enroll.active, enroll.sub?.plan_key, profile?.plan]
+    () => {
+      const base = enroll.active
+        ? planEntitlement(enroll.sub?.plan_key || profile?.plan || null)
+        : FULL_ENTITLEMENT;
+      return staffEntitlement(staff, base);
+    },
+    [enroll.active, enroll.sub?.plan_key, profile?.plan, staff]
   );
+  // ── Admin-tab authorization (#45) ────────────────────────────────────────────
+  // Admin tabs are NOT in DEFAULT_STAGES, so the plan entitlement has no opinion
+  // about them — this is the check that does. A tab id absent from
+  // ADMIN_TAB_PERMISSION falls through to `true`, which is correct for every
+  // ordinary tool: those are the plan's business, not the role's.
+  //
+  // ★ THE LEGACY BRANCH IS DELIBERATE AND IS THE SAFE DIRECTION. The client build
+  //   ships the moment it is pushed; a human runs the migration afterwards. In that
+  //   window my_staff_context() does not exist, every staff context is legitimately
+  //   empty, and a Super Admin would otherwise watch every admin screen vanish. So
+  //   when the lookup could not run at all we fall back to profile.is_admin — which
+  //   AFTER #45 means exactly "active Super Admin", so this fallback can only ever
+  //   grant Super-Admin-level UI and never Ops or Trainer reach.
+  //   This is a RENDER decision only. Every one of these screens re-asks the
+  //   database, and RLS plus api/_lib/staffAuth.js are the actual boundary — that
+  //   gate deliberately fails CLOSED, because it is protecting the service-role key.
+  const adminTabAllowed = useCallback((tabId) => {
+    const perm = ADMIN_TAB_PERMISSION[tabId];
+    if (!perm) return true;
+    if (staffDegraded) return !!profile?.is_admin;
+    if (!staffReady) return false;   // absent permission data means "no", not "yes"
+    return can(perm);
+  }, [staffReady, staffDegraded, profile?.is_admin, can]);
+
   // Billing surfaces (membership/upgrade/extend/renew + the menu's billing items) exist only
   // for non-admins under an enforced enrollment — admins have no subscription, and with the
   // flag off a submit would insert enrollment_requests rows nobody reviews.
-  const showBillingControls = !profile?.is_admin && REQUIRE_ENROLLMENT;
+  // Staff accounts are not paying members either, so they get no billing surfaces.
+  const showBillingControls = !profile?.is_admin && !staff.isStaff && REQUIRE_ENROLLMENT;
   // Community notification bell (mentions/replies + unread announcements). Same render gate
   // as the voice assistant: enrolled members + admins (RLS re-enforces server-side). The
   // hook lives HERE — bell state never threads through the memoized TabPanel tree; the
@@ -6907,14 +7164,28 @@ export default function BookkeeperProToolkit() {
   // Global label overrides: { item_key: custom_label } loaded from Supabase (every user reads
   // them, so the whole app shows the admin's labels). `draftLabels` holds an admin's in-progress
   // edits (local only) until "Done" upserts them. Effective label = draft ?? global ?? code default.
+  // ★ `isAdmin` here means SUPER ADMIN and nothing else. After #45 profiles.is_admin
+  //   is a trigger-maintained cache of "has an active super_admin membership", so this
+  //   is the right variable for the few things that really are super-admin-only
+  //   (global label editing, the diagnostic surfaces below). Anything a Trainer or an
+  //   Operations Admin should reach asks adminTabAllowed()/can() instead.
   const isAdmin = !!profile?.is_admin;
+  // Per-queue capability, so an Operations Admin gets the badges for the queues they
+  // can actually work and a Trainer gets none of them. Each is the same question the
+  // chokepoint asks about the matching tab, so the badge can never advertise a screen
+  // the viewer would be refused.
+  const canReviewAccess = adminTabAllowed('accessrequests');
+  const canReviewEnrollments = adminTabAllowed('enrollments');
+  const canRunImports = adminTabAllowed('studentimports');
+  // Not a tab, so it does not go through adminTabAllowed — same legacy rule though.
+  const canCustomizeSidebar = staffDegraded ? isAdmin : (staffReady && can('sidebar.customize'));
   // Pending-approval count for the admin sidebar badge (temporary approval workflow). Only
-  // admins can read other profiles (RLS), so this stays 0 / inert for everyone else. Stays 0
+  // reviewers can read other profiles (RLS), so this stays 0 / inert for everyone else. Stays 0
   // gracefully if the approval migration hasn't been run yet.
   const [pendingCount, setPendingCount] = useState(0);
   // useCallback: passed to the memoized Access Requests TabPanel (onAccessCount).
   const refreshPendingCount = useCallback(async () => {
-    if (!isAdmin) return;
+    if (!canReviewAccess) return;
     try {
       const { count, error } = await supabase
         .from('profiles')
@@ -6922,15 +7193,15 @@ export default function BookkeeperProToolkit() {
         .eq('approval_status', 'pending');
       if (!error) setPendingCount(count || 0);
     } catch { /* table/column not migrated — leave at 0 */ }
-  }, [isAdmin]);
-  useEffect(() => { refreshPendingCount(); /* eslint-disable-next-line */ }, [isAdmin]);
+  }, [canReviewAccess]);
+  useEffect(() => { refreshPendingCount(); /* eslint-disable-next-line */ }, [canReviewAccess]);
   // Pending-enrollment count for the admin sidebar badge (Enrollments tab — manual payment
   // review). Same shape as refreshPendingCount: admin-only, inert if the enrollment
   // migration (db/2026-07-04-enrollment.sql) hasn't been run yet.
   const [enrollPendingCount, setEnrollPendingCount] = useState(0);
   // useCallback: passed to the memoized Enrollments TabPanel (onEnrollCount).
   const refreshEnrollPendingCount = useCallback(async () => {
-    if (!isAdmin) return;
+    if (!canReviewEnrollments) return;
     try {
       const { count, error } = await supabase
         .from('enrollment_requests')
@@ -6938,14 +7209,14 @@ export default function BookkeeperProToolkit() {
         .eq('status', 'pending_review');
       if (!error) setEnrollPendingCount(count || 0);
     } catch { /* table not migrated — leave at 0 */ }
-  }, [isAdmin]);
-  useEffect(() => { refreshEnrollPendingCount(); /* eslint-disable-next-line */ }, [isAdmin]);
+  }, [canReviewEnrollments]);
+  useEffect(() => { refreshEnrollPendingCount(); /* eslint-disable-next-line */ }, [canReviewEnrollments]);
   // Active-import count for the admin sidebar badge (Student Imports tab — Thinkific
   // migration). Same shape: admin-only, inert if the #26 migration hasn't been run.
   const [importActiveCount, setImportActiveCount] = useState(0);
   // useCallback: passed to the memoized Student Imports TabPanel (onImportCount).
   const refreshImportCount = useCallback(async () => {
-    if (!isAdmin) return;
+    if (!canRunImports) return;
     try {
       const { count, error } = await supabase
         .from('student_import_jobs')
@@ -6953,14 +7224,31 @@ export default function BookkeeperProToolkit() {
         .in('status', ['draft', 'validating', 'dry_run', 'ready', 'processing', 'paused']);
       if (!error) setImportActiveCount(count || 0);
     } catch { /* table not migrated — leave at 0 */ }
-  }, [isAdmin]);
-  useEffect(() => { refreshImportCount(); /* eslint-disable-next-line */ }, [isAdmin]);
+  }, [canRunImports]);
+  useEffect(() => { refreshImportCount(); /* eslint-disable-next-line */ }, [canRunImports]);
   const [labelByKey, setLabelByKey] = useState({});
   const [draftLabels, setDraftLabels] = useState({});
   const [savingLabels, setSavingLabels] = useState(false);
   const [labelsErr, setLabelsErr] = useState('');
   const [labelsNotice, setLabelsNotice] = useState('');
   const effLabel = (key, fallback) => draftLabels[key] ?? labelByKey[key] ?? defaultLabelByKey[key] ?? fallback;
+
+  // ── The admin nav, defined ONCE (#45) ────────────────────────────────────────
+  // These were four hard-coded `{isAdmin && …}` anchors, repeated VERBATIM in the
+  // desktop sidebar and again in the mobile drawer — eight blocks to keep in step
+  // for four links, which is how a permission change drifts between the two rails.
+  // One list now, rendered twice, gated per-item by capability.
+  //
+  // Adding an admin screen means adding a row HERE plus TAB_ROUTES,
+  // NON_TOOL_TAB_IDS, TOOL_META and renderToolContent (see CLAUDE.md).
+  const adminNavItems = useMemo(() => ([
+    { id: 'accessrequests', label: 'Access Requests', Icon: ShieldCheck, count: pendingCount, tone: C.amber },
+    { id: 'enrollments', label: 'Enrollments', Icon: Receipt, count: enrollPendingCount, tone: C.amber },
+    { id: 'studentimports', label: 'Student Imports', Icon: UploadCloud, count: importActiveCount, tone: C.primary },
+    { id: 'batches', label: 'Batches', Icon: CalendarCheck, count: 0, tone: C.primary },
+    { id: 'staffroles', label: 'Team & Roles', Icon: Users, count: 0, tone: C.primary },
+  ].filter((item) => adminTabAllowed(item.id))),
+  [pendingCount, enrollPendingCount, importActiveCount, adminTabAllowed]);
 
   // Helper: serialize stages without icons (icons are components, not serializable)
   const stagesToStorable = (stgs) => stgs.map(s => ({
@@ -7607,82 +7895,35 @@ export default function BookkeeperProToolkit() {
             );
           })()}
 
-          {/* Access Requests — admin only (temporary approval workflow). Badge = pending count. */}
-          {isAdmin && (
+          {/* Admin nav (#45) — ONE capability-gated list, rendered here and again in
+              the mobile drawer below. An Operations Admin sees the student-operations
+              links; a Trainer sees none of them. See adminNavItems for the source. */}
+          {adminNavItems.map((item, i) => (
             <a
-              href={tabHref('accessrequests')}
-              onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('accessrequests'); } }}
-              className="mt-4 w-full px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5"
-              style={tab === 'accessrequests'
+              key={item.id}
+              href={tabHref(item.id)}
+              onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab(item.id); } }}
+              className={`${i === 0 ? 'mt-4' : 'mt-2'} w-full px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5`}
+              style={tab === item.id
                 ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)` }
                 : { background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
-              <ShieldCheck size={11} />
-              Access Requests
-              {pendingCount > 0 && (
+              <item.Icon size={11} />
+              {item.label}
+              {item.count > 0 && (
                 <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[9px] font-bold"
-                  style={{ background: tab === 'accessrequests' ? 'rgba(255,255,255,0.25)' : C.amber, color: 'white' }}>
-                  {pendingCount}
+                  style={{ background: tab === item.id ? 'rgba(255,255,255,0.25)' : item.tone, color: 'white' }}>
+                  {item.count}
                 </span>
               )}
             </a>
-          )}
+          ))}
 
-          {/* Enrollments — admin only (manual payment review). Badge = pending submissions. */}
-          {isAdmin && (
-            <a
-              href={tabHref('enrollments')}
-              onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('enrollments'); } }}
-              className="mt-2 w-full px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5"
-              style={tab === 'enrollments'
-                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)` }
-                : { background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
-              <Receipt size={11} />
-              Enrollments
-              {enrollPendingCount > 0 && (
-                <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[9px] font-bold"
-                  style={{ background: tab === 'enrollments' ? 'rgba(255,255,255,0.25)' : C.amber, color: 'white' }}>
-                  {enrollPendingCount}
-                </span>
-              )}
-            </a>
-          )}
-
-          {/* Student Imports — admin only (Thinkific migration). Badge = active import jobs. */}
-          {isAdmin && (
-            <a
-              href={tabHref('studentimports')}
-              onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('studentimports'); } }}
-              className="mt-2 w-full px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5"
-              style={tab === 'studentimports'
-                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)` }
-                : { background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
-              <UploadCloud size={11} />
-              Student Imports
-              {importActiveCount > 0 && (
-                <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[9px] font-bold"
-                  style={{ background: tab === 'studentimports' ? 'rgba(255,255,255,0.25)' : C.primary, color: 'white' }}>
-                  {importActiveCount}
-                </span>
-              )}
-            </a>
-          )}
-
-          {/* Batches — admin only (#32): VIP batches + their private communities. */}
-          {isAdmin && (
-            <a
-              href={tabHref('batches')}
-              onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('batches'); } }}
-              className="mt-2 w-full px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5"
-              style={tab === 'batches'
-                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)` }
-                : { background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
-              <CalendarCheck size={11} />
-              Batches
-            </a>
-          )}
-
-          {/* Customize sidebar — admin only. Renames persist globally (Supabase) on "Done". */}
-          {isAdmin && (
+          {/* Customize sidebar — renames persist GLOBALLY (Supabase) on "Done", so this is
+              gated on sidebar.customize, a key only super_admin holds today. #45 left
+              sidebar_settings_admin_write on is_admin() precisely because the two are
+              equivalent while that stays true — if the key is ever given to another role,
+              that policy has to move with it. */}
+          {canCustomizeSidebar && (
             <div className="mt-4">
               {!editMode ? (
                 <button onClick={enterCustomize}
@@ -7766,75 +8007,29 @@ export default function BookkeeperProToolkit() {
         {/* Rail nav — desktop only, flat icon list (every tool reachable in one click, with tooltips) */}
         {railCollapsed && (
           <nav className="hidden lg:flex flex-col flex-1 py-3 overflow-y-auto items-center gap-1">
-            {isAdmin && (
+            {/* Same adminNavItems list as the expanded sidebar — icon-only here.
+                Rendering both rails from one source is what stops the two drifting
+                apart when a permission changes (#45). */}
+            {adminNavItems.map((item) => (
               <a
-                href={tabHref('accessrequests')}
-                onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('accessrequests'); } }}
-                title={`Access Requests${pendingCount ? ` (${pendingCount} pending)` : ''}`}
-                aria-label="Access Requests"
+                key={`rail-admin-${item.id}`}
+                href={tabHref(item.id)}
+                onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab(item.id); } }}
+                title={`${item.label}${item.count ? ` (${item.count} pending)` : ''}`}
+                aria-label={item.label}
                 className="relative flex items-center justify-center rounded-xl transition mb-1"
-                style={tab === 'accessrequests'
+                style={tab === item.id
                   ? { width: 40, height: 40, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white' }
                   : { width: 40, height: 40, background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
-                <ShieldCheck size={18} />
-                {pendingCount > 0 && (
+                <item.Icon size={18} />
+                {item.count > 0 && (
                   <span className="absolute -top-1 -right-1 px-1 rounded-full text-[9px] font-bold flex items-center justify-center"
-                    style={{ minWidth: 16, height: 16, background: C.amber, color: 'white', border: `2px solid ${C.white}` }}>
-                    {pendingCount}
+                    style={{ minWidth: 16, height: 16, background: item.tone, color: 'white', border: `2px solid ${C.white}` }}>
+                    {item.count}
                   </span>
                 )}
               </a>
-            )}
-            {isAdmin && (
-              <a
-                href={tabHref('enrollments')}
-                onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('enrollments'); } }}
-                title={`Enrollments${enrollPendingCount ? ` (${enrollPendingCount} pending)` : ''}`}
-                aria-label="Enrollments"
-                className="relative flex items-center justify-center rounded-xl transition mb-1"
-                style={tab === 'enrollments'
-                  ? { width: 40, height: 40, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white' }
-                  : { width: 40, height: 40, background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
-                <Receipt size={18} />
-                {enrollPendingCount > 0 && (
-                  <span className="absolute -top-1 -right-1 px-1 rounded-full text-[9px] font-bold flex items-center justify-center"
-                    style={{ minWidth: 16, height: 16, background: C.amber, color: 'white', border: `2px solid ${C.white}` }}>
-                    {enrollPendingCount}
-                  </span>
-                )}
-              </a>
-            )}
-            {isAdmin && (
-              <a
-                href={tabHref('studentimports')}
-                onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('studentimports'); } }}
-                title={`Student Imports${importActiveCount ? ` (${importActiveCount} active)` : ''}`}
-                aria-label="Student Imports"
-                className="relative flex items-center justify-center rounded-xl transition mb-1"
-                style={tab === 'studentimports'
-                  ? { width: 40, height: 40, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white' }
-                  : { width: 40, height: 40, background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
-                <UploadCloud size={18} />
-                {importActiveCount > 0 && (
-                  <span className="absolute -top-1 -right-1 px-1 rounded-full text-[9px] font-bold flex items-center justify-center"
-                    style={{ minWidth: 16, height: 16, background: C.primary, color: 'white', border: `2px solid ${C.white}` }}>
-                    {importActiveCount}
-                  </span>
-                )}
-              </a>
-            )}
-            {isAdmin && (
-              <a
-                href={tabHref('batches')}
-                onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab('batches'); } }}
-                title="Batches" aria-label="Batches"
-                className="relative flex items-center justify-center rounded-xl transition mb-1"
-                style={tab === 'batches'
-                  ? { width: 40, height: 40, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white' }
-                  : { width: 40, height: 40, background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
-                <CalendarCheck size={18} />
-              </a>
-            )}
+            ))}
             {visibleStages.map((stage, sIdx) => {
               const hasNumber = !!stage.number;
               const containsActive = stage.tabs.some(t => t.id === tab);
@@ -8155,14 +8350,27 @@ export default function BookkeeperProToolkit() {
             <NotificationBell bell={communityBell} placement="topbar" />
           </div>
         </div>
-        {/* Entitlement chokepoint — the SINGLE enforcement point for plan-based access.
+        {/* Entitlement chokepoint — the SINGLE enforcement point for tab access.
             A disallowed tab reached ANY way (deep-link seed, popstate, stale nav:lastTab,
             programmatic goto, the mockinterview alias) renders RestrictedTab instead of the
-            tool, so the sidebar/tile hiding above is pure UX. Admins & full-access plans
-            allow every tab (entitlement.full → allowsTab always true). RestrictedTab is kept
-            OUT of TabPanel's memoized prop set, so hidden panels still skip root re-renders. */}
+            tool, so the sidebar/tile hiding above is pure UX. RestrictedTab is kept OUT of
+            TabPanel's memoized prop set, so hidden panels still skip root re-renders.
+
+            ★ #45 ADDED THE ROLE HALF, and it closed a real hole. This test used to be
+              `entitlement.allowsTab(tabId)` alone — but admin tabs are not in
+              DEFAULT_STAGES at all (they are hard-coded sidebar links), so allowsTab
+              never had an opinion about them. A silver_self_paced or vip student, both
+              `full: true`, who typed /admin/enrollments therefore MOUNTED AdminEnrollments
+              and ran its queries. RLS denied the rows and the screen's own guard card
+              eventually rendered, but the component and its network calls had already
+              happened. adminTabAllowed() now refuses first.
+
+            ★ Gated on staffReady: while my_staff_context() is in flight every context is
+              legitimately EMPTY, so admitting a tab then would be admitting it to nobody,
+              and refusing it would flash RestrictedTab at a real administrator. We hold
+              the panel until the answer lands. */}
         {Array.from(visitedTabs).map(tabId => (
-          entitlement.allowsTab(tabId) ? (
+          entitlement.allowsTab(tabId) && adminTabAllowed(tabId) ? (
             <TabPanel
               key={tabId}
               tabId={tabId}
@@ -8401,9 +8609,923 @@ function AdminUserCell({ name, email, meta, badges }) {
 // elapsed IN ITS OWN TIMEZONE is read-only; validateBatchEdit() mirrors
 // every server rule so the modal can refuse before a round trip.
 // ═══════════════════════════════════════════════════════════════════
+/**
+ * The Super Admin special extension (#47).
+ *
+ * ★ THIS IS NOT THE PAID EXTENSION FLOW. That one is a student-submitted
+ *   enrollment_requests row with a receipt, approved through
+ *   admin_finalize_enrollment. This is the discretionary one — a goodwill week
+ *   after an outage, a rescheduled coaching call — and it has no payment behind
+ *   it, which is exactly why it is Super-Admin-only and why the reason field is
+ *   mandatory: the reason is the only record of why the days were given.
+ *
+ * ★ The idempotency key is generated ONCE per open dialog, not per click. That is
+ *   the point: a double-click, a retried fetch or an impatient second press all
+ *   carry the same key, and admin_grant_special_extension returns the ORIGINAL
+ *   result instead of granting the days twice.
+ */
+function SpecialExtensionModal({ row, sub, onClose, onDone }) {
+  const acc = subAccess(sub);
+  const [mode, setMode] = useState('days');       // 'days' | 'until'
+  const [days, setDays] = useState(7);
+  const [untilDate, setUntilDate] = useState('');
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  // One key per dialog instance — see the note above.
+  const idemKey = useMemo(
+    () => (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `ext-${Date.now()}`),
+    [],
+  );
+
+  // Mirrors the RPC: an EXPIRED term extends from now, not from its old end date,
+  // or "14 days" on a term that lapsed 10 days ago would silently be 4.
+  const base = acc.ends && acc.ends.getTime() > Date.now() ? acc.ends : new Date();
+  const projected = mode === 'days'
+    ? (Number(days) > 0 ? new Date(base.getTime() + Number(days) * 86400000) : null)
+    : (untilDate ? new Date(`${untilDate}T23:59:59`) : null);
+
+  const movesForward = projected && acc.ends && projected.getTime() > acc.ends.getTime();
+  const daysOk = mode !== 'days' || (Number(days) >= 1 && Number(days) <= 365);
+  const ready = reason.trim().length > 0 && !!projected && movesForward && daysOk;
+
+  const submit = async () => {
+    setBusy(true); setErr('');
+    try {
+      const { data, error } = await supabase.rpc('admin_grant_special_extension', {
+        p_user_id: row.user_id,
+        p_mode: mode,
+        p_days: mode === 'days' ? Number(days) : null,
+        p_new_ends_at: mode === 'until' && projected ? projected.toISOString() : null,
+        p_reason: reason.trim(),
+        p_idempotency_key: idemKey,
+      });
+      if (error) throw error;
+      const out = data || {};
+      onDone(out.replayed
+        ? `${row.email} — that extension was already applied; nothing changed.`
+        : `${row.email} extended by ${out.days_granted} day${out.days_granted === 1 ? '' : 's'} — access until ${fmtEnrollDate(out.new_ends_at)}.`);
+    } catch (e) {
+      setErr(isMigrationMissing(e)
+        ? 'Special extensions need migration #47 — run db/2026-08-27-special-extension.sql in the Supabase SQL Editor. No changes were made.'
+        : appErrorMessage(e, 'That extension could not be applied.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <AccountModal icon={CalendarPlus} tone="primary" title="Grant a special extension"
+      subtitle={row.email} canClose={!busy} onClose={onClose}>
+      <div className="rounded-xl px-3.5 py-2.5" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+        {[
+          ['Plan', PLAN_LABELS[sub.plan_key] || sub.plan_key],
+          ['Current expiry', acc.ends ? fmtEnrollDate(acc.ends) : 'no expiry'],
+          ['Grace ends', acc.graceEnds ? fmtEnrollDate(acc.graceEnds) : '—'],
+          ['Status', acc.inGrace ? 'In grace' : acc.valid ? 'Active' : 'Ended'],
+        ].map(([k, v]) => (
+          <div key={k} className="flex items-center justify-between gap-3 py-1" style={{ fontSize: 12.5 }}>
+            <span style={{ color: C.textMute }}>{k}</span>
+            <span style={{ color: C.text, fontWeight: 600 }}>{v}</span>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-4 flex items-center gap-2">
+        {[['days', 'Add days'], ['until', 'Set a date']].map(([k, label]) => (
+          <button key={k} onClick={() => setMode(k)}
+            className="px-3 py-1.5 rounded-lg text-xs font-bold transition"
+            style={mode === k
+              ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white' }
+              : { background: 'var(--wash)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}` }}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {mode === 'days' ? (
+        <div className="mt-3">
+          <label className="block" style={{ fontSize: 12, fontWeight: 700, color: C.textSoft }}>Days to add (1–365)</label>
+          <input type="number" min={1} max={365} value={days}
+            onChange={e => setDays(e.target.value)} className="gh-input mt-1.5 w-full" />
+        </div>
+      ) : (
+        <div className="mt-3">
+          <label className="block" style={{ fontSize: 12, fontWeight: 700, color: C.textSoft }}>New expiry date</label>
+          <input type="date" value={untilDate} onChange={e => setUntilDate(e.target.value)}
+            className="gh-input mt-1.5 w-full" />
+        </div>
+      )}
+
+      {projected && (
+        <div className="mt-3 flex items-start gap-2.5 px-3.5 py-2.5 rounded-xl"
+          style={{ background: 'var(--primary-tint)', border: '1px solid var(--primary-selection)' }}>
+          <CalendarClock size={15} style={{ color: C.primary, marginTop: 1, flexShrink: 0 }} />
+          <div style={{ fontSize: 12.5, color: C.text, lineHeight: 1.5 }}>
+            {acc.ends && <>Was <b>{fmtEnrollDate(acc.ends)}</b> → </>}
+            becomes <b>{fmtEnrollDate(projected)}</b>{' '}
+            <span style={{ color: C.textMute }}>(+ 3-day grace)</span>
+            {!acc.valid && <><br /><span style={{ color: 'var(--status-warn-fg)' }}>
+              This term had already ended, so the new date is measured from today.
+            </span></>}
+          </div>
+        </div>
+      )}
+
+      {projected && !movesForward && (
+        <div role="alert" className="mt-3 px-3.5 py-2.5 rounded-xl" style={{
+          background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)',
+          color: 'var(--status-danger-fg)', fontSize: 12.5,
+        }}>
+          That is not later than the current expiry. An extension may never shorten access.
+        </div>
+      )}
+
+      <label className="block mt-4" style={{ fontSize: 12, fontWeight: 700, color: C.textSoft }}>
+        Reason <span style={{ color: C.red }}>*</span>
+      </label>
+      <textarea value={reason} onChange={e => setReason(e.target.value)} rows={3}
+        placeholder="Why are these days being given? This is the only record — the student never sees it."
+        className="gh-input mt-1.5 w-full" style={{ resize: 'vertical' }} />
+
+      {err && (
+        <div role="alert" className="mt-3 px-3.5 py-2.5 rounded-xl" style={{
+          background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)',
+          color: 'var(--status-danger-fg)', fontSize: 12.5, lineHeight: 1.5,
+        }}>{err}</div>
+      )}
+
+      <div className="mt-5 flex items-center justify-end gap-2.5">
+        <button onClick={onClose} disabled={busy}
+          className="px-4 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-60"
+          style={{ background: 'var(--wash)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}` }}>
+          Cancel
+        </button>
+        <button onClick={submit} disabled={busy || !ready}
+          className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
+          style={ADMIN_BTN_OK}>
+          {busy ? <Loader2 size={15} className="animate-spin" /> : <CalendarPlus size={15} />} Grant extension
+        </button>
+      </div>
+    </AccountModal>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TEAM & ROLES (#45) — the staff directory. Gated on staff.manage.
+// ═══════════════════════════════════════════════════════════════════
+// EVERY write goes through /api/admin/staff, which verifies the caller's JWT and
+// independently confirms staff.manage BEFORE constructing a service-role client,
+// then calls the admin_* RPCs with the CALLER's token — so staff_role_events
+// records a real actor. Nothing here writes a staff table directly; those tables
+// carry no client write policy at all, which is what makes the audit row
+// unbypassable rather than merely customary.
+//
+// ★ The last-Super-Admin rule is enforced THREE times: here (to disable the
+//   control and say why), inside admin_set_staff_status /
+//   admin_upsert_staff_membership, and again as a staff_memberships BEFORE
+//   trigger so a direct SQL UPDATE — or deleting the Auth user, which cascades —
+//   is caught too. This copy is the courtesy. The trigger is the boundary.
+const STAFF_STATUS_TONE = {
+  active: 'ok',
+  invited: 'info',
+  suspended: 'warn',
+  revoked: 'danger',
+};
+
+// Human copy for a staff_role_events.action. The ledger is append-only, so this
+// is the only place these verbs are rendered.
+const STAFF_EVENT_VERB = {
+  bootstrap: 'migrated in',
+  invite: 'invited',
+  assign: 'assigned',
+  role_change: 'role changed',
+  suspend: 'suspended',
+  reactivate: 'reactivated',
+  revoke: 'revoked',
+};
+
+/**
+ * Invite a new person, or promote an existing account.
+ *
+ * ★ The endpoint decides which of those two it is, not this form. inviteUserByEmail
+ *   FAILS on an address that already belongs to a confirmed user — which is the
+ *   common case here, since staff are usually existing students or the founder's
+ *   second account — so api/admin/staff.js looks the address up first and promotes
+ *   rather than erroring. The copy below says so, because "invited" and "promoted"
+ *   land the person in different states (invited vs active).
+ */
+function StaffInviteDrawer({ busy, onClose, onSubmit }) {
+  const [email, setEmail] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [roleKey, setRoleKey] = useState('trainer');
+  const [title, setTitle] = useState('');
+  const [localErr, setLocalErr] = useState('');
+
+  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+  const role = staffRole(roleKey);
+
+  const submit = () => {
+    if (!emailOk) { setLocalErr('Enter a valid email address.'); return; }
+    setLocalErr('');
+    onSubmit({
+      email: email.trim().toLowerCase(),
+      full_name: fullName.trim() || null,
+      role_key: roleKey,
+      display_title: title.trim() || null,
+    });
+  };
+
+  return (
+    <SidePanel title="Invite staff" subtitle="They keep any student history they already have"
+      icon={Users} onClose={onClose} canClose={!busy} maxW="sm:max-w-lg"
+      footer={(
+        <div className="flex items-center justify-end gap-2.5">
+          <button onClick={onClose} disabled={busy}
+            className="px-4 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-60"
+            style={{ background: 'var(--wash)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}` }}>
+            Cancel
+          </button>
+          <button onClick={submit} disabled={busy || !emailOk}
+            className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
+            style={ADMIN_BTN_OK}>
+            {busy ? <Loader2 size={15} className="animate-spin" /> : <Mail size={15} />}
+            Send invitation
+          </button>
+        </div>
+      )}>
+      {localErr && (
+        <div role="alert" className="mb-4 px-3.5 py-2.5 rounded-xl" style={{
+          background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)',
+          color: 'var(--status-danger-fg)', fontSize: 12.5,
+        }}>{localErr}</div>
+      )}
+
+      <label className="block" style={{ fontSize: 12, fontWeight: 700, color: C.textSoft }}>Email address</label>
+      <input type="email" value={email} onChange={e => setEmail(e.target.value)} autoFocus
+        placeholder="name@example.com" className="gh-input mt-1.5 w-full" />
+      <p className="mt-1.5" style={{ fontSize: 11.5, color: C.textMute, lineHeight: 1.5 }}>
+        If this address already has an account it is <strong>promoted</strong> immediately and no email is
+        sent — their existing membership, progress and community history are untouched. A new address gets
+        an invitation and shows as <strong>Invited</strong> until they accept it.
+      </p>
+
+      <label className="block mt-4" style={{ fontSize: 12, fontWeight: 700, color: C.textSoft }}>Full name <span style={{ fontWeight: 500, color: C.textMute }}>(optional)</span></label>
+      <input value={fullName} onChange={e => setFullName(e.target.value)}
+        placeholder="Jane Dela Cruz" className="gh-input mt-1.5 w-full" />
+
+      <label className="block mt-4" style={{ fontSize: 12, fontWeight: 700, color: C.textSoft }}>Role</label>
+      <select value={roleKey} onChange={e => setRoleKey(e.target.value)} className="gh-input mt-1.5 w-full">
+        {STAFF_ROLES.map(r => <option key={r.key} value={r.key}>{r.label}</option>)}
+      </select>
+      {role && (
+        <div className="mt-2 px-3.5 py-2.5 rounded-xl" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+          <p style={{ fontSize: 12, color: C.textSoft, lineHeight: 1.5 }}>{role.description}</p>
+          <ul className="mt-2 space-y-1">
+            {STAFF_PERMISSIONS.filter(p => permissionsForRole(roleKey).includes(p.key)).map(p => (
+              <li key={p.key} className="flex items-start gap-1.5" style={{ fontSize: 11.5, color: C.textSoft }}>
+                <Check size={12} style={{ color: C.green, marginTop: 2, flexShrink: 0 }} />
+                <span>{p.label}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <label className="block mt-4" style={{ fontSize: 12, fontWeight: 700, color: C.textSoft }}>Job title <span style={{ fontWeight: 500, color: C.textMute }}>(optional)</span></label>
+      <input value={title} onChange={e => setTitle(e.target.value)}
+        placeholder="Lead Trainer" className="gh-input mt-1.5 w-full" />
+    </SidePanel>
+  );
+}
+
+/** One staff member: their role, their status actions, and their history. */
+function StaffDetailDrawer({ row, events, busy, isSelf, activeSuperAdmins, onClose, onRequest }) {
+  const [nextRole, setNextRole] = useState(row.role_key);
+  const role = staffRole(row.role_key);
+
+  // Client mirror of the SQL guard, used only to disable a control and explain why.
+  const roleGuard = lastSuperAdminGuard(
+    { roleKey: row.role_key, status: row.status },
+    { roleKey: nextRole },
+    activeSuperAdmins,
+  );
+  const suspendGuard = lastSuperAdminGuard(
+    { roleKey: row.role_key, status: row.status }, { status: 'suspended' }, activeSuperAdmins,
+  );
+  const revokeGuard = lastSuperAdminGuard(
+    { roleKey: row.role_key, status: row.status }, { status: 'revoked' }, activeSuperAdmins,
+  );
+
+  return (
+    <SidePanel title={row.full_name || row.email || 'Staff member'} subtitle={row.email}
+      icon={ShieldCheck} onClose={onClose} canClose={!busy} maxW="sm:max-w-lg">
+      <div className="flex items-center gap-3">
+        <MemberAvatar name={row.full_name || row.email} src={resolveAvatarUrl(row.avatar_url)} size={44} />
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span style={{ fontWeight: 700, fontSize: 14, color: C.text }}>{role?.label || row.role_key}</span>
+            <StaffStatusPill status={row.status} />
+          </div>
+          {row.display_title && (
+            <div style={{ fontSize: 12, color: C.textSoft }}>{row.display_title}</div>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-4 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+        {[
+          ['Invited', row.invited_at ? fmtEnrollDate(row.invited_at) : '—'],
+          ['Activated', row.activated_at ? fmtEnrollDate(row.activated_at) : '—'],
+          ['Invited by', row.invited_by_email || '—'],
+          ...(row.suspended_at ? [['Suspended', fmtEnrollDate(row.suspended_at)]] : []),
+          ...(row.revoked_at ? [['Revoked', fmtEnrollDate(row.revoked_at)]] : []),
+          ...(row.suspension_reason ? [['Reason', row.suspension_reason]] : []),
+        ].map(([k, v]) => (
+          <div key={k} className="flex items-start justify-between gap-3 py-1" style={{ fontSize: 12.5 }}>
+            <span style={{ color: C.textMute }}>{k}</span>
+            <span className="text-right" style={{ color: C.text, fontWeight: 600 }}>{v}</span>
+          </div>
+        ))}
+      </div>
+
+      {isSelf && (
+        <div className="mt-4 px-3.5 py-2.5 rounded-xl" style={{
+          background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)',
+          color: 'var(--status-info-fg)', fontSize: 12.5, lineHeight: 1.5,
+        }}>
+          This is your own account. Changing your role here changes what you can do immediately — including,
+          possibly, your ability to open this screen.
+        </div>
+      )}
+
+      {/* Role */}
+      <div className="mt-5">
+        <AdminFilterCaption>Role</AdminFilterCaption>
+        <select value={nextRole} onChange={e => setNextRole(e.target.value)} className="gh-input mt-1.5 w-full">
+          {STAFF_ROLES.map(r => <option key={r.key} value={r.key}>{r.label}</option>)}
+        </select>
+        {!roleGuard.ok && (
+          <p className="mt-1.5" style={{ fontSize: 11.5, color: 'var(--status-warn-fg)', lineHeight: 1.5 }}>
+            {roleGuard.message}
+          </p>
+        )}
+        <button
+          onClick={() => onRequest('role', { nextRole })}
+          disabled={busy || nextRole === row.role_key || !roleGuard.ok}
+          className="mt-2 px-4 py-2 rounded-xl text-sm font-bold text-white transition disabled:opacity-60"
+          style={ADMIN_BTN_OK}>
+          Change role
+        </button>
+      </div>
+
+      {/* Status */}
+      <div className="mt-5">
+        <AdminFilterCaption>Access</AdminFilterCaption>
+        <div className="mt-1.5 flex items-center gap-2 flex-wrap">
+          {row.status !== 'active' && (
+            <button onClick={() => onRequest('reactivate')} disabled={busy}
+              className="px-3.5 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
+              style={ADMIN_BTN_OK}>
+              <UserCheck size={15} /> Reactivate
+            </button>
+          )}
+          {row.status === 'active' && (
+            <button onClick={() => onRequest('suspend')} disabled={busy || !suspendGuard.ok}
+              title={suspendGuard.ok ? undefined : suspendGuard.message}
+              className="px-3.5 py-2 rounded-xl text-sm font-semibold flex items-center gap-2 transition disabled:opacity-60"
+              style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
+              <Pause size={15} /> Suspend
+            </button>
+          )}
+          {row.status !== 'revoked' && (
+            <button onClick={() => onRequest('revoke')} disabled={busy || !revokeGuard.ok}
+              title={revokeGuard.ok ? undefined : revokeGuard.message}
+              className="px-3.5 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
+              style={ADMIN_BTN_DANGER}>
+              <UserX size={15} /> Revoke
+            </button>
+          )}
+        </div>
+        <p className="mt-2" style={{ fontSize: 11.5, color: C.textMute, lineHeight: 1.5 }}>
+          Suspending or revoking takes effect on their <strong>next request</strong>, not their next sign-in —
+          authority is read from the database every time, never decoded from their token.
+        </p>
+      </div>
+
+      {/* Audit history */}
+      <div className="mt-6">
+        <AdminFilterCaption>History</AdminFilterCaption>
+        {events === null ? (
+          <div className="mt-2" style={{ fontSize: 12.5, color: C.textMute }}>Loading history…</div>
+        ) : events.length === 0 ? (
+          <div className="mt-2" style={{ fontSize: 12.5, color: C.textMute }}>No recorded changes.</div>
+        ) : (
+          <ul className="mt-2 space-y-2">
+            {events.map(ev => (
+              <li key={ev.id} className="px-3.5 py-2.5 rounded-xl"
+                style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <span style={{ fontSize: 12.5, fontWeight: 700, color: C.text }}>
+                    {STAFF_EVENT_VERB[ev.action] || ev.action}
+                    {ev.to_role_key && ev.from_role_key && ev.to_role_key !== ev.from_role_key
+                      && ` · ${staffRole(ev.from_role_key)?.label || ev.from_role_key} → ${staffRole(ev.to_role_key)?.label || ev.to_role_key}`}
+                  </span>
+                  <span style={{ fontSize: 11, color: C.textMute }}>{fmtEnrollDate(ev.created_at)}</span>
+                </div>
+                <div className="mt-0.5" style={{ fontSize: 11.5, color: C.textSoft }}>
+                  by {ev.actor_email || 'system'}{ev.source !== 'admin_ui' ? ` · ${ev.source}` : ''}
+                </div>
+                {ev.reason && (
+                  <div className="mt-1" style={{ fontSize: 11.5, color: C.textMute, fontStyle: 'italic' }}>“{ev.reason}”</div>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </SidePanel>
+  );
+}
+
+/**
+ * The confirm step. A reason is REQUIRED for anything that takes access away —
+ * enforced here so the control explains itself, and again in
+ * admin_set_staff_status(), which raises STAFF_ROLE_INVALID without one.
+ */
+function StaffConfirmModal({ confirm, busy, activeSuperAdmins, onCancel, onRun }) {
+  const [reason, setReason] = useState('');
+  const { kind, row, nextRole } = confirm;
+
+  const isDemotion = kind === 'role' && row.role_key === 'super_admin' && nextRole !== 'super_admin';
+  const needsReason = kind === 'suspend' || kind === 'revoke' || isDemotion;
+  const reasonOk = !needsReason || reason.trim().length > 0;
+
+  const COPY = {
+    role: {
+      title: 'Change this role?',
+      tone: 'primary',
+      body: `${row.full_name || row.email} becomes ${staffRole(nextRole)?.label || nextRole}. Their capabilities change on their next request.`,
+      cta: 'Change role',
+      style: ADMIN_BTN_OK,
+    },
+    suspend: {
+      title: 'Suspend this staff member?',
+      tone: 'danger',
+      body: 'They keep their account and any student membership, but lose every staff capability immediately. This is reversible.',
+      cta: 'Suspend access',
+      style: ADMIN_BTN_DANGER,
+    },
+    reactivate: {
+      title: 'Reactivate this staff member?',
+      tone: 'ok',
+      body: 'Their role and its capabilities are restored immediately.',
+      cta: 'Reactivate',
+      style: ADMIN_BTN_OK,
+    },
+    revoke: {
+      title: 'Revoke staff access?',
+      tone: 'danger',
+      body: 'They lose every staff capability. The membership row and its full history are kept, so this is auditable and reversible — it is not a deletion.',
+      cta: 'Revoke access',
+      style: ADMIN_BTN_DANGER,
+    },
+  }[kind];
+
+  const guard = lastSuperAdminGuard(
+    { roleKey: row.role_key, status: row.status },
+    kind === 'role' ? { roleKey: nextRole } : { status: kind === 'reactivate' ? 'active' : kind === 'suspend' ? 'suspended' : 'revoked' },
+    activeSuperAdmins,
+  );
+
+  const run = () => {
+    const payload = kind === 'role'
+      ? { action: 'assign-role', user_id: row.user_id, role_key: nextRole, reason: reason.trim() || null, status: row.status === 'invited' ? 'invited' : 'active' }
+      : {
+        action: 'set-status',
+        user_id: row.user_id,
+        status: kind === 'reactivate' ? 'active' : kind === 'suspend' ? 'suspended' : 'revoked',
+        reason: reason.trim() || null,
+      };
+    const msg = kind === 'role'
+      ? `${row.email} is now ${staffRole(nextRole)?.label || nextRole}.`
+      : kind === 'reactivate' ? `${row.email} is active again.`
+        : kind === 'suspend' ? `${row.email} is suspended.`
+          : `${row.email}'s staff access is revoked.`;
+    onRun(payload, msg);
+  };
+
+  return (
+    <AccountModal icon={kind === 'reactivate' ? UserCheck : AlertTriangle} tone={COPY.tone}
+      title={COPY.title} subtitle={row.email} canClose={!busy} onClose={onCancel}>
+      <p style={{ fontSize: 13, color: C.text, lineHeight: 1.55 }}>{COPY.body}</p>
+
+      {!guard.ok && (
+        <div role="alert" className="mt-3 px-3.5 py-2.5 rounded-xl" style={{
+          background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)',
+          color: 'var(--status-danger-fg)', fontSize: 12.5, lineHeight: 1.5,
+        }}>{guard.message}</div>
+      )}
+
+      <label className="block mt-4" style={{ fontSize: 12, fontWeight: 700, color: C.textSoft }}>
+        Reason {needsReason ? <span style={{ color: C.red }}>*</span> : <span style={{ fontWeight: 500, color: C.textMute }}>(optional)</span>}
+      </label>
+      <textarea value={reason} onChange={e => setReason(e.target.value)} rows={3}
+        placeholder={needsReason ? 'Recorded in the audit trail — say why.' : 'Recorded in the audit trail.'}
+        className="gh-input mt-1.5 w-full" style={{ resize: 'vertical' }} />
+
+      <div className="mt-5 flex items-center justify-end gap-2.5">
+        <button onClick={onCancel} disabled={busy}
+          className="px-4 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-60"
+          style={{ background: 'var(--wash)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}` }}>
+          Cancel
+        </button>
+        <button onClick={run} disabled={busy || !reasonOk || !guard.ok}
+          className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition disabled:opacity-60"
+          style={COPY.style}>
+          {busy ? <Loader2 size={15} className="animate-spin" /> : <Check size={15} />} {COPY.cta}
+        </button>
+      </div>
+    </AccountModal>
+  );
+}
+
+function StaffStatusPill({ status }) {
+  const tone = STAFF_STATUS_TONE[status] || 'neutral';
+  return (
+    <span className="px-2 py-0.5 rounded-full" style={{
+      fontSize: 10.5, fontWeight: 700, letterSpacing: '0.04em',
+      background: `var(--status-${tone}-bg)`,
+      border: `1px solid var(--status-${tone}-bd)`,
+      color: `var(--status-${tone}-fg)`,
+    }}>
+      {staffStatusLabel(status)}
+    </span>
+  );
+}
+
+/**
+ * The role → capability reference (#45).
+ *
+ * Extracted so it can render on its own when the role model is not installed:
+ * it is built from src/lib/staffRoles.js, so it still describes what you are
+ * about to install even when every server call on this screen would fail.
+ * The SERVER's matrix wins whenever it is present — an operator may have
+ * granted a capability in SQL that this file does not know about.
+ */
+function RoleCapabilityPreview({ roles }) {
+  return (
+    <div className="mt-8">
+      <AdminFilterCaption>What each role can do</AdminFilterCaption>
+      <div className="mt-2 grid gap-3 md:grid-cols-3">
+        {roles.map(role => (
+          <div key={role.key} className="glass-card p-4">
+            <div className="flex items-center gap-2">
+              <span style={{ fontWeight: 800, fontSize: 14, color: C.text }}>{role.label}</span>
+              {role.isProtected && (
+                <span className="px-1.5 py-0.5 rounded-full" style={{
+                  fontSize: 9.5, fontWeight: 700, background: 'var(--status-info-bg)',
+                  border: '1px solid var(--status-info-bd)', color: 'var(--status-info-fg)',
+                }}>Protected</span>
+              )}
+            </div>
+            <p className="mt-1" style={{ fontSize: 12, color: C.textSoft, lineHeight: 1.5 }}>{role.description}</p>
+            <ul className="mt-2.5 space-y-1">
+              {(role.permissions.length
+                ? role.permissions.map(p => ({ key: p.permission_key, label: p.permission_label }))
+                // Falls back to the client mirror while the matrix RPC is still
+                // loading — the same list, from src/lib/staffRoles.js. The SERVER's
+                // answer wins whenever it is present, because an operator may have
+                // granted a capability in SQL that this file does not know about.
+                : STAFF_PERMISSIONS.filter(p => permissionsForRole(role.key).includes(p.key))
+                  .map(p => ({ key: p.key, label: p.label }))
+              ).map(p => (
+                <li key={p.key} className="flex items-start gap-1.5" style={{ fontSize: 11.5, color: C.textSoft }}>
+                  <Check size={12} style={{ color: C.green, marginTop: 2, flexShrink: 0 }} />
+                  <span>{p.label}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AdminStaffRoles() {
+  const { user, profile, can, staffReady, staffDegraded, staffMissing, refreshStaff } = useAuth();
+  // Same legacy rule as the root: a pre-#45 database has no my_staff_context(), so
+  // every context is legitimately empty and profile.is_admin — which after #45
+  // means "active Super Admin" — is the only thing left to ask.
+  const allowed = staffDegraded ? !!profile?.is_admin : (staffReady && can('staff.manage'));
+
+  const [rows, setRows] = useState([]);
+  const [matrix, setMatrix] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
+  const [needsSetup, setNeedsSetup] = useState(false);
+
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [roleFilter, setRoleFilter] = useState('all');
+
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [detailFor, setDetailFor] = useState(null);   // the membership row in the drawer
+  const [events, setEvents] = useState(null);         // audit rows for detailFor
+  const [confirm, setConfirm] = useState(null);       // { kind, row, nextRole? }
+
+  // One fetch helper. app_error codes ride in `code` and are re-attached as
+  // `hint`, because appErrorMessage() reads hint — the house wire contract.
+  const callStaff = async (payload) => {
+    const { data: s } = await supabase.auth.getSession();
+    const token = s?.session?.access_token;
+    const res = await fetch('/api/admin/staff', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(payload),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const e = new Error(json.error || 'Staff operation failed.');
+      e.hint = json.code || null;
+      e.status = res.status;
+      throw e;
+    }
+    return json;
+  };
+
+  const load = async (silent = false) => {
+    if (!silent) setLoading(true);
+    setErr('');
+    try {
+      const out = await callStaff({ action: 'list' });
+      setRows(Array.isArray(out.staff) ? out.staff : []);
+      setMatrix(Array.isArray(out.matrix) ? out.matrix : []);
+      setNeedsSetup(false);
+    } catch (e) {
+      // Branch on what the SERVER said. api/admin/staff.js now maps PostgREST's
+      // PGRST202 (function does not exist) to MIGRATION_MISSING, so "not installed"
+      // is distinguishable from "the call failed" — staffDegraded also covers a
+      // timeout, and sending someone to the SQL editor because their connection
+      // blipped is a worse failure than the one being handled.
+      if (isMigrationMissing(e) || staffMissing) setNeedsSetup(true);
+      else setErr(appErrorMessage(e, 'Could not load the staff directory.'));
+      setRows([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+  // ★ When the role model is absent we already know every call will fail, so we
+  //   render the setup card WITHOUT calling the API. Firing it anyway is what made
+  //   a missing migration show up as a 500 in the console — twice, because
+  //   StrictMode double-invokes effects in dev.
+  useEffect(() => {
+    if (!allowed) return;
+    if (staffMissing) { setNeedsSetup(true); setLoading(false); return; }
+    load();
+    /* eslint-disable-next-line */
+  }, [allowed, staffMissing]);
+
+  const activeSuperAdmins = rows.filter(r => r.role_key === 'super_admin' && r.status === 'active').length;
+
+  const statusCounts = STAFF_STATUSES.reduce((acc, s) => {
+    acc[s] = rows.filter(r => r.status === s).length;
+    return acc;
+  }, {});
+
+  const visible = rows.filter(r =>
+    (statusFilter === 'all' || r.status === statusFilter)
+    && (roleFilter === 'all' || r.role_key === roleFilter));
+
+  // The role → capability preview. Grouped from staff_role_permission_matrix(),
+  // which describes the product's role DESIGN, not who holds what — so it is not
+  // sensitive and every signed-in user may read it.
+  const matrixByRole = STAFF_ROLES.map(role => ({
+    ...role,
+    permissions: matrix.filter(m => m.role_key === role.key),
+  }));
+
+  const openDetail = async (row) => {
+    setDetailFor(row);
+    setEvents(null);
+    try {
+      const out = await callStaff({ action: 'audit', user_id: row.user_id, limit: 50 });
+      setEvents(Array.isArray(out.events) ? out.events : []);
+    } catch {
+      setEvents([]);   // the drawer still works without its history
+    }
+  };
+
+  const runAction = async (payload, successMsg) => {
+    setBusy(true); setErr(''); setNotice('');
+    try {
+      await callStaff(payload);
+      setNotice(successMsg);
+      setConfirm(null);
+      setDetailFor(null);
+      await load(true);
+      // If the actor changed their OWN role, their capabilities just moved.
+      if (payload.user_id === user?.id) await refreshStaff?.();
+    } catch (e) {
+      setErr(appErrorMessage(e, 'That change could not be applied.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!allowed) {
+    return (
+      <div>
+        <SectionHead eyebrow="Admin" title="Team & Roles"
+          desc="Invite staff and manage what they can do." />
+        <AdminNotice kind="warn">
+          You do not have permission to manage staff. Only a Super Admin can open this screen.
+        </AdminNotice>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <SectionHead eyebrow="Admin" title="Team & Roles"
+        desc="Invite staff, assign roles, and read the audit trail of every change. Roles are enforced by the database — hiding a control here never grants or removes authority on its own." />
+
+      {needsSetup && (
+        <>
+          <AdminNotice kind="warn">
+            The staff role model isn’t in this database yet — run{' '}
+            <strong>db/2026-08-25-staff-authorization.sql</strong>, then{' '}
+            <strong>db/2026-08-26-course-staff-assignments.sql</strong> and{' '}
+            <strong>db/2026-08-27-special-extension.sql</strong>, in the Supabase SQL Editor. Sign out and
+            back in afterwards. Until then every administrator keeps working through the
+            legacy <code>profiles.is_admin</code> flag, and nothing on this screen can do anything —
+            so its controls are hidden rather than left to fail.
+          </AdminNotice>
+          {/* The role reference below is pure client data (src/lib/staffRoles.js), so it
+              still tells you what you are about to install. */}
+          <RoleCapabilityPreview roles={matrixByRole} />
+        </>
+      )}
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
+
+      {!needsSetup && activeSuperAdmins === 1 && !loading && (
+        <AdminNotice kind="warn">
+          There is exactly <strong>one active Super Admin</strong>. They cannot be demoted, suspended or revoked —
+          and their Auth account cannot be deleted — until a second one exists. Promote a replacement before
+          making any change to that account.
+        </AdminNotice>
+      )}
+
+      {/* Toolbar + directory. Hidden entirely when the role model is absent —
+          every control here calls an RPC that does not exist yet. */}
+      {!needsSetup && (
+      <div className="mt-5 flex flex-col gap-3">
+        <div className="flex items-start gap-4 flex-wrap">
+          <div>
+            <AdminFilterCaption>Status</AdminFilterCaption>
+            <div className="mt-1.5 flex items-center gap-2 flex-wrap">
+              <AdminFilterChip active={statusFilter === 'all'} label="All" count={rows.length}
+                onClick={() => setStatusFilter('all')} />
+              {STAFF_STATUSES.map(s => (
+                <AdminFilterChip key={s} active={statusFilter === s} label={staffStatusLabel(s)}
+                  count={statusCounts[s]} onClick={() => setStatusFilter(s)} />
+              ))}
+            </div>
+          </div>
+          <div>
+            <AdminFilterCaption>Role</AdminFilterCaption>
+            <div className="mt-1.5 flex items-center gap-2 flex-wrap">
+              <AdminFilterChip active={roleFilter === 'all'} label="All roles"
+                onClick={() => setRoleFilter('all')} />
+              {STAFF_ROLES.map(r => (
+                <AdminFilterChip key={r.key} active={roleFilter === r.key} label={r.label}
+                  count={rows.filter(x => x.role_key === r.key).length}
+                  onClick={() => setRoleFilter(r.key)} />
+              ))}
+            </div>
+          </div>
+          <div className="ml-auto flex items-center gap-2 self-end">
+            <button onClick={() => load()} disabled={loading}
+              className="px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
+              style={{ background: 'var(--wash)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}` }}>
+              <RefreshCw size={13} className={loading ? 'animate-spin' : ''} /> Refresh
+            </button>
+            <button onClick={() => setInviteOpen(true)}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 transition"
+              style={ADMIN_BTN_OK}>
+              <Users size={15} /> Invite staff
+            </button>
+          </div>
+        </div>
+      </div>
+
+      )}
+
+      {/* Directory */}
+      {!needsSetup && (
+      <div className="mt-5 space-y-3">
+        {loading ? <AdminListSkeleton rows={3} /> : visible.length === 0 ? (
+          <div className="glass-card p-8 text-center" style={{ color: C.textMute, fontSize: 13.5 }}>
+            {rows.length === 0
+              ? 'No staff yet. Invite someone to get started.'
+              : 'No staff match these filters.'}
+          </div>
+        ) : visible.map(row => {
+          const role = staffRole(row.role_key);
+          const isMe = row.user_id === user?.id;
+          return (
+            <div key={row.user_id} className="glass-card p-4 flex items-center gap-3">
+              <MemberAvatar name={row.full_name || row.email} src={resolveAvatarUrl(row.avatar_url)} size={40} />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="truncate" style={{ fontWeight: 700, fontSize: 14, color: C.text }}>
+                    {row.full_name || row.email?.split('@')[0] || 'Unknown'}
+                  </span>
+                  <StaffStatusPill status={row.status} />
+                  {isMe && (
+                    <span className="px-2 py-0.5 rounded-full" style={{
+                      fontSize: 10.5, fontWeight: 700, background: 'var(--primary-tint)',
+                      border: '1px solid var(--primary-selection)', color: C.primary,
+                    }}>You</span>
+                  )}
+                </div>
+                <div className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{row.email}</div>
+                <div className="mt-1 flex items-center gap-3 flex-wrap" style={{ fontSize: 11, color: C.textMute }}>
+                  <span style={{ fontWeight: 700, color: C.textSoft }}>{role?.label || row.role_key}</span>
+                  {row.display_title && <span>· {row.display_title}</span>}
+                  {row.invited_by_email && <span>· invited by {row.invited_by_email}</span>}
+                  {row.updated_at && <span>· changed {fmtEnrollDate(row.updated_at)}</span>}
+                </div>
+              </div>
+              <button onClick={() => openDetail(row)}
+                className="px-3 py-2 rounded-xl text-xs font-semibold transition flex-shrink-0"
+                style={{ background: 'var(--wash)', color: C.text, border: `1px solid ${GLASS.borderSoft}` }}>
+                Manage
+              </button>
+            </div>
+          );
+        })}
+      </div>
+      )}
+
+      {/* Role → capability preview. This is the product's role DESIGN, and it is the
+          one place a Super Admin can see what a role actually confers before they
+          hand it to somebody. */}
+      {!needsSetup && <RoleCapabilityPreview roles={matrixByRole} />}
+
+      {inviteOpen && (
+        <StaffInviteDrawer
+          busy={busy}
+          onClose={() => setInviteOpen(false)}
+          onSubmit={async (payload) => {
+            setBusy(true); setErr(''); setNotice('');
+            try {
+              const out = await callStaff({ action: 'invite', ...payload });
+              setNotice(out.invited
+                ? `Invitation sent to ${payload.email}. They appear as “Invited” until they accept.`
+                : `${payload.email} already had an account — promoted to ${staffRole(payload.role_key)?.label || payload.role_key}.`);
+              setInviteOpen(false);
+              await load(true);
+            } catch (e) {
+              setErr(appErrorMessage(e, 'The invitation could not be sent.'));
+            } finally {
+              setBusy(false);
+            }
+          }} />
+      )}
+
+      {detailFor && (
+        <StaffDetailDrawer
+          row={detailFor}
+          events={events}
+          busy={busy}
+          isSelf={detailFor.user_id === user?.id}
+          activeSuperAdmins={activeSuperAdmins}
+          onClose={() => { setDetailFor(null); setEvents(null); }}
+          onRequest={(kind, extra) => setConfirm({ kind, row: detailFor, ...extra })} />
+      )}
+
+      {confirm && (
+        <StaffConfirmModal
+          confirm={confirm}
+          busy={busy}
+          activeSuperAdmins={activeSuperAdmins}
+          onCancel={() => setConfirm(null)}
+          onRun={runAction} />
+      )}
+    </div>
+  );
+}
+
 function AdminBatches() {
-  const { profile } = useAuth();
-  const isAdmin = !!profile?.is_admin;
+  const { profile, can, staffReady, staffDegraded } = useAuth();
+  // #45: cohort work is `batches.manage`, which an Operations Admin holds. The
+  // is_admin fallback covers only a pre-#45 database, where the staff context
+  // cannot be read at all and is_admin is still the whole authorization model.
+  const isAdmin = staffDegraded ? !!profile?.is_admin : (staffReady && can('batches.manage'));
 
   const [rows, setRows] = useState([]);            // admin_batch_overview() rows
   const [queue, setQueue] = useState([]);          // [{ sub, profile, segment, planName }]
@@ -9078,8 +10200,14 @@ function AdminBatches() {
 }
 
 function AccessRequests({ onCountChange }) {
-  const { user, profile } = useAuth();
-  const isAdmin = !!profile?.is_admin;
+  const { user, profile, can, staffReady } = useAuth();
+  // #45: reviewing signups is its own capability, so an Operations Admin can work
+  // this queue without holding any other admin power. `staffReady` gates the first
+  // load — rendering before the context settles would show an empty queue and look
+  // like "no pending signups" rather than "not loaded yet".
+  // The `profile.is_admin` fallback is for a pre-#45 database, where my_staff_context()
+  // does not exist and every staff context is legitimately empty.
+  const isAdmin = can('access_requests.review') || !!profile?.is_admin;
 
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -9097,20 +10225,51 @@ function AccessRequests({ onCountChange }) {
       // Two-tier fetch: the actionable pending queue is never capped away, while
       // decided accounts are limited to the newest 400 — an unbounded select would
       // hit PostgREST's max_rows=1000 and silently hide older pending signups.
-      const COLS = 'id,email,full_name,avatar_url,approval_status,rejection_reason,approved_at,rejected_at,created_at';
+      // #45 reads this queue through admin_access_request_queue(), not a direct
+      // profiles select. profiles_admin_select alone left an Operations Admin able
+      // to DECIDE on a signup they could not DISCOVER; the SECURITY DEFINER reader
+      // keeps the permission test in one place and returns zero rows — rather than
+      // an error — to a caller without it.
+      //
+      // Two calls, preserving the two-tier guarantee the direct query had: the
+      // actionable pending queue is never capped away, while decided accounts are
+      // limited. An unbounded single select would hit PostgREST's max_rows and
+      // silently hide older pending signups.
       const [pendRes, restRes] = await Promise.all([
-        supabase.from('profiles').select(COLS)
-          .eq('approval_status', 'pending').order('created_at', { ascending: false }).limit(500),
-        supabase.from('profiles').select(COLS)
-          .neq('approval_status', 'pending').order('created_at', { ascending: false }).limit(400),
+        supabase.rpc('admin_access_request_queue', { p_status: 'pending', p_limit: 500 }),
+        supabase.rpc('admin_access_request_queue', { p_status: null, p_limit: 900 }),
       ]);
-      const error = pendRes.error || restRes.error;
-      if (error) {
-        if (isApprovalNotConfiguredErr(error)) setNotConfigured(true);
-        else setErr(error.message || 'Could not load users.');
+      const rpcErr = pendRes.error || restRes.error;
+
+      if (rpcErr && isMigrationMissing(rpcErr)) {
+        // Pre-#45 database: the RPC does not exist yet. Fall back to the direct
+        // select, which still works there because profiles_admin_update and
+        // profiles_admin_select are both still in place. This branch dies with #45.
+        const COLS = 'id,email,full_name,avatar_url,approval_status,rejection_reason,approved_at,rejected_at,created_at';
+        const [p2, r2] = await Promise.all([
+          supabase.from('profiles').select(COLS)
+            .eq('approval_status', 'pending').order('created_at', { ascending: false }).limit(500),
+          supabase.from('profiles').select(COLS)
+            .neq('approval_status', 'pending').order('created_at', { ascending: false }).limit(400),
+        ]);
+        const legacyErr = p2.error || r2.error;
+        if (legacyErr) {
+          if (isApprovalNotConfiguredErr(legacyErr)) setNotConfigured(true);
+          else setErr(legacyErr.message || 'Could not load users.');
+          setRows([]);
+        } else {
+          setRows([...(p2.data || []), ...(r2.data || [])]
+            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
+        }
+      } else if (rpcErr) {
+        setErr(appErrorMessage(rpcErr, 'Could not load users.'));
         setRows([]);
       } else {
-        setRows([...(pendRes.data || []), ...(restRes.data || [])]
+        const pending = pendRes.data || [];
+        const decided = (restRes.data || [])
+          .filter(r => (r.approval_status || 'pending') !== 'pending')
+          .slice(0, 400);
+        setRows([...pending, ...decided]
           .sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
       }
     } catch (e) {
@@ -9120,7 +10279,10 @@ function AccessRequests({ onCountChange }) {
       setLoading(false);
     }
   };
-  useEffect(() => { if (isAdmin) load(); /* eslint-disable-next-line */ }, [isAdmin]);
+  // Wait for the staff context before the first load: firing while it is still
+  // empty would query as a non-reviewer, get zero rows, and render "no pending
+  // signups" — a wrong answer that looks exactly like a right one.
+  useEffect(() => { if (staffReady && isAdmin) load(); /* eslint-disable-next-line */ }, [staffReady, isAdmin]);
 
   // Best-effort email (never blocks the approval). Returns { ok } / { skipped } / { ok:false }.
   const notifyAccess = async (payload) => {
@@ -9151,21 +10313,41 @@ function AccessRequests({ onCountChange }) {
       : { approval_status: 'rejected', rejected_at: nowIso, rejected_by: user?.id || null,
           rejection_reason: reason, approved_at: null, approved_by: null, updated_at: nowIso };
     try {
-      // .select() so we can CONFIRM a row actually changed. PostgREST returns NO error when an
-      // UPDATE matches 0 rows (e.g. the admin RLS policy isn't applied or you aren't really
-      // is_admin) — without this check the panel would show a false "Approved" while the DB row
-      // stays 'pending', trapping the user on the Pending screen forever. See ADMIN_APPROVAL_SETUP.md.
-      const { data, error } = await supabase
-        .from('profiles').update(patch).eq('id', row.id)
-        .select('id, approval_status');
-      if (error) throw error;
-      const updated = Array.isArray(data) ? data[0] : null;
-      console.debug('[access] setStatus', { adminId: user?.id, targetId: row.id, status, rowsAffected: data?.length ?? 0, newStatus: updated?.approval_status });
-      if (!updated) {
-        throw new Error(
-          'No row was updated — your admin permissions may not be applied. Re-run db/2026-06-29-user-approval.sql in Supabase (it creates the profiles_admin_update policy), confirm you are flagged is_admin, then sign out and back in.'
-        );
+      // ★ #45 made this an RPC, and it had to. That migration drops
+      //   profiles_admin_update and revokes UPDATE on profiles from `authenticated`,
+      //   so the direct write below returns ZERO ROWS AND NO ERROR — PostgREST's
+      //   answer to a policy-filtered UPDATE. The screen would report success while
+      //   the row stayed 'pending', trapping the student on the Pending screen.
+      //   admin_review_access_request() does the write inside a SECURITY DEFINER
+      //   body gated on access_requests.review, and raises instead of no-oping.
+      let updated = null;
+      const rpc = await supabase.rpc('admin_review_access_request', {
+        p_user_id: row.id,
+        p_decision: status,
+        p_reason: status === 'rejected' ? reason : null,
+      });
+
+      if (rpc.error && isMigrationMissing(rpc.error)) {
+        // Pre-#45 database. The old policy is still in place, so the direct write
+        // still works — and still needs its own zero-rows check, which is the bug
+        // this whole branch exists to survive. This branch dies with #45.
+        const { data, error } = await supabase
+          .from('profiles').update(patch).eq('id', row.id)
+          .select('id, approval_status');
+        if (error) throw error;
+        updated = Array.isArray(data) ? data[0] : null;
+        if (!updated) {
+          throw new Error(
+            'No row was updated — your admin permissions may not be applied. Re-run db/2026-06-29-user-approval.sql in Supabase (it creates the profiles_admin_update policy), confirm you are flagged is_admin, then sign out and back in.'
+          );
+        }
+      } else if (rpc.error) {
+        throw rpc.error;
+      } else {
+        const out = rpc.data || {};
+        updated = { id: row.id, approval_status: out.approval_status || status };
       }
+      console.debug('[access] setStatus', { adminId: user?.id, targetId: row.id, status, newStatus: updated?.approval_status });
       // Drive local state from the DB's actual value, not an optimistic guess.
       setRows(prev => prev.map(r => r.id === row.id
         ? { ...r, approval_status: updated.approval_status, rejection_reason: status === 'rejected' ? reason : null }
@@ -9174,8 +10356,10 @@ function AccessRequests({ onCountChange }) {
       const mail = await notifyAccess({ email: row.email, fullName: row.full_name, status, reason });
       setNotice(`${status === 'approved' ? 'Approved' : 'Rejected'} ${row.email}${emailSuffix(mail)}.`);
     } catch (e) {
-      console.error('[access] setStatus failed', { targetId: row.id, status, code: e?.code, message: e?.message });
-      setErr(e?.message || `Could not ${status === 'approved' ? 'approve' : 'reject'} this user.`);
+      console.error('[access] setStatus failed', { targetId: row.id, status, code: appErrorCode(e) || e?.code });
+      // appErrorMessage renders the copy for a stable app_error code (FORBIDDEN,
+      // STAFF_NOT_FOUND, …) and falls through to the raw message otherwise.
+      setErr(appErrorMessage(e, `Could not ${status === 'approved' ? 'approve' : 'reject'} this user.`));
     } finally {
       setBusyId(null);
     }
@@ -9352,8 +10536,17 @@ function AccessRequests({ onCountChange }) {
 // See db/2026-07-04-enrollment.sql + ENROLLMENT_SETUP.md.
 
 function AdminEnrollments({ onCountChange }) {
-  const { user, profile } = useAuth();
-  const isAdmin = !!profile?.is_admin;
+  const { user, profile, can, staffReady, staffDegraded } = useAuth();
+  // #45: reviewing payment proofs is `enrollments.review`. Section 15 re-gated the
+  // whole server side of this screen — admin_finalize_enrollment, the receipt
+  // storage policy, the enrollment/subscription policies — onto the same key, so a
+  // client check on is_admin would now be STRICTER than the database and would hide
+  // a screen an Operations Admin is fully authorized to use.
+  const isAdmin = staffDegraded ? !!profile?.is_admin : (staffReady && can('enrollments.review'));
+  // #47: a discretionary extension is Super-Admin-only. Reviewing a payment and
+  // granting free time are different acts, and the matrix keeps them apart.
+  const canGrantExtension = staffDegraded ? !!profile?.is_admin : (staffReady && can('students.extend_access'));
+  const [extendFor, setExtendFor] = useState(null);   // { row, sub } → SpecialExtensionModal
 
   const [rows, setRows] = useState([]);
   const [profilesById, setProfilesById] = useState({});
@@ -10262,6 +11455,18 @@ function AdminEnrollments({ onCountChange }) {
                           <CalendarClock size={11} /> {a.inGrace ? `grace: ${a.graceDaysLeft}d left` : a.valid ? `${a.daysLeft}d left` : `ended ${daysPast}d ago`}
                         </span>
                       )}
+                      {/* #47: the discretionary extension. Super-Admin-only, because it
+                          creates paid access with no payment behind it — an Operations
+                          Admin extends the normal way, by approving a request with a
+                          receipt. A legacy no-expiry term has nothing to extend, and the
+                          RPC refuses it, so the control is not offered. */}
+                      {canGrantExtension && !a.legacy && (
+                        <button onClick={() => setExtendFor({ row: r, sub: s })}
+                          className="ml-auto inline-flex items-center gap-1 px-2 py-0.5 rounded-lg font-bold transition"
+                          style={{ fontSize: 10.5, background: 'var(--primary-tint)', border: '1px solid var(--primary-selection)', color: C.primary }}>
+                          <CalendarPlus size={11} /> Grant extension
+                        </button>
+                      )}
                     </div>
                   );
                 })()}
@@ -10367,6 +11572,16 @@ function AdminEnrollments({ onCountChange }) {
 
       {/* Approve confirmation modal — shared AccountModal shell (dialog a11y, focus trap,
           Escape/backdrop gated on busyId, dark-mode surface). */}
+      {/* #47: the discretionary extension. Reloads the list on success so the
+          membership strip shows the new expiry immediately. */}
+      {extendFor && (
+        <SpecialExtensionModal
+          row={extendFor.row}
+          sub={extendFor.sub}
+          onClose={() => setExtendFor(null)}
+          onDone={(msg) => { setExtendFor(null); setNotice(msg); load(true); }} />
+      )}
+
       {approveFor && (
         <AccountModal icon={UserCheck} tone="ok" subtitle={approveFor.email}
           title={kindOf(approveFor) === 'extension' ? 'Approve this extension?' : kindOf(approveFor) === 'upgrade' ? 'Approve this upgrade?' : 'Approve this enrollment?'}
@@ -10685,8 +11900,11 @@ function autoMapHeaders(headers) {
 }
 
 function StudentImports({ onCountChange }) {
-  const { profile } = useAuth();
-  const isAdmin = !!profile?.is_admin;
+  const { profile, can, staffReady, staffDegraded } = useAuth();
+  // #45: the migration wizard is `students.import`. api/admin/student-imports.js
+  // already gates on exactly this key, so before this change the screen and its
+  // own endpoint disagreed about who could use it.
+  const isAdmin = staffDegraded ? !!profile?.is_admin : (staffReady && can('students.import'));
 
   const [step, setStep] = useState('upload');            // upload | map | plans | preview | results
   const [err, setErr] = useState('');
@@ -12243,6 +13461,21 @@ function Course() {
 // link or upload videos. All writes are also enforced server-side by RLS.
 
 // Parse a pasted URL into a known provider + an embeddable URL.
+//
+// ★ AUTHORING: feature guides only since #44. A course LESSON can no longer be given a
+//   pasted link at all — see src/lib/courseVideo.js and
+//   db/2026-08-24-course-video-upload-only.sql. It survives as an authoring path only for
+//   MockInterviewSimulator's `feature_guides` row, whose video is a public explainer rather
+//   than paid content, so an external link there is deliberate.
+// ★ PLAYBACK: renderVideo still calls this from ONE clearly-marked TEMPORARY block, so the
+//   YouTube lessons already sold keep playing while they are re-uploaded. That block names
+//   its own removal criterion. Do not add a second lesson caller.
+//
+// ★ Note what it does with input it does not recognise: it returns provider 'mp4' and the
+//   string VERBATIM as embedUrl. There is no scheme allowlist and no URL parsing. That is
+//   survivable for a guide (one admin-curated row, public by design) and was not survivable
+//   for lessons, where the value reached <video src> on a page members paid for. Do not
+//   reintroduce it as a lesson code path.
 function parseVideoUrl(url) {
   if (!url) return { provider: null, embedUrl: null };
   const u = String(url).trim();
@@ -12318,38 +13551,711 @@ const COURSE_COMPLETION_SELECT = 'user_id,course_id,completed_at';
 const FEATURE_GUIDE_SELECT = 'feature_key,title,description,video_url,video_path,video_provider,external_url,is_active,updated_by,created_at,updated_at';
 
 // PAID lesson videos live in a PRIVATE bucket (course-videos) and are served via short-lived
-// signed URLs gated by is_enrolled() RLS. Course covers + feature-guide videos stay in the
-// PUBLIC course-media bucket. See db/2026-07-08-course-videos-private.sql.
-const LESSON_VIDEO_BUCKET = 'course-videos';
+// signed URLs gated by RLS. Course covers + feature-guide videos stay in the PUBLIC course-media
+// bucket. The bucket name, size cap, format and every other rule now live in ./lib/courseVideo.
+// See db/2026-08-24-course-video-upload-only.sql (#44).
 
-// Renders an uploaded lesson video from the private bucket via a signed URL. Falls back to the
-// course-media public URL for legacy videos uploaded before the bucket split, so nothing breaks
-// during the transition. Re-signs when the lesson changes.
-function SignedLessonVideo({ lesson }) {
+/** Sign one lesson object, returning { url, signedAt } or throwing a described error. */
+async function signLessonVideo(path) {
+  const { data, error } = await supabase.storage
+    .from(LESSON_VIDEO_BUCKET).createSignedUrl(path, LESSON_VIDEO_SIGN_TTL_SECONDS);
+  if (error || !data?.signedUrl) throw (error || new Error('No signed URL was returned.'));
+  return { url: data.signedUrl, signedAt: Date.now() };
+}
+
+/**
+ * Renders an uploaded lesson video from the PRIVATE bucket via a signed URL.
+ *
+ * ★ THERE IS NO PUBLIC FALLBACK, and its removal is the point of this component.
+ *   The previous version did `if (!data?.signedUrl) getPublicUrl('course-media', path)`,
+ *   which was taken for ANY failure — an RLS denial and an expired session included, not
+ *   only a genuine pre-#15 legacy object. And getPublicUrl() is a pure string builder that
+ *   never round-trips, so it always returned a truthy URL: the `failed` branch was dead
+ *   code, the real signing error was never logged, and the learner got a <video> pointed
+ *   at a 400 with no onError. Every distinct failure — denied, missing, expired, wrong
+ *   codec, offline — looked identical: a black box. That is why "the video doesn't play"
+ *   was never diagnosable.
+ *
+ * ★ A signing failure and a DECODE failure are now different states with different
+ *   actions. Re-signing cannot fix a codec, so it is not attempted.
+ *
+ * ★ One URL per mounted lesson, held with its mint time in a ref and refreshed BEFORE it
+ *   expires — not minted per render, and not left to rot for the hour a learner might
+ *   spend on one lesson. Same idiom as the community feed's signedExpRef.
+ */
+function SignedLessonVideo({ lesson, isAdmin = false }) {
+  const [state, setState] = useState('signing');      // signing | ready | error
   const [src, setSrc] = useState(null);
-  const [failed, setFailed] = useState(false);
+  const [problem, setProblem] = useState(null);       // { reason, message, fatal }
+  const signedAtRef = useRef(0);
+  // Bumped whenever the lesson or its path changes. A signing request that resolves after
+  // that compares its captured value and drops itself — see sign().
+  const genRef = useRef(0);
+  const attemptRef = useRef(0);
+  const resumeAtRef = useRef(0);
+  const resumePlayingRef = useRef(false);
+  const videoRef = useRef(null);
+  const path = lesson?.storage_path;
+
+  /**
+   * Mint a signed URL.
+   *
+   * ★ `quiet` exists because the pre-expiry refresh must not tear the player down. Dropping
+   *   to the 'signing' state unmounts the <video> and replaces it with a "Loading video…"
+   *   placeholder — roughly 55 minutes into a lesson, for a refresh whose entire purpose is
+   *   to keep playback going. Quiet mode swaps the src in place; the media element still
+   *   re-buffers (there is no way to hand a <video> a new URL without it), but currentTime
+   *   and the play/pause state are restored, so the learner sees a brief stall rather than
+   *   losing their place. A quiet failure also leaves the current URL alone: it may still
+   *   have minutes left on it, and taking playback down to report a refresh problem would
+   *   cause the very outage the refresh is preventing.
+   */
+  const sign = useCallback(async (label, { quiet = false } = {}) => {
+    // ★ Captured BEFORE the await and re-checked after it. The effect's own `cancelled`
+    //   flag was only ever read synchronously before this call, so it could never suppress
+    //   a late result: a request in flight when the learner moved to another lesson — or a
+    //   quiet pre-expiry refresh racing a storage_path change — would still call setSrc and
+    //   leave the player pointed at the PREVIOUS object's URL.
+    const gen = genRef.current;
+    if (!quiet) { setState('signing'); setProblem(null); }
+    try {
+      const { url, signedAt } = await signLessonVideo(path);
+      if (gen !== genRef.current) return false;      // a different lesson took over
+      signedAtRef.current = signedAt;
+      setSrc(url); setState('ready');
+      return true;
+    } catch (e) {
+      if (quiet) {
+        console.warn('[course-videos] refresh failed; keeping the current URL', e?.status || e?.name || 'error');
+        return false;
+      }
+      if (gen !== genRef.current) return false;      // stale failure, not this lesson's
+      // Never log or render the signed URL itself — it is a working grant of the file.
+      console.error(`[course-videos] ${label} failed`, e?.status || e?.name || 'error');
+      setProblem({
+        reason: 'sign',
+        fatal: false,
+        message: isAdmin
+          ? 'This lesson’s video file could not be authorized. Confirm the file is still in the '
+            + 'course-videos bucket, and that the course is published for the plans that need it.'
+          : 'This video isn’t loading right now.',
+      });
+      setState('error');
+      return false;
+    }
+  }, [path, isAdmin]);
+
   useEffect(() => {
-    let cancelled = false;
-    setSrc(null); setFailed(false);
-    (async () => {
-      const path = lesson?.storage_path;
-      if (!path) return;
-      const { data, error } = await supabase.storage.from(LESSON_VIDEO_BUCKET).createSignedUrl(path, 3600);
-      if (cancelled) return;
-      if (data?.signedUrl) { setSrc(data.signedUrl); return; }
-      // Legacy object still in the public bucket (pre-split upload) — fall back to its public URL.
-      const pub = supabase.storage.from('course-media').getPublicUrl(path)?.data?.publicUrl;
-      if (pub) setSrc(pub); else { setFailed(true); if (error) console.error('[course-videos] sign failed', error); }
-    })();
-    return () => { cancelled = true; };
-  }, [lesson?.id, lesson?.storage_path]);
-  if (failed) {
-    return <div className="rounded-xl border-2 border-dashed border-slate-200 p-10 text-center text-slate-400">This video isn’t available. Refresh, or contact support if it persists.</div>;
+    genRef.current += 1;                              // invalidate anything already in flight
+    attemptRef.current = 0; resumeAtRef.current = 0; resumePlayingRef.current = false;
+    setSrc(null); setProblem(null); setState('signing');
+    if (!path) { setState('error'); setProblem({ reason: 'missing', fatal: true, message: 'No video file is attached to this lesson yet.' }); return undefined; }
+    sign('sign');
+    return undefined;
+  }, [lesson?.id, path, sign]);
+
+  // Refresh before expiry rather than after a failure: a learner who sits on one lesson
+  // longer than the TTL used to lose playback with no recovery path at all.
+  useEffect(() => {
+    if (state !== 'ready') return undefined;
+    const ttlMs = LESSON_VIDEO_SIGN_TTL_SECONDS * 1000;
+    const id = setInterval(() => {
+      const d = shouldResignPlayback({ signedAt: signedAtRef.current, ttlMs, now: Date.now() });
+      if (!d.resign) return;
+      resumeAtRef.current = videoRef.current?.currentTime || 0;
+      resumePlayingRef.current = !!videoRef.current && !videoRef.current.paused;
+      attemptRef.current = 0;                       // a scheduled refresh is not a retry
+      sign('refresh', { quiet: true });             // never drop the player to a placeholder
+    }, 60_000);
+    return () => clearInterval(id);
+  }, [state, sign]);
+
+  async function handleMediaError() {
+    const code = videoRef.current?.error?.code ?? null;
+    const decision = shouldResignPlayback({ code, attempt: attemptRef.current });
+    if (decision.resign) {
+      attemptRef.current += 1;
+      resumeAtRef.current = videoRef.current?.currentTime || 0;
+      resumePlayingRef.current = !!videoRef.current && !videoRef.current.paused;
+      await sign('re-sign');
+      return;
+    }
+    setProblem({
+      reason: decision.reason,
+      fatal: decision.reason === 'decode',
+      message: decision.reason === 'decode'
+        ? (isAdmin
+          ? 'The browser can’t decode this file. Re-export it as MP4 (H.264 video, AAC audio) and upload it again.'
+          : 'This video can’t be played in this browser. Please let support know.')
+        : 'This video stopped loading.',
+    });
+    setState('error');
   }
-  if (!src) {
-    return <div className="rounded-xl bg-black/80 flex items-center justify-center text-white/70 text-sm" style={{ height: 240 }}>Loading video…</div>;
+
+  if (state === 'error') {
+    return (
+      <div className="rounded-xl border-2 border-dashed p-8 text-center"
+        style={{ borderColor: 'var(--status-danger-bd)', background: 'var(--status-danger-bg)' }}>
+        <AlertCircle size={24} className="mx-auto mb-2" style={{ color: 'var(--status-danger-fg)' }} />
+        <div className="text-sm" style={{ color: 'var(--status-danger-fg)' }}>{problem?.message}</div>
+        {!problem?.fatal && (
+          <button type="button" className="mt-3 px-3 py-1.5 rounded-lg text-xs font-semibold border"
+            style={{ borderColor: 'var(--status-danger-bd)', color: 'var(--status-danger-fg)' }}
+            onClick={() => { attemptRef.current = 0; sign('retry'); }}>
+            Try again
+          </button>
+        )}
+      </div>
+    );
   }
-  return <video key={lesson.id} controls className="w-full rounded-xl bg-black" style={{ maxHeight: 460 }} src={src} />;
+  if (state === 'signing' || !src) {
+    return (
+      <div className="rounded-xl bg-black/80 flex items-center justify-center gap-2 text-white/70 text-sm" style={{ height: 240 }}>
+        <Loader2 size={16} className="animate-spin" /> Loading video…
+      </div>
+    );
+  }
+  return (
+    <video
+      ref={videoRef}
+      key={`${lesson.id}:${path}`}
+      src={src}
+      controls
+      // preload="metadata": a course page must not pull whole videos before anyone presses play.
+      preload="metadata"
+      // playsInline keeps iOS Safari from hijacking playback into fullscreen.
+      playsInline
+      // Deterrence only, and documented as such: a signed URL is still copyable until it
+      // expires, and no browser app can stop a screen recording. Not a security boundary.
+      controlsList="nodownload"
+      onLoadedMetadata={() => {
+        // Restore the learner's place after a re-sign or a quiet pre-expiry refresh, and
+        // resume playback if it was running — otherwise a URL refresh silently pauses the
+        // lesson at a point the learner did not choose.
+        if (resumeAtRef.current > 0 && videoRef.current) {
+          try { videoRef.current.currentTime = resumeAtRef.current; } catch (_) { /* seek unsupported */ }
+          resumeAtRef.current = 0;
+        }
+        if (resumePlayingRef.current && videoRef.current) {
+          resumePlayingRef.current = false;
+          videoRef.current.play?.().catch(() => { /* autoplay policy — leave it paused */ });
+        }
+      }}
+      onError={handleMediaError}
+      className="w-full rounded-xl bg-black"
+      style={{ maxHeight: 460 }}
+    />
+  );
+}
+
+/**
+ * The resumable (TUS) upload endpoint.
+ *
+ * Supabase documents the DIRECT storage hostname — <ref>.storage.supabase.co — rather than
+ * routing resumable traffic through the API gateway. Uploading a multi-hundred-megabyte
+ * lesson through a serverless function would be both slow and, on Vercel, impossible
+ * (body-size limits), so the browser talks to Storage directly and RLS stays the boundary.
+ */
+function resumableUploadEndpoint() {
+  const base = (import.meta.env.VITE_SUPABASE_URL || '').replace(/\/+$/, '');
+  const m = /^https:\/\/([a-z0-9-]+)\.supabase\.co$/i.exec(base);
+  return m
+    ? `https://${m[1]}.storage.supabase.co/storage/v1/upload/resumable`
+    : `${base}/storage/v1/upload/resumable`;      // self-hosted / custom domain
+}
+
+/**
+ * Load metadata for a URL in a detached <video> and resolve its duration, or reject.
+ *
+ * This is what separates "Storage accepted the bytes" from "a browser can play this".
+ * Used twice: once on the local blob before a single byte is sent, and once on the SIGNED
+ * URL afterwards — so "Ready" means the object exists, is authorized, AND decodes.
+ * Always revokes nothing itself: the caller owns the URL it passed in.
+ */
+function probeVideoMetadata(url, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    const el = document.createElement('video');
+    el.preload = 'metadata';
+    el.muted = true;
+    let done = false;
+    const finish = (fn, arg) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      el.removeAttribute('src');
+      try { el.load(); } catch (_) { /* detached element */ }
+      fn(arg);
+    };
+    const timer = setTimeout(() => finish(reject, new Error('timeout')), timeoutMs);
+    el.onloadedmetadata = () => finish(resolve, Number.isFinite(el.duration) ? el.duration : null);
+    el.onerror = () => finish(reject, el.error || new Error('decode'));
+    el.src = url;
+  });
+}
+
+/**
+ * The lesson-video uploader. Module scope, NOT declared inside CourseProgram: a component
+ * defined in the parent gets a fresh type identity on every render, so React would unmount
+ * and remount it on each keystroke elsewhere in the drawer — losing an upload in progress.
+ * (The same reason renderLessonEditor is a method rather than a component.)
+ *
+ * Props:
+ *   courseId        the course the object is filed under
+ *   value           { storage_path, video_provider, video_url } from the lesson draft
+ *   savedPath       the path currently stored on the row — never deleted by this component
+ *   onChange        (patch) => void, applied to the draft
+ *   onStateChange   (uploadState) => void, so the drawer can gate Save and Close
+ *   disabled        the drawer is busy saving
+ */
+function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChange, disabled }) {
+  const hasSaved = isLessonVideoPath(value?.storage_path);
+  const [state, setState] = useState(hasSaved ? UPLOAD_STATES.SAVED_AND_PLAYABLE : UPLOAD_STATES.EMPTY);
+  const [progress, setProgress] = useState({ loaded: 0, total: 0 });
+  const [fileInfo, setFileInfo] = useState(null);        // { name, size }
+  const [duration, setDuration] = useState(null);
+  const [errMsg, setErrMsg] = useState('');
+  const [live, setLive] = useState('');                  // throttled aria-live text
+
+  const uploadRef = useRef(null);                        // the tus.Upload instance
+  const fileRef = useRef(null);                          // the File, for pause/resume
+  const pendingPathRef = useRef(null);                   // uploaded but NOT yet saved
+  const blobUrlRef = useRef(null);
+  const inputRef = useRef(null);
+  const liveStepRef = useRef(-1);
+  const mountedRef = useRef(true);
+
+  const go = useCallback((event) => {
+    setState((prev) => {
+      const next = nextUploadState(prev, event);
+      // A transition the machine does not define means a stale callback fired (an aborted
+      // upload's onError, say). Ignoring it is the point: inventing a destination here is
+      // how a cancelled upload reopens a closed editor.
+      return next || prev;
+    });
+  }, []);
+
+  /**
+   * Enter FILE_SELECTED from wherever we are — always, and without inventing an edge.
+   *
+   * ★ Choosing the event from render-time state was a real freeze: emitting REPLACE whenever
+   *   state !== EMPTY meant that after a rejected file (UNSUPPORTED_FILE) or a cancel
+   *   (CANCELLED) — neither of which defines REPLACE — the transition was dropped, every
+   *   following one was dropped with it, and the machine sat frozen while a multi-gigabyte
+   *   transfer ran with no progress bar, no cancel button, and Save enabled.
+   *
+   * Choosing a file is a user action that must never silently do nothing. Every state the
+   * picker is reachable from defines SELECT_FILE or REPLACE, but "every state" is exactly
+   * the kind of claim that stops being true when someone adds one — so there is a last
+   * resort: fall back to the edge EMPTY defines, which is the same destination. Resolving
+   * inside the updater also uses live state rather than a stale render closure.
+   */
+  const beginPick = useCallback(() => {
+    setState((prev) => nextUploadState(prev, UPLOAD_EVENTS.SELECT_FILE)
+      || nextUploadState(prev, UPLOAD_EVENTS.REPLACE)
+      || nextUploadState(UPLOAD_STATES.EMPTY, UPLOAD_EVENTS.SELECT_FILE));
+  }, []);
+
+  useEffect(() => { onStateChange?.(state); }, [state, onStateChange]);
+  useEffect(() => {
+    // ★ Re-arm on mount, don't just disarm on unmount. <React.StrictMode> (src/main.jsx)
+    //   deliberately runs mount → cleanup → mount in development. A ref set to false by the
+    //   first cleanup and never restored stays false for the component's whole life, so every
+    //   `if (!mountedRef.current) return` bails and the uploader is silently inert — in dev
+    //   only, which is the worst place for it to be, because that is where it gets tested.
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+      try { uploadRef.current?.abort(); } catch (_) { /* already finished */ }
+      // ★ Tell the drawer the transfer is over. This component is unmounted by the
+      //   `d.type === 'video'` gate, so switching a lesson to Text mid-upload would
+      //   otherwise leave the drawer's videoUploadState stuck at UPLOADING: Save disabled
+      //   forever reading "Video not ready", and a close-confirm warning about an upload
+      //   that no longer exists — with no uploader on screen to explain either.
+      onStateChange?.(UPLOAD_STATES.EMPTY);
+    };
+    // onStateChange is the parent's stable setState; listing it would re-run this on every
+    // parent render and abort a live upload.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const releaseBlob = () => {
+    if (blobUrlRef.current) { URL.revokeObjectURL(blobUrlRef.current); blobUrlRef.current = null; }
+  };
+
+  /** Delete an object we uploaded but never saved. Never touches the saved path. */
+  const discardPending = useCallback(async () => {
+    const path = pendingPathRef.current;
+    pendingPathRef.current = null;
+    if (!path || path === savedPath) return;
+    // Reference-aware even here: a duplicated course can legitimately share a path.
+    await removeMediaIfUnreferenced([path]);
+  }, [savedPath]);
+
+  function announce(text, step) {
+    // Throttled on purpose: announcing every progress tick makes a screen reader unusable.
+    if (step !== undefined) {
+      if (step === liveStepRef.current) return;
+      liveStepRef.current = step;
+    }
+    setLive(text);
+  }
+
+  async function startUpload(file) {
+    // `let`, because a resumed transfer may already be writing somewhere else — see below.
+    let path = buildLessonVideoPath(courseId, crypto.randomUUID(), file.name);
+    const { data: sess } = await supabase.auth.getSession();
+    const token = sess?.session?.access_token;
+    if (!token) throw Object.assign(new Error('no session'), { status: 401 });
+
+    const tus = await import('tus-js-client');          // own chunk — the XLSX/jspdf idiom
+    await new Promise((resolve, reject) => {
+      const upload = new tus.Upload(file, {
+        endpoint: resumableUploadEndpoint(),
+        // ★ Scope the fingerprint to THIS course. tus's default browser fingerprint is
+        //   name+type+size+lastModified+endpoint — the bucket and object path are not in it,
+        //   so uploading the same file to course A and then to course B would "resume"
+        //   B's upload into A's object.
+        fingerprint: (f) => Promise.resolve(
+          `gh-lesson-${courseId}-${f.name}-${f.type}-${f.size}-${f.lastModified}`),
+        retryDelays: [...LESSON_VIDEO_RETRY_DELAYS],
+        headers: {
+          authorization: `Bearer ${token}`,
+          // No x-upsert: every upload gets its own uuid path, so overwriting is never
+          // wanted and enabling it would let a retry clobber a live lesson's file.
+        },
+        uploadDataDuringCreation: true,
+        removeFingerprintOnSuccess: true,               // so the same file can be re-uploaded later
+        metadata: {
+          bucketName: LESSON_VIDEO_BUCKET,
+          objectName: path,
+          contentType: LESSON_VIDEO_MIME,
+          cacheControl: '3600',
+        },
+        // Supabase requires EXACTLY this. It is not a tuning knob.
+        chunkSize: LESSON_VIDEO_CHUNK_BYTES,
+        onProgress: (loaded, total) => {
+          if (!mountedRef.current) return;
+          setProgress({ loaded, total });
+          const pct = total ? Math.floor((loaded / total) * 100) : 0;
+          announce(`Uploading, ${pct}% complete.`, Math.floor(pct / 25));
+        },
+        onError: (err) => reject(err),
+        onSuccess: () => { pendingPathRef.current = path; resolve(); },
+      });
+      uploadRef.current = upload;
+      upload.findPreviousUploads().then((prev) => {
+        // Resumes from the server-recorded offset when the SAME file is re-selected in the
+        // SAME course — which is why the copy tells the admin to pick the same file again,
+        // rather than promising a resume that cannot survive losing the File handle.
+        //
+        // ★ ADOPT THE RESUMED UPLOAD'S OBJECT NAME. resumeFromPreviousUpload() restores the
+        //   stored upload URL but NOT options.metadata, so the server keeps writing to the
+        //   objectName the transfer was created with — not the fresh uuid path generated a
+        //   few lines above. Without this the bytes land at the old path while the lesson
+        //   draft records the new one, so verification signs an object that does not exist
+        //   and can never succeed. That is precisely the flow the close-confirm dialog
+        //   promises will work.
+        const resumed = prev[0];
+        if (resumed) {
+          const resumedName = resumed.metadata?.objectName;
+          if (typeof resumedName === 'string' && isLessonVideoPath(resumedName)) path = resumedName;
+          upload.resumeFromPreviousUpload(resumed);
+        }
+        upload.start();
+      }).catch(() => upload.start());
+    });
+    return path;
+  }
+
+  async function verifyPrivateObject(path) {
+    // "Ready" has to mean the object EXISTS, can be AUTHORIZED, and DECODES from the very
+    // URL a student will get. Anything less and the admin publishes a lesson that is broken
+    // only for the people who paid for it.
+    const { url } = await signLessonVideo(path);
+    return probeVideoMetadata(url);
+  }
+
+  async function handlePick(file) {
+    setErrMsg(''); liveStepRef.current = -1;
+    if (!file) return;
+    await discardPending();                              // replacing? drop the last orphan first
+    fileRef.current = file;
+    setFileInfo({ name: file.name, size: file.size });
+    setProgress({ loaded: 0, total: file.size });
+    setDuration(null);
+    beginPick();
+    go(UPLOAD_EVENTS.VALIDATE_START);
+    announce('Checking the file.');
+
+    const verdict = validateVideoFile(file);
+    if (!verdict.ok) { setErrMsg(verdict.message); go(UPLOAD_EVENTS.VALIDATE_FAIL); announce(verdict.message); return; }
+
+    releaseBlob();
+    blobUrlRef.current = URL.createObjectURL(file);
+    try {
+      const secs = await probeVideoMetadata(blobUrlRef.current);
+      if (!mountedRef.current) return;
+      setDuration(secs);
+    } catch (_) {
+      releaseBlob();
+      setErrMsg('This browser can’t play that file, so students wouldn’t be able to either. '
+        + 'Re-export it as MP4 (H.264 video, AAC audio) and try again.');
+      go(UPLOAD_EVENTS.VALIDATE_FAIL);
+      announce('That file can’t be played.');
+      return;
+    }
+    releaseBlob();
+    go(UPLOAD_EVENTS.VALIDATE_OK);
+    announce('Upload started.');
+    await runTransfer(file);
+  }
+
+  /** The transfer + verification half, shared by a fresh pick and by a retry. */
+  async function runTransfer(file) {
+    try {
+      const uploadedPath = await startUpload(file);
+      if (!mountedRef.current) return;
+      go(UPLOAD_EVENTS.UPLOAD_DONE);
+      announce('Upload finished. Checking playback.');
+      await runVerification(uploadedPath);
+    } catch (e) {
+      if (!mountedRef.current) return;
+      const d = describeUploadError(e);
+      if (d.reason === 'aborted') return;                // cancel/pause already set the state
+      setErrMsg(d.message);
+      go(UPLOAD_EVENTS.INTERRUPT);
+      announce(d.message);
+    }
+  }
+
+  async function runVerification(path) {
+    try {
+      const secs = await verifyPrivateObject(path);
+      if (!mountedRef.current) return;
+      if (secs != null) setDuration(secs);
+      pendingPathRef.current = path;
+      onChange?.({ storage_path: path, video_provider: 'upload', video_url: null, __durationSeconds: secs });
+      go(UPLOAD_EVENTS.VERIFY_OK);
+      announce('Video uploaded and ready to save.');
+    } catch (e) {
+      if (!mountedRef.current) return;
+      setErrMsg(e?.message === 'timeout' || e?.code === 3
+        ? 'The file uploaded, but the browser could not read it back as video. Re-export it as MP4 (H.264 + AAC) and upload again.'
+        : 'The file uploaded, but it could not be authorized for playback yet. Try the check again.');
+      go(UPLOAD_EVENTS.VERIFY_FAIL);
+      announce('Upload finished, but the playback check failed.');
+    }
+  }
+
+  // abort() without terminate stops the transfer but does NOT reject startUpload's promise,
+  // so a paused upload can simply be started again and still resolve into verification.
+  function pause() { try { uploadRef.current?.abort(); } catch (_) { /* noop */ } go(UPLOAD_EVENTS.PAUSE); announce('Upload paused.'); }
+
+  function resume() {
+    if (state === UPLOAD_STATES.INTERRUPTED) {
+      // ★ An INTERRUPTED upload got there through tus's onError, which REJECTED
+      //   startUpload's promise. Calling upload.start() again would transfer the bytes
+      //   into a settled promise: onSuccess's resolve() is a no-op, runVerification never
+      //   runs, and the drawer sits at 100% with Save disabled forever. Re-enter the
+      //   transfer instead — the fingerprint makes tus pick up from the server's recorded
+      //   offset, so nothing already sent is sent again.
+      const f = fileRef.current;
+      if (!f) return;
+      setErrMsg('');
+      go(UPLOAD_EVENTS.RETRY);
+      announce('Upload resumed.');
+      runTransfer(f);
+      return;
+    }
+    go(UPLOAD_EVENTS.RESUME); announce('Upload resumed.');
+    try { uploadRef.current?.start(); } catch (_) { if (fileRef.current) runTransfer(fileRef.current); }
+  }
+  async function cancel() {
+    try { await uploadRef.current?.abort(true); } catch (_) { /* noop */ }
+    await discardPending();
+    if (!mountedRef.current) return;
+    go(UPLOAD_EVENTS.CANCEL);
+    setProgress({ loaded: 0, total: 0 }); setFileInfo(null); setErrMsg('');
+    announce('Upload cancelled.');
+  }
+  async function removeVideo() {
+    await discardPending();
+    if (!mountedRef.current) return;
+    onChange?.({ storage_path: null, video_provider: null, video_url: null });
+    setFileInfo(null); setDuration(null); setProgress({ loaded: 0, total: 0 });
+    go(UPLOAD_EVENTS.RESET);
+    announce('Video removed. Save the lesson to confirm.');
+  }
+
+  const pct = progress.total ? Math.min(100, Math.round((progress.loaded / progress.total) * 100)) : 0;
+  const busy = isUploadInFlight(state) || disabled;
+  const showBar = state === UPLOAD_STATES.UPLOADING || state === UPLOAD_STATES.PAUSED
+    || state === UPLOAD_STATES.INTERRUPTED || state === UPLOAD_STATES.VERIFYING_PRIVATE_OBJECT;
+  const ready = state === UPLOAD_STATES.READY_TO_SAVE || state === UPLOAD_STATES.SAVED_AND_PLAYABLE;
+
+  return (
+    <div className="rounded-xl border p-4" style={{ borderColor: 'var(--glass-border)', background: SHEEN }}>
+      {/* One region that morphs through every state, rather than panels that swap — the
+          drawer footer never jumps and the scroll position never moves under the cursor. */}
+      <div className="sr-only" role="status" aria-live="polite">{live}</div>
+
+      {!showBar && !ready && (
+        <>
+          <label className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border text-sm font-semibold cursor-pointer focus-within:ring-2"
+            style={{ borderColor: 'var(--glass-border)', color: C.text, ringColor: 'var(--focus-ring)' }}>
+            <UploadCloud size={16} /> Upload lesson video
+            {/* sr-only rather than hidden: display:none drops it from the tab order. */}
+            <input ref={inputRef} type="file" accept={LESSON_VIDEO_ACCEPT} className="sr-only" disabled={busy}
+              onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) handlePick(f); }} />
+          </label>
+          <div className="text-[11px] mt-2 leading-relaxed" style={{ color: C.textSoft }}>
+            MP4 only — H.264 video, AAC audio. Up to {formatBytes(LESSON_VIDEO_MAX_BYTES)}.
+            <br />Students stream it from private storage; it is never published to a public link.
+          </div>
+        </>
+      )}
+
+      {showBar && (
+        <div>
+          <div className="flex items-center justify-between gap-3 text-sm font-semibold" style={{ color: C.text }}>
+            <span className="truncate">{fileInfo?.name || 'Lesson video'}</span>
+            <span className="tabular-nums text-xs" style={{ color: C.textSoft }}>
+              {state === UPLOAD_STATES.VERIFYING_PRIVATE_OBJECT ? 'Checking playback' : `${pct}%`}
+            </span>
+          </div>
+          <div className="mt-2 h-2 rounded-full overflow-hidden" style={{ background: 'var(--wash-strong)' }}>
+            <div
+              className={state === UPLOAD_STATES.VERIFYING_PRIVATE_OBJECT ? 'h-full animate-pulse' : 'h-full transition-all'}
+              style={{
+                width: state === UPLOAD_STATES.VERIFYING_PRIVATE_OBJECT ? '100%' : `${pct}%`,
+                background: state === UPLOAD_STATES.INTERRUPTED ? 'var(--c-red)' : C.primary,
+              }}
+            />
+          </div>
+          <div className="mt-2 flex items-center justify-between gap-2">
+            <span className="text-[11px] tabular-nums" style={{ color: C.textSoft }}>
+              {formatBytes(progress.loaded)} of {formatBytes(progress.total)}
+            </span>
+            <span className="flex items-center gap-2">
+              {state === UPLOAD_STATES.UPLOADING && (
+                <button type="button" onClick={pause} className="px-2.5 py-1 rounded-lg text-xs font-semibold border"
+                  style={{ borderColor: 'var(--glass-border)', color: C.text }}><Pause size={12} className="inline mr-1" />Pause</button>
+              )}
+              {(state === UPLOAD_STATES.PAUSED || state === UPLOAD_STATES.INTERRUPTED) && (
+                <button type="button" onClick={resume} className="px-2.5 py-1 rounded-lg text-xs font-semibold border"
+                  style={{ borderColor: 'var(--glass-border)', color: C.text }}><Play size={12} className="inline mr-1" />Resume</button>
+              )}
+              {state !== UPLOAD_STATES.VERIFYING_PRIVATE_OBJECT && (
+                <button type="button" onClick={cancel} className="px-2.5 py-1 rounded-lg text-xs font-semibold border"
+                  style={{ borderColor: 'var(--status-danger-bd)', color: 'var(--status-danger-fg)' }}>Cancel</button>
+              )}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {ready && (
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <span className="inline-flex items-center gap-2 text-sm font-semibold" style={{ color: 'var(--status-ok-fg)' }}>
+            <CheckCircle2 size={16} />
+            {state === UPLOAD_STATES.READY_TO_SAVE ? 'Uploaded — ready to save' : 'Video uploaded'}
+            {formatMediaDuration(duration) && (
+              <span className="font-normal text-xs" style={{ color: C.textSoft }}>· {formatMediaDuration(duration)}</span>
+            )}
+          </span>
+          <span className="flex items-center gap-2">
+            <label className="px-2.5 py-1 rounded-lg text-xs font-semibold border cursor-pointer"
+              style={{ borderColor: 'var(--glass-border)', color: C.text }}>
+              Replace video
+              <input type="file" accept={LESSON_VIDEO_ACCEPT} className="sr-only" disabled={busy}
+                onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) handlePick(f); }} />
+            </label>
+            <button type="button" onClick={removeVideo} disabled={busy}
+              className="px-2.5 py-1 rounded-lg text-xs font-semibold border"
+              style={{ borderColor: 'var(--status-danger-bd)', color: 'var(--status-danger-fg)' }}>Remove</button>
+          </span>
+        </div>
+      )}
+
+      {errMsg && (
+        <div className="mt-3 rounded-lg px-3 py-2 text-xs flex items-start gap-2" role="alert"
+          style={{ background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)', color: 'var(--status-danger-fg)' }}>
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span>
+            {errMsg}
+            {state === UPLOAD_STATES.STORAGE_OR_SIGNING_ERROR && pendingPathRef.current && (
+              <button type="button" className="ml-2 underline font-semibold"
+                onClick={() => { go(UPLOAD_EVENTS.RETRY); runVerification(pendingPathRef.current); }}>
+                Check again
+              </button>
+            )}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Admin-only: unused video files under ONE course's folder, with an explicit delete.
+ *
+ * Deliberately opt-in (nothing runs until "Check" is pressed), scoped to one course, and
+ * routed through removeMediaIfUnreferenced() so a file a duplicated course still shares is
+ * never removed. It never deletes from storage.objects directly and never sweeps by prefix.
+ */
+function LessonVideoOrphans({ courseId }) {
+  const [status, setStatus] = useState('idle');   // idle | checking | listed | busy | error
+  const [orphans, setOrphans] = useState([]);
+  const [msg, setMsg] = useState('');
+
+  async function check() {
+    setStatus('checking'); setMsg('');
+    const { orphans: found, error } = await findOrphanLessonVideos(courseId);
+    if (error) { setStatus('error'); setMsg('Could not read the video folder. You may not have storage access, or the bucket is missing.'); return; }
+    setOrphans(found); setStatus('listed');
+    if (!found.length) setMsg('No unused video files — every file in this course is in use.');
+  }
+
+  async function purge() {
+    if (!window.confirm(`Delete ${orphans.length} unused video file${orphans.length === 1 ? '' : 's'}?\n\n`
+      + 'Files still used by this or any other course are kept automatically.')) return;
+    setStatus('busy');
+    await removeMediaIfUnreferenced(orphans);
+    await check();
+  }
+
+  return (
+    <div className="bg-white rounded-2xl border border-slate-200 p-4">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div>
+          <div className="text-sm font-semibold" style={{ color: C.text }}>Unused video files</div>
+          <div className="text-[11px] mt-0.5" style={{ color: C.textSoft }}>
+            Left behind when an upload finishes but the lesson is never saved. Nothing is deleted until you say so.
+          </div>
+        </div>
+        <button type="button" onClick={check} disabled={status === 'checking' || status === 'busy'}
+          className="px-3 py-1.5 rounded-lg text-xs font-semibold border disabled:opacity-60"
+          style={{ borderColor: 'var(--glass-border)', color: C.text }}>
+          {status === 'checking' ? <><Loader2 size={12} className="inline animate-spin mr-1" />Checking…</> : 'Check for unused files'}
+        </button>
+      </div>
+      {msg && <div className="mt-2 text-xs" style={{ color: status === 'error' ? 'var(--status-danger-fg)' : C.textSoft }}>{msg}</div>}
+      {status !== 'idle' && orphans.length > 0 && (
+        <div className="mt-3">
+          <ul className="text-[11px] space-y-1" style={{ color: C.textSoft, fontFamily: fontMono }}>
+            {orphans.slice(0, 10).map(p => <li key={p} className="truncate">{p.split('/').pop()}</li>)}
+            {orphans.length > 10 && <li>…and {orphans.length - 10} more</li>}
+          </ul>
+          <button type="button" onClick={purge} disabled={status === 'busy'}
+            className="mt-2 px-3 py-1.5 rounded-lg text-xs font-semibold border disabled:opacity-60"
+            style={{ borderColor: 'var(--status-danger-bd)', color: 'var(--status-danger-fg)' }}>
+            {status === 'busy' ? 'Deleting…' : `Delete ${orphans.length} unused file${orphans.length === 1 ? '' : 's'}`}
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ── Learner: the optional "Zoom Live Replay" link on a lesson (#37b) ────────────
@@ -12671,7 +14577,10 @@ function CourseAiTrainerPanel({ course, modules, onEnabledChange }) {
             {lessons.length === 0 && <div className="p-4 text-sm text-slate-400">Add lessons to this course, then sync.</div>}
             {lessons.map((l) => {
               const isVideo = l.type === 'video';
-              const canScribe = isVideo && ['upload', 'mp4'].includes(l.video_provider);
+              // Mirrors api/admin/course-trainer.js's transcribe gate exactly. Drift here is a
+              // microphone button that 400s. The 'mp4' branch went with #44: a direct MP4 link
+              // can no longer be a lesson's primary content, so there is nothing to fetch.
+              const canScribe = isVideo && l.video_provider === 'upload' && !!l.storage_path;
               const textSrc = byLessonKind[l.id]?.lesson_text || null;
               const txSrc = byLessonKind[l.id]?.transcript || null;
               const primary = isVideo ? txSrc : textSrc;
@@ -12710,7 +14619,7 @@ function CourseAiTrainerPanel({ course, modules, onEnabledChange }) {
                       {txSrc && <button onClick={() => openEditor({ lesson: l })} title="Edit transcript" className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100"><Edit3 size={14} /></button>}
                     </>
                   ) : (
-                    <button onClick={() => openEditor({ lesson: l })} title="Paste/edit transcript (YouTube/Vimeo — manual only)"
+                    <button onClick={() => openEditor({ lesson: l })} title="Paste or edit this lesson’s transcript by hand"
                       className="px-2 py-1 rounded-lg text-[11px] font-semibold text-slate-500 hover:bg-slate-100 inline-flex items-center gap-1">
                       <Edit3 size={12} /> {txSrc ? 'Edit' : 'Add'} transcript
                     </button>
@@ -12856,12 +14765,32 @@ function CourseProgram({
   initialNotice = null,                                  // one-time success banner (e.g. after duplicating a course)
   initialLessonId = null,                                // deep-link (?lesson=) — open straight to this lesson if it exists
 } = {}) {
-  const { user, profile } = useAuth();
-  const isAdmin = !!profile?.is_admin;
+  const { user, profile, staff, staffDegraded, can } = useAuth();
+  // #46: course authoring is per-course. `isAdmin` in this component means "may I
+  // EDIT THIS course", which for a Super Admin (courses.manage_all) is every course
+  // and for a Trainer is the ones assigned to them. It is resolved below, once the
+  // course row is loaded, because the question needs a course id to answer.
+  // Publishing is deliberately separate — a Trainer authors, someone with
+  // courses.publish ships — and courses_publish_guard enforces that server-side.
+  const canPublish = staffDegraded ? !!profile?.is_admin : can('courses.publish');
+  const canDeleteCourses = staffDegraded ? !!profile?.is_admin : can('courses.delete');
   const ent = useContext(EntitlementContext);            // plan scope — a deep-link guard for restricted courses
   const showHead = !embedded && !onBack;                 // the catalog/suite supplies its own header instead
 
   const [course, setCourse] = useState(null);
+
+  // ★ THE per-course authorization question, answered once. canManageCourseClient()
+  //   is the client mirror of SQL can_manage_course(): courses.manage_all short-
+  //   circuits to true, courses.manage_assigned needs the course in the caller's
+  //   assigned list. It decides only what to RENDER — courses_staff_update,
+  //   modules_staff_write, lessons_staff_write and the storage policies re-answer it
+  //   for every actual write, and those are the boundary.
+  //   Before the course row loads there is no id, so the answer is "no", which keeps
+  //   the builder controls from flashing on for a Trainer who cannot edit this one.
+  const isAdmin = staffDegraded
+    ? !!profile?.is_admin
+    : canManageCourseClient(staff, course);
+
   const [courseDraft, setCourseDraft] = useState({ title: '', subtitle: '', description: '', month: '', course_date: '' });
   const [notice, setNotice] = useState(initialNotice);   // dismissible green banner shown once on arrival
   const [modules, setModules] = useState([]);            // [{ ...module, lessons: [...] }]
@@ -12881,8 +14810,9 @@ function CourseProgram({
   // Builder state
   const [editingLesson, setEditingLesson] = useState(null);  // draft copy of a lesson row
   const [savingLesson, setSavingLesson] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [previewUrl, setPreviewUrl] = useState(null);        // local object URL while authoring
+  // The uploader owns its own transfer state and reports it up so the drawer can gate Save
+  // and warn before a close would discard transferred bytes. It is NOT threaded back down.
+  const [videoUploadState, setVideoUploadState] = useState(UPLOAD_STATES.EMPTY);
   const [metaBusy, setMetaBusy] = useState(false);           // saving course details / toggling publish
   const [structBusy, setStructBusy] = useState(false);       // adding a module or lesson
   // ── Errors raised from inside the lesson drawer ───────────────────────────────
@@ -13040,8 +14970,6 @@ function CourseProgram({
   }
 
   useEffect(() => { if (user?.id) load(); /* eslint-disable-next-line */ }, [user?.id, courseId, isAdmin]);
-  // Revoke the local preview object URL when it changes / on unmount.
-  useEffect(() => () => { if (previewUrl) URL.revokeObjectURL(previewUrl); }, [previewUrl]);
 
   // ── Derived ──
   const allLessons = modules.flatMap(m => m.lessons || []);
@@ -13081,14 +15009,18 @@ function CourseProgram({
   const clearLessonDraft = () => course?.id && clearStoredValue(lessonEditorDraftKey(course.id));
   const closeLessonEditor = () => {
     // Blocked only while SAVING — a bounded DB write that always settles. Deliberately NOT
-    // blocked while uploading: supabase.storage.upload() has no timeout, so gating on it would
-    // strand the admin behind an un-closable full-screen drawer whose only exit is a reload
-    // (which then trips the beforeunload prompt). Closing mid-upload is already safe because
-    // uploadVideo's updater bails on a null draft — that guard is the real invariant here.
+    // blocked while uploading: gating on the transfer would strand the admin behind an
+    // un-closable drawer whose only exit is a reload (which then trips beforeunload).
+    // ★ But an upload in flight is now a real loss, so say so rather than discarding it
+    //   silently. Unlike the old single-POST upload, this one can be paused and picked up
+    //   again — from the server's recorded offset — by re-selecting the same file.
     if (savingLesson) return;
+    if (needsCloseConfirmation(videoUploadState)
+      && !window.confirm('This lesson\'s video is still uploading.\n\nClose anyway? The transfer stops, '
+        + 'and choosing the same file again later picks up where it left off.')) return;
     if (lessonDraftDirty && !window.confirm('Discard unsaved lesson changes?')) return;
     clearLessonDraft();
-    if (previewUrl) { URL.revokeObjectURL(previewUrl); setPreviewUrl(null); }
+    setVideoUploadState(UPLOAD_STATES.EMPTY);
     setEditingLesson(null);
   };
   const confirmLeaveCourse = () => !hasUnsavedCourseWork || window.confirm('You have unsaved course changes. Leave this course without saving?');
@@ -13227,6 +15159,22 @@ function CourseProgram({
   async function togglePublished() {
     setMetaBusy(true); setErr('');
     try {
+      // Client preflight, for a message that names the lessons. courses_publish_guard (#44)
+      // is the actual boundary — this only saves the admin a round trip and gives them
+      // something to act on instead of a bare refusal.
+      if (!course.published) {
+        const blockers = coursePublishBlockers(allLessons);
+        if (blockers.length) {
+          setErr(
+            `This course can’t be published yet — ${blockers.length} lesson${blockers.length === 1 ? '' : 's'} `
+            + `still ${blockers.length === 1 ? 'needs' : 'need'} an uploaded video: `
+            + blockers.slice(0, 6).map(b => `“${b.title}”`).join(', ')
+            + (blockers.length > 6 ? `, and ${blockers.length - 6} more.` : '.')
+            + ' Open each one and upload its MP4, then publish.',
+          );
+          return;
+        }
+      }
       const { error } = await supabase.from('courses')
         .update({ published: !course.published, updated_at: new Date().toISOString() }).eq('id', course.id);
       if (error) throw error;
@@ -13299,7 +15247,10 @@ function CourseProgram({
       // Purge the uploaded video AFTER the row delete — and only if no other course (e.g. a
       // duplicate that reused this path) still references it. Order matters: deleting first means
       // this lesson's own reference is gone before the check.
-      if (l.video_provider === 'upload' && l.storage_path) await removeMediaIfUnreferenced([l.storage_path]);
+      // ★ Gated on storage_path, NOT on video_provider === 'upload'. A row carrying a path with
+      //   any other provider (a mid-edit inconsistency, a hand-fixed row) used to leak its object
+      //   forever, because the provider test failed while the file was still there.
+      if (l.storage_path) await removeMediaIfUnreferenced([l.storage_path]);
       setActiveLessonId(prev => (prev === l.id ? null : prev)); // don't keep a deleted lesson active
       await load();
     } catch (e) { logDbError('[CourseProgram] deleteLesson', e, { courseId: course.id, lessonId: l.id }); setErr(describeDbError(e, 'Could not delete lesson.')); }
@@ -13315,38 +15266,29 @@ function CourseProgram({
     } catch (e) { logDbError('[CourseProgram] moveLesson', e, { courseId: course.id, moduleId: m.id }); setErr(describeDbError(e, 'Could not reorder lessons.')); }
   }
 
-  async function uploadVideo(file) {
-    if (!file || !course) return;
-    // Every failure below is raised from inside the drawer, so it goes to lessonErr rather
-    // than the page banner the drawer covers. Cleared up front so a retry shows no stale text.
-    setLessonErr('');
-    const MAX_MB = 50;
-    if (!/^video\//i.test(file.type)) { setLessonErr('Please choose a video file (MP4, MOV, WebM…), or paste a YouTube/Vimeo link instead.'); return; }
-    if (file.size > MAX_MB * 1024 * 1024) {
-      setLessonErr(`That video is ${(file.size / 1024 / 1024).toFixed(0)} MB — the upload limit is ${MAX_MB} MB. Compress it, or host it on YouTube/Vimeo and paste the link.`);
-      return;
-    }
-    setUploading(true);
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    setPreviewUrl(URL.createObjectURL(file));
-    try {
-      const safe = file.name.replace(/[^\w.\-]+/g, '_');
-      const path = `lessons/${course.id}/${crypto.randomUUID()}-${safe}`;
-      // Paid lesson videos go to the PRIVATE course-videos bucket (served via signed URLs).
-      const { error } = await supabase.storage.from(LESSON_VIDEO_BUCKET)
-        .upload(path, file, { upsert: false, contentType: file.type || 'video/mp4' });
-      if (error) throw error;
-      // ★ Bail if the drawer closed while this upload was in flight. Spreading a null draft
-      // ({ ...null }) yields a truthy, id-less object, which would re-satisfy the
-      // `editingLesson &&` render guard and reopen the drawer on a phantom lesson — and a
-      // later Save would run .eq('id', undefined). Returning `d` schedules no state update.
-      setEditingLesson(d => (d ? { ...d, storage_path: path, video_provider: 'upload', video_url: '' } : d));
-    } catch (e) {
-      logDbError('[CourseProgram] video upload', e, { courseId: course.id });
-      setLessonErr(describeDbError(e, 'Video upload failed — check the file size and that you have admin access.'));
-    } finally {
-      setUploading(false);
-    }
+  // ★ uploadVideo() is GONE. Lesson video is uploaded by the module-scope
+  //   <LessonVideoUploader>, which owns the resumable transfer, the local decodability
+  //   check, the post-upload signed-URL verification, and orphan cleanup. The old
+  //   single-POST supabase.storage.upload() could not report progress, could not be
+  //   paused, resumed or cancelled, and capped out at 50 MB — which is roughly five
+  //   minutes of watchable video, and the reason the "or paste a YouTube link" escape
+  //   hatch existed in the first place.
+  //
+  //   Applied by the uploader through onChange; ★ the guard is the same one uploadVideo
+  //   carried: spreading a null draft ({ ...null }) yields a truthy, id-less object, which
+  //   would re-satisfy the `editingLesson &&` render guard and reopen the drawer on a
+  //   phantom lesson — and a later Save would run .eq('id', undefined).
+  function applyVideoPatch(patch) {
+    const { __durationSeconds, ...cols } = patch || {};
+    setEditingLesson(d => {
+      if (!d) return d;
+      const next = { ...d, ...cols };
+      // Prefill the duration label from the file itself, but never overwrite a label the
+      // admin already wrote.
+      const label = formatMediaDuration(__durationSeconds);
+      if (label && !String(d.duration_label || '').trim()) next.duration_label = label;
+      return next;
+    });
   }
 
   async function saveLesson() {
@@ -13356,14 +15298,26 @@ function CourseProgram({
     setLessonErr('');
     const d = editingLesson;
     const isVideo = d.type === 'video';
-    const isUpload = isVideo && d.video_provider === 'upload' && !!d.storage_path;
-    const hasLink = isVideo && !isUpload && !!(d.video_url || '').trim();
+    const prevRow = allLessons.find(x => x.id === d.id) || null;
+    // ★ The three video columns are built by lessonVideoPayload(), the same pure function
+    //   test/courseVideo.test.mjs pins. It carries a grandfathered legacy link over BYTE FOR
+    //   BYTE and refuses to author a new one — which is exactly what course_lessons_video_guard
+    //   (#44) enforces server-side, so the client can never construct a row the database
+    //   would reject.
+    const videoCols = lessonVideoPayload(d, prevRow);
+    const isUpload = videoCols.video_provider === 'upload';
+    const hasLegacyLink = !!videoCols.video_url;
     const hasText = !!(d.text_content || '').trim();
     // Don't let an empty lesson be saved (it would show "No video added yet" to students).
     // ★ A replay link deliberately does NOT satisfy this gate: it renders below the player
     // slot, so a replay-only lesson would still show students an empty video.
-    if (isVideo && !isUpload && !hasLink && !hasText) {
-      setLessonErr('Add a video link, upload a file, or write some lesson notes before saving.'); return;
+    if (isVideo && !isUpload && !hasLegacyLink && !hasText) {
+      setLessonErr('Upload the lesson video, or write some lesson notes, before saving.'); return;
+    }
+    // A half-finished upload must never be saved: the row would point at an object that is
+    // still transferring, or at nothing at all.
+    if (blocksLessonSave(videoUploadState)) {
+      setLessonErr('Wait for the video upload to finish before saving.'); return;
     }
     if (!isVideo && !hasText) { setLessonErr('Add some lesson content before saving.'); return; }
     // Supplementary replay link. Returning here leaves the modal open with the draft intact,
@@ -13382,13 +15336,17 @@ function CourseProgram({
     setReplayErr('');
     setSavingLesson(true);
     try {
-      const oldPath = allLessons.find(x => x.id === d.id)?.storage_path; // for cleanup if the video changed
+      const oldPath = prevRow?.storage_path; // for cleanup if the video changed
       const payload = {
         title: (d.title || '').trim() || 'Untitled lesson',
         type: d.type || 'video',
-        video_url: isVideo && !isUpload ? (d.video_url || null) : null,
-        video_provider: isVideo ? (isUpload ? 'upload' : parseVideoUrl(d.video_url).provider) : null,
-        storage_path: isUpload ? d.storage_path : null,
+        // ★ The three video columns come from lessonVideoPayload() above, NOT from
+        //   parseVideoUrl(). That call was the reason a legacy row could not be renamed:
+        //   parseVideoUrl re-derived the provider from the URL on every single save, and its
+        //   YouTube pattern requires exactly 11 word characters — so a stored 'youtube' row
+        //   whose URL it no longer recognises (youtube.com/live/…, an extra path segment)
+        //   silently became 'mp4' on a title-only edit.
+        ...videoCols,
         text_content: d.text_content || null,
         duration_label: (d.duration_label || '').trim() || null,
       };
@@ -13402,7 +15360,7 @@ function CourseProgram({
       // If a previously-uploaded file was replaced or removed, purge the old object — but only if no
       // other course (e.g. a duplicate that reused this path) still references it (copy-on-write).
       if (oldPath && oldPath !== payload.storage_path) await removeMediaIfUnreferenced([oldPath]);
-      if (previewUrl) { URL.revokeObjectURL(previewUrl); setPreviewUrl(null); }
+      setVideoUploadState(UPLOAD_STATES.EMPTY);
       clearLessonDraft();
       setEditingLesson(null);
       await load();
@@ -13462,27 +15420,89 @@ function CourseProgram({
         ? <div className="text-slate-700 whitespace-pre-line leading-relaxed text-[15px]">{lesson.text_content}</div>
         : <div className="rounded-xl border-2 border-dashed border-slate-200 p-10 text-center text-slate-400">No content yet.</div>;
     }
+    // Private bucket → signed URL. This is the only shape a NEW lesson can have.
     if (lesson.video_provider === 'upload' && lesson.storage_path) {
-      // Private bucket → signed URL (with legacy public-bucket fallback) via SignedLessonVideo.
-      return <SignedLessonVideo key={lesson.id} lesson={lesson} />;
+      return <SignedLessonVideo key={lesson.id} lesson={lesson} isAdmin={isAdmin} />;
     }
-    if (lesson.video_provider === 'mp4' && lesson.video_url) {
-      return <video key={lesson.id} controls className="w-full rounded-xl bg-black" style={{ maxHeight: 460 }} src={lesson.video_url} />;
-    }
-    if ((lesson.video_provider === 'youtube' || lesson.video_provider === 'vimeo') && lesson.video_url) {
-      const { embedUrl } = parseVideoUrl(lesson.video_url);
-      if (embedUrl) return (
-        <div style={{ position: 'relative', paddingBottom: '56.25%', height: 0 }} className="rounded-xl overflow-hidden bg-black">
-          <iframe src={embedUrl} title={lesson.title} loading="lazy"
-            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen
-            style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', border: 0 }} />
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // TEMPORARY — LEGACY LINK PLAYBACK. Delete this whole block when the migration is done.
+    // ══════════════════════════════════════════════════════════════════════════════
+    // REMOVAL CRITERION, exactly: `npm run media:audit` reports 0 external links. Then
+    // delete this block, and renderVideo falls through to the empty state below.
+    //
+    // WHY IT IS STILL HERE. Authoring went upload-only in #44 — the editor has no link
+    // field and course_lessons_video_guard refuses the write — but on 2026-08-24 every
+    // single video lesson in the live database was a YouTube link: 101 of 102, across three
+    // PUBLISHED courses, with zero uploaded files anywhere. Removing playback in the same
+    // change would have shown 96 lessons a placeholder to paying members until ~59 videos
+    // had been re-uploaded one at a time. So authoring and playback were deliberately
+    // separated: no new links can be created, and the ones already sold stay watchable.
+    //
+    // ★ This block ADDS NO EXPOSURE. It renders links that are already stored and were
+    //   already being rendered; it cannot come into existence for a new lesson.
+    // ★ It DOES tighten one thing on the way out: the mp4 branch used to bind video_url
+    //   straight into <video src> with no validation anywhere in its life — parseVideoUrl
+    //   labelled ANY unrecognised string 'mp4' and saveLesson stored it verbatim, so a
+    //   `javascript:` or `data:` value would have been bound as a media source. It is now
+    //   proven to be an absolute https URL first, by the same parseReplayUrl() that guards
+    //   the Zoom field two sections down.
+    if (classifyLessonVideo(lesson) === 'legacy-link') {
+      const notice = isAdmin ? (
+        <div className="rounded-lg px-3 py-2 mb-2 text-xs flex items-start gap-2"
+          style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
+          <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+          <span><b>Upload replacement required.</b> This lesson still plays from an external
+            {' '}{lesson.video_provider} link. Edit it and upload the video file — the course can’t be
+            published or duplicated until you do.</span>
         </div>
+      ) : null;
+
+      // The stored value is not usable as a media source. ONE fallback for every reason,
+      // so no branch below can quietly fall through to binding the raw value.
+      const unusable = (
+        <>{notice}<div className="rounded-xl border-2 border-dashed border-slate-200 p-10 text-center text-slate-400">
+          {isAdmin
+            ? 'This lesson’s stored video link isn’t one this player can use. Upload the video file.'
+            : 'This lesson is being updated. Please check back shortly.'}
+        </div></>
+      );
+
+      if (lesson.video_provider === 'mp4') {
+        // parseReplayUrl proves an absolute https URL with no credentials, and only a
+        // proven result carries a `url` — the same primitive the Zoom field is built on.
+        const checked = parseReplayUrl(lesson.video_url);
+        if (checked.kind !== 'zoom' && checked.kind !== 'external') return unusable;
+        return <>{notice}<video key={lesson.id} controls preload="metadata" playsInline
+          className="w-full rounded-xl bg-black" style={{ maxHeight: 460 }} src={checked.url} /></>;
+      }
+
+      // ★ Gate on the PROVIDER parseVideoUrl returned, not merely on embedUrl being truthy.
+      //   parseVideoUrl falls through to `{ provider: 'mp4', embedUrl: <the raw string> }`
+      //   for anything it does not recognise — so a row stored as 'youtube' whose URL the
+      //   11-character id pattern cannot match (youtube.com/live/…, music.youtube.com, an
+      //   extra path segment: exactly the shapes #44's trigger comment cites) had its raw,
+      //   never-validated video_url bound straight into an <iframe src>. Only the
+      //   RECONSTRUCTED youtube/vimeo embed URLs — built from a captured id or digits, and
+      //   therefore safe by construction — reach the iframe.
+      const parsed = parseVideoUrl(lesson.video_url);
+      if ((parsed.provider !== 'youtube' && parsed.provider !== 'vimeo') || !parsed.embedUrl) return unusable;
+      return (
+        <>{notice}
+          <div style={{ position: 'relative', paddingBottom: '56.25%', height: 0 }} className="rounded-xl overflow-hidden bg-black">
+            <iframe src={parsed.embedUrl} title={lesson.title} loading="lazy"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen
+              style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', border: 0 }} />
+          </div>
+        </>
       );
     }
+    // ═════════════════════ END TEMPORARY LEGACY BLOCK ═════════════════════════════
+
     return (
       <div className="rounded-xl border-2 border-dashed border-slate-200 p-10 text-center text-slate-400">
         <Video size={28} className="mx-auto mb-2 opacity-60" />
-        No video added yet.
+        {isAdmin ? 'No video uploaded yet.' : 'No video added yet.'}
       </div>
     );
   }
@@ -13623,11 +15643,20 @@ function CourseProgram({
         <div className="glass-card rounded-2xl p-5" style={{ background: SHEEN }}>
           <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
             <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg font-bold flex items-center gap-2"><Edit3 size={18} /> Course settings</div>
-            <button onClick={togglePublished} disabled={metaBusy} className="px-4 py-2 rounded-xl text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-60"
+            {/* #46: publishing is its own capability. A Trainer authors; someone with
+                courses.publish ships. Rendered as a static state pill rather than
+                hidden, so a Trainer can still SEE whether their course is live —
+                they just cannot flip it. courses_publish_guard refuses the write
+                either way, with COURSE_PUBLISH_FORBIDDEN. */}
+            <button onClick={togglePublished} disabled={metaBusy || !canPublish}
+              title={canPublish ? undefined : 'Publishing and withdrawing courses needs the "Publish and unpublish courses" permission.'}
+              className="px-4 py-2 rounded-xl text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-60"
               style={course.published ? { background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)' } : { background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)' }}>
               {metaBusy ? <Loader2 size={15} className="animate-spin" /> : course.published ? <Eye size={15} /> : <Lock size={15} />}
               {course.published ? 'Published' : 'Draft'}
-              <span className="opacity-60 font-normal">· click to {course.published ? 'unpublish' : 'publish'}</span>
+              {canPublish
+                ? <span className="opacity-60 font-normal">· click to {course.published ? 'unpublish' : 'publish'}</span>
+                : <span className="opacity-60 font-normal">· a Super Admin publishes</span>}
             </button>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -13667,6 +15696,13 @@ function CourseProgram({
 
         {/* AI Trainer — index this course for the voice trainer (per-course opt-in). */}
         {course?.id && <CourseAiTrainerPanel course={course} modules={modules} onEnabledChange={setAiTrainerEnabled} />}
+
+        {/* Unused video files. A resumable upload that finishes and is then abandoned — the
+            drawer closed, the browser died between "uploaded" and "saved" — leaves a real
+            object nothing points at. Under #44 those are unreadable by members (the read
+            policy is reference-based), so this is billable storage rather than a leak, but
+            nothing else would ever surface it. */}
+        {course?.id && <LessonVideoOrphans courseId={course.id} />}
 
         {/* Modules */}
         {modules.map((m, mi) => (
@@ -13717,14 +15753,16 @@ function CourseProgram({
   // rather than the window: it opened off-screen as soon as the builder was scrolled.
   function renderLessonEditor() {
     const d = editingLesson;
-    const detected = d.type === 'video' && d.video_provider !== 'upload' ? parseVideoUrl(d.video_url).provider : null;
+    // A pre-#44 row still carrying an external link. It is READ-ONLY here — shown so the
+    // admin can find the source file, never editable back into a working link.
+    const legacyLink = classifyLessonVideo(d) === 'legacy-link';
     const replay = parseReplayUrl(d.zoom_replay_url);
     const replayOk = replay.kind === 'zoom' || replay.kind === 'external';
     // saveLesson omits the column on a pre-#37b database, so offering the field there would
     // accept a link, confirm "Detected: Zoom", and then silently discard it.
     const preReplayDb = lessonRowsArePreReplay(allLessons);
     // One busy flag, so the shell's close gate and the footer buttons can never disagree.
-    const lessonBusy = savingLesson || uploading;
+    const lessonBusy = savingLesson || blocksLessonSave(videoUploadState);
     const mIdx = modules.findIndex(m => m.id === d.module_id);
     const moduleLabel = mIdx >= 0 ? `Module ${mIdx + 1} · ${modules[mIdx].title || 'Untitled module'}` : null;
     const drawerSubtitle = [course?.title, moduleLabel].filter(Boolean).join(' — ') || undefined;
@@ -13760,7 +15798,8 @@ function CourseProgram({
               <button type="button" onClick={saveLesson} disabled={lessonBusy}
                 className="px-5 py-2 rounded-xl text-white text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-60"
                 style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
-                {lessonBusy ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />} {uploading ? 'Uploading…' : 'Save lesson'}
+                {lessonBusy ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
+                {savingLesson ? 'Saving…' : hasUnfinishedUpload(videoUploadState) ? 'Video not ready' : 'Save lesson'}
               </button>
             </div>
           </>
@@ -13790,35 +15829,40 @@ function CourseProgram({
           <>
             <SettingsSectionLabel>Primary content</SettingsSectionLabel>
             <div className="space-y-3">
-              <label className="block">
-                <span className="text-xs font-semibold text-slate-500">Video link (YouTube, Vimeo, or MP4 URL)</span>
-                <input value={d.video_provider === 'upload' ? '' : (d.video_url || '')} placeholder="https://youtube.com/watch?v=…"
-                  onChange={e => setEditingLesson(s => ({ ...s, video_url: e.target.value, video_provider: parseVideoUrl(e.target.value).provider, storage_path: null }))}
-                  className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
-                {detected && d.video_url && <span className="text-[11px] text-slate-400 mt-1 inline-block">Detected: {detected}</span>}
-              </label>
-              <div className="flex items-center gap-2 text-xs text-slate-400"><div className="flex-1 h-px bg-slate-200" /> or upload a file <div className="flex-1 h-px bg-slate-200" /></div>
-              <div className="flex items-center">
-                {/* sr-only rather than `hidden`: display:none takes the input out of the tab order,
-                    which made this control mouse-only. focus-within surfaces the ring on the label. */}
-                <label className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border border-slate-200 text-sm font-semibold text-slate-600 cursor-pointer hover:bg-slate-50 focus-within:ring-2 focus-within:ring-[color:var(--focus-ring)]">
-                  <Upload size={15} /> {uploading ? 'Uploading…' : 'Choose video file'}
-                  <input type="file" accept="video/*" className="sr-only" disabled={uploading}
-                    onChange={e => { const f = e.target.files?.[0]; if (f) uploadVideo(f); e.target.value = ''; }} />
-                </label>
-                {uploading && <Loader2 size={16} className="animate-spin ml-2 text-blue-500" />}
-                {d.video_provider === 'upload' && d.storage_path && !uploading && <span className="text-[11px] text-green-600 ml-2 inline-flex items-center gap-1"><Check size={12} /> Uploaded</span>}
-              </div>
-              {/* Bounded by max-WIDTH, never max-height. renderVideo's YouTube/Vimeo branch is a
-                  56.25% padding-bottom aspect box whose height derives from its width, so a height
-                  clamp would do nothing there — and combined with this wrapper's overflow-hidden it
-                  would crop the player's control bar. Width governs the aspect box and <video> alike. */}
-              {(previewUrl || (d.video_provider && (d.video_url || d.storage_path))) && (
-                <div className="rounded-xl overflow-hidden max-w-md">
-                  {previewUrl
-                    ? <video controls src={previewUrl} className="w-full rounded-xl bg-black" style={{ maxHeight: 300 }} />
-                    : renderVideo(d)}
+              {/* ★ There is no video-link field here any more, and no "or upload a file"
+                  separator. A pasted YouTube/Vimeo/MP4 URL in course_lessons.video_url is a
+                  permanent, public, un-revokable pointer to material a member paid for, and
+                  parseVideoUrl() classified ANY unrecognised string as 'mp4' and stored it
+                  verbatim with no scheme check. course_lessons_video_guard (#44) refuses the
+                  write server-side too, so this is not merely a hidden input.
+                  Feature-guide videos (MockInterviewSimulator) deliberately keep their link
+                  field — those are public explainers, not paid content. */}
+              {legacyLink && (
+                <div className="rounded-xl px-3 py-2.5 text-xs" role="status"
+                  style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
+                  <div className="font-semibold flex items-center gap-1.5"><AlertTriangle size={13} /> Upload replacement required</div>
+                  <div className="mt-1 leading-relaxed">
+                    This lesson still plays from an external {d.video_provider} link. The course cannot
+                    be published until it is replaced. The stored link is kept below so you can find the
+                    source file — uploading a video replaces it.
+                  </div>
+                  {/* Rendered as TEXT, never as an href: this value was stored with no scheme
+                      validation whatsoever, so it may be anything at all. */}
+                  <div className="mt-1.5 font-mono break-all opacity-80" style={{ fontFamily: fontMono }}>{d.video_url}</div>
                 </div>
+              )}
+              <LessonVideoUploader
+                courseId={course.id}
+                value={d}
+                savedPath={originalEditingLesson?.storage_path || null}
+                onChange={applyVideoPatch}
+                onStateChange={setVideoUploadState}
+                disabled={savingLesson}
+              />
+              {/* Bounded by max-WIDTH, never max-height — the player derives its height from its
+                  width, so a height clamp combined with overflow-hidden would crop the controls. */}
+              {d.video_provider === 'upload' && d.storage_path && (
+                <div className="rounded-xl overflow-hidden max-w-md">{renderVideo(d)}</div>
               )}
             </div>
           </>
@@ -14164,13 +16208,69 @@ async function removeMediaIfUnreferenced(rawPaths) {
   // when the object is absent).
   const videoOrphans = orphans.filter(p => p.startsWith('lessons/'));
   const mediaOrphans = orphans.filter(p => !p.startsWith('lessons/'));
+  // ★ Inspect the RESULT, don't just catch. supabase-js returns a storage failure as
+  //   { data: null, error } WITHOUT throwing — the exact behaviour the reference check 20
+  //   lines above correctly guards against. A try/catch alone therefore swallowed every
+  //   permission-denied, bucket-missing and invalid-path delete silently, leaving the object
+  //   orphaned with no log, no retry and nothing anywhere saying it had happened.
+  //   Reported, never thrown: cleanup is best-effort by design and must not fail the row
+  //   operation that already succeeded.
+  const failed = [];
+  const sweep = async (bucket, part, why) => {
+    try {
+      const { error } = await supabase.storage.from(bucket).remove(part);
+      if (error) failed.push(`${bucket}: ${error.message || error.name || why}`);
+    } catch (e) {
+      failed.push(`${bucket}: ${e?.message || why}`);
+    }
+  };
   for (const part of chunk(videoOrphans, 100)) {
-    try { await supabase.storage.from(LESSON_VIDEO_BUCKET).remove(part); } catch (_) { /* best-effort */ }
+    await sweep(LESSON_VIDEO_BUCKET, part, 'remove failed');
+    // Legacy sweep: a video uploaded before the #15 bucket split may still sit in
+    // course-media. remove() is a no-op when the object is absent, so this is not an error.
     try { await supabase.storage.from('course-media').remove(part); } catch (_) { /* legacy sweep */ }
   }
   for (const part of chunk(mediaOrphans, 100)) {
-    try { await supabase.storage.from('course-media').remove(part); } catch (_) { /* best-effort */ }
+    await sweep('course-media', part, 'remove failed');
   }
+  if (failed.length) {
+    console.error('[course-media] some unreferenced files could not be deleted:', failed.join(' | '));
+  }
+}
+
+/**
+ * Every object filed under one course's lesson folder that no lesson row references.
+ *
+ * A resumable upload that completes and is then abandoned — the admin closes the drawer, or
+ * the browser dies between "uploaded" and "saved" — leaves a real object nothing points at.
+ * Under #44 those are unreadable by members (the read policy is reference-based), so they are
+ * not a leak; they are billable storage nobody can see. Scoped to ONE course on purpose:
+ * never a global prefix sweep, and never a delete straight out of storage.objects.
+ */
+async function findOrphanLessonVideos(courseId) {
+  if (!courseId) return { orphans: [], error: null };
+  const prefix = `lessons/${courseId}`;
+  const found = [];
+  // .list() caps at 1000 per call and gives no total, so page until a short page comes back.
+  for (let offset = 0; offset < 10000; offset += 1000) {
+    const { data, error } = await supabase.storage.from(LESSON_VIDEO_BUCKET)
+      .list(prefix, { limit: 1000, offset });
+    if (error) return { orphans: [], error };
+    const page = data || [];
+    page.forEach(o => o?.name && found.push(`${prefix}/${o.name}`));
+    if (page.length < 1000) break;
+  }
+  if (!found.length) return { orphans: [], error: null };
+  const referenced = new Set();
+  for (let i = 0; i < found.length; i += 100) {
+    const { data, error } = await supabase.from('course_lessons')
+      .select('storage_path').in('storage_path', found.slice(i, i + 100));
+    // Fail conservatively, exactly as removeMediaIfUnreferenced does: if references cannot be
+    // confirmed, report NOTHING as an orphan rather than offering to delete a live video.
+    if (error) return { orphans: [], error };
+    (data || []).forEach(r => r.storage_path && referenced.add(r.storage_path));
+  }
+  return { orphans: found.filter(p => !referenced.has(p)), error: null };
 }
 
 // Pull the underlying PostgrestError fields off a thrown error. Our multi-step flows wrap the real
@@ -14215,7 +16315,10 @@ function describeDbError(e, fallback) {
   // Storage upload/playback failure when the bucket was never created (COURSE_SETUP.md Step 2).
   const hay = [e.message, root.message, root.details, root.hint].filter(Boolean).join(' ');
   if (/bucket/i.test(hay) && /not found|does not exist/i.test(hay)) {
-    parts.push('The “course-media” storage bucket may be missing — create it as a public bucket and add the storage policies from COURSE_SETUP.md Step 2, then retry.');
+    // Lesson VIDEO lives in the private course-videos bucket; only covers and feature-guide
+    // videos are in public course-media. Naming the wrong one sent admins to check a bucket
+    // that was fine while the one that mattered stayed broken.
+    parts.push('A storage bucket may be missing — lesson videos need the PRIVATE “course-videos” bucket and covers need the public “course-media” one. See COURSE_SETUP.md Step 2, then retry.');
   }
   if (code) parts.push(`(code ${code})`);
   return parts.filter(Boolean).join(' — ') || generic;
@@ -14240,8 +16343,17 @@ function CourseCatalog({
   newCourseTitle = 'New QuickBooks Course',
   comingSoonDesc = 'Your QuickBooks Online training is being prepared. Check back soon.',
 } = {}) {
-  const { user, profile } = useAuth();
-  const isAdmin = !!profile?.is_admin;
+  const { user, profile, staff, staffDegraded, can } = useAuth();
+  // #46: authoring rights in a catalog are per-course, so `isAdmin` here means
+  // "may I author in this catalog at all" — it drives the New-course bar and the
+  // draft-visibility rule. Whether a specific card is editable is canManage(c),
+  // below, which mirrors SQL can_manage_course().
+  const legacyAdmin = !!profile?.is_admin;
+  const canCreateCourses = staffDegraded ? legacyAdmin : can('courses.create');
+  const canManageAll = staffDegraded ? legacyAdmin : can('courses.manage_all');
+  const canDeleteCourses = staffDegraded ? legacyAdmin : can('courses.delete');
+  const canManage = (c) => (staffDegraded ? legacyAdmin : canManageCourseClient(staff, c));
+  const isAdmin = canCreateCourses || canManageAll;
   const ent = useContext(EntitlementContext);   // plan scope — drives which course cards a student sees
   const catalogTabId = prefix === 'resume-' ? 'resumestrategy' : prefix === 'interview-' ? 'interview' : 'qbomastery';
   const catalogInterviewSub = prefix === 'interview-' ? 'winstrat' : null;
@@ -14377,6 +16489,24 @@ function CourseCatalog({
       if (e1) throw e1;
       if (e2 || e3) throw (e2 || e3);
 
+      // 1b. Refuse to duplicate a course that still has external-link lessons.
+      // ★ This check runs BEFORE anything is inserted, on purpose. The catch block below
+      //   deletes the half-built copy to avoid leaving a course without its lessons — so if
+      //   the lesson insert were the thing that failed, the admin would lose the new course,
+      //   its modules and every lesson already copied, and read only "Could not duplicate the
+      //   course." Failing here instead costs them nothing and says exactly what to fix.
+      const legacyLessons = (lessons || []).filter(l => classifyLessonVideo(l) === 'legacy-link');
+      if (legacyLessons.length) {
+        setErr(
+          `“${src.title}” can’t be duplicated yet — ${legacyLessons.length} lesson`
+          + `${legacyLessons.length === 1 ? '' : 's'} still play${legacyLessons.length === 1 ? 's' : ''} from an external link: `
+          + legacyLessons.slice(0, 6).map(l => `“${l.title}”`).join(', ')
+          + (legacyLessons.length > 6 ? `, and ${legacyLessons.length - 6} more.` : '.')
+          + ' Open the course, upload each one’s video, then duplicate it.',
+        );
+        return;
+      }
+
       // 2. Unique, catalog-scoped slug for the copy (mirror createCourse's collision handling).
       const newTitle = `Copy of ${src.title}`;
       const existing = new Set(courses.map(x => x.slug));
@@ -14413,19 +16543,27 @@ function CourseCatalog({
         if (error) { const wrap = new Error('Couldn’t copy the modules for this course.'); wrap.cause = error; throw wrap; }
       }
 
-      // 5. Copy lessons under the remapped modules (reuse video/storage references verbatim).
-      // zoom_replay_url is copied like every other content column: unlike course_date (which
+      // 5. Copy lessons under the remapped modules.
+      // ★ storage_path is reused BY REFERENCE — copy-on-write, no bytes are copied. This is
+      //   the whole reason removeMediaIfUnreferenced() exists, and it is also why the #44
+      //   storage policy authorizes an object through EVERY course that cites it rather than
+      //   by parsing a course id out of its path: a duplicate's video legitimately lives in
+      //   the source course's folder.
+      // ★ video_url / video_provider are NOT copied. Step 1b already refused a source with a
+      //   link-backed lesson, so there is nothing legitimate left to carry over, and copying
+      //   one would be a fresh link-backed INSERT that course_lessons_video_guard refuses.
+      // zoom_replay_url IS copied, like every other content column: unlike course_date (which
       // resets to today) a replay is often evergreen, and the copy is born a draft the admin
-      // reviews — so carry it over and let them clear it if it was specific to that run. On a
-      // DB predating #37b the key is left OFF the payload entirely rather than sent as
-      // undefined, which postgrest-js would still union into ?columns= and 42703 the insert.
+      // reviews. On a DB predating #37b the key is left OFF the payload entirely rather than
+      // sent as undefined, which postgrest-js would still union into ?columns= and 42703 the insert.
       const preReplayDb = lessonRowsArePreReplay(lessons);
       const lessonPayloads = (lessons || [])
         .filter(l => moduleIdMap.has(l.module_id))
         .map(l => ({
           module_id: moduleIdMap.get(l.module_id), course_id: newCourseId,
-          title: l.title, type: l.type, video_url: l.video_url, video_provider: l.video_provider,
-          storage_path: l.storage_path, text_content: l.text_content,
+          title: l.title, type: l.type,
+          ...lessonVideoPayload(l, null),
+          text_content: l.text_content,
           duration_label: l.duration_label, position: l.position,
           ...(preReplayDb ? {} : { zoom_replay_url: l.zoom_replay_url ?? null }),
         }));
@@ -14479,16 +16617,21 @@ function CourseCatalog({
       const candidates = new Set();
       // Covers live in course-media; lesson videos in the private course-videos bucket (with
       // possible legacy copies still in course-media). List each from the right bucket(s).
-      try {
-        const { data: objs } = await supabase.storage.from('course-media').list(`covers/${c.id}`, { limit: 1000 });
-        (objs || []).forEach(o => candidates.add(`covers/${c.id}/${o.name}`));
-      } catch (_) { /* ignore — row delete still proceeds */ }
-      for (const bkt of [LESSON_VIDEO_BUCKET, 'course-media']) {
-        try {
-          const { data: objs } = await supabase.storage.from(bkt).list(`lessons/${c.id}`, { limit: 1000 });
-          (objs || []).forEach(o => candidates.add(`lessons/${c.id}/${o.name}`));
-        } catch (_) { /* ignore — row delete still proceeds */ }
-      }
+      // ★ Paginated and error-checked. .list() caps at 1000 per call and returns a failure as
+      //   { data: null, error } WITHOUT throwing, so the previous single unchecked call
+      //   silently under-collected on a large course and reported nothing at all on a failure —
+      //   leaving the remainder as billable objects no later pass would ever find.
+      const listAll = async (bucket, prefix) => {
+        for (let offset = 0; offset < 10000; offset += 1000) {
+          const { data, error } = await supabase.storage.from(bucket).list(prefix, { limit: 1000, offset });
+          if (error) { console.error(`[course-media] could not list ${bucket}/${prefix}:`, error.message || error); return; }
+          const page = data || [];
+          page.forEach(o => o?.name && candidates.add(`${prefix}/${o.name}`));
+          if (page.length < 1000) return;
+        }
+      };
+      await listAll('course-media', `covers/${c.id}`);
+      for (const bkt of [LESSON_VIDEO_BUCKET, 'course-media']) await listAll(bkt, `lessons/${c.id}`);
       try {
         const { data: ls } = await supabase.from('course_lessons').select('storage_path').eq('course_id', c.id);
         (ls || []).forEach(r => r.storage_path && candidates.add(r.storage_path));
@@ -14560,7 +16703,14 @@ function CourseCatalog({
 
   // Students only see courses their plan can open (e.g. a Sampler sees Essentials, not
   // Mastery); admins always see all. RLS is the real boundary — this drives card display.
-  const visibleCourses = isAdmin ? courses : courses.filter(c => ent.allowsCourse(c));
+  // Who sees which cards. courses.manage_all sees everything including drafts; a
+  // Trainer sees the drafts assigned to them PLUS whatever their own plan entitles
+  // them to as a member; a student sees only plan-entitled published courses.
+  // courses_read re-decides all of this server-side — a draft nobody assigned to
+  // this Trainer is not merely hidden here, it is not returned by the query.
+  const visibleCourses = canManageAll
+    ? courses
+    : courses.filter(c => canManage(c) || ent.allowsCourse(c));
 
   return (
     <div>
@@ -14627,12 +16777,14 @@ function CourseCatalog({
                   {cover
                     ? <img src={cover} alt="" className="absolute inset-0 w-full h-full object-cover" />
                     : <div className="absolute inset-0 flex items-center justify-center" style={{ background: `linear-gradient(135deg, ${ROYAL}, ${CYAN})` }}><GraduationCap size={44} className="text-white/90" /></div>}
-                  {isAdmin && !c.published && <span className="absolute top-2 left-2 px-2 py-0.5 rounded-full text-[10px] font-bold" style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)' }}>Draft</span>}
-                  {total > 0 && pct === 100 && <span className={`absolute top-2 ${isAdmin ? 'right-11' : 'right-2'} px-2 py-0.5 rounded-full text-[10px] font-bold inline-flex items-center gap-1`} style={{ background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)' }}><Award size={11} /> Done</span>}
+                  {canManage(c) && !c.published && <span className="absolute top-2 left-2 px-2 py-0.5 rounded-full text-[10px] font-bold" style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)' }}>Draft</span>}
+                  {total > 0 && pct === 100 && <span className={`absolute top-2 ${canManage(c) ? 'right-11' : 'right-2'} px-2 py-0.5 rounded-full text-[10px] font-bold inline-flex items-center gap-1`} style={{ background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)' }}><Award size={11} /> Done</span>}
                 </button>
 
                 {/* Admin ⋮ action menu (Edit / Duplicate / cover / reorder / Delete) */}
-                {isAdmin && (
+                {/* #46: per-course. A Trainer sees this menu only on the courses
+                    assigned to them; courses_staff_update re-decides every write. */}
+                {canManage(c) && (
                   <>
                     <button title="Course options" aria-label="Course options" aria-haspopup="menu" aria-expanded={menuOpen} disabled={busy}
                       onClick={() => setMenuOpenId(menuOpen ? null : c.id)}
@@ -14660,7 +16812,9 @@ function CourseCatalog({
                           <button role="menuitem" disabled={idx === 0 || busy} onClick={() => reorderCourse(idx, -1)} className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2 disabled:opacity-30"><ChevronUp size={14} /> Move up</button>
                           <button role="menuitem" disabled={idx === courses.length - 1 || busy} onClick={() => reorderCourse(idx, 1)} className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2 disabled:opacity-30"><ChevronDown size={14} /> Move down</button>
                           <div className="h-px bg-slate-100 my-1" />
-                          <button role="menuitem" disabled={busy} onClick={() => deleteCourse(c)} className="w-full text-left px-3 py-2 text-sm text-red-600 hover:bg-red-50 inline-flex items-center gap-2 disabled:opacity-50"><Trash2 size={14} /> Delete course</button>
+                          {canDeleteCourses && (
+                            <button role="menuitem" disabled={busy} onClick={() => deleteCourse(c)} className="w-full text-left px-3 py-2 text-sm text-red-600 hover:bg-red-50 inline-flex items-center gap-2 disabled:opacity-50"><Trash2 size={14} /> Delete course</button>
+                          )}
                         </div>
                       </>
                     )}

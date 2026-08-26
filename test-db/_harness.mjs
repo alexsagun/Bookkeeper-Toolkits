@@ -309,8 +309,19 @@ export async function resetShadow() {
       public.community_comments,
       public.community_posts,
       public.subscriptions,
-      public.enrollment_requests
+      public.enrollment_requests,
+      -- #44: the course-video suite creates courses, modules and lessons. Without these
+      -- three the next suite inherits them, and courseVideos.dbtest's own fixtures would
+      -- accumulate across runs until a slug collision made the failure look unrelated.
+      -- CASCADE carries course_modules/course_lessons/lesson_progress/course_completions
+      -- and the course_ai_* rows; naming the two children anyway keeps the intent legible.
+      public.course_lessons,
+      public.course_modules,
+      public.courses
     restart identity cascade`);
+  // Objects the course-video tests file under the private bucket. Deleted rather than
+  // truncated: storage.objects is shared with the community-media and receipts suites.
+  await runSql(`delete from storage.objects where bucket_id = 'course-videos'`);
   // Cohorts and their spaces: delete the batches, let the FK cascade take the
   // spaces (and, since #40, their categories and channels). General is seeded
   // by #32 and its channels by #40 — both must survive.

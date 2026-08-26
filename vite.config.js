@@ -138,6 +138,87 @@ const studentImportDevApi = (env) => ({
   },
 });
 
+// Staff management (#45). Same shape as studentImportDevApi — it needs the
+// service key because inviting a user goes through the Auth Admin API, and it
+// must exercise the real staff.manage gate locally, since that gate is now the
+// only thing standing between a Trainer and the ability to promote themselves.
+const staffDevApi = (env) => ({
+  name: 'staff-admin-dev',
+  configureServer(server) {
+    server.middlewares.use('/api/admin/staff', async (req, res) => {
+      const keys = [
+        'SUPABASE_SECRET_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'APP_URL',
+        'VITE_SUPABASE_URL', 'VITE_SUPABASE_ANON_KEY', 'SUPABASE_URL', 'SUPABASE_ANON_KEY',
+      ];
+      for (const k of keys) {
+        if (!process.env[k] && env[k]) process.env[k] = env[k];
+      }
+      res.status = (code) => { res.statusCode = code; return res; };
+      res.json = (obj) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(obj)); };
+      res.send = (text) => { res.end(String(text)); };
+      try {
+        if (req.method === 'POST') {
+          req.body = await new Promise((resolve) => {
+            let data = '';
+            req.on('data', (c) => { data += c; });
+            req.on('end', () => resolve(data));
+            req.on('error', () => resolve(''));
+          });
+        }
+        const { default: handler } = await import('./api/admin/staff.js');
+        await handler(req, res);
+      } catch (err) {
+        res.status(500).json({ error: String(err) });
+      }
+    });
+  },
+});
+
+// The two Resend notification endpoints. They were the ONLY api/ handlers with no
+// dev middleware, so under `npm run dev` they 404'd and no send was ever attempted
+// — which is why the enrollment confirmation email was believed not to exist at
+// all. Vercel ran them; localhost never did. One factory serves both, since the
+// request plumbing is identical and only the module path differs.
+const notifyDevApi = (env, route, modulePath) => ({
+  name: `notify-dev${route.replace(/\W+/g, '-')}`,
+  configureServer(server) {
+    server.middlewares.use(route, async (req, res) => {
+      const keys = [
+        'RESEND_API_KEY', 'RESEND_FROM', 'NOTIFY_ADMIN_EMAIL', 'APP_URL',
+        // No service-role key here on purpose: both notify handlers authenticate
+        // with the CALLER's JWT + the anon key, so handing them one would overstate
+        // what these endpoints are allowed to do.
+        'VITE_SUPABASE_URL', 'VITE_SUPABASE_ANON_KEY', 'SUPABASE_URL', 'SUPABASE_ANON_KEY',
+      ];
+      for (const k of keys) {
+        if (!process.env[k] && env[k]) process.env[k] = env[k];
+      }
+      res.status = (code) => { res.statusCode = code; return res; };
+      res.json = (obj) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(obj)); };
+      res.send = (text) => { res.end(String(text)); };
+      try {
+        if (req.method === 'POST') {
+          const raw = await new Promise((resolve) => {
+            let data = '';
+            req.on('data', (c) => { data += c; });
+            req.on('end', () => resolve(data));
+            req.on('error', () => resolve(''));
+          });
+          // The Vercel runtime hands the handler a PARSED body; the dev server does
+          // not. Both handlers do tolerate a string body, so this is not strictly
+          // required — parse anyway so dev and prod hand the handler the same shape
+          // and a bug can't hide behind the difference.
+          try { req.body = raw ? JSON.parse(raw) : {}; } catch { req.body = {}; }
+        }
+        const { default: handler } = await import(modulePath);
+        await handler(req, res);
+      } catch (err) {
+        res.status(500).json({ error: String(err) });
+      }
+    });
+  },
+});
+
 // The app's AI features call the Anthropic API. To keep the API key OUT of the
 // browser bundle, the dev server proxies `/api/anthropic/*` to the real API and
 // injects the auth headers here, server-side. (See src/main.jsx for the fetch
@@ -147,7 +228,10 @@ export default defineConfig(({ mode }) => {
   const apiKey = env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY || '';
 
   return {
-    plugins: [react(), elevenlabsDevApi(env), studentImportDevApi(env), trainerDevApi(env), courseTrainerDevApi(env)],
+    plugins: [react(), elevenlabsDevApi(env), studentImportDevApi(env), trainerDevApi(env), courseTrainerDevApi(env),
+      staffDevApi(env),
+      notifyDevApi(env, '/api/notify-enrollment', './api/notify-enrollment.js'),
+      notifyDevApi(env, '/api/notify-access', './api/notify-access.js')],
     build: {
       rollupOptions: {
         output: {
