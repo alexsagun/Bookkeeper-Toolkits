@@ -244,8 +244,15 @@ The invitation needs `RESEND_API_KEY`, `RESEND_FROM` and `APP_URL` on the server
 ```
 
 If `hasResend` is false the membership is still created and the role is still assigned — the email
-simply is not sent, the row is flagged `invite_status = 'failed'`, and Team & Roles offers
-**Resend invitation**. An unset `APP_URL` falls back to the request host.
+simply is not sent. What happens next depends on which branch ran:
+
+- **A new or unconfirmed account** stays at `status='invited'`, the row is flagged
+  `invite_status='failed'`, and Team & Roles offers **Resend invitation**.
+- **A confirmed existing account** was promoted straight to `active` with no token, so nothing is
+  pending and there is no Resend control — the failed message was a *notification*, not an
+  invitation. Tell them directly that they now hold the role.
+
+An unset `APP_URL` falls back to the request host.
 
 ### Deliverability
 

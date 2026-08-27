@@ -8075,6 +8075,7 @@ export default function BookkeeperProToolkit() {
     loading, recovery, user, profileReady, profile,
     staffReady, staffDegraded, staffMembership, staff,
     enroll, renewNow, inviteDismissed: staffInviteDismissed,
+    hasInviteToken: !!staffInvite,
     requireApproval: REQUIRE_ADMIN_APPROVAL,
     requireEnrollment: REQUIRE_ENROLLMENT,
   });
@@ -8085,19 +8086,6 @@ export default function BookkeeperProToolkit() {
   // it prints the decision. Ids only — never an email, never a token.
   if (gate.screen !== GATE_SCREENS.APP) {
     console.debug('[gate]', gate.reason, { uid: user?.id, screen: gate.screen });
-  }
-
-  // An invitation token in the URL outranks everything except the initial auth
-  // load: the person arriving from that link may have no session at all yet, so
-  // this cannot wait for the signed-in branches below.
-  if (!loading && staffInvite) {
-    return (
-      <StaffInvitationSetup
-        invite={staffInvite}
-        onAccepted={acceptStaffInvite}
-        onDismissToken={dismissStaffInvite}
-      />
-    );
   }
 
   switch (gate.screen) {
@@ -8113,13 +8101,15 @@ export default function BookkeeperProToolkit() {
     case GATE_SCREENS.IMPORT_ONBOARDING:
       return <SetPasswordScreen />;
 
-    // #49: an invited staff member, reached WITHOUT a token — they signed in
-    // normally and a pending membership is waiting. This is what repairs someone
-    // who accepted an old-style invitation and landed on the pricing page.
+    // #49: both entry paths land here — arriving from the email link (a token in
+    // `staffInvite`), and signing in normally with a pending membership waiting,
+    // which is what repairs someone who accepted an old-style invitation and was
+    // dropped on the pricing page. Routing both through resolveGateScreen() is what
+    // makes the ban outrank the token; a branch ahead of this switch did not.
     case GATE_SCREENS.STAFF_INVITATION:
       return (
         <StaffInvitationSetup
-          invite={null}
+          invite={staffInvite}
           onAccepted={acceptStaffInvite}
           onDismissToken={dismissStaffInvite}
         />
@@ -13181,10 +13171,13 @@ function MembershipPanel() {
   // ★ #49: this panel renders null for "staff", and until now that meant Super
   //   Admin only. An Operations Admin or Trainer has no subscription by design, so
   //   once #49 let them reach the dashboard they would have been shown a
-  //   membership card about a membership they were never meant to buy. A staff
-  //   member who IS also a paying student still sees it — staffBypassesPaywall is
-  //   about the paywall, and this is about whether the card is meaningful.
-  const isAdmin = !!profile?.is_admin || staffBypassesPaywall(staff);
+  //   membership card about a membership they were never meant to buy.
+  //
+  //   ★ But that test belongs BELOW, on whether a subscription actually exists —
+  //     not here. Folding staffBypassesPaywall() into `isAdmin` also skipped the
+  //     fetch, so a staff member who IS a paying student lost their expiry date
+  //     and their Renew button along with it. (CodeRabbit, PR #4.)
+  const isAdmin = !!profile?.is_admin;
   const [sub, setSub] = useState(null);
   const [reqs, setReqs] = useState([]);
   const [plan, setPlan] = useState(null);
@@ -13274,6 +13267,10 @@ function MembershipPanel() {
   }, []);
 
   if (!REQUIRE_ENROLLMENT || !uid || isAdmin) return null;
+  // ★ Active staff with NO subscription have no membership to show, so the card
+  //   would be a prompt to buy something their job already gives them. Staff who
+  //   ALSO bought a plan keep it, expiry and Renew included.
+  if (loaded && !sub && staffBypassesPaywall(staff)) return null;
   // First load in flight → fixed-height skeleton so the Dashboard doesn't reflow/flash
   // when the real panel lands. A failed load shows a compact retry card — a student's
   // membership card must never just vanish with no explanation.

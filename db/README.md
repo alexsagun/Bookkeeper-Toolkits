@@ -67,7 +67,7 @@ the #20/#21 incident. Full explanation and a per-tab inventory:
    (see [../AUTH_SETUP.md](../AUTH_SETUP.md)).
 2. Run **[`000_full_database_bootstrap.sql`](000_full_database_bootstrap.sql)** once. It creates the entire
    final schema (all tables, functions, RLS, indexes, all five storage buckets, realtime publication) in
-   the fully-gated state (approval + enrollment both ON), **through #48** — including the cohort-entitlement
+   the fully-gated state (approval + enrollment both ON), **through `#49`** — including the cohort-entitlement
    ledger, the channel layer (categories, channels, per-channel plan/batch audiences); D2 is retired by #40, the batch past-lock + month-end sweep, and the
    three-plan catalog (Sampler / Silver / VIP; VIP is the only cohort segment). One thing the
    SQL cannot finish on its own: if #38's `do` block printed the pg_cron notice, enable

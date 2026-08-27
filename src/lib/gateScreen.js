@@ -87,12 +87,17 @@ export function resolveGateScreen(state) {
   const {
     loading, recovery, user, profileReady, profile,
     staffReady = true, staffDegraded = false, staffMembership,
-    staff, enroll, renewNow = false, inviteDismissed = false,
+    staff, enroll, renewNow = false, inviteDismissed = false, hasInviteToken = false,
     requireApproval = true, requireEnrollment = true,
   } = s;
 
   if (loading) return { screen: GATE_SCREENS.SPLASH, reason: 'auth_loading' };
   if (recovery) return { screen: GATE_SCREENS.RECOVERY, reason: 'password_recovery' };
+  if (hasInviteToken && !inviteDismissed && !user) {
+    // No session yet, so no profile and therefore no ban to check — redeeming the
+    // token is what creates the session the rest of this function reasons about.
+    return { screen: GATE_SCREENS.STAFF_INVITATION, reason: 'staff_invitation_token' };
+  }
   if (!user) return { screen: GATE_SCREENS.AUTH, reason: 'signed_out' };
   if (!profileReady) return { screen: GATE_SCREENS.SPLASH, reason: 'profile_loading' };
 
@@ -136,8 +141,18 @@ export function resolveGateScreen(state) {
   // nothing, so whoever dismisses it simply meets whichever student gate applies.
   // Without it a paying student who is offered a job is PINNED here, unable to
   // reach the membership they already bought without first accepting the job.
-  if (!inviteDismissed && staffInvitationPending(staffMembership)) {
-    return { screen: GATE_SCREENS.STAFF_INVITATION, reason: 'staff_invitation_pending' };
+  // ★ THE TOKEN IS DECIDED HERE, BELOW THE BAN — not in a branch ahead of the
+  //   switch. It used to be exactly that: `if (!loading && staffInvite)` ran before
+  //   this function's verdict was consulted at all, so a rejected account that
+  //   opened an invitation link rendered the acceptance screen anyway and could
+  //   call accept_staff_invitation(), committing a membership write and an audit
+  //   row. That defeated the whole reason the ban was moved above the invitation.
+  //   Recovery was bypassed the same way. (CodeRabbit, PR #4.)
+  if (!inviteDismissed && (hasInviteToken || staffInvitationPending(staffMembership))) {
+    return {
+      screen: GATE_SCREENS.STAFF_INVITATION,
+      reason: hasInviteToken ? 'staff_invitation_token' : 'staff_invitation_pending',
+    };
   }
 
 

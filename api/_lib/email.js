@@ -26,6 +26,8 @@
 //   the provider's response body.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import { randomUUID } from 'node:crypto';
+
 export const BRAND = 'Toolkits by Alex';
 
 /**
@@ -63,12 +65,23 @@ export async function sendEmail({ to, subject, html, text, tag = 'email' }) {
   // Resend accepts both parts and builds a multipart/alternative message.
   if (text) payload.text = text;
 
+  // ★ ONE key for all three attempts. A fetch() that rejects AFTER Resend has
+  //   accepted the request is indistinguishable from one it never received, so a
+  //   blind retry can deliver the same invitation twice. Resend de-duplicates on
+  //   this header, which turns "retry" back into "retry" rather than "resend".
+  //   (CodeRabbit, PR #4.)
+  const idempotencyKey = randomUUID();
+
   for (let attempt = 0; attempt < 3; attempt++) {
     let r;
     try {
       r = await fetch('https://api.resend.com/emails', {
         method: 'POST',
-        headers: { 'content-type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        headers: {
+          'content-type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+          'Idempotency-Key': idempotencyKey,
+        },
         body: JSON.stringify(payload),
       });
     } catch { r = null; }

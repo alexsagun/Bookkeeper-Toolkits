@@ -338,3 +338,55 @@ test('the ban still outranks the paywall, as it always did', () => {
   });
   assert.equal(screenOf(s), GATE_SCREENS.REJECTED);
 });
+
+// ── The invitation TOKEN obeys the same precedence ──────────────────────────
+// The token used to be handled by a branch that ran BEFORE resolveGateScreen()'s
+// verdict was consulted, checking only `!loading`. So every rule this module
+// establishes — the ban outranking the invitation, recovery outranking everything
+// — was bypassed the moment someone arrived from the email link. (CodeRabbit, PR #4.)
+
+test('a token does NOT let a rejected account reach the acceptance screen', () => {
+  // Accepting commits a membership write and an audit row the UI cannot undo.
+  const s = student({
+    profile: { is_admin: false, approval_status: 'rejected' },
+    hasInviteToken: true,
+  });
+  assert.equal(screenOf(s), GATE_SCREENS.REJECTED);
+});
+
+test('a token does not pre-empt a password recovery in flight', () => {
+  assert.equal(screenOf(student({ recovery: true, hasInviteToken: true })), GATE_SCREENS.RECOVERY);
+});
+
+test('a token does not pre-empt the initial auth load', () => {
+  assert.equal(screenOf(student({ loading: true, hasInviteToken: true })), GATE_SCREENS.SPLASH);
+});
+
+test('a SIGNED-OUT holder of a token gets the acceptance screen, not the login form', () => {
+  // No session means no profile, so no ban can apply — and redeeming the token is
+  // what creates the session everything else reasons about.
+  const s = student({ user: null, hasInviteToken: true });
+  assert.equal(screenOf(s), GATE_SCREENS.STAFF_INVITATION);
+  assert.equal(resolveGateScreen(s).reason, 'staff_invitation_token');
+});
+
+test('a signed-out holder who dismisses the token falls back to the login form', () => {
+  const s = student({ user: null, hasInviteToken: true, inviteDismissed: true });
+  assert.equal(screenOf(s), GATE_SCREENS.AUTH);
+});
+
+test('a token still reaches the screen for an ordinary signed-in student', () => {
+  const s = student({
+    hasInviteToken: true,
+    enroll: { active: true, ready: true, configured: true, state: 'paywall' },
+  });
+  assert.equal(screenOf(s), GATE_SCREENS.STAFF_INVITATION);
+});
+
+test('imported onboarding still outranks a token', () => {
+  const s = student({
+    profile: { is_admin: false, account_origin: 'import', onboarding_status: 'pending' },
+    hasInviteToken: true,
+  });
+  assert.equal(screenOf(s), GATE_SCREENS.IMPORT_ONBOARDING);
+});

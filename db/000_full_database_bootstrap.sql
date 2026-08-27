@@ -19386,6 +19386,24 @@ begin
       'A name is required and must be 120 characters or fewer.', 422);
   end if;
 
+  -- ★ STAFF ONLY. This exists so an invitee can give their name while accepting;
+  --   it was granted to `authenticated` at large, which is wider than the reason
+  --   for it. A rejected or revoked non-staff account could rewrite full_name AND
+  --   the author name on all of their historical community posts. 'invited' is
+  --   included because the invitee is mid-acceptance and not yet active — the
+  --   whole point — but a membership row must exist. (CodeRabbit, PR #4.)
+  --
+  --   This is why it does NOT copy set_my_avatar()'s
+  --   is_approved()+is_enrolled() guard: an invitee is by definition not enrolled,
+  --   so that guard would fail for exactly the person this serves.
+  if not exists (
+    select 1 from public.staff_memberships m
+     where m.user_id = v_uid and m.status in ('invited', 'active')
+  ) then
+    perform public.app_error('FORBIDDEN',
+      'Only staff can set their display name here.', 403);
+  end if;
+
   update public.profiles
      set full_name  = v_name,
          updated_at = now()
