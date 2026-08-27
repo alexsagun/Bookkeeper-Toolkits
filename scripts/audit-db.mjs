@@ -468,6 +468,56 @@ export const OBJECT_CHECKS = [
   ['#47    only Super Admin may grant a discretionary extension', `select coalesce(bool_and(
         role_key = 'super_admin'), false) as ok
       from public.staff_role_permissions where permission_key='students.extend_access'`],
+
+  // ── #48, authorization hardening ──────────────────────────────────────────
+  // The finding that mattered: subscriptions_admin_all / enroll_req_admin_all were
+  // FOR ALL gated on enrollments.review, and `authenticated` keeps Supabase's
+  // default table grants — so RLS was the only gate and an Operations Admin could
+  // PATCH any subscription to plan_key=vip / ends_at=2099 and DELETE rows outright,
+  // making #47's Super-Admin-only extension split decorative.
+  ['#48    money tables are no longer FOR ALL to a reviewer', `select not exists (
+      select 1 from pg_policies where schemaname='public'
+       and policyname in ('subscriptions_admin_all','enroll_req_admin_all')) as ok`],
+  ['#48    reviewers read subscriptions, Super Admin writes them', `select
+      exists (select 1 from pg_policies where schemaname='public'
+               and policyname='subscriptions_staff_read' and cmd='SELECT')
+      and exists (select 1 from pg_policies where schemaname='public'
+                   and policyname='subscriptions_super_write'
+                   and qual ilike '%is_super_admin%') as ok`],
+  ['#48    a reviewer may update a request but not create one', `select
+      exists (select 1 from pg_policies where schemaname='public'
+               and policyname='enroll_req_staff_update' and cmd='UPDATE')
+      and exists (select 1 from pg_policies where schemaname='public'
+                   and policyname='enroll_req_super_write'
+                   and qual ilike '%is_super_admin%') as ok`],
+  ['#48    a reviewer cannot approve their OWN request', `select coalesce(bool_or(
+        tgname='enrollment_self_approval_guard'), false) as ok
+      from pg_trigger where tgrelid='public.enrollment_requests'::regclass and not tgisinternal`],
+  ['#48    ALL THREE AI-trainer tables are course-scoped', `select count(*) = 3 as ok
+      from pg_policies where schemaname='public'
+       and tablename in ('course_ai_sources','course_ai_chunks','course_ai_index_jobs')
+       and coalesce(qual,'') ilike '%can_manage_course%'`],
+  // A Trainer could not create a course at all: createCourse() emits
+  // INSERT ... RETURNING and the returned row failed courses_read.
+  ['#48    a course creator can read what they just created', `select coalesce(bool_and(
+        qual ilike '%created_by%'), false) as ok
+      from pg_policies where schemaname='public' and policyname='courses_read'`],
+  // ...but that branch must expire with employment, not outlive it via provenance.
+  ['#48    the creator branch expires with the staff role', `select coalesce(bool_and(
+        qual ilike '%courses.create%'), false) as ok
+      from pg_policies where schemaname='public' and policyname='courses_read'`],
+  // Every per-row can_manage_course() call in a READ policy must sit behind an
+  // InitPlan-able capability test, or an ordinary student pays a SECURITY DEFINER
+  // call once per row (#44 reasoned about exactly this ordering).
+  ['#48    no read policy calls can_manage_course unguarded', `select not exists (
+      select 1 from pg_policies
+       where schemaname in ('public','storage') and cmd='SELECT'
+         and coalesce(qual,'') ilike '%can_manage_course%'
+         and coalesce(qual,'') not ilike '%has_staff_permission%') as ok`],
+  ['#48    feature-guide media is writable again', `select coalesce(bool_and(
+        coalesce(with_check, qual) ilike '%feature-guides%'), false) as ok
+      from pg_policies where schemaname='storage'
+       and policyname in ('course_media_admin_write','course_media_admin_update','course_media_admin_delete')`],
 ];
 
 async function main() {

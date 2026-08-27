@@ -7,12 +7,12 @@
 //      my_staff_context() (read with the CALLER's JWT),
 //   BOTH BEFORE the service-role client is constructed. (#45)
 //
-//   3. THEN, for every action except 'preview', resolves the course the request
-//      will actually act on — from lesson_id / source_id, NOT from the caller's
-//      course_id — and confirms can_manage_course() on THAT. This step runs after
-//      service() because resolving a lesson or source to its course needs a
-//      privileged read. Constructing the client is not the danger; mutating an
-//      unauthorized row is, and no handler has run at that point.
+//   3. THEN, for every action except 'preview', resolves EVERY course the request
+//      touches — from course_id AND lesson_id AND source_id, requiring ALL of
+//      them to clear can_manage_course(). Resolving only ONE let a caller pair a
+//      course they own with one they do not. This runs after service() because
+//      resolving a lesson/source needs a privileged read; constructing the client
+//      is not the danger — mutating an unauthorized row is, and no handler has run.
 //
 // Actions (POST body.action):
 //   'status'             — { migrated, embeddings, pendingJobs, sourceCounts }
@@ -31,7 +31,7 @@
 
 import crypto from 'node:crypto';
 import { requireStaff, callerCanManageCourse, service, serviceConfigured } from '../_lib/staffAuth.js';
-import { courseScopeVerdict } from '../../src/lib/staffRoles.js';
+import { courseScopeVerdict, staffCan } from '../../src/lib/staffRoles.js';
 import { elevenLabsApiBase } from '../elevenlabs/signed-url.js';
 import { chunkText, ENROLLMENT_PLAN_KEYS } from '../../src/lib/trainerContent.js';
 
@@ -117,37 +117,45 @@ async function edgeEmbedReachable() {
 }
 
 /**
- * Which course does this request actually ACT on?
+ * EVERY course this request touches — not just the one a priority order picks.
  *
- * Not "which course did the caller claim" — which one will the handler mutate.
- * `doTranscribe` and the lesson branch of `doSaveTranscript` resolve their target
- * from `lesson_id`; `doSetIncluded` and `doRetrySource` from `source_id`. Each of
- * those rows carries its own `course_id`, and THAT is the one authorization has to
- * be checked against.
+ * ★ THE BUG THIS REPLACES. The previous version resolved a SINGLE target by
+ *   priority (lesson_id → source_id → course_id) and returned it. But the
+ *   dispatcher below hands each action a DIFFERENT identifier: `sync` uses
+ *   body.course_id, `set-source-included` uses body.source_id, `save-transcript`
+ *   uses either. A request may carry all three at once, so an attacker supplied a
+ *   HIGH-priority id they own and a LOW-priority id they do not: the gate
+ *   authorised the first, the handler mutated the second.
  *
- * Returns null when there is nothing to resolve — the caller then requires
- * `courses.manage_all`, which is the correct fallback for an unscoped action.
+ *   Concretely, a Trainer assigned only to course A could POST
+ *   `{action:'sync', course_id:'<B>', lesson_id:'<a lesson in A>'}` and re-index —
+ *   deleting sources and chunks of — course B, which they have no rights over.
+ *   The old function's own comment says "that is the confused deputy again"; it
+ *   closed the course_id → lesson/source direction and left the inverse open.
+ *
+ *   Returning the SET and requiring all of it to be authorised removes the
+ *   priority order entirely, so there is no longer a high and a low id to split.
  */
-async function resolveTargetCourseId(admin, action, body) {
-  const lessonId = body?.lesson_id;
-  const sourceId = body?.source_id;
+async function resolveTargetCourseIds(admin, body) {
+  const ids = new Set();
 
-  if (UUID_RE.test(lessonId || '')) {
+  if (UUID_RE.test(body?.course_id || '')) ids.add(body.course_id);
+
+  if (UUID_RE.test(body?.lesson_id || '')) {
     const { data } = await admin.from('course_lessons')
-      .select('course_id').eq('id', lessonId).maybeSingle();
-    // A lesson id that resolves to nothing must not silently fall through to the
-    // caller-supplied course_id — that is the confused deputy again.
-    return data?.course_id || null;
+      .select('course_id').eq('id', body.lesson_id).maybeSingle();
+    // An id that resolves to nothing is not "no constraint" — it is an id we
+    // cannot authorise, so it must fail the caller rather than drop out of the set.
+    ids.add(data?.course_id || '__unresolved__');
   }
 
-  if (UUID_RE.test(sourceId || '')) {
+  if (UUID_RE.test(body?.source_id || '')) {
     const { data } = await admin.from('course_ai_sources')
-      .select('course_id').eq('id', sourceId).maybeSingle();
-    return data?.course_id || null;
+      .select('course_id').eq('id', body.source_id).maybeSingle();
+    ids.add(data?.course_id || '__unresolved__');
   }
 
-  // Only now is the caller's own course_id the target (status / sync / notes).
-  return UUID_RE.test(body?.course_id || '') ? body.course_id : null;
+  return [...ids];
 }
 
 // ── Actions (each returns { status, body }) ──────────────────────────────────
@@ -538,31 +546,54 @@ export default async function handler(req, res) {
   //
   // ★ `preview` is exempt: it renders the trainer response as a given PLAN would
   //   see it, over already-published content, and has no course target.
-  if (action !== 'preview') {
-    let targetCourseId = null;
+  if (action === 'preview') {
+    // ★ `preview` renders the trainer response as a given PLAN would see it, over
+    //   every published ai_trainer_enabled course in that plan's scope — it has no
+    //   single course target, which is why it used to skip the course gate. That was
+    //   safe while this endpoint was admin-only. #45 re-gated it on
+    //   `course_trainer.manage`, a key TRAINERS hold, and #46 then narrowed
+    //   courses_read so a Trainer may only read courses they manage. The exemption
+    //   therefore became a way for a Trainer to read excerpts of paid courses they
+    //   are not assigned to, via the service role, by iterating queries.
+    //   Previewing the whole catalogue is a whole-catalogue capability.
+    if (!staffCan(gate.context, 'courses.manage_all') && !gate.legacy) {
+      return res.status(403).json({
+        error: 'Previewing the trainer across a plan needs permission to manage every course.',
+        code: 'COURSE_NOT_ASSIGNED',
+      });
+    }
+  } else {
+    let targetCourseIds = [];
     try {
-      targetCourseId = await resolveTargetCourseId(admin, action, body);
+      targetCourseIds = await resolveTargetCourseIds(admin, body);
     } catch {
       return res.status(500).json({ error: 'Could not resolve the target course.' });
     }
 
-    // `assignment` is tri-state: true / false / 'unavailable'. can_manage_course()
-    // is created by #46, so between #45 and #46 it does not exist — that must fall
-    // through to the capability check for a manage_all holder, not deny everyone.
-    let assignment = 'unavailable';
-    if (targetCourseId) assignment = await callerCanManageCourse(u, targetCourseId);
+    // EVERY implied course must clear the gate. One unauthorised id in the body is
+    // enough to refuse the whole request — that is what stops a caller pairing a
+    // course they own with one they do not.
+    for (const courseId of targetCourseIds.length ? targetCourseIds : [null]) {
+      const resolvable = courseId && courseId !== '__unresolved__';
 
-    const scope = courseScopeVerdict({
-      context: gate.context,
-      legacy: gate.legacy,
-      courseId: targetCourseId,
-      assignment,
-    });
-    if (!scope.allow) {
-      return res.status(scope.status).json({
-        error: 'That course is not assigned to you.',
-        code: scope.code,
+      // `assignment` is tri-state: true / false / 'unavailable'. can_manage_course()
+      // is created by #46, so between #45 and #46 it does not exist — that must fall
+      // through to the capability check for a manage_all holder, not deny everyone.
+      let assignment = 'unavailable';
+      if (resolvable) assignment = await callerCanManageCourse(u, courseId);
+
+      const scope = courseScopeVerdict({
+        context: gate.context,
+        legacy: gate.legacy,
+        courseId: resolvable ? courseId : null,
+        assignment: resolvable ? assignment : false,
       });
+      if (!scope.allow) {
+        return res.status(scope.status).json({
+          error: 'That course is not assigned to you.',
+          code: scope.code,
+        });
+      }
     }
   }
 
