@@ -92,6 +92,10 @@ export const APP_ERROR_CODES = [
   'SUBSCRIPTION_NOT_FOUND',
   'EXTENSION_NOT_ALLOWED',
   'EXTENSION_INVALID',
+  // ── Staff invitation acceptance (#49) ──
+  'STAFF_NO_INVITATION',
+  'STAFF_INVITATION_NOT_PENDING',
+  'STAFF_EMAIL_NOT_VERIFIED',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -215,6 +219,17 @@ const COPY = {
   EXTENSION_INVALID:
     'That extension can’t be applied. It must move the expiry forward, be between 1 and 365 '
     + 'days, and carry a reason.',
+  // Staff invitation acceptance (#49). Each is read by the INVITEE, mid-signup, on
+  // a screen with no navigation — so each one has to name the next move itself.
+  STAFF_NO_INVITATION:
+    'There’s no staff invitation on this account. If you were expecting one, ask the person '
+    + 'who invited you to send it again — invitation links are tied to one email address.',
+  STAFF_INVITATION_NOT_PENDING:
+    'This staff access isn’t active any more, and an old invitation link can’t restore it. '
+    + 'Ask a Super Admin to reinstate your role.',
+  STAFF_EMAIL_NOT_VERIFIED:
+    'Confirm your email address first — open the confirmation link we sent you, then accept '
+    + 'the invitation again.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };

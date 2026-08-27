@@ -1173,6 +1173,46 @@ role `is_admin = true`.**
   `staff_memberships` + `staff_role_events` **directly** rather than calling
   `admin_upsert_staff_membership()`, because the Management API runs as `postgres` with no JWT, so
   `auth.uid()` is null and the RPC would 403 every time. It never sets `profiles.is_admin`.
+- **The invitation lifecycle (#49).** #45 shipped an invitation **nothing could accept**:
+  `staff_memberships` allowed `status='invited'`, the API wrote it and the directory rendered it,
+  but no function, trigger or policy moved a row out of it. A real Operations Admin sat there with
+  a confirmed email and a password, being shown the ₱1,499 student pricing page — because
+  `is_admin` is false for every non-super role by design and the gate had no other reason to pass
+  them. `accept_staff_invitation()` is the ONLY `invited → active` path and **takes no arguments**:
+  the subject is `auth.uid()`, the role is the one already on the row, so there is no surface on
+  which to name someone else or pick a role. It locks `for update`, requires
+  `auth.users.email_confirmed_at`, refuses suspended/revoked rather than reactivating them, and is
+  idempotent. ★ `my_staff_context()` now emits authority **only** for `status='active'`, plus a
+  separate `membership` object that carries **no permission list by construction** — that split is
+  what lets the client render "you were invited as a Trainer" without a pending row sitting one
+  inverted boolean away from a live one. ★ **No `is_admin` trigger work**: `staff_sync_is_admin`
+  already recomputes on UPDATE, so acceptance flips the cache for a Super Admin and leaves Ops
+  Admin/Trainer false.
+- **The invitation EMAIL is this repo's, not Supabase's (#49).** `inviteUserByEmail()` is gone —
+  it used Supabase's mailer and the hosted "Invite user" template, which was verbatim the stock
+  default (one `<h2>`, one bare link, subject "You've been invited"). Now: `generateLink()` mints
+  without sending, `api/_lib/staffInviteEmail.js` builds HTML **and plain text** with the role in
+  the subject, and `api/_lib/email.js` sends it through Resend. **Do not edit the dashboard
+  template — nothing reads it.** The link is **first-party with the token in the fragment**
+  (`/staff/invitation#invite=…`), which needs no Redirect-URL allow-list entry, keeps the token out
+  of server logs and `Referer`, and cannot be redeemed by a mail-scanner prefetch (Supabase's
+  `/auth/v1/verify` redeems on GET). Format lives in `src/lib/staffInvite.js` and is shared by both
+  sides. `INVITE_LINK_TTL_HOURS` **mirrors** the Supabase `mailer_otp_exp` setting by hand — change
+  both together.
+- **The invite path branches on CONFIRMED, not on EXISTS (#49)** — and that was a real bug. The old
+  code asked only whether an Auth user existed, so re-inviting an unaccepted invitee took the
+  "promote" branch and flipped them to `active` with no acceptance and no email. Now: absent →
+  `invite`; exists-unconfirmed → `magiclink`, stays `invited`; exists-confirmed → promote + a
+  notification carrying no token. Ordering is a safety property — **membership row before email,
+  always** — so a failed send leaves a recoverable `invited` row, never an active one.
+- **The gate ordering is a pure function now (#49).** `resolveGateScreen()` in
+  [src/lib/gateScreen.js](src/lib/gateScreen.js) decides; `BookkeeperProToolkit` switches on the
+  answer. Every rule that ordering encodes used to be only a comment. `staffBypassesPaywall()` —
+  written in #45 and imported by **nothing** — is now wired into `useEnrollmentGate`, so active
+  staff are not treated as unpaid students. The `staffReady` wait is deliberately narrow: it
+  applies only immediately before a **price-bearing** screen, so no student pays the RPC's latency
+  and no invited Trainer sees a flash of the paywall. A degraded staff context falls back to
+  `profile.is_admin`, never to "assume staff".
 - Setup + the full permission matrix: **[STAFF_ROLES_SETUP.md](STAFF_ROLES_SETUP.md)**.
 
 ## AI / proxy pattern
@@ -1580,6 +1620,29 @@ docs **in the same change**:
   (`test/batchLifecycle.test.mjs` + `test-db/batchLifecycle.dbtest.mjs` pin both halves). If a new
   editable column is added, it also needs a `grant update (…)` in #38's column-privilege block —
   otherwise the write silently 42501s for every admin.
+- **Changing the staff INVITATION flow** → the link format is one module and both sides import it:
+  `buildInviteUrl()`/`parseInviteHash()` in [src/lib/staffInvite.js](src/lib/staffInvite.js) ↔
+  `api/_lib/staffInviteEmail.js` (server) ↔ the `StaffInvitationSetup` callback in
+  BookkeeperPro.jsx (browser) ↔ `test/staffInvite.test.mjs`, which round-trips build → parse. A
+  format change that breaks the callback fails there rather than in someone's inbox. ★ Never edit
+  the Supabase dashboard's "Invite user" template — nothing has read it since #49. ★
+  `INVITE_LINK_TTL_HOURS` is a hand-kept mirror of `mailer_otp_exp`; the test pins it so drift
+  cannot be silent.
+- **Computing the root `entitlement`** → it may NOT key off `enroll.active`. That was correct only
+  while the sole accounts with `active:false` were admins; #49 makes it false for **every active
+  staff member**, and the old `enroll.active ? planEntitlement(…) : FULL_ENTITLEMENT` therefore
+  handed a Trainer FULL — which `staffEntitlement()` returns unchanged, silently turning the union
+  into a replacement. The rule the union exists to enforce is that bypassing the paywall is NOT the
+  same as buying the toolkit: staff who also hold a valid term keep their plan's tabs, staff who do
+  not get their role's tools and nothing else (a `null` base means "grants nothing").
+  `test/staffInvite.test.mjs` pins it.
+- **Changing WHO the auth gate holds, or in what order** → `resolveGateScreen()` in
+  [src/lib/gateScreen.js](src/lib/gateScreen.js) ↔ the switch in `BookkeeperProToolkit` ↔
+  `test/gateMatrix.test.mjs`. The ordering is load-bearing (a ban outranks the paywall, imported
+  onboarding outranks the membership gate, the legacy approval gate comes last) and for years none
+  of it was a test. Add the case to the matrix in the same change. ★ There is no jsdom or RTL in
+  this repo, so the suite pins the DECISION, not the render — a new `GATE_SCREENS` value still
+  needs its switch arm added by hand, or it falls through `default` and renders the app.
 - **Adding, removing or re-granting a STAFF PERMISSION** → four places move together:
   the `staff_permissions` + `staff_role_permissions` seed in a dated migration ↔ the **bootstrap
   fold** ↔ `STAFF_PERMISSIONS` / `ROLE_PERMISSIONS` in [src/lib/staffRoles.js](src/lib/staffRoles.js)

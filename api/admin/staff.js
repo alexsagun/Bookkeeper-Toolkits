@@ -1,11 +1,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Vercel serverless endpoint — STAFF MANAGEMENT (invite / assign / suspend). #45
+// Rewritten by #49: branded invitation email + a real invited→active lifecycle.
 // ─────────────────────────────────────────────────────────────────────────────
-// Holds the Supabase SERVICE-ROLE key, and needs it for exactly one thing: the
-// Auth Admin API, which is the only way to look a user up by email or send an
-// invitation. Everything else — the membership row, the role, the audit event —
-// goes through the admin_* RPCs with the CALLER's JWT, so the database enforces
-// the same rules whether the change came from here or from the SQL editor.
+// Holds the Supabase SERVICE-ROLE key, and needs it for exactly two things: the
+// Auth Admin API (the only way to look a user up by email or mint an invitation
+// link) and nothing else. Every membership change, role and audit row goes
+// through the admin_* RPCs with the CALLER's JWT, so the database enforces the
+// same rules whether the change came from here or from the SQL editor.
 //
 // Every action:
 //   1. verifies the caller's Supabase Bearer JWT (against /auth/v1/user), AND
@@ -14,19 +15,44 @@
 //   BEFORE the service-role client is constructed.
 //
 // Actions (POST body.action):
-//   'list'        — the staff directory + the role/capability matrix
-//   'invite'      — invite a NEW person, or promote an EXISTING account
-//   'assign-role' — change someone's role
-//   'set-status'  — suspend / reactivate / revoke
-//   'audit'       — the staff_role_events ledger
-//   GET           — health { ok, configured }
+//   'list'          — the staff directory + the role/capability matrix
+//   'invite'        — invite a NEW person, or promote an EXISTING account
+//   'resend-invite' — mint a fresh link for someone still at status='invited'
+//   'assign-role'   — change someone's role
+//   'set-status'    — suspend / reactivate / revoke
+//   'audit'         — the staff_role_events ledger
+//   GET             — health { ok, configured, hasResend, hasAppUrl }
 //
-// ★ THE INVITE PATH HAS TWO BRANCHES AND THAT IS NOT AN OPTIMISATION.
-//   auth.admin.inviteUserByEmail FAILS on an email that already belongs to a
-//   confirmed user — which is the common case here, because the people being
-//   made staff are usually existing students or the founder's own second
-//   account. So this looks the address up first and PROMOTES an existing user
-//   (membership + audit row, no email) rather than erroring at them.
+// ★ #49 — THE INVITE PATH BRANCHES ON *CONFIRMED*, NOT ON *EXISTS*, AND THAT WAS
+//   A REAL BUG. The old code asked only whether an Auth user existed. Re-inviting
+//   somebody who had been invited but had NOT yet accepted therefore took the
+//   "promote an existing account" branch and flipped their membership straight to
+//   ACTIVE — no acceptance, no email, no proof they ever read the invitation. The
+//   three cases are now distinct:
+//     • no account          → generateLink('invite')    → status stays 'invited'
+//     • account, unconfirmed→ generateLink('magiclink') → status stays 'invited'
+//     • account, confirmed  → promote to 'active' + a plain notification email
+//   Only the third grants anything, and only because that person has already
+//   proven they own the mailbox.
+//
+// ★ #49 — inviteUserByEmail() IS GONE. It sends through Supabase's own mailer,
+//   which meant the invitation used the hosted "Invite user" template — verified
+//   in production as verbatim the Supabase default: an <h2>, one sentence, one
+//   bare link, subject "You've been invited". It could not name the role, could
+//   not be tested, and could not be changed without a dashboard edit nobody would
+//   review. generateLink() mints WITHOUT sending, so the message is built in this
+//   repo (api/_lib/staffInviteEmail.js) and sent through the same Resend path as
+//   every other transactional email here.
+//
+// ★ ORDER IS A SAFETY PROPERTY: caller → role validated → auth user → MEMBERSHIP
+//   ROW → email → record the delivery outcome. Auth, the database and the mail
+//   provider cannot share a transaction, so the compensating rule is that an
+//   email may never be sent for a membership that does not exist, and a failed
+//   send must leave a recoverable 'invited' row rather than an active one.
+//
+// ★ THE LINK IS MINTED, SENT, AND DISCARDED. It is never returned to the browser,
+//   never written to a row, never logged, and never put in an audit event. Only
+//   its OUTCOME is recorded, as a short safe code.
 //
 // ★ Membership is keyed by the Auth user's UUID, never by email. An email can be
 //   changed, reassigned, or belong to two accounts across environments; the UUID
@@ -36,8 +62,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { requireStaff, service, serviceConfigured } from '../_lib/staffAuth.js';
+import { emailConfigured, sendEmail } from '../_lib/email.js';
+import {
+  buildInviteUrl, staffInviteEmail, staffRoleAssignedEmail,
+} from '../_lib/staffInviteEmail.js';
+import { STAFF_ROLE_KEYS } from '../../src/lib/staffRoles.js';
+import { inviteBranchFor } from '../../src/lib/staffInvite.js';
 
-const APP_URL = process.env.APP_URL || '';
 const MAX_BODY_BYTES = 64 * 1024;
 
 // ── Per-warm-instance burst guard (the anthropic-proxy idiom) ──
@@ -55,9 +86,37 @@ function rateLimited(userId) {
   return false;
 }
 
+// A separate, tighter guard for resends, keyed on the TARGET rather than the
+// actor. The burst limit above is per-admin, so two admins could hammer one
+// invitee's mailbox between them and still be under it.
+const RESEND_COOLDOWN_MS = 60_000;
+const resendHits = new Map();
+function resendTooSoon(targetId) {
+  const last = resendHits.get(targetId) || 0;
+  return Date.now() - last < RESEND_COOLDOWN_MS;
+}
+// ★ Stamped only after the provider ACCEPTS. Stamping at the check would lock the
+//   admin out for a minute over an invitation that never left — and a failed send
+//   is exactly the moment they need to retry.
+function markResent(targetId) {
+  resendHits.set(targetId, Date.now());
+}
+
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const normalizeEmail = (v) => String(v || '').trim().toLowerCase();
+
+/**
+ * The absolute origin invitation links point at.
+ * APP_URL when set; otherwise the request host, matching notify-enrollment.js —
+ * an unset env var must not silently produce a link to nowhere.
+ */
+function appOrigin(req) {
+  const configured = (process.env.APP_URL || '').replace(/\/+$/, '');
+  if (configured) return configured;
+  const host = req?.headers?.host;
+  return host ? `https://${host}` : '';
+}
 
 /**
  * Call an admin_* RPC with the CALLER's JWT, not the service key.
@@ -121,9 +180,86 @@ async function findAuthUserByEmail(admin, email) {
   return null;
 }
 
+/** The inviter's display name, for the email. Best-effort — never blocks a send. */
+async function callerName(user) {
+  const url = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
+  const anon = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
+  try {
+    const r = await fetch(`${url}/rest/v1/profiles?id=eq.${user.id}&select=full_name`, {
+      headers: { apikey: anon, Authorization: `Bearer ${user.token}` },
+    });
+    if (!r.ok) return null;
+    const rows = await r.json();
+    const name = rows?.[0]?.full_name;
+    return typeof name === 'string' && name.trim() ? name.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Mint a one-time link WITHOUT sending anything.
+ * @returns {{ tokenHash: string|null, userId: string|null, error: string|null }}
+ */
+async function mintLink(admin, { email, type, metadata }) {
+  const options = {};
+  if (metadata) options.data = metadata;
+  const { data, error } = await admin.auth.admin.generateLink({ type, email, options });
+  if (error) return { tokenHash: null, userId: null, error: error.message || 'generate_link_failed' };
+  return {
+    // ★ hashed_token, NOT properties.action_link. action_link points at
+    //   /auth/v1/verify, which consumes the token on GET — a mail scanner that
+    //   follows links would burn the invitation before the human saw it.
+    tokenHash: data?.properties?.hashed_token || null,
+    userId: data?.user?.id || null,
+    error: null,
+  };
+}
+
+/** Record how the send went. Best-effort: never turns a live invite into a failure. */
+async function recordDelivery(user, userId, status, code) {
+  try {
+    await callerRpc(user, 'admin_record_staff_invite', {
+      p_user_id: userId,
+      p_status: status,
+      p_error_code: code || null,
+    });
+  } catch {
+    // A pre-#49 database has no such function. The membership is already correct;
+    // only the delivery badge is missing, and that must not fail the request.
+  }
+}
+
+/**
+ * Upsert the membership, absorbing the signup-trigger race.
+ * The profiles row is created by a trigger on auth.users INSERT, and an invite
+ * races it; admin_upsert_staff_membership requires the profile to exist.
+ */
+async function upsertMembership(user, args) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return { out: await callerRpc(user, 'admin_upsert_staff_membership', args), err: null };
+    } catch (e) {
+      lastErr = e;
+      if (e.hint !== 'STAFF_NOT_FOUND') throw e;
+      await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+    }
+  }
+  return { out: null, err: lastErr };
+}
+
 export default async function handler(req, res) {
   if (req.method === 'GET') {
-    return res.status(200).json({ ok: true, configured: serviceConfigured() });
+    // hasResend / hasAppUrl are reported because an unconfigured sender and an
+    // unset origin both look exactly like "invitations are broken" from the UI,
+    // and neither was visible anywhere before.
+    return res.status(200).json({
+      ok: true,
+      configured: serviceConfigured(),
+      hasResend: emailConfigured(),
+      hasAppUrl: Boolean(process.env.APP_URL),
+    });
   }
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed. Use POST.' });
@@ -200,78 +336,178 @@ export default async function handler(req, res) {
     if (action === 'invite') {
       const email = normalizeEmail(body.email);
       if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'A valid email is required.' });
-      if (!body.role_key) return res.status(400).json({ error: 'role_key required.' });
 
+      // ★ Validated against the trusted catalog BEFORE any Auth call, so a bad
+      //   role can never create an account, and body.role_key never reaches the
+      //   email as free text — the label and description are looked up from it.
+      const roleKey = String(body.role_key || '');
+      if (!STAFF_ROLE_KEYS.includes(roleKey)) {
+        return res.status(400).json({ error: 'Unknown role.', code: 'STAFF_ROLE_INVALID' });
+      }
+
+      const origin = appOrigin(req);
       const admin = service();
       const existing = await findAuthUserByEmail(admin, email);
 
-      let userId = existing?.id || null;
-      let invited = false;
+      // The decision lives in src/lib/staffInvite.js so node:test can reach it —
+      // api/ handlers have no test harness here, and this is precisely the branch
+      // that was wrong (it asked "exists?" instead of "confirmed?").
+      const branch = inviteBranchFor(existing);
+      const promote = branch.action === 'promote';
 
-      if (!existing) {
-        // Brand-new person: create the Auth user via an invitation email.
-        const { data, error } = await admin.auth.admin.inviteUserByEmail(email, {
-          redirectTo: APP_URL ? `${APP_URL}/` : undefined,
-          data: {
+      let userId = existing?.id || null;
+      let tokenHash = null;
+      let tokenType = null;
+
+      if (branch.action === 'invite') {
+        // Creates the Auth user and returns a token — but sends nothing.
+        const minted = await mintLink(admin, {
+          email,
+          type: 'invite',
+          metadata: {
             // Metadata is DISPLAY ONLY. It is user-editable and must never be
-            // read for authorization — the membership row is the authority.
-            invited_as: body.role_key,
+            // read for authorization — the membership row is the authority, and
+            // accept_staff_invitation() never looks at it.
+            invited_as: roleKey,
             full_name: body.full_name || null,
           },
         });
-        if (error) {
-          return res.status(502).json({ error: `Could not send the invitation: ${error.message}` });
+        if (minted.error) {
+          return res.status(502).json({ error: 'Could not create the invitation.' });
         }
-        userId = data?.user?.id || null;
-        invited = true;
+        userId = minted.userId;
+        tokenHash = minted.tokenHash;
+        tokenType = branch.tokenType;
+      } else if (branch.action === 'reinvite') {
+        // ★ The case the old code got wrong. This account exists but has never
+        //   proven it owns the mailbox, so it does NOT get promoted — it gets a
+        //   fresh link and stays 'invited'. ('invite' would fail here: the user
+        //   already exists.)
+        const minted = await mintLink(admin, { email, type: branch.tokenType });
+        if (minted.error) {
+          return res.status(502).json({ error: 'Could not create the invitation.' });
+        }
+        tokenHash = minted.tokenHash;
+        tokenType = branch.tokenType;
       }
 
       if (!userId) {
         return res.status(502).json({ error: 'The invitation did not return a user id.' });
       }
 
-      // The signup trigger creates the profiles row on auth.users INSERT, but an
-      // invite and that trigger race. admin_upsert_staff_membership requires the
-      // profile to exist, so give it a moment and retry rather than failing a
-      // legitimate invite on a timing artefact.
-      let out = null;
-      let lastErr = null;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          out = await callerRpc(u, 'admin_upsert_staff_membership', {
-            p_user_id: userId,
-            p_role_key: body.role_key,
-            p_display_title: body.display_title || null,
-            p_reason: body.reason || (invited ? 'Invited from Team & Roles.' : 'Promoted from an existing account.'),
-            // An invitee has not accepted yet. An existing account is active now.
-            p_status: invited ? 'invited' : 'active',
-          });
-          break;
-        } catch (e) {
-          lastErr = e;
-          if (e.hint !== 'STAFF_NOT_FOUND') throw e;
-          await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
-        }
-      }
+      // ── The membership row exists BEFORE any email goes out ──
+      const { out, err } = await upsertMembership(u, {
+        p_user_id: userId,
+        p_role_key: roleKey,
+        p_display_title: body.display_title || null,
+        p_reason: body.reason
+          || (promote ? 'Promoted from an existing account.' : 'Invited from Team & Roles.'),
+        p_status: branch.status,
+      });
       if (!out) {
         return res.status(502).json({
           error: 'The account was created but the staff role could not be assigned. '
             + 'Open Team & Roles and assign it directly.',
-          code: lastErr?.hint || null,
+          code: err?.hint || null,
         });
       }
 
+      // ── Now the email ──
+      const inviterName = await callerName(u);
+      let sent;
+      if (promote) {
+        const msg = staffRoleAssignedEmail({
+          roleKey, appUrl: origin, inviteeName: body.full_name || null, inviterName,
+        });
+        sent = await sendEmail({ to: email, ...msg, tag: 'staff-invite' });
+      } else {
+        const actionUrl = buildInviteUrl({ appUrl: origin, tokenHash, type: tokenType });
+        if (!actionUrl) {
+          sent = { ok: false, code: origin ? 'no_link' : 'app_url_not_configured' };
+        } else {
+          const msg = staffInviteEmail({
+            roleKey, actionUrl, inviteeName: body.full_name || null, inviterName,
+          });
+          sent = await sendEmail({ to: email, ...msg, tag: 'staff-invite' });
+        }
+        await recordDelivery(u, userId, sent.ok ? 'sent' : 'failed', sent.code);
+      }
+
+      // 200 with an explicit outcome, not a 502: the membership really was
+      // created, and the client must be able to say "invited, but the email did
+      // not go out — resend" rather than either lying or implying nothing
+      // happened.
       return res.status(200).json({
         ok: true,
         user_id: userId,
-        invited,
-        promoted: !invited,
+        invited: !promote,
+        promoted: promote,
+        email_sent: Boolean(sent?.ok),
+        email_code: sent?.ok ? null : (sent?.code || 'email_failed'),
         result: out,
       });
     }
 
+    // ── resend-invite ─────────────────────────────────────────────────────
+    // Only for someone still at status='invited'. Resending is not a way to
+    // reactivate a suspended or revoked account, and it never changes status.
+    if (action === 'resend-invite') {
+      if (!UUID_RE.test(body.user_id || '')) {
+        return res.status(400).json({ error: 'user_id required.' });
+      }
+      const targetId = body.user_id;
+
+      // Read the row through the caller's own JWT, so the directory's
+      // staff.manage guard decides what this admin may even see.
+      const directory = await callerRpc(u, 'admin_staff_directory', {});
+      const row = (directory || []).find((r) => r.user_id === targetId);
+      if (!row) return res.status(404).json({ error: 'That account is not a staff member.' });
+      if (row.status !== 'invited') {
+        return res.status(409).json({
+          error: `That invitation was already ${row.status === 'active' ? 'accepted' : row.status}.`,
+        });
+      }
+      if (resendTooSoon(targetId)) {
+        return res.status(429).json({ error: 'An invitation was just sent. Wait a minute before resending.' });
+      }
+
+      const admin = service();
+      const { data: got, error: getErr } = await admin.auth.admin.getUserById(targetId);
+      if (getErr || !got?.user?.email) {
+        return res.status(502).json({ error: 'Could not read that account.' });
+      }
+      const email = normalizeEmail(got.user.email);
+
+      // Always 'magiclink' on a resend: the Auth user necessarily exists by now
+      // (they were invited), and generateLink('invite') refuses an existing
+      // address. magiclink verification also confirms an unconfirmed mailbox,
+      // which is what accept_staff_invitation() requires before it will activate.
+      const minted = await mintLink(admin, { email, type: 'magiclink' });
+      if (minted.error) return res.status(502).json({ error: 'Could not create a new invitation link.' });
+
+      const origin = appOrigin(req);
+      const actionUrl = buildInviteUrl({ appUrl: origin, tokenHash: minted.tokenHash, type: 'magiclink' });
+      if (!actionUrl) {
+        await recordDelivery(u, targetId, 'failed', origin ? 'no_link' : 'app_url_not_configured');
+        return res.status(502).json({ error: 'Could not build the invitation link. Set APP_URL.' });
+      }
+
+      const inviterName = await callerName(u);
+      const msg = staffInviteEmail({
+        roleKey: row.role_key, actionUrl, inviteeName: row.full_name || null, inviterName, resent: true,
+      });
+      const sent = await sendEmail({ to: email, ...msg, tag: 'staff-invite' });
+      await recordDelivery(u, targetId, sent.ok ? 'resent' : 'failed', sent.code);
+
+      if (!sent.ok) {
+        return res.status(502).json({ error: 'The invitation email could not be sent.', code: sent.code });
+      }
+      markResent(targetId);
+      return res.status(200).json({ ok: true, email_sent: true });
+    }
+
     return res.status(400).json({
-      error: "action must be 'list', 'invite', 'assign-role', 'set-status' or 'audit'.",
+      error: "action must be 'list', 'invite', 'resend-invite', 'assign-role', 'set-status' or 'audit'.",
     });
   } catch (err) {
     // app_error codes travel in `hint`; surface them so the client can render

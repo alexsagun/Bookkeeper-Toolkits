@@ -148,6 +148,11 @@ const staffDevApi = (env) => ({
     server.middlewares.use('/api/admin/staff', async (req, res) => {
       const keys = [
         'SUPABASE_SECRET_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'APP_URL',
+        // #49: the staff invitation is now sent by THIS handler through Resend,
+        // not by Supabase's mailer. Without these two the dev server reports
+        // email_not_configured while production sends fine — a difference that is
+        // invisible until someone tests an invite locally and believes it works.
+        'RESEND_API_KEY', 'RESEND_FROM',
         'VITE_SUPABASE_URL', 'VITE_SUPABASE_ANON_KEY', 'SUPABASE_URL', 'SUPABASE_ANON_KEY',
       ];
       for (const k of keys) {

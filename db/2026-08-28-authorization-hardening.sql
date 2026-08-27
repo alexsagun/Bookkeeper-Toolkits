@@ -125,6 +125,29 @@ create policy enroll_req_staff_update on public.enrollment_requests
   using ((select public.has_staff_permission('enrollments.review')))
   with check ((select public.has_staff_permission('enrollments.review')));
 
+-- ★ …BUT RLS HAS NO COLUMN GRANULARITY, AND THAT POLICY ALONE IS A HOLE.
+--   The comment above says the screen writes the reject decision and admin_notes.
+--   The POLICY says an enrollments.review holder may UPDATE the row — every
+--   column of it. `authenticated` holds Supabase's default table-level UPDATE on
+--   all 42 columns, so an Operations Admin could rewrite another student's
+--   pending request to plan_key='vip' and then approve it through
+--   admin_finalize_enrollment(), which reads plan_key straight off the row. That
+--   is a ₱16,999 grant with no payment behind it — the exact escalation this file
+--   closes for `subscriptions` two policies up, missed on the sibling table.
+--   (Found by CodeRabbit on PR #3, confirmed against the live schema.)
+--
+--   GRANT has the column granularity RLS lacks. Same idiom as #38's
+--   `revoke update (code) on batches`, and the six columns below are the complete
+--   set the app writes, from its only three UPDATE paths: the student self-expire,
+--   the admin decision, and the admin note.
+--
+--   The SECURITY DEFINER RPCs are unaffected — admin_finalize_enrollment() and
+--   record_enrollment_notification() run as the owner, so column grants do not
+--   restrict them. This narrows what a CLIENT may send, nothing else.
+revoke update on public.enrollment_requests from authenticated;
+grant update (status, rejection_reason, reviewed_at, reviewed_by, admin_notes, updated_at)
+  on public.enrollment_requests to authenticated;
+
 drop policy if exists enroll_req_super_write on public.enrollment_requests;
 create policy enroll_req_super_write on public.enrollment_requests
   for all to authenticated
