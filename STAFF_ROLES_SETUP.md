@@ -98,13 +98,60 @@ client, because RLS reads the table, not the JS mirror.
 
 **Admin → Team & Roles** (Super Admin only) → **Invite staff**.
 
-- A **new** email gets a Supabase invitation and appears as **Invited** until they accept.
-- An email that **already has an account** is *promoted* immediately, with no email sent. Their
-  existing membership, course progress and community history are untouched — a staff account and a
-  student account are the same account.
+The path taken depends on whether the address already has a **confirmed** account — not merely
+whether an account row exists. That distinction is the whole of the #49 fix: the old code branched on
+existence, so re-inviting somebody who had been invited but had **not** yet accepted took the
+"promote" branch and flipped their membership straight to `active`, with no acceptance and no email.
+
+| The address | What happens | Membership |
+|---|---|---|
+| has no account | `generateLink('invite')` creates the Auth user, branded email sent | `invited` |
+| exists, **unconfirmed** | `generateLink('magiclink')`, fresh branded email sent | `invited` — never promoted |
+| exists, **confirmed** | promoted at once, "your staff role has been assigned" email, no token | `active` |
 
 Membership is keyed by the Auth user's **UUID**, never by email: an address can be changed or
 reassigned, but `auth.uid()` is what every RLS policy sees.
+
+### What the invitee sees
+
+The link opens **`/staff/invitation`** on your own domain. Nothing is redeemed until they click
+**Accept** — a mail scanner that follows the link cannot burn the invitation. They then set a password
+and a name, and `accept_staff_invitation()` moves the row `invited → active` and writes an `accept`
+audit event.
+
+`accept_staff_invitation()` **takes no arguments**. The subject is `auth.uid()` and the role is the one
+already on the row, so there is no surface on which to name another user or choose a role. It locks
+the row (so a double-click serialises), requires a confirmed email, refuses `suspended`/`revoked`
+rather than reactivating them, and is idempotent if they accept twice.
+
+**They are never shown a price.** An Operations Admin and a Trainer both carry `is_admin = false` by
+design, so before #49 the gate treated them as unpaid students — a real one was shown a ₱1,499 pricing
+page. `staffBypassesPaywall()` is now wired into `useEnrollmentGate`, and the gate waits for the staff
+context before it will render any priced screen.
+
+### Order matters, and only the last step grants anything
+
+```
+validate the role → create/find the Auth user → CREATE THE MEMBERSHIP ROW → send the email
+```
+
+Auth, the database and the mail provider cannot share a transaction, so the compensating rule is that
+an email is never sent for a membership that does not exist, and **a failed send leaves a recoverable
+`invited` row, never an active one**. Team & Roles shows the delivery state and will not claim
+"Invitation sent" for a send Resend refused.
+
+### Resending
+
+Open the person's row → **Resend invitation**. It mints a fresh single-use link, works only while they
+are still `invited`, is rate-limited per recipient, and **never changes their status**. The link is
+minted, sent and discarded — it is never returned to the browser, written to a row, logged, or put in
+an audit event; only the outcome is recorded, as a short safe code.
+
+### Nothing about invitations lives in a Supabase template
+
+The invitation email is built in this repo (`api/_lib/staffInviteEmail.js`) and sent through Resend.
+The dashboard's **"Invite user"** template is no longer read by anything. See **AUTH_SETUP.md §4e**
+for the link format, the expiry setting, the required env vars and the deliverability notes.
 
 **Assigning a Trainer to a course**: open the course, then use the Trainers control (needs
 `courses.manage_all`). A Trainer who creates a course is auto-assigned as its owner — otherwise
@@ -112,7 +159,8 @@ reassigned, but `auth.uid()` is what every RLS policy sees.
 
 **Suspending or revoking** requires a reason, and takes effect on that person's **next request** —
 not their next sign-in. Authority is read from the database every time, never decoded from their
-token.
+token. A revoked staff member who is *also* a paying student keeps their student access; only the
+staff authority goes.
 
 ---
 

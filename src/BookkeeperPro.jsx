@@ -50,8 +50,11 @@ import { appErrorCode, appErrorMessage, isMigrationMissing } from './lib/appErro
 import {
   ADMIN_TAB_PERMISSION, STAFF_PERMISSIONS, STAFF_ROLES, STAFF_STATUSES,
   canManageCourseClient, lastSuperAdminGuard, permissionsForRole,
-  staffEntitlement, staffRole, staffStatusLabel,
+  staffBypassesPaywall, staffEntitlement, staffInvitationPending, staffLandingTab,
+  staffRole, staffStatusLabel,
 } from './lib/staffRoles';
+import { parseInviteHash } from './lib/staffInvite';
+import { GATE_SCREENS, resolveGateScreen } from './lib/gateScreen';
 import {
   ENROLLMENT_PLANS_FALLBACK, PLAN_LABELS, PLAN_ENTITLEMENTS, planEntitlement,
   FULL_ENTITLEMENT, filterStagesForEntitlement, extensionPrice, phpAmount,
@@ -2153,6 +2156,308 @@ function SetPasswordScreen() {
   );
 }
 
+// ── Staff invitation acceptance (#49) ────────────────────────────────────────
+// Reads the one-time token out of the URL fragment ONCE, at module load, and
+// strips it from the address bar in the same breath.
+//
+// ★ MODULE SCOPE, NOT A useState INITIALISER. Under React.StrictMode a state
+//   initialiser runs twice; the second call would find the hash already stripped
+//   and could win, throwing the token away. Module scope runs exactly once,
+//   before React mounts anything.
+//
+// ★ THE TOKEN NEVER TOUCHES STORAGE. It lives in this one module-scope constant
+//   and in React state for the life of the tab. It is not written to
+//   window.storage, not logged, and — because history.replaceState removes it
+//   immediately — not left in the address bar, a bookmark, or a Back entry.
+function readStaffInviteFromUrl() {
+  if (typeof window === 'undefined') return null;
+  try {
+    const parsed = parseInviteHash(window.location.hash);
+    if (!parsed) return null;
+    // Strip BEFORE returning, so no later read can see it and no navigation can
+    // carry it. Keeps path + query so /staff/invitation still reads as itself.
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+const INITIAL_STAFF_INVITE = readStaffInviteFromUrl();
+
+/**
+ * The screen an invited staff member sees. Two ways in:
+ *
+ *  • From the email link — `invite` holds a token. NOTHING is consumed until the
+ *    person clicks Accept, so a mail-scanner prefetch of the link cannot burn the
+ *    invitation. That deliberate click is the whole reason this is a two-step
+ *    screen rather than an auto-redeem on mount.
+ *
+ *  • Already signed in with a pending membership and no token — which is how a
+ *    stranded invitee (accepted the old Supabase link, landed on the pricing
+ *    page) is repaired without anyone re-sending anything.
+ */
+function StaffInvitationSetup({ invite, onAccepted, onDismissToken }) {
+  const { user, profile, staffMembership, staffReady, updatePassword, refreshStaff, signOut } = useAuth();
+
+  const [exchanged, setExchanged] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPw, setConfirmPw] = useState('');
+  const [showPw, setShowPw] = useState(false);
+
+  // Adopt the profile name once it lands, but never clobber what they are typing.
+  const nameTouched = useRef(false);
+  useEffect(() => {
+    if (!nameTouched.current && profile?.full_name) setFullName(profile.full_name);
+  }, [profile?.full_name]);
+
+  // ★ DERIVED, never stored. Both call sites render this component as the root
+  //   element of the gate, so React keeps the same instance when `invite` becomes
+  //   null — a stored step survived that transition and left the confirm screen up
+  //   with nothing to confirm.
+  const step = invite && !exchanged ? 'confirm' : 'form';
+
+  const role = staffMembership?.exists ? staffMembership : null;
+  const roleLabel = role?.roleLabel || null;
+  // A brand-new invitee has no password at all, so after a token exchange it is
+  // required. Someone who was already signed in got here with credentials that
+  // work, so for them it is optional.
+  const needsPassword = exchanged;
+
+  const acceptToken = async () => {
+    if (!invite) return;   // belt and braces: the button only renders with one
+    setBusy(true); setErr('');
+    try {
+      const { error } = await supabase.auth.verifyOtp({
+        token_hash: invite.token,
+        type: invite.type,
+      });
+      if (error) throw error;
+      setExchanged(true);
+      // No refreshStaff() here. It closes over THIS render's session, which is
+      // still the pre-verifyOtp one, so it would return the empty context without
+      // fetching. AuthProvider's own effect — keyed on the user id — does the
+      // fetch when the new session lands, and `staffReady` is false until it does,
+      // which is what keeps the "no invitation waiting" branch from firing early.
+    } catch (e) {
+      // Expired / already used / tampered all surface here. Say what to do next
+      // without confirming whether any particular address has an account.
+      setErr(
+        /expired|invalid|not found|token/i.test(e?.message || '')
+          ? 'This invitation link has expired or was already used. Ask the person who invited you to send a new one.'
+          : (e?.message || 'Could not open this invitation. Try the link again.'),
+      );
+      setBusy(false);
+      return;
+    }
+    setBusy(false);
+  };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setErr('');
+    if ((needsPassword || password) && password !== confirmPw) {
+      setErr('The two passwords do not match.');
+      return;
+    }
+    setBusy(true);
+    try {
+      if (needsPassword || password) {
+        const { error } = await updatePassword(password);
+        if (error) throw error;
+      }
+      const trimmed = fullName.trim();
+      if (trimmed && trimmed !== (profile?.full_name || '').trim()) {
+        // Best-effort: a name that would not save must not block activation, and
+        // it is fixable afterwards. The role is the thing that matters here.
+        const { error: nameErr } = await supabase.rpc('set_my_display_name', { p_full_name: trimmed });
+        if (nameErr) console.warn('[staff-invite] display name not saved');
+      }
+
+      const { error: rpcErr } = await supabase.rpc('accept_staff_invitation');
+      if (rpcErr) throw rpcErr;
+
+      // ★ Confirm from the SERVER before letting anyone through. The RPC returning
+      //   without error is not the same as this browser holding an active context,
+      //   and rendering the app on the strength of a write we have not read back
+      //   is how a half-finished acceptance would look exactly like a finished one.
+      const ctx = await refreshStaff();
+      if (!ctx || ctx.status !== 'active') {
+        throw new Error('Your role was activated, but this page could not confirm it. Reload to continue.');
+      }
+      onAccepted?.(ctx);
+    } catch (e2) {
+      setErr(appErrorMessage(e2, 'Could not finish setting up your account.'));
+      setBusy(false);
+    }
+  };
+
+  const inputStyle = { background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody };
+  const shell = (children) => (
+    <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
+      <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
+        background: GLASS.cardDeep,
+        backdropFilter: 'blur(30px) saturate(180%)',
+        WebkitBackdropFilter: 'blur(30px) saturate(180%)',
+        border: `1px solid ${GLASS.border}`,
+        boxShadow: '0 24px 60px -12px rgba(10,30,80,0.22), inset 0 1px 0 rgba(255,255,255,0.6)',
+      }}>
+        <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+          <img src={LOGO_DATA_URI} alt="Get Hired With Alex" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
+          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>
+            You&rsquo;re invited to join the team
+          </div>
+          {roleLabel && (
+            <div className="mt-2 inline-flex items-center gap-1.5 px-3 py-1 rounded-full" style={{ background: 'var(--primary-tint)', border: '1px solid var(--primary-halo)', color: C.primary, fontSize: 12, fontWeight: 700 }}>
+              <ShieldCheck size={13} /> {roleLabel}
+            </div>
+          )}
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+
+  const errorBox = err ? (
+    <div className="flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs" role="alert" style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: '1px solid rgba(208,35,35,0.18)' }}>
+      <AlertTriangle size={14} className="flex-shrink-0 mt-px" /> <span>{err}</span>
+    </div>
+  ) : null;
+
+  // ── Step 1: deliberate consent. Nothing has been redeemed yet. ──
+  if (step === 'confirm') {
+    return shell(
+      <div className="px-8 py-7 space-y-4">
+        <p style={{ fontSize: 13.5, lineHeight: 1.65, color: C.textSoft }}>
+          This is a staff account, so there&rsquo;s nothing to buy &mdash; you won&rsquo;t be asked
+          to choose a plan or make a payment.
+        </p>
+        {user && (
+          <div className="px-3 py-2.5 rounded-xl text-xs" style={{ background: 'var(--wash)', border: `1px solid ${C.border}`, color: C.textSoft }}>
+            You&rsquo;re currently signed in as <strong style={{ color: C.text }}>{user.email}</strong>.
+            Accepting will switch this browser to the invited account.
+          </div>
+        )}
+        {errorBox}
+        <button type="button" onClick={acceptToken} disabled={busy}
+          className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+          style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)' }}>
+          {busy ? <Loader2 size={15} className="animate-spin" /> : <ArrowRight size={15} />}
+          Accept invitation and set up my account
+        </button>
+        <div className="text-center">
+          <button type="button" onClick={onDismissToken} className="text-xs" style={{ color: C.textMute }}>
+            Not now
+          </button>
+        </div>
+      </div>,
+    );
+  }
+
+  // ── No invitation is waiting on this account. ──
+  // ★ `!err` is load-bearing. accept_staff_invitation() can succeed and the
+  //   follow-up refreshStaff() still fail (timeout, blip) — which empties
+  //   staffMembership and lands here. Without this guard the screen would replace
+  //   an accurate "your role was activated but this page could not confirm it"
+  //   with "there is no staff invitation waiting", the opposite of what happened,
+  //   AFTER the write had already committed.
+  if (staffReady && !busy && !err && !staffInvitationPending(staffMembership)) {
+    // ★ THREE cases, not two. This read `status !== 'invited'`, which lumps
+    //   ACTIVE in with suspended and revoked — so a staff member who had already
+    //   accepted and then clicked their link a second time (the single most
+    //   likely thing anyone does with an invitation email) was told their access
+    //   "is active, and an invitation link can't restore it. Ask a Super Admin to
+    //   reinstate your role." Nothing was wrong, and the message said otherwise.
+    const status = staffMembership?.exists ? staffMembership.status : null;
+    const alreadyActive = status === 'active';
+    const ended = status === 'suspended' || status === 'revoked';
+    return shell(
+      <div className="px-8 py-7 space-y-4">
+        <p style={{ fontSize: 13.5, lineHeight: 1.65, color: C.textSoft }}>
+          {alreadyActive
+            ? `You’re already set up${staffMembership.roleLabel ? ` as ${staffMembership.roleLabel}` : ''}. There’s nothing left to accept — this link has already done its job.`
+            : ended
+              ? `This staff access is ${staffStatusLabel(status).toLowerCase()}, and an invitation link can’t restore it. Ask a Super Admin to reinstate your role.`
+              : 'There’s no staff invitation waiting on this account. If you were expecting one, ask the person who invited you to send it again — invitations are tied to a single email address.'}
+        </p>
+        <button type="button" onClick={onDismissToken}
+          className="w-full py-2.5 rounded-xl text-sm font-bold transition"
+          style={alreadyActive
+            ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff', border: 'none' }
+            : { background: 'var(--wash-strong)', border: `1px solid ${C.border}`, color: C.text }}>
+          Continue to the app
+        </button>
+        <div className="text-center">
+          <button type="button" onClick={signOut} className="text-xs" style={{ color: C.textMute }}>
+            Signed in as {user?.email} &middot; Sign out
+          </button>
+        </div>
+      </div>,
+    );
+  }
+
+  // ── Step 2: name + password, then accept. ──
+  return shell(
+    <form onSubmit={submit} className="px-8 py-7 space-y-3.5">
+      {role?.roleDescription && (
+        <p style={{ fontSize: 12.5, lineHeight: 1.6, color: C.textSoft, margin: 0 }}>{role.roleDescription}</p>
+      )}
+
+      <div className="relative">
+        <Users size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+        <input className="w-full pl-10 pr-3 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
+          type="text" autoComplete="name" placeholder="Your full name" aria-label="Your full name"
+          value={fullName} onChange={(e) => { nameTouched.current = true; setFullName(e.target.value); }} />
+      </div>
+
+      <div className="relative">
+        <Lock size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+        <input className="w-full pl-10 pr-10 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
+          type={showPw ? 'text' : 'password'} autoComplete="new-password"
+          placeholder={needsPassword ? 'Choose a password' : 'New password (optional)'}
+          aria-label={needsPassword ? 'Choose a password' : 'New password, optional'}
+          value={password} onChange={(e) => setPassword(e.target.value)}
+          required={needsPassword} minLength={8} />
+        <button type="button" onClick={() => setShowPw((v) => !v)} tabIndex={-1}
+          className="absolute right-3 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} aria-label="Toggle password visibility">
+          <Eye size={15} />
+        </button>
+      </div>
+
+      {(needsPassword || password) && (
+        <div className="relative">
+          <Lock size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+          <input className="w-full pl-10 pr-3 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
+            type={showPw ? 'text' : 'password'} autoComplete="new-password" placeholder="Confirm password"
+            aria-label="Confirm password"
+            value={confirmPw} onChange={(e) => setConfirmPw(e.target.value)} required minLength={8} />
+        </div>
+      )}
+      <div style={{ fontSize: 11.5, color: C.textMute }}>Use at least 8 characters.</div>
+
+      {errorBox}
+
+      <button type="submit" disabled={busy || !staffReady}
+        className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+        style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)' }}>
+        {busy && <Loader2 size={15} className="animate-spin" />}
+        {roleLabel ? `Accept ${roleLabel} invitation` : 'Accept invitation'}
+      </button>
+
+      <div className="text-center pt-1 space-y-1.5">
+        <button type="button" onClick={onDismissToken} className="block w-full text-xs" style={{ color: C.textSoft }}>
+          Not now — continue to my account
+        </button>
+        <button type="button" onClick={signOut} className="block w-full text-xs" style={{ color: C.textMute }}>
+          Signed in as {user?.email} &middot; Sign out
+        </button>
+      </div>
+    </form>,
+  );
+}
+
 // First-login welcome. Shown once per user (gated on the namespaced
 // `onboarding:welcomed` storage flag) so a brand-new account is greeted and
 // oriented to the three career stages instead of landing on a blank dashboard.
@@ -2502,8 +2807,20 @@ const EntitlementContext = React.createContext(FULL_ENTITLEMENT);
 // the same two own-row queries (0 rows; negligible). Fail-open on request errors
 // (configured:false → the root gate falls back to the legacy approval behavior),
 // so a missing migration or a broken query can never lock anyone out.
-function useEnrollmentGate(user, profile, profileReady) {
-  const active = REQUIRE_ENROLLMENT && !!user && profileReady && !profile?.is_admin;
+function useEnrollmentGate(user, profile, profileReady, staff) {
+  // ★ #49 — ACTIVE STAFF ARE NOT STUDENTS. Until now the only exemption here was
+  //   profile.is_admin, which since #45 means "active SUPER ADMIN" and nothing
+  //   else. So an Operations Admin or Trainer — is_admin = false by design, and
+  //   usually holding no subscription — was treated as an unpaid student and held
+  //   on the paywall. staffRoles.js has exported staffBypassesPaywall() since #45
+  //   and nothing imported it; this is the line it was written for.
+  //
+  //   Note this only stops the gate from HOLDING them. It does not widen what they
+  //   can open: staffEntitlement() still unions their plan with their permissions,
+  //   and the visitedTabs chokepoint still refuses a tab they lack. "Not paywalled"
+  //   and "gets the whole toolkit" stay separate questions.
+  const staffPasses = staffBypassesPaywall(staff) || !!profile?.is_admin;
+  const active = REQUIRE_ENROLLMENT && !!user && profileReady && !staffPasses;
   const uid = user?.id;
   const [ready, setReady] = useState(false);
   const [configured, setConfigured] = useState(true);
@@ -5286,6 +5603,10 @@ function AvatarSection() {
 // flag-off member just gets overview + support. `ready=false` (enrollment gate still fetching)
 // renders shimmer rows instead of misreading "no plan" — the drawer is never blank.
 function ProfileSettingsBody({ user, profile, sub, latestReq, entitlement, plan, onOpen, showBilling = true, ready = true }) {
+  // Read directly rather than threading another prop through the account drawer —
+  // the same self-contained idiom AvatarSection (rendered just below) already uses.
+  // This lives outside the memoized TabPanel tree, so it costs no re-renders there.
+  const { staff } = useAuth();
   const a = subAccess(sub);
   const status = membershipStatus(sub, latestReq);
   const planLabel = plan?.name || entitlement?.label || PLAN_LABELS[sub?.plan_key || profile?.plan] || (sub?.plan_key || profile?.plan) || '—';
@@ -5302,7 +5623,15 @@ function ProfileSettingsBody({ user, profile, sub, latestReq, entitlement, plan,
       <div className="rounded-xl px-3.5 py-1" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
         <FactRow k="Name" v={profile?.full_name || '—'} />
         <FactRow k="Email" v={user?.email || '—'} />
-        <FactRow k="Role" v={profile?.is_admin ? 'Administrator' : 'Member'} />
+        {/* ★ #49: profile.is_admin means "active SUPER ADMIN" and nothing else
+             (#45), so this row told an Operations Admin and a Trainer they were a
+             "Member" — on their own account page, about the job they were hired
+             for. staff.roleLabel is the server's own word for the role; the
+             is_admin fallback covers a degraded context, where it is the only
+             thing left that is true. */}
+        <FactRow k="Role" v={staff?.isStaff && staff.roleLabel
+          ? (staff.displayTitle ? `${staff.roleLabel} · ${staff.displayTitle}` : staff.roleLabel)
+          : (profile?.is_admin ? 'Administrator' : 'Member')} />
         {user?.id && (
           <FactRow k="Account ID" v={
             <span className="inline-flex items-center gap-1.5">
@@ -6802,6 +7131,10 @@ export default function BookkeeperProToolkit() {
     // EMPTY until my_staff_context() answers, and `staffReady` says when that is —
     // so a screen never flashes an admin control it is about to take away.
     staff, staffReady, staffDegraded, can, isSuperAdmin,
+    // #49: the DESCRIPTIVE membership — what role is pending, or why access ended.
+    // It carries no permissions, so it can pick a screen but never open a door.
+    // refreshStaff() is how the invitation screen turns 'invited' into 'active'.
+    staffMembership, refreshStaff,
   } = useAuth();
   // Theme runs above the auth gate so pre-auth screens are themed too
   // (the data-theme attribute lives on <html>, not on this component's DOM).
@@ -6810,7 +7143,26 @@ export default function BookkeeperProToolkit() {
   // and signed-out visitors; paid users ARE checked (their term may have expired) —
   // see useEnrollmentGate. renewNow = expired member clicked "Renew" (expired screen →
   // paywall handoff; reset on submit).
-  const enroll = useEnrollmentGate(user, profile, profileReady);
+  const enroll = useEnrollmentGate(user, profile, profileReady, staff);
+  // Pulled out as primitives so the entitlement memo keeps a stable identity across
+  // unrelated re-renders — the perf contract the memoized TabPanel tree relies on.
+  const enrollConfigured = enroll.configured;
+  const enrollPass = enroll.state === 'pass';
+  const enrollPlanKey = enroll.sub?.plan_key || null;
+  // #49: the invitation token, captured once at module load and stripped from the
+  // URL there. Held in state (never storage) so it survives this component's
+  // re-renders and is dropped the moment it is spent or declined.
+  const [staffInvite, setStaffInvite] = useState(INITIAL_STAFF_INVITE);
+  const [staffInviteDismissed, setStaffInviteDismissed] = useState(false);
+  // ★ BOTH flags, always. Clearing only the token drops out of the token path and
+  //   straight back into the state path, because the membership is still pending —
+  //   so "Not now" would appear to do nothing. Session-only: a reload offers the
+  //   invitation again, which is right, since declining is not a decision worth
+  //   persisting against someone.
+  const dismissStaffInvite = useCallback(() => {
+    setStaffInvite(null);
+    setStaffInviteDismissed(true);
+  }, []);
   const [renewNow, setRenewNow] = useState(false);
   // Sidebar account menu -> which account surface is open. The URL is the source of truth:
   // ?panel=settings | membership | upgrade | extend | renew. This keeps refresh, Back/Forward,
@@ -6831,14 +7183,34 @@ export default function BookkeeperProToolkit() {
   //   who also bought VIP keeps their VIP tabs and a Trainer gets the course catalogs and
   //   nothing else. A Super Admin resolves to the base entitlement unchanged, which for
   //   the admin branch is FULL — exactly the pre-#45 behaviour for is_admin accounts.
+  //
+  // ★ THIS MAY NOT KEY OFF enroll.active ANY MORE, AND THAT IS A #49 TRAP.
+  //   The old expression read `enroll.active ? planEntitlement(...) : FULL`, which
+  //   was right while the only people with active=false were admins. #49 makes it
+  //   false for EVERY active staff member — so that same line would have handed a
+  //   Trainer FULL_ENTITLEMENT, and staffEntitlement() returns a full base
+  //   unchanged. The union would have silently become a replacement: bypassing the
+  //   paywall would have meant getting the entire paid toolkit, which is exactly
+  //   what "bypass payment is not full access" forbids.
   const entitlement = useMemo(
     () => {
-      const base = enroll.active
-        ? planEntitlement(enroll.sub?.plan_key || profile?.plan || null)
-        : FULL_ENTITLEMENT;
-      return staffEntitlement(staff, base);
+      // Super Admins and flag-off dev mode: FULL, exactly as before.
+      if (profile?.is_admin || !REQUIRE_ENROLLMENT) return FULL_ENTITLEMENT;
+      // Fail open when the enrollment migration has not run — also unchanged.
+      if (!enrollConfigured) return FULL_ENTITLEMENT;
+
+      const planKey = enrollPlanKey || profile?.plan || null;
+
+      if (staffBypassesPaywall(staff)) {
+        // Staff who ALSO hold a valid term keep their plan's tabs on top of their
+        // role's; staff who do not get their role's tools and nothing else.
+        // staffEntitlement() treats a null base as "grants nothing", so the union
+        // starts from zero rather than from everything.
+        return staffEntitlement(staff, enrollPass ? planEntitlement(planKey) : null);
+      }
+      return planEntitlement(planKey);
     },
-    [enroll.active, enroll.sub?.plan_key, profile?.plan, staff]
+    [enrollConfigured, enrollPass, enrollPlanKey, profile?.is_admin, profile?.plan, staff]
   );
   // ── Admin-tab authorization (#45) ────────────────────────────────────────────
   // Admin tabs are NOT in DEFAULT_STAGES, so the plan entitlement has no opinion
@@ -6955,6 +7327,16 @@ export default function BookkeeperProToolkit() {
     if (normalizedTab === 'interview' && nextInterviewSub) setInterviewSubRoute(nextInterviewSub);
     writeAppRoute(normalizedTab, { interviewSub: nextInterviewSub, replace: opts.replace });
   }, [rememberScroll]);
+
+  // ★ Declared AFTER setTab on purpose. A useCallback's dependency array is
+  //   evaluated when the hook runs, so listing [setTab] above setTab's own `const`
+  //   is a temporal-dead-zone ReferenceError on the FIRST render — a white screen
+  //   for every user. `npm run build` cannot catch it: Rollup never evaluates the
+  //   module body.
+  const acceptStaffInvite = useCallback((ctx) => {
+    setStaffInvite(null);
+    setTab(staffLandingTab(ctx) || DEFAULT_APP_TAB);
+  }, [setTab]);
 
   useEffect(() => {
     setVisitedTabs(prev => {
@@ -7693,89 +8075,103 @@ export default function BookkeeperProToolkit() {
     dragRef.current = { kind: null, stageId: null, tabId: null };
   };
 
-  // ── Auth gate ── unauthenticated users never see the app shell below.
-  if (loading)  return <AuthSplash />;
-  if (recovery) return <UpdatePasswordScreen />;  // returned from a reset-link
-  if (!user)    return <AuthScreen themePref={themePref} onCycleTheme={cycleTheme} />;
+  // ── Auth gate ────────────────────────────────────────────────────────────
+  // ★ THE ORDERING NOW LIVES IN src/lib/gateScreen.js, NOT HERE. Every rule this
+  //   sequence encodes was previously a comment on an early return — a ban
+  //   outranks the paywall, imported onboarding outranks the membership gate, the
+  //   legacy approval gate comes last — and none of them was a test, because they
+  //   lived inside a 33,000-line component with no rendering test infrastructure.
+  //   resolveGateScreen() is a pure function over this state, so
+  //   test/gateMatrix.test.mjs asserts the whole table; this switch only renders.
+  const gate = resolveGateScreen({
+    loading, recovery, user, profileReady, profile,
+    staffReady, staffDegraded, staffMembership, staff,
+    enroll, renewNow, inviteDismissed: staffInviteDismissed,
+    hasInviteToken: !!staffInvite,
+    requireApproval: REQUIRE_ADMIN_APPROVAL,
+    requireEnrollment: REQUIRE_ENROLLMENT,
+  });
 
-  // ── Admin-approval + enrollment gates ──
-  // Wait for the first profile fetch so a pending/unpaid user never briefly sees the dashboard.
-  // Admins always pass everything. Both gates fail OPEN when their migration hasn't run, so
-  // deploying the code before the SQL never locks anyone out.
-  if (!profileReady) return <AuthSplash />;
-
-  // 0) Imported-student onboarding (db #26): a migrated account must set its own password
-  //    BEFORE the membership gate. Flag-driven (account_origin='import' + onboarding not
-  //    completed) so it's robust regardless of how the invite/recovery link authenticated.
-  //    Admins are exempt; a pre-#26 DB has no account_origin → this never triggers.
-  if (!profile?.is_admin && profile?.account_origin === 'import' && profile?.onboarding_status !== 'completed') {
-    console.debug('[gate] holding on Imported onboarding', { uid: user?.id });
-    return <SetPasswordScreen />;
+  // The old chain carried five separate console.debug lines, added deliberately so
+  // support could answer "why am I stuck on Pending?" without a screen-share. One
+  // line replaces them, and it cannot drift out of step with the decision because
+  // it prints the decision. Ids only — never an email, never a token.
+  if (gate.screen !== GATE_SCREENS.APP) {
+    console.debug('[gate]', gate.reason, { uid: user?.id, screen: gate.screen });
   }
 
-  // 1) Old-flow hard ban outranks the paywall — a rejected account can't pay its way around it.
-  if (REQUIRE_ADMIN_APPROVAL && !profile?.is_admin && profile?.approval_status === 'rejected') {
-    console.debug('[gate] holding on Rejected', { uid: user?.id, email: user?.email });
-    return <RejectedScreen email={user?.email} reason={profile?.rejection_reason} onSignOut={signOut} />;
-  }
+  switch (gate.screen) {
+    case GATE_SCREENS.SPLASH:
+      return <AuthSplash />;
+    case GATE_SCREENS.RECOVERY:
+      return <UpdatePasswordScreen />;   // returned from a reset-link
+    case GATE_SCREENS.AUTH:
+      return <AuthScreen themePref={themePref} onCycleTheme={cycleTheme} />;
 
-  // 2) Enrollment/payment gate (REQUIRE_ENROLLMENT) — subsumes the pending-approval screen for
-  //    unpaid users AND enforces subscription expiry for paid members. The decision lives in
-  //    enrollGateState() (see its state table); this switch only picks the screen. If
-  //    db/2026-07-04-enrollment.sql hasn't run (enroll.configured=false), we fall through to
-  //    the legacy approval gate below.
-  if (enroll.active) {
-    if (!enroll.ready) return <AuthSplash />;   // one fast own-rows fetch; avoids a paywall flash
-    if (enroll.configured) {
+    // A migrated account must own its password before it can be told about a
+    // subscription (db #26).
+    case GATE_SCREENS.IMPORT_ONBOARDING:
+      return <SetPasswordScreen />;
+
+    // #49: both entry paths land here — arriving from the email link (a token in
+    // `staffInvite`), and signing in normally with a pending membership waiting,
+    // which is what repairs someone who accepted an old-style invitation and was
+    // dropped on the pricing page. Routing both through resolveGateScreen() is what
+    // makes the ban outrank the token; a branch ahead of this switch did not.
+    case GATE_SCREENS.STAFF_INVITATION:
+      return (
+        <StaffInvitationSetup
+          invite={staffInvite}
+          onAccepted={acceptStaffInvite}
+          onDismissToken={dismissStaffInvite}
+        />
+      );
+
+    case GATE_SCREENS.REJECTED:
+      return <RejectedScreen email={user?.email} reason={profile?.rejection_reason} onSignOut={signOut} />;
+
+    case GATE_SCREENS.ENROLL_PENDING:
+      // 'finalizing' = request approved while the profile/subscription flip is
+      // still in flight — hold on the review screen until the gate data catches up.
+      return <EnrollmentPendingScreen request={enroll.latestReq}
+        finalizing={enroll.state === 'finalizing'}
+        renewal={enroll.state === 'renew_pending'}
+        email={user?.email} uid={user?.id} onSignOut={signOut}
+        onRefreshProfile={refreshProfile} onRefreshRequest={enroll.refresh} />;
+
+    case GATE_SCREENS.MEMBERSHIP_EXPIRED:
+      return <MembershipExpiredScreen user={user} profile={profile} sub={enroll.sub}
+        latestReq={enroll.latestReq} email={user?.email} uid={user?.id}
+        onRenew={() => setRenewNow(true)} onSignOut={signOut}
+        onRefreshProfile={refreshProfile} onRefreshRequest={enroll.refresh} />;
+
+    case GATE_SCREENS.RENEWAL_PAYWALL: {
+      // priorRequest only when it can matter: a rejected/expired renewal shows its
+      // notice, and an OVERDUE pending row MUST be passed so the paywall's
+      // self-expire frees the one-pending unique index before the renewal insert.
       const r = enroll.latestReq;
       const overdue = r?.status === 'pending_review' && r?.expires_at && new Date(r.expires_at) < new Date();
-      switch (enroll.state) {
-        case 'pending':
-        case 'renew_pending':
-        case 'finalizing':
-          // 'finalizing' = request approved while the profile/subscription flip is still in
-          // flight — hold on the review screen until the gate data catches up.
-          console.debug('[gate] holding on Enrollment review', { uid: user?.id, status: r?.status, state: enroll.state });
-          return <EnrollmentPendingScreen request={r} finalizing={enroll.state === 'finalizing'}
-            renewal={enroll.state === 'renew_pending'}
-            email={user?.email} uid={user?.id} onSignOut={signOut}
-            onRefreshProfile={refreshProfile} onRefreshRequest={enroll.refresh} />;
-        case 'expired': {
-          console.debug('[gate] holding on Membership expired', { uid: user?.id, renewNow });
-          // priorRequest only when it can matter: a rejected/expired renewal shows its notice,
-          // and an OVERDUE pending row MUST be passed so the paywall's self-expire frees the
-          // one-pending unique index before the renewal insert.
-          const prior = r && (r.status === 'rejected' || r.status === 'expired' || overdue) ? r : null;
-          if (!renewNow) {
-            return <MembershipExpiredScreen user={user} profile={profile} sub={enroll.sub} latestReq={r} email={user?.email}
-              uid={user?.id} onRenew={() => setRenewNow(true)} onSignOut={signOut}
-              onRefreshProfile={refreshProfile} onRefreshRequest={enroll.refresh} />;
-          }
-          return <EnrollmentPaywall user={user} profile={profile} renewal currentSub={enroll.sub}
-            priorRequest={prior} prefillFrom={r} overdue={!!overdue} onClose={() => setRenewNow(false)}
-            onSubmitted={(row) => { setRenewNow(false); enroll.refresh(row); }} onSignOut={signOut} />;
-        }
-        case 'paywall':
-        case 'paywall_notice':
-          // No request yet, rejected, expired, or overdue-pending → paywall (with a resubmit
-          // notice step when a prior request exists).
-          return <EnrollmentPaywall user={user} profile={profile} priorRequest={r} prefillFrom={r} overdue={!!overdue}
-            onSubmitted={enroll.refresh} onSignOut={signOut} />;
-        case 'pass':
-        default:
-          break;   // valid membership (or grandfathered) → app shell below
-      }
+      const prior = r && (r.status === 'rejected' || r.status === 'expired' || overdue) ? r : null;
+      return <EnrollmentPaywall user={user} profile={profile} renewal currentSub={enroll.sub}
+        priorRequest={prior} prefillFrom={r} overdue={!!overdue} onClose={() => setRenewNow(false)}
+        onSubmitted={(row) => { setRenewNow(false); enroll.refresh(row); }} onSignOut={signOut} />;
     }
-  }
 
-  // 3) Legacy admin-approval gate (REQUIRE_ADMIN_APPROVAL) — the active gate when the enrollment
-  //    feature is off or its migration hasn't run. ('rejected' is already handled above.)
-  if (REQUIRE_ADMIN_APPROVAL && !profile?.is_admin) {
-    if (profile?.approval_status === 'pending') {
-      // Secret-safe diagnostic for the "stuck on Pending" case: shows whose status the gate read.
-      console.debug('[gate] holding on Pending', { uid: user?.id, email: user?.email, approval_status: profile?.approval_status, is_admin: profile?.is_admin });
-      return <PendingApprovalScreen email={user?.email} uid={user?.id} onSignOut={signOut} onRefresh={refreshProfile} />;
+    case GATE_SCREENS.PAYWALL: {
+      // No request yet, rejected, expired, or overdue-pending → paywall (with a
+      // resubmit notice step when a prior request exists).
+      const r = enroll.latestReq;
+      const overdue = r?.status === 'pending_review' && r?.expires_at && new Date(r.expires_at) < new Date();
+      return <EnrollmentPaywall user={user} profile={profile} priorRequest={r} prefillFrom={r}
+        overdue={!!overdue} onSubmitted={enroll.refresh} onSignOut={signOut} />;
     }
+
+    case GATE_SCREENS.APPROVAL_PENDING:
+      return <PendingApprovalScreen email={user?.email} uid={user?.id} onSignOut={signOut} onRefresh={refreshProfile} />;
+
+    case GATE_SCREENS.APP:
+    default:
+      break;   // valid membership (or grandfathered) → app shell below
   }
 
   // Theme (data-theme) lives on <html> — set by the index.html boot script + useTheme.
@@ -8895,12 +9291,30 @@ function StaffInviteDrawer({ busy, onClose, onSubmit }) {
       <label className="block mt-4" style={{ fontSize: 12, fontWeight: 700, color: C.textSoft }}>Job title <span style={{ fontWeight: 500, color: C.textMute }}>(optional)</span></label>
       <input value={title} onChange={e => setTitle(e.target.value)}
         placeholder="Lead Trainer" className="gh-input mt-1.5 w-full" />
+
+      {/* #49 — what is about to happen, stated rather than looked up.
+          ★ Deliberately NOT a live "does this address already exist?" check. That
+            would be an account-enumeration oracle, and the branch is decided
+            server-side anyway (on whether the account is CONFIRMED, not merely
+            present). Saying both outcomes is honest and adds no new surface. */}
+      {emailOk && (
+        <div className="mt-4 px-3.5 py-2.5 rounded-xl" style={{
+          background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)',
+          color: 'var(--status-info-fg)', fontSize: 12, lineHeight: 1.55,
+        }}>
+          <strong>{email.trim().toLowerCase()}</strong> will be added as{' '}
+          <strong>{role?.label || roleKey}</strong>. If that address already has a confirmed
+          account they get the role straight away and a short notification; otherwise they
+          are emailed an invitation and stay <em>Invited</em> until they accept it. Either way
+          they are never asked to pay for anything.
+        </div>
+      )}
     </SidePanel>
   );
 }
 
 /** One staff member: their role, their status actions, and their history. */
-function StaffDetailDrawer({ row, events, busy, isSelf, activeSuperAdmins, onClose, onRequest }) {
+function StaffDetailDrawer({ row, events, busy, isSelf, activeSuperAdmins, error, onClose, onRequest }) {
   const [nextRole, setNextRole] = useState(row.role_key);
   const role = staffRole(row.role_key);
 
@@ -8933,11 +9347,23 @@ function StaffDetailDrawer({ row, events, busy, isSelf, activeSuperAdmins, onClo
         </div>
       </div>
 
+      {error && (
+        <div className="mt-4 flex items-start gap-2 px-3.5 py-2.5 rounded-xl" role="alert" style={{
+          background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)',
+          color: 'var(--status-danger-fg)', fontSize: 12.5, lineHeight: 1.5,
+        }}>
+          <AlertTriangle size={14} className="flex-shrink-0 mt-px" /> <span>{error}</span>
+        </div>
+      )}
+
       <div className="mt-4 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
         {[
           ['Invited', row.invited_at ? fmtEnrollDate(row.invited_at) : '—'],
           ['Activated', row.activated_at ? fmtEnrollDate(row.activated_at) : '—'],
           ['Invited by', row.invited_by_email || '—'],
+          // #49: where the invitation email actually got to. Absent on a pre-#49
+          // database and on rows invited before it, so it renders only when known.
+          ...(row.invite_sent_at ? [['Email sent', fmtEnrollDate(row.invite_sent_at)]] : []),
           ...(row.suspended_at ? [['Suspended', fmtEnrollDate(row.suspended_at)]] : []),
           ...(row.revoked_at ? [['Revoked', fmtEnrollDate(row.revoked_at)]] : []),
           ...(row.suspension_reason ? [['Reason', row.suspension_reason]] : []),
@@ -8978,6 +9404,38 @@ function StaffDetailDrawer({ row, events, busy, isSelf, activeSuperAdmins, onClo
           Change role
         </button>
       </div>
+
+      {/* Invitation delivery (#49) — only meaningful while they have not accepted. */}
+      {row.status === 'invited' && (
+        <div className="mt-4">
+          <AdminFilterCaption>Invitation</AdminFilterCaption>
+          {row.invite_status === 'failed' ? (
+            <div className="mt-1.5 px-3.5 py-2.5 rounded-xl" style={{
+              background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)',
+              color: 'var(--status-danger-fg)', fontSize: 12.5, lineHeight: 1.5,
+            }}>
+              <strong>The invitation email was not sent.</strong> Their role is saved and the
+              invitation is still valid &mdash; send it again below.
+              {row.invite_error_code && (
+                <span style={{ opacity: 0.75 }}> ({row.invite_error_code})</span>
+              )}
+            </div>
+          ) : (
+            <p className="mt-1.5" style={{ fontSize: 12, color: C.textMute, lineHeight: 1.5 }}>
+              {row.invite_sent_at
+                ? 'Waiting for them to accept. Sending again issues a new single-use link and invalidates nothing else.'
+                : 'No send has been recorded for this invitation yet.'}
+            </p>
+          )}
+          <div className="mt-2">
+            <button onClick={() => onRequest('resend-invite')} disabled={busy}
+              className="px-3.5 py-2 rounded-xl text-sm font-semibold flex items-center gap-2 transition disabled:opacity-60"
+              style={{ background: 'var(--wash-strong)', border: `1px solid ${C.border}`, color: C.text }}>
+              <Mail size={15} /> Resend invitation
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Status */}
       <div className="mt-5">
@@ -9233,6 +9691,10 @@ function AdminStaffRoles() {
 
   const [inviteOpen, setInviteOpen] = useState(false);
   const [detailFor, setDetailFor] = useState(null);   // the membership row in the drawer
+  // Dialog-local failure text. The detail drawer is portaled above a scrim, so a
+  // page-level AdminNotice renders BEHIND it — a failed Resend would look like the
+  // button did nothing at all.
+  const [detailErr, setDetailErr] = useState('');
   const [events, setEvents] = useState(null);         // audit rows for detailFor
   const [confirm, setConfirm] = useState(null);       // { kind, row, nextRole? }
 
@@ -9309,6 +9771,7 @@ function AdminStaffRoles() {
 
   const openDetail = async (row) => {
     setDetailFor(row);
+    setDetailErr('');
     setEvents(null);
     try {
       const out = await callStaff({ action: 'audit', user_id: row.user_id, limit: 50 });
@@ -9318,18 +9781,26 @@ function AdminStaffRoles() {
     }
   };
 
-  const runAction = async (payload, successMsg) => {
-    setBusy(true); setErr(''); setNotice('');
+  const runAction = async (payload, successMsg, opts = {}) => {
+    setBusy(true); setErr(''); setNotice(''); setDetailErr('');
+    // The drawer stays open on failure, and it is portaled ABOVE the page, so a
+    // page-level banner would render behind its scrim. Report where the reader is.
+    const inDrawer = !!detailFor;
     try {
       await callStaff(payload);
       setNotice(successMsg);
       setConfirm(null);
-      setDetailFor(null);
+      // ★ Resending an invitation is the one action here that is repeatable and
+      //   drawer-local: the admin wants to stay on the row and watch the send
+      //   state change. Every other action is a role or status change confirmed
+      //   through StaffConfirmModal, where closing back to the list is right.
+      if (!opts.keepDrawerOpen) setDetailFor(null);
       await load(true);
       // If the actor changed their OWN role, their capabilities just moved.
       if (payload.user_id === user?.id) await refreshStaff?.();
     } catch (e) {
-      setErr(appErrorMessage(e, 'That change could not be applied.'));
+      const msg = appErrorMessage(e, 'That change could not be applied.');
+      if (inDrawer) setDetailErr(msg); else setErr(msg);
     } finally {
       setBusy(false);
     }
@@ -9357,8 +9828,11 @@ function AdminStaffRoles() {
           <AdminNotice kind="warn">
             The staff role model isn’t in this database yet — run{' '}
             <strong>db/2026-08-25-staff-authorization.sql</strong>, then{' '}
-            <strong>db/2026-08-26-course-staff-assignments.sql</strong> and{' '}
-            <strong>db/2026-08-27-special-extension.sql</strong>, in the Supabase SQL Editor. Sign out and
+            <strong>db/2026-08-26-course-staff-assignments.sql</strong>,{' '}
+            <strong>db/2026-08-27-special-extension.sql</strong>,{' '}
+            <strong>db/2026-08-28-authorization-hardening.sql</strong> and{' '}
+            <strong>db/2026-08-29-staff-invitation-acceptance.sql</strong>, in that order, in the
+            Supabase SQL Editor. Sign out and
             back in afterwards. Until then every administrator keeps working through the
             legacy <code>profiles.is_admin</code> flag, and nothing on this screen can do anything —
             so its controls are hidden rather than left to fail.
@@ -9484,9 +9958,23 @@ function AdminStaffRoles() {
             setBusy(true); setErr(''); setNotice('');
             try {
               const out = await callStaff({ action: 'invite', ...payload });
-              setNotice(out.invited
-                ? `Invitation sent to ${payload.email}. They appear as “Invited” until they accept.`
-                : `${payload.email} already had an account — promoted to ${staffRole(payload.role_key)?.label || payload.role_key}.`);
+              const roleName = staffRole(payload.role_key)?.label || payload.role_key;
+              if (!out.email_sent) {
+                // The role IS saved either way — say exactly that, then name the
+                // action that actually applies. ★ "Resend invitation" only exists
+                // while status='invited', so pointing a PROMOTED (already active)
+                // account at it would send the admin to a control that is not there.
+                const why = out.email_code ? ` (${out.email_code})` : '';
+                setErr(out.promoted
+                  ? `${payload.email} is now ${roleName} and already has access — only the `
+                    + `notification email could not be sent${why}. Let them know directly.`
+                  : `${payload.email} was added as ${roleName}, but the invitation email could `
+                    + `not be sent${why}. Open their row and use “Resend invitation”.`);
+              } else {
+                setNotice(out.invited
+                  ? `Invitation sent to ${payload.email}. They appear as “Invited” until they accept.`
+                  : `${payload.email} already had an account — promoted to ${roleName}.`);
+              }
               setInviteOpen(false);
               await load(true);
             } catch (e) {
@@ -9504,8 +9992,19 @@ function AdminStaffRoles() {
           busy={busy}
           isSelf={detailFor.user_id === user?.id}
           activeSuperAdmins={activeSuperAdmins}
-          onClose={() => { setDetailFor(null); setEvents(null); }}
-          onRequest={(kind, extra) => setConfirm({ kind, row: detailFor, ...extra })} />
+          onClose={() => { setDetailFor(null); setEvents(null); setDetailErr(''); }}
+          error={detailErr}
+          onRequest={(kind, extra) => {
+            if (kind === 'resend-invite') {
+              runAction(
+                { action: 'resend-invite', user_id: detailFor.user_id },
+                `A new invitation link is on its way to ${detailFor.email}.`,
+                { keepDrawerOpen: true },
+              );
+              return;
+            }
+            setConfirm({ kind, row: detailFor, ...extra });
+          }} />
       )}
 
       {confirm && (
@@ -12684,8 +13183,17 @@ function RestrictedTab({ active, goto }) {
 // pending the member keeps full access.
 
 function MembershipPanel() {
-  const { user, profile, signOut } = useAuth();
+  const { user, profile, signOut, staff } = useAuth();
   const uid = user?.id;
+  // ★ #49: this panel renders null for "staff", and until now that meant Super
+  //   Admin only. An Operations Admin or Trainer has no subscription by design, so
+  //   once #49 let them reach the dashboard they would have been shown a
+  //   membership card about a membership they were never meant to buy.
+  //
+  //   ★ But that test belongs BELOW, on whether a subscription actually exists —
+  //     not here. Folding staffBypassesPaywall() into `isAdmin` also skipped the
+  //     fetch, so a staff member who IS a paying student lost their expiry date
+  //     and their Renew button along with it. (CodeRabbit, PR #4.)
   const isAdmin = !!profile?.is_admin;
   const [sub, setSub] = useState(null);
   const [reqs, setReqs] = useState([]);
@@ -12776,6 +13284,10 @@ function MembershipPanel() {
   }, []);
 
   if (!REQUIRE_ENROLLMENT || !uid || isAdmin) return null;
+  // ★ Active staff with NO subscription have no membership to show, so the card
+  //   would be a prompt to buy something their job already gives them. Staff who
+  //   ALSO bought a plan keep it, expiry and Renew included.
+  if (loaded && !sub && staffBypassesPaywall(staff)) return null;
   // First load in flight → fixed-height skeleton so the Dashboard doesn't reflow/flash
   // when the real panel lands. A failed load shows a compact retry card — a student's
   // membership card must never just vanish with no explanation.

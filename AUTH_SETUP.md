@@ -179,6 +179,100 @@ Alex"*. Paste this body (swap the heading/copy for the reset template — "Reset
 </div>
 ```
 
+## 4e. Staff invitations do NOT use a Supabase template (#49)
+
+Everything above governs the **student** emails (confirm signup, reset password). The **staff
+invitation is different, deliberately**, and it is worth knowing why before you go looking for a
+template to edit.
+
+Before #49 the invitation was sent by `auth.admin.inviteUserByEmail()`, which means Supabase's own
+mailer and the hosted **"Invite user"** template. That template was never customised, so what went
+out was verbatim the Supabase default — an `<h2>`, one sentence, one bare link, subject
+*"You've been invited"* — with no way to name the role, no plain-text part, and no test coverage.
+It also went to spam.
+
+Since #49 the invitation is built in this repo and sent through **Resend's API**, exactly like the
+enrollment emails:
+
+- content: `api/_lib/staffInviteEmail.js` (HTML **and** plain text, role in the subject)
+- link format: `src/lib/staffInvite.js`
+- send: `api/_lib/email.js`
+- pinned by: `test/staffInvite.test.mjs`
+
+**So do not edit the "Invite user" template in the dashboard — nothing reads it any more.** To change
+the invitation, change the module and ship it.
+
+### The link is first-party, and needs no Redirect-URL entry
+
+The invitation link points at **`https://<your-app>/staff/invitation#invite=<token>&t=invite`** — your
+own domain, with the one-time token in the **fragment**. It is never a Supabase `/auth/v1/verify`
+URL, and it never uses `redirectTo`.
+
+That is a deliberate choice with four consequences worth keeping:
+
+1. **No Redirect-URL allow-list entry is required.** `redirectTo` values that are not on the list are
+   silently discarded in favour of Site URL, which is how these flows end up dumping people on the
+   dashboard (or the paywall) with no explanation. Not using it removes the failure mode.
+2. **A fragment is never sent to a server**, so the token cannot appear in a Vercel access log, a
+   proxy log, or a `Referer` header.
+3. **A GET consumes nothing.** Supabase's `/auth/v1/verify` redeems the token on GET, so a corporate
+   mail scanner that follows links burns the invitation before the human clicks it. Ours only redeems
+   when a person clicks **Accept**, via `supabase.auth.verifyOtp({ token_hash, type })`.
+4. The link's domain matches the From domain, which is what a reader and a spam filter both expect.
+
+`/staff/invitation` needs **no `vercel.json` change** — the existing SPA catch-all rewrite already
+serves it.
+
+### Link expiry
+
+The invitation link's lifetime is **Supabase → Authentication → Providers → Email → "Email OTP
+Expiration"** (`mailer_otp_exp`). It is a **single global setting** that also governs password-reset
+and signup-confirmation links.
+
+`INVITE_LINK_TTL_HOURS` in `src/lib/staffInvite.js` is a hand-kept **mirror** of it, used for the
+"expires in N hours" line in the email — GoTrue does not expose the value to a server function.
+`test/staffInvite.test.mjs` pins the constant, so changing one without the other fails the suite.
+**Set the dashboard value to 86400 (24 hours) to match.**
+
+### Required environment variables
+
+The invitation needs `RESEND_API_KEY`, `RESEND_FROM` and `APP_URL` on the server (never `VITE_`-prefixed).
+`GET /api/admin/staff` reports all three without exposing any value:
+
+```json
+{ "ok": true, "configured": true, "hasResend": true, "hasAppUrl": true }
+```
+
+If `hasResend` is false the membership is still created and the role is still assigned — the email
+simply is not sent. What happens next depends on which branch ran:
+
+- **A new or unconfirmed account** stays at `status='invited'`, the row is flagged
+  `invite_status='failed'`, and Team & Roles offers **Resend invitation**.
+- **A confirmed existing account** was promoted straight to `active` with no token, so nothing is
+  pending and there is no Resend control — the failed message was a *notification*, not an
+  invitation. Tell them directly that they now hold the role.
+
+An unset `APP_URL` falls back to the request host.
+
+### Deliverability
+
+Authentication is not the problem and a redesign is not a guarantee. Verified for
+`toolkits.alexsagun.com`: DKIM (`resend._domainkey`) aligns strictly with the From domain, SPF passes
+and aligns in relaxed mode via the `send.` subdomain's SES Return-Path, and DMARC resolves through the
+organizational domain to `p=none`. Gmail's own explanation for the spam placement was *"similar to
+messages that were identified as spam in the past"* — a content and reputation verdict, **not** the
+authentication-failure banner.
+
+What is genuinely worth doing, in order of effect:
+
+1. **Publish `_dmarc.toolkits.alexsagun.com`** — `v=DMARC1; p=none; rua=mailto:<you>`. Today there is
+   no `rua` anywhere, so nobody receives a single aggregate report. Start at `p=none`; only consider
+   `quarantine` after the reports show every legitimate sender passing.
+2. **Confirm click-tracking is OFF** for the domain in Resend. Tracking rewrites links to a tracking
+   host, which breaks the first-party-link property above and can let a scanner redeem the token.
+3. Keep sending the plain-text part (#49 added it; nothing else in `api/` sends one).
+
+
 ## 5. Run it
 
 ```powershell

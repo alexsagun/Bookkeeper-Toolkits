@@ -8,8 +8,8 @@
 //   const { session, user, profile, loading, profileReady, recovery, configured,
 //           signUp, signIn, signInWithGoogle, signOut, resetPassword,
 //           resendConfirmation, updatePassword, clearRecovery, refreshProfile,
-//           staff, staffReady, staffDegraded, staffMissing, isSuperAdmin, can,
-//           refreshStaff } = useAuth();
+//           staff, staffReady, staffDegraded, staffMissing, staffMembership,
+//           isSuperAdmin, can, refreshStaff } = useAuth();
 //
 // STAFF AUTHORITY (#45). `can('enrollments.review')` is the one predicate admin
 // surfaces should ask; `profile.is_admin` now means "active Super Admin" and
@@ -36,7 +36,9 @@
 // ---------------------------------------------------------------------------
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import { supabase, supabaseConfigured } from '../lib/supabase';
-import { EMPTY_STAFF_CONTEXT, staffCan, staffContextFromRpc } from '../lib/staffRoles.js';
+import {
+  EMPTY_STAFF_CONTEXT, EMPTY_STAFF_MEMBERSHIP, staffCan, staffContextFromRpc,
+} from '../lib/staffRoles.js';
 
 const AuthContext = createContext(null);
 
@@ -204,6 +206,13 @@ export function AuthProvider({ children }) {
   //   is absent can also skip a request that cannot possibly succeed, which is
   //   what was turning "not installed yet" into a 500 in the console.
   const [staffMissing, setStaffMissing] = useState(false);
+  // ★ DESCRIPTIVE, NEVER AUTHORITATIVE (#49). `staff` above collapses any
+  //   non-active membership to EMPTY, which is right for authority and is exactly
+  //   why an invited member used to be indistinguishable from a student — the app
+  //   had thrown away the one fact it needed to offer them the invitation screen.
+  //   This holds that fact SEPARATELY, and it carries no permission list at all,
+  //   so there is no boolean anywhere that could turn it into access.
+  const [staffMembership, setStaffMembership] = useState(EMPTY_STAFF_MEMBERSHIP);
   // True after the user returns from a password-reset email link, until they set
   // a new password. The reset link signs them in with a recovery session, so the
   // app must show a "set new password" screen instead of the toolkit (see the gate).
@@ -337,6 +346,7 @@ export function AuthProvider({ children }) {
     const uid = session?.user?.id;
     if (!uid) {
       setStaff(EMPTY_STAFF_CONTEXT);
+      setStaffMembership(EMPTY_STAFF_MEMBERSHIP);
       setStaffDegraded(false);
       setStaffMissing(false);
       setStaffFetchedFor(null);
@@ -347,6 +357,7 @@ export function AuthProvider({ children }) {
       const res = await fetchStaffContext();
       if (!active) return;
       setStaff(res.context);
+      setStaffMembership(res.membership || EMPTY_STAFF_MEMBERSHIP);
       setStaffDegraded(res.degraded);
       setStaffMissing(res.missing);
       if (res.degraded && !res.missing) {
@@ -373,6 +384,7 @@ export function AuthProvider({ children }) {
     if (!session?.user?.id) return EMPTY_STAFF_CONTEXT;
     const res = await fetchStaffContext();
     setStaff(res.context);
+    setStaffMembership(res.membership || EMPTY_STAFF_MEMBERSHIP);
     setStaffDegraded(res.degraded);
     setStaffMissing(res.missing);
     return res.context;
@@ -417,6 +429,10 @@ export function AuthProvider({ children }) {
     // that cannot succeed — which is what was surfacing a missing migration as a
     // 500 in the browser console.
     staffMissing,
+    // The pending/ended membership, for the invitation screen and for telling
+    // someone why their access stopped. Carries no permissions by construction —
+    // staffCan() is the only thing that answers "may I".
+    staffMembership,
     isSuperAdmin: staff.isSuperAdmin,
     can,
     refreshStaff,

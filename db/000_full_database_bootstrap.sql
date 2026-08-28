@@ -18650,3 +18650,953 @@ on conflict (filename) do nothing;
 --   -- Re-running the SAME call with the SAME key must return replayed = true and
 --   -- must NOT move the expiry a second time.
 -- ─────────────────────────────────────────────────────────────────────────────
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- §35) FOLDED VERBATIM — 2026-08-28-authorization-hardening.sql   (#48)
+-- ═════════════════════════════════════════════════════════════════════════════
+-- Appended at the tail for the same reason as §19-§32: the earlier sections
+-- create the pre-#48 shapes, and this file's DROP+CREATE must win on a fresh
+-- install. The file is idempotent and self-guarded, so appending reproduces the
+-- live end state exactly. RE-FOLD whenever the dated file changes.
+--
+-- Its `do $pre$ … $pre$;` preflight is omitted: the bootstrap creates every
+-- dependency itself, above, in order.
+-- ═════════════════════════════════════════════════════════════════════════════
+-- ─────────────────────────────────────────────────────────────────────────────
+-- #48 — Authorization hardening: corrections to #45/#46/#47 after a full review.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Every item below was REPRODUCED against the live schema inside a rolled-back
+-- transaction (impersonating a real user via `set local role authenticated` +
+-- `request.jwt.claims`), not inferred from reading the SQL. Where a test passed
+-- for the wrong reason that is called out, because one of them did.
+--
+-- ★ 1. THE BIG ONE — an Operations Admin could rewrite and DELETE any
+--      subscription directly, which made #47 decorative.
+--      #45 §15 moved `subscriptions_admin_all` from is_admin() to
+--      has_staff_permission('enrollments.review'), but that policy is FOR ALL and
+--      `authenticated` still holds Supabase's default table grants, so RLS was the
+--      only gate. Reproduced: as an Ops Admin, one PATCH set plan_key='vip' and
+--      ends_at='2099-01-01' on a live row, and one DELETE removed it.
+--
+--      That is exactly the act #47's header says must stay with Super Admin —
+--      "a discretionary extension creates paid access with no payment behind it".
+--      admin_grant_special_extension() enforces a reason, a 1-365 clamp,
+--      forward-only, and an append-only ledger row. The direct table write
+--      enforced none of them and left no record at all.
+--
+--      The fix is to stop using FOR ALL for a read-mostly screen. AdminEnrollments
+--      never writes `subscriptions` — every grant goes through a SECURITY DEFINER
+--      RPC — and on `enrollment_requests` it only ever UPDATEs (reject reason,
+--      admin notes). So: SELECT for reviewers, UPDATE where the screen needs it,
+--      and INSERT/DELETE reserved for Super Admin. Forging a request row and then
+--      approving it is no longer available to the lower-trust tier.
+--
+-- ★ 2. #46 scoped ONE of the three AI-trainer tables.
+--      course_ai_sources_admin_all got `and can_manage_course(course_id)`;
+--      course_ai_chunks_admin_read and course_ai_index_jobs_admin_all did not,
+--      leaving a Trainer able to read every course's indexed text and manipulate
+--      every course's index queue. Both tables carry course_id, so the same
+--      conjunct applies.
+--      ★★ The first test of this PASSED and was WRONG: both tables are empty
+--         today, so "0 rows visible" proved nothing. Reading pg_policies directly
+--         is what found it. Latent, not live — but live the moment anyone indexes.
+--
+-- ★ 3. A Trainer could not create a course at all — the feature #46 exists for.
+--      CourseCatalog.createCourse() issues `insert … select()`, which PostgREST
+--      compiles to INSERT … RETURNING; the RETURNING row is checked against the
+--      SELECT policy, and at that instant the AFTER-INSERT owner assignment is not
+--      yet usable, so courses_read denied it and the whole insert rolled back.
+--      Fixed with a creator branch — gated on STILL holding courses.create, because
+--      created_by is permanent provenance and on its own would keep granting read
+--      to someone whose staff access was revoked. (The first draft of this fix did
+--      exactly that; the test caught it.)
+--
+-- ★ 4. #46 broke feature-guide video uploads for EVERYONE, including Super Admins.
+--      Those live at `feature-guides/<key>/<file>` in course-media, which
+--      course_object_course_id() correctly returns NULL for — so the narrowed write
+--      policies denied it. Fails closed, so not a vulnerability, but the Mock
+--      Interview guide became un-editable.
+--
+-- ★ 5. Per-row cost: #46 put can_manage_course() — a SECURITY DEFINER doing up to
+--      two permission lookups — AHEAD of the member branch in three read policies,
+--      so every ordinary student paid it once per row. #44's own comment reasoned
+--      about exactly this ordering. Each staff branch now sits behind an
+--      InitPlan-able capability test, so a non-staff caller short-circuits once per
+--      statement and never makes the per-row call.
+--
+-- Depends on: #45, #46, #47.
+--
+-- HOW TO RUN: paste into the Supabase dashboard → SQL Editor → Run.
+-- IDEMPOTENT — safe to re-run.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+
+-- == 0) Preflight ============================================================
+
+
+-- == 1) An Operations Admin reviews money; they do not rewrite it =============
+-- ★ FOR ALL was the mistake. Split by verb so the capability grants exactly the
+--   screen's needs and nothing else.
+--
+-- ★ DROP+CREATE is safe here in a way it would not be for a read policy: while
+--   the write policy is absent RLS refuses the write (fail-closed), and SELECT is
+--   carried by the separate policies created alongside. The reverse — dropping a
+--   READ policy — would blank the screen for everyone, which is why #46 used
+--   ALTER for reads.
+
+drop policy if exists subscriptions_admin_all on public.subscriptions;
+
+drop policy if exists subscriptions_staff_read on public.subscriptions;
+create policy subscriptions_staff_read on public.subscriptions
+  for select to authenticated
+  using ((select public.has_staff_permission('enrollments.review')));
+
+-- Super Admin keeps a direct write path (break-glass / data repair). Everything
+-- routine already goes through approve_subscription / approve_extension /
+-- admin_finalize_enrollment / admin_grant_special_extension, all SECURITY DEFINER.
+drop policy if exists subscriptions_super_write on public.subscriptions;
+create policy subscriptions_super_write on public.subscriptions
+  for all to authenticated
+  using ((select public.is_super_admin()))
+  with check ((select public.is_super_admin()));
+
+drop policy if exists enroll_req_admin_all on public.enrollment_requests;
+
+drop policy if exists enroll_req_staff_read on public.enrollment_requests;
+create policy enroll_req_staff_read on public.enrollment_requests
+  for select to authenticated
+  using ((select public.has_staff_permission('enrollments.review')));
+
+-- The reviewer screen writes exactly two things: the reject decision and
+-- admin_notes. UPDATE covers both. It deliberately does NOT cover INSERT, so a
+-- reviewer cannot forge a request and then approve their own forgery.
+drop policy if exists enroll_req_staff_update on public.enrollment_requests;
+create policy enroll_req_staff_update on public.enrollment_requests
+  for update to authenticated
+  using ((select public.has_staff_permission('enrollments.review')))
+  with check ((select public.has_staff_permission('enrollments.review')));
+
+-- ★ …BUT RLS HAS NO COLUMN GRANULARITY, AND THAT POLICY ALONE IS A HOLE.
+--   The comment above says the screen writes the reject decision and admin_notes.
+--   The POLICY says an enrollments.review holder may UPDATE the row — every
+--   column of it. `authenticated` holds Supabase's default table-level UPDATE on
+--   all 42 columns, so an Operations Admin could rewrite another student's
+--   pending request to plan_key='vip' and then approve it through
+--   admin_finalize_enrollment(), which reads plan_key straight off the row. That
+--   is a ₱16,999 grant with no payment behind it — the exact escalation this file
+--   closes for `subscriptions` two policies up, missed on the sibling table.
+--   (Found by CodeRabbit on PR #3, confirmed against the live schema.)
+--
+--   GRANT has the column granularity RLS lacks. Same idiom as #38's
+--   `revoke update (code) on batches`, and the six columns below are the complete
+--   set the app writes, from its only three UPDATE paths: the student self-expire,
+--   the admin decision, and the admin note.
+--
+--   The SECURITY DEFINER RPCs are unaffected — admin_finalize_enrollment() and
+--   record_enrollment_notification() run as the owner, so column grants do not
+--   restrict them. This narrows what a CLIENT may send, nothing else.
+revoke update on public.enrollment_requests from authenticated;
+grant update (status, rejection_reason, reviewed_at, reviewed_by, admin_notes, updated_at)
+  on public.enrollment_requests to authenticated;
+
+drop policy if exists enroll_req_super_write on public.enrollment_requests;
+create policy enroll_req_super_write on public.enrollment_requests
+  for all to authenticated
+  using ((select public.is_super_admin()))
+  with check ((select public.is_super_admin()));
+
+
+-- == 2) The AI-trainer tables are course-scoped, all three of them ============
+alter policy course_ai_chunks_admin_read on public.course_ai_chunks
+  using ((select public.is_admin())
+         or ((select public.has_staff_permission('course_trainer.manage'))
+             and public.can_manage_course(course_id)));
+
+alter policy course_ai_index_jobs_admin_all on public.course_ai_index_jobs
+  using ((select public.is_admin())
+         or ((select public.has_staff_permission('course_trainer.manage'))
+             and public.can_manage_course(course_id)))
+  with check ((select public.is_admin())
+              or ((select public.has_staff_permission('course_trainer.manage'))
+                  and public.can_manage_course(course_id)));
+
+
+-- == 3) Course reads: a creator can read what they created, and a student =====
+--       never pays for a staff-only check
+--
+-- ★ ORDER IS THE POINT. is_admin() is one InitPlan. The MEMBER branch comes next
+--   and is entirely InitPlans plus column tests. The STAFF branch comes last and
+--   is itself guarded by an InitPlan-able capability test, so a plain student
+--   evaluates it once per statement, gets false, and never reaches the per-row
+--   can_manage_course() call.
+--
+-- ★ The creator branch pairs created_by with STILL holding courses.create.
+--   created_by is permanent provenance; alone it would outlive employment.
+
+alter policy courses_read on public.courses
+  using (
+    (select public.is_admin())
+    or (published = true
+        and (select public.is_approved())
+        and (select public.is_enrolled())
+        and ((not (select public.plan_is_sampler()))
+             or (slug like 'qbo-%' and access_tier = 'essentials')))
+    or ((select public.has_staff_permission('courses.create')
+          or public.has_staff_permission('courses.manage_assigned')
+          or public.has_staff_permission('courses.manage_all'))
+        and (created_by = (select auth.uid()) or public.can_manage_course(id)))
+  );
+
+alter policy modules_read on public.course_modules
+  using (
+    (select public.is_admin())
+    or ((select public.is_approved()) and (select public.is_enrolled())
+        and exists (
+          select 1 from public.courses c
+           where c.id = course_modules.course_id
+             and c.published = true
+             and ((not (select public.plan_is_sampler()))
+                  or (c.slug like 'qbo-%' and c.access_tier = 'essentials'))))
+    or ((select public.has_staff_permission('courses.manage_assigned')
+          or public.has_staff_permission('courses.manage_all'))
+        and public.can_manage_course(course_modules.course_id))
+  );
+
+alter policy lessons_read on public.course_lessons
+  using (
+    (select public.is_admin())
+    or ((select public.is_approved()) and (select public.is_enrolled())
+        and exists (
+          select 1 from public.courses c
+           where c.id = course_lessons.course_id
+             and c.published = true
+             and ((not (select public.plan_is_sampler()))
+                  or (c.slug like 'qbo-%' and c.access_tier = 'essentials'))))
+    or ((select public.has_staff_permission('courses.manage_assigned')
+          or public.has_staff_permission('courses.manage_all'))
+        and public.can_manage_course(course_lessons.course_id))
+  );
+
+
+-- == 4) Storage: same reordering, plus feature guides work again =============
+-- ★ Reads stay REFERENCE-based (course_video_object_readable) for members. That
+--   is #44's rule and #48 does not touch it — only the ORDER of the staff branch
+--   and the guard in front of it change.
+alter policy course_videos_read on storage.objects
+  using (
+    bucket_id = 'course-videos'
+    and ((select public.is_admin())
+         or ((select public.is_approved())
+             and (select public.is_enrolled())
+             and public.course_video_object_readable(name, (select public.plan_is_sampler())))
+         or ((select public.has_staff_permission('courses.manage_assigned')
+               or public.has_staff_permission('courses.manage_all'))
+             and public.can_manage_course(public.course_object_course_id(name))))
+  );
+
+-- Feature-guide media is not course media. It lives in the same PUBLIC bucket at
+-- `feature-guides/<key>/<file>`, which the course path parser correctly refuses —
+-- so #46 locked everyone out of replacing a guide video. Restore it as its own
+-- branch rather than by loosening the parser, which must keep failing closed.
+alter policy course_media_read on storage.objects
+  using (bucket_id = 'course-media'
+         and ((select public.is_admin())
+              or ((select public.has_staff_permission('courses.manage_assigned')
+                    or public.has_staff_permission('courses.manage_all'))
+                  and public.can_manage_course(public.course_object_course_id(name)))));
+
+alter policy course_media_admin_write on storage.objects
+  with check (bucket_id = 'course-media'
+              and (public.can_manage_course(public.course_object_course_id(name))
+                   or ((storage.foldername(name))[1] = 'feature-guides'
+                       and (select public.has_staff_permission('courses.manage_all')))));
+
+alter policy course_media_admin_update on storage.objects
+  using (bucket_id = 'course-media'
+         and (public.can_manage_course(public.course_object_course_id(name))
+              or ((storage.foldername(name))[1] = 'feature-guides'
+                  and (select public.has_staff_permission('courses.manage_all')))));
+
+alter policy course_media_admin_delete on storage.objects
+  using (bucket_id = 'course-media'
+         and (public.can_manage_course(public.course_object_course_id(name))
+              or ((storage.foldername(name))[1] = 'feature-guides'
+                  and (select public.has_staff_permission('courses.manage_all')))));
+
+
+
+-- == 5) A reviewer may not approve their OWN enrollment request ==============
+-- Surfaced while testing #48: enroll_req_own_insert lets ANY signed-in user file
+-- a request for themselves - that is the ordinary signup path. Combined with
+-- enrollments.review it becomes a self-grant: an Operations Admin files a request
+-- for a VIP plan, approves it themselves, and holds paid access with no payment
+-- and no second pair of eyes. Segregation of duties is the whole reason the role
+-- exists below Super Admin.
+--
+-- Super Admin is exempt: they already hold students.extend_access and can grant
+-- access outright, so barring them would add ceremony without adding a boundary.
+create or replace function public.enrollment_self_approval_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+begin
+  if new.status = 'approved' and old.status is distinct from new.status
+     and new.user_id = auth.uid()
+     and not public.is_super_admin() then
+    perform public.app_error('FORBIDDEN',
+      'You cannot approve your own enrollment request — ask a Super Admin to review it.', 403,
+      jsonb_build_object('request_id', new.id));
+  end if;
+  return new;
+end;
+$fn$;
+
+revoke all on function public.enrollment_self_approval_guard() from public, anon, authenticated;
+
+drop trigger if exists enrollment_self_approval_guard on public.enrollment_requests;
+create trigger enrollment_self_approval_guard
+  before update on public.enrollment_requests
+  for each row execute function public.enrollment_self_approval_guard();
+
+notify pgrst, 'reload schema';
+
+insert into public.schema_migrations (filename, checksum, notes) values
+ ('2026-08-28-authorization-hardening.sql', null,
+  'authorization hardening (#48): corrections to #45/#46/#47, each reproduced against the live '
+  'schema in a rolled-back transaction. (1) SECURITY: subscriptions_admin_all and '
+  'enroll_req_admin_all were FOR ALL gated on enrollments.review, and authenticated keeps '
+  'Supabase''s default table grants, so an Operations Admin could PATCH any subscription to '
+  'plan_key=vip / ends_at=2099 and DELETE rows outright — making #47''s Super-Admin-only '
+  'discretionary-extension split decorative, with no reason, no clamp and no ledger row. Split '
+  'by verb: SELECT for reviewers, UPDATE on requests only (the reject reason and admin_notes are '
+  'all the screen writes), INSERT/DELETE reserved for Super Admin so a reviewer cannot forge a '
+  'request and approve their own forgery. (2) SECURITY: #46 scoped course_ai_sources with '
+  'can_manage_course but left course_ai_chunks and course_ai_index_jobs on the bare capability, '
+  'so a Trainer could read every course''s indexed text and manipulate every index job; both '
+  'carry course_id and are now scoped. Latent only because those tables are empty today — which '
+  'is also why the first test of it passed for the wrong reason. (3) BUG: a Trainer could not '
+  'create a course at all — createCourse() emits INSERT ... RETURNING and the returned row failed '
+  'courses_read because the AFTER-INSERT owner assignment is not usable yet; a creator branch '
+  'fixes it, gated on STILL holding courses.create so provenance cannot outlive employment. '
+  '(4) BUG: #46 locked everyone, Super Admins included, out of replacing feature-guide videos, '
+  'which live at feature-guides/<key>/<file> and correctly parse to NULL; restored as its own '
+  'branch rather than by loosening the parser. (5) PERF: the per-row can_manage_course() call sat '
+  'AHEAD of the member branch in five read policies, so every student paid a SECURITY DEFINER '
+  'call per row; each staff branch now sits behind an InitPlan-able capability test.')
+on conflict (filename) do nothing;
+
+
+-- ── AFTER RUNNING ────────────────────────────────────────────────────────────
+--   -- 1) An Ops Admin can no longer write money:
+--   select policyname, cmd from pg_policies
+--    where schemaname='public' and tablename in ('subscriptions','enrollment_requests')
+--    order by tablename, policyname;
+--     -- expect *_staff_read (SELECT), enroll_req_staff_update (UPDATE),
+--     -- *_super_write (ALL), plus the student own-row policies
+--
+--   -- 2) All three AI-trainer tables are course-scoped:
+--   select policyname, qual ilike '%can_manage_course%' as scoped from pg_policies
+--    where schemaname='public' and tablename like 'course_ai%';
+--
+--   -- 3) The staff branch is behind an InitPlan guard in every read policy:
+--   select policyname from pg_policies
+--    where schemaname in ('public','storage')
+--      and qual ilike '%can_manage_course%'
+--      and qual not ilike '%has_staff_permission%';
+--     -- expect ZERO rows: a bare per-row call with no capability guard in front
+--
+--   -- 4) Feature guides are editable again (as a Super Admin):
+--   select public.course_object_course_id('feature-guides/mockinterview/x.mp4') is null as still_null;
+--     -- expect true — the parser is unchanged; the policy gained a separate branch
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- §36) FOLDED VERBATIM — 2026-08-29-staff-invitation-acceptance.sql   (#49)
+-- ═════════════════════════════════════════════════════════════════════════════
+-- Appended at the tail for the same reason as §19-§35: the earlier sections
+-- create the pre-#49 shapes — §32 defines my_staff_context() and #46 extends it,
+-- and this file REPLACES it — so this must win on a fresh install. The file is
+-- idempotent and self-guarded, so appending reproduces the live end state
+-- exactly. RE-FOLD whenever the dated file changes.
+--
+-- Its `do $pre$ … $pre$;` preflight is omitted: the bootstrap creates every
+-- dependency itself, above, in order.
+-- ═════════════════════════════════════════════════════════════════════════════
+-- ─────────────────────────────────────────────────────────────────────────────
+-- #49 — Staff invitation acceptance: the invited → active transition.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- #45 shipped an invitation that nothing could ever accept. `staff_memberships`
+-- has always allowed status='invited', api/admin/staff.js has always written it,
+-- and the Team & Roles directory has always rendered it — but no function, no
+-- trigger and no policy anywhere moved a row OUT of it. Verified in production:
+-- one operations_admin sitting at status='invited', activated_at null, whose
+-- auth.users row shows email_confirmed_at, last_sign_in_at AND a password hash.
+-- They accepted, signed in, and were shown the student pricing page, because
+-- profiles.is_admin is false for every non-super role by design and the root gate
+-- had no other reason to let them through.
+--
+-- ★ 1. my_staff_context() HANDED OUT PERMISSIONS FOR AN UNACCEPTED INVITATION.
+--      Called as that same user it returned is_staff:true, role_label:'Operations
+--      Admin' and all five operations permissions. It is NOT exploitable today —
+--      has_staff_permission() correctly returns false (verified as that user), and
+--      normalizeStaffContext() collapses any non-active status to the empty
+--      context — but this is the one RPC both the browser and api/_lib/staffAuth.js
+--      treat as authoritative, and it was describing an authority its own database
+--      would refuse. Defence in depth means the source agrees with the gate.
+--      Now: permissions/role_key/assigned_course_ids are emitted ONLY for
+--      status='active'.
+--
+-- ★ 2. The membership is still REPORTED, in a separate object that structurally
+--      cannot authorize. `membership` carries status/role/label/dates and NO
+--      permission list, so the client can render "you were invited as a Trainer"
+--      without any code path existing by which that could become authority. The
+--      alternative — relaxing normalizeStaffContext() — would have put an invited
+--      row one boolean away from a live one.
+--
+-- ★ 3. accept_staff_invitation() TAKES NO ARGUMENTS. Not a user id, not a role.
+--      auth.uid() is the subject and the pre-assigned role is the role, so the
+--      RPC has no surface on which to name someone else or promote yourself.
+--      It locks the row FOR UPDATE, so a double-click serializes instead of
+--      writing twice, and requires auth.users.email_confirmed_at — an
+--      unconfirmed identity has not proven it owns the mailbox the invitation
+--      was sent to.
+--
+-- ★ 4. NO is_admin TRIGGER WORK. staff_sync_is_admin already fires AFTER INSERT
+--      OR UPDATE OR DELETE and recomputes "has an ACTIVE super_admin membership",
+--      so invited→active flips the cache for a Super Admin and leaves it false
+--      for Operations Admin and Trainer, with nothing added here. Re-deriving it
+--      in this file would have created a second writer for a column #45 spent a
+--      whole section reducing to one.
+--
+-- ★ 5. Audit vocabulary is EXTENDED, not repurposed. 'accept' and 'invite_resent'
+--      join the action CHECK and 'staff_invite' joins the source CHECK, so an
+--      acceptance is distinguishable from an admin assignment in the ledger. The
+--      delivery OUTCOME is membership state (invite_status), not an audit action,
+--      matching student_import_rows.invite_status — an audit row records a
+--      decision someone made, and "Resend accepted the API call" is not one.
+--
+-- Depends on: #45 (staff tables + staff_sync_is_admin), #31 (schema_migrations).
+-- Independent of #47/#48 — it touches no subscription or policy they define — but
+-- my_staff_context() is REPLACED here, so it must run AFTER #46, which added
+-- assigned_course_ids to it.
+--
+-- HOW TO RUN: paste into the Supabase dashboard → SQL Editor → Run.
+-- IDEMPOTENT — safe to re-run.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+
+-- == 1) Audit vocabulary =====================================================
+-- Drop-then-add rather than a conditional, so a re-run always lands on exactly
+-- this list instead of depending on what was there before.
+
+alter table public.staff_role_events drop constraint if exists staff_role_events_action_check;
+alter table public.staff_role_events add constraint staff_role_events_action_check
+  check (action = any (array[
+    'bootstrap', 'invite', 'assign', 'role_change',
+    'suspend', 'reactivate', 'revoke',
+    'accept',          -- #49: the invitee accepted, by their own hand
+    'invite_resent'    -- #49: a Super Admin minted a fresh link
+  ]));
+
+alter table public.staff_role_events drop constraint if exists staff_role_events_source_check;
+alter table public.staff_role_events add constraint staff_role_events_source_check
+  check (source = any (array[
+    'admin_ui', 'bootstrap_script', 'migration', 'sql',
+    'staff_invite'     -- #49: written by the invitation flow, actor = the invitee
+  ]));
+
+
+-- == 2) Invitation delivery state ============================================
+-- Where the email got to, so Team & Roles can stop claiming "Invitation sent"
+-- for a send the provider refused. Mirrors student_import_rows.invite_status.
+--
+-- ★ invite_error_code holds a SAFE CODE ONLY ('resend_422', 'no_link', …) — never
+--   a provider message, never an address, and above all never a link. The
+--   one-time token is minted, sent and discarded in the same function call; it is
+--   not written here or anywhere else.
+
+alter table public.staff_memberships
+  add column if not exists invite_sent_at    timestamptz,
+  add column if not exists invite_status     text,
+  add column if not exists invite_error_code text;
+
+alter table public.staff_memberships drop constraint if exists staff_memberships_invite_status_check;
+alter table public.staff_memberships add constraint staff_memberships_invite_status_check
+  check (invite_status is null or invite_status = any (array['pending', 'sent', 'failed', 'resent']));
+
+comment on column public.staff_memberships.invite_status is
+  '#49: delivery state of the invitation email — pending|sent|failed|resent. NOT authority: '
+  'only status=''active'' confers permissions. A failed send must leave the row recoverable at '
+  'status=''invited'' so Resend invitation can retry it.';
+
+comment on column public.staff_memberships.invite_error_code is
+  '#49: a safe short code for why a send failed (resend_4xx, no_link, email_not_configured). '
+  'Never a provider message, an address, or a link — the one-time token is discarded at send.';
+
+
+-- == 3) my_staff_context() — authority only when active ======================
+-- ★ The shape change: role_key / role_label / display_title / permissions /
+--   assigned_course_ids are now NULL or empty unless the membership is active.
+--   `status` and the new `membership` object still describe the row, so the
+--   client can offer acceptance without ever holding a permission it may not use.
+--
+--   normalizeStaffContext() already refuses anything that is not active, so this
+--   narrows what crosses the wire without changing a single client decision.
+
+create or replace function public.my_staff_context()
+returns jsonb
+language sql
+stable security definer
+set search_path = public, pg_temp
+as $fn$
+  select coalesce(
+    (select jsonb_build_object(
+       -- Authority half. Every field here is gated on active.
+       'is_staff',        (m.status = 'active'),
+       'role_key',        case when m.status = 'active' then m.role_key      end,
+       'role_label',      case when m.status = 'active' then r.label         end,
+       'status',          m.status,
+       'display_title',   case when m.status = 'active' then m.display_title end,
+       'is_super_admin',  (m.status = 'active' and m.role_key = 'super_admin'),
+       'permissions',     case when m.status = 'active' then coalesce(
+                            (select jsonb_agg(rp.permission_key order by rp.permission_key)
+                               from public.staff_role_permissions rp
+                              where rp.role_key = m.role_key),
+                            '[]'::jsonb)
+                          else '[]'::jsonb end,
+       -- #46: the courses this person holds a LIVE assignment on. Only meaningful
+       -- for a manage_assigned holder; a manage_all holder edits everything and
+       -- the client's canManageCourseClient() short-circuits on that permission
+       -- before it ever looks at this list.
+       'assigned_course_ids', case when m.status = 'active' then coalesce(
+                                (select jsonb_agg(distinct a.course_id)
+                                   from public.course_staff_assignments a
+                                  where a.staff_user_id = m.user_id
+                                    and a.revoked_at is null),
+                                '[]'::jsonb)
+                              else '[]'::jsonb end,
+       -- Descriptive half (#49). NO permission list, by construction: this object
+       -- exists so an invited member can be shown their pending role, and it must
+       -- be impossible to mistake for authority.
+       'membership',      jsonb_build_object(
+                            'exists',        true,
+                            'status',        m.status,
+                            'role_key',      m.role_key,
+                            'role_label',    r.label,
+                            'display_title', m.display_title,
+                            'invited_at',    m.invited_at,
+                            'activated_at',  m.activated_at
+                          )
+     )
+     from public.staff_memberships m
+     join public.staff_roles r on r.key = m.role_key
+    where m.user_id = (select auth.uid())),
+    jsonb_build_object(
+      'is_staff', false,
+      'membership', jsonb_build_object('exists', false)
+    )
+  )
+$fn$;
+
+comment on function public.my_staff_context() is
+  '#49: the ONE call the client and api/_lib/staffAuth.js make to learn who the caller is, read '
+  'LIVE on every request rather than decoded from a JWT claim — which is what makes a suspension '
+  'take effect on the next request. Authority fields are emitted ONLY for status=''active''; the '
+  'separate `membership` object describes a pending or ended membership and carries no permission '
+  'list, so an invited row cannot be one boolean away from a live one.';
+
+revoke all on function public.my_staff_context() from public, anon;
+grant execute on function public.my_staff_context() to authenticated;
+
+
+-- == 4) accept_staff_invitation() ============================================
+-- The invitee's own hand, and nothing else's. No arguments at all.
+
+create or replace function public.accept_staff_invitation()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+declare
+  v_uid       uuid := (select auth.uid());
+  v_m         public.staff_memberships%rowtype;
+  v_email     text;
+  v_confirmed timestamptz;
+begin
+  if v_uid is null then
+    perform public.app_error('FORBIDDEN', 'Sign in to accept a staff invitation.', 401);
+  end if;
+
+  -- FOR UPDATE: a double-click, a retried request and a duplicated tab all
+  -- serialize here. The loser re-reads the row and takes the idempotent branch
+  -- below instead of writing a second time or a second audit event.
+  select * into v_m
+    from public.staff_memberships
+   where user_id = v_uid
+   for update;
+
+  if not found then
+    perform public.app_error('STAFF_NO_INVITATION',
+      'There is no staff invitation on this account.', 404);
+  end if;
+
+  -- Idempotent replay. Accepting twice is a normal thing for a human to do; it is
+  -- not an error, and it must not write a second 'accept' row.
+  if v_m.status = 'active' then
+    return jsonb_build_object(
+      'status', 'active', 'role_key', v_m.role_key, 'already_active', true);
+  end if;
+
+  -- Suspended and revoked are refused HERE rather than being silently reactivated.
+  -- An old invitation link is not a way back in; that needs a deliberate admin act.
+  if v_m.status <> 'invited' then
+    perform public.app_error('STAFF_INVITATION_NOT_PENDING',
+      'This staff access is ' || v_m.status || '. An administrator has to restore it.', 409,
+      jsonb_build_object('status', v_m.status));
+  end if;
+
+  select u.email, u.email_confirmed_at into v_email, v_confirmed
+    from auth.users u where u.id = v_uid;
+
+  -- The invitation was sent to a mailbox. Activating before that mailbox is proven
+  -- would let an unconfirmed account claim a role it was never sent.
+  if v_confirmed is null then
+    perform public.app_error('STAFF_EMAIL_NOT_VERIFIED',
+      'Confirm your email address before accepting the invitation.', 403);
+  end if;
+
+  update public.staff_memberships
+     set status       = 'active',
+         activated_at = now(),
+         updated_at   = now()
+   where user_id = v_uid;
+  -- staff_sync_is_admin fires on this UPDATE and recomputes profiles.is_admin from
+  -- "active super_admin". Nothing to do here: a Super Admin gains the cache flag, an
+  -- Operations Admin or Trainer correctly keeps is_admin = false.
+
+  insert into public.staff_role_events
+    (actor_user_id, actor_email, target_user_id, target_email,
+     action, from_role_key, to_role_key, from_status, to_status, reason, source, metadata)
+  values
+    (v_uid, v_email, v_uid, v_email,
+     'accept', v_m.role_key, v_m.role_key, 'invited', 'active',
+     'Invitation accepted by the invitee.', 'staff_invite', '{}'::jsonb);
+
+  return jsonb_build_object(
+    'status', 'active', 'role_key', v_m.role_key, 'already_active', false);
+end
+$fn$;
+
+comment on function public.accept_staff_invitation() is
+  '#49: the ONLY path from staff_memberships.status invited → active. Takes NO arguments — the '
+  'subject is auth.uid() and the role is the one already on the row — so there is no surface on '
+  'which to name another user or choose a role. Locks the row FOR UPDATE (duplicate clicks '
+  'serialize), requires auth.users.email_confirmed_at, refuses suspended/revoked rather than '
+  'reactivating them, is idempotent when already active, and writes an append-only accept event. '
+  'Never reads user metadata: raw_user_meta_data.invited_as is display-only and user-editable.';
+
+revoke all on function public.accept_staff_invitation() from public, anon;
+grant execute on function public.accept_staff_invitation() to authenticated;
+
+
+-- == 5) admin_record_staff_invite() ==========================================
+-- staff_memberships has no client write policy and must keep none, so the send
+-- outcome is stamped through a guarded function rather than by widening the table.
+
+create or replace function public.admin_record_staff_invite(
+  p_user_id    uuid,
+  p_status     text,
+  p_error_code text default null
+)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+begin
+  if not public.has_staff_permission('staff.manage') then
+    perform public.app_error('FORBIDDEN', 'Managing staff needs the staff.manage permission.', 403);
+  end if;
+  if p_status is null or p_status not in ('pending', 'sent', 'failed', 'resent') then
+    perform public.app_error('STAFF_ROLE_INVALID',
+      'Invitation status must be pending, sent, failed or resent.', 422);
+  end if;
+
+  update public.staff_memberships
+     set invite_status     = p_status,
+         -- Only a real send moves the clock; a failure leaves the previous
+         -- successful send time alone so the directory can still show it.
+         invite_sent_at    = case when p_status in ('sent', 'resent') then now() else invite_sent_at end,
+         -- Truncated and shape-checked: this column is rendered in an admin UI and
+         -- must never become a channel for provider prose.
+         invite_error_code = case
+                               when p_status = 'failed'
+                                 then left(regexp_replace(coalesce(p_error_code, 'unknown'), '[^a-zA-Z0-9_]', '_', 'g'), 40)
+                               else null
+                             end,
+         updated_at        = now()
+   where user_id = p_user_id;
+end
+$fn$;
+
+comment on function public.admin_record_staff_invite(uuid, text, text) is
+  '#49: stamps the invitation email delivery outcome. staff_memberships has no client write '
+  'policy and keeps none — this guarded function is the writer. The error code is regexp-scrubbed '
+  'and truncated because it is rendered in Team & Roles; it must never carry provider prose, an '
+  'address, or a link.';
+
+revoke all on function public.admin_record_staff_invite(uuid, text, text) from public, anon;
+grant execute on function public.admin_record_staff_invite(uuid, text, text) to authenticated;
+
+
+-- == 5b) set_my_display_name() ===============================================
+-- An invitee finishing setup needs to be able to give their own name. profiles
+-- has NO user-update RLS policy and must keep none, so this mirrors #24's
+-- set_my_avatar() exactly: a SECURITY DEFINER function pinned to auth.uid() that
+-- touches ONE column.
+--
+-- ★ It is a SEPARATE function rather than a p_full_name argument on
+--   accept_staff_invitation(), so that function can keep taking no arguments at
+--   all. "No arguments" is the property that makes it obviously incapable of
+--   naming another user or choosing a role, and it is worth more than saving a
+--   round-trip.
+--
+-- ★ It deliberately does NOT touch email. The account IS the email; letting a
+--   user rewrite it here would let someone edit their way into another person's
+--   pending invitation.
+
+create or replace function public.set_my_display_name(p_full_name text)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+declare
+  v_uid  uuid := (select auth.uid());
+  v_name text := nullif(btrim(coalesce(p_full_name, '')), '');
+begin
+  if v_uid is null then
+    perform public.app_error('FORBIDDEN', 'Sign in first.', 401);
+  end if;
+  if v_name is null or length(v_name) > 120 then
+    perform public.app_error('STAFF_ROLE_INVALID',
+      'A name is required and must be 120 characters or fewer.', 422);
+  end if;
+
+  -- ★ STAFF ONLY. This exists so an invitee can give their name while accepting;
+  --   it was granted to `authenticated` at large, which is wider than the reason
+  --   for it. A rejected or revoked non-staff account could rewrite full_name AND
+  --   the author name on all of their historical community posts. 'invited' is
+  --   included because the invitee is mid-acceptance and not yet active — the
+  --   whole point — but a membership row must exist. (CodeRabbit, PR #4.)
+  --
+  --   This is why it does NOT copy set_my_avatar()'s
+  --   is_approved()+is_enrolled() guard: an invitee is by definition not enrolled,
+  --   so that guard would fail for exactly the person this serves.
+  if not exists (
+    select 1 from public.staff_memberships m
+     where m.user_id = v_uid and m.status in ('invited', 'active')
+  ) then
+    perform public.app_error('FORBIDDEN',
+      'Only staff can set their display name here.', 403);
+  end if;
+
+  update public.profiles
+     set full_name  = v_name,
+         updated_at = now()
+   where id = v_uid;
+
+  -- Keep the community denormalized copy in step, the same way set_my_avatar()
+  -- does — otherwise a new staff member posts under their old name forever.
+  -- ★ author_id, NOT user_id. Those tables denormalize the author, and the first
+  --   draft of this function said user_id: it parsed, it passed every static test,
+  --   and it failed at runtime with 42703 the first time anyone ran it. Only
+  --   executing it against the real schema found that.
+  update public.community_posts    set author_name = v_name where author_id = v_uid;
+  update public.community_comments set author_name = v_name where author_id = v_uid;
+
+  -- ★ Deliberately NO is_approved()/is_enrolled() guard, unlike set_my_avatar().
+  --   That guard is right for an avatar, which is public content. This function
+  --   exists so an invited staff member can give their name while accepting — and
+  --   an invitee is by definition not yet enrolled, so copying the guard would
+  --   make it fail for the only person who needs it. Writing your own display name
+  --   grants nothing.
+end
+$fn$;
+
+comment on function public.set_my_display_name(text) is
+  '#49: the second sanctioned user-facing profiles write, after set_my_avatar(). Pinned to '
+  'auth.uid(), touches full_name only (never email, never is_admin, never plan), and refreshes '
+  'the denormalized community author_name. profiles still has no user-update RLS policy.';
+
+revoke all on function public.set_my_display_name(text) from public, anon;
+grant execute on function public.set_my_display_name(text) to authenticated;
+
+
+-- == 6) admin_staff_directory() — surface the delivery state =================
+-- ★ DROP + CREATE, not CREATE OR REPLACE: the return TABLE gains columns, and
+--   Postgres refuses to change a function's result type in place (42P13). #39 hit
+--   exactly this on admin_batch_overview(). The grant must be restated after a
+--   DROP, or every caller gets "permission denied for function".
+
+drop function if exists public.admin_staff_directory();
+
+create function public.admin_staff_directory()
+returns table (
+  user_id uuid, email text, full_name text, avatar_url text,
+  role_key text, role_label text, rank integer, status text, display_title text,
+  invited_by uuid, invited_by_email text, invited_at timestamptz,
+  activated_at timestamptz, suspended_at timestamptz, revoked_at timestamptz,
+  suspension_reason text, updated_at timestamptz,
+  invite_sent_at timestamptz, invite_status text, invite_error_code text
+)
+language sql
+stable security definer
+set search_path = public, pg_temp
+as $fn$
+  select m.user_id, p.email, p.full_name, p.avatar_url,
+         m.role_key, r.label, r.rank, m.status, m.display_title,
+         m.invited_by, ip.email, m.invited_at,
+         m.activated_at, m.suspended_at, m.revoked_at, m.suspension_reason, m.updated_at,
+         m.invite_sent_at, m.invite_status, m.invite_error_code
+    from public.staff_memberships m
+    join public.staff_roles r on r.key = m.role_key
+    left join public.profiles p on p.id = m.user_id
+    left join public.profiles ip on ip.id = m.invited_by
+   where public.has_staff_permission('staff.manage')
+   order by r.rank desc, p.full_name nulls last, p.email
+$fn$;
+
+revoke all on function public.admin_staff_directory() from public, anon;
+grant execute on function public.admin_staff_directory() to authenticated;
+
+
+-- == 7) Error catalog ========================================================
+-- ★ Replaced WHOLESALE, so every pre-existing code has to be re-listed. Dropping
+--   one here is invisible until some older feature raises it and the client shows
+--   a fallback string — test/staffRolesSql.test.mjs pins the whole list against
+--   APP_ERROR_CODES for exactly that reason.
+
+create or replace function public.app_error_catalog()
+returns table (code text, http int, summary text)
+language sql
+immutable
+parallel safe
+set search_path = public
+as $cat$
+  select * from (values
+    ('BATCH_REQUIRED',               422, 'A VIP action needs an explicit batch; none was supplied.'),
+    ('BATCH_NOT_FOUND',              404, 'The batch id or month code does not exist.'),
+    ('BATCH_CLOSED',                 409, 'The batch is closed to new assignments, or archived.'),
+    ('BATCH_FULL',                   409, 'A cohort in the run has no seats left.'),
+    ('NO_SPACE_FOR_SEGMENT',         409, 'The batch has no active community space for that plan segment.'),
+    ('INVALID_BATCH_CODE',           422, 'Not a real YYYY-MM month.'),
+    ('ENTITLEMENT_EXPIRED',          403, 'The membership term (or its grace) has ended.'),
+    ('INVALID_PLAN',                 422, 'Unknown, inactive, or non-premium plan for this action.'),
+    ('ALREADY_ENTITLED',             409, 'The member already holds an outstanding seat in that cohort.'),
+    ('RUN_LIMIT_EXCEEDED',           409, 'Outstanding seats would exceed the per-member ceiling.'),
+    ('SEGMENT_MISMATCH',             409, 'The grant would mix cohort segments in one outstanding run.'),
+    ('INVALID_MEMBERSHIP_TRANSITION',409, 'The current membership state does not allow this transition.'),
+    ('IMMUTABLE_ENTITLEMENT',        409, 'An attempt to rewrite a frozen ledger column.'),
+    ('FORBIDDEN',                    403, 'Admin-only operation called by a non-admin.'),
+    ('REQUEST_NOT_FOUND',            404, 'The enrollment request does not exist.'),
+    ('COURSE_ACCESS_DENIED',         403, 'Course hidden by plan scope, publication, or cohort entitlement.'),
+    ('LESSON_NOT_RELEASED',          403, 'The cohort drip has not unlocked this lesson yet.'),
+    ('COMMUNITY_ACCESS_DENIED',      403, 'The community write was refused.'),
+    ('COMMENT_PERMISSION_DENIED',    403, 'Replies are off in this channel.'),
+    ('ASSIGNMENT_CLOSED',            409, 'Past the due date, or the assignment is unpublished.'),
+    ('SUBMISSION_LOCKED',            409, 'The submission is handed in or graded; edits refused.'),
+    ('COURSE_HAS_SUBMISSIONS',       409, 'The course has graded assignment work and cannot be deleted.'),
+    ('BATCH_PAST',                   409, 'The batch period has elapsed in its own timezone; it is read-only.'),
+    ('BATCH_CODE_TAKEN',             409, 'Another batch already uses that month code.'),
+    ('BATCH_CODE_REORDER',           409, 'The new code would move the batch past a sibling and reorder members'' runs.'),
+    ('BATCH_PERIOD_PAST',            422, 'The requested period has already ended; a batch cannot be edited into the past.'),
+    ('BATCH_PERIOD_INVALID',         422, 'The end date falls before the start date, or a date is missing.'),
+    ('BATCH_TIMEZONE_INVALID',       422, 'Not a timezone Postgres recognises (see pg_timezone_names).'),
+    ('BATCH_CAPACITY_BELOW_OCCUPANCY',409,'The new capacity is below the seats already sold in that segment.'),
+    ('CHANNEL_NOT_FOUND',            404, 'The channel does not exist, or is not available to you.'),
+    ('CHANNEL_SLUG_TAKEN',           409, 'Another channel in this space already uses that address.'),
+    ('CHANNEL_AUDIENCE_EMPTY',       422, 'The audience needs at least one plan or batch, or nobody could see it.'),
+    ('CHANNEL_ARCHIVED',             409, 'The channel is archived and accepts no new content.'),
+    ('CATEGORY_NOT_FOUND',           404, 'The channel category does not exist.'),
+    ('CATEGORY_NOT_EMPTY',           409, 'The category still holds active channels.'),
+    ('LESSON_VIDEO_UPLOAD_ONLY',     409, 'A lesson video must be an uploaded file in the private bucket; external links are no longer accepted.'),
+    ('LESSON_VIDEO_PATH_INVALID',    422, 'An uploaded lesson video must live at lessons/<course-uuid>/<file>.'),
+    ('COURSE_PUBLISH_BLOCKED',       409, 'The course still has video lessons with no uploaded file.'),
+    ('STAFF_LAST_SUPER_ADMIN',       409, 'That change would leave no active Super Admin. Promote a replacement first.'),
+    ('STAFF_NOT_FOUND',              404, 'That account is not staff, or has no profile.'),
+    ('STAFF_ROLE_INVALID',           422, 'Unknown staff role or status, or a required reason was missing.'),
+    ('COURSE_NOT_ASSIGNED',          403, 'You can edit courses, but not this one — nobody has assigned it to you.'),
+    ('COURSE_PUBLISH_FORBIDDEN',     403, 'Publishing or withdrawing a course needs its own permission.'),
+    ('COURSE_ASSIGNMENT_INVALID',    422, 'Unknown assignment role, or the target account cannot edit courses at all.'),
+    ('SUBSCRIPTION_NOT_FOUND',       404, 'That member has no subscription to act on.'),
+    ('EXTENSION_NOT_ALLOWED',        409, 'This membership never expires, so an extension could only shorten it.'),
+    ('EXTENSION_INVALID',            422, 'The requested extension is out of range, backwards, or missing its reason.'),
+    ('STAFF_NO_INVITATION',          404, 'There is no staff membership on this account to accept.'),
+    ('STAFF_INVITATION_NOT_PENDING', 409, 'The membership is suspended, revoked or already active; an old link cannot restore it.'),
+    ('STAFF_EMAIL_NOT_VERIFIED',     403, 'The Auth identity has not confirmed the mailbox the invitation was sent to.')
+  ) as t(code, http, summary);
+$cat$;
+
+revoke all on function public.app_error_catalog() from public, anon;
+grant execute on function public.app_error_catalog() to authenticated;
+
+
+notify pgrst, 'reload schema';
+
+insert into public.schema_migrations (filename, checksum, notes) values
+ ('2026-08-29-staff-invitation-acceptance.sql', null,
+  'staff invitation acceptance (#49): #45 shipped an invitation nothing could accept — '
+  'staff_memberships allowed status=''invited'', the API wrote it and the directory rendered it, '
+  'but no function, trigger or policy ever moved a row out of it. Verified in production: one '
+  'operations_admin at invited/activated_at-null whose auth.users row had email_confirmed_at, '
+  'last_sign_in_at and a password — they had accepted, signed in, and were shown the student '
+  'pricing page. Adds accept_staff_invitation(), which takes NO ARGUMENTS (subject is auth.uid(), '
+  'role is the one already on the row, so there is no surface to name another user or pick a '
+  'role), locks FOR UPDATE so duplicate clicks serialize, requires auth.users.email_confirmed_at, '
+  'refuses suspended/revoked rather than letting an old link restore access, is idempotent when '
+  'already active, and writes an append-only accept event. SECURITY: my_staff_context() was '
+  'returning is_staff:true and the full permission array for that unaccepted membership — not '
+  'exploitable (has_staff_permission() correctly said false and normalizeStaffContext() collapses '
+  'non-active to empty) but the one RPC the browser AND api/_lib/staffAuth.js treat as '
+  'authoritative was describing an authority the database would refuse; authority fields are now '
+  'emitted only for status=''active'', with a separate `membership` object that carries no '
+  'permission list so a pending invitation can be rendered without ever being one boolean away '
+  'from a live one. Extends the audit CHECKs with accept/invite_resent and source staff_invite, '
+  'adds invite_sent_at/invite_status/invite_error_code (a safe code only — the one-time token is '
+  'minted, sent and discarded, never stored) written through the guarded '
+  'admin_record_staff_invite() so staff_memberships keeps no client write policy, and rebuilds '
+  'admin_staff_directory() (DROP+CREATE with a restated GRANT — a return-type change cannot be '
+  'done in place). No is_admin trigger work: staff_sync_is_admin already recomputes on UPDATE, so '
+  'invited→active flips the cache for a Super Admin and leaves Operations Admin and Trainer false.')
+on conflict (filename) do nothing;
+
+
+-- ── AFTER RUNNING ────────────────────────────────────────────────────────────
+--   -- 1) The acceptance RPC exists, takes nothing, and is not reachable by anon:
+--   select p.proname || '(' || pg_get_function_arguments(p.oid) || ')' as sig,
+--          has_function_privilege('authenticated', p.oid, 'execute') as authed,
+--          has_function_privilege('anon',          p.oid, 'execute') as anon
+--     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+--    where n.nspname = 'public' and p.proname = 'accept_staff_invitation';
+--     -- expect accept_staff_invitation()  |  true  |  false
+--
+--   -- 2) An unaccepted invitation no longer reports permissions. As that user:
+--   --    select set_config('request.jwt.claims',
+--   --      json_build_object('sub','<their uuid>','role','authenticated')::text, true);
+--   --    select public.my_staff_context();
+--     -- expect permissions: [], is_staff: false, and membership.status: 'invited'
+--
+--   -- 3) The membership tables are still not client-writable:
+--   select has_table_privilege('authenticated','public.staff_memberships','update') as can_update;
+--     -- expect false
+--
+--   -- 4) The audit vocabulary took:
+--   select pg_get_constraintdef(oid) from pg_constraint
+--    where conrelid = 'public.staff_memberships'::regclass and conname like '%invite_status%';
+--   select pg_get_constraintdef(oid) from pg_constraint
+--    where conrelid = 'public.staff_role_events'::regclass and contype = 'c';
+-- ─────────────────────────────────────────────────────────────────────────────

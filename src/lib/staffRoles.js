@@ -201,6 +201,23 @@ export const EMPTY_STAFF_CONTEXT = Object.freeze({
 });
 
 /**
+ * "This account has no staff membership." The descriptive counterpart to
+ * EMPTY_STAFF_CONTEXT, and what every error path resolves to — a lookup that
+ * could not run must not offer someone an invitation screen any more than it
+ * would grant them a permission.
+ */
+export const EMPTY_STAFF_MEMBERSHIP = Object.freeze({
+  exists: false,
+  status: null,
+  roleKey: null,
+  roleLabel: null,
+  roleDescription: null,
+  displayTitle: null,
+  invitedAt: null,
+  activatedAt: null,
+});
+
+/**
  * Normalize whatever my_staff_context() returned into the shape the app uses.
  *
  * ★ ONLY an `active` membership yields authority. 'invited' (has not accepted the
@@ -280,6 +297,7 @@ export function staffContextFromRpc(result) {
   if (error) {
     return {
       context: EMPTY_STAFF_CONTEXT,
+      membership: EMPTY_STAFF_MEMBERSHIP,
       degraded: true,
       missing: isMigrationMissing(error),
     };
@@ -289,7 +307,61 @@ export function staffContextFromRpc(result) {
   // array. Tolerate both — a shape change here is not a security event.
   const row = Array.isArray(data) ? data[0] : data;
 
-  return { context: normalizeStaffContext(row), degraded: false, missing: false };
+  return {
+    context: normalizeStaffContext(row),
+    membership: staffMembershipFromRpc(row),
+    degraded: false,
+    missing: false,
+  };
+}
+
+/**
+ * The DESCRIPTIVE half of a staff membership — what it is, never what it may do.
+ *
+ * ★ THIS OBJECT HAS NO `permissions` FIELD, AND THAT IS THE WHOLE DESIGN.
+ *   normalizeStaffContext() collapses 'invited' to the empty context, which is
+ *   correct for authority and is exactly why an invited member was previously
+ *   indistinguishable from a random student — the app could not tell them "you
+ *   were invited as a Trainer" because it had thrown that away. The fix is a
+ *   SECOND object rather than a relaxed first one: if the pending role lived on
+ *   the authority context behind a status check, then an invited membership would
+ *   sit one inverted boolean away from a live one. Here there is no boolean to
+ *   invert — there is nothing to grant.
+ *
+ *   Legitimate uses: pick the invitation screen, show the assigned role, explain
+ *   why access ended. It must never gate an API call, an RPC, a route or a
+ *   privileged control; staffCan() is the only thing that answers that.
+ *
+ * Reads the `membership` block #49 added to my_staff_context(). A pre-#49 server
+ * has no such block, so this degrades to "no membership" — which keeps the
+ * invitation screen from appearing on a database that cannot yet accept one.
+ */
+export function staffMembershipFromRpc(raw) {
+  if (!raw || typeof raw !== 'object') return EMPTY_STAFF_MEMBERSHIP;
+
+  const m = raw.membership && typeof raw.membership === 'object' ? raw.membership : null;
+  if (!m || m.exists !== true) return EMPTY_STAFF_MEMBERSHIP;
+
+  const status = typeof m.status === 'string' ? m.status : null;
+  const roleKey = typeof m.role_key === 'string' ? m.role_key : null;
+  if (!status || !roleKey) return EMPTY_STAFF_MEMBERSHIP;
+
+  const meta = staffRole(roleKey);
+  return Object.freeze({
+    exists: true,
+    status,
+    roleKey,
+    roleLabel: (typeof m.role_label === 'string' && m.role_label) || meta?.label || roleKey,
+    roleDescription: meta?.description || null,
+    displayTitle: (typeof m.display_title === 'string' && m.display_title) || null,
+    invitedAt: typeof m.invited_at === 'string' ? m.invited_at : null,
+    activatedAt: typeof m.activated_at === 'string' ? m.activated_at : null,
+  });
+}
+
+/** True when this membership is waiting on the invitee to accept it. */
+export function staffInvitationPending(membership) {
+  return Boolean(membership && membership.exists && membership.status === 'invited');
 }
 
 /** Does this context hold `key`? Unknown key, empty context, bad input -> false. */
@@ -449,6 +521,49 @@ export const COURSE_AUTHORING_TABS = ['course', 'qbomastery', 'resumestrategy', 
 /** True when this context should bypass the student paywall for staff work. */
 export function staffBypassesPaywall(ctx) {
   return Boolean(ctx && ctx.isStaff && ctx.status === 'active');
+}
+
+/**
+ * Ops queues in the order the work actually arrives, so "first tab this person
+ * may open" is a deliberate ordering rather than an accident of object key order.
+ */
+const STAFF_LANDING_QUEUES = ['enrollments', 'accessrequests', 'studentimports', 'batches'];
+
+/**
+ * Where a staff member should land after accepting an invitation.
+ *
+ * ★ NEVER pricing. That is the entire point: an Operations Admin or Trainer has
+ *   is_admin = false and usually no subscription, so every route that reasons
+ *   from "unpaid" sends them to the paywall. This answers from PERMISSIONS
+ *   instead, and returns a tab the person demonstrably holds — every candidate is
+ *   checked with staffCan(), so a role whose permissions were narrowed in SQL
+ *   lands somewhere it can actually open rather than on a RestrictedTab.
+ *
+ * ★ Returns null for anyone who is not active staff, so the caller keeps its own
+ *   default. A pending invitation resolves to null here — landing is decided
+ *   after acceptance, never from the invitation itself.
+ */
+export function staffLandingTab(ctx) {
+  if (!staffBypassesPaywall(ctx)) return null;
+
+  // A Super Admin's first question is almost always "who else is in here".
+  if (ctx.isSuperAdmin) return 'staffroles';
+
+  for (const tab of STAFF_LANDING_QUEUES) {
+    const perm = ADMIN_TAB_PERMISSION[tab];
+    if (perm && staffCan(ctx, perm)) return tab;
+  }
+
+  // A Trainer holds no admin queue at all; their work is the course library.
+  if (staffCan(ctx, 'courses.create')
+    || staffCan(ctx, 'courses.manage_assigned')
+    || staffCan(ctx, 'courses.manage_all')) {
+    return 'qbomastery';
+  }
+
+  // Staff with a role that grants no landing surface still get the app, not a
+  // refusal — staffEntitlement() has already decided what they may open.
+  return 'dashboard';
 }
 
 /**
