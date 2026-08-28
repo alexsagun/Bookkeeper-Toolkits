@@ -2364,17 +2364,29 @@ function StaffInvitationSetup({ invite, onAccepted, onDismissToken }) {
   //   with "there is no staff invitation waiting", the opposite of what happened,
   //   AFTER the write had already committed.
   if (staffReady && !busy && !err && !staffInvitationPending(staffMembership)) {
-    const ended = staffMembership?.exists && staffMembership.status !== 'invited';
+    // ★ THREE cases, not two. This read `status !== 'invited'`, which lumps
+    //   ACTIVE in with suspended and revoked — so a staff member who had already
+    //   accepted and then clicked their link a second time (the single most
+    //   likely thing anyone does with an invitation email) was told their access
+    //   "is active, and an invitation link can't restore it. Ask a Super Admin to
+    //   reinstate your role." Nothing was wrong, and the message said otherwise.
+    const status = staffMembership?.exists ? staffMembership.status : null;
+    const alreadyActive = status === 'active';
+    const ended = status === 'suspended' || status === 'revoked';
     return shell(
       <div className="px-8 py-7 space-y-4">
         <p style={{ fontSize: 13.5, lineHeight: 1.65, color: C.textSoft }}>
-          {ended
-            ? `This staff access is ${staffStatusLabel(staffMembership.status).toLowerCase()}, and an invitation link can’t restore it. Ask a Super Admin to reinstate your role.`
-            : 'There’s no staff invitation waiting on this account. If you were expecting one, ask the person who invited you to send it again — invitations are tied to a single email address.'}
+          {alreadyActive
+            ? `You’re already set up${staffMembership.roleLabel ? ` as ${staffMembership.roleLabel}` : ''}. There’s nothing left to accept — this link has already done its job.`
+            : ended
+              ? `This staff access is ${staffStatusLabel(status).toLowerCase()}, and an invitation link can’t restore it. Ask a Super Admin to reinstate your role.`
+              : 'There’s no staff invitation waiting on this account. If you were expecting one, ask the person who invited you to send it again — invitations are tied to a single email address.'}
         </p>
         <button type="button" onClick={onDismissToken}
           className="w-full py-2.5 rounded-xl text-sm font-bold transition"
-          style={{ background: 'var(--wash-strong)', border: `1px solid ${C.border}`, color: C.text }}>
+          style={alreadyActive
+            ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff', border: 'none' }
+            : { background: 'var(--wash-strong)', border: `1px solid ${C.border}`, color: C.text }}>
           Continue to the app
         </button>
         <div className="text-center">
@@ -9769,7 +9781,7 @@ function AdminStaffRoles() {
     }
   };
 
-  const runAction = async (payload, successMsg) => {
+  const runAction = async (payload, successMsg, opts = {}) => {
     setBusy(true); setErr(''); setNotice(''); setDetailErr('');
     // The drawer stays open on failure, and it is portaled ABOVE the page, so a
     // page-level banner would render behind its scrim. Report where the reader is.
@@ -9778,7 +9790,11 @@ function AdminStaffRoles() {
       await callStaff(payload);
       setNotice(successMsg);
       setConfirm(null);
-      setDetailFor(null);
+      // ★ Resending an invitation is the one action here that is repeatable and
+      //   drawer-local: the admin wants to stay on the row and watch the send
+      //   state change. Every other action is a role or status change confirmed
+      //   through StaffConfirmModal, where closing back to the list is right.
+      if (!opts.keepDrawerOpen) setDetailFor(null);
       await load(true);
       // If the actor changed their OWN role, their capabilities just moved.
       if (payload.user_id === user?.id) await refreshStaff?.();
@@ -9983,6 +9999,7 @@ function AdminStaffRoles() {
               runAction(
                 { action: 'resend-invite', user_id: detailFor.user_id },
                 `A new invitation link is on its way to ${detailFor.email}.`,
+                { keepDrawerOpen: true },
               );
               return;
             }
