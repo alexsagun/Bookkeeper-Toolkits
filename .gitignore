@@ -9,6 +9,11 @@ dist-ssr
 # Shadow-project credentials for the DB/RLS suite (npm run test:db)
 .env.test
 
+# Vite rewrites its config to a timestamped ESM file on every dev-server start and
+# does not always clean up after itself, so these accumulate in the repo root. They
+# are transient build output, and a `git add -A` will otherwise stage them.
+vite.config.js.timestamp-*
+
 # Logs
 *.log
 build_output.txt
