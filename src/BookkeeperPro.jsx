@@ -7998,6 +7998,14 @@ export default function BookkeeperProToolkit() {
       // should never show.
       const { data, error } = await supabase.rpc('admin_access_request_pending_count');
       if (!error && typeof data === 'number') { setPendingCount(data); return; }
+      // ★ ONLY an unmigrated database may fall back. Falling back on ANY error made
+      //   a transient failure or an authorization refusal silently restore the
+      //   pre-#50 head-count — which counts the invited and active staff this whole
+      //   change exists to remove — while the LIST kept using the gated RPC. Badge
+      //   and list would then disagree, which is the exact divergence #50 closed.
+      //   isMigrationMissing() is the house idiom for this distinction (5 other
+      //   call sites). (CodeRabbit, PR #5.)
+      if (error && !isMigrationMissing(error)) return;
       // Pre-#50 fallback: the direct head-count (may still include staff — the old
       // behaviour, kept so an unmigrated database degrades rather than zeroes).
       const { count, error: e2 } = await supabase

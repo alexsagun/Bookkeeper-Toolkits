@@ -35,6 +35,29 @@ function tokenLines(src) {
   return src.split('\n').filter((l) => /token_hash|tokenHash|hashed_token|invite\.token|tokenRef/.test(l));
 }
 
+/**
+ * Slice the region between two anchors, ASSERTING both were found first.
+ *
+ * ★ WHY THIS IS NOT JUST src.slice(indexOf(a), indexOf(b)). String.slice() reads a
+ *   negative index as an offset from the END, so a missing anchor silently widens
+ *   the region instead of failing. Rename `INITIAL_STAFF_INVITE` and the first scan
+ *   below would slice nearly the whole 24k-line file, find `history.replaceState`
+ *   somewhere unrelated, and PASS — reporting success while inspecting the wrong
+ *   code. A source scan that can pass for the wrong reason is worse than no scan,
+ *   because it is the only thing enforcing this rule. (CodeRabbit, PR #5.)
+ *
+ * @param {string} src
+ * @param {string} from   anchor the region starts at (searched from the end when `last`)
+ * @param {string} to     anchor the region ends at, searched AFTER `from`
+ */
+function region(src, from, to, { last = false } = {}) {
+  const start = last ? src.lastIndexOf(from) : src.indexOf(from);
+  assert.ok(start >= 0, `anchor not found, so this scan would prove nothing: ${from}`);
+  const end = src.indexOf(to, start + from.length);
+  assert.ok(end > start, `closing anchor not found after "${from}", so the slice would be wrong: ${to}`);
+  return src.slice(start, end);
+}
+
 // ── The browser ──────────────────────────────────────────────────────────────
 
 test('the token is never logged in the browser', () => {
@@ -53,9 +76,7 @@ test('the token never reaches window.storage, localStorage or sessionStorage', (
 
 test('the URL is stripped of the fragment before anything else can read it', () => {
   // readStaffInviteFromUrl() must strip inside the same function that parses.
-  const fnStart = app.indexOf('function readStaffInviteFromUrl');
-  const fnEnd = app.indexOf('const INITIAL_STAFF_INVITE');
-  const fn = app.slice(fnStart, fnEnd);
+  const fn = region(app, 'function readStaffInviteFromUrl', 'const INITIAL_STAFF_INVITE');
   assert.match(fn, /history\.replaceState/, 'the strip is what keeps the token out of bookmarks and Back entries');
   assert.match(fn, /window\.location\.pathname \+ window\.location\.search/,
     'path and query survive; only the fragment goes');
@@ -63,8 +84,7 @@ test('the URL is stripped of the fragment before anything else can read it', () 
 
 test('the redeemed root state carries NO token', () => {
   // markStaffInviteRedeemed must null the secret while keeping the redeemed fact.
-  const fnStart = app.indexOf('const markStaffInviteRedeemed');
-  const fn = app.slice(fnStart, app.indexOf(';', app.indexOf('}, []', fnStart)));
+  const fn = region(app, 'const markStaffInviteRedeemed', '}, []');
   assert.match(fn, /token: null/, 'the secret must leave root state the moment it is spent');
   assert.match(fn, /redeemed: true/, 'while the FACT of a token this session keeps pinning the gate');
 });
@@ -141,8 +161,9 @@ test('no migration stores a token column', () => {
 });
 
 test('the resend audit row records the act, never the link', () => {
-  const start = migration50.lastIndexOf('create or replace function public.admin_record_staff_invite');
-  const body = migration50.slice(start, migration50.indexOf('$fn$;', start));
+  const body = region(
+    migration50, 'create or replace function public.admin_record_staff_invite', '$fn$;', { last: true },
+  );
   assert.match(body, /'invite_resent'/);
   assert.ok(!/url|link|token/i.test(body.replace(/--[^\n]*/g, '').replace(/one-time credential/gi, '')),
     'the ledger must stay clean of the credential');
