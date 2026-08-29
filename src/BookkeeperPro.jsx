@@ -2551,9 +2551,16 @@ function StaffInvitationSetup({ invite, deferred, onAccepted, onDecline, onDismi
   switch (view.state) {
     case INVITE_STATES.LOADING:
     case INVITE_STATES.SIGNED_OUT:
+      // The facts fetch is raced at 8s, so this card is bounded — a stall becomes
+      // ERROR, which carries the full escape. The sign-out row is here anyway,
+      // because "a signed-in viewer is never pinned on a card with no way off it"
+      // has to hold for the spinner too, not only for the cards that talk.
       return shell(
-        <div className="px-8 py-10 flex items-center justify-center gap-2" style={{ color: C.textSoft, fontSize: 13 }}>
-          <Loader2 size={16} className="animate-spin" /> Loading your invitation&hellip;
+        <div className="px-8 py-10 space-y-4">
+          <div className="flex items-center justify-center gap-2" style={{ color: C.textSoft, fontSize: 13 }}>
+            <Loader2 size={16} className="animate-spin" /> Loading your invitation&hellip;
+          </div>
+          {user && <div className="text-center">{signOutRow}</div>}
         </div>,
       );
 
@@ -2648,6 +2655,14 @@ function StaffInvitationSetup({ invite, deferred, onAccepted, onDecline, onDismi
             className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition"
             style={primaryBtn}>
             <Mail size={15} /> I&rsquo;ve confirmed it &mdash; check again
+          </button>
+          {/* Same escape as every other card a signed-in viewer can be pinned on.
+              Rare — a paying student's mailbox is already confirmed — but "rare"
+              is not "impossible", and the invariant is cheaper to keep than to
+              reason about each time. */}
+          <button type="button" onClick={decline}
+            className="w-full py-2.5 rounded-xl text-sm font-bold transition" style={quietBtn}>
+            Continue without the invitation
           </button>
           <div className="text-center">{signOutRow}</div>
         </>,
