@@ -1,6 +1,6 @@
 # Staff roles — setup, the permission matrix, and recovery
 
-Migrations **#45 → #46 → #47**. This is the operator's guide: how to turn the role model on, what
+Migrations **#45 → #46 → #47 → #48 → #49 → #50 → #51**. This is the operator's guide: how to turn the role model on, what
 each role can actually do, how to hire someone, and how to get back in if you are locked out.
 
 The design rationale lives in [CLAUDE.md](CLAUDE.md) → "Staff authorization"; the per-migration
@@ -43,8 +43,12 @@ Two consequences worth internalising before you run anything:
    - `db/2026-08-25-staff-authorization.sql` (#45)
    - `db/2026-08-26-course-staff-assignments.sql` (#46)
    - `db/2026-08-27-special-extension.sql` (#47)
+   - `db/2026-08-28-authorization-hardening.sql` (#48)
+   - `db/2026-08-29-staff-invitation-acceptance.sql` (#49)
+   - `db/2026-08-30-staff-activation-consistency.sql` (#50)
+   - `db/2026-08-31-access-request-staff-target.sql` (#51)
    Each is idempotent and self-guarded; each records itself in `public.schema_migrations`.
-3. **Verify**: `npm run db:audit`. Every `#45` / `#46` / `#47` line should read `OK`.
+3. **Verify**: `npm run db:audit`. Every `#45`–`#51` line should read `OK`.
 4. **Sign out and back in** so the browser picks up the new staff context.
 
 #45 backfills every account that currently has `is_admin = true` into an active `super_admin`
@@ -129,6 +133,29 @@ design, so before #49 the gate treated them as unpaid students — a real one wa
 page. `staffBypassesPaywall()` is now wired into `useEnrollmentGate`, and the gate waits for the staff
 context before it will render any priced screen.
 
+**The screen is a state machine (#50), and its facts are durable.** Every card the invitee can see
+is chosen by `resolveInviteState()` (`src/lib/inviteMachine.js`) from the `auth.uid()`-scoped
+`staff_invitation_state()` RPC — membership status, role, whether the mailbox is confirmed, and
+whether the account already **has a password**. That last fact is what makes the password step
+mandatory for a brand-new invitee and skipped for a promoted account, and it survives any refresh.
+Two rules worth knowing when someone reports a strange screen:
+
+- **A dead token on the invitee's own signed-in session recovers to the password step** — it never
+  says "expired", because the session already proves the identity the token existed to prove. Only
+  a genuinely dead link with no matching pending invitation says "expired".
+- **"Not now" never shows pricing to a staff-only invitee.** They get a "finish later" card
+  (resume, or sign out); an invitee who also has a paid student membership returns to it; a
+  signed-out visitor returns to sign-in.
+
+**After acceptance they land on the Dashboard**, greeted by a welcome card naming the role, with
+their working queue (Enrollments / Access Requests / …) as a labelled secondary button. They are
+**approved automatically** — `staff_sync_is_admin()` clears a `pending` `approval_status` in the
+same transaction as the acceptance, so an active staff member never appears in student Access
+Requests, never inflates its badge, and never needs (or can perform — self-review is refused) a
+student-style approval. A `rejected` profile is never touched: a ban has to be lifted deliberately
+before an invitation can be accepted, and the database enforces that too
+(`STAFF_ACCOUNT_REJECTED`).
+
 ### Order matters, and only the last step grants anything
 
 ```
@@ -206,7 +233,7 @@ The equivalent SQL, if you would rather paste it, is in [db/README.md](db/README
 ## 7. Verifying it worked
 
 ```bash
-npm run db:audit          # every #45/#46/#47 line should read OK
+npm run db:audit          # every #45–#51 line should read OK
 npm test                  # the JS↔SQL mirrors
 ```
 

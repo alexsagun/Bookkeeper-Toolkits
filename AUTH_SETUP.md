@@ -270,7 +270,25 @@ What is genuinely worth doing, in order of effect:
    `quarantine` after the reports show every legitimate sender passing.
 2. **Confirm click-tracking is OFF** for the domain in Resend. Tracking rewrites links to a tracking
    host, which breaks the first-party-link property above and can let a scanner redeem the token.
+   Resend has **no per-message opt-out** — the toggle is per-domain, in Resend → Domains.
 3. Keep sending the plain-text part (#49 added it; nothing else in `api/` sends one).
+
+Since #50 the app can run this audit itself: `POST /api/admin/staff` with
+`{"action":"email-diagnostics"}` (Super Admin JWT) reads the sending domain's verification status,
+each DNS record's state, and the **click/open-tracking flags** from Resend's API, and reports
+whether the From domain, CTA domain and app domain align — names and statuses only, never a DNS
+value or a key. Run it after any DNS or Resend change.
+
+#50 also upgraded the message itself, all pinned by `test/staffInvite.test.mjs`:
+
+- a full HTML **document** (doctype, `lang`, `color-scheme` meta, `role="presentation"` table
+  layout, a responsive narrow-screen rule, a bulletproof table CTA) instead of a bare `<div>` —
+  the old shell rendered in quirks mode in Outlook;
+- a hidden **preheader** carrying the "nothing to buy" line into the inbox preview;
+- a **From display name** (`Toolkits by Alex <addr>`) composed when `RESEND_FROM` is a bare
+  address, and a **Reply-To** + visible support contact resolved from the admin-editable
+  `payment_settings.notify_email` (fallback `NOTIFY_ADMIN_EMAIL`; omitted when neither is set,
+  never invented).
 
 
 ## 5. Run it

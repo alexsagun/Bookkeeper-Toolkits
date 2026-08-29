@@ -45,12 +45,23 @@ function firstNameOf(fullName) {
 }
 
 /**
+ * "a Trainer" but "an Operations Admin". Of the three role labels exactly one is
+ * vowel-initial, so the hardcoded "a" was wrong in the SUBJECT LINE of every
+ * Operations Admin invitation — the first thing the reader sees, on the message
+ * whose credibility is the point.
+ */
+function articleFor(label) {
+  return /^[aeiou]/i.test(String(label || '').trim()) ? 'an' : 'a';
+}
+
+/**
  * The invitation itself.
  *
  * @returns {{ subject: string, html: string, text: string }}
  */
 export function staffInviteEmail({
   roleKey, actionUrl, inviteeName = null, inviterName = null, resent = false,
+  supportEmail = null,
 }) {
   const role = staffRole(roleKey);
   const label = role?.label || 'Team member';
@@ -66,7 +77,7 @@ export function staffInviteEmail({
   // subject — is indistinguishable from every phishing message ever sent.
   const subject = resent
     ? `Your ${BRAND} ${label} invitation (new link)`
-    : `You're invited to join ${BRAND} as a ${label}`;
+    : `You're invited to join ${BRAND} as ${articleFor(label)} ${label}`;
 
   const openingLine = inviter
     ? `${inviter} has invited you to join the ${BRAND} team.`
@@ -92,6 +103,9 @@ export function staffInviteEmail({
     cta: { href: actionUrl, label: 'Accept invitation and set up my account' },
     footNote: `This link works once and expires in ${INVITE_LINK_TTL_HOURS} hours. `
       + 'If you were not expecting this invitation, ignore this email or contact our team.',
+    // The inbox preview line. Without it, clients promote the first body sentence.
+    preheader: `Your ${label} account is ready to set up — nothing to buy, no plan to choose.`,
+    supportEmail,
   });
 
   const text = plainText([
@@ -107,6 +121,7 @@ export function staffInviteEmail({
     actionUrl,
     `This link works once and expires in ${INVITE_LINK_TTL_HOURS} hours.`,
     'If you were not expecting this invitation, ignore this email or contact our team.',
+    supportEmail ? `Questions? Contact our team at ${supportEmail}.` : null,
     `— The ${BRAND} team`,
   ]);
 
@@ -121,7 +136,7 @@ export function staffInviteEmail({
  * sign-in link nobody asked for. It just tells them what changed and where to go.
  */
 export function staffRoleAssignedEmail({
-  roleKey, appUrl, inviteeName = null, inviterName = null,
+  roleKey, appUrl, inviteeName = null, inviterName = null, supportEmail = null,
 }) {
   const role = staffRole(roleKey);
   const label = role?.label || 'Team member';
@@ -133,7 +148,7 @@ export function staffRoleAssignedEmail({
   const inviter = String(inviterName || '').trim();
   const origin = String(appUrl || '').replace(/\/+$/, '');
 
-  const subject = `You're now a ${label} on ${BRAND}`;
+  const subject = `You're now ${articleFor(label)} ${label} on ${BRAND}`;
   const openingLine = inviter
     ? `${inviter} has given your existing ${BRAND} account a staff role.`
     : `Your existing ${BRAND} account has been given a staff role.`;
@@ -146,10 +161,12 @@ export function staffRoleAssignedEmail({
   ].join('');
 
   const html = emailShell({
-    heading: `You're now a ${label}`,
+    heading: `You're now ${articleFor(label)} ${label}`,
     bodyHtml,
     cta: origin ? { href: origin, label: 'Open the toolkit' } : null,
     footNote: 'If you were not expecting this, contact our team.',
+    preheader: `Your existing ${BRAND} account now has the ${label} role.`,
+    supportEmail,
   });
 
   const text = plainText([
@@ -162,6 +179,7 @@ export function staffRoleAssignedEmail({
     'Sign in with the email and password you already use. Nothing about your existing membership, course progress or community history has changed.',
     origin ? `Open the toolkit: ${origin}` : null,
     'If you were not expecting this, contact our team.',
+    supportEmail ? `Questions? Contact our team at ${supportEmail}.` : null,
     `— The ${BRAND} team`,
   ]);
 

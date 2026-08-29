@@ -595,6 +595,82 @@ export const OBJECT_CHECKS = [
      where n.nspname='public' and p.proname='set_my_display_name'`],
   ['#49    profiles still has no client UPDATE grant', `select
       not has_table_privilege('authenticated','public.profiles','UPDATE') as ok`],
+
+  // ── #50, staff activation consistency ─────────────────────────────────────
+  // An active staff member must not still be a pending STUDENT. Before #50 an
+  // accepted Operations Admin kept approval_status='pending' forever, appeared
+  // in the student Access Requests queue, inflated the amber badge — and found
+  // their OWN row, with an Approve button, in the queue they had just been given.
+  ['#50    no active staff member is still a pending student', `select count(*) = 0 as ok
+      from public.profiles p
+     where p.approval_status = 'pending'
+       and exists (select 1 from public.staff_memberships m
+                    where m.user_id = p.id and m.status = 'active')`],
+  ['#50    staff_sync_is_admin() also clears the pending approval', `select coalesce(bool_and(
+        pg_get_functiondef(p.oid) ilike '%approval_status = ''approved''%'
+        and pg_get_functiondef(p.oid) ilike '%approval_status = ''pending''%'), false) as ok
+      from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+     where n.nspname='public' and p.proname='staff_sync_is_admin'`],
+  // …and it must still be scoped so a ban is never laundered: the approval half
+  // only ever moves 'pending', and is_admin still means active super_admin only.
+  ['#50    the trigger never writes is_admin outside the super_admin recompute', `select coalesce(bool_and(
+        pg_get_functiondef(p.oid) ilike '%role_key = ''super_admin''%'), false) as ok
+      from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+     where n.nspname='public' and p.proname='staff_sync_is_admin'`],
+  ['#50    accept_staff_invitation() refuses a rejected profile', `select coalesce(bool_and(
+        pg_get_functiondef(p.oid) ilike '%STAFF_ACCOUNT_REJECTED%'), false) as ok
+      from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+     where n.nspname='public' and p.proname='accept_staff_invitation'`],
+  ['#50    staff_invitation_state() exists, self-scoped, no arguments', `select case
+      when to_regprocedure('public.staff_invitation_state()') is null then false
+      else has_function_privilege('authenticated','public.staff_invitation_state()','execute')
+           and not has_function_privilege('anon','public.staff_invitation_state()','execute')
+      end as ok`],
+  ['#50    it reads has_password from auth.users, never exposing the hash', `select coalesce(bool_and(
+        pg_get_functiondef(p.oid) ilike '%encrypted_password%<>%'
+        and pg_get_functiondef(p.oid) not ilike '%''password''%'), false) as ok
+      from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+     where n.nspname='public' and p.proname='staff_invitation_state'`],
+  ['#50    the Access Requests queue excludes invited and active staff', `select coalesce(bool_and(
+        pg_get_functiondef(p.oid) ilike '%not exists%staff_memberships%'
+        and pg_get_functiondef(p.oid) ilike '%''invited'', ''active''%'), false) as ok
+      from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+     where n.nspname='public' and p.proname='admin_access_request_queue'`],
+  ['#50    the badge count RPC exists and shares the queue predicate', `select case
+      when to_regprocedure('public.admin_access_request_pending_count()') is null then false
+      else (select coalesce(bool_and(
+              pg_get_functiondef(p.oid) ilike '%has_staff_permission(''access_requests.review'')%'
+              and pg_get_functiondef(p.oid) ilike '%not exists%staff_memberships%'), false)
+              from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+             where n.nspname='public' and p.proname='admin_access_request_pending_count')
+      end as ok`],
+  ['#50    reviewing your own access request is refused', `select coalesce(bool_and(
+        pg_get_functiondef(p.oid) ilike '%ACCESS_REQUEST_SELF_REVIEW%'), false) as ok
+      from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+     where n.nspname='public' and p.proname='admin_review_access_request'`],
+  ['#50    the two new codes are in the catalog', `select count(*) = 2 as ok
+      from public.app_error_catalog()
+     where code in ('STAFF_ACCOUNT_REJECTED','ACCESS_REQUEST_SELF_REVIEW')`],
+
+  // ── #51, access-request staff target ──────────────────────────────────────
+  // The decider must refuse what the queue hides. admin_review_access_request()
+  // is granted to `authenticated` and gated only on access_requests.review — a
+  // permission Ops Admins hold — so the UI hiding staff rows is not a boundary:
+  // a direct PostgREST call takes any uuid.
+  ['#51    the decider refuses an invited or active staff target', `select coalesce(bool_and(
+        pg_get_functiondef(p.oid) ilike '%ACCESS_REQUEST_STAFF_TARGET%'
+        and pg_get_functiondef(p.oid) ilike '%''invited'', ''active''%'), false) as ok
+      from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+     where n.nspname='public' and p.proname='admin_review_access_request'`],
+  // suspended/revoked stay reviewable: a former staff member may be a real student.
+  ['#51    it still refuses a self-review, keeping the #50 guard', `select coalesce(bool_and(
+        pg_get_functiondef(p.oid) ilike '%ACCESS_REQUEST_SELF_REVIEW%'
+        and pg_get_functiondef(p.oid) ilike '%is_super_admin()%'), false) as ok
+      from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+     where n.nspname='public' and p.proname='admin_review_access_request'`],
+  ['#51    the new code is in the catalog', `select count(*) = 1 as ok
+      from public.app_error_catalog()
+     where code = 'ACCESS_REQUEST_STAFF_TARGET'`],
 ];
 
 async function main() {
