@@ -1097,7 +1097,7 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   `entitlement.allowsTab(tabId)`. A future Stripe/Gumroad webhook could still flip `is_paid` +
   grant a subscription term server-side without manual review.
 
-## Staff authorization — Super Admin / Operations Admin / Trainer (#45–#47)
+## Staff authorization — Super Admin / Operations Admin / Trainer (#45–#51)
 
 Authorization used to be one boolean. `profiles.is_admin` drove `public.is_admin()` — ~74 RLS
 policies, 21 self-gating RPCs, 13 storage policies and 145 frontend checks — so every admin could
@@ -1213,6 +1213,50 @@ role `is_admin = true`.**
   applies only immediately before a **price-bearing** screen, so no student pays the RPC's latency
   and no invited Trainer sees a flash of the paywall. A degraded staff context falls back to
   `profile.is_admin`, never to "assume staff".
+- **The invitation is a STATE MACHINE now (#50, `db/2026-08-30-staff-activation-consistency.sql`).**
+  #49's screen derived its step from ONE component-local boolean, and the gate's
+  `!profileReady → SPLASH` arm **unmounted it at the exact moment `verifyOtp()` succeeded** — a
+  new session uid makes `profileReady` false — so a fresh instance forgot the token was spent,
+  offered Accept again, and the duplicate exchange told a brand-new Operations Admin their
+  invitation had "expired". A refresh likewise reset `needsPassword = exchanged` and made the
+  password OPTIONAL for the one person who does not have one. Now:
+  ★ **Every screen is a projection of `resolveInviteState()`** in
+  [src/lib/inviteMachine.js](src/lib/inviteMachine.js) (pure; pinned by
+  `test/inviteMachine.test.mjs`), and every deciding fact is DURABLE — served by the new
+  `auth.uid()`-scoped **`staff_invitation_state()`** RPC (`exists/status/role/email_confirmed/`
+  **`has_password`** — the fact no client could previously ask for). Unmount, remount and refresh
+  all rebuild the same state. **The recovery rule:** while the signed-in user's own membership is
+  `invited`, the machine can never return `expired` — a dead token becomes the credentials step.
+  ★ **The gate keeps a token-holding invitation mounted through the profile load**
+  (`gateScreen.js`'s `!profileReady` arm), and the ban is enforced twice: the `REJECTED` arm fires
+  the moment the profile lands, and `accept_staff_invitation()` refuses a rejected profile
+  server-side (`STAFF_ACCOUNT_REJECTED`).
+  ★ **Token redemption is single-flight**: a `useRef` lock checked before any await (a `useState`
+  busy flag is not a lock — setState is async and StrictMode double-invokes), the secret lives in
+  a ref and is nulled on spend, and the root keeps only `{token: null, redeemed: true}` so
+  `hasInviteToken` still pins the gate. `test/tokenLeakage.test.mjs` scans that the token reaches
+  no console, no storage, no query param, no response body and no DB column.
+  ★ **An active staff member is not a pending STUDENT.** `staff_sync_is_admin()` now also flips a
+  `pending` profile to `approved` in the same transaction as the acceptance — scoped to `pending`
+  so a `rejected` ban is never laundered and a revoke never un-approves — plus an idempotent
+  backfill. `admin_access_request_queue()` excludes `invited`+`active` staff (`suspended`/`revoked`
+  deliberately kept — they may be real students), the sidebar badge now asks
+  **`admin_access_request_pending_count()`** (same predicate, same `has_staff_permission` gate —
+  it used to count through `profiles_admin_select` RLS, a different authorization path), and
+  `admin_review_access_request()` refuses self-review (`ACCESS_REQUEST_SELF_REVIEW`, Super Admin
+  exempt like #48).
+  ★ **"Not now" routes by identity** (`resolveDeclineTarget()`): a paying student falls back to
+  the product they bought, a signed-out holder to sign-in, and a STAFF-ONLY invitee is *deferred*
+  — kept on a "finish later" card — because for them the old answer was the ₱1,499 pricing page.
+  ★ **A deferral holds only against the COLD PAYWALL, and only while it would still show.** The
+  pending/renew_pending/finalizing screens show no price, and MembershipExpiredScreen shows one
+  only to someone who already bought — it carries their Renew/Extend/Upgrade actions. Deferring
+  any of them replaced an accurate screen with "nothing else is needed from you" and then re-pinned
+  it every render, so a lapsed member offered a job could reach Renew only by accepting the job.
+  `declineWouldShowAPrice()` and the gate's `staffOnlyWouldSeeAPrice()` are the two halves of that
+  rule and must move together. Every card a signed-in viewer can be pinned on carries an escape.
+  ★ **Success lands on the Dashboard**, with the role named and the ops queue as a labelled
+  secondary action — never dropped straight into a list of other people's payments.
 - Setup + the full permission matrix: **[STAFF_ROLES_SETUP.md](STAFF_ROLES_SETUP.md)**.
 
 ## AI / proxy pattern
@@ -1643,6 +1687,33 @@ docs **in the same change**:
   of it was a test. Add the case to the matrix in the same change. ★ There is no jsdom or RTL in
   this repo, so the suite pins the DECISION, not the render — a new `GATE_SCREENS` value still
   needs its switch arm added by hand, or it falls through `default` and renders the app.
+  ★ **The `!profileReady` arm is NOT allowed to swallow a live invitation token** (#50): a
+  successful `verifyOtp()` creates a session whose uid makes `profileReady` false, so a bare
+  `→ SPLASH` there unmounts the invitation screen at the moment it has just spent the one-time
+  token — which is the whole "your invitation has expired" incident. The pinned rule: token +
+  `!profileReady` → `STAFF_INVITATION`, and the ban still wins the moment the profile lands.
+- **Changing what the INVITATION SCREEN shows, or when** → the decision is
+  `resolveInviteState()` in [src/lib/inviteMachine.js](src/lib/inviteMachine.js) ↔ the switch in
+  `StaffInvitationSetup` ↔ `staff_invitation_state()` in
+  `db/2026-08-30-staff-activation-consistency.sql` (+ its bootstrap fold §37) ↔
+  `test/inviteMachine.test.mjs`. Facts must stay DURABLE (server-derived, refetchable) — deriving
+  a step or a password requirement from component state is exactly the #49 bug. The recovery rule
+  ("while my own membership is `invited`, never report `expired`") and the decline table
+  (`resolveDeclineTarget()` — a staff-only decline never renders pricing) are both pinned there;
+  a new state also needs its switch arm in the component, by hand.
+- **Changing who appears in student ACCESS REQUESTS** → `admin_access_request_queue()` ↔
+  `admin_access_request_pending_count()` (the badge — same predicate, same permission gate,
+  by design; they diverged before #50 and the badge counted staff the list never showed) ↔
+  `staff_sync_is_admin()`'s approval half ↔ **`admin_review_access_request()`'s staff-target
+  refusal (#51)** ↔ `test/accessRequestsSql.test.mjs`. The exclusion is `invited`+`active` only —
+  hiding `suspended`/`revoked` would lose a real student. ★ **The DECIDER must refuse whatever the
+  QUEUE hides.** #50 hid staff from the list but left `admin_review_access_request()` accepting any
+  uuid, and it is granted to `authenticated` and gated only on `access_requests.review` — a
+  permission Ops Admins hold — so a direct PostgREST call could ban a peer Trainer or veto a Super
+  Admin's unaccepted invitee, producing a banned-but-authorized account the approval trigger
+  cannot repair (its half is scoped to `pending`, so a ban is never laundered). #51 closes it with
+  `ACCESS_REQUEST_STAFF_TARGET` and **no Super Admin exemption** — withdrawing staff access is
+  `admin_set_staff_status()`, which writes an audit row.
 - **Adding, removing or re-granting a STAFF PERMISSION** → four places move together:
   the `staff_permissions` + `staff_role_permissions` seed in a dated migration ↔ the **bootstrap
   fold** ↔ `STAFF_PERMISSIONS` / `ROLE_PERMISSIONS` in [src/lib/staffRoles.js](src/lib/staffRoles.js)

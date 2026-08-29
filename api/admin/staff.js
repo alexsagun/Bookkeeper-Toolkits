@@ -21,6 +21,9 @@
 //   'assign-role'   — change someone's role
 //   'set-status'    — suspend / reactivate / revoke
 //   'audit'         — the staff_role_events ledger
+//   'email-diagnostics' — (#50) the sending domain's verification + DNS record
+//                     status and its click/open-tracking flags, read from Resend.
+//                     Names and statuses only: no key, no DNS value.
 //   GET             — health { ok, configured, hasResend, hasAppUrl }
 //
 // ★ #49 — THE INVITE PATH BRANCHES ON *CONFIRMED*, NOT ON *EXISTS*, AND THAT WAS
@@ -165,7 +168,17 @@ async function callerRpc(user, fn, args) {
   return data;
 }
 
-/** Find an Auth user by email. Returns { id, confirmed } or null. */
+/**
+ * Find an Auth user by email. Returns { id, confirmed }, null when the account
+ * genuinely does not exist, or the string 'capped' when the search ran out of
+ * pages WITHOUT proving absence.
+ *
+ * ★ THE CAP IS A DISTINCT ANSWER, NOT A NULL (#50). At >2000 Auth users the old
+ *   version returned null, the branch classified an existing confirmed account
+ *   as brand-new, generateLink('invite') refused the existing address, and the
+ *   admin read "Could not create the invitation" — an error pointing nowhere
+ *   near the cause. Failing with a named reason keeps it closed AND diagnosable.
+ */
 async function findAuthUserByEmail(admin, email) {
   // listUsers is paginated and has no server-side email filter in supabase-js v2,
   // so page until found. Staff lists are small; this is bounded at 10 pages.
@@ -175,9 +188,39 @@ async function findAuthUserByEmail(admin, email) {
     const users = data?.users || [];
     const hit = users.find((u) => normalizeEmail(u.email) === email);
     if (hit) return { id: hit.id, confirmed: Boolean(hit.email_confirmed_at || hit.confirmed_at) };
-    if (users.length < 200) break;
+    if (users.length < 200) return null; // a short page proves we saw everyone
   }
-  return null;
+  return 'capped';
+}
+
+/**
+ * The address invitation replies and "contact our team" point at (#50).
+ * The admin-editable payment_settings.notify_email first — read with the
+ * CALLER's JWT, the same source the enrollment notifier resolves — then the
+ * NOTIFY_ADMIN_EMAIL env var. Null when neither is set: the email builders omit
+ * the contact line rather than inventing an address.
+ */
+async function supportEmailFor(user) {
+  const url = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
+  const anon = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
+  try {
+    // ★ payment_settings is a KEY/VALUE table (key, value, …) — there is no
+    //   notify_email COLUMN. Selecting one returns 400/42703, which `r.ok`
+    //   swallows, so the admin-editable address would be silently unreachable and
+    //   every invitation would fall through to the env var. Same query shape as
+    //   api/notify-enrollment.js, which is the precedent this resolves against.
+    const r = await fetch(
+      `${url}/rest/v1/payment_settings?key=eq.notify_email&select=value`,
+      { headers: { apikey: anon, Authorization: `Bearer ${user.token}` } },
+    );
+    if (r.ok) {
+      const rows = await r.json();
+      const addr = normalizeEmail(rows?.[0]?.value);
+      if (EMAIL_RE.test(addr)) return addr;
+    }
+  } catch { /* best-effort — fall through to the env var */ }
+  const envAddr = normalizeEmail(process.env.NOTIFY_ADMIN_EMAIL);
+  return EMAIL_RE.test(envAddr) ? envAddr : null;
 }
 
 /** The inviter's display name, for the email. Best-effort — never blocks a send. */
@@ -348,6 +391,14 @@ export default async function handler(req, res) {
       const origin = appOrigin(req);
       const admin = service();
       const existing = await findAuthUserByEmail(admin, email);
+      if (existing === 'capped') {
+        // See findAuthUserByEmail: absence was NOT proven, so classifying this
+        // address as "new" could promote-or-invite the wrong way. Refuse loudly.
+        return res.status(502).json({
+          error: 'Too many accounts to search for that address. Contact support to invite this person.',
+          code: 'user_search_capped',
+        });
+      }
 
       // The decision lives in src/lib/staffInvite.js so node:test can reach it —
       // api/ handlers have no test harness here, and this is precisely the branch
@@ -413,22 +464,22 @@ export default async function handler(req, res) {
       }
 
       // ── Now the email ──
-      const inviterName = await callerName(u);
+      const [inviterName, supportEmail] = await Promise.all([callerName(u), supportEmailFor(u)]);
       let sent;
       if (promote) {
         const msg = staffRoleAssignedEmail({
-          roleKey, appUrl: origin, inviteeName: body.full_name || null, inviterName,
+          roleKey, appUrl: origin, inviteeName: body.full_name || null, inviterName, supportEmail,
         });
-        sent = await sendEmail({ to: email, ...msg, tag: 'staff-invite' });
+        sent = await sendEmail({ to: email, ...msg, replyTo: supportEmail, tag: 'staff-invite' });
       } else {
         const actionUrl = buildInviteUrl({ appUrl: origin, tokenHash, type: tokenType });
         if (!actionUrl) {
           sent = { ok: false, code: origin ? 'no_link' : 'app_url_not_configured' };
         } else {
           const msg = staffInviteEmail({
-            roleKey, actionUrl, inviteeName: body.full_name || null, inviterName,
+            roleKey, actionUrl, inviteeName: body.full_name || null, inviterName, supportEmail,
           });
-          sent = await sendEmail({ to: email, ...msg, tag: 'staff-invite' });
+          sent = await sendEmail({ to: email, ...msg, replyTo: supportEmail, tag: 'staff-invite' });
         }
         await recordDelivery(u, userId, sent.ok ? 'sent' : 'failed', sent.code);
       }
@@ -492,11 +543,12 @@ export default async function handler(req, res) {
         return res.status(502).json({ error: 'Could not build the invitation link. Set APP_URL.' });
       }
 
-      const inviterName = await callerName(u);
+      const [inviterName, supportEmail] = await Promise.all([callerName(u), supportEmailFor(u)]);
       const msg = staffInviteEmail({
-        roleKey: row.role_key, actionUrl, inviteeName: row.full_name || null, inviterName, resent: true,
+        roleKey: row.role_key, actionUrl, inviteeName: row.full_name || null, inviterName,
+        resent: true, supportEmail,
       });
-      const sent = await sendEmail({ to: email, ...msg, tag: 'staff-invite' });
+      const sent = await sendEmail({ to: email, ...msg, replyTo: supportEmail, tag: 'staff-invite' });
       await recordDelivery(u, targetId, sent.ok ? 'resent' : 'failed', sent.code);
 
       if (!sent.ok) {
@@ -506,8 +558,75 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, email_sent: true });
     }
 
+    // ── email-diagnostics ─────────────────────────────────────────────────
+    // A real deliverability audit, not a promise (#50): reads the sending
+    // domain's verification + DNS record status and its tracking flags from
+    // Resend's own API. Reported because CLICK TRACKING REWRITES EVERY LINK to a
+    // Resend redirect domain — which breaks the "the CTA's domain matches the
+    // From domain" property the fragment-token design depends on, and hands the
+    // one-time URL to a redirect service. Resend has no per-message opt-out, so
+    // if it is on, the fix is the dashboard toggle and this report says so.
+    // No secret and no full DNS values leave this handler — names and statuses only.
+    if (action === 'email-diagnostics') {
+      const apiKey = process.env.RESEND_API_KEY;
+      const from = String(process.env.RESEND_FROM || '');
+      const fromDomain = (from.match(/@([^\s>]+)>?\s*$/) || [])[1]?.toLowerCase() || null;
+      const appDomain = (() => {
+        try { return new URL(appOrigin(req)).hostname.toLowerCase(); } catch { return null; }
+      })();
+      if (!apiKey) {
+        return res.status(200).json({
+          ok: true, configured: false, fromDomain, appDomain,
+          note: 'RESEND_API_KEY is not set — nothing to audit.',
+        });
+      }
+      const rr = await fetch('https://api.resend.com/domains', {
+        headers: { Authorization: `Bearer ${apiKey}` },
+      });
+      if (!rr.ok) {
+        return res.status(200).json({ ok: false, configured: true, error: `resend_${rr.status}` });
+      }
+      const listing = await rr.json();
+      const domains = listing?.data || [];
+      const match = fromDomain
+        ? domains.find((d) => String(d.name || '').toLowerCase() === fromDomain) || null
+        : null;
+      let detail = null;
+      if (match?.id) {
+        const dr = await fetch(`https://api.resend.com/domains/${match.id}`, {
+          headers: { Authorization: `Bearer ${apiKey}` },
+        });
+        if (dr.ok) detail = await dr.json();
+      }
+      const d = detail || match;
+      return res.status(200).json({
+        ok: true,
+        configured: true,
+        fromDomain,
+        appDomain,
+        // Aligned From/CTA/app domains are what a reader (and a filter) expects.
+        domainsAligned: Boolean(fromDomain && appDomain
+          && (appDomain === fromDomain || appDomain.endsWith(`.${fromDomain}`)
+            || fromDomain.endsWith(`.${appDomain}`))),
+        domainFound: Boolean(match),
+        domainStatus: d?.status || null,
+        clickTracking: d?.click_tracking ?? null,
+        openTracking: d?.open_tracking ?? null,
+        // Record NAMES + statuses only — enough to see an unverified DKIM/SPF
+        // entry without echoing DNS values into a browser.
+        records: Array.isArray(d?.records)
+          ? d.records.map((r) => ({ record: r.record, type: r.type, status: r.status }))
+          : [],
+        warnings: [
+          ...(d?.click_tracking ? ['Click tracking is ON for this domain: every invitation link is rewritten to a Resend redirect, which breaks the same-domain property one-time links rely on. Turn it off in Resend → Domains.'] : []),
+          ...(match && d?.status !== 'verified' ? [`The sending domain is ${d?.status || 'not verified'} — SPF/DKIM will not align until every DNS record shows verified.`] : []),
+          ...(!match && fromDomain ? [`RESEND_FROM's domain (${fromDomain}) is not registered in this Resend account, so mail is sent from a shared/unaligned domain.`] : []),
+        ],
+      });
+    }
+
     return res.status(400).json({
-      error: "action must be 'list', 'invite', 'resend-invite', 'assign-role', 'set-status' or 'audit'.",
+      error: "action must be 'list', 'invite', 'resend-invite', 'assign-role', 'set-status', 'audit' or 'email-diagnostics'.",
     });
   } catch (err) {
     // app_error codes travel in `hint`; surface them so the client can render

@@ -54,6 +54,11 @@ import {
   staffRole, staffStatusLabel,
 } from './lib/staffRoles';
 import { parseInviteHash } from './lib/staffInvite';
+import {
+  INVITE_STATES, EMPTY_INVITATION_STATE, normalizeInvitationState, resolveInviteState,
+  invitationNeedsPassword, classifyExchangeError, exchangeErrorIsRetryable,
+  resolveDeclineTarget,
+} from './lib/inviteMachine';
 import { GATE_SCREENS, resolveGateScreen } from './lib/gateScreen';
 import {
   ENROLLMENT_PLANS_FALLBACK, PLAN_LABELS, PLAN_ENTITLEMENTS, planEntitlement,
@@ -2195,17 +2200,74 @@ const INITIAL_STAFF_INVITE = readStaffInviteFromUrl();
  *  • Already signed in with a pending membership and no token — which is how a
  *    stranded invitee (accepted the old Supabase link, landed on the pricing
  *    page) is repaired without anyone re-sending anything.
+ *
+ * ★ #50: EVERY SCREEN IS A PROJECTION OF resolveInviteState() (src/lib/
+ *   inviteMachine.js), and every fact that decides one is DURABLE — fetched from
+ *   the auth.uid()-scoped staff_invitation_state() RPC, not remembered in a
+ *   component flag. The #49 version derived its step from `exchanged`, a local
+ *   useState: the gate's !profileReady arm unmounted this component the moment
+ *   verifyOtp() succeeded (a new session uid makes profileReady false), the
+ *   fresh instance forgot the token had been spent, offered Accept again, and the
+ *   duplicate exchange produced "This invitation link has expired". A refresh
+ *   after redemption likewise forgot `exchanged` and made the password OPTIONAL
+ *   for the one person who does not have one. Neither is possible now: unmount,
+ *   remount and refresh all rebuild the same state from the same server facts.
  */
-function StaffInvitationSetup({ invite, onAccepted, onDismissToken }) {
-  const { user, profile, staffMembership, staffReady, updatePassword, refreshStaff, signOut } = useAuth();
+const INVITE_QUEUE_LABELS = {
+  enrollments: 'Enrollments',
+  accessrequests: 'Access Requests',
+  studentimports: 'Student Imports',
+  batches: 'Batches',
+  staffroles: 'Team & Roles',
+  qbomastery: 'Course Library',
+};
 
-  const [exchanged, setExchanged] = useState(false);
-  const [busy, setBusy] = useState(false);
+const EXCHANGE_ERROR_COPY = {
+  expired: 'This invitation link has expired or was already used. Ask the person who invited you to send a new one.',
+  rate_limited: 'Too many attempts in a short time. Wait a minute, then try again.',
+  network: 'Could not reach the server. Check your connection and try again.',
+  server: 'The server had a problem opening this invitation. Try again in a moment.',
+  invalid: 'This invitation link is not valid. Ask the person who invited you to send a new one.',
+  unknown: 'Could not open this invitation. Try the link again.',
+};
+
+function StaffInvitationSetup({ invite, deferred, onAccepted, onDecline, onDismiss, onResume, onTokenSpent }) {
+  const {
+    user, profile, profileReady, staffMembership, staffReady,
+    updatePassword, refreshStaff, signOut,
+  } = useAuth();
+
+  // ── Durable server facts (staff_invitation_state) ──────────────────────────
+  const [inviteFacts, setInviteFacts] = useState(null);
+  const [factsFor, setFactsFor] = useState(null);      // uid the facts describe
+  const [factsMissing, setFactsMissing] = useState(false); // pre-#50 database
+  const [factsError, setFactsError] = useState(null);
+  const factsGen = useRef(0);                          // discard stale responses
+
+  // ── Transient, in-flight only ──────────────────────────────────────────────
+  const [phase, setPhase] = useState('idle');          // idle | exchanging | activating
+  const [tokenSpent, setTokenSpent] = useState(Boolean(invite?.redeemed));
+  const [exchangeOk, setExchangeOk] = useState(false);
+  const [activated, setActivated] = useState(false);
+  const [activatedCtx, setActivatedCtx] = useState(null);
   const [err, setErr] = useState('');
   const [fullName, setFullName] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPw, setConfirmPw] = useState('');
   const [showPw, setShowPw] = useState(false);
+
+  // ★ SINGLE-FLIGHT, SYNCHRONOUSLY. `disabled={busy}` alone is not a lock: setState
+  //   is asynchronous, so two clicks dispatched before the re-render both read the
+  //   stale `busy === false` closure — and under StrictMode dev double-invocation
+  //   the same handler can run twice. A ref is checked and set before any await,
+  //   so the second entrant returns without touching the network.
+  const exchangingRef = useRef(false);
+  const activatingRef = useRef(false);
+  // The secret itself lives in a ref, NEVER in state: it is cleared the moment it
+  // is spent (or refused terminally), so no later render, log, or devtools state
+  // dump can see it. It reaches exactly one call: supabase.auth.verifyOtp().
+  const tokenRef = useRef(invite && invite.token ? { token: invite.token, type: invite.type } : null);
+  const preExchangeUid = useRef(null);
 
   // Adopt the profile name once it lands, but never clobber what they are typing.
   const nameTouched = useRef(false);
@@ -2213,56 +2275,184 @@ function StaffInvitationSetup({ invite, onAccepted, onDismissToken }) {
     if (!nameTouched.current && profile?.full_name) setFullName(profile.full_name);
   }, [profile?.full_name]);
 
-  // ★ DERIVED, never stored. Both call sites render this component as the root
-  //   element of the gate, so React keeps the same instance when `invite` becomes
-  //   null — a stored step survived that transition and left the confirm screen up
-  //   with nothing to confirm.
-  const step = invite && !exchanged ? 'confirm' : 'form';
+  const loadFacts = useCallback(async (uid) => {
+    if (!uid) return;
+    const gen = ++factsGen.current;
+    setFactsError(null);
+    try {
+      // ★ RACED, like every other gate-blocking fetch in this app (AuthProvider's
+      //   profile + staff calls at 8s, useEnrollmentGate at 7s). supabase.rpc()
+      //   awaits getSession() internally, which is precisely the call those races
+      //   exist for — a stall there never rejects, so without this the screen sits
+      //   on a spinner the viewer cannot leave.
+      const res = await Promise.race([
+        supabase.rpc('staff_invitation_state'),
+        new Promise((resolve) => setTimeout(
+          () => resolve({ data: null, error: new Error('staff_invitation_state timed out') }), 8000,
+        )),
+      ]);
+      if (gen !== factsGen.current) return; // a newer fetch superseded this one
+      const { state, missing, failed } = normalizeInvitationState(res);
+      if (failed && !missing) {
+        setFactsError('server');
+        return;
+      }
+      setFactsMissing(missing);
+      setInviteFacts(state);
+      setFactsFor(uid);
+    } catch {
+      if (gen === factsGen.current) setFactsError('network');
+    }
+  }, []);
 
-  const role = staffMembership?.exists ? staffMembership : null;
-  const roleLabel = role?.roleLabel || null;
-  // A brand-new invitee has no password at all, so after a token exchange it is
-  // required. Someone who was already signed in got here with credentials that
-  // work, so for them it is optional.
-  const needsPassword = exchanged;
+  useEffect(() => {
+    if (user?.id) {
+      loadFacts(user.id);
+    } else {
+      setInviteFacts(null);
+      setFactsFor(null);
+      setFactsError(null);
+    }
+  }, [user?.id, loadFacts]);
+
+  // A successful exchange replaces the session; hold the "exchanging" phase until
+  // the NEW uid actually lands, so no intermediate render can reach a verdict from
+  // half-updated inputs.
+  useEffect(() => {
+    if (exchangeOk && user?.id && user.id !== preExchangeUid.current && phase === 'exchanging') {
+      setPhase('idle');
+    }
+  }, [exchangeOk, user?.id, phase]);
+  useEffect(() => {
+    if (!exchangeOk || phase !== 'exchanging') return undefined;
+    // Belt and braces: verifyOtp() returned a session, so it will land — but if the
+    // client somehow never delivers it, do not spin forever.
+    const t = setTimeout(() => {
+      setPhase('idle');
+      setErr('Signed in, but this page could not load your session. Reload to continue.');
+    }, 10000);
+    return () => clearTimeout(t);
+  }, [exchangeOk, phase]);
+
+  // ── The durable facts the machine reasons from ─────────────────────────────
+  const factsReady = Boolean(user?.id && factsFor === user.id);
+  const effectiveFacts = useMemo(() => {
+    if (!factsReady) return null;
+    if (!factsMissing) return inviteFacts;
+    // Pre-#50 database: staff_invitation_state() does not exist yet. Degrade to
+    // what my_staff_context()'s membership can tell us. has_password is unknowable
+    // here, so fall back to the #49 heuristic — a token exchanged THIS session
+    // means a brand-new account. Documented degrade, not the design.
+    if (!staffReady) return null;
+    if (!staffMembership?.exists) return EMPTY_INVITATION_STATE;
+    return {
+      exists: true,
+      status: staffMembership.status,
+      roleKey: staffMembership.roleKey,
+      roleLabel: staffMembership.roleLabel,
+      displayTitle: staffMembership.displayTitle || null,
+      invitedAt: staffMembership.invitedAt || null,
+      emailConfirmed: true, // the server refuses if not; do not block on a guess
+      hasPassword: !exchangeOk,
+    };
+  }, [factsReady, factsMissing, inviteFacts, staffReady, staffMembership, exchangeOk]);
+
+  const view = resolveInviteState({
+    hasToken: Boolean(invite),
+    tokenSpent: tokenSpent || Boolean(invite?.redeemed),
+    phase,
+    sessionUserId: user?.id || null,
+    inviteState: effectiveFacts,
+    activated,
+    deferred: Boolean(deferred),
+    errorCode: factsError,
+  });
+
+  const needsPassword = invitationNeedsPassword(effectiveFacts);
+  const roleLabel = effectiveFacts?.roleLabel
+    || (staffMembership?.exists ? staffMembership.roleLabel : null);
+  const busy = phase !== 'idle';
+  // Decline with the DURABLE membership status, so the root's routing decision and
+  // the card the person is looking at are reading the same fact. `undefined` (the
+  // facts have not loaded) tells the root to fall back to my_staff_context().
+  const decline = () => onDecline?.(effectiveFacts
+    ? (effectiveFacts.exists ? effectiveFacts.status : null)
+    : undefined);
+  // The ban is enforced twice — resolveGateScreen() swaps this screen for
+  // RejectedScreen the moment a rejected profile lands, and the database refuses
+  // the acceptance outright (#50: STAFF_ACCOUNT_REJECTED). This disable is the
+  // belt on top: no action fires before the profile and staff answers are in.
+  const actionsBlocked = Boolean(user && (!profileReady || !staffReady));
+
+  // ── Accessibility: announce transitions, move focus to each new heading ─────
+  const headingRef = useRef(null);
+  const screenGroup = (
+    view.state === INVITE_STATES.CONFIRM || view.state === INVITE_STATES.EXCHANGING ? 'confirm'
+      : view.state === INVITE_STATES.CREDENTIALS || view.state === INVITE_STATES.PROFILE_ONLY
+        || view.state === INVITE_STATES.ACTIVATING ? 'form'
+        : view.state
+  );
+  useEffect(() => {
+    headingRef.current?.focus?.();
+  }, [screenGroup]);
+  const LIVE_STATUS = {
+    [INVITE_STATES.EXCHANGING]: 'Opening your invitation…',
+    [INVITE_STATES.ACTIVATING]: 'Activating your staff access…',
+    [INVITE_STATES.SUCCESS]: 'Your staff access is active.',
+    [INVITE_STATES.LOADING]: 'Loading your invitation…',
+  };
 
   const acceptToken = async () => {
-    if (!invite) return;   // belt and braces: the button only renders with one
-    setBusy(true); setErr('');
+    if (exchangingRef.current) return;      // the synchronous lock
+    if (actionsBlocked) return;
+    const tok = tokenRef.current;
+    if (!tok) return;                       // the button only renders with one
+    exchangingRef.current = true;
+    preExchangeUid.current = user?.id || null;
+    setPhase('exchanging');
+    setErr('');
     try {
       const { error } = await supabase.auth.verifyOtp({
-        token_hash: invite.token,
-        type: invite.type,
+        token_hash: tok.token,
+        type: tok.type,
       });
       if (error) throw error;
-      setExchanged(true);
-      // No refreshStaff() here. It closes over THIS render's session, which is
-      // still the pre-verifyOtp one, so it would return the empty context without
-      // fetching. AuthProvider's own effect — keyed on the user id — does the
-      // fetch when the new session lands, and `staffReady` is false until it does,
-      // which is what keeps the "no invitation waiting" branch from firing early.
+      // Spent. Clear the secret everywhere — this ref, and the root's copy — so
+      // nothing can offer or resend it. The session lands via onAuthStateChange;
+      // the phase effect above releases 'exchanging' when the new uid arrives.
+      tokenRef.current = null;
+      setTokenSpent(true);
+      setExchangeOk(true);
+      onTokenSpent?.();
     } catch (e) {
-      // Expired / already used / tampered all surface here. Say what to do next
-      // without confirming whether any particular address has an account.
-      setErr(
-        /expired|invalid|not found|token/i.test(e?.message || '')
-          ? 'This invitation link has expired or was already used. Ask the person who invited you to send a new one.'
-          : (e?.message || 'Could not open this invitation. Try the link again.'),
-      );
-      setBusy(false);
-      return;
+      const kind = classifyExchangeError(e);
+      if (!exchangeErrorIsRetryable(kind)) {
+        // Consumed, expired or tampered: this token must never be offered again.
+        // If this session's own membership is pending, the machine recovers to
+        // the credentials step — the token was only ever going to prove an
+        // identity the session already has.
+        tokenRef.current = null;
+        setTokenSpent(true);
+        onTokenSpent?.();
+      }
+      setErr(EXCHANGE_ERROR_COPY[kind] || EXCHANGE_ERROR_COPY.unknown);
+      setPhase('idle');
+    } finally {
+      exchangingRef.current = false;
     }
-    setBusy(false);
   };
 
   const submit = async (e) => {
     e.preventDefault();
+    if (activatingRef.current) return;      // the synchronous lock
+    if (actionsBlocked) return;
     setErr('');
     if ((needsPassword || password) && password !== confirmPw) {
       setErr('The two passwords do not match.');
       return;
     }
-    setBusy(true);
+    activatingRef.current = true;
+    setPhase('activating');
     try {
       if (needsPassword || password) {
         const { error } = await updatePassword(password);
@@ -2287,15 +2477,31 @@ function StaffInvitationSetup({ invite, onAccepted, onDismissToken }) {
       if (!ctx || ctx.status !== 'active') {
         throw new Error('Your role was activated, but this page could not confirm it. Reload to continue.');
       }
-      onAccepted?.(ctx);
+      // refreshStaff() IS server confirmation, so updating the local durable copy
+      // is honest — and it means a failed background refetch cannot bounce the
+      // screen back to the password form after a committed activation.
+      setInviteFacts((prev) => (prev && prev.exists
+        ? { ...prev, status: 'active', hasPassword: needsPassword ? true : prev.hasPassword }
+        : prev));
+      setActivatedCtx(ctx);
+      setActivated(true);
+      loadFacts(user?.id); // background re-read; the local copy already says active
     } catch (e2) {
       setErr(appErrorMessage(e2, 'Could not finish setting up your account.'));
-      setBusy(false);
+    } finally {
+      activatingRef.current = false;
+      setPhase('idle');
     }
   };
 
   const inputStyle = { background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody };
-  const shell = (children) => (
+  const primaryBtn = {
+    background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`,
+    boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)',
+  };
+  const quietBtn = { background: 'var(--wash-strong)', border: `1px solid ${C.border}`, color: C.text };
+
+  const shell = (children, headline = 'You’re invited to join the team') => (
     <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
       <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
         background: GLASS.cardDeep,
@@ -2306,15 +2512,16 @@ function StaffInvitationSetup({ invite, onAccepted, onDismissToken }) {
       }}>
         <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
           <img src={LOGO_DATA_URI} alt="Get Hired With Alex" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
-          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>
-            You&rsquo;re invited to join the team
-          </div>
+          <h1 ref={headingRef} tabIndex={-1} className="mt-3 outline-none" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>
+            {headline}
+          </h1>
           {roleLabel && (
             <div className="mt-2 inline-flex items-center gap-1.5 px-3 py-1 rounded-full" style={{ background: 'var(--primary-tint)', border: '1px solid var(--primary-halo)', color: C.primary, fontSize: 12, fontWeight: 700 }}>
               <ShieldCheck size={13} /> {roleLabel}
             </div>
           )}
         </div>
+        <span role="status" aria-live="polite" className="sr-only">{LIVE_STATUS[view.state] || ''}</span>
         {children}
       </div>
     </div>
@@ -2326,136 +2533,282 @@ function StaffInvitationSetup({ invite, onAccepted, onDismissToken }) {
     </div>
   ) : null;
 
-  // ── Step 1: deliberate consent. Nothing has been redeemed yet. ──
-  if (step === 'confirm') {
-    return shell(
-      <div className="px-8 py-7 space-y-4">
-        <p style={{ fontSize: 13.5, lineHeight: 1.65, color: C.textSoft }}>
-          This is a staff account, so there&rsquo;s nothing to buy &mdash; you won&rsquo;t be asked
-          to choose a plan or make a payment.
-        </p>
-        {user && (
-          <div className="px-3 py-2.5 rounded-xl text-xs" style={{ background: 'var(--wash)', border: `1px solid ${C.border}`, color: C.textSoft }}>
-            You&rsquo;re currently signed in as <strong style={{ color: C.text }}>{user.email}</strong>.
-            Accepting will switch this browser to the invited account.
-          </div>
-        )}
-        {errorBox}
-        <button type="button" onClick={acceptToken} disabled={busy}
-          className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
-          style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)' }}>
-          {busy ? <Loader2 size={15} className="animate-spin" /> : <ArrowRight size={15} />}
-          Accept invitation and set up my account
-        </button>
-        <div className="text-center">
-          <button type="button" onClick={onDismissToken} className="text-xs" style={{ color: C.textMute }}>
-            Not now
-          </button>
-        </div>
-      </div>,
-    );
-  }
+  const signOutRow = user ? (
+    <button type="button" onClick={signOut} className="block w-full text-xs py-2" style={{ color: C.textMute }}>
+      Signed in as {user.email} &middot; Sign out
+    </button>
+  ) : null;
 
-  // ── No invitation is waiting on this account. ──
-  // ★ `!err` is load-bearing. accept_staff_invitation() can succeed and the
-  //   follow-up refreshStaff() still fail (timeout, blip) — which empties
-  //   staffMembership and lands here. Without this guard the screen would replace
-  //   an accurate "your role was activated but this page could not confirm it"
-  //   with "there is no staff invitation waiting", the opposite of what happened,
-  //   AFTER the write had already committed.
-  if (staffReady && !busy && !err && !staffInvitationPending(staffMembership)) {
-    // ★ THREE cases, not two. This read `status !== 'invited'`, which lumps
-    //   ACTIVE in with suspended and revoked — so a staff member who had already
-    //   accepted and then clicked their link a second time (the single most
-    //   likely thing anyone does with an invitation email) was told their access
-    //   "is active, and an invitation link can't restore it. Ask a Super Admin to
-    //   reinstate your role." Nothing was wrong, and the message said otherwise.
-    const status = staffMembership?.exists ? staffMembership.status : null;
-    const alreadyActive = status === 'active';
-    const ended = status === 'suspended' || status === 'revoked';
-    return shell(
-      <div className="px-8 py-7 space-y-4">
-        <p style={{ fontSize: 13.5, lineHeight: 1.65, color: C.textSoft }}>
-          {alreadyActive
-            ? `You’re already set up${staffMembership.roleLabel ? ` as ${staffMembership.roleLabel}` : ''}. There’s nothing left to accept — this link has already done its job.`
-            : ended
-              ? `This staff access is ${staffStatusLabel(status).toLowerCase()}, and an invitation link can’t restore it. Ask a Super Admin to reinstate your role.`
-              : 'There’s no staff invitation waiting on this account. If you were expecting one, ask the person who invited you to send it again — invitations are tied to a single email address.'}
-        </p>
-        <button type="button" onClick={onDismissToken}
-          className="w-full py-2.5 rounded-xl text-sm font-bold transition"
-          style={alreadyActive
-            ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff', border: 'none' }
-            : { background: 'var(--wash-strong)', border: `1px solid ${C.border}`, color: C.text }}>
-          Continue to the app
-        </button>
-        <div className="text-center">
-          <button type="button" onClick={signOut} className="text-xs" style={{ color: C.textMute }}>
-            Signed in as {user?.email} &middot; Sign out
-          </button>
-        </div>
-      </div>,
-    );
-  }
-
-  // ── Step 2: name + password, then accept. ──
-  return shell(
-    <form onSubmit={submit} className="px-8 py-7 space-y-3.5">
-      {role?.roleDescription && (
-        <p style={{ fontSize: 12.5, lineHeight: 1.6, color: C.textSoft, margin: 0 }}>{role.roleDescription}</p>
-      )}
-
-      <div className="relative">
-        <Users size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
-        <input className="w-full pl-10 pr-3 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
-          type="text" autoComplete="name" placeholder="Your full name" aria-label="Your full name"
-          value={fullName} onChange={(e) => { nameTouched.current = true; setFullName(e.target.value); }} />
-      </div>
-
-      <div className="relative">
-        <Lock size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
-        <input className="w-full pl-10 pr-10 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
-          type={showPw ? 'text' : 'password'} autoComplete="new-password"
-          placeholder={needsPassword ? 'Choose a password' : 'New password (optional)'}
-          aria-label={needsPassword ? 'Choose a password' : 'New password, optional'}
-          value={password} onChange={(e) => setPassword(e.target.value)}
-          required={needsPassword} minLength={8} />
-        <button type="button" onClick={() => setShowPw((v) => !v)} tabIndex={-1}
-          className="absolute right-3 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} aria-label="Toggle password visibility">
-          <Eye size={15} />
-        </button>
-      </div>
-
-      {(needsPassword || password) && (
-        <div className="relative">
-          <Lock size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
-          <input className="w-full pl-10 pr-3 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
-            type={showPw ? 'text' : 'password'} autoComplete="new-password" placeholder="Confirm password"
-            aria-label="Confirm password"
-            value={confirmPw} onChange={(e) => setConfirmPw(e.target.value)} required minLength={8} />
-        </div>
-      )}
-      <div style={{ fontSize: 11.5, color: C.textMute }}>Use at least 8 characters.</div>
-
-      {errorBox}
-
-      <button type="submit" disabled={busy || !staffReady}
-        className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
-        style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)' }}>
-        {busy && <Loader2 size={15} className="animate-spin" />}
-        {roleLabel ? `Accept ${roleLabel} invitation` : 'Accept invitation'}
-      </button>
-
-      <div className="text-center pt-1 space-y-1.5">
-        <button type="button" onClick={onDismissToken} className="block w-full text-xs" style={{ color: C.textSoft }}>
-          Not now — continue to my account
-        </button>
-        <button type="button" onClick={signOut} className="block w-full text-xs" style={{ color: C.textMute }}>
-          Signed in as {user?.email} &middot; Sign out
-        </button>
-      </div>
-    </form>,
+  // ── Simple informational cards ─────────────────────────────────────────────
+  const noticeCard = (body, actions, { hideError = false } = {}) => shell(
+    <div className="px-8 py-7 space-y-4">
+      <p style={{ fontSize: 13.5, lineHeight: 1.65, color: C.textSoft }}>{body}</p>
+      {hideError ? null : errorBox}
+      {actions}
+    </div>,
   );
+
+  switch (view.state) {
+    case INVITE_STATES.LOADING:
+    case INVITE_STATES.SIGNED_OUT:
+      return shell(
+        <div className="px-8 py-10 flex items-center justify-center gap-2" style={{ color: C.textSoft, fontSize: 13 }}>
+          <Loader2 size={16} className="animate-spin" /> Loading your invitation&hellip;
+        </div>,
+      );
+
+    case INVITE_STATES.ERROR:
+      // ★ Every card a signed-in viewer can be pinned on carries an onDecline
+      //   escape — the same rule the EXPIRED card learned. Retry is the primary
+      //   action; leaving must still be possible when retrying keeps failing.
+      return noticeCard(
+        'Your invitation could not be loaded. Nothing has been lost — check your connection and try again.',
+        <>
+          <button type="button" onClick={() => loadFacts(user?.id)}
+            className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition"
+            style={primaryBtn}>
+            <RefreshCw size={15} /> Try again
+          </button>
+          {user && (
+            <button type="button" onClick={decline}
+              className="w-full py-2.5 rounded-xl text-sm font-bold transition" style={quietBtn}>
+              Continue without the invitation
+            </button>
+          )}
+          <div className="text-center">{signOutRow}</div>
+        </>,
+      );
+
+    case INVITE_STATES.EXPIRED:
+      // The card's own copy already explains the refusal; repeating the exchange
+      // error underneath it said the same thing twice in two colours.
+      //
+      // ★ A SIGNED-IN VIEWER MUST BE GIVEN A WAY OUT. hasInviteToken stays true
+      //   after a spent token (the root keeps {token:null, redeemed:true} so the
+      //   gate is not unmounted mid-flow), so without an explicit dismiss this
+      //   card pinned the session: a paying student who clicked a forwarded or
+      //   already-used invitation link could not reach the product they bought
+      //   without signing out. onDecline routes them by identity, so for them it
+      //   resolves to 'student_app' and the ordinary gate takes over.
+      return noticeCard(
+        'This invitation link has expired or was already used. Invitation links work once — ask the person who invited you to send a new one.',
+        <>
+          <button type="button" onClick={decline}
+            className="w-full py-2.5 rounded-xl text-sm font-bold transition" style={quietBtn}>
+            {user ? 'Continue to the app' : 'Back to sign in'}
+          </button>
+          <div className="text-center">{signOutRow}</div>
+        </>,
+        { hideError: true },
+      );
+
+    case INVITE_STATES.NO_INVITATION:
+      return noticeCard(
+        'There’s no staff invitation waiting on this account. If you were expecting one, ask the person who invited you to send it again — invitations are tied to a single email address.',
+        <>
+          <button type="button" onClick={decline} className="w-full py-2.5 rounded-xl text-sm font-bold transition" style={quietBtn}>
+            Continue to the app
+          </button>
+          <div className="text-center">{signOutRow}</div>
+        </>,
+      );
+
+    case INVITE_STATES.ALREADY_ACTIVE:
+      return noticeCard(
+        `You’re already set up${roleLabel ? ` as ${roleLabel}` : ''}. There’s nothing left to accept — this link has already done its job.`,
+        <>
+          <button type="button" onClick={decline}
+            className="w-full py-2.5 rounded-xl text-sm font-bold transition text-white" style={primaryBtn}>
+            Continue to the app
+          </button>
+          <div className="text-center">{signOutRow}</div>
+        </>,
+      );
+
+    case INVITE_STATES.ENDED: {
+      const status = effectiveFacts?.status;
+      const label = status === 'suspended' || status === 'revoked'
+        ? staffStatusLabel(status).toLowerCase() : 'no longer active';
+      return noticeCard(
+        `This staff access is ${label}, and an invitation link can’t restore it. Ask a Super Admin to reinstate your role.`,
+        <>
+          <button type="button" onClick={decline} className="w-full py-2.5 rounded-xl text-sm font-bold transition" style={quietBtn}>
+            Continue
+          </button>
+          <div className="text-center">{signOutRow}</div>
+        </>,
+      );
+    }
+
+    case INVITE_STATES.EMAIL_UNVERIFIED:
+      return noticeCard(
+        'Confirm your email address first — open the confirmation link we sent you, then come back and accept the invitation.',
+        <>
+          <button type="button" onClick={() => loadFacts(user?.id)}
+            className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition"
+            style={primaryBtn}>
+            <Mail size={15} /> I&rsquo;ve confirmed it &mdash; check again
+          </button>
+          <div className="text-center">{signOutRow}</div>
+        </>,
+      );
+
+    case INVITE_STATES.DEFERRED:
+      return noticeCard(
+        'No problem — your invitation is saved to this account, and you can finish setting up whenever you’re ready. Nothing else is needed from you until then.',
+        <>
+          <button type="button" onClick={onResume}
+            className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition"
+            style={primaryBtn}>
+            <ArrowRight size={15} /> Resume setup
+          </button>
+          <button type="button" onClick={signOut} className="w-full py-2.5 rounded-xl text-sm font-bold transition" style={quietBtn}>
+            Sign out for now
+          </button>
+          {/* The quiet third door: someone deferred because the alternative was a
+              pricing page — but a person may genuinely want to enroll as a student
+              anyway, and holding them here would decide that for them. Deliberate,
+              labelled, and last. */}
+          <div className="text-center">
+            <button type="button" onClick={onDismiss} className="text-xs py-2 px-3" style={{ color: C.textMute }}>
+              I want to browse membership plans instead
+            </button>
+          </div>
+        </>,
+      );
+
+    case INVITE_STATES.SUCCESS: {
+      // ★ The first thing a new staff member reads must say "you are in", not hand
+      //   them a queue of other people's payments. The Dashboard is the default;
+      //   the role's working queue is one labelled click away.
+      const queueTab = staffLandingTab(activatedCtx);
+      const queueLabel = queueTab && queueTab !== 'dashboard' ? INVITE_QUEUE_LABELS[queueTab] : null;
+      return shell(
+        <div className="px-8 py-7 space-y-4 text-center">
+          <div className="mx-auto w-12 h-12 rounded-full flex items-center justify-center" style={{ background: 'var(--status-ok-bg)', border: '1px solid var(--status-ok-bd)' }}>
+            <CheckCircle2 size={24} style={{ color: 'var(--status-ok-fg)' }} />
+          </div>
+          <p style={{ fontSize: 13.5, lineHeight: 1.65, color: C.textSoft, margin: 0 }}>
+            Your {roleLabel ? <strong style={{ color: C.text }}>{roleLabel}</strong> : 'staff'} access is
+            active. No approval queue, no payment &mdash; your account is ready to use right now.
+          </p>
+          <button type="button" onClick={() => onAccepted?.(activatedCtx, 'dashboard')}
+            className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition"
+            style={primaryBtn}>
+            <ArrowRight size={15} /> Go to Dashboard
+          </button>
+          {queueLabel && (
+            <button type="button" onClick={() => onAccepted?.(activatedCtx, queueTab)}
+              className="w-full py-2.5 rounded-xl text-sm font-bold transition" style={quietBtn}>
+              Open {queueLabel}
+            </button>
+          )}
+        </div>,
+        'Welcome to the team',
+      );
+    }
+
+    // ── Step 1: deliberate consent. Nothing has been redeemed yet. ──
+    case INVITE_STATES.CONFIRM:
+    case INVITE_STATES.EXCHANGING: {
+      const exchanging = view.state === INVITE_STATES.EXCHANGING;
+      return shell(
+        <div className="px-8 py-7 space-y-4">
+          <p style={{ fontSize: 13.5, lineHeight: 1.65, color: C.textSoft }}>
+            This is a staff account, so there&rsquo;s nothing to buy &mdash; you won&rsquo;t be asked
+            to choose a plan or make a payment.
+          </p>
+          {user && (
+            <div className="px-3 py-2.5 rounded-xl text-xs" style={{ background: 'var(--wash)', border: `1px solid ${C.border}`, color: C.textSoft }}>
+              You&rsquo;re currently signed in as <strong style={{ color: C.text }}>{user.email}</strong>.
+              Accepting will switch this browser to the invited account.
+            </div>
+          )}
+          {errorBox}
+          <button type="button" onClick={acceptToken} disabled={exchanging || actionsBlocked}
+            aria-busy={exchanging}
+            className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+            style={primaryBtn}>
+            {exchanging ? <Loader2 size={15} className="animate-spin" /> : <ArrowRight size={15} />}
+            {exchanging ? 'Opening your invitation…' : 'Accept invitation and set up my account'}
+          </button>
+          <div className="text-center">
+            <button type="button" onClick={decline} disabled={exchanging} className="text-xs py-2 px-3" style={{ color: C.textMute }}>
+              Not now
+            </button>
+          </div>
+        </div>,
+      );
+    }
+
+    // ── Step 2: name (+ password when the account has none), then accept. ──
+    default: {
+      const activating = view.state === INVITE_STATES.ACTIVATING;
+      return shell(
+        <form onSubmit={submit} className="px-8 py-7 space-y-3.5">
+          {needsPassword ? (
+            <p style={{ fontSize: 12.5, lineHeight: 1.6, color: C.textSoft, margin: 0 }}>
+              Choose a password to secure your account, then accept your role.
+            </p>
+          ) : (
+            <p style={{ fontSize: 12.5, lineHeight: 1.6, color: C.textSoft, margin: 0 }}>
+              Your account already has a password &mdash; accepting adds the staff role to it.
+            </p>
+          )}
+
+          <div className="relative">
+            <Users size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+            <input className="w-full pl-10 pr-3 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
+              type="text" autoComplete="name" placeholder="Your full name" aria-label="Your full name"
+              value={fullName} onChange={(e) => { nameTouched.current = true; setFullName(e.target.value); }} />
+          </div>
+
+          <div className="relative">
+            <Lock size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+            <input className="w-full pl-10 pr-10 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
+              type={showPw ? 'text' : 'password'} autoComplete="new-password"
+              placeholder={needsPassword ? 'Choose a password' : 'New password (optional)'}
+              aria-label={needsPassword ? 'Choose a password' : 'New password, optional'}
+              value={password} onChange={(e) => setPassword(e.target.value)}
+              required={needsPassword} minLength={8} />
+            <button type="button" onClick={() => setShowPw((v) => !v)} tabIndex={-1}
+              className="absolute right-3 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} aria-label="Toggle password visibility">
+              <Eye size={15} />
+            </button>
+          </div>
+
+          {(needsPassword || password) && (
+            <div className="relative">
+              <Lock size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+              <input className="w-full pl-10 pr-3 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
+                type={showPw ? 'text' : 'password'} autoComplete="new-password" placeholder="Confirm password"
+                aria-label="Confirm password"
+                value={confirmPw} onChange={(e) => setConfirmPw(e.target.value)} required minLength={8} />
+            </div>
+          )}
+          <div style={{ fontSize: 11.5, color: C.textMute }}>Use at least 8 characters.</div>
+
+          {errorBox}
+
+          <button type="submit" disabled={activating || actionsBlocked}
+            aria-busy={activating}
+            className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+            style={primaryBtn}>
+            {activating && <Loader2 size={15} className="animate-spin" />}
+            {activating ? 'Activating your access…'
+              : (roleLabel ? `Accept ${roleLabel} invitation` : 'Accept invitation')}
+          </button>
+
+          <div className="text-center pt-1 space-y-1.5">
+            <button type="button" onClick={decline} disabled={activating} className="block w-full text-xs py-2" style={{ color: C.textSoft }}>
+              Not now
+            </button>
+            {signOutRow}
+          </div>
+        </form>,
+      );
+    }
+  }
 }
 
 // First-login welcome. Shown once per user (gated on the namespaced
@@ -7154,13 +7507,62 @@ export default function BookkeeperProToolkit() {
   // re-renders and is dropped the moment it is spent or declined.
   const [staffInvite, setStaffInvite] = useState(INITIAL_STAFF_INVITE);
   const [staffInviteDismissed, setStaffInviteDismissed] = useState(false);
-  // ★ BOTH flags, always. Clearing only the token drops out of the token path and
-  //   straight back into the state path, because the membership is still pending —
-  //   so "Not now" would appear to do nothing. Session-only: a reload offers the
-  //   invitation again, which is right, since declining is not a decision worth
-  //   persisting against someone.
-  const dismissStaffInvite = useCallback(() => {
+  // #50: "finish later" for a staff-only invitee. Distinct from `dismissed` on
+  // purpose — dismissed means "fall through to the student gate", which is only
+  // the right answer for someone who HAS a student membership to fall back to.
+  const [staffInviteDeferred, setStaffInviteDeferred] = useState(false);
+  // #50: the token was spent. Drop the SECRET from root state while keeping the
+  // fact that a token arrived this session — `hasInviteToken` must keep pinning
+  // the gate on the invitation screen through the post-exchange profile load, or
+  // the gate's SPLASH arm unmounts the screen mid-flow (the "expired" bug).
+  const markStaffInviteRedeemed = useCallback(() => {
+    setStaffInvite((prev) => (prev && prev.token
+      ? { token: null, type: prev.type, redeemed: true }
+      : prev));
+  }, []);
+  // ★ "Not now" ROUTES BY IDENTITY (#50) — resolveDeclineTarget() in
+  //   src/lib/inviteMachine.js. A paying student falls back to the product they
+  //   bought (both flags, exactly the pre-#50 behaviour); a signed-out holder goes
+  //   back to sign-in; a STAFF-ONLY invitee is deferred — kept on the invitation
+  //   screen's "finish later" card — because for them "whichever student gate
+  //   applies" was the ₱1,499 pricing page, after an email that promised there is
+  //   nothing to buy. Session-only either way: a reload offers the invitation
+  //   again, which is right, since declining is not a decision worth persisting
+  //   against someone.
+  const dismissStaffInvite = useCallback((durableStatus) => {
+    // ★ The DURABLE status first. The invitation screen passes what
+    //   staff_invitation_state() reported — the same facts it renders from — so
+    //   the decline decision cannot disagree with the screen the person declined.
+    //   my_staff_context()'s membership is only the fallback for the moment
+    //   before those facts have loaded: it fails EMPTY on any RPC hiccup, and an
+    //   empty membership would read a staff-only invitee as an ordinary student
+    //   and hand them the pricing page.
+    const membershipStatus = durableStatus !== undefined
+      ? durableStatus
+      : (staffMembership?.exists ? staffMembership.status : null);
+    const target = resolveDeclineTarget({
+      hasSession: !!user,
+      membershipStatus,
+      enrollState: enroll.state,
+      // Without this, a fully paid member who declines before their gate data
+      // lands is read as 'paywall' (enrollGateState() with a null profile) and
+      // deferred instead of dismissed.
+      enrollReady: enroll.ready,
+    });
+    if (target === 'defer') {
+      setStaffInviteDeferred(true);
+      return;
+    }
     setStaffInvite(null);
+    setStaffInviteDeferred(false);
+    setStaffInviteDismissed(true);
+  }, [user, staffMembership, enroll.state, enroll.ready]);
+  const resumeStaffInvite = useCallback(() => setStaffInviteDeferred(false), []);
+  // The deliberate full dismissal — "I want the student flow, price and all".
+  // The only caller is the deferred card's labelled last-resort link.
+  const hardDismissStaffInvite = useCallback(() => {
+    setStaffInvite(null);
+    setStaffInviteDeferred(false);
     setStaffInviteDismissed(true);
   }, []);
   const [renewNow, setRenewNow] = useState(false);
@@ -7333,9 +7735,14 @@ export default function BookkeeperProToolkit() {
   //   is a temporal-dead-zone ReferenceError on the FIRST render — a white screen
   //   for every user. `npm run build` cannot catch it: Rollup never evaluates the
   //   module body.
-  const acceptStaffInvite = useCallback((ctx) => {
+  const acceptStaffInvite = useCallback((ctx, tabId) => {
     setStaffInvite(null);
-    setTab(staffLandingTab(ctx) || DEFAULT_APP_TAB);
+    setStaffInviteDeferred(false);
+    // #50: the success card names the destination — Dashboard by default, or the
+    // role's working queue as its labelled secondary action. Landing someone in a
+    // list of other people's payments as their FIRST sight of the product was
+    // exactly the "am I awaiting approval?" confusion this flow exists to end.
+    setTab(tabId || DEFAULT_APP_TAB);
   }, [setTab]);
 
   useEffect(() => {
@@ -7569,11 +7976,20 @@ export default function BookkeeperProToolkit() {
   const refreshPendingCount = useCallback(async () => {
     if (!canReviewAccess) return;
     try {
-      const { count, error } = await supabase
+      // #50: the badge asks the SAME question as the queue, through the SAME gate.
+      // The old head-count was filtered by profiles_admin_select RLS while the list
+      // is an RPC gated on has_staff_permission() — two authorization paths for one
+      // number, which is how the badge came to count invited/active staff the list
+      // should never show.
+      const { data, error } = await supabase.rpc('admin_access_request_pending_count');
+      if (!error && typeof data === 'number') { setPendingCount(data); return; }
+      // Pre-#50 fallback: the direct head-count (may still include staff — the old
+      // behaviour, kept so an unmigrated database degrades rather than zeroes).
+      const { count, error: e2 } = await supabase
         .from('profiles')
         .select('id', { count: 'exact', head: true })
         .eq('approval_status', 'pending');
-      if (!error) setPendingCount(count || 0);
+      if (!e2) setPendingCount(count || 0);
     } catch { /* table/column not migrated — leave at 0 */ }
   }, [canReviewAccess]);
   useEffect(() => { refreshPendingCount(); /* eslint-disable-next-line */ }, [canReviewAccess]);
@@ -8088,6 +8504,7 @@ export default function BookkeeperProToolkit() {
     staffReady, staffDegraded, staffMembership, staff,
     enroll, renewNow, inviteDismissed: staffInviteDismissed,
     hasInviteToken: !!staffInvite,
+    inviteDeferred: staffInviteDeferred,
     requireApproval: REQUIRE_ADMIN_APPROVAL,
     requireEnrollment: REQUIRE_ENROLLMENT,
   });
@@ -8122,8 +8539,12 @@ export default function BookkeeperProToolkit() {
       return (
         <StaffInvitationSetup
           invite={staffInvite}
+          deferred={staffInviteDeferred}
           onAccepted={acceptStaffInvite}
-          onDismissToken={dismissStaffInvite}
+          onDecline={dismissStaffInvite}
+          onDismiss={hardDismissStaffInvite}
+          onResume={resumeStaffInvite}
+          onTokenSpent={markStaffInviteRedeemed}
         />
       );
 

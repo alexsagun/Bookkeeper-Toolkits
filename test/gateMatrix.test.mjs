@@ -143,6 +143,13 @@ test('an invited Operations Admin gets it too', () => {
 test('a pending invitation does NOT bypass the paywall on its own', () => {
   // Reaching the invitation screen grants nothing. If it is dismissed, the person
   // is still exactly the student they were a moment ago.
+  //
+  // ★ `inviteDismissed` now means specifically "fall through to the student gate",
+  //   and since #50 the root only sets it for someone who HAS a student membership
+  //   to fall back to. A staff-only invitee gets `inviteDeferred` instead — see the
+  //   deferred-decline section at the end of this file. The rule asserted here is
+  //   unchanged and still load-bearing: an invitation, declined or not, is not a
+  //   subscription.
   const s = student({
     staffMembership: membership('trainer', 'invited'),
     inviteDismissed: true,
@@ -389,4 +396,179 @@ test('imported onboarding still outranks a token', () => {
     hasInviteToken: true,
   });
   assert.equal(screenOf(s), GATE_SCREENS.IMPORT_ONBOARDING);
+});
+
+// ── The unmount that produced "your invitation has expired" (#50) ───────────
+// profileReady is `!session?.user || profileFetchedFor === session.user.id`, so a
+// SUCCESSFUL verifyOtp() — which creates a session with a uid the profile effect
+// has not fetched yet — is itself what makes it false. Returning SPLASH there
+// unmounted the invitation screen at the moment it had just spent the one-time
+// token, and the fresh instance that replaced it offered the Accept button again.
+
+test('an invitation in flight is NOT replaced by the splash while the profile loads', () => {
+  const s = student({ profileReady: false, profile: null, hasInviteToken: true });
+  assert.equal(screenOf(s), GATE_SCREENS.STAFF_INVITATION);
+  assert.equal(resolveGateScreen(s).reason, 'staff_invitation_token');
+});
+
+test('without a token the profile load still shows the splash, exactly as before', () => {
+  assert.equal(
+    screenOf(student({ profileReady: false, profile: null })),
+    GATE_SCREENS.SPLASH,
+  );
+});
+
+test('a dismissed token does not pin the screen through the profile load', () => {
+  const s = student({ profileReady: false, profile: null, hasInviteToken: true, inviteDismissed: true });
+  assert.equal(screenOf(s), GATE_SCREENS.SPLASH);
+});
+
+test('the ban still wins the moment the profile actually arrives', () => {
+  // Holding the screen during the load is safe only because this stays true: the
+  // component blocks every action until profileReady, and the instant the profile
+  // lands the rejected account is refused.
+  const rejected = { is_admin: false, approval_status: 'rejected' };
+  assert.equal(
+    screenOf(student({ profileReady: false, profile: null, hasInviteToken: true })),
+    GATE_SCREENS.STAFF_INVITATION,
+  );
+  assert.equal(
+    screenOf(student({ profileReady: true, profile: rejected, hasInviteToken: true })),
+    GATE_SCREENS.REJECTED,
+  );
+});
+
+test('a pending-membership invitation with no token still waits on the splash', () => {
+  // Only a live token pins the screen. Without one there is nothing in flight to
+  // protect, so the ordinary load path is unchanged.
+  const s = student({
+    profileReady: false,
+    profile: null,
+    staffMembership: membership('operations_admin', 'invited'),
+  });
+  assert.equal(screenOf(s), GATE_SCREENS.SPLASH);
+});
+
+// ── "Not now" must never be a shop window (#50) ────────────────────────────
+// The old behaviour set one flag for everyone, so a staff-only invitee who
+// declined landed on the ₱1,499 pricing cards — after an email that told them in
+// as many words that there is nothing to buy.
+
+test('a staff-only invitee who defers stays on the invitation screen, not pricing', () => {
+  const s = student({
+    staffMembership: membership('operations_admin', 'invited'),
+    inviteDeferred: true,
+    enroll: { active: true, ready: true, configured: true, state: 'paywall' },
+  });
+  assert.equal(screenOf(s), GATE_SCREENS.STAFF_INVITATION);
+  assert.equal(resolveGateScreen(s).reason, 'staff_invitation_deferred');
+});
+
+test('deferring never drops a staff-only invitee on the cold paywall', () => {
+  // ★ 'expired' is deliberately NOT here. MembershipExpiredScreen shows prices,
+  //   but only to someone who already bought, and it is the only surface with
+  //   their Renew / Extend / Upgrade actions — see the lapsed-member case below.
+  //   The screen a staff-only invitee must never be dropped on is the paywall.
+  for (const state of ['paywall', 'paywall_notice']) {
+    const s = student({
+      staffMembership: membership('trainer', 'invited'),
+      inviteDeferred: true,
+      enroll: { active: true, ready: true, configured: true, state },
+    });
+    assert.equal(screenOf(s), GATE_SCREENS.STAFF_INVITATION,
+      `enroll.state=${state} must not reach the paywall through a deferral`);
+  }
+});
+
+test('a paying student who declines is dismissed, not deferred, and reaches the app', () => {
+  // resolveDeclineTarget() sends this person to 'student_app', so the root sets
+  // inviteDismissed — the pre-#50 flag — and the gate behaves exactly as it did.
+  const s = student({
+    staffMembership: membership('trainer', 'invited'),
+    inviteDismissed: true,
+    enroll: { active: true, ready: true, configured: true, state: 'pass' },
+  });
+  assert.equal(screenOf(s), GATE_SCREENS.APP);
+});
+
+test('deferring does not survive acceptance: an active member is let through', () => {
+  const s = student({
+    staff: staffCtx('operations_admin'),
+    staffMembership: membership('operations_admin', 'active'),
+    inviteDeferred: true,
+    enroll: { active: true, ready: true, configured: true, state: 'paywall' },
+  });
+  assert.equal(screenOf(s), GATE_SCREENS.APP,
+    'a stale deferral flag must not trap someone who has already activated');
+});
+
+test('deferring cannot be used to skip a ban', () => {
+  const s = student({
+    profile: { is_admin: false, approval_status: 'rejected' },
+    staffMembership: membership('trainer', 'invited'),
+    inviteDeferred: true,
+  });
+  assert.equal(screenOf(s), GATE_SCREENS.REJECTED);
+});
+
+// ── A deferral only holds while there is a price to hold them back from (#50) ──
+// Deferring is not a decision about the invitation; it is a decision that the
+// alternative was a pricing page. Pinning unconditionally meant a student who
+// deferred, then paid and was approved, stayed on the "finish later" card while
+// their membership had become perfectly usable.
+
+test('a deferral stops pinning once the enrollment no longer shows a price', () => {
+  const deferred = (state) => student({
+    staffMembership: membership('trainer', 'invited'),
+    inviteDeferred: true,
+    enroll: { active: true, ready: true, configured: true, state },
+  });
+  assert.equal(screenOf(deferred('paywall')), GATE_SCREENS.STAFF_INVITATION,
+    'while a price would show, the deferral holds');
+  assert.equal(screenOf(deferred('pass')), GATE_SCREENS.APP,
+    'once they have paid and been approved, the deferral must release');
+  assert.equal(screenOf(deferred('pending')), GATE_SCREENS.ENROLL_PENDING,
+    'a receipt under review has its own no-price screen, and it must win');
+});
+
+test('a deferral still holds while the enrollment answer is unknown', () => {
+  const s = student({
+    staffMembership: membership('trainer', 'invited'),
+    inviteDeferred: true,
+    enroll: { active: true, ready: false, configured: true, state: 'paywall' },
+  });
+  assert.equal(screenOf(s), GATE_SCREENS.STAFF_INVITATION,
+    'not knowing must never resolve to a pricing screen');
+});
+
+test('a deferral does not pin someone the enrollment gate never holds', () => {
+  // Flag off, or a viewer the gate is inert for: there is no price, so no pin.
+  assert.equal(
+    screenOf(student({
+      staffMembership: membership('trainer', 'invited'),
+      inviteDeferred: true,
+      requireEnrollment: false,
+    })),
+    GATE_SCREENS.APP,
+  );
+  assert.equal(
+    screenOf(student({
+      staffMembership: membership('trainer', 'invited'),
+      inviteDeferred: true,
+      enroll: { active: false, ready: true, configured: true, state: 'pass' },
+    })),
+    GATE_SCREENS.APP,
+  );
+});
+
+test('a lapsed member who declines reaches the renewal screen, not a deferral', () => {
+  // The decline router sends them to 'student_app', so the root sets
+  // inviteDismissed — but even if a stale deferral flag survived, the gate must
+  // not pin someone away from their own Renew/Extend/Upgrade actions.
+  const s = student({
+    staffMembership: membership('trainer', 'invited'),
+    inviteDeferred: true,
+    enroll: { active: true, ready: true, configured: true, state: 'expired' },
+  });
+  assert.equal(screenOf(s), GATE_SCREENS.MEMBERSHIP_EXPIRED);
 });

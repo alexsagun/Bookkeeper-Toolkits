@@ -18,7 +18,7 @@ import {
 import {
   staffInviteEmail, staffRoleAssignedEmail,
 } from '../api/_lib/staffInviteEmail.js';
-import { esc, plainText } from '../api/_lib/email.js';
+import { esc, plainText, displayFrom, sendEmail, BRAND } from '../api/_lib/email.js';
 import {
   EMPTY_STAFF_MEMBERSHIP, STAFF_ROLES,
   staffEntitlement, staffInvitationPending, staffLandingTab, staffMembershipFromRpc,
@@ -383,4 +383,122 @@ test('a non-staff context passes the base straight through', () => {
   const plain = { isStaff: false, status: null, permissions: [] };
   const base = { full: false, allowsTab: () => false };
   assert.equal(staffEntitlement(plain, base), base);
+});
+
+// ── The rebuilt shell (#50): a real email document, not a floating div ──────
+// The #49 shell had no doctype, no table layout, no preheader, no lang, no
+// responsive rules and nowhere for a support address — Outlook rendered it in
+// quirks mode and the inbox preview showed the first body sentence.
+
+test('the invitation renders as a full HTML document', () => {
+  const url = buildInviteUrl({ appUrl: APP, tokenHash: TOKEN, type: 'invite' });
+  const { html } = staffInviteEmail({ roleKey: 'operations_admin', actionUrl: url });
+  assert.match(html, /^<!doctype html>/i, 'no doctype means quirks mode in Outlook');
+  assert.match(html, /<html lang="en"/, 'a lang attribute for screen readers');
+  assert.match(html, /name="color-scheme" content="light dark"/, 'dark-mode clients must not invert the card');
+  assert.match(html, /role="presentation"/, 'layout tables must be presentation, not data');
+  assert.match(html, /@media only screen and \(max-width: 600px\)/, 'the responsive narrow-screen rules');
+});
+
+test('the preheader carries the no-payment promise into the inbox preview', () => {
+  const url = buildInviteUrl({ appUrl: APP, tokenHash: TOKEN, type: 'invite' });
+  const { html } = staffInviteEmail({ roleKey: 'trainer', actionUrl: url });
+  assert.match(html, /display:none;max-height:0;overflow:hidden/, 'hidden in the body');
+  assert.match(html, /nothing to buy, no plan to choose/, 'the preview is the first thing read');
+});
+
+test('the CTA is a table button whose href is the exact invitation URL', () => {
+  const url = buildInviteUrl({ appUrl: APP, tokenHash: TOKEN, type: 'invite' });
+  const { html } = staffInviteEmail({ roleKey: 'operations_admin', actionUrl: url });
+  assert.ok(html.includes(`href="${esc(url)}"`), 'the URL, verbatim after entity-escaping');
+  // The button must sit in its own table cell — a padded <a> alone dies in Outlook.
+  const ctaIdx = html.indexOf(`href="${esc(url)}"`);
+  const before = html.slice(Math.max(0, ctaIdx - 300), ctaIdx);
+  assert.match(before, /<table role="presentation"[^>]*>/, 'bulletproof table CTA');
+});
+
+test('a support address is rendered as a reachable mailto in HTML and named in text', () => {
+  const url = buildInviteUrl({ appUrl: APP, tokenHash: TOKEN, type: 'invite' });
+  const msg = staffInviteEmail({
+    roleKey: 'operations_admin', actionUrl: url, supportEmail: 'support@toolkits.example.com',
+  });
+  assert.match(msg.html, /mailto:support@toolkits\.example\.com/);
+  assert.match(msg.text, /support@toolkits\.example\.com/);
+});
+
+test('no support address means the contact line is omitted, never invented', () => {
+  const url = buildInviteUrl({ appUrl: APP, tokenHash: TOKEN, type: 'invite' });
+  const msg = staffInviteEmail({ roleKey: 'operations_admin', actionUrl: url });
+  assert.ok(!/mailto:/.test(msg.html), 'no fabricated address');
+  assert.ok(!/Questions\? Contact our team at/.test(msg.text));
+});
+
+test('the promote notification gets the same support plumbing and still no token', () => {
+  const msg = staffRoleAssignedEmail({
+    roleKey: 'trainer', appUrl: APP, supportEmail: 'help@toolkits.example.com',
+  });
+  assert.match(msg.html, /mailto:help@toolkits\.example\.com/);
+  assert.ok(!msg.html.includes('#invite='), 'a promotion mints no credential');
+  assert.ok(!msg.text.includes('#invite='));
+});
+
+// ── From / Reply-To (#50) ───────────────────────────────────────────────────
+
+test('a bare From address gains the brand display name', () => {
+  assert.equal(displayFrom('noreply@toolkits.example.com'), `${BRAND} <noreply@toolkits.example.com>`);
+});
+
+test('a From that already carries a display name passes through untouched', () => {
+  assert.equal(displayFrom('Alex <alex@toolkits.example.com>'), 'Alex <alex@toolkits.example.com>');
+  assert.equal(displayFrom(''), '');
+});
+
+test('sendEmail posts reply_to and the display-name From to Resend', async () => {
+  const oldFetch = globalThis.fetch;
+  const oldKey = process.env.RESEND_API_KEY;
+  const oldFrom = process.env.RESEND_FROM;
+  process.env.RESEND_API_KEY = 're_test_key';
+  process.env.RESEND_FROM = 'noreply@toolkits.example.com';
+  let captured = null;
+  globalThis.fetch = async (url, opts) => {
+    captured = { url, body: JSON.parse(opts.body), headers: opts.headers };
+    return { ok: true, status: 200, json: async () => ({ id: 'msg_1' }) };
+  };
+  try {
+    const out = await sendEmail({
+      to: 'invitee@example.com', subject: 's', html: '<p>h</p>', text: 't',
+      replyTo: 'support@toolkits.example.com', tag: 'staff-invite',
+    });
+    assert.equal(out.ok, true);
+    assert.equal(captured.body.reply_to, 'support@toolkits.example.com');
+    assert.equal(captured.body.from, `${BRAND} <noreply@toolkits.example.com>`);
+    assert.equal(captured.body.text, 't', 'the plain-text part still rides along');
+    assert.ok(captured.headers['Idempotency-Key'], 'one key per logical send');
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldKey === undefined) delete process.env.RESEND_API_KEY; else process.env.RESEND_API_KEY = oldKey;
+    if (oldFrom === undefined) delete process.env.RESEND_FROM; else process.env.RESEND_FROM = oldFrom;
+  }
+});
+
+test('omitting replyTo omits the field — Resend must not see reply_to: undefined', async () => {
+  const oldFetch = globalThis.fetch;
+  const oldKey = process.env.RESEND_API_KEY;
+  const oldFrom = process.env.RESEND_FROM;
+  process.env.RESEND_API_KEY = 're_test_key';
+  process.env.RESEND_FROM = 'noreply@toolkits.example.com';
+  let captured = null;
+  globalThis.fetch = async (url, opts) => {
+    captured = JSON.parse(opts.body);
+    return { ok: true, status: 200, json: async () => ({ id: 'msg_2' }) };
+  };
+  try {
+    await sendEmail({ to: 'a@b.com', subject: 's', html: '<p>h</p>' });
+    assert.ok(!('reply_to' in captured));
+    assert.ok(!('headers' in captured));
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldKey === undefined) delete process.env.RESEND_API_KEY; else process.env.RESEND_API_KEY = oldKey;
+    if (oldFrom === undefined) delete process.env.RESEND_FROM; else process.env.RESEND_FROM = oldFrom;
+  }
 });

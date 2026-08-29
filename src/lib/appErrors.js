@@ -96,6 +96,11 @@ export const APP_ERROR_CODES = [
   'STAFF_NO_INVITATION',
   'STAFF_INVITATION_NOT_PENDING',
   'STAFF_EMAIL_NOT_VERIFIED',
+  // ── Staff activation consistency (#50) ──
+  'STAFF_ACCOUNT_REJECTED',
+  'ACCESS_REQUEST_SELF_REVIEW',
+  // ── Access-request staff target (#51) ──
+  'ACCESS_REQUEST_STAFF_TARGET',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -230,6 +235,16 @@ const COPY = {
   STAFF_EMAIL_NOT_VERIFIED:
     'Confirm your email address first — open the confirmation link we sent you, then accept '
     + 'the invitation again.',
+  // Staff activation consistency (#50).
+  STAFF_ACCOUNT_REJECTED:
+    'This account has been blocked from the platform, so a staff invitation can’t be accepted '
+    + 'on it. Ask a Super Admin to lift the block first, then open the invitation again.',
+  ACCESS_REQUEST_SELF_REVIEW:
+    'You can’t decide on your own access request. Ask a Super Admin to review it — and if you '
+    + 'are staff, you don’t need this approval at all.',
+  ACCESS_REQUEST_STAFF_TARGET:
+    'That account is a staff member, not a student waiting for approval. To take their access '
+    + 'away, suspend or revoke their role in Team & Roles — that’s the action that gets recorded.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };

@@ -68,6 +68,31 @@ const PRICING_SCREENS = new Set([
   GATE_SCREENS.MEMBERSHIP_EXPIRED,
 ]);
 
+/**
+ * Would the student gate put a PRICE in front of this viewer right now?
+ *
+ * The one question a deferral needs answered, and the reason it is asked on every
+ * render rather than once at the moment of declining: enrollment state moves
+ * underneath the person (an admin approves their payment), and a deferral that
+ * outlives the price it was protecting them from becomes a trap.
+ *
+ * Unknown counts as "yes" — a card with a Resume button is a far cheaper mistake
+ * than the pricing page this whole flow exists to keep staff away from.
+ */
+function staffOnlyWouldSeeAPrice({ requireEnrollment, enroll, renewNow }) {
+  if (!requireEnrollment) return false;
+  if (!enroll?.active) return false;
+  if (!enroll.ready || !enroll.configured) return true;
+  const decided = enrollmentScreen(enroll, renewNow);
+  // ★ PAYWALL only — NOT the whole PRICING_SCREENS set. MEMBERSHIP_EXPIRED and
+  //   RENEWAL_PAYWALL also show prices, but only to someone who already bought,
+  //   and they are the only surfaces carrying Renew / Extend / Upgrade. Treating
+  //   them as "a price to protect the invitee from" pinned a lapsed member away
+  //   from the one screen that could restore their membership. The cold shop
+  //   window a staff-only invitee must never be dropped on is the paywall.
+  return Boolean(decided && decided.screen === GATE_SCREENS.PAYWALL);
+}
+
 /** Is this viewer allowed past the student membership gates? */
 function passesAsStaff({ staff, staffDegraded, profile }) {
   // Availability may fail open; authority never does. A context we could not read
@@ -88,6 +113,7 @@ export function resolveGateScreen(state) {
     loading, recovery, user, profileReady, profile,
     staffReady = true, staffDegraded = false, staffMembership,
     staff, enroll, renewNow = false, inviteDismissed = false, hasInviteToken = false,
+    inviteDeferred = false,
     requireApproval = true, requireEnrollment = true,
   } = s;
 
@@ -99,7 +125,31 @@ export function resolveGateScreen(state) {
     return { screen: GATE_SCREENS.STAFF_INVITATION, reason: 'staff_invitation_token' };
   }
   if (!user) return { screen: GATE_SCREENS.AUTH, reason: 'signed_out' };
-  if (!profileReady) return { screen: GATE_SCREENS.SPLASH, reason: 'profile_loading' };
+
+  // ── The profile has not loaded yet ────────────────────────────────────────
+  // ★ THIS ARM IS WHERE THE "expired invitation" BUG LIVED, and it is worth being
+  //   precise about, because the line itself looks completely innocent.
+  //
+  //   profileReady is `!session?.user || profileFetchedFor === session.user.id`.
+  //   verifyOtp() creates a session with a uid the profile effect has not fetched
+  //   yet, so the SUCCESSFUL redemption of an invitation is itself what makes this
+  //   false. Returning SPLASH here therefore unmounted StaffInvitationSetup at the
+  //   exact moment it had just spent the one-time token, destroying the only record
+  //   that it had been spent. When the profile landed, a FRESH instance offered the
+  //   Accept button again, the second verifyOtp hit a consumed token, and the
+  //   invitee was told their brand-new invitation had expired.
+  //
+  //   Keeping the screen mounted does NOT weaken the ban below it. The invitation
+  //   component blocks every action until profileReady AND staffReady, the REJECTED
+  //   arm fires the moment the profile arrives, and since #50
+  //   accept_staff_invitation() refuses a rejected profile server-side as well — so
+  //   the ban is enforced twice, once here and once in the database.
+  if (!profileReady) {
+    if (!inviteDismissed && hasInviteToken) {
+      return { screen: GATE_SCREENS.STAFF_INVITATION, reason: 'staff_invitation_token' };
+    }
+    return { screen: GATE_SCREENS.SPLASH, reason: 'profile_loading' };
+  }
 
   const isAdmin = Boolean(profile?.is_admin);
 
@@ -141,6 +191,18 @@ export function resolveGateScreen(state) {
   // nothing, so whoever dismisses it simply meets whichever student gate applies.
   // Without it a paying student who is offered a job is PINNED here, unable to
   // reach the membership they already bought without first accepting the job.
+  //
+  // ★ BUT "whichever student gate applies" WAS THE PAYWALL, AND THAT WAS WRONG FOR
+  //   THE COMMON CASE. #49 set one flag for everybody, so a staff-only invitee who
+  //   clicked "Not now" — someone whose invitation email says in as many words that
+  //   there is nothing to buy — landed on the ₱1,499 pricing cards. Declining a job
+  //   offer is not the same event as shopping for a course.
+  //
+  //   `inviteDeferred` is the staff-only half of that decision, chosen by
+  //   resolveDeclineTarget() in src/lib/inviteMachine.js: it keeps them on this
+  //   screen's "finish later" card, which offers resuming setup or signing out and
+  //   never a price. `inviteDismissed` is still set for someone who HAS a student
+  //   membership to fall back to, and for them the behaviour is unchanged.
   // ★ THE TOKEN IS DECIDED HERE, BELOW THE BAN — not in a branch ahead of the
   //   switch. It used to be exactly that: `if (!loading && staffInvite)` ran before
   //   this function's verdict was consulted at all, so a rejected account that
@@ -149,10 +211,23 @@ export function resolveGateScreen(state) {
   //   row. That defeated the whole reason the ban was moved above the invitation.
   //   Recovery was bypassed the same way. (CodeRabbit, PR #4.)
   if (!inviteDismissed && (hasInviteToken || staffInvitationPending(staffMembership))) {
-    return {
-      screen: GATE_SCREENS.STAFF_INVITATION,
-      reason: hasInviteToken ? 'staff_invitation_token' : 'staff_invitation_pending',
-    };
+    if (inviteDeferred) {
+      // ★ A DEFERRAL ONLY HOLDS WHILE THERE IS A PRICE TO HOLD THEM BACK FROM.
+      //   Deferring is not a decision about the invitation — it is a decision that
+      //   the alternative was a pricing page. Pinning unconditionally meant a
+      //   student who deferred, then paid and was approved, stayed on the
+      //   "finish later" card: their membership had become usable and the screen
+      //   kept saying nothing was needed from them. Re-checking each render makes
+      //   the deferral self-correcting.
+      if (staffOnlyWouldSeeAPrice({ requireEnrollment, enroll, renewNow })) {
+        return { screen: GATE_SCREENS.STAFF_INVITATION, reason: 'staff_invitation_deferred' };
+      }
+    } else {
+      return {
+        screen: GATE_SCREENS.STAFF_INVITATION,
+        reason: hasInviteToken ? 'staff_invitation_token' : 'staff_invitation_pending',
+      };
+    }
   }
 
 
