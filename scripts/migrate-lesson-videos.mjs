@@ -190,7 +190,9 @@ async function main() {
     const pub = report.externalLinks.filter((r) => r.published);
     if (pub.length) {
       say(`  ★ ${pub.length} of these are in a PUBLISHED course. Those courses cannot be`);
-      say('    re-published after #44, and their lessons show students a placeholder.');
+      say('    re-published or duplicated after #44 until each lesson has an uploaded file.');
+      say('    They DO still play: renderVideo keeps a temporary legacy branch that rebuilds');
+      say('    the embed URL, so students are not seeing a placeholder today.');
     }
     for (const r of report.externalLinks.slice(0, 40)) {
       say(`    ${r.published ? '[LIVE]' : '[draft]'} ${r.course} — ${r.title}  (${r.provider})`);

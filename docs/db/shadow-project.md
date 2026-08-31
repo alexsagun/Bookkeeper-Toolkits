@@ -36,7 +36,7 @@ SQLSTATE→HTTP mapping) that several assertions depend on. A free hosted projec
 $0 — it just occupies the second slot. Free projects auto-pause after about a week idle and can be
 restored from the dashboard.
 
-## Recreating one (about 5 minutes of work, ~40 minutes of waiting)
+## Recreating one (about 5 minutes of work, then a long wait for the bootstrap)
 
 ### 1. Create the project
 
@@ -76,7 +76,8 @@ node scripts/apply-db-files.mjs db/2026-07-30-batch-entitlements.sql
 node scripts/apply-db-files.mjs db/2026-07-31-community-plan-capabilities.sql
 ```
 
-The bootstrap is ~600 statements over the Management API and takes **30–40 minutes**. That is the slow
+The bootstrap is ~1,640 statements over the Management API (measured with the repo's own
+`splitSqlStatements()`) and takes well over an hour. That is the slow
 part; everything after it is fast. Statements are applied one at a time so a failure names the exact
 statement, and transient deadlocks on `storage.objects` are retried automatically.
 
@@ -106,7 +107,7 @@ whenever a dated migration is folded into the bootstrap.
 ### 5. Run the suite
 
 ```bash
-npm run test:db     # 42 tests, ~12 minutes
+npm run test:db     # 132 tests across six suites
 ```
 
 It is slow because every fixture statement is an HTTPS round trip to the Management API. That is the
@@ -125,7 +126,8 @@ Without a target the suite simply cannot start; with one it works again immediat
 
 ## What the suite covers (and why it is worth the wait)
 
-42 tests across two files:
+Across six files (`test-db/*.dbtest.mjs`). The two oldest are described below; the rest follow the
+same persona-driven shape:
 
 - `test-db/entitlements.dbtest.mjs` — cohort runs, registry allocation, the FIFO queue, batch
   isolation between cohorts and between VIP and the general segment, live-plan reconciliation on
@@ -133,6 +135,13 @@ Without a target the suite simply cannot start; with one it works again immediat
 - `test-db/communityRls.dbtest.mjs` — the D2 matrix (no plan posts or comments in General, every plan
   reacts), cohort-space separation, `author_id` / `space_id` / admin-tag forgery, the withdraw vs
   re-publish split, the mention directory gate, and anonymous access.
+- `test-db/batchLifecycle.dbtest.mjs` — the past-lock, rank-preserving re-code, and automatic closure.
+- `test-db/communityChannels.dbtest.mjs` — channel audiences narrow but never widen a space.
+- `test-db/courseVideos.dbtest.mjs` — reference-based video reads and the private bucket.
+- `test-db/studentProgress.dbtest.mjs` — the #52 ranking population and the public boards: a Sampler
+  is scored only against Essentials, a VIP cannot reach another cohort's board, a hidden learner
+  disappears from every public list but stays in the staff report, an expired member leaves the
+  boards, staff never appear on them, and Trainer is refused the operational report.
 
 Three genuine defects were found this way, none of which reading the SQL had caught:
 

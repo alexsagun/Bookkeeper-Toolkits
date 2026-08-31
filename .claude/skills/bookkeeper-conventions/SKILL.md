@@ -15,7 +15,10 @@ hook + `ThemeToggle`; pre-paint boot script in `index.html`). The tokens near th
 are **CSS custom-property references**, with the actual per-theme values in
 [src/index.css](../../../src/index.css):
 
-- `C` — color palette: `C.primary` = `var(--c-primary)`, `C.text`, `C.textSoft`, `C.textMute`,
+- `C` — color palette: `C.primary` = `var(--c-primary)`, `C.primarySolid` = `var(--primary-solid)`
+  (**the blue for a FLAT fill behind white text — `C.primary` is 3.65:1 on white and fails WCAG AA in
+  both themes; use `C.primary` only for borders, icons, rings, bars and accent text**), `C.text`,
+  `C.textSoft`, `C.textMute`,
   `C.green`, `C.amber`, `C.red`, `C.bg`, `C.white` (a *surface*, dark-aware), etc.
 - `GLASS` — glass surfaces (`GLASS.card`, `GLASS.cardElev`, `GLASS.border`…), `SHEEN` — the
   top-light gradient. Both var-backed, both theme automatically.

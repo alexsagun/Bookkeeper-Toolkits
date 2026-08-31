@@ -80,7 +80,7 @@ test('role ranks are unique and strictly descending', () => {
 
 // ── The matrix ───────────────────────────────────────────────────────────────
 
-test('the matrix covers 3 roles x 18 permissions with no unknown keys', () => {
+test('the matrix covers 3 roles x 19 permissions with no unknown keys', () => {
   let cells = 0;
   for (const roleKey of STAFF_ROLE_KEYS) {
     const held = ROLE_PERMISSIONS[roleKey];
@@ -93,8 +93,8 @@ test('the matrix covers 3 roles x 18 permissions with no unknown keys', () => {
     for (const key of STAFF_PERMISSION_KEYS) cells += 1;
   }
   assert.equal(cells, STAFF_ROLE_KEYS.length * STAFF_PERMISSION_KEYS.length,
-    'the matrix must cover 3 roles x 18 permissions');
-  assert.equal(cells, 54, 'a changed cell count means a permission or role was added without updating this sweep');
+    'the matrix must cover 3 roles x 19 permissions');
+  assert.equal(cells, 57, 'a changed cell count means a permission or role was added without updating this sweep');
 });
 
 test('super_admin holds every permission', () => {

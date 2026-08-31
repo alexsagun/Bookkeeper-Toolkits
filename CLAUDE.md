@@ -51,12 +51,16 @@ npm run ai:knowledge       # regenerate docs/ai/toolkits-voice-agent-knowledge.m
 npm run ai:knowledge:check # rebuild the knowledge doc in memory + diff vs disk; exit 1 on drift (writes nothing)
 npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge base
 npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
-npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, bootstrapFolds, courseVideo, courseVideoSql, …)
+npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, bootstrapFolds, courseVideo, courseVideoSql, studentProgress, studentProgressSql, uiSafety, coaIntegrity,
+                           approveGrantSql, …)
 ```
 
 There is **no linter** — verify UI changes by running `npm run dev` and exercising the affected
 tool in the browser. The only automated tests are the `node --test` suites over the pure
-`src/lib/*.js` modules (`npm test`).
+`src/lib/*.js` modules — **plus** source/artifact scans over the monolith
+(`uiSafety` also scans `dist/`, `coaIntegrity` evaluates `COA_BASE`/`COA_INDUSTRY` out of it) and
+SQL-parity suites that read `db/*.sql` (`approveGrantSql`, `studentProgressSql`, `staffRolesSql`,
+`bootstrapFolds`) — all under `npm test`.
 
 ## Architecture map
 
@@ -520,7 +524,7 @@ as the other admin tabs). Migration **#26**
   degrade). After completion the imported subscription flows through `useEnrollmentGate → is_enrolled`
   with zero special-casing. Import state is server-side — nothing goes in `LEGACY_KEYS`.
 
-### [src/BookkeeperPro.jsx](src/BookkeeperPro.jsx) — the entire app (~24.2k lines)
+### [src/BookkeeperPro.jsx](src/BookkeeperPro.jsx) — the entire app (~35.1k lines)
 
 > Note: lines are long; prefer `Grep` over reading the whole file. Line numbers below are anchors,
 > approximate as the file evolves.
@@ -534,7 +538,8 @@ as the other admin tabs). Migration **#26**
 | Root component | 4887–~6600 | `BookkeeperProToolkit` (L4887): `tab` + `accountPanel` state, sidebar `DEFAULT_STAGES` config (L5080), drag-drop reorder, rename/persist to `window.storage` (`sidebar:*` keys), and the **keep-alive render** (`visitedTabs` map). |
 | Tool components | ~8200–end | ~60 self-contained functional components |
 
-**Notable tools → approximate line:** `Dashboard` 8236, `CoaGenerator` 8521, `Course` 8624,
+**Notable tools → approximate line:** `Dashboard` 8236, `ProgressRankings` ~14740 (the `progress`
+tab — learner report + leaderboard + staff report), `CoaGenerator` 8521, `Course` 8624,
 `CourseProgram` ~8805 (single-course Supabase video engine — builder + PDF certificate),
 `CourseCatalog` ~9966 (prefix-parameterized multi-course catalog) + the `QBOMastery` (`qbo-`) /
 `InterviewStrategyCatalog` (`interview-`, the `winstrat` subtab) / `ResumeStrategy` (`resume-`) wrappers right after it,
@@ -772,7 +777,9 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   non-expired subscription (or the legacy/no-rows grandfather fallback) — all content `*_read`
   RLS enforces expiry server-side with zero policy changes; `profiles.is_paid` is now only a
   cache. Terms are granted solely by `approve_subscription(p_user_id, p_plan_key, p_request_id)`
-  (SECURITY DEFINER, internal `is_admin()` guard; one transaction: supersede active row → insert
+  (SECURITY DEFINER, gated on `has_staff_permission('enrollments.review')`; **since #55 NOT granted
+  to `authenticated` — the only caller is `admin_finalize_enrollment()`, nested, so the effective user
+  is the owner**; one transaction: supersede active row → insert
   new term; renewal stacking = `greatest(now, current ends_at) + access_days`, so early renewal
   never loses days; grace knob `v_grace_days` = **3** — every term gets a 3-day `grace_ends_at`
   cushion, turned on by `db/2026-07-10-subscription-grace.sql` (#18), which also backfilled existing
@@ -1119,7 +1126,7 @@ That direction is the whole safety argument. **Never repair a missed check by ha
 role `is_admin = true`.**
 
 - **Tables** (`db/2026-08-25-staff-authorization.sql`, #45): `staff_roles` / `staff_permissions` /
-  `staff_role_permissions` (the 18 × 3 matrix, **26 grants**) → `staff_memberships` (ONE row per
+  `staff_role_permissions` (the 19 × 3 matrix, **28 grants** — #52 added `student_progress.read`) → `staff_memberships` (ONE row per
   user, mutated in place; only `status='active'` confers authority, which is what makes a suspension
   take effect on the next *request* rather than the next token refresh) → `staff_role_events`
   (append-only; FKs `on delete set null` + denormalized email snapshots, so deleting an Auth account
@@ -1257,7 +1264,138 @@ role `is_admin = true`.**
   rule and must move together. Every card a signed-in viewer can be pinned on carries an escape.
   ★ **Success lands on the Dashboard**, with the role named and the ops queue as a labelled
   secondary action — never dropped straight into a list of other people's payments.
+- **The approve RPCs were client-callable, and that was an Ops-Admin escalation (#55,
+  `db/2026-09-04-approve-rpc-grant-revoke.sql`, folded as §42).** `approve_subscription()` and
+  `approve_extension()` are SECURITY DEFINER and were granted `EXECUTE` to `authenticated`, gated only
+  on `has_staff_permission('enrollments.review')` — a permission **Operations Admins hold**. Neither
+  function reads or writes `enrollment_requests`, so #48's `enrollment_self_approval_guard` (a BEFORE
+  UPDATE trigger on *that* table) can never fire on this path, and `p_request_id` is nullable and never
+  checked for existence, status or payment.
+  ★ **Verified live on 2026-08-31**, signed in through PostgREST as a real active `operations_admin`:
+  `approve_subscription(<own uid>, 'vip', null)` inserted an active VIP term with `request_id` null and
+  `grant_source` `'payment'` where no payment existed, flipping `is_enrolled()` false → true and taking
+  visible published courses from 0 to 3; `approve_extension(<own uid>, null, 365)` then stacked a year
+  on. That is strictly more power than `admin_grant_special_extension()`, which #47 restricted to Super
+  Admin *precisely because* a goodwill grant creates paid access with no payment behind it — and which
+  writes an append-only `student_access_events` row. This path wrote none.
+  ★ **The revoke is the whole fix, and it breaks nothing.** Nothing calls these from a client (`grep`
+  finds zero call sites in `src/` and `api/`); the sanctioned caller `admin_finalize_enrollment()`
+  invokes both **nested** and is itself SECURITY DEFINER, so inside it the effective user is the owner
+  (`postgres`), which holds its own EXECUTE. The grant was legacy from
+  `2026-07-04-subscription-lifecycle.sql`, when the client *did* call it directly; #32 replaced that
+  path and never revoked what it left behind. **Client-neutral**, so it applies in either order
+  relative to a deploy. Pinned by `test/approveGrantSql.test.mjs` (both the dated file and the fold)
+  and by a `#55` check in `npm run db:audit`.
 - Setup + the full permission matrix: **[STAFF_ROLES_SETUP.md](STAFF_ROLES_SETUP.md)**.
+
+## Progress & Rankings — learning analytics and privacy-safe leaderboards (#52)
+
+Tab id `progress`, route `/progress-rankings`, Home stage between Dashboard and Community, plus a
+compact preview widget in the Community tab. Migration
+[db/2026-09-01-student-progress-rankings.sql](db/2026-09-01-student-progress-rankings.sql), folded
+verbatim as bootstrap **§39**.
+
+**Completion-first scoring, and nothing else.** Four tracks — Accounting Foundations 20, QuickBooks
+Mastery 40, Profile Optimization 20, Interview Readiness 20 — each scored as completed eligible
+milestones over total eligible milestones. Overall is the weighted average of the tracks the
+learner's plan can actually open, with the weights **renormalised** so nobody is penalised for
+content they cannot reach (a Sampler's overall score is simply their QBO Essentials percentage).
+Logins, page views, time online, community posts, reactions, AI chats and booking clicks are
+deliberately not inputs. The labels are Overall Progress / Completion Rate / Track Progress /
+Cohort Average — **never** an employment "success rate", which is reserved for a future verified
+employment-outcome system. Completion is a learning-progress indicator, not proof of mastery.
+
+- **`student_progress_current(p_user)` is the ONE population and the ONE scorer.** Everything else —
+  `student_leaderboard()`, `student_rank_in_scope()`, `my_student_progress()`,
+  `student_progress_snapshot()` — reads it, so there is a single place where "who counts" is decided.
+  It MIRRORS the `courses_read` policy (published + approved + enrolled + the sampler
+  `qbo-%`/`essentials` rule); drift there is a scoring bug in one direction and a disclosure bug in
+  the other. It is revoked from every client role and reached only through the granted wrappers.
+- **★ STAFF ARE NEVER LEARNERS, and the population is the only place that says so.** A paying student
+  promoted to staff keeps their `subscriptions` row — no staff migration cancels one — so without an
+  explicit `staff_memberships` exclusion they stay scored, dense-ranked and displayed on the
+  student-facing board, shifting every real learner down a rank and inflating the report's cohort
+  average. `user_is_enrolled()` also returns true for `is_admin` alone. Excluded statuses are
+  `invited` + `active` only, matching #50's access-request queue: `suspended`/`revoked` confer no
+  authority and may be real students.
+- **★ Current values are LIVE; snapshots are history only.** `student_progress_daily` (UTC, unique on
+  `(user_id, snapshot_date)`, 400-day retention, written by a cron-only SECDEF function at 00:15 UTC)
+  powers trends and weekly movement. No current score or rank ever reads it, so a completion appears
+  on the next request rather than the next cron run. The table has RLS on with **no select policy and
+  no grant** — it is reachable only through SECURITY DEFINER functions.
+- **★ "No baseline" is NULL, never 0.00.** A learner with no snapshot from 7–14 days ago has not been
+  measured over a week; the `week` window EXCLUDES them and the UI renders "—"/New. Coalescing a
+  missing baseline to the current score yields exactly zero, which for the first seven days after the
+  migration would turn Most Improved into a mislabelled copy of the overall board with every row
+  claiming no improvement. The lookback is bounded at BOTH ends, so a stale snapshot left by a cron
+  outage cannot be presented and ranked as a 7-day gain.
+- **Privacy.** Public rows carry rank, a first-name + last-initial label ("Emmanuel A."), initials,
+  scores, milestone counts and `is_current_user` — never a uuid, email, full name, avatar, plan or
+  payment field. Hidden learners (`student_ranking_preferences.public_visible`, default true) are
+  filtered **before** `dense_rank()`, so the surviving ranks carry no gaps disclosing how many hidden
+  learners outrank you; they keep their private dashboard and still appear in the staff report, which
+  is an operational record, not a board. ★ The anonymous "Learner NNNN" number is built in SQL with
+  `hashtextextended()`, which the dependency-free JS mirror cannot reproduce — so **the server owns
+  that label** and every rendered row uses `learner_label`. `test/studentProgress.test.mjs` scans that
+  no client code relabels a row.
+- **Scopes** `my_plan | general | vip | my_batch | all` × windows `overall | week`, dense-ranked (ties
+  share a rank), bounded pagination, with a non-public deterministic key breaking ties only for stable
+  paging. `my_batch` derives the cohort from `user_entitled_batches()` (the #35 ledger), never from
+  `subscriptions.batch_id` and never from the argument; a foreign `p_batch_id` is refused with the
+  same message as "you are not VIP", so it is not a membership oracle.
+- **Lesson completion is no longer client-writable.** `insert/update/delete` on `lesson_progress`,
+  `course_completions` and `feature_video_completions` is revoked from `authenticated`;
+  `complete_course_lesson(uuid)` derives `course_id` from the lesson and re-checks publication,
+  approval, enrolment and plan scope. ★ **Ship the client and the SQL together** — a pre-#52 course
+  player upserts those tables directly and would silently stop recording completions.
+  `set_foundation_milestone()` keeps the row and flips a `completed` flag rather than deleting, so
+  `completed_at` records the FIRST completion and cannot be re-minted to forge recency and game the
+  Most Improved window or the report's inactivity signal.
+- **Staff report** `admin_student_progress_report()` is gated on the new `student_progress.read`
+  permission (Super Admin + Operations Admin; **not** Trainer, who sees only the same public boards a
+  learner does). "Needs attention" = an active incomplete student with no trusted milestone for 14+
+  days, excluding anyone enrolled fewer than 7 days.
+- **Accounting 101 milestones are durable and STABLE-keyed.** The eight modules seed
+  `student_progress_milestones` as `accounting-101-module-01…08`. Before #52 completion lived in React
+  state keyed by array index, so it reset on every refresh and reordering a module would have moved a
+  student's progress. There is deliberately **no backfill** — that state was never stored.
+**Follow-up #53 ([db/2026-09-02-progress-rankings-followup.sql](db/2026-09-02-progress-rankings-followup.sql),
+folded as §40).** A full code review of #52 found four defects that #52 could no longer fix itself,
+being already applied and logged. All four are `create or replace` on existing functions.
+★ **A leaderboard scope you do not belong to is a plan oracle.** `student_leaderboard` guarded
+`my_batch` from the start but accepted `vip` and `general` from anyone, so a Sampler could request the
+VIP board, receive the roster by label, then request `general` for the complement. The rows carry no
+plan column — but **set membership IS the plan**. A learner now sees their own segment only; staff
+still see both; the refusal reuses `my_batch`'s wording so probing cannot separate "not allowed" from
+"does not exist". `progressScopeOptions()` mirrors it so the UI never renders a tab that can only
+error. ★ **`complete_progress_feature_guide` re-stamped `completed_at` on every call**, letting a
+learner clear their own "needs attention" flag and advance `last_milestone_at` without learning
+anything — the same recency forgery #52 fixed for foundation milestones and missed on this path. It
+now re-stamps only for a genuinely new `video_version`, which is what makes the `completed_at` claim
+above true of BOTH paths rather than one. ★ **The staff report excluded staff from its live arm but
+not its historical one**, so a promoted student reappeared as an "inactive" learner, with name and
+email, for the 400-day life of their snapshots. ★ **The recent-milestone feed** could name a lesson
+from an unpublished or out-of-plan course; it now mirrors the scorer.
+
+**Follow-up #54 ([db/2026-09-03-progress-course-family-scoping.sql](db/2026-09-03-progress-course-family-scoping.sql),
+folded as §41) — a programme RE-RUN must not inflate the denominator.** A monthly cohort re-run is
+created by the course duplication feature: a new `courses` row with the same lessons and
+`source_course_id` pointing at the run it was copied from. Both are published, and #52 counted every
+published course in a track — so the live QuickBooks denominator was **84 lessons across two copies of
+one 42-lesson programme**. Finishing the entire programme scored 50% on the 40%-weighted track, and
+every future re-run would have divided every score again. The scorer now walks the duplication lineage
+(recursive, depth-bounded — `source_course_id` is not constrained acyclic) and counts **one run per
+learner per family**: the run they have progress in, else the newest. ★ **This is not a batch problem
+and a `courses.batch_id` FK could not have fixed it** — Sampler and Silver hold no cohort seat at all,
+yet their denominators doubled too; the grouping that matches the cause is the duplication lineage, not
+the cohort. ★ The "newest" tie-break reads **`created_at`, never `course_date`** — picking the newest
+run is exactly the temptation that would break the standing rule that `course_date` is a display label
+no function reads, and `test/studentProgressSql.test.mjs` asserts the scorer never names it.
+
+- Pure mirror: [src/lib/studentProgress.js](src/lib/studentProgress.js) (tracks, weights, scopes,
+  label formatting, scope selection). Suites: `test/studentProgress.test.mjs`,
+  `test/studentProgressSql.test.mjs` (asserts against the dated file **and** the bootstrap fold),
+  `test-db/studentProgress.dbtest.mjs`.
 
 ## AI / proxy pattern
 
@@ -1433,6 +1571,13 @@ explain/quiz/practice/recap the Supabase-hosted courses. Full setup:
   is the `data-theme` attribute on `<html>`, set pre-paint by the `index.html` boot script and driven
   at runtime by the **`useTheme`** hook + the `ThemeToggle` button (sidebar profile area + AuthScreen).
   Because tokens are vars, every inline `style={{ color: C.text }}` themes automatically.
+- **A FLAT fill behind white text uses `C.primarySolid`** (`--primary-solid`, #0070E0, 4.78:1), never
+  `C.primary` (#0A84FF, 3.65:1 — below the WCAG AA 4.5:1 floor, and it fails in BOTH themes because
+  the brand blues are theme-independent). `C.primary` stays correct for borders, icons, rings, bars and
+  accent text, where the 3:1 non-text floor applies. ★ Known-outstanding: the house GRADIENT button
+  (`linear-gradient(180deg, C.primaryHi, C.primary)`, ~73 inline uses plus `.sheen-btn`) still puts
+  white text on `--c-primary-hi` #3D8BFF = 3.31:1. `test/uiSafety.test.mjs` ratchets the flat pattern
+  and cannot see the gradient one; restyling those ~109 controls is a visual change, not an audit fix.
 - **Never string-concat an alpha onto a token** — `` `${C.primary}66` `` is broken CSS against a var.
   Use the alpha tokens instead: `var(--primary-glow)` (was `66`), `--primary-glow-soft` (`55`),
   `--primary-selection` (`33`), `--primary-halo` (`1A`), `--primary-tint` (`14`), `--green-ring`,
@@ -1714,6 +1859,20 @@ docs **in the same change**:
   cannot repair (its half is scoped to `pending`, so a ban is never laundered). #51 closes it with
   `ACCESS_REQUEST_STAFF_TARGET` and **no Super Admin exemption** — withdrawing staff access is
   `admin_set_staff_status()`, which writes an audit row.
+- **Changing how learning PROGRESS is scored, or who appears on a leaderboard** → five places move
+  together: `student_progress_current()` (the ONE population and scorer) ↔ the `courses_read` policy
+  it mirrors ↔ `STUDENT_PROGRESS_TRACKS` / `LEADERBOARD_SCOPES` in
+  [src/lib/studentProgress.js](src/lib/studentProgress.js) ↔ `test/studentProgressSql.test.mjs` ↔
+  `test-db/studentProgress.dbtest.mjs`. The parity suite runs every assertion against **both** the
+  dated migration and the bootstrap fold, because `bootstrapFolds.test.mjs` is a line-set
+  **containment** check: it proves nothing was dropped from a fold, never that nothing wrong was
+  added, and on a fresh install the last definition wins. ★ Two invariants are load-bearing and are
+  pinned by name: **staff are excluded from the population** (`invited` + `active`, the #50 rule —
+  a promoted student keeps their subscription row, so nothing else removes them), and **a missing
+  7-day baseline is NULL, never 0.00** (both `student_leaderboard` and `my_student_progress`, plus
+  the `week` window's exclusion — a fabricated zero makes Most Improved a mislabelled copy of the
+  overall board). ★ Current scores must never read `student_progress_daily`: it is history, and a
+  learner has to see a completion on the next request, not the next cron run.
 - **Adding, removing or re-granting a STAFF PERMISSION** → four places move together:
   the `staff_permissions` + `staff_role_permissions` seed in a dated migration ↔ the **bootstrap
   fold** ↔ `STAFF_PERMISSIONS` / `ROLE_PERMISSIONS` in [src/lib/staffRoles.js](src/lib/staffRoles.js)

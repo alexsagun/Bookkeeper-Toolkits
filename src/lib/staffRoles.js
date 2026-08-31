@@ -66,6 +66,8 @@ export const STAFF_PERMISSIONS = [
     description: 'Run the Thinkific migration wizard and issue invitations.' },
   { key: 'batches.manage', category: 'Students', label: 'Manage cohort batches',
     description: 'Create, edit, close and archive batches, and assign members to them.' },
+  { key: 'student_progress.read', category: 'Students', label: 'View student progress reports',
+    description: 'Read private operational progress reports, cohort averages, inactivity signals and CSV exports.' },
 
   // ── Course authoring ───────────────────────────────────────────────────────
   { key: 'courses.create', category: 'Courses', label: 'Create courses',
@@ -132,7 +134,7 @@ export const STAFF_ROLE_KEYS = STAFF_ROLES.map((r) => r.key);
 export const SUPER_ADMIN_ROLE = 'super_admin';
 
 /**
- * THE matrix. 18 permissions x 3 roles.
+ * THE matrix. 19 permissions x 3 roles.
  *
  * Two deliberate omissions, both of which a reader will want to challenge:
  *
@@ -159,6 +161,7 @@ export const ROLE_PERMISSIONS = {
     'students.assign_courses',
     'students.import',
     'batches.manage',
+    'student_progress.read',
   ],
   trainer: [
     'courses.create',
@@ -585,7 +588,7 @@ export function staffEntitlement(ctx, base) {
   if (ctx.isSuperAdmin) return base;
   if (base && base.full) return base;
 
-  const extra = new Set(['dashboard']);
+  const extra = new Set(['dashboard', 'progress']);
   for (const [tabId, perm] of Object.entries(ADMIN_TAB_PERMISSION)) {
     if (staffCan(ctx, perm)) extra.add(tabId);
   }

@@ -97,7 +97,7 @@ export const PLAN_ENTITLEMENTS = {
   sampler: {
     scopeLabel: 'Essentials + 1-on-1 coaching',
     stageIds: ['home', 'training', 'jobsearch'],
-    tabIds: ['dashboard', 'qbomastery', 'linkedinopt', 'coachalex', 'community'],
+    tabIds: ['dashboard', 'progress', 'qbomastery', 'linkedinopt', 'coachalex', 'community'],
     courseTier: 'essentials',
   },
   // Premium self-paced: full non-admin toolkit.

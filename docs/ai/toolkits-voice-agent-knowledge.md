@@ -1,5 +1,5 @@
 <!-- GENERATED FILE — do not hand-edit. Regenerate with `npm run ai:knowledge`
-     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-08-25 -->
+     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-08-30 -->
 
 # Toolkits by Alex — Voice Assistant Knowledge
 
@@ -12,7 +12,7 @@ paths never change.
 
 ## 1. App overview
 
-- The toolkit bundles **36 tools** across three career stages: **01 Training &
+- The toolkit bundles **37 tools** across three career stages: **01 Training &
   Skills** (build your foundation), **02 Job Application** (land US clients), and
   **03 Client Management & Delivery** (onboard, operate, close the year), plus a Home
   dashboard.
@@ -44,6 +44,7 @@ paths never change.
 | Tool | Tab id | URL path | What it does |
 |---|---|---|---|
 | Dashboard | `dashboard` | `/` | Progress overview with career-stage tiles, membership status, and quick links to every tool. |
+| Progress & Rankings | `progress` | `/progress-rankings` | Private learning report with completion-based Accounting Foundations, QuickBooks Mastery, Profile Optimization and Interview Readiness progress, daily trends, fair plan and VIP batch leaderboards, and privacy controls. |
 | Community | `community` | `/community` | Member forum organised into channels grouped by category, like a chat community. Text channels for discussion and announcement channels that are read-and-react only. Every member sees #announcements plus general channels for QuickBooks help, the job search and client work; VIP members also get their own private cohort channels. Channels can be limited to particular plans or batches, and members only ever see the channels they may open. Includes per-channel unread markers, search within a channel or across all of them, free-form tags, image/video/link attachments, @mentions, reactions, pinned posts and a notification bell. Admins create and organise channels from Manage community. Access follows the membership automatically. |
 
 ### Training & Skills
@@ -121,7 +122,7 @@ to USD.
 
 **What each plan can open (entitlement scope):**
 
-- **Sampler Session** (`sampler`): Essentials + 1-on-1 coaching. Can open: Dashboard, QuickBooks Online Mastery, Book 1-on-1 with Alex, Personalized Coaching With Alex, Community. Within the QuickBooks catalog it can only open **essentials-tier** courses (QuickBooks Online Essentials — NOT Mastery).
+- **Sampler Session** (`sampler`): Essentials + 1-on-1 coaching. Can open: Dashboard, Progress & Rankings, QuickBooks Online Mastery, Book 1-on-1 with Alex, Personalized Coaching With Alex, Community. Within the QuickBooks catalog it can only open **essentials-tier** courses (QuickBooks Online Essentials — NOT Mastery).
 - **QBO + Resume Combo** (`silver_self_paced`): **Full toolkit access** — every student tool in the toolkit.
 - **Personalized Coaching Program** (`vip`): **Full toolkit access** — every student tool in the toolkit.
 - **Admins, and legacy members with no plan key on file**: full toolkit access.

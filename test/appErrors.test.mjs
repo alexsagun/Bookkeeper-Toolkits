@@ -62,6 +62,36 @@ test('appErrorCode maps PGRST202 to MIGRATION_MISSING', () => {
   assert.ok(!isMigrationMissing(pgErr({ hint: 'BATCH_FULL' })));
 });
 
+// A function NAME in an error message says which object failed, never why. The
+// Progress & Rankings tab used to add /student_progress|student_leaderboard/ to its
+// own check, so "permission denied for function my_student_progress" — a missing
+// GRANT — rendered as "migration #52 is not applied" and sent an admin to re-run
+// SQL that had already run. Every one of these must stay FALSE.
+//
+// ★ This test alone does NOT pin that bug: it never lived in this module —
+// isMigrationMissing() is a one-line code check and never carried a name regex, so
+// these cases passed before the fix too. What stops the JSX widening it again is the
+// source scan in test/studentProgress.test.mjs ("the setup card is not triggered by
+// a function name"). Keep the two together.
+test('isMigrationMissing does not fire on failures that merely name our functions', () => {
+  const notMissing = [
+    { code: '42501', message: 'permission denied for function my_student_progress' },
+    { code: '42501', message: 'permission denied for function student_leaderboard' },
+    { code: '42501', message: 'permission denied for table student_progress_daily' },
+    { code: '42P01', message: 'relation "student_progress_milestones" does not exist' },
+    { code: '57014', message: 'canceling statement due to statement timeout' },
+    { code: 'P0001', message: 'student_leaderboard: unknown scope' },
+  ];
+  for (const e of notMissing) {
+    assert.equal(isMigrationMissing(e), false, `should not be MIGRATION_MISSING: ${e.message}`);
+  }
+  // The genuine article still is.
+  assert.ok(isMigrationMissing({
+    code: 'PGRST202',
+    message: "Could not find the function public.my_student_progress without parameters in the schema cache",
+  }));
+});
+
 // These strings are HISTORICAL VERBATIM — they are what a pre-#35 database actually
 // raised, including plan and segment names that #39 has since removed. They stay as
 // written on purpose: the parser's whole job is recognising messages it did not
