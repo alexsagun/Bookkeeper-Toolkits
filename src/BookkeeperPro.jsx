@@ -83,6 +83,9 @@ import {
   blankIntake, intakeField, fileTypeAllowed, contentTypeFor, intakeValuesFromRequest, intakePayload, ENROLLMENT_PROCESSING_NOTE,
 } from './lib/enrollmentIntake';
 import { AGREEMENT_VERSION, agreementModel, agreementSnapshot } from './lib/trainingAgreement';
+import {
+  LEADERBOARD_SCOPES, STUDENT_PROGRESS_TRACKS, progressScopeOptions,
+} from './lib/studentProgress';
 
 const DEFAULT_APP_TAB = 'dashboard';
 
@@ -131,6 +134,7 @@ const PAYMENT_SETTINGS_FALLBACK = {
 
 const TAB_ROUTES = {
   dashboard: '/',
+  progress: '/progress-rankings',
   community: '/community',
   accessrequests: '/admin/access-requests',
   enrollments: '/admin/enrollments',
@@ -188,10 +192,11 @@ const VALID_APP_TABS = new Set(Object.keys(TAB_ROUTES));
 // admin-only screens, the member community (a space, not a tool), and the legacy
 // mockinterview alias (a redirect, not a tool). Derived so the number can never drift
 // from the actual toolkit again.
-const NON_TOOL_TAB_IDS = new Set(['dashboard', 'community', 'accessrequests', 'enrollments', 'studentimports', 'batches', 'staffroles', 'mockinterview']);
+const NON_TOOL_TAB_IDS = new Set(['dashboard', 'progress', 'community', 'accessrequests', 'enrollments', 'studentimports', 'batches', 'staffroles', 'mockinterview']);
 const TOOL_COUNT = Object.keys(TAB_ROUTES).filter((id) => !NON_TOOL_TAB_IDS.has(id)).length;
 const INTERVIEW_SUBTAB_IDS = new Set(['winstrat', 'mock', 'common', 'accounting', 'body', 'jdgen', 'salary']);
 const APP_ROUTE_CHANGE_EVENT = 'bookkeeper:route-change';
+const STUDENT_PROGRESS_CHANGE_EVENT = 'bookkeeper:student-progress-change';
 const ACCOUNT_PANEL_ALIASES = {
   settings: 'settings',
   profile: 'settings',
@@ -354,6 +359,7 @@ function shouldHandleInAppClick(e) {
 // same change (see "Keeping docs current" in CLAUDE.md).
 const VOICE_TAB_INFO = {
   dashboard:    { label: 'Dashboard', stage: 'Home', desc: 'Progress overview with career-stage tiles, membership status, and quick links to every tool.' },
+  progress:     { label: 'Progress & Rankings', stage: 'Home', desc: 'Private learning report with completion-based Accounting Foundations, QuickBooks Mastery, Profile Optimization and Interview Readiness progress, daily trends, fair plan and VIP batch leaderboards, and privacy controls.' },
   community:    { label: 'Community', stage: 'Home', desc: 'Member forum organised into channels grouped by category, like a chat community. Text channels for discussion and announcement channels that are read-and-react only. Every member sees #announcements plus general channels for QuickBooks help, the job search and client work; VIP members also get their own private cohort channels. Channels can be limited to particular plans or batches, and members only ever see the channels they may open. Includes per-channel unread markers, search within a channel or across all of them, free-form tags, image/video/link attachments, @mentions, reactions, pinned posts and a notification bell. Admins create and organise channels from Manage community. Access follows the membership automatically.' },
   course:       { label: 'Accounting 101', stage: 'Training & Skills', desc: 'Self-paced foundational accounting course (8 modules).' },
   qbomastery:   { label: 'QuickBooks Online Mastery', stage: 'Training & Skills', desc: 'QuickBooks Online video-course catalog (Essentials and Mastery programs) with completion certificates.' },
@@ -399,6 +405,10 @@ const VOICE_TAB_INFO = {
 // navigate_to_tool — we do the right thing instead of failing).
 const VOICE_TOOL_ALIASES = {
   'home': { tab: 'dashboard' },
+  'progress': { tab: 'progress' },
+  'my progress': { tab: 'progress' },
+  'rankings': { tab: 'progress' },
+  'leaderboard': { tab: 'progress' },
   'community': { tab: 'community' },
   'community feed': { tab: 'community' },
   'the feed': { tab: 'community' },
@@ -956,7 +966,7 @@ const COA_INDUSTRY = {
     { num: '4290', name: 'Referral Fee Income', type: 'Income', detail: 'Service/Fee Income', desc: 'Referrals received' },
     { num: '5250', name: 'Broker Splits', type: 'Cost of Goods Sold', detail: 'Other Costs of Service - COS', desc: 'Amount paid to brokerage from gross commission' },
     { num: '5260', name: 'Transaction Coordinator Fees', type: 'Cost of Goods Sold', detail: 'Other Costs of Service - COS', desc: 'TC fees per transaction' },
-    { num: '6400', name: 'MLS Fees', type: 'Expenses', detail: 'Dues & Subscriptions', desc: 'MLS and Realtor board dues' },
+    { num: '6405', name: 'MLS Fees', type: 'Expenses', detail: 'Dues & Subscriptions', desc: 'MLS and Realtor board dues' },
     { num: '6410', name: 'Lead Generation', type: 'Expenses', detail: 'Advertising/Promotional', desc: 'Zillow, Realtor.com, Google leads' },
     { num: '6420', name: 'Signage & Lockboxes', type: 'Expenses', detail: 'Supplies', desc: 'Yard signs, lockboxes, brochures' },
     { num: '6430', name: 'Staging Costs', type: 'Expenses', detail: 'Advertising/Promotional', desc: 'Home staging for listings' },
@@ -983,7 +993,7 @@ const COA_INDUSTRY = {
     { num: '4380', name: 'Special Events Income', type: 'Income', detail: 'Other Miscellaneous Income', desc: 'Fundraising event revenue' },
     { num: '6480', name: 'Program Expenses', type: 'Expenses', detail: 'Other Business Expenses', desc: 'Direct mission program costs' },
     { num: '6490', name: 'Management & General', type: 'Expenses', detail: 'Other Business Expenses', desc: 'Admin overhead' },
-    { num: '6500', name: 'Fundraising Expenses', type: 'Expenses', detail: 'Advertising/Promotional', desc: 'Costs of fundraising activities' },
+    { num: '6505', name: 'Fundraising Expenses', type: 'Expenses', detail: 'Advertising/Promotional', desc: 'Costs of fundraising activities' },
     { num: '6510', name: 'Grant Writing', type: 'Expenses', detail: 'Legal & Professional Fees', desc: 'Grant writing consultants' },
   ],
   'Property Management': [
@@ -1019,7 +1029,7 @@ const COA_INDUSTRY = {
   ],
   'Retail Store': [
     { num: '4490', name: 'Retail Sales - In Store', type: 'Income', detail: 'Sales of Product Income', desc: 'In-store retail revenue' },
-    { num: '4500', name: 'Retail Sales - Online', type: 'Income', detail: 'Sales of Product Income', desc: 'Online retail revenue' },
+    { num: '4505', name: 'Retail Sales - Online', type: 'Income', detail: 'Sales of Product Income', desc: 'Online retail revenue' },
     { num: '4520', name: 'Returns & Allowances', type: 'Income', detail: 'Discounts/Refunds Given', desc: 'Customer returns (contra)' },
     { num: '5350', name: 'Cost of Goods Sold - Retail', type: 'Cost of Goods Sold', detail: 'Supplies & Materials - COGS', desc: 'Cost of retail merchandise sold' },
     { num: '5360', name: 'Freight In', type: 'Cost of Goods Sold', detail: 'Shipping, Freight & Delivery - COS', desc: 'Inbound freight on merchandise' },
@@ -1044,9 +1054,9 @@ const COA_INDUSTRY = {
     { num: '5390', name: 'Stock Assets / Licensing', type: 'Cost of Goods Sold', detail: 'Other Costs of Service - COS', desc: 'Stock photos, music, fonts' },
   ],
   'Accounting / Tax / CFO Firm (Scaling with Remote Bookkeepers)': [
-    { num: '1020', name: 'Client Trust Account', type: 'Bank', detail: 'Bank', desc: 'Client funds held for tax / payroll / sales tax remittance' },
+    { num: '1025', name: 'Client Trust Account', type: 'Bank', detail: 'Bank', desc: 'Client funds held for tax / payroll / sales tax remittance' },
     { num: '1230', name: 'Unbilled Revenue / WIP', type: 'Other Current Assets', detail: 'Other Current Assets', desc: 'Hours worked but not yet invoiced' },
-    { num: '2100', name: 'Client Funds Held - Liability', type: 'Other Current Liabilities', detail: 'Other Current Liabilities', desc: 'Counter-balance for client trust funds' },
+    { num: '2105', name: 'Client Funds Held - Liability', type: 'Other Current Liabilities', detail: 'Other Current Liabilities', desc: 'Counter-balance for client trust funds' },
     { num: '4010', name: 'MRR - Bookkeeping Services', type: 'Income', detail: 'Service/Fee Income', desc: 'Monthly recurring bookkeeping revenue' },
     { num: '4015', name: 'MRR - Fractional CFO / Advisory', type: 'Income', detail: 'Service/Fee Income', desc: 'Monthly recurring CFO / advisory revenue' },
     { num: '4020', name: 'Project Revenue - Tax Preparation', type: 'Income', detail: 'Service/Fee Income', desc: 'Individual and business tax return prep' },
@@ -1055,7 +1065,7 @@ const COA_INDUSTRY = {
     { num: '4050', name: 'Project Revenue - Advisory / Consulting', type: 'Income', detail: 'Service/Fee Income', desc: 'Strategic, M&A, valuation, special projects' },
     { num: '5010', name: 'Subcontractor Costs - Offshore Bookkeepers', type: 'Cost of Goods Sold', detail: 'Other Costs of Service - COS', desc: 'Offshore team and contractor labor' },
     { num: '5020', name: 'Subcontractor Costs - Contract Tax Preparers', type: 'Cost of Goods Sold', detail: 'Other Costs of Service - COS', desc: 'Seasonal 1099 tax preparers' },
-    { num: '6220', name: 'Professional Liability Insurance (E&O)', type: 'Expenses', detail: 'Insurance', desc: 'Errors & omissions insurance for firm' },
+    { num: '6225', name: 'Professional Liability Insurance (E&O)', type: 'Expenses', detail: 'Insurance', desc: 'Errors & omissions insurance for firm' },
     { num: '6240', name: 'CPA Licensing & CPE', type: 'Expenses', detail: 'Professional Fees', desc: 'License renewals, CPE courses, ethics training' },
     { num: '6320', name: 'Tax Prep Software (Drake/Lacerte/UltraTax)', type: 'Expenses', detail: 'Dues & Subscriptions', desc: 'Annual tax software subscriptions' },
     { num: '6325', name: 'Practice Mgmt Software (Karbon/Jetpack/Canopy)', type: 'Expenses', detail: 'Dues & Subscriptions', desc: 'Workflow and practice management tools' },
@@ -1186,48 +1196,56 @@ const VENDOR_PATTERNS = [
 
 const COURSE_MODULES = [
   {
+    milestoneKey: 'accounting-101-module-01',
     title: 'The Accounting Equation & Double-Entry',
     body: `Every bookkeeping system in the world is built on one elegant equation:\n\nASSETS = LIABILITIES + EQUITY\n\nThis equation must ALWAYS balance. When you record a transaction, you make at least two entries (a debit and a credit) so the equation stays in balance — that's "double-entry" bookkeeping.\n\nExample: You buy a $1,000 laptop with cash. Computer Equipment (asset) goes up $1,000. Checking (asset) goes down $1,000. Total assets are unchanged. The equation still balances.\n\nQBO does all the double-entry behind the scenes — but understanding what's happening underneath is the difference between a button-pusher and a real bookkeeper.`,
     quiz: 'A client pays a $500 utility bill from the checking account. Which two accounts are affected?',
     answer: 'Utilities Expense (increases by $500) and Checking (decreases by $500). The debit hits an expense; the credit hits an asset. Equity ultimately decreases because expenses reduce net income.'
   },
   {
+    milestoneKey: 'accounting-101-module-02',
     title: 'The 5 Account Types + Normal Balances',
     body: `Every account on the Chart of Accounts belongs to one of five families. Each has a "normal balance" — the side it naturally sits on.\n\n• ASSETS — what the business owns (Cash, A/R, Equipment). Normal balance: DEBIT.\n• LIABILITIES — what the business owes (A/P, Loans, Credit Cards). Normal balance: CREDIT.\n• EQUITY — owner's stake (Capital, Draws, Retained Earnings). Normal balance: CREDIT.\n• INCOME — revenue earned (Sales, Service Revenue). Normal balance: CREDIT.\n• EXPENSES — costs of operating (Rent, Utilities, Wages). Normal balance: DEBIT.\n\nMnemonic: DEAD CLIC — Debits increase Expenses, Assets, Draws. Credits increase Liabilities, Income, Capital.\n\nWhen you categorize a bank transaction in QBO, you're really telling the system which account gets the offsetting debit or credit.`,
     quiz: 'You record $2,000 of new sales paid by credit card. The customer charge clears to checking. What\'s the debit, and what\'s the credit?',
     answer: 'Debit: Checking $2,000 (an asset went up). Credit: Sales Income $2,000 (income went up). Both debits and credits agree with normal balances.'
   },
   {
+    milestoneKey: 'accounting-101-module-03',
     title: 'The Bookkeeping Cycle',
     body: `Bookkeeping isn't random — it's a repeating cycle:\n\n1. SOURCE DOCUMENTS — receipts, invoices, bank statements arrive.\n2. JOURNAL — transactions are recorded chronologically (QBO does this when you enter bills, invoices, expenses).\n3. LEDGER — transactions get posted to individual accounts (QBO does this automatically).\n4. TRIAL BALANCE — list of all accounts with their balances; debits must equal credits.\n5. ADJUSTING ENTRIES — month-end entries for things like depreciation, prepaid expenses, accruals.\n6. FINANCIAL STATEMENTS — Profit & Loss, Balance Sheet, Cash Flow.\n7. CLOSING — period closed, retained earnings updated.\n\nIn QBO, you mostly work in step 1-2 (data entry) and step 5 (adjustments). The rest is automatic. Your job is to make sure the inputs are CLEAN.`,
     quiz: 'A client asks why their P&L doesn\'t match their bank balance. What do you tell them?',
     answer: 'The P&L shows income and expenses for a PERIOD (Jan–Dec). The bank balance is a SNAPSHOT on one date. They show different things. Use the Balance Sheet to see cash; use the P&L to see profitability.'
   },
   {
+    milestoneKey: 'accounting-101-module-04',
     title: 'Cash Basis vs Accrual Basis',
     body: `Two ways to recognize income and expenses:\n\nCASH BASIS — record income when cash is received, expenses when cash is paid. Simple. Used by most small businesses for tax purposes.\n\nACCRUAL BASIS — record income when EARNED (invoice sent), expenses when INCURRED (bill received), regardless of cash movement. Required by GAAP. Required for businesses with inventory or revenue over $27M.\n\nQBO can toggle reports between cash and accrual with one click. But the underlying transactions matter — invoices and bills create accrual-basis entries, expenses and sales receipts create cash-basis-friendly entries.\n\nKey tell: If a client uses invoices (A/R) and bills (A/P), they're operating accrually even if they report on cash basis to the IRS.`,
     quiz: 'A client sends a $5,000 invoice on Dec 28. The customer pays on Jan 15. On accrual basis, what year is the income reported?',
     answer: 'Accrual basis: Income is recorded in December (when earned/invoiced). Cash basis: Income is recorded in January (when received). This is the most common cash-vs-accrual question on the CPA exam — and the most common mistake bookkeepers make at year-end.'
   },
   {
+    milestoneKey: 'accounting-101-module-05',
     title: 'Reading a P&L and Balance Sheet',
     body: `P&L (Profit & Loss / Income Statement):\n  Revenue\n  − Cost of Goods Sold (COGS)\n  = GROSS PROFIT\n  − Operating Expenses\n  = NET OPERATING INCOME\n  ± Other Income/Expense\n  = NET INCOME\n\nBalance Sheet (point in time):\n  ASSETS = LIABILITIES + EQUITY\n  Current Assets (cash, A/R, inventory)\n  + Fixed Assets (equipment, buildings)\n  = TOTAL ASSETS\n\n  Current Liabilities (A/P, credit cards)\n  + Long-Term Liabilities (loans)\n  + Equity (capital, retained earnings, current net income)\n  = TOTAL LIAB + EQUITY\n\nKey ratios bookkeepers should know:\n• Gross Margin = Gross Profit / Revenue (industry-specific target)\n• Current Ratio = Current Assets / Current Liabilities (>1.5 is healthy)\n• Quick Ratio = (Cash + A/R) / Current Liabilities`,
     quiz: 'Your client\'s Balance Sheet shows Total Assets of $250K, Total Liabilities of $180K. What is Total Equity?',
     answer: '$70K. The accounting equation: Assets = Liabilities + Equity, so Equity = Assets − Liabilities = $250K − $180K = $70K.'
   },
   {
+    milestoneKey: 'accounting-101-module-06',
     title: 'Bank Reconciliation Fundamentals',
     body: `Bank reconciliation = matching what QBO says to what the bank says.\n\nWhy it matters: Catches missing transactions, duplicates, fraud, and bank errors. Required to trust the books.\n\nThe formula:\n  Ending balance per QBO\n  + Outstanding deposits (in QBO, not yet on bank)\n  − Outstanding checks (in QBO, not yet cleared)\n  = Should equal ending balance per bank statement\n\nIn QBO: Go to ⚙️ Settings → Reconcile. Enter the ending date and ending balance from the statement. Check off transactions that match. The "difference" must equal $0.00 before saving.\n\nCommon mistakes:\n• Duplicate transactions (manual entry + bank feed)\n• Transactions in the wrong account\n• Missing transactions (bank fees, interest)\n• Wrong ending balance entered\n\nReconcile EVERY month, EVERY account, including credit cards.`,
     quiz: 'Your reconciliation has a $35 difference. The bank statement shows a $35 service charge you forgot to enter. What do you do?',
     answer: 'Add the $35 service charge as a new expense (Bank Fees) dated within the statement period — don\'t adjust the difference manually. Then the reconciliation will balance to $0.00. Never use the "auto-adjust" button to force a reconciliation — it creates a junk journal entry that hides real errors.'
   },
   {
+    milestoneKey: 'accounting-101-module-07',
     title: 'Common Beginner Mistakes',
     body: `The mistakes I see beginner remote bookkeepers make over and over:\n\n1. CATEGORIZING TRANSFERS AS EXPENSES — Moving money from Checking to Savings is NOT an expense. Use "Transfer" or match the two transactions.\n\n2. BOOKING OWNER PAYMENTS TO "WAGES" — A sole prop or single-member LLC owner takes Draws (Equity), not Wages. Only S-Corp owners on payroll get Wages.\n\n3. NEGATIVE A/R — Means you applied a payment to a customer with no invoice, or duplicate payments. Always investigate.\n\n4. UNDEPOSITED FUNDS PILING UP — UF is meant to be a temporary holding account. When a deposit hits the bank, match it to clear UF — don\'t leave 200 payments sitting there.\n\n5. FORCING RECONCILIATIONS WITH ADJUSTMENTS — Adjustments hide errors. Find the real mistake.\n\n6. MIXING PERSONAL AND BUSINESS — Personal expenses paid from business should be Owner\'s Draws, not real expenses.\n\n7. NOT USING CLASSES / LOCATIONS — Critical for tracking property, project, or location profitability.\n\n8. IGNORING SALES TAX — Sales tax collected is a liability, not income. Set up sales tax in QBO from Day 1.`,
     quiz: 'A client wants to "make the reconciliation balance" by entering a $400 adjustment. What\'s your response?',
     answer: 'Decline. Find the real cause first. A $400 unexplained difference usually means a duplicate, a missing transaction, a wrong amount, or a wrong account. Hiding it with an adjustment creates a phantom transaction that will haunt the books forever.'
   },
   {
+    milestoneKey: 'accounting-101-module-08',
     title: 'Month-End Close Checklist',
     body: `A repeatable month-end close is what separates a real bookkeeper from a data-entry clerk. Run this same checklist every month:\n\n☐ All bank transactions imported and categorized\n☐ All bills entered, all invoices sent\n☐ Customer payments applied to invoices\n☐ Vendor payments applied to bills\n☐ Undeposited Funds cleared\n☐ Bank accounts reconciled (✓ to $0.00)\n☐ Credit card accounts reconciled\n☐ Loan accounts — interest split from principal\n☐ Payroll posted; payroll liabilities match Gusto/ADP\n☐ Sales tax accrued / paid\n☐ Inventory adjusted to physical count (if applicable)\n☐ Depreciation entered (monthly fixed asset entry)\n☐ Prepaid expenses amortized\n☐ Owner Draws / Contributions reviewed\n☐ A/R aging reviewed — flag old balances\n☐ A/P aging reviewed — flag old balances\n☐ P&L reviewed for unusual amounts\n☐ Balance Sheet reviewed — no negative balances on asset accounts\n☐ Books closed (Settings → Account & Settings → Advanced → Close the books)\n☐ Reports sent to client with brief commentary\n\nThis checklist is what clients pay you for. Use it.`,
     quiz: 'On your month-end Balance Sheet, you see Accounts Receivable is negative $1,200. Is this a problem?',
@@ -1355,7 +1373,8 @@ const TIPS = [
 //    window, html2canvas) must use the frozen literal INK palette below.
 const C = {
   // Blues (identical in both themes)
-  primary:   'var(--c-primary)',     // iOS systemBlue — primary action
+  primary:   'var(--c-primary)',     // iOS systemBlue — borders, icons, rings, bars, accent text
+  primarySolid: 'var(--primary-solid)', // ★ the ONLY blue allowed behind WHITE TEXT (AA 4.78:1)
   primaryHi: 'var(--c-primary-hi)',  // bright lift
   primaryLo: 'var(--c-primary-lo)',  // deep base for gradients
   accent:    'var(--c-accent)',      // cyan accent
@@ -2831,6 +2850,38 @@ function StaffInvitationSetup({ invite, deferred, onAccepted, onDecline, onDismi
 // oriented to the three career stages instead of landing on a blank dashboard.
 function WelcomeOverlay({ name, onClose }) {
   const first = (name || '').trim().split(/\s+/)[0] || 'there';
+  // ★ This is a MODAL, so it owes the same contract AccountModal pays: a dialog role,
+  //   an accessible name, focus moved in and restored on close, Escape, and a Tab trap.
+  //   It used to skip all of that — measured: 1 focusable inside and 28 still reachable
+  //   behind the scrim, with document.activeElement left on <body>.
+  //   ★ It does NOT go through OverlayPortal: it renders inline in the shell root, which
+  //   is fine ONLY because the shell root is not a transformed .fade-in TabPanel. Move it
+  //   inside a tab and its fixed positioning breaks — portal it first.
+  const panelRef = useRef(null);
+  useEffect(() => {
+    const opener = document.activeElement;
+    panelRef.current?.focus();
+    return () => { if (opener && typeof opener.focus === 'function') opener.focus(); };
+  }, []);
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape') { onClose?.(); return; }
+      if (e.key !== 'Tab' || !panelRef.current) return;
+      const focusables = panelRef.current.querySelectorAll(
+        'button:not([disabled]), [href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      );
+      if (!focusables.length) return;
+      const firstEl = focusables[0];
+      const lastEl = focusables[focusables.length - 1];
+      if (e.shiftKey && (document.activeElement === firstEl || document.activeElement === panelRef.current)) {
+        e.preventDefault(); lastEl.focus();
+      } else if (!e.shiftKey && document.activeElement === lastEl) {
+        e.preventDefault(); firstEl.focus();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
   const stages = [
     { n: '01', label: 'Training & Skills', desc: 'Master the accounting foundations and the tools US clients expect.' },
     { n: '02', label: 'Job Application', desc: 'Build authentic branding and ace interviews & discovery calls.' },
@@ -2841,7 +2892,8 @@ function WelcomeOverlay({ name, onClose }) {
     <div className="fixed inset-0 z-50 flex items-center justify-center p-6"
       style={{ background: 'rgba(10,20,40,0.45)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)', fontFamily: fontBody, color: C.text }}>
       <style>{`.welcome-in{animation:welcomeIn .5s cubic-bezier(.16,1,.3,1) both}@keyframes welcomeIn{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:none}}`}</style>
-      <div className="welcome-in w-full max-w-lg rounded-3xl overflow-hidden" style={{
+      <div ref={panelRef} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby="welcome-overlay-title"
+        className="welcome-in w-full max-w-lg rounded-3xl overflow-hidden outline-none" style={{
         background: GLASS.cardDeep,
         backdropFilter: 'blur(30px) saturate(180%)',
         WebkitBackdropFilter: 'blur(30px) saturate(180%)',
@@ -2850,7 +2902,7 @@ function WelcomeOverlay({ name, onClose }) {
       }}>
         <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
           <img src={LOGO_DATA_URI} alt="" style={{ width: 52, height: 52, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
-          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 20, letterSpacing: '-0.02em' }}>Welcome, {first}! 👋</div>
+          <div id="welcome-overlay-title" className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 20, letterSpacing: '-0.02em' }}>Welcome, {first}! 👋</div>
           <div className="mt-1.5" style={{ fontSize: 13, color: C.textSoft, maxWidth: 400, margin: '6px auto 0', lineHeight: 1.5 }}>
             Your complete toolkit to launch and grow a remote bookkeeping career serving US clients. Here's the journey ahead:
           </div>
@@ -5700,6 +5752,69 @@ function SettingsSectionLabel({ children, first = false }) {
   );
 }
 
+function LeaderboardVisibilitySetting() {
+  const { user } = useAuth();
+  const [visible, setVisible] = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [unavailable, setUnavailable] = useState(false);
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    if (!user?.id) { setLoading(false); return; }
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase.from('student_ranking_preferences')
+        .select('public_visible').eq('user_id', user.id).maybeSingle();
+      if (cancelled) return;
+      if (error) {
+        if (isMigrationMissing(error)) setUnavailable(true);
+        else setErr(appErrorMessage(error, 'Could not load this privacy setting.'));
+      } else {
+        setVisible(data?.public_visible !== false);
+      }
+      setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [user?.id]);
+
+  async function toggle() {
+    if (saving || loading || unavailable) return;
+    const next = !visible;
+    setSaving(true); setErr('');
+    const { data, error } = await supabase.rpc('set_leaderboard_visibility', { p_visible: next });
+    if (error) setErr(appErrorMessage(error, 'Could not update leaderboard privacy.'));
+    else setVisible(data !== false);
+    setSaving(false);
+  }
+
+  return (
+    <>
+      <SettingsSectionLabel>Leaderboard privacy</SettingsSectionLabel>
+      <div className="rounded-xl px-3.5 py-3.5 flex items-start gap-3"
+        style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+        <div className="min-w-0 flex-1">
+          <div style={{ fontSize: 12.5, fontWeight: 750, color: C.text }}>Show me on public leaderboards</div>
+          <p className="mt-1" style={{ fontSize: 11.5, color: C.textMute, lineHeight: 1.5 }}>
+            When enabled, other learners see only your first name and last initial. Your email, full name and account ID are never public. Turning this off keeps your private progress report.
+          </p>
+          {unavailable && <p className="mt-1.5 text-[11px]" style={{ color: C.amber }}>Available after the Progress &amp; Rankings database update.</p>}
+          {err && <p className="mt-1.5 text-[11px]" style={{ color: C.red }}>{err}</p>}
+        </div>
+        <button type="button" role="switch" aria-checked={visible}
+          aria-label="Show me on public leaderboards"
+          onClick={toggle} disabled={loading || saving || unavailable}
+          className="relative flex-shrink-0 rounded-full transition disabled:opacity-50"
+          style={{ width: 42, height: 24, background: visible ? C.primary : 'var(--status-neutral-bd)' }}>
+          <span className="absolute top-1 rounded-full bg-white shadow transition-transform"
+            style={{ width: 16, height: 16, left: 4, transform: visible ? 'translateX(18px)' : 'translateX(0)' }} />
+          <span className="sr-only">{saving ? 'Saving' : visible ? 'Visible' : 'Hidden'}</span>
+        </button>
+      </div>
+    </>
+  );
+}
+
 // Copy-to-clipboard chip for the account id. Its 1.5s "copied" flash is the one bit of state
 // the settings body would otherwise need, so it lives here to keep ProfileSettingsBody pure.
 function CopyIdButton({ value }) {
@@ -6010,6 +6125,8 @@ function ProfileSettingsBody({ user, profile, sub, latestReq, entitlement, plan,
           } />
         )}
       </div>
+
+      {showBilling && <LeaderboardVisibilitySetting />}
 
       {showBilling && (
         <>
@@ -7438,6 +7555,7 @@ function VoiceAssistant({ user, profile, sub, latestReq, entitlement, showBillin
 function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImportCount, interviewSub }) {
   switch (tabId) {
     case 'dashboard': return <Dashboard goto={goto} />;
+    case 'progress': return <ProgressRankings goto={goto} />;
     case 'community': return <CommunityHub />;
     case 'accessrequests': return <AccessRequests onCountChange={onAccessCount} />;
     case 'enrollments': return <AdminEnrollments onCountChange={onEnrollCount} />;
@@ -7845,6 +7963,7 @@ export default function BookkeeperProToolkit() {
       desc: 'Start here',
       tabs: [
         { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
+        { id: 'progress', label: 'Progress & Rankings', icon: TrendingUp },
         { id: 'community', label: 'Community', icon: MessagesSquare },
       ],
     },
@@ -14213,6 +14332,755 @@ function StatCard({ label, value, sub, icon: Icon }) {
 // COMPONENT: CHART OF ACCOUNTS GENERATOR
 // ═══════════════════════════════════════════════════════════════════
 
+const PROGRESS_TRACK_UI = {
+  foundation: { label: 'Accounting Foundations', icon: Landmark, weight: 20, tab: 'course' },
+  qbo: { label: 'QuickBooks Mastery', icon: BookOpen, weight: 40, tab: 'qbomastery' },
+  profile: { label: 'Profile Optimization', icon: UserCheck, weight: 20, tab: 'resumestrategy' },
+  interview: { label: 'Interview Readiness', icon: MessagesSquare, weight: 20, tab: 'interview' },
+};
+
+const progressScore = (value) => Math.max(0, Math.min(100, Number(value) || 0));
+const progressPercent = (value) => `${Math.round(progressScore(value))}%`;
+const progressDate = (value) => {
+  if (!value) return 'No milestones yet';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'No milestones yet';
+  return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+};
+// #52's RPCs are absent ONLY when PostgREST cannot find them — which is exactly
+// what isMigrationMissing() already answers (PGRST202 / "schema cache").
+// ★ Do NOT widen this back to a name match on the message. The previous version
+//   also matched /student_progress|student_leaderboard/, and "permission denied
+//   for function my_student_progress" contains "student_progress" — so a missing
+//   GRANT, a half-applied migration and a stale schema cache all rendered the same
+//   "migration #52 is not applied" card, sending an admin to re-run SQL that had
+//   already run. A function name in an error says WHICH object failed, never WHY.
+
+function ProgressBar({ value, label, compact = false }) {
+  const score = progressScore(value);
+  return (
+    <div className="w-full">
+      <div className="h-2.5 rounded-full overflow-hidden" style={{ background: 'var(--wash)' }}
+        role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(score)}>
+        <div className="h-full rounded-full transition-[width] duration-500"
+          style={{ width: `${score}%`, background: `linear-gradient(90deg, ${C.primary}, ${C.primaryHi})` }} />
+      </div>
+      {!compact && <span className="sr-only">{label}: {progressPercent(score)}</span>}
+    </div>
+  );
+}
+
+function ProgressTrend({ points = [] }) {
+  const clean = (points || []).map((point) => ({
+    date: String(point?.date || ''), score: progressScore(point?.score),
+  })).filter((point) => point.date);
+  if (clean.length < 2) {
+    return (
+      <div className="rounded-xl px-4 py-8 text-center" style={{ background: 'var(--wash)', color: C.textMute, fontSize: 12.5 }}>
+        Daily trend appears after the next UTC snapshot.
+      </div>
+    );
+  }
+  const width = 600; const height = 150; const pad = 18;
+  const coords = clean.map((point, index) => ({
+    ...point,
+    x: pad + (index * (width - pad * 2)) / Math.max(1, clean.length - 1),
+    y: height - pad - (point.score * (height - pad * 2)) / 100,
+  }));
+  const path = coords.map((point, index) => `${index ? 'L' : 'M'} ${point.x} ${point.y}`).join(' ');
+  return (
+    <figure aria-label="Daily overall progress trend">
+      <svg viewBox={`0 0 ${width} ${height}`} className="w-full" style={{ minHeight: 130 }} role="img"
+        aria-label={`Progress moved from ${progressPercent(clean[0].score)} to ${progressPercent(clean.at(-1).score)} across ${clean.length} daily points.`}>
+        {[0, 50, 100].map((tick) => {
+          const y = height - pad - (tick * (height - pad * 2)) / 100;
+          return <line key={tick} x1={pad} x2={width - pad} y1={y} y2={y} stroke="var(--glass-border-soft)" strokeDasharray="4 5" />;
+        })}
+        <path d={path} fill="none" stroke={C.primary} strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
+        {coords.map((point) => <circle key={`${point.date}-${point.score}`} cx={point.x} cy={point.y} r="4" fill={C.primaryHi} stroke={GLASS.card} strokeWidth="2" />)}
+      </svg>
+      <figcaption className="flex justify-between gap-3 text-[10px]" style={{ color: C.textMute }}>
+        <span>{progressDate(clean[0].date)}</span><span>{progressDate(clean.at(-1).date)}</span>
+      </figcaption>
+    </figure>
+  );
+}
+
+function ProgressLoadingCard({ label = 'Loading progress…' }) {
+  return (
+    <div className="rounded-2xl p-8 flex items-center justify-center gap-2 text-sm"
+      style={{ background: 'var(--wash)', color: C.textMute }} role="status">
+      <Loader2 size={17} className="animate-spin" /> {label}
+    </div>
+  );
+}
+
+function LeaderboardTable({ rows = [], loading, windowKey = 'overall', compact = false, failed = false }) {
+  if (loading) return <ProgressLoadingCard label="Loading rankings…" />;
+  // The caller renders the error and the retry; an empty-state card here would
+  // contradict it by asserting there is simply nobody to rank.
+  if (failed && !rows.length) return null;
+  if (!rows.length) {
+    // The week board ranks MEASURED movement, so it is legitimately empty until
+    // learners have a snapshot from 7 days ago. Saying "no ranked learners" there
+    // reads as "nobody is learning" rather than "we cannot compare yet".
+    const weekly = windowKey === 'week';
+    return (
+      <div className="rounded-2xl p-8 text-center" style={{ background: 'var(--wash)', color: C.textMute }}>
+        <Award size={30} className="mx-auto mb-2" style={{ color: C.primary }} />
+        <div className="font-bold" style={{ color: C.text }}>
+          {weekly ? 'No weekly movement to compare yet' : 'No ranked learners yet'}
+        </div>
+        <p className="mt-1 text-xs">
+          {weekly
+            ? 'This board compares each learner against their own progress 7 days ago, so it fills in once that history exists.'
+            : 'Complete an eligible learning milestone to start the board.'}
+        </p>
+      </div>
+    );
+  }
+  const shown = compact ? rows.slice(0, 5) : rows;
+  return (
+    <div className="overflow-x-auto rounded-2xl" style={{ border: `1px solid ${GLASS.borderSoft}` }}>
+      <table className="w-full text-left" style={{ minWidth: compact ? 560 : 760 }}>
+        <caption className="sr-only">Student progress leaderboard</caption>
+        <thead style={{ background: 'var(--wash)' }}>
+          <tr className="gh-label" style={{ color: C.textMute, fontSize: 10 }}>
+            <th scope="col" className="px-4 py-3">Rank</th>
+            <th scope="col" className="px-4 py-3">Learner</th>
+            <th scope="col" className="px-4 py-3">{windowKey === 'week' ? '7-day gain' : 'Overall'}</th>
+            <th scope="col" className="px-4 py-3">Milestones</th>
+            {!compact && <th scope="col" className="px-4 py-3">Track progress</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {shown.map((row, index) => {
+            // null = no 7-day baseline yet, which is NOT a zero gain. The week board
+            // excludes those learners server-side; overall still lists them, so render an em dash.
+            const measured = row.weekly_gain !== null && row.weekly_gain !== undefined;
+            const gain = measured ? Number(row.weekly_gain) : null;
+            return (
+              <tr key={`${row.rank}-${row.learner_label}-${index}`}
+                style={{ borderTop: `1px solid ${GLASS.borderSoft}`, background: row.is_current_user ? 'var(--status-info-bg)' : 'transparent' }}>
+                <td className="px-4 py-3.5 font-bold" style={{ color: Number(row.rank) <= 3 ? C.primary : C.textSoft }}>
+                  #{row.rank}
+                </td>
+                <th scope="row" className="px-4 py-3.5">
+                  <div className="flex items-center gap-2.5">
+                    <span className="w-8 h-8 rounded-full flex items-center justify-center text-[11px] font-extrabold"
+                      aria-hidden="true" style={{ background: 'var(--status-info-bg)', color: C.primary }}>{row.initials || 'L'}</span>
+                    <span className="font-bold" style={{ color: C.text }}>{row.learner_label}{row.is_current_user ? ' (You)' : ''}</span>
+                  </div>
+                </th>
+                <td className="px-4 py-3.5">
+                  {windowKey === 'week'
+                    ? (measured
+                        ? <span className="inline-flex items-center gap-1 font-bold" style={{ color: gain > 0 ? C.green : C.textMute }}>
+                            {gain > 0 ? <ArrowUp size={13} /> : <CircleOff size={13} />}{gain > 0 ? '+' : ''}{gain.toFixed(1)} pts
+                          </span>
+                        : <span className="font-bold" style={{ color: C.textMute }} title="No progress snapshot from 7 days ago yet">—</span>)
+                    : <span className="font-bold" style={{ color: C.text }}>{progressPercent(row.overall_score)}</span>}
+                </td>
+                <td className="px-4 py-3.5 text-xs" style={{ color: C.textSoft }}>
+                  {row.completed_milestones} / {row.total_milestones}
+                </td>
+                {!compact && (
+                  <td className="px-4 py-3.5">
+                    <div className="grid grid-cols-4 gap-1" aria-label="Track percentages">
+                      {Object.keys(PROGRESS_TRACK_UI).map((key) => (
+                        <span key={key} title={`${PROGRESS_TRACK_UI[key].label}: ${progressPercent(row[`${key}_score`])}`}
+                          className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--wash)' }}>
+                          <span className="block h-full" style={{ width: `${progressScore(row[`${key}_score`])}%`, background: C.primary }} />
+                        </span>
+                      ))}
+                    </div>
+                  </td>
+                )}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+const EMPTY_PROGRESS_FILTERS = Object.freeze({
+  plan: '', batch: '', track: '', min: '', max: '', inactivity: '', includeInactive: false,
+});
+
+function progressReportParams(filters, limit, offset) {
+  const numberOrNull = (value) => value === '' || value == null ? null : Number(value);
+  return {
+    p_plan_key: filters.plan || null,
+    p_batch_id: filters.batch || null,
+    p_track: filters.track || null,
+    p_completion_min: numberOrNull(filters.min),
+    p_completion_max: numberOrNull(filters.max),
+    p_inactive_days: numberOrNull(filters.inactivity),
+    p_include_inactive: !!filters.includeInactive,
+    p_limit: limit,
+    p_offset: offset,
+  };
+}
+
+function StaffProgressReport() {
+  const pageSize = 100;
+  const [draft, setDraft] = useState({ ...EMPTY_PROGRESS_FILTERS });
+  const [filters, setFilters] = useState({ ...EMPTY_PROGRESS_FILTERS });
+  const [rows, setRows] = useState([]);
+  const [batches, setBatches] = useState([]);
+  const [offset, setOffset] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [exporting, setExporting] = useState(false);
+  const [err, setErr] = useState('');
+
+  // ★ A request-sequence guard, not a boolean: changing a filter twice quickly can
+  //   land the SLOWER first response last and paint stale rows under the new filter.
+  //   Every other fetch in this feature already guards; this one did not.
+  const requestSeq = useRef(0);
+
+  const load = useCallback(async () => {
+    const seq = ++requestSeq.current;
+    setLoading(true); setErr('');
+    const { data, error } = await supabase.rpc('admin_student_progress_report', progressReportParams(filters, pageSize, offset));
+    if (seq !== requestSeq.current) return;   // a newer request has overtaken this one
+    if (error) setErr(appErrorMessage(error, 'Could not load the staff progress report.'));
+    else setRows(data || []);
+    setLoading(false);
+  }, [filters, offset]);
+
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    let cancelled = false;
+    supabase.rpc('admin_batch_overview').then(({ data, error }) => {
+      if (!cancelled && !error) setBatches(data || []);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  const total = Number(rows[0]?.total_count) || 0;
+  const average = Number(rows[0]?.cohort_average) || 0;
+  const attention = Number(rows[0]?.needs_attention_count) || 0;
+  const distribution = rows[0]?.completion_distribution || {};
+
+  function applyFilters(event) {
+    event.preventDefault();
+    setOffset(0);
+    setFilters({ ...draft });
+  }
+
+  async function exportCsv() {
+    setExporting(true); setErr('');
+    try {
+      const allRows = [];
+      let nextOffset = 0;
+      while (nextOffset < 10000) {
+        const { data, error } = await supabase.rpc('admin_student_progress_report', progressReportParams(filters, 200, nextOffset));
+        if (error) throw error;
+        const page = data || [];
+        allRows.push(...page);
+        nextOffset += page.length;
+        // Not `page.length < 200`: 200 is the server cap, so that spelling silently
+        // truncates the export the day anyone lowers it.
+        if (page.length === 0 || nextOffset >= Number(page[0]?.total_count || 0)) break;
+      }
+      const headers = [
+        'Name', 'Email', 'Plan', 'Batch', 'Access status', 'Overall progress',
+        'Completed milestones', 'Available milestones', 'Accounting foundations',
+        'QuickBooks mastery', 'Profile optimization', 'Interview readiness',
+        'Last trusted milestone', 'Needs attention', 'Public leaderboard visible',
+      ];
+      const csvRows = allRows.map((row) => ({
+        Name: row.full_name || '',
+        Email: row.email || '',
+        Plan: PLAN_LABELS[row.plan_key] || row.plan_key || '',
+        Batch: row.batch_code || '',
+        'Access status': row.access_status || '',
+        'Overall progress': progressPercent(row.overall_score),
+        'Completed milestones': row.completed_milestones,
+        'Available milestones': row.total_milestones,
+        'Accounting foundations': progressPercent(row.track_scores?.foundation),
+        'QuickBooks mastery': progressPercent(row.track_scores?.qbo),
+        'Profile optimization': progressPercent(row.track_scores?.profile),
+        'Interview readiness': progressPercent(row.track_scores?.interview),
+        'Last trusted milestone': row.last_milestone_at || '',
+        'Needs attention': row.needs_attention ? 'Yes' : 'No',
+        'Public leaderboard visible': row.public_visible ? 'Yes' : 'No',
+      }));
+      downloadFile(`\ufeff${toCsv(csvRows, headers)}`, `student-progress-${todayISODate()}.csv`, 'text/csv;charset=utf-8');
+    } catch (error) {
+      setErr(appErrorMessage(error, 'Could not export the progress report.'));
+    } finally { setExporting(false); }
+  }
+
+  const setFilter = (key, value) => setDraft((current) => ({ ...current, [key]: value }));
+
+  return (
+    <div className="space-y-5">
+      <div className="glass-card p-5 sm:p-6">
+        <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+          <div>
+            <div className="gh-label" style={{ color: C.primary, fontSize: 10 }}>Authorized Staff Report</div>
+            <h2 className="mt-1 text-xl font-bold" style={{ color: C.text }}>Learning operations</h2>
+            <p className="mt-1 text-sm max-w-2xl" style={{ color: C.textMute }}>
+              Private operational records include opted-out learners. Completion indicates learning progress, not assessment or job-placement success.
+            </p>
+          </div>
+          <button onClick={exportCsv} disabled={exporting || loading}
+            className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl font-bold text-sm disabled:opacity-50"
+            style={{ background: C.primarySolid, color: 'white' }}>
+            {exporting ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />} Export CSV
+          </button>
+        </div>
+
+        <form onSubmit={applyFilters} className="mt-5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          <label className="text-xs font-bold" style={{ color: C.textSoft }}>Plan
+            <select className="gh-input mt-1.5 w-full" value={draft.plan} onChange={(event) => setFilter('plan', event.target.value)}>
+              <option value="">All plans</option>
+              {ENROLLMENT_PLANS_FALLBACK.map((plan) => <option key={plan.key} value={plan.key}>{plan.name}</option>)}
+            </select>
+          </label>
+          <label className="text-xs font-bold" style={{ color: C.textSoft }}>Batch
+            <select className="gh-input mt-1.5 w-full" value={draft.batch} onChange={(event) => setFilter('batch', event.target.value)}>
+              <option value="">All batches</option>
+              {batches.map((batch) => <option key={batch.batch_id} value={batch.batch_id}>{batch.name} ({batch.code})</option>)}
+            </select>
+          </label>
+          <label className="text-xs font-bold" style={{ color: C.textSoft }}>Track needing work
+            <select className="gh-input mt-1.5 w-full" value={draft.track} onChange={(event) => setFilter('track', event.target.value)}>
+              <option value="">All tracks</option>
+              {Object.entries(PROGRESS_TRACK_UI).map(([key, track]) => <option key={key} value={key}>{track.label}</option>)}
+            </select>
+          </label>
+          <label className="text-xs font-bold" style={{ color: C.textSoft }}>No milestone for
+            <select className="gh-input mt-1.5 w-full" value={draft.inactivity} onChange={(event) => setFilter('inactivity', event.target.value)}>
+              <option value="">Any activity</option><option value="7">7+ days</option><option value="14">14+ days</option><option value="30">30+ days</option>
+            </select>
+          </label>
+          <label className="text-xs font-bold" style={{ color: C.textSoft }}>Minimum completion
+            <input className="gh-input mt-1.5 w-full" type="number" min="0" max="100" value={draft.min}
+              onChange={(event) => setFilter('min', event.target.value)} placeholder="0" />
+          </label>
+          <label className="text-xs font-bold" style={{ color: C.textSoft }}>Maximum completion
+            <input className="gh-input mt-1.5 w-full" type="number" min="0" max="100" value={draft.max}
+              onChange={(event) => setFilter('max', event.target.value)} placeholder="100" />
+          </label>
+          <label className="flex items-center gap-2 self-end min-h-[42px] text-xs font-bold" style={{ color: C.textSoft }}>
+            <input type="checkbox" checked={draft.includeInactive}
+              onChange={(event) => setFilter('includeInactive', event.target.checked)} /> Include expired history
+          </label>
+          <div className="flex gap-2 self-end">
+            <button type="submit" className="flex-1 px-4 py-2.5 rounded-xl text-sm font-bold text-white" style={{ background: C.primarySolid }}>
+              <Filter size={15} className="inline mr-1.5" /> Apply
+            </button>
+            <button type="button" aria-label="Reset report filters" onClick={() => {
+              setDraft({ ...EMPTY_PROGRESS_FILTERS }); setFilters({ ...EMPTY_PROGRESS_FILTERS }); setOffset(0);
+            }} className="px-3 rounded-xl" style={{ border: `1px solid ${GLASS.borderSoft}`, color: C.textSoft }}>
+              <RotateCcw size={15} />
+            </button>
+          </div>
+        </form>
+      </div>
+
+      {err && <AdminNotice kind="danger">{err}</AdminNotice>}
+
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <StatCard label="Filtered learners" value={total} sub="Operational records" icon={Users} />
+        <StatCard label="Cohort average" value={progressPercent(average)} sub="Normalized progress" icon={Activity} />
+        <StatCard label="Needs attention" value={attention} sub="14+ days without progress" icon={AlertTriangle} />
+        <StatCard label="Completed" value={Number(distribution.complete) || 0} sub="Reached all eligible milestones" icon={CheckCircle2} />
+      </div>
+
+      <div className="glass-card overflow-hidden">
+        {loading ? <div className="p-5"><ProgressLoadingCard label="Loading student records…" /></div> : (rows.length === 0 && !err) ? (
+          <div className="p-10 text-center" style={{ color: C.textMute }}>No students match these filters.</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left" style={{ minWidth: 940 }}>
+              <caption className="sr-only">Private staff student progress report</caption>
+              <thead style={{ background: 'var(--wash)' }}><tr className="gh-label" style={{ color: C.textMute, fontSize: 10 }}>
+                <th scope="col" className="px-4 py-3">Student</th><th scope="col" className="px-4 py-3">Plan / Batch</th>
+                <th scope="col" className="px-4 py-3">Overall</th><th scope="col" className="px-4 py-3">Tracks</th>
+                <th scope="col" className="px-4 py-3">Last milestone</th><th scope="col" className="px-4 py-3">Status</th>
+              </tr></thead>
+              <tbody>{rows.map((row) => (
+                <tr key={row.user_id} style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
+                  <th scope="row" className="px-4 py-3.5"><div className="font-bold" style={{ color: C.text }}>{row.full_name || 'Unnamed learner'}</div>
+                    <div className="text-xs" style={{ color: C.textMute }}>{row.email}</div></th>
+                  <td className="px-4 py-3.5 text-xs" style={{ color: C.textSoft }}><div>{PLAN_LABELS[row.plan_key] || row.plan_key}</div><div>{row.batch_code || 'No batch'}</div></td>
+                  <td className="px-4 py-3.5"><div className="font-bold" style={{ color: C.text }}>{progressPercent(row.overall_score)}</div>
+                    <div className="text-[11px]" style={{ color: C.textMute }}>{row.completed_milestones}/{row.total_milestones} milestones</div></td>
+                  <td className="px-4 py-3.5"><div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]" style={{ color: C.textSoft }}>
+                    {Object.entries(PROGRESS_TRACK_UI).map(([key, track]) => <span key={key}>{track.label.split(' ')[0]} {progressPercent(row.track_scores?.[key])}</span>)}
+                  </div></td>
+                  <td className="px-4 py-3.5 text-xs" style={{ color: C.textSoft }}>{progressDate(row.last_milestone_at)}</td>
+                  <td className="px-4 py-3.5"><span className="inline-flex px-2 py-1 rounded-full text-[10px] font-bold"
+                    style={{ background: row.needs_attention ? 'var(--status-warn-bg)' : 'var(--status-ok-bg)', color: row.needs_attention ? 'var(--status-warn-fg)' : 'var(--status-ok-fg)' }}>
+                    {row.needs_attention ? 'Needs attention' : row.access_status}
+                  </span></td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {total > pageSize && <div className="flex items-center justify-between gap-3">
+        <span className="text-xs" style={{ color: C.textMute }}>Showing {offset + 1}–{Math.min(offset + pageSize, total)} of {total}</span>
+        <div className="flex gap-2"><button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - pageSize))}
+          className="px-3 py-2 rounded-xl text-xs font-bold disabled:opacity-40" style={{ border: `1px solid ${GLASS.borderSoft}`, color: C.text }}>Previous</button>
+          <button disabled={offset + pageSize >= total} onClick={() => setOffset(offset + pageSize)}
+            className="px-3 py-2 rounded-xl text-xs font-bold disabled:opacity-40" style={{ border: `1px solid ${GLASS.borderSoft}`, color: C.text }}>Next</button></div>
+      </div>}
+    </div>
+  );
+}
+
+function ProgressRankings({ goto }) {
+  const { user, profile, staff, staffReady, staffDegraded, can } = useAuth();
+  const canReadReport = staffDegraded ? !!profile?.is_admin : (staffReady && can('student_progress.read'));
+  const [view, setView] = useState('learner');
+  const [summary, setSummary] = useState(null);
+  const [summaryLoading, setSummaryLoading] = useState(true);
+  const [summaryErr, setSummaryErr] = useState('');
+  const [setupMissing, setSetupMissing] = useState(false);
+  const [setupDetail, setSetupDetail] = useState(null);   // shown to admins so the card is self-diagnosing
+  const [scope, setScope] = useState('my_plan');
+  const [windowKey, setWindowKey] = useState('overall');
+  const [rows, setRows] = useState([]);
+  const [boardLoading, setBoardLoading] = useState(true);
+  const [boardErr, setBoardErr] = useState('');
+  const [offset, setOffset] = useState(0);
+  const [refreshVersion, setRefreshVersion] = useState(0);
+  const [privacySaving, setPrivacySaving] = useState(false);
+  const scopeTouched = useRef(false);
+  const autoSwitched = useRef(false);
+  const summarySeq = useRef(0);
+  // Read for error classification only. As a useCallback dep it re-created loadSummary
+  // when the staff context resolved, so every staff mount fetched the summary twice.
+  const isStaffRef = useRef(false);
+  const pageSize = 25;
+
+  // A staff account with no enrolment is refused my_student_progress with 42501, so a
+  // null summary IS "not a learner here" - and unlike the old test, it is a fact we
+  // actually have. That test read staff.hasPaidPlan, which the staff context has never
+  // carried: it resolved to undefined, so the condition was unconditionally true and
+  // every Super/Operations Admin landed on the staff report - including one who is also
+  // a paying learner opening their own progress page. Latched, so "Learner view" sticks.
+  useEffect(() => {
+    if (autoSwitched.current || summaryLoading) return;
+    // Arm the latch once the summary has settled, either way. Arming it only in the
+    // !summary branch left the effect live all session for a staff member who IS a
+    // learner, so a later failed reload (which sets summary=null) would yank them
+    // out of Learner view into the Staff report mid-session.
+    if (!canReadReport || !staff?.isStaff) return;
+    autoSwitched.current = true;
+    if (!summary) setView('staff');
+  }, [canReadReport, staff?.isStaff, summary, summaryLoading]);
+
+  useEffect(() => { isStaffRef.current = !!staff?.isStaff; }, [staff?.isStaff]);
+
+  const loadSummary = useCallback(async () => {
+    if (!user?.id) { setSummaryLoading(false); return; }
+    const seq = ++summarySeq.current;
+    setSummaryLoading(true); setSummaryErr('');
+    const { data, error } = await supabase.rpc('my_student_progress');
+    if (seq !== summarySeq.current) return;   // a newer load started; this answer is stale
+    if (error) {
+      // 42501 = the RPC exists but this caller may not run it. For a staff account
+      // with no enrollment that is the correct answer and the card below explains it;
+      // for anyone else it is a real fault, so it must not be swallowed.
+      if (isMigrationMissing(error)) { setSetupMissing(true); setSetupDetail(error); }
+      else if (error.code !== '42501' || !isStaffRef.current) {
+        setSummaryErr(appErrorMessage(error, 'Could not load your progress.'));
+      }
+      setSummary(null);
+      if (!scopeTouched.current) setScope('all');
+    } else {
+      setSetupMissing(false); setSetupDetail(null);
+      setSummary(data || null);
+      if (!scopeTouched.current && data?.default_scope) setScope(data.default_scope);
+    }
+    setSummaryLoading(false);
+  }, [user?.id]);
+
+  useEffect(() => { loadSummary(); }, [loadSummary, refreshVersion]);
+  // Each event costs a full-population my_student_progress + student_leaderboard pair,
+  // and marking several lessons complete in a row fires one event each. Coalesce them.
+  useEffect(() => {
+    let timer = null;
+    const refresh = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => setRefreshVersion((version) => version + 1), 400);
+    };
+    window.addEventListener(STUDENT_PROGRESS_CHANGE_EVENT, refresh);
+    return () => {
+      if (timer) clearTimeout(timer);
+      window.removeEventListener(STUDENT_PROGRESS_CHANGE_EVENT, refresh);
+    };
+  }, []);
+
+  const scopeOptions = useMemo(() => {
+    if (summary) return progressScopeOptions({
+      planKey: summary.plan_key,
+      hasCurrentBatch: !!summary.batch_id,
+    });
+    return LEADERBOARD_SCOPES.filter((option) => ['general', 'vip', 'all'].includes(option.key));
+    // Depend on `summary` itself, not only its fields: the body branches on it, and a
+    // null -> object transition where both fields are undefined would otherwise keep
+    // the stale signed-out fallback.
+  }, [summary, summary?.plan_key, summary?.batch_id]);
+
+  useEffect(() => {
+    if (!scopeOptions.some((option) => option.key === scope)) {
+      setScope(scopeOptions[0]?.key || 'all');
+      setOffset(0);
+    }
+  }, [scope, scopeOptions]);
+
+  useEffect(() => {
+    // Wait for the summary: it supplies default_scope and batch_id, so firing early
+    // means one wasted full-population call plus another when the scope is normalised.
+    if (setupMissing || !user?.id || !scope) { setBoardLoading(false); return; }
+    if (summaryLoading) return;
+    let cancelled = false;
+    setBoardLoading(true); setBoardErr('');
+    supabase.rpc('student_leaderboard', {
+      p_scope: scope,
+      p_batch_id: scope === 'my_batch' ? (summary?.batch_id || null) : null,
+      p_window: windowKey,
+      p_limit: pageSize,
+      p_offset: offset,
+    }).then(({ data, error }) => {
+      if (cancelled) return;
+      if (error) {
+        if (isMigrationMissing(error)) { setSetupMissing(true); setSetupDetail(error); }
+        else setBoardErr(appErrorMessage(error, 'Could not load this leaderboard.'));
+        // Deliberately NOT setRows([]): an empty list renders the authoritative "No
+        // ranked learners yet" card, telling a member nobody in their cohort has made
+        // progress when in truth the request simply failed. Keep the last good page;
+        // the notice above the table carries the failure and the retry.
+      } else setRows(data || []);
+      setBoardLoading(false);
+    });
+    return () => { cancelled = true; };
+    // refreshVersion is deliberately NOT a dependency. It already re-runs loadSummary,
+    // which drives summaryLoading false->true->false, and that transition is what re-runs
+    // this effect. Listing it here fired a full-population student_leaderboard against the
+    // stale summaryLoading===false before the summary reload had set it true - an entire
+    // extra population scan per refresh, cancelled on arrival and thrown away.
+  }, [user?.id, scope, windowKey, offset, summary?.batch_id, setupMissing, summaryLoading]);
+
+  const total = Number(rows[0]?.total_count) || 0;
+  const tracks = summary?.tracks || {};
+  const recommended = Object.entries(PROGRESS_TRACK_UI)
+    .map(([key, definition]) => ({ key, ...definition, ...tracks[key] }))
+    .filter((track) => track.in_plan !== false && Number(track.total) > 0 && progressScore(track.score) < 100)
+    .sort((left, right) => progressScore(left.score) - progressScore(right.score))[0] || null;
+
+  async function setVisibility() {
+    if (!summary || privacySaving) return;
+    const next = !summary.public_visible;
+    setPrivacySaving(true); setSummaryErr('');
+    const { data, error } = await supabase.rpc('set_leaderboard_visibility', { p_visible: next });
+    if (error) setSummaryErr(appErrorMessage(error, 'Could not update leaderboard privacy.'));
+    else {
+      setSummary((current) => ({ ...current, public_visible: data !== false, private_rank: data === false ? null : current.private_rank }));
+      setRefreshVersion((version) => version + 1);
+    }
+    setPrivacySaving(false);
+  }
+
+  const selectScope = (next) => {
+    scopeTouched.current = true; setScope(next); setOffset(0);
+  };
+  const selectWindow = (next) => { setWindowKey(next); setOffset(0); };
+
+  return (
+    <div>
+      <SectionHead eyebrow="Learning Analytics" title="Progress & Rankings"
+        desc="Track eligible course milestones, compare fairly with peers, and choose your next learning action. Progress is motivational—not an exam grade or job-success measure." gold />
+
+      {canReadReport && (
+        <div className="mt-5 inline-flex p-1 rounded-xl" role="tablist" aria-label="Progress view"
+          style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+          <button role="tab" aria-selected={view === 'learner'} onClick={() => setView('learner')}
+            className="px-4 py-2 rounded-lg text-xs font-bold transition"
+            style={view === 'learner' ? { background: C.primarySolid, color: 'white' } : { color: C.textSoft }}>Learner view</button>
+          <button role="tab" aria-selected={view === 'staff'} onClick={() => setView('staff')}
+            className="px-4 py-2 rounded-lg text-xs font-bold transition"
+            style={view === 'staff' ? { background: C.primarySolid, color: 'white' } : { color: C.textSoft }}>Staff report</button>
+        </div>
+      )}
+
+      {view === 'staff' && canReadReport ? <div className="mt-5"><StaffProgressReport /></div> : (
+        <div className="mt-5 space-y-5">
+          {setupMissing ? (
+            <div className="glass-card p-8 text-center">
+              <Database size={38} className="mx-auto mb-3" style={{ color: C.primary }} />
+              <h2 className="text-xl font-bold" style={{ color: C.text }}>Progress reporting is being set up</h2>
+              <p className="mt-2 text-sm max-w-xl mx-auto" style={{ color: C.textMute }}>
+                Rankings fail closed until database migration #52 is applied. Existing course progress remains safe.
+              </p>
+              {!!profile?.is_admin && (
+                <div className="mt-3 text-xs" style={{ color: C.textMute }}>
+                  <code className="inline-block">db/2026-09-01-student-progress-rankings.sql</code>
+                  {/* The raw code, so the next occurrence is diagnosable without a DevTools trip.
+                      PGRST202 = the function is genuinely absent; anything else reaching this card
+                      means the classifier is too broad again. */}
+                  {!!setupDetail && (
+                    <div className="mt-2 break-all" style={{ fontFamily: fontMono, color: C.textMute }}>
+                      {setupDetail.code || 'no code'} — {String(setupDetail.message || '').slice(0, 200)}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          ) : (
+            <>
+              {summaryErr && <AdminNotice kind="danger">{summaryErr}</AdminNotice>}
+              {summaryLoading ? <ProgressLoadingCard /> : summary ? (
+                <>
+                  <section className="grid grid-cols-1 lg:grid-cols-[minmax(0,1.35fr),minmax(280px,0.65fr)] gap-4" aria-labelledby="my-progress-title">
+                    <div className="glass-card p-6 sm:p-7">
+                      <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+                        <div>
+                          <div className="gh-label" style={{ color: C.primary, fontSize: 10 }}>My Learning Report</div>
+                          <h2 id="my-progress-title" className="mt-1 text-2xl font-bold" style={{ color: C.text }}>Overall Progress</h2>
+                          <p className="mt-1 text-sm" style={{ color: C.textMute }}>
+                            {summary.completed_milestones} of {summary.total_milestones} eligible milestones completed
+                          </p>
+                        </div>
+                        <div className="sm:text-right">
+                          <div className="gh-bignum" style={{ color: C.primary, fontSize: 42 }}>{progressPercent(summary.overall_score)}</div>
+                          <div className="text-xs font-bold" style={{ color: C.textSoft }}>
+                            {summary.private_rank ? `Rank #${summary.private_rank}` : summary.public_visible ? 'Rank appears after a milestone' : 'Hidden from public ranks'}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="mt-5"><ProgressBar value={summary.overall_score} label="Overall learning progress" /></div>
+                      <div className="mt-5 grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        <div className="rounded-xl p-3" style={{ background: 'var(--wash)' }}><div className="text-[10px] gh-label" style={{ color: C.textMute }}>7-day change</div>
+                          {/* null = never measured over a week. Showing 0.0 would invent a number. */}
+                          {summary.weekly_gain === null || summary.weekly_gain === undefined
+                            ? <div className="mt-1 font-bold" style={{ color: C.textMute }} title="We compare against a snapshot from 7 days ago. Yours starts once you have one.">&mdash; <span className="text-[11px] font-semibold">New</span></div>
+                            : <div className="mt-1 font-bold" style={{ color: Number(summary.weekly_gain) > 0 ? C.green : C.text }}>{Number(summary.weekly_gain) > 0 ? '+' : ''}{Number(summary.weekly_gain).toFixed(1)} pts</div>}</div>
+                        <div className="rounded-xl p-3" style={{ background: 'var(--wash)' }}><div className="text-[10px] gh-label" style={{ color: C.textMute }}>Plan</div>
+                          <div className="mt-1 font-bold text-sm" style={{ color: C.text }}>{PLAN_LABELS[summary.plan_key] || summary.plan_key}</div></div>
+                        <div className="rounded-xl p-3" style={{ background: 'var(--wash)' }}><div className="text-[10px] gh-label" style={{ color: C.textMute }}>Batch</div>
+                          <div className="mt-1 font-bold text-sm" style={{ color: C.text }}>{summary.batch_code || 'Not applicable'}</div></div>
+                        <div className="rounded-xl p-3" style={{ background: 'var(--wash)' }}><div className="text-[10px] gh-label" style={{ color: C.textMute }}>Last milestone</div>
+                          <div className="mt-1 font-bold text-sm" style={{ color: C.text }}>{progressDate(summary.last_milestone_at)}</div></div>
+                      </div>
+                    </div>
+
+                    <aside className="glass-card p-6">
+                      <div className="flex items-center gap-2"><Target size={18} style={{ color: C.primary }} /><h2 className="font-bold" style={{ color: C.text }}>Recommended next</h2></div>
+                      {recommended ? <>
+                        <p className="mt-3 text-lg font-bold" style={{ color: C.text }}>{recommended.label}</p>
+                        <p className="mt-1 text-sm" style={{ color: C.textMute }}>
+                          {recommended.completed} of {recommended.total} milestones completed. Continue your least-complete available track.
+                        </p>
+                        <button onClick={() => goto(recommended.tab)} className="mt-4 w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold text-white"
+                          style={{ background: C.primarySolid }}>Continue learning <ArrowRight size={15} /></button>
+                      </> : <p className="mt-3 text-sm" style={{ color: C.textMute }}>You have completed every milestone currently available under your plan.</p>}
+                      <div className="mt-5 pt-5" style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
+                        <div className="flex items-start justify-between gap-3">
+                          <div><div className="text-xs font-bold" style={{ color: C.text }}>Show me on public leaderboards</div>
+                            <p className="mt-1 text-[11px] leading-relaxed" style={{ color: C.textMute }}>Only your first name and last initial are shown. Your private report remains available when hidden.</p></div>
+                          <button type="button" role="switch" aria-checked={summary.public_visible} aria-label="Show me on public leaderboards"
+                            onClick={setVisibility} disabled={privacySaving} className="relative flex-shrink-0 rounded-full transition disabled:opacity-50"
+                            style={{ width: 42, height: 24, background: summary.public_visible ? C.primary : 'var(--status-neutral-bd)' }}>
+                            <span className="absolute top-1 rounded-full bg-white shadow transition-transform"
+                              style={{ width: 16, height: 16, left: 4, transform: summary.public_visible ? 'translateX(18px)' : 'translateX(0)' }} />
+                          </button>
+                        </div>
+                      </div>
+                    </aside>
+                  </section>
+
+                  <section className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3" aria-label="Track progress">
+                    {STUDENT_PROGRESS_TRACKS.map((definition) => {
+                      const track = tracks[definition.key] || {}; const ui = PROGRESS_TRACK_UI[definition.key]; const Icon = ui.icon;
+                      // in_plan is a PLAN fact from the server; total === 0 is a CONTENT fact.
+                      // Conflating them told a full-access member that a track they paid for was
+                      // outside their plan whenever nothing was published in it yet.
+                      const outOfPlan = track.in_plan === false;
+                      const empty = !outOfPlan && Number(track.total) === 0;
+                      const unavailable = outOfPlan || empty;
+                      return <article key={definition.key} className="glass-card p-5">
+                        <div className="flex items-start justify-between gap-3"><span className="w-9 h-9 rounded-xl flex items-center justify-center" style={{ background: 'var(--status-info-bg)', color: C.primary }}><Icon size={17} /></span>
+                          <span className="text-[10px] font-bold" style={{ color: C.textMute }}>{definition.weight}% weight</span></div>
+                        <h3 className="mt-4 font-bold" style={{ color: C.text }}>{definition.label}</h3>
+                        <div className="mt-1 text-xs" style={{ color: C.textMute }}>{outOfPlan ? 'Not included in your current plan' : empty ? 'No published content yet' : `${track.completed} of ${track.total} milestones`}</div>
+                        <div className="mt-4 flex items-center gap-3"><ProgressBar value={track.score} label={`${definition.label} progress`} compact />
+                          <span className="text-xs font-bold" style={{ color: unavailable ? C.textMute : C.text }}>{unavailable ? '—' : progressPercent(track.score)}</span></div>
+                      </article>;
+                    })}
+                  </section>
+
+                  <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                    <div className="glass-card p-6"><div className="flex items-center gap-2 mb-4"><TrendingUp size={18} style={{ color: C.primary }} /><h2 className="font-bold" style={{ color: C.text }}>Daily progress trend</h2></div>
+                      <ProgressTrend points={summary.daily_trend} /></div>
+                    <div className="glass-card p-6"><div className="flex items-center gap-2 mb-4"><CheckCheck size={18} style={{ color: C.primary }} /><h2 className="font-bold" style={{ color: C.text }}>Recent milestones</h2></div>
+                      {(summary.recent_milestones || []).length ? <ul className="space-y-3">{summary.recent_milestones.map((item, index) => <li key={`${item.track}-${item.completed_at}-${index}`} className="flex items-start gap-3">
+                        <CheckCircle2 size={16} className="mt-0.5 flex-shrink-0" style={{ color: C.green }} /><div><div className="text-sm font-bold" style={{ color: C.text }}>{item.title}</div>
+                          <div className="text-[11px]" style={{ color: C.textMute }}>{PROGRESS_TRACK_UI[item.track]?.label || item.track} · {progressDate(item.completed_at)}</div></div></li>)}</ul>
+                        : <p className="text-sm" style={{ color: C.textMute }}>Your latest completed course milestones will appear here.</p>}
+                    </div>
+                  </section>
+                </>
+              ) : (
+                <div className="glass-card p-6 flex items-start gap-3"><Info size={20} style={{ color: C.primary }} />
+                  <div><h2 className="font-bold" style={{ color: C.text }}>Public learning boards</h2><p className="mt-1 text-sm" style={{ color: C.textMute }}>{staff?.isStaff
+                    ? 'This staff account has no active student enrollment, so no private learner report is shown. You can still view the same privacy-safe boards learners see.'
+                    : 'Your private learner report is not available right now. The public boards below are unaffected.'}</p></div>
+                </div>
+              )}
+
+              <section className="glass-card p-5 sm:p-6" aria-labelledby="leaderboard-title">
+                <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
+                  <div><div className="gh-label" style={{ color: C.primary, fontSize: 10 }}>Peer Progress</div><h2 id="leaderboard-title" className="mt-1 text-xl font-bold" style={{ color: C.text }}>Leaderboard</h2>
+                    <p className="mt-1 text-xs" style={{ color: C.textMute }}>Dense ranks use normalized completion only. Equal scores and milestone counts share a rank.</p></div>
+                  <div className="inline-flex p-1 rounded-xl self-start" style={{ background: 'var(--wash)' }}>
+                    <button onClick={() => selectWindow('overall')} className="px-3 py-2 rounded-lg text-xs font-bold" style={windowKey === 'overall' ? { background: C.primarySolid, color: 'white' } : { color: C.textSoft }}>Overall</button>
+                    <button onClick={() => selectWindow('week')} className="px-3 py-2 rounded-lg text-xs font-bold" style={windowKey === 'week' ? { background: C.primarySolid, color: 'white' } : { color: C.textSoft }}>Most improved</button>
+                  </div>
+                </div>
+                <div className="mt-4 flex gap-2 overflow-x-auto pb-1" role="tablist" aria-label="Leaderboard scope">
+                  {scopeOptions.map((option) => <button key={option.key} role="tab" aria-selected={scope === option.key} onClick={() => selectScope(option.key)}
+                    className="whitespace-nowrap px-3.5 py-2 rounded-xl text-xs font-bold transition"
+                    style={scope === option.key ? { background: 'var(--status-info-bg)', color: C.primary, border: '1px solid var(--status-info-bd)' } : { color: C.textSoft, border: `1px solid ${GLASS.borderSoft}` }}>
+                    {option.label}
+                  </button>)}
+                </div>
+                {boardErr && (
+                  <AdminNotice kind="danger">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <span>{boardErr}</span>
+                      <button
+                        type="button"
+                        onClick={() => setRefreshVersion((version) => version + 1)}
+                        className="rounded-lg px-3 py-1.5 text-xs font-bold shrink-0"
+                        style={{ background: 'var(--wash-strong)', color: C.text, border: '1px solid ' + GLASS.border }}
+                      >Retry</button>
+                    </div>
+                  </AdminNotice>
+                )}
+                <div className="mt-4"><LeaderboardTable rows={rows} loading={boardLoading} windowKey={windowKey} failed={!!boardErr} /></div>
+                {total > pageSize && <div className="mt-4 flex items-center justify-between gap-3"><span className="text-xs" style={{ color: C.textMute }}>Showing {offset + 1}–{Math.min(offset + pageSize, total)} of {total}</span>
+                  <div className="flex gap-2"><button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - pageSize))} className="px-3 py-2 rounded-xl text-xs font-bold disabled:opacity-40" style={{ border: `1px solid ${GLASS.borderSoft}`, color: C.text }}>Previous</button>
+                    <button disabled={offset + pageSize >= total} onClick={() => setOffset(offset + pageSize)} className="px-3 py-2 rounded-xl text-xs font-bold disabled:opacity-40" style={{ border: `1px solid ${GLASS.borderSoft}`, color: C.text }}>Next</button></div></div>}
+              </section>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CoaGenerator() {
   const [industry, setIndustry] = useState(INDUSTRIES[0]);
   const [entity, setEntity] = useState('LLC');
@@ -14317,14 +15185,57 @@ function CoaGenerator() {
 // ═══════════════════════════════════════════════════════════════════
 
 function Course() {
+  const { user } = useAuth();
   const [openIdx, setOpenIdx] = useState(0);
   const [completed, setCompleted] = useState(new Set());
   const [revealAnswer, setRevealAnswer] = useState(new Set());
+  const [progressLoading, setProgressLoading] = useState(true);
+  const [progressSaving, setProgressSaving] = useState(new Set());
+  const [progressErr, setProgressErr] = useState('');
 
-  const toggleComplete = (i) => {
+  useEffect(() => {
+    if (!user?.id) { setProgressLoading(false); return; }
+    let cancelled = false;
+    (async () => {
+      // `completed` is a flag, not row existence — un-completing keeps the row so
+      // completed_at (the FIRST completion) cannot be re-minted. Filter on it, or an
+      // un-checked module comes back checked on the next load.
+      const { data, error } = await supabase.from('student_foundation_completions')
+        .select('milestone_key').eq('user_id', user.id).eq('completed', true);
+      if (cancelled) return;
+      if (error) setProgressErr(isMigrationMissing(error)
+        ? 'Progress saving is not configured yet. Run database migration #52.'
+        : appErrorMessage(error, 'Could not load Accounting Foundations progress.'));
+      else setCompleted(new Set((data || []).map(row => row.milestone_key)));
+      setProgressLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [user?.id]);
+
+  const toggleComplete = async (module) => {
+    const key = module.milestoneKey;
+    if (!key || progressSaving.has(key)) return;
+    const nextDone = !completed.has(key);
     const next = new Set(completed);
-    if (next.has(i)) next.delete(i); else next.add(i);
+    if (nextDone) next.add(key); else next.delete(key);
     setCompleted(next);
+    setProgressSaving(prev => new Set(prev).add(key));
+    setProgressErr('');
+    const { error } = await supabase.rpc('set_foundation_milestone', {
+      p_milestone_key: key,
+      p_completed: nextDone,
+    });
+    if (error) {
+      setCompleted(prev => {
+        const reverted = new Set(prev);
+        if (nextDone) reverted.delete(key); else reverted.add(key);
+        return reverted;
+      });
+      setProgressErr(appErrorMessage(error, 'Could not save this module.'));
+    } else if (typeof window !== 'undefined') window.dispatchEvent(new Event(STUDENT_PROGRESS_CHANGE_EVENT));
+    setProgressSaving(prev => {
+      const settled = new Set(prev); settled.delete(key); return settled;
+    });
   };
   const toggleAnswer = (i) => {
     const next = new Set(revealAnswer);
@@ -14353,20 +15264,24 @@ function Course() {
             <div className="absolute inset-0 shimmer" />
           </div>
         </div>
+        {progressLoading && <div className="mt-3 text-xs" style={{ color: C.textMute }}>Loading saved progress…</div>}
+        {progressErr && <div className="mt-3 text-xs" role="alert" style={{ color: C.red }}>{progressErr}</div>}
       </div>
 
       <div className="mt-6 space-y-3">
         {COURSE_MODULES.map((m, i) => {
           const open = openIdx === i;
-          const done = completed.has(i);
+          const done = completed.has(m.milestoneKey);
+          const saving = progressSaving.has(m.milestoneKey);
           const shown = revealAnswer.has(i);
           return (
-            <div key={i} className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm transition-all hover:shadow-md">
+            <div key={m.milestoneKey} className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm transition-all hover:shadow-md">
               <button onClick={() => setOpenIdx(open ? -1 : i)}
                 className="w-full px-6 py-4 flex items-center gap-4 text-left">
-                <button onClick={(e) => { e.stopPropagation(); toggleComplete(i); }}
-                  className="flex-shrink-0 transition-transform hover:scale-110">
-                  {done
+                <button onClick={(e) => { e.stopPropagation(); toggleComplete(m); }} disabled={saving || progressLoading}
+                  aria-label={`${done ? 'Mark incomplete' : 'Mark complete'}: ${m.title}`}
+                  className="flex-shrink-0 transition-transform hover:scale-110 disabled:opacity-60">
+                  {saving ? <Loader2 size={26} className="animate-spin" style={{ color: ROYAL }} /> : done
                     ? <CheckCircle2 size={26} style={{ color: ROYAL }} />
                     : <Circle size={26} className="text-slate-300" />}
                 </button>
@@ -14436,7 +15351,10 @@ function parseVideoUrl(url) {
   if (!url) return { provider: null, embedUrl: null };
   const u = String(url).trim();
   const yt = u.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/|v\/)|youtu\.be\/)([\w-]{11})/);
-  if (yt) return { provider: 'youtube', embedUrl: `https://www.youtube.com/embed/${yt[1]}` };
+  // youtube-nocookie serves the same video without the advertising cookie/identifier
+  // calls. Measured on a paid lesson page, the plain youtube.com embed issued requests
+  // to googleads.g.doubleclick.net, jnn-pa.googleapis.com and youtubei log_event.
+  if (yt) return { provider: 'youtube', embedUrl: `https://www.youtube-nocookie.com/embed/${yt[1]}` };
   const vm = u.match(/vimeo\.com\/(?:video\/)?(\d+)/);
   if (vm) return { provider: 'vimeo', embedUrl: `https://player.vimeo.com/video/${vm[1]}` };
   return { provider: 'mp4', embedUrl: u };
@@ -16056,22 +16974,12 @@ function CourseProgram({
     if (!lesson) return;
     if (doneIds.has(lesson.id)) { goAdjacent(lesson, 1); return; }
     try {
-      const { error } = await supabase.from('lesson_progress').upsert(
-        { user_id: user.id, lesson_id: lesson.id, course_id: course.id },
-        { onConflict: 'user_id,lesson_id', ignoreDuplicates: true }
-      );
+      const { data, error } = await supabase.rpc('complete_course_lesson', { p_lesson_id: lesson.id });
       if (error) throw error;
+      if (typeof window !== 'undefined') window.dispatchEvent(new Event(STUDENT_PROGRESS_CHANGE_EVENT));
       const next = new Set(doneIds); next.add(lesson.id); setDoneIds(next);
-      const newCount = allLessons.filter(l => next.has(l.id)).length;
-      if (totalLessons > 0 && newCount === totalLessons && !completion) {
-        const { error: cErr } = await supabase.from('course_completions').upsert(
-          { user_id: user.id, course_id: course.id },
-          { onConflict: 'user_id,course_id', ignoreDuplicates: true }
-        );
-        if (cErr) throw cErr;
-        const { data: c2 } = await supabase.from('course_completions').select(COURSE_COMPLETION_SELECT)
-          .eq('user_id', user.id).eq('course_id', course.id).maybeSingle();
-        setCompletion(c2 || { completed_at: new Date().toISOString() });
+      if (data?.course_completed_at && !completion) {
+        setCompletion({ user_id: user.id, course_id: course.id, completed_at: data.course_completed_at });
       }
       goAdjacent(lesson, 1);
     } catch (e) {
@@ -17364,12 +18272,25 @@ function CourseCatalog({
       window.removeEventListener(APP_ROUTE_CHANGE_EVENT, onRoute);
     };
   }, [catalogTabId]);
-  // Close the ⋮ menu on Escape while one is open.
+  // Close the ⋮ menu on Escape, or on a pointerdown anywhere outside it.
+  // ★ The outside-click half is the house document-level idiom (AccountMenu's), NOT a
+  //   `fixed inset-0` catcher. A catcher rendered inside a tab is laid out against the
+  //   .fade-in TabPanel's transform rather than the viewport, so it does not cover the
+  //   sidebar and the menu survives a click on the nav.
   useEffect(() => {
     if (!menuOpenId) return;
     const onKey = (e) => { if (e.key === 'Escape') setMenuOpenId(null); };
+    const onDown = (e) => {
+      const t = e.target;
+      if (t && typeof t.closest === 'function' && t.closest('[data-course-menu]')) return;
+      setMenuOpenId(null);
+    };
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    document.addEventListener('pointerdown', onDown);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      document.removeEventListener('pointerdown', onDown);
+    };
   }, [menuOpenId]);
 
   async function loadCatalog() {
@@ -17742,15 +18663,19 @@ function CourseCatalog({
                     assigned to them; courses_staff_update re-decides every write. */}
                 {canManage(c) && (
                   <>
-                    <button title="Course options" aria-label="Course options" aria-haspopup="menu" aria-expanded={menuOpen} disabled={busy}
+                    <button data-course-menu={c.id} title="Course options" aria-label="Course options" aria-haspopup="menu" aria-expanded={menuOpen} disabled={busy}
                       onClick={() => setMenuOpenId(menuOpen ? null : c.id)}
                       className="absolute top-2 right-2 z-10 p-1.5 rounded-lg bg-white/90 backdrop-blur border border-slate-200 text-slate-600 hover:bg-white shadow-sm disabled:opacity-50">
                       <MoreVertical size={16} />
                     </button>
                     {menuOpen && (
                       <>
-                        <div className="fixed inset-0 z-40" aria-hidden="true" onClick={() => setMenuOpenId(null)} />
-                        <div role="menu" aria-label="Course options" className="absolute top-11 right-2 z-50 w-48 rounded-xl border border-slate-200 bg-white shadow-lg py-1 overflow-hidden">
+                        {/* No `fixed inset-0` catcher here — see the outside-click effect above.
+                            A catcher rendered inside a tab is laid out against the .fade-in
+                            TabPanel's transform, not the viewport, so it missed the sidebar
+                            entirely (measured x=288 in a 1036px viewport) and the menu would
+                            not dismiss when you clicked the nav. */}
+                        <div data-course-menu={c.id} role="menu" aria-label="Course options" className="absolute top-11 right-2 z-50 w-48 rounded-xl border border-slate-200 bg-white shadow-lg py-1 overflow-hidden">
                           <button role="menuitem" onClick={() => openCourse(c.id)} className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2"><Edit3 size={14} /> Edit course</button>
                           <button role="menuitem" disabled={busy} onClick={() => duplicateCourse(c)} className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2 disabled:opacity-50"><Copy size={14} /> Duplicate course</button>
                           <label role="menuitem" className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2 cursor-pointer">
@@ -18936,7 +19861,7 @@ const CommunityChannelRow = React.memo(function CommunityChannelRow({ row, activ
         )}
         {unread && (
           <span className="px-1.5 rounded-full gh-tnum"
-            style={{ background: C.primary, color: '#fff', fontSize: 10, fontWeight: 800, lineHeight: '16px' }}>
+            style={{ background: C.primarySolid, color: '#fff', fontSize: 10, fontWeight: 800, lineHeight: '16px' }}>
             {unread}
           </span>
         )}
@@ -19016,7 +19941,7 @@ function CommunityChannelRail({
                 <span className="truncate text-left">{g.categoryName}</span>
                 {!isOpen && groupUnread > 0 && (
                   <span className="ml-auto px-1.5 rounded-full gh-tnum"
-                    style={{ background: C.primary, color: '#fff', fontSize: 9.5, fontWeight: 800 }}>
+                    style={{ background: C.primarySolid, color: '#fff', fontSize: 9.5, fontWeight: 800 }}>
                     {unreadLabel(groupUnread)}
                   </span>
                 )}
@@ -20640,6 +21565,112 @@ function CommunityPostCard({ post, tag, postTags, attachments, signedUrls, isAdm
   );
 }
 
+function CommunityRankingWidget() {
+  const { user } = useAuth();
+  const [summary, setSummary] = useState(null);
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [unavailable, setUnavailable] = useState(false);
+  // A transient RPC failure is NOT "nobody is ranked yet". Without this the widget
+  // rendered an authoritative empty board with no message and no way to retry.
+  const [failed, setFailed] = useState(false);
+  const [version, setVersion] = useState(0);
+
+  useEffect(() => {
+    let timer = null;
+    const refresh = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => setVersion((current) => current + 1), 400);
+    };
+    window.addEventListener(STUDENT_PROGRESS_CHANGE_EVENT, refresh);
+    return () => {
+      if (timer) clearTimeout(timer);
+      window.removeEventListener(STUDENT_PROGRESS_CHANGE_EVENT, refresh);
+    };
+  }, []);
+
+  useEffect(() => {
+    // Clear the skeleton on the signed-out branch too, or the widget renders a
+    // permanent loading state at the top of the Community feed.
+    if (!user?.id) { setLoading(false); return; }
+    let cancelled = false;
+    (async () => {
+      setLoading(true); setFailed(false);
+      const summaryResult = await supabase.rpc('my_student_progress');
+      if (cancelled) return;
+      if (summaryResult.error) {
+        // 42501 = not a student (staff, or no active enrollment): hide, do not alarm.
+        const expected = isMigrationMissing(summaryResult.error) || summaryResult.error.code === '42501';
+        setUnavailable(expected);
+        setFailed(!expected);
+        setLoading(false);
+        return;
+      }
+      const mine = summaryResult.data || null;
+      if (!mine) {
+        // A null payload is not an error row, so nothing above catches it. Without
+        // this the deref below throws inside a floating async IIFE, setLoading(false)
+        // never runs, and the widget spins forever with no retry path.
+        setUnavailable(true); setLoading(false);
+        return;
+      }
+      const boardResult = await supabase.rpc('student_leaderboard', {
+        p_scope: mine.default_scope,
+        p_batch_id: mine.default_scope === 'my_batch' ? mine.batch_id : null,
+        p_window: 'overall', p_limit: 5, p_offset: 0,
+      });
+      if (cancelled) return;
+      if (boardResult.error) {
+        const expected = isMigrationMissing(boardResult.error);
+        setUnavailable(expected);
+        setFailed(!expected);
+      } else {
+        setSummary(mine); setRows(boardResult.data || []); setUnavailable(false);
+      }
+      setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [user?.id, version]);
+
+  if (unavailable) return null;
+  if (failed) {
+    return (
+      <div className="glass-card rounded-2xl p-4 flex items-center justify-between gap-3"
+        style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)' }}>
+        <span style={{ fontSize: 12, color: 'var(--status-warn-fg)' }}>Couldn&rsquo;t load the rankings preview.</span>
+        <button type="button" onClick={() => setVersion((current) => current + 1)}
+          className="inline-flex items-center gap-1 rounded-lg px-2 py-1"
+          style={{ fontSize: 11.5, color: 'var(--status-warn-fg)', border: '1px solid var(--status-warn-bd)' }}>
+          <RefreshCw size={12} /> Retry
+        </button>
+      </div>
+    );
+  }
+  if (!loading && !summary) return null;
+  return (
+    <section className="mb-5 max-w-6xl mx-auto glass-card p-4 sm:p-5" aria-labelledby="community-ranking-title">
+      <div className="flex flex-col lg:flex-row lg:items-center gap-4">
+        <div className="lg:w-56 flex-shrink-0">
+          <div className="flex items-center gap-2"><Award size={18} style={{ color: C.primary }} />
+            <h2 id="community-ranking-title" className="font-bold" style={{ color: C.text }}>Progress leaders</h2></div>
+          {summary && <div className="mt-3 rounded-xl p-3" style={{ background: 'var(--status-info-bg)' }}>
+            <div className="text-[10px] gh-label" style={{ color: C.textMute }}>Your progress</div>
+            <div className="mt-1 flex items-end justify-between gap-2"><strong className="text-xl" style={{ color: C.primary }}>{progressPercent(summary.overall_score)}</strong>
+              <span className="text-xs font-bold" style={{ color: C.textSoft }}>{summary.private_rank ? `#${summary.private_rank}` : 'Private'}</span></div>
+            <div className="mt-2"><ProgressBar value={summary.overall_score} label="Your overall progress" compact /></div>
+          </div>}
+        </div>
+        <div className="min-w-0 flex-1"><LeaderboardTable rows={rows} loading={loading} compact /></div>
+        <button onClick={() => writeAppRoute('progress')}
+          className="lg:self-center inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold whitespace-nowrap"
+          style={{ color: C.primary, border: '1px solid var(--status-info-bd)', background: 'var(--status-info-bg)' }}>
+          Full report <ArrowRight size={15} />
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function CommunityHub() {
   const { user, profile } = useAuth();
   const isAdmin = !!profile?.is_admin;
@@ -22064,6 +23095,8 @@ function CommunityHub() {
         desc={isAdmin
           ? 'Post announcements, pin important discussions, and moderate the forum inline.'
           : 'A member forum — ask questions, share wins, discuss the courses, and follow announcements.'} gold />
+
+      {!selectedPostId && <CommunityRankingWidget />}
 
       {/* The space switcher is retired (#40): spaces are an entitlement boundary,
           not something a member navigates. The channel rail below is the
@@ -28430,6 +29463,10 @@ function GuideVideoPlayer({ guide, onComplete }) {
       if (cancelled || !ytHostRef.current) return;
       player = new YT.Player(ytHostRef.current, {
         videoId,
+        // Same privacy rule as parseVideoUrl's iframe path. The IFrame API defaults to
+        // youtube.com, so without this the completion-gated guide video — the one
+        // learner-facing player that grants a milestone — still contacts the ad hosts.
+        host: 'https://www.youtube-nocookie.com',
         playerVars: { rel: 0, modestbranding: 1 },
         events: { onStateChange: (e) => { if (e.data === YT.PlayerState.ENDED) onComplete(); } },
       });
@@ -28598,15 +29635,11 @@ function MockInterviewSimulator({ embedded = false }) {
     setNotice('Guide completed. You can now open the simulator.');
     if (!user?.id || !hasVideo) return;
     try {
-      const { error } = await supabase.from(FVC_TABLE).upsert({
-        user_id: user.id,
-        feature_key: MOCK_INTERVIEW_FEATURE_KEY,
-        video_version: videoVersion,
-        completed: true,
-        completed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      }, { onConflict: 'user_id,feature_key' });
+      const { error } = await supabase.rpc('complete_progress_feature_guide', {
+        p_feature_key: MOCK_INTERVIEW_FEATURE_KEY,
+      });
       if (error) throw error;
+      if (typeof window !== 'undefined') window.dispatchEvent(new Event(STUDENT_PROGRESS_CHANGE_EVENT));
     } catch (e) {
       logDbError('[MockInterviewGuide] markComplete', e, { featureKey: MOCK_INTERVIEW_FEATURE_KEY });
       // Non-fatal: the button is already unlocked for this session.

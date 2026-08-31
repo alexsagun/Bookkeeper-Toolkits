@@ -286,9 +286,9 @@ export const OBJECT_CHECKS = [
       (to_regclass('public.staff_roles')), (to_regclass('public.staff_permissions')),
       (to_regclass('public.staff_role_permissions')), (to_regclass('public.staff_memberships')),
       (to_regclass('public.staff_role_events'))) as v(t)`],
-  ['#45    the role x permission matrix is seeded', `select count(*) = 26 as ok
+  ['#45/#52 role x permission matrix is seeded', `select count(*) = 28 as ok
       from public.staff_role_permissions`],
-  ['#45    all 18 permissions are seeded', `select count(*) = 18 as ok from public.staff_permissions`],
+  ['#45/#52 all 19 permissions are seeded', `select count(*) = 19 as ok from public.staff_permissions`],
   // The caller-scoped helpers MUST be executable by authenticated: an RLS qual is
   // evaluated AS THE QUERYING ROLE, so without the grant every gated read fails
   // with "permission denied for function" instead of a clean authorization denial.
@@ -671,6 +671,114 @@ export const OBJECT_CHECKS = [
   ['#51    the new code is in the catalog', `select count(*) = 1 as ok
       from public.app_error_catalog()
      where code = 'ACCESS_REQUEST_STAFF_TARGET'`],
+
+  // ── #52, student progress and privacy-safe rankings ──────────────────────
+  ['#52    progress tables exist with RLS', `select coalesce(bool_and(c.relrowsecurity), false) as ok
+      from pg_class c where c.oid in (
+        'public.student_progress_milestones'::regclass,
+        'public.student_foundation_completions'::regclass,
+        'public.student_ranking_preferences'::regclass,
+        'public.student_progress_daily'::regclass)`],
+  // All SEVEN functions #52 grants to `authenticated`. complete_progress_feature_guide
+  // was missing here, so the audit passed clean while the mock-interview watch-gate
+  // had no server-side write path at all.
+  ['#52    the seven client APIs exist', `select coalesce(bool_and(p is not null), false) as ok from (values
+      (to_regprocedure('public.my_student_progress()')),
+      (to_regprocedure('public.student_leaderboard(text,uuid,text,integer,integer)')),
+      (to_regprocedure('public.admin_student_progress_report(text,uuid,text,numeric,numeric,integer,boolean,integer,integer)')),
+      (to_regprocedure('public.set_leaderboard_visibility(boolean)')),
+      (to_regprocedure('public.set_foundation_milestone(text,boolean)')),
+      (to_regprocedure('public.complete_progress_feature_guide(text)')),
+      (to_regprocedure('public.complete_course_lesson(uuid)'))) as v(p)`],
+  ['#52    internal scorer and snapshot are client-unreachable', `select case
+      when to_regprocedure('public.student_progress_current(uuid)') is null then false
+      when to_regprocedure('public.student_progress_snapshot(date)') is null then false
+      else not has_function_privilege('authenticated','public.student_progress_current(uuid)','execute')
+       and not has_function_privilege('authenticated','public.student_progress_snapshot(date)','execute')
+       and not has_function_privilege('anon','public.student_progress_current(uuid)','execute')
+       and not has_function_privilege('anon','public.student_progress_snapshot(date)','execute') end as ok`],
+  // insert, update AND delete: checking only insert would pass a future migration that
+  // re-granted update on lesson_progress, which is just as much a client write path.
+  ['#52    raw progress mutation is revoked', `select bool_and(
+        not has_table_privilege('authenticated', t, 'insert')
+        and not has_table_privilege('authenticated', t, 'update')
+        and not has_table_privilege('authenticated', t, 'delete')) as ok
+      from unnest(array[
+        'public.lesson_progress','public.course_completions',
+        'public.feature_video_completions','public.student_foundation_completions',
+        'public.student_ranking_preferences']) as t`],
+  ['#52    snapshots are not client-readable', `select
+      not has_table_privilege('authenticated','public.student_progress_daily','select')
+      and not has_table_privilege('anon','public.student_progress_daily','select') as ok`],
+  ['#52    lesson/course identity has a composite FK', `select exists (
+      select 1 from pg_constraint where conrelid='public.lesson_progress'::regclass
+        and conname='lesson_progress_lesson_course_fkey' and contype='f') as ok`],
+  ['#52    public leaderboard return type has no private identity', `select case
+      when to_regprocedure('public.student_leaderboard(text,uuid,text,integer,integer)') is null then false
+      else pg_get_function_result(to_regprocedure('public.student_leaderboard(text,uuid,text,integer,integer)'))
+             not similar to '%(user_id|email|full_name|avatar|batch_id|receipt|payment)%' end as ok`],
+  ['#52    My Batch is derived from the entitlement ledger', `select
+      exists(select 1 from pg_proc where pronamespace='public'::regnamespace
+        and proname='student_progress_current' and prosrc like '%user_entitled_batches%')
+      and exists(select 1 from pg_proc where pronamespace='public'::regnamespace
+        and proname='student_leaderboard' and prosrc like '%v_caller.batch_id%'
+        -- and the wrong one is ABSENT: 'appears somewhere' is not the invariant.
+        -- Filtering on the caller-supplied p_batch_id is exactly the batch oracle
+        -- this check exists to forbid, and a substring test for the right name
+        -- passes happily while the wrong name sits two lines below it.
+        and prosrc not like '%batch_id = p_batch_id%') as ok`],
+  ['#52    student_progress.read belongs only to Super and Operations', `select
+      (select count(*) from public.staff_role_permissions where permission_key='student_progress.read') = 2
+      and exists(select 1 from public.staff_role_permissions where role_key='super_admin' and permission_key='student_progress.read')
+      and exists(select 1 from public.staff_role_permissions where role_key='operations_admin' and permission_key='student_progress.read')
+      and not exists(select 1 from public.staff_role_permissions where role_key='trainer' and permission_key='student_progress.read') as ok`],
+  ['#52    all eight Accounting 101 milestones are seeded', `select count(*) = 8 as ok
+      from public.student_progress_milestones where track_key='foundation' and active`],
+  ['#52    snapshots retain at most 400 days', `select coalesce(bool_and(
+      prosrc like '%snapshot_date < p_date - 400%'), false) as ok
+      from pg_proc where pronamespace='public'::regnamespace and proname='student_progress_snapshot'`],
+  ['#53    a learner reads only their own segment board', `select
+      src ~ 'v_scope = ''vip''\\s+and v_caller\\.plan_key <> ''vip'''
+      and src ~ 'v_scope = ''general''\\s+and v_caller\\.plan_key =\\s+''vip'''
+      and src like '%not v_is_staff%' as ok
+      from (select regexp_replace(prosrc, '--[^\n]*', '', 'g') as src
+              from pg_proc where pronamespace='public'::regnamespace
+                and proname='student_leaderboard') t`],
+  ['#53    guide completion cannot re-mint its own recency', `select
+      prosrc like '%is distinct from excluded.video_version%'
+      and prosrc not like '%completed = true,%completed_at = now(),%' as ok
+      from pg_proc where pronamespace='public'::regnamespace
+        and proname='complete_progress_feature_guide'`],
+  ['#53    staff are excluded from BOTH arms of the report', `select
+      prosrc like '%staff_memberships sm%' as ok
+      from pg_proc where pronamespace='public'::regnamespace
+        and proname='admin_student_progress_report'`],
+  ['#54    one run per course family in the denominator', `select
+      src like '%distinct on (cr.user_id, cr.root_id)%'
+      and src like '%l.depth < 10%'
+      and src like '%source_course_id%'
+      -- course_date stays a display label the scorer must never read. Checked against
+      -- COMMENT-STRIPPED source: the comment explaining the rule names the column.
+      and src not like '%course_date%' as ok
+      from (select regexp_replace(prosrc, '--[^\n]*', '', 'g') as src
+              from pg_proc where pronamespace='public'::regnamespace
+                and proname='student_progress_current') t`],
+  ['#52    daily snapshot cron is scheduled', `select coalesce((select
+      (xpath('/row/ok/text()', x))[1]::text::boolean from query_to_xml(
+        case when to_regclass('cron.job') is null then 'select false as ok'
+             else 'select exists(select 1 from cron.job where jobname = ''snapshot-student-progress'') as ok' end,
+        false, true, '') as t(x)), false) as ok`],
+
+  // #55 — the approve RPCs must not be client-callable. Verified live on 2026-08-31:
+  // an active operations_admin called approve_subscription(<own uid>,'vip',null) through
+  // PostgREST and minted itself an unpaid VIP term. #48's self-approval trigger is on
+  // enrollment_requests, which neither function touches, so it could not fire. The
+  // sanctioned caller (admin_finalize_enrollment) is SECURITY DEFINER and unaffected.
+  ['#55    approve RPCs are not callable by a client', `select coalesce(bool_and(
+      not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')), false) as ok
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public' and p.proname in ('approve_subscription','approve_extension')`],
 ];
 
 async function main() {

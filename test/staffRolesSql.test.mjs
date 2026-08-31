@@ -35,8 +35,10 @@ const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => readFileSync(join(REPO, rel), 'utf8').replace(/\r\n/g, '\n');
 
 const MIGRATION = 'db/2026-08-25-staff-authorization.sql';
+const CURRENT_SEED_MIGRATION = 'db/2026-09-01-student-progress-rankings.sql';
 const BOOTSTRAP = 'db/000_full_database_bootstrap.sql';
 const SQL_FILES = [MIGRATION, BOOTSTRAP];
+const SEED_SQL_FILES = [CURRENT_SEED_MIGRATION, BOOTSTRAP];
 
 /**
  * Executable SQL only — the header prose quotes SQL and names permission keys in
@@ -76,8 +78,8 @@ const pairs = (block) =>
 
 // ── The seeds exist at all ───────────────────────────────────────────────────
 
-test('both SQL files carry the three staff seeds', () => {
-  for (const file of SQL_FILES) {
+test('the current migration and bootstrap carry the three staff seeds', () => {
+  for (const file of SEED_SQL_FILES) {
     const sql = read(file);
     for (const table of ['staff_permissions', 'staff_roles', 'staff_role_permissions']) {
       assert.ok(lastValuesBlock(sql, table),
@@ -91,7 +93,7 @@ test('both SQL files carry the three staff seeds', () => {
 
 let permissionComparisons = 0;
 
-for (const file of SQL_FILES) {
+for (const file of SEED_SQL_FILES) {
   test(`${file}: staff_permissions seeds exactly STAFF_PERMISSION_KEYS`, () => {
     const seeded = firstColumnKeys(lastValuesBlock(read(file), 'staff_permissions'));
     assert.deepEqual(seeded, [...STAFF_PERMISSION_KEYS],
@@ -105,7 +107,7 @@ for (const file of SQL_FILES) {
 
 let roleComparisons = 0;
 
-for (const file of SQL_FILES) {
+for (const file of SEED_SQL_FILES) {
   test(`${file}: staff_roles seeds exactly STAFF_ROLE_KEYS`, () => {
     const seeded = firstColumnKeys(lastValuesBlock(read(file), 'staff_roles'));
     assert.deepEqual(seeded, [...STAFF_ROLE_KEYS], 'the three roles must match, in rank order');
@@ -134,7 +136,7 @@ const JS_PAIRS = STAFF_ROLE_KEYS.flatMap((role) =>
 
 let matrixComparisons = 0;
 
-for (const file of SQL_FILES) {
+for (const file of SEED_SQL_FILES) {
   test(`${file}: staff_role_permissions seeds exactly the JS matrix`, () => {
     const seeded = pairs(lastValuesBlock(read(file), 'staff_role_permissions'));
 
@@ -151,18 +153,18 @@ for (const file of SQL_FILES) {
   });
 }
 
-test('the matrix is pinned in both files, all 26 grants', () => {
-  assert.equal(JS_PAIRS.length, 26,
-    '18 super_admin + 5 operations_admin + 3 trainer; a change here must be deliberate');
-  assert.equal(permissionComparisons, SQL_FILES.length, 'permissions unchecked in one file');
-  assert.equal(roleComparisons, SQL_FILES.length, 'roles unchecked in one file');
-  assert.equal(matrixComparisons, SQL_FILES.length, 'the matrix is unchecked in one file');
+test('the matrix is pinned in both current seed definitions, all 28 grants', () => {
+  assert.equal(JS_PAIRS.length, 28,
+    '19 super_admin + 6 operations_admin + 3 trainer; a change here must be deliberate');
+  assert.equal(permissionComparisons, SEED_SQL_FILES.length, 'permissions unchecked in one file');
+  assert.equal(roleComparisons, SEED_SQL_FILES.length, 'roles unchecked in one file');
+  assert.equal(matrixComparisons, SEED_SQL_FILES.length, 'the matrix is unchecked in one file');
 });
 
 // ── Escalation invariants, asserted against the SQL itself ───────────────────
 
 test('no non-super role is seeded any staff.* permission, in either file', () => {
-  for (const file of SQL_FILES) {
+  for (const file of SEED_SQL_FILES) {
     const seeded = pairs(lastValuesBlock(read(file), 'staff_role_permissions'));
     const offenders = seeded.filter((p) => {
       const [role, perm] = p.split('|');
@@ -174,7 +176,7 @@ test('no non-super role is seeded any staff.* permission, in either file', () =>
 });
 
 test('no non-super role is seeded students.extend_access or courses.manage_all', () => {
-  for (const file of SQL_FILES) {
+  for (const file of SEED_SQL_FILES) {
     const seeded = pairs(lastValuesBlock(read(file), 'staff_role_permissions'));
     for (const perm of ['students.extend_access', 'courses.manage_all']) {
       const holders = seeded.filter((p) => p.endsWith(`|${perm}`)).map((p) => p.split('|')[0]);

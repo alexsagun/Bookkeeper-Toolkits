@@ -59,7 +59,8 @@ running it.
 
 ## 3. The permission matrix
 
-Three fixed roles, 18 permissions, 26 grants. Seeded by #45 and mirrored in
+Three fixed roles, 19 permissions, 28 grants. #45 seeded 18 permissions and 26 grants; #52 added
+`student_progress.read` for Super Admin and Operations Admin. Mirrored in
 [src/lib/staffRoles.js](src/lib/staffRoles.js); `test/staffRolesSql.test.mjs` fails if the two drift.
 
 | Permission | Super Admin | Operations Admin | Trainer |
@@ -72,6 +73,7 @@ Three fixed roles, 18 permissions, 26 grants. Seeded by #45 and mirrored in
 | `students.extend_access` — discretionary extensions | ✅ | — | — |
 | `students.import` — run the Thinkific migration | ✅ | ✅ | — |
 | `batches.manage` — cohorts and seat assignment | ✅ | ✅ | — |
+| `student_progress.read` — operational progress reports | ✅ | ✅ | — |
 | `courses.create` — create and duplicate courses | ✅ | — | ✅ |
 | `courses.manage_assigned` — edit assigned courses | ✅ | — | ✅ |
 | `courses.manage_all` — edit every course | ✅ | — | — |

@@ -297,6 +297,11 @@ export async function resetShadow() {
   // each. Their membership state is wiped below and re-seeded per test.
   await runSql(`
     truncate table
+      public.student_progress_daily,
+      public.student_foundation_completions,
+      public.student_ranking_preferences,
+      public.feature_video_completions,
+      public.feature_guides,
       public.batch_entitlements,
       public.batch_events,
       public.community_channel_events,

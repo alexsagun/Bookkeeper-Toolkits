@@ -28,6 +28,18 @@
   --c-primary: #0A84FF;
   --c-primary-hi: #3D8BFF;
   --c-primary-lo: #0057B8;
+  /* ★ --primary-solid is the blue for a FLAT fill behind WHITE TEXT.
+     White on --c-primary (#0A84FF) measures 3.65:1 — below the WCAG AA 4.5:1 floor for
+     text under 18.66px bold, and it fails in BOTH themes because these brand blues are
+     deliberately theme-independent. #0070E0 is 4.78:1. Keep --c-primary for borders,
+     icons, rings, bars and accent text, where the 3:1 non-text floor applies and it passes.
+     ★ SCOPE, HONESTLY: this covers FLAT `background: C.primarySolid` fills only. The house
+     GRADIENT button — linear-gradient(180deg, C.primaryHi, C.primary), inline in ~73 places
+     and again in .sheen-btn below — still puts white text on --c-primary-hi #3D8BFF, which
+     is 3.31:1 and therefore WORSE than the flat colour this token replaces. That family was
+     left alone deliberately: restyling ~109 controls is a visual redesign, not an audit fix.
+     test/uiSafety.test.mjs ratchets the flat pattern and CANNOT see the gradient one. */
+  --primary-solid: #0070E0;
   --c-accent: #5AC8FA;
   --c-soft: #6FAAFF;
 
