@@ -330,7 +330,7 @@ create policy course_media_admin_delete on storage.objects for delete to authent
 |---|---|
 | **Format** | **MP4 — H.264 video, AAC audio.** Nothing else is accepted. |
 | **Maximum size** | **2 GB** per lesson |
-| **Project-wide ceiling** | A **separate** Storage setting caps every bucket. The effective limit is `min(bucket, project-wide)`, so the 2 GB above is a promise only once the project limit is at least 2 GB. `npm run db:audit` asserts they agree. |
+| **Project-wide ceiling** | A **separate** Storage setting caps every bucket. The effective limit is `min(bucket, project-wide)`, so the 2 GB above is a promise only once the project limit is at least 2 GB. `npm run db:audit` asserts both halves — the project-wide limit reaches the cap (storage section) and `course-videos` itself is still capped at 2 GiB (the #44 object check). `npm run storage:config` re-checks the same thing after it writes. |
 | **Transfer** | Resumable (TUS), direct browser → Storage. Pause, resume and cancel are supported; an interrupted upload picks up from where it stopped when you choose the same file again. |
 | **Where it goes** | `course-videos/lessons/<course-id>/<uuid>-<filename>.mp4` — private |
 | **How students get it** | A signed URL minted per view and refreshed before it expires |

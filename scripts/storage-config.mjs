@@ -38,7 +38,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { LESSON_VIDEO_MAX_BYTES } from '../src/lib/courseVideo.js';
+import { LESSON_VIDEO_MAX_BYTES, LESSON_VIDEO_BUCKET } from '../src/lib/courseVideo.js';
 // Imported, not re-implemented: the audit and the fix must agree on what "correct"
 // means, or the fix can leave the audit still failing.
 import { describeStorageLimits, prettyBytes } from './audit-db.mjs';
@@ -190,7 +190,45 @@ async function main() {
     console.error('  Restore the other settings in Dashboard → Storage → Settings.\n');
     process.exit(1);
   }
-  console.log(`\n✔ project-wide fileSizeLimit is now ${prettyBytes(after)} (${after}).`);
+  // ★ RE-VALIDATE AGAINST THE NEW LIMIT BEFORE CLAIMING SUCCESS.
+  //   The verdict computed at the top of main() used the OLD project limit. A bucket
+  //   whose own limit sits above the NEW ceiling still over-promises, so without this
+  //   the fixer prints a tick while the detector (npm run db:audit) fails — and a fixer
+  //   that disagrees with its own detector is worse than no fixer.
+  const afterBuckets = await sql('select id, file_size_limit from storage.buckets order by id', token);
+  const afterVerdict = describeStorageLimits({
+    projectLimit: gotLimit, buckets: afterBuckets, required: target,
+  });
+
+  // And the LESSON bucket specifically: the effective ceiling is min(bucket, project),
+  // so raising the project alone does not deliver 2 GB if that bucket is lower.
+  //
+  // ★ Deliberately NOT a blanket "every bucket must reach the lesson cap" rule. Four of
+  //   the five buckets are meant to be far smaller — avatars 5 MB, enrollment-receipts
+  //   10 MB, community-media and course-media 50 MB — and failing them would make this
+  //   report permanently red, which is precisely how the #44 external-link check stopped
+  //   being read and how this whole class of drift survived.
+  const lesson = afterBuckets.find((b) => b.id === LESSON_VIDEO_BUCKET);
+  const lessonCeiling = lesson && lesson.file_size_limit != null
+    ? Math.min(Number(lesson.file_size_limit), gotLimit)
+    : gotLimit;
+
+  if (!afterVerdict.ok || lessonCeiling < target) {
+    console.error('\n✘ The project limit was raised, but the picture is still not consistent:');
+    if (afterVerdict.overPromising.length) {
+      console.error(`  buckets promising more than the project allows: ${afterVerdict.overPromising.join(', ')}`);
+    }
+    if (lessonCeiling < target) {
+      console.error(`  ${LESSON_VIDEO_BUCKET} effective ceiling is ${prettyBytes(lessonCeiling)}, `
+        + `below the ${prettyBytes(target)} lesson cap — raise that bucket’s own limit `
+        + '(db/2026-08-24-course-video-upload-only.sql sets it).');
+    }
+    console.error('');
+    process.exit(1);
+  }
+
+  console.log(`\n✔ project-wide fileSizeLimit is now ${prettyBytes(gotLimit)} (${gotLimit}).`);
+  console.log(`  ${LESSON_VIDEO_BUCKET} effective ceiling: ${prettyBytes(lessonCeiling)} — verified after the write.`);
   console.log('  Verify the whole picture with: npm run db:audit\n');
   process.exit(0);
 }
