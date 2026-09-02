@@ -276,9 +276,23 @@ prints a NOTICE and you create it by hand instead:
 3. **Settings →** file size limit **2 GB**, allowed MIME types **`video/mp4`**.
 
 > ★ **The bucket limit is a ceiling, not a grant.** Supabase enforces
-> *min(bucket limit, project-wide upload limit)*, and the project-wide limit is a separate
-> setting (**Storage → Settings**) that defaults to **50 MB** on the free tier. Until you raise
-> that too, uploads will fail partway through with a 413 no matter what the bucket says.
+> *min(bucket limit, project-wide upload limit)*, and the project-wide limit is a **separate
+> setting** (**Storage → Settings**) that defaults to **50 MB**. Until you raise that too,
+> uploads fail partway through with a 413 no matter what the bucket says.
+>
+> ★★ **Upgrading to Pro does NOT raise it.** This is not a free-tier-only trap. It stays at
+> the default until someone changes it, and on 2026-09-02 this project was on Pro, had the
+> bucket at 2 GiB, and was still capped at 50 MB — so every real lesson video failed.
+>
+> Set it to exactly **`2147483648`** bytes. "2 GB" typed as `2000000000` is 147 MiB short of
+> the bucket and reintroduces the identical bug at 1.86 GiB, where it is far harder to spot.
+> Don't type it at all:
+>
+> ```powershell
+> npm run db:audit                     # detects the drift (and now fails on it)
+> npm run storage:config               # shows the effective limit for every bucket
+> npm run storage:config -- --apply    # raises it to exactly LESSON_VIDEO_MAX_BYTES
+> ```
 
 ### 2b. `course-media` (public — covers and feature guides)
 
@@ -305,7 +319,8 @@ create policy course_media_admin_delete on storage.objects for delete to authent
 ```
 
 > **File size:** the project-wide upload limit (**Storage → Settings**) caps every bucket, and
-> defaults to **50 MB** on the free tier. Lesson videos need it raised to **2 GB**. There is no
+> defaults to **50 MB** — **on every plan, including Pro; upgrading does not change it**.
+> Lesson videos need it raised to **2 GB** (`npm run storage:config -- --apply`). There is no
 > longer a link fallback for a lesson that is too large — see *Lesson video format and limits*
 > below.
 
@@ -315,6 +330,7 @@ create policy course_media_admin_delete on storage.objects for delete to authent
 |---|---|
 | **Format** | **MP4 — H.264 video, AAC audio.** Nothing else is accepted. |
 | **Maximum size** | **2 GB** per lesson |
+| **Project-wide ceiling** | A **separate** Storage setting caps every bucket. The effective limit is `min(bucket, project-wide)`, so the 2 GB above is a promise only once the project limit is at least 2 GB. `npm run db:audit` asserts both halves — the project-wide limit reaches the cap (storage section) and `course-videos` itself is still capped at 2 GiB (the #44 object check). `npm run storage:config` re-checks the same thing after it writes. |
 | **Transfer** | Resumable (TUS), direct browser → Storage. Pause, resume and cancel are supported; an interrupted upload picks up from where it stopped when you choose the same file again. |
 | **Where it goes** | `course-videos/lessons/<course-id>/<uuid>-<filename>.mp4` — private |
 | **How students get it** | A signed URL minted per view and refreshed before it expires |
@@ -456,9 +472,24 @@ Students see published content immediately, complete lessons, and earn the certi
   - *file is missing from the bucket* — the row points at an object that is not there. Run
     `npm run media:audit`; if it reports the file is still in `course-media`, run
     `npm run media:migrate` to move it into the private bucket.
-- **Upload fails partway with a 413.** The project-wide upload limit is below the file size. Raise
-  it in **Storage → Settings** (the per-bucket limit alone is not enough — Supabase enforces the
-  smaller of the two).
+- **Upload stops at about 6 MB / 5%, whatever the file size.** That exact stopping point is the
+  signature of this bug, not a coincidence: the uploader sends `uploadDataDuringCreation`, so the
+  TUS creation request carries `Upload-Length` for the whole file *and* the first 6 MiB chunk in
+  its body. Storage rejects on the header after the browser has already streamed that chunk.
+
+  The cause is the **project-wide** upload limit being below the file size — the per-bucket limit
+  alone is never enough, because Supabase enforces the smaller of the two. Confirm and fix with:
+
+  ```powershell
+  npm run storage:config               # prints the effective limit for every bucket
+  npm run storage:config -- --apply    # raises the project-wide limit to 2 GB
+  ```
+
+  The app now says *"Storage refused this file as too large — but the app checked it against the
+  2 GB lesson limit before sending a single byte, so the file itself is not the problem…"* and
+  **deliberately does not offer Resume**, because resuming re-sends the identical request and
+  takes the identical 413. Before 2026-09-02 it claimed the video exceeded 2 GB, which sent
+  admins off to re-export files that were never at fault.
 - **"Lesson videos must be uploaded, not linked."** Something tried to write a YouTube/Vimeo/MP4
   URL into a lesson. That is refused by `course_lessons_video_guard`, not just hidden in the UI.
 - **"Some video lessons still have no uploaded file."** `courses_publish_guard` is refusing to

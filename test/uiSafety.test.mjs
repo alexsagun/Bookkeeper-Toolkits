@@ -158,3 +158,81 @@ test('YouTube lesson embeds use the no-cookie host', () => {
     'a plain youtube.com embed is back — a paid lesson page then contacts '
     + 'googleads.g.doubleclick.net and the youtubei logging endpoints');
 });
+
+// ── 6. The lesson-video upload bearer ───────────────────────────────────────
+//
+// Raising the project-wide Storage ceiling to 2 GiB made hour-long transfers possible
+// for the first time, which made a 1-hour access token expiring MID-upload reachable.
+// The fix attaches the bearer per request via tus's onBeforeRequest.
+//
+// ★ THIS IS UNREACHABLE FROM A UNIT TEST, WHICH IS WHY IT IS A SOURCE SCAN.
+//   tus's browser stack calls XMLHttpRequest.setRequestHeader(), and per spec that
+//   COMBINES repeated header names instead of replacing them. options.headers is applied
+//   in createRequest() BEFORE sendRequest() awaits onBeforeRequest, so declaring
+//   `authorization` in BOTH places sends `Bearer <stale>, Bearer <fresh>` and Storage
+//   rejects every single request. Nothing in node --test can observe that, and putting
+//   the header back into `headers` is the obvious-looking tidy-up.
+test('the lesson-video upload attaches its bearer per request, and from exactly one place', () => {
+  const source = app();
+  const start = source.indexOf('new tus.Upload(');
+  assert.ok(start > 0, 'the tus upload call was not found');
+  const region = source.slice(start, start + 4000);
+
+  assert.match(region, /onBeforeRequest:/,
+    'the bearer must be refreshed per request, or a 2 GB upload dies when the JWT expires');
+  assert.match(region, /req\.setHeader\('authorization'/,
+    'onBeforeRequest must actually set the header it exists to refresh');
+
+  // Brace-match the headers object so this reads the real block, not a nearby line.
+  const h = region.indexOf('headers: {');
+  assert.ok(h > 0, 'the tus options carry no headers block');
+  let depth = 0;
+  let end = h;
+  for (let i = region.indexOf('{', h); i < region.length; i += 1) {
+    if (region[i] === '{') depth += 1;
+    else if (region[i] === '}') { depth -= 1; if (depth === 0) { end = i; break; } }
+  }
+  assert.ok(depth === 0 && end > h,
+    'could not brace-match the headers block — the scan below would pass vacuously');
+  const headers = region.slice(h, end + 1);
+
+  // Match an object PROPERTY, not the bare word: the block deliberately explains why
+  // authorization is absent, and a ratchet that trips on its own explanation is noise.
+  // A comment line starts with //, so it can never satisfy the property pattern. The
+  // optional quotes matter: 'authorization': and "authorization": are ordinary style for
+  // a header object, and without them the ratchet would wave through the exact regression
+  // it exists to catch.
+  // Strip comments first: this block deliberately EXPLAINS why authorization is absent,
+  // and with the [,{] alternation below a prose example could otherwise trip it.
+  const headerCode = headers.replace(/\/\/.*$/gm, '');
+  // `^` alone would miss the single-line form `headers: { authorization: … }` and a
+  // trailing `, "authorization": …` — both of which reintroduce the duplicate header.
+  assert.ok(!/(?:^|[,{])\s*['"]?authorization['"]?\s*:/im.test(headerCode),
+    'authorization is declared in BOTH options.headers and onBeforeRequest. XHR combines '
+    + 'repeated header names, so every request would go out as "Bearer <stale>, Bearer '
+    + '<fresh>" and Storage would 401 all of them. Set it ONLY in onBeforeRequest.');
+});
+
+// ── 7. Resume is not offered for failures that cannot be resumed ────────────
+//
+// runTransfer's catch emits INTERRUPT for every non-abort reason, and INTERRUPTED
+// renders a Resume button whose handler re-enters runTransfer. For a 413 (the project
+// ceiling), a 403 (role) or a 404 (missing bucket) that re-sends the identical request
+// and takes the identical status — so the UI invited an admin to burn another 6 MiB
+// confirming a verdict the message had already given them. describeUploadError now
+// returns `retryable`; the button must consult it.
+test('the uploader never offers Resume on a failure the pure module called permanent', () => {
+  const source = app();
+  // Anchor on the button itself: 'UPLOAD_STATES.PAUSED' also appears in showBar.
+  const i = source.indexOf('onClick={resume}');
+  assert.ok(i > 0, 'the Resume button was not found');
+  const region = source.slice(Math.max(0, i - 900), i + 200);
+  assert.match(region, /UPLOAD_STATES.INTERRUPTED/, 'wrong region — INTERRUPTED not in it');
+  // Anchor on the actual expression, not the bare token: /retryable/ alone could not
+  // distinguish `INTERRUPTED && retryable` from `INTERRUPTED && !retryable`, and would
+  // also pass on an unrelated mention nearby.
+  assert.match(region, /UPLOAD_STATES\.INTERRUPTED\s*&&\s*retryable/,
+    'Resume must be gated on describeUploadError().retryable for INTERRUPTED');
+  assert.match(region, /state === UPLOAD_STATES\.PAUSED/,
+    'PAUSED must stay unconditional — pausing is not a failure');
+});

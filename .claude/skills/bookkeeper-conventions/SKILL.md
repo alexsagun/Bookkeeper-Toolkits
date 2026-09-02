@@ -193,6 +193,19 @@ with the URL and **bypasses RLS on read entirely**, so a public bucket cannot pr
   re-sign decision — lives in the pure [src/lib/courseVideo.js](../../../src/lib/courseVideo.js) and
   is mirrored in `db/2026-08-24-course-video-upload-only.sql`. Change the module, the SQL, and
   `test/courseVideo*.test.mjs` together.
+- ★ **A client-side limit is a PROMISE, not a grant — check the whole chain of ceilings.**
+  Supabase enforces `min(bucket file_size_limit, PROJECT-WIDE fileSizeLimit)`, and the
+  project-wide value lives in storage-api config: it is in no `db/*.sql`, not in
+  `storage.buckets`, and unreachable from SQL. #44 set the bucket to 2 GiB and left the
+  project at its 50 MiB default (upgrading to Pro does NOT raise it), so for months every
+  lesson video over 50 MiB died at ~6 MiB — one TUS chunk — while the UI blamed the
+  admin's file, and no migration, dbtest or `db:shadow:verify` could see it. Before
+  shipping any upload feature, verify the limit the SERVICE enforces, not the one the
+  code states: `npm run storage:config` prints the effective limit per bucket and
+  `npm run db:audit` now fails closed if they disagree.
+- ★ **A 413 mid-transfer is never the user's file** when you validated size up front —
+  it is a server ceiling below the one you promised. Say so, and do not offer a Retry
+  that re-sends the identical request.
 - **A large upload never goes through a serverless function.** Use resumable TUS
   (`tus-js-client`, lazy `import()`) straight from the browser to
   `https://<ref>.storage.supabase.co/storage/v1/upload/resumable`, forwarding the user's access

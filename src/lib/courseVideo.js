@@ -37,6 +37,11 @@
 // ── Constants: a contract with Supabase Storage and with the migration ──────
 
 /** Paid lesson video lives here, and only here. course-media is public. */
+// Declared here, not beside formatBytes(), because STORAGE_LIMIT_MESSAGE formats the
+// cap at MODULE-EVAL time. formatBytes is hoisted, but a const it reads is not — so
+// leaving this below would put BYTE_UNITS in the temporal dead zone and throw on import.
+const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];
+
 export const LESSON_VIDEO_BUCKET = 'course-videos';
 
 /**
@@ -464,39 +469,93 @@ export function shouldResignPlayback(input) {
 
 // ── Upload errors ──────────────────────────────────────────────────────────
 
-const UPLOAD_ERROR_MESSAGES = Object.freeze({
-  'too-large': '',      // built below — it needs the cap
-  unauthorized: 'Your session expired during the upload. Sign in again, then re-select the file — '
-    + 'the transfer resumes where it stopped.',
+/**
+ * ★ THERE IS NO 'too-large' UPLOAD REASON, AND THERE MUST NEVER BE ONE AGAIN.
+ *   validateVideoFile() refuses anything over LESSON_VIDEO_MAX_BYTES before a single
+ *   byte leaves the browser, so a 413 DURING a transfer cannot be the admin’s file —
+ *   it is definitionally a Storage ceiling below the one this app was told to promise.
+ *   Telling someone their 117 MB video "is larger than the 2 GB limit" sent them off to
+ *   re-export a file that was never the problem, while the actual fault — a project-wide
+ *   Storage limit left at its 50 MiB default — went unmentioned. That is the dishonesty
+ *   this reason code exists to end.
+ *
+ * ★ AND THE MESSAGE MUST NOT NAME THE REAL CEILING. Supabase answers 413 with
+ *   EntityTooLarge / "The object exceeded the maximum allowed size" — it carries no
+ *   number, so a client can never learn the project-wide limit from the response. Any
+ *   figure quoted here beyond this app’s OWN cap would be invented.
+ */
+const STORAGE_LIMIT_MESSAGE =
+  'Storage refused this file as too large — but the app checked it against the '
+  + `${formatBytes(LESSON_VIDEO_MAX_BYTES)} lesson limit before sending a single byte, so the `
+  + 'file itself is not the problem. Supabase caps every upload at the SMALLER of the bucket '
+  + 'limit and the project-wide Storage limit, and the project-wide one is set below it. '
+  + 'Raise it (npm run storage:config -- --apply, or Supabase → Storage → Settings). '
+  + 'Resuming before then fails at exactly the same point.';
+
+/**
+ * Upload failure copy, keyed by reason. Exported so a test can prove this map and
+ * UPLOAD_ERROR_RETRYABLE below stay in lockstep — a new reason code must not be able
+ * to ship with copy but no retryability, or vice versa.
+ */
+export const UPLOAD_ERROR_MESSAGES = Object.freeze({
+  'storage-limit': STORAGE_LIMIT_MESSAGE,
+  unauthorized: 'Storage rejected the credentials for this upload. The bearer token is now '
+    + 'refreshed on every request, so this almost always means the session itself ended — '
+    + 'sign in again, then choose Resume; nothing already transferred is lost.',
   forbidden: 'This account is not allowed to upload course videos. Admin access is required.',
   'bucket-missing': 'The course-videos storage bucket is missing. Create it as a PRIVATE bucket '
     + 'and run db/2026-08-24-course-video-upload-only.sql, then retry.',
   offline: 'The connection dropped. Reconnect and choose Resume — nothing already transferred is lost.',
   aborted: 'Upload cancelled.',
-  unknown: 'The upload could not be completed. Choose Retry, or re-select the file to resume.',
+  unknown: 'The upload could not be completed. Choose Resume to pick up where it stopped, or '
+    + 'cancel and re-select the file.',
 });
 
-function uploadErrorMessage(reason) {
-  if (reason === 'too-large') {
-    return `That video is larger than the ${formatBytes(LESSON_VIDEO_MAX_BYTES)} limit for a lesson. `
-      + 'Re-export it at a lower bitrate, or split the lesson in two. '
-      + '(If it is under the limit, the project-wide Storage upload limit needs raising.)';
-  }
-  return UPLOAD_ERROR_MESSAGES[reason] || UPLOAD_ERROR_MESSAGES.unknown;
-}
+/**
+ * May the UI offer Resume?
+ *
+ * ★ FAIL OPEN. `unknown` is TRUE on purpose: refusing Resume on a failure we could not
+ *   classify would strand a transfer that is genuinely resumable, and every byte already
+ *   accepted by the server would be re-sent from zero on the next attempt. A failure is
+ *   permanent only when we can NAME why.
+ * ★ The three FALSE entries are the three answers no amount of retrying changes: the
+ *   project-wide ceiling (413), this account’s role (403), and a bucket that does not
+ *   exist (404). Each needs a human to change something outside the browser, and the old
+ *   UI offered a Resume button for all three — re-running the identical doomed transfer.
+ * ★ `aborted` never reaches the UI (runTransfer returns before setting a message), but it
+ *   is listed so this map stays exhaustive against UPLOAD_ERROR_MESSAGES.
+ */
+export const UPLOAD_ERROR_RETRYABLE = Object.freeze({
+  'storage-limit': false,
+  unauthorized: true,
+  forbidden: false,
+  'bucket-missing': false,
+  offline: true,
+  aborted: true,
+  unknown: true,
+});
 
 function statusOf(err) {
   if (!err || typeof err !== 'object') return null;
-  const fromTus = typeof err.originalResponse?.getStatus === 'function'
-    ? Number(err.originalResponse.getStatus())
-    : null;
-  const raw = fromTus ?? err.status ?? err.statusCode ?? err.originalResponse?.status ?? null;
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : null;
+  // ★ CANDIDATES, NOT A ?? CHAIN. `fromTus ?? err.status` treated a getStatus() of 0 —
+  //   the XHR "no response yet" value — as a real answer, because 0 is not nullish, and
+  //   then the `> 0` guard threw it away. Every fallback behind it was unreachable. Each
+  //   candidate is now judged on its own and skipped unless it is a real HTTP status.
+  const candidates = [
+    typeof err.originalResponse?.getStatus === 'function' ? err.originalResponse.getStatus() : null,
+    err.status,
+    err.statusCode,
+    err.originalResponse?.status,
+  ];
+  for (const raw of candidates) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 100 && n < 600) return n;
+  }
+  return null;
 }
 
 /**
- * Map an upload failure to `{ reason, message }`.
+ * Map an upload failure to `{ reason, status, retryable, message }`.
  *
  * ★ The message is built from the reason code ALONE. The underlying error text
  *   routinely contains the full resumable URL — and, after a redirect, a signed
@@ -506,22 +565,34 @@ function statusOf(err) {
 export function describeUploadError(err) {
   const name = String(err?.name || '');
   const status = statusOf(err);
-  let reason;
 
+  // ★ SHAPE, NOT NAME. tus wraps every transport failure in its own DetailedError, which
+  //   extends Error WITHOUT setting `name` — so `name === "TypeError"` could never fire for
+  //   a tus failure and every dropped connection was reported as `unknown`. A DetailedError
+  //   always carries originalRequest, and carries originalResponse ONLY when a response
+  //   actually arrived (upload.js calls _emitHttpError(req, null, …) on transport failure).
+  //   "A request went out and nothing came back" is precisely the offline shape.
+  const noResponse = !!err?.originalRequest && !err?.originalResponse;
+
+  let reason;
   if (name === 'AbortError' || err?.aborted === true) reason = 'aborted';
-  else if (status === 413) reason = 'too-large';
+  else if (status === 413) reason = 'storage-limit';
   else if (status === 401) reason = 'unauthorized';
   else if (status === 403) reason = 'forbidden';
   else if (status === 404) reason = 'bucket-missing';
-  else if (status === null && (name === 'TypeError' || err?.offline === true)) reason = 'offline';
+  else if (status === null && (noResponse || name === 'TypeError' || err?.offline === true)) reason = 'offline';
   else reason = 'unknown';
 
-  return { reason, status, message: uploadErrorMessage(reason) };
+  return {
+    reason,
+    status,
+    retryable: UPLOAD_ERROR_RETRYABLE[reason] ?? true,
+    message: UPLOAD_ERROR_MESSAGES[reason] || UPLOAD_ERROR_MESSAGES.unknown,
+  };
 }
 
 // ── Formatting ─────────────────────────────────────────────────────────────
 
-const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];
 
 /** Binary steps, familiar labels — what an admin reads off their file manager. */
 export function formatBytes(bytes) {
