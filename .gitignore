@@ -39,3 +39,7 @@ pnpm-debug.log*
 api/*.jpeg
 api/*.jpg
 api/*.png
+
+# Machine-local Claude Code permissions. This was previously ignored ONLY by the
+# developer's global gitignore, so the protection did not travel to another clone.
+.claude/settings.local.json

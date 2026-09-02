@@ -33,6 +33,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
+import { describeStorageLimits } from '../scripts/audit-db.mjs';
+
 import {
   LESSON_VIDEO_MAX_BYTES,
   LESSON_VIDEO_MIME,
@@ -249,4 +251,76 @@ test('the read policy finally requires approval, and asks by reference', () => {
     'authorization must come from the reference, not from parsing the object name');
   assert.ok(!/course_object_allowed/.test(m[1]),
     'the path parser must not survive in the policy it was written for');
+});
+
+// ── The limit that is NOT in any SQL file ───────────────────────────────────
+//
+// This suite says "the constants and the config that has to accept them must agree",
+// and for months it was right about every config it could see and blind to the one
+// that actually decided the outcome.
+//
+// Supabase enforces min(bucket file_size_limit, PROJECT-WIDE fileSizeLimit). The
+// project-wide value is storage-api configuration: it is in no db/*.sql, not in
+// storage.buckets, and unreachable from SQL — so no migration, no test-db suite and
+// not db:shadow:verify could ever have observed it. #44 set the bucket to 2 GiB and
+// documented the project-wide step as MANUAL in three places. It was never done. The
+// project stayed at the 50 MiB default (which upgrading to Pro does NOT change), so
+// every lesson video over 50 MiB died at ~6 MiB — one TUS chunk — while the app told
+// the admin their file exceeded 2 GB.
+//
+// npm run db:audit now checks it. These tests pin that the check exists and is right,
+// with no credentials required.
+
+test('the project-wide Storage limit is checked by something, not merely documented', () => {
+  const audit = read('scripts/audit-db.mjs');
+  assert.match(audit, /config\/storage/,
+    'db:audit must read the project Storage config; it is the only guard that can');
+  assert.match(audit, /LESSON_VIDEO_MAX_BYTES/,
+    'the threshold must be IMPORTED from the client cap, not retyped — retyping is how '
+    + 'the bucket and the project came to disagree in the first place');
+});
+
+test('the audit refuses a project limit below the cap the browser promises', () => {
+  const buckets = [{ id: 'course-videos', file_size_limit: 2147483648 }];
+
+  // The exact production state that caused the outage.
+  const broken = describeStorageLimits({
+    projectLimit: 52428800, buckets, required: LESSON_VIDEO_MAX_BYTES,
+  });
+  assert.equal(broken.ok, false);
+  assert.equal(broken.belowRequired, true);
+  assert.deepEqual(broken.overPromising, ['course-videos'],
+    'a bucket claiming more than the project allows is the general form of this bug');
+
+  // Exactly at the cap is correct — the bucket becomes the binding limit.
+  assert.equal(describeStorageLimits({
+    projectLimit: 2147483648, buckets, required: LESSON_VIDEO_MAX_BYTES,
+  }).ok, true);
+
+  // Headroom above the bucket is fine too.
+  assert.equal(describeStorageLimits({
+    projectLimit: 3221225472, buckets, required: LESSON_VIDEO_MAX_BYTES,
+  }).ok, true);
+
+  // A null bucket limit is not a lie: it means "no bucket ceiling", so the project
+  // limit simply applies and the two cannot disagree.
+  assert.equal(describeStorageLimits({
+    projectLimit: 2147483648, buckets: [{ id: 'x', file_size_limit: null }],
+    required: LESSON_VIDEO_MAX_BYTES,
+  }).ok, true);
+
+  // Unknown/unreadable config FAILS CLOSED. A silent pass here is the whole reason
+  // the ceiling stayed wrong in production.
+  assert.equal(describeStorageLimits({
+    projectLimit: null, buckets, required: LESSON_VIDEO_MAX_BYTES,
+  }).ok, false);
+});
+
+test('the migration still tells the operator that the bucket limit alone does nothing', () => {
+  // The only place the mechanism is explained next to the number it applies to.
+  for (const f of SQL_FILES) {
+    const sql = read(f);
+    assert.match(sql, /min\(bucket limit, project-wide upload limit\)/,
+      `${f} must keep the sentence explaining that file_size_limit is a ceiling, not a grant`);
+  }
 });

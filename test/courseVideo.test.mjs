@@ -53,6 +53,8 @@ import {
   lessonVideoPayload,
   shouldResignPlayback,
   describeUploadError,
+  UPLOAD_ERROR_MESSAGES,
+  UPLOAD_ERROR_RETRYABLE,
   formatBytes,
   formatMediaDuration,
 } from '../src/lib/courseVideo.js';
@@ -552,10 +554,93 @@ test('an expiring URL is re-signed before it is used, without waiting for a fail
 
 // ── Error copy: actionable, and never a token ──────────────────────────────
 
-test('an over-limit rejection from Storage names the limit, not the transport', () => {
+// ★ THE TEST THAT USED TO LIVE HERE ASSERTED THE BUG.
+//   It pinned reason === 'too-large' and a /\b2 GB\b/ message for any 413, which is
+//   exactly what told an admin their 117 MB file exceeded 2 GB while the real fault was
+//   a project-wide Storage limit left at its 50 MiB default. A test can hold a defect in
+//   place as firmly as code does.
+
+test('a 413 mid-transfer is a Storage misconfiguration, never the admin’s file', () => {
   const r = describeUploadError({ originalResponse: { getStatus: () => 413 } });
-  assert.equal(r.reason, 'too-large');
-  assert.match(r.message, /\b2 GB\b/, 'the admin needs the number, not "request entity too large"');
+  assert.equal(r.reason, 'storage-limit');
+  assert.equal(r.retryable, false,
+    'resuming re-sends the identical request and takes the identical 413');
+  assert.notEqual(r.reason, 'too-large',
+    'the pre-flight owns that reason; a transfer-time 413 must never borrow it');
+});
+
+test('the local cap is checked before a byte moves, which is why a 413 cannot mean “your file is too big”', () => {
+  // This test IS the argument. validateVideoFile refuses an oversize file up front, so
+  // by the time any byte reaches Storage the size has already been agreed. A 413 after
+  // that point can only mean the server’s ceiling is lower than the one we enforce.
+  const tooBig = validateVideoFile({
+    name: 'lesson.mp4', size: LESSON_VIDEO_MAX_BYTES + 1, type: 'video/mp4',
+  });
+  assert.equal(tooBig.ok, false);
+  assert.equal(tooBig.reason, 'too-large');
+  assert.match(tooBig.message, /\b2 GB\b/,
+    'the pre-flight DOES know the real size, so it may quote the cap');
+
+  const fromServer = describeUploadError({ originalResponse: { getStatus: () => 413 } });
+  assert.notEqual(fromServer.reason, tooBig.reason,
+    'the two paths must not collapse into one reason code again');
+});
+
+test('the 413 copy blames the project-wide setting and invents no ceiling of its own', () => {
+  // The suite otherwise asserts reason codes rather than prose. This one exception is
+  // load-bearing: Supabase’s 413 body (EntityTooLarge) carries NO number, so any figure
+  // here other than our own cap would be fabricated — which is the original bug.
+  const m = describeUploadError({ originalResponse: { getStatus: () => 413 } }).message;
+  assert.match(m, /project-wide/i, 'the admin must be told which setting is actually wrong');
+  assert.ok(m.includes(formatBytes(LESSON_VIDEO_MAX_BYTES)),
+    'quoting our own cap is fine — we enforce it');
+  assert.ok(!/\b50\s?MB\b/i.test(m),
+    'the client cannot know the project limit, so it must not print one');
+});
+
+test('a permanent failure never offers a Resume that cannot work', () => {
+  for (const status of [413, 403, 404]) {
+    const r = describeUploadError({ originalResponse: { getStatus: () => status } });
+    assert.equal(r.retryable, false, `${status} is permanent until a human changes something`);
+  }
+});
+
+test('a transient failure still offers a way forward', () => {
+  assert.equal(describeUploadError({ originalResponse: { getStatus: () => 401 } }).retryable, true,
+    'signing in again on another tab makes Resume genuinely work');
+  assert.equal(describeUploadError({ originalRequest: {}, originalResponse: null }).retryable, true);
+});
+
+test('an unclassified failure is treated as retryable, because refusing Resume would strand a live transfer', () => {
+  assert.equal(describeUploadError(new Error('kaboom')).retryable, true);
+});
+
+test('every upload reason has both a message and a retryability, so a new code cannot ship half-defined', () => {
+  assert.deepEqual(
+    Object.keys(UPLOAD_ERROR_RETRYABLE).sort(),
+    Object.keys(UPLOAD_ERROR_MESSAGES).sort(),
+    'a reason with copy but no retryability silently falls back to “retryable”',
+  );
+  for (const [reason, msg] of Object.entries(UPLOAD_ERROR_MESSAGES)) {
+    assert.ok(typeof msg === 'string' && msg.trim().length > 0, `${reason} has no copy`);
+  }
+});
+
+test('a dropped connection is reported as a dropped connection, not as an unknown failure', () => {
+  // tus wraps transport failures in DetailedError, which extends Error WITHOUT setting
+  // `name`, so the old `name === 'TypeError'` branch could never fire and every drop was
+  // reported as “could not be completed”. upload.js calls _emitHttpError(req, null, …) on
+  // a transport failure, so “a request went out and nothing came back” is the real shape.
+  const r = describeUploadError({ name: 'Error', originalRequest: {}, originalResponse: null });
+  assert.equal(r.reason, 'offline');
+  assert.equal(r.retryable, true);
+});
+
+test('a status of 0 does not blind the classifier to a status the error does carry', () => {
+  // `fromTus ?? err.status` treated 0 as an answer (0 is not nullish) and the `> 0` guard
+  // then discarded it, making every fallback behind it unreachable.
+  const r = describeUploadError({ originalResponse: { getStatus: () => 0 }, status: 403 });
+  assert.equal(r.reason, 'forbidden');
 });
 
 test('an authorization failure is distinguishable from a size failure', () => {
@@ -583,6 +668,7 @@ test('no message this module produces can ever contain a signed URL or a token',
     describeUploadError(new Error(`upload failed for ${signed}`)),
     describeUploadError({ message: signed, originalResponse: { getStatus: () => 500 } }),
     describeUploadError({ originalRequest: { getURL: () => signed } }),
+    describeUploadError({ message: signed, originalResponse: { getStatus: () => 413 } }),
   ];
   for (const p of probes) {
     assert.ok(!p.message.includes('token='), `leaked a token query param: ${p.message}`);

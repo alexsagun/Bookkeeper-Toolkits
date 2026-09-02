@@ -22,6 +22,7 @@
     "staff:bootstrap": "node scripts/bootstrap-super-admin.mjs",
     "db:shadow:apply": "node scripts/apply-db-files.mjs",
     "db:shadow:verify": "node scripts/apply-db-files.mjs --verify",
+    "storage:config": "node scripts/storage-config.mjs",
     "media:audit": "node scripts/migrate-lesson-videos.mjs",
     "media:migrate": "node scripts/migrate-lesson-videos.mjs --apply"
   },

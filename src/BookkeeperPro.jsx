@@ -15688,6 +15688,9 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
   const [fileInfo, setFileInfo] = useState(null);        // { name, size }
   const [duration, setDuration] = useState(null);
   const [errMsg, setErrMsg] = useState('');
+  // Whether the CURRENT errMsg describes something Resume could actually fix. A 413,
+  // 403 or 404 cannot be resumed away, and the old UI offered the button regardless.
+  const [retryable, setRetryable] = useState(true);
   const [live, setLive] = useState('');                  // throttled aria-live text
 
   const uploadRef = useRef(null);                        // the tus.Upload instance
@@ -15794,9 +15797,42 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
           `gh-lesson-${courseId}-${f.name}-${f.type}-${f.size}-${f.lastModified}`),
         retryDelays: [...LESSON_VIDEO_RETRY_DELAYS],
         headers: {
-          authorization: `Bearer ${token}`,
+          // ★ NO `authorization` HERE — it is set in onBeforeRequest below, and it must be
+          //   set in exactly ONE place. tus's browser stack calls
+          //   XMLHttpRequest.setRequestHeader(), which COMBINES repeated header names
+          //   rather than replacing them, and options.headers is applied in createRequest()
+          //   BEFORE sendRequest() awaits onBeforeRequest. Setting it in both would send
+          //   `Bearer <stale>, Bearer <fresh>` and Storage would reject every request.
+          //   Moving it back here is the tidy-looking edit that breaks all uploads;
+          //   test/uiSafety.test.mjs pins its absence for exactly that reason.
+          //
           // No x-upsert: every upload gets its own uuid path, so overwriting is never
           // wanted and enabling it would let a retry clobber a live lesson's file.
+        },
+        /**
+         * The bearer is attached PER REQUEST, not once for the whole transfer.
+         *
+         * ★ WHY THIS IS NOW REQUIRED. Until the project-wide Storage limit was raised, no
+         *   upload could exceed 50 MiB, so no transfer could outlive a 1-hour access token.
+         *   At 2 GiB a slow link genuinely can: tus would then PATCH every remaining 6 MiB
+         *   chunk with a dead bearer, take a 401 on each, exhaust the retry ladder, and
+         *   surface as an "expired session" long after the token actually died. Raising the
+         *   ceiling is what made this reachable, so it is fixed in the same change.
+         *
+         * ★ getSession() returns the cached session and refreshes it when it has expired,
+         *   so this is a memory read on all but roughly one call per hour.
+         *
+         * ★ IT NEVER THROWS. Rejecting here makes tus build a DetailedError with no
+         *   response, which classifies as `offline` — the wrong story. Falling back to the
+         *   captured token lets Storage answer, and the classifier report what it said.
+         */
+        onBeforeRequest: async (req) => {
+          let fresh = token;
+          try {
+            const { data } = await supabase.auth.getSession();
+            fresh = data?.session?.access_token || token;
+          } catch (_) { /* keep the captured token; Storage will answer honestly */ }
+          req.setHeader('authorization', `Bearer ${fresh}`);
         },
         uploadDataDuringCreation: true,
         removeFingerprintOnSuccess: true,               // so the same file can be re-uploaded later
@@ -15851,7 +15887,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
   }
 
   async function handlePick(file) {
-    setErrMsg(''); liveStepRef.current = -1;
+    setErrMsg(''); setRetryable(true); liveStepRef.current = -1;
     if (!file) return;
     await discardPending();                              // replacing? drop the last orphan first
     fileRef.current = file;
@@ -15897,6 +15933,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
       if (!mountedRef.current) return;
       const d = describeUploadError(e);
       if (d.reason === 'aborted') return;                // cancel/pause already set the state
+      setRetryable(d.retryable);
       setErrMsg(d.message);
       go(UPLOAD_EVENTS.INTERRUPT);
       announce(d.message);
@@ -15936,7 +15973,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
       //   offset, so nothing already sent is sent again.
       const f = fileRef.current;
       if (!f) return;
-      setErrMsg('');
+      setErrMsg(''); setRetryable(true);
       go(UPLOAD_EVENTS.RETRY);
       announce('Upload resumed.');
       runTransfer(f);
@@ -16016,7 +16053,13 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
                 <button type="button" onClick={pause} className="px-2.5 py-1 rounded-lg text-xs font-semibold border"
                   style={{ borderColor: 'var(--glass-border)', color: C.text }}><Pause size={12} className="inline mr-1" />Pause</button>
               )}
-              {(state === UPLOAD_STATES.PAUSED || state === UPLOAD_STATES.INTERRUPTED) && (
+              {/* ★ PAUSED is unconditional — pausing is not a failure. INTERRUPTED is gated:
+                  a 413/403/404 changes nothing about the next attempt, so Resume would re-send
+                  the same request, take the same status, and cost the admin another 6 MiB and
+                  another wait while believing their file is at fault. Cancel stays rendered and
+                  CANCELLED defines SELECT_FILE, so this is never a dead end. */}
+              {(state === UPLOAD_STATES.PAUSED
+                || (state === UPLOAD_STATES.INTERRUPTED && retryable)) && (
                 <button type="button" onClick={resume} className="px-2.5 py-1 rounded-lg text-xs font-semibold border"
                   style={{ borderColor: 'var(--glass-border)', color: C.text }}><Play size={12} className="inline mr-1" />Resume</button>
               )}
