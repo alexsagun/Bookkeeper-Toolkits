@@ -982,9 +982,14 @@ export const OBJECT_CHECKS = [
     from pg_policies where schemaname='public'
       and policyname in ('community_posts_read','community_comments_read',
                          'community_attachments_read','community_post_tags_read')`],
+  // ★ objects.name, NOT name. pg_policies renders a storage policy's qual with the table
+  //   qualified, so the source text `a.storage_path = name` never appears in the catalog and
+  //   this line reported a FAIL against a policy that was entirely correct — every arm
+  //   present, no legacy is_admin(). A check that cries wolf is exactly how the #44
+  //   external-link line stopped being read.
   ['#56    a moderator storage delete is bounded, blanket stays super', `select
       qual ilike '%is_super_admin%' and qual ilike '%community_moderation_events%'
-      and qual ilike '%a.storage_path = name%' and qual not ilike '%is_admin()%' as ok
+      and qual ilike '%a.storage_path = objects.name%' and qual not ilike '%is_admin()%' as ok
     from pg_policies where schemaname='storage' and policyname='community_media_delete'`],
   ['#56    community_spaces_admin_all is still the batch lifecycle', `select
       qual ilike '%batches.manage%' as ok
