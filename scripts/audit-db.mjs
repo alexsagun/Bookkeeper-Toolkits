@@ -30,6 +30,11 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 
+// ★ The audit's threshold is the CLIENT's own cap, imported rather than retyped, so
+//   raising LESSON_VIDEO_MAX_BYTES moves this check with it. Precedent for a script
+//   importing from src/lib: scripts/generate-voice-agent-knowledge.mjs.
+import { LESSON_VIDEO_MAX_BYTES } from '../src/lib/courseVideo.js';
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..');
 
@@ -80,6 +85,82 @@ async function q(sql, token) {
     await sleep(600 * 2 ** attempt);
   }
   throw new Error('unreachable');
+}
+
+/**
+ * One read-only Management API GET. Same retry ladder as q(), different transport.
+ *
+ * ★ SOME THINGS ARE NOT IN THE DATABASE. The project-wide Storage upload limit is
+ *   storage-api configuration, not a row — it is in no table, no db/*.sql and no
+ *   pg_catalog. q() therefore cannot reach it at any price, which is precisely why
+ *   nothing in this repo noticed it was wrong for months.
+ */
+async function api(path, token) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const res = await fetch(`https://api.supabase.com/v1/projects/${LIVE_REF}${path}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const text = await res.text();
+      if (res.ok) return text ? JSON.parse(text) : {};
+      if (res.status < 500 && res.status !== 429) {
+        let detail = text;
+        try { detail = JSON.parse(text).message || text; } catch { /* raw */ }
+        throw new Error(`HTTP ${res.status}: ${String(detail).slice(0, 200)}`);
+      }
+    } catch (e) {
+      if (attempt === 4) throw e;
+    }
+    await sleep(600 * 2 ** attempt);
+  }
+  throw new Error('unreachable');
+}
+
+/**
+ * Does the project-wide Storage ceiling actually allow what this app promises?
+ *
+ * THE BUG THIS EXISTS FOR. db/2026-08-24-course-video-upload-only.sql set
+ * course-videos.file_size_limit to 2 GiB and said so in three files. The
+ * project-wide limit stayed at its 50 MiB default — which upgrading to Pro does
+ * NOT change — and Supabase enforces min(bucket, project-wide). So every lesson
+ * video over 50 MiB died at ~6 MiB with the app blaming the admin’s file, and
+ * NOTHING in this repo could catch it: not a migration, not test-db (SQL cannot
+ * see this value), and not db:shadow:verify (it snapshots pg_policies, never
+ * storage config).
+ *
+ * PURE and exported so node --test can pin it with no credentials — the reason
+ * this went unnoticed is that every existing guard needed a database or a token.
+ *
+ * ★ A NULL bucket limit is not a lie: it means "no bucket ceiling", so the project
+ *   limit simply applies and the two cannot disagree.
+ * ★ The second rule is the general form of the bug — no bucket may PROMISE more
+ *   than the project allows, because the promise is what an operator reads.
+ */
+export function describeStorageLimits({ projectLimit, buckets, required }) {
+  const limit = Number(projectLimit);
+  const known = Number.isFinite(limit) && limit > 0;
+  const need = Number(required);
+  const belowRequired = !known || limit < need;
+  const overPromising = (buckets || [])
+    .filter((b) => known && b.file_size_limit != null && Number(b.file_size_limit) > limit)
+    .map((b) => b.id)
+    .sort();
+  return {
+    ok: !belowRequired && overPromising.length === 0,
+    projectLimit: known ? limit : null,
+    required: need,
+    belowRequired,
+    overPromising,
+  };
+}
+
+/** Bytes -> a short human size, for report lines only. */
+export function prettyBytes(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v <= 0) return 'unknown';
+  if (v >= 1024 ** 3) return `${+(v / 1024 ** 3).toFixed(2)} GiB`;
+  if (v >= 1024 ** 2) return `${+(v / 1024 ** 2).toFixed(0)} MiB`;
+  return `${v} B`;
 }
 
 /**
@@ -804,13 +885,47 @@ async function main() {
   }
 
   const failedObjects = objects.filter((o) => !o.ok);
-  const clean = notApplied.length === 0 && orphanRows.length === 0 && failedObjects.length === 0;
+
+  // The project-wide Storage ceiling. NOT an OBJECT_CHECKS entry: those are
+  // [label, sql] run through q(), and this value does not exist in SQL at all.
+  // FAILS CLOSED — an unreachable endpoint is reported not-clean, exactly like an
+  // object check that threw. Never make this fail open; a silent pass here is the
+  // whole reason the ceiling stayed wrong in production for months.
+  let storage;
+  try {
+    // Two different transports, so name them separately: a storage.buckets query that
+    // fails is not "could not read the project Storage config", and reporting it as one
+    // sends the operator to the wrong dashboard page.
+    let cfg;
+    try {
+      cfg = await api('/config/storage', token);
+    } catch (e) { throw new Error(`project Storage config: ${e.message}`); }
+    let buckets;
+    try {
+      buckets = await q('select id, file_size_limit from storage.buckets order by id', token);
+    } catch (e) { throw new Error(`storage.buckets query: ${e.message}`); }
+    storage = {
+      ...describeStorageLimits({
+        projectLimit: cfg?.fileSizeLimit, buckets, required: LESSON_VIDEO_MAX_BYTES,
+      }),
+      err: null,
+    };
+  } catch (e) {
+    storage = {
+      ok: false, projectLimit: null, required: LESSON_VIDEO_MAX_BYTES,
+      belowRequired: true, overPromising: [], err: e.message,
+    };
+  }
+
+  const clean = notApplied.length === 0 && orphanRows.length === 0
+    && failedObjects.length === 0 && storage.ok;
 
   if (json) {
     console.log(JSON.stringify({
       project: LIVE_REF, files: files.length, logged: logged.length,
       notApplied, orphanRows,
       objectChecks: objects.map(({ label, ok }) => ({ label, ok })),
+      storage,
       clean,
     }, null, 2));
     process.exit(clean ? 0 : 1);
@@ -826,6 +941,26 @@ async function main() {
   console.log('\nObject-level checks — does the schema really contain it?\n');
   for (const o of objects) {
     console.log(`  ${o.ok ? 'OK  ' : 'FAIL'}  ${o.label}${o.err ? `  (${o.err})` : ''}`);
+  }
+
+  console.log('\nProject-wide Storage limit — the ceiling every bucket is silently capped by\n');
+  if (storage.err) {
+    console.log(`  FAIL  could not check the project Storage limit  (${storage.err})`);
+  } else {
+    console.log(
+      `  ${storage.belowRequired ? 'FAIL' : 'OK  '}  project-wide upload limit : `
+      + `${prettyBytes(storage.projectLimit)} (${storage.projectLimit})`
+      + (storage.belowRequired
+        ? ` — below the ${prettyBytes(storage.required)} lesson cap` : ''),
+    );
+    if (storage.belowRequired) {
+      console.log('        Supabase enforces min(bucket, project-wide), so a larger bucket limit does nothing.');
+      console.log('        Fix: npm run storage:config -- --apply   (or Dashboard → Storage → Settings)');
+    }
+    console.log(
+      `  ${storage.overPromising.length ? 'FAIL' : 'OK  '}  buckets promising more than the project allows: `
+      + `${storage.overPromising.length ? storage.overPromising.join(', ') : 'none'}`,
+    );
   }
 
   console.log(

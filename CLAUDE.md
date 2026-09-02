@@ -53,6 +53,10 @@ npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge 
 npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
 npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, bootstrapFolds, courseVideo, courseVideoSql, studentProgress, studentProgressSql, uiSafety, coaIntegrity,
                            approveGrantSql, …)
+npm run storage:config     # read the PROJECT-WIDE Supabase Storage upload limit and the effective
+                           # limit of every bucket; --apply raises it to LESSON_VIDEO_MAX_BYTES.
+                           # The bucket limit alone is a ceiling, not a grant — Supabase enforces
+                           # min(bucket, project-wide), and the project-wide one is NOT in any SQL.
 ```
 
 There is **no linter** — verify UI changes by running `npm run dev` and exercising the affected
@@ -1785,6 +1789,31 @@ docs **in the same change**:
   ↔ the `#44` `OBJECT_CHECKS` in `scripts/audit-db.mjs`. The SQL-parity suite exists because a
   client cap above the bucket's makes the browser promise a size Storage will 413 — after the file
   has already spent ten minutes transferring.
+  ★ **And the one limit that is in NO SQL file.** Supabase enforces
+  `min(bucket file_size_limit, PROJECT-WIDE fileSizeLimit)`. The project-wide value is
+  storage-api configuration: it is not in any `db/*.sql`, not in `storage.buckets`, and
+  **unreachable from SQL** — so no migration, no `test-db` suite and not `db:shadow:verify`
+  could ever observe it. #44 set the bucket to 2 GiB and documented the project-wide step as
+  MANUAL in three places; it was never performed, and on 2026-09-02 the project was still at
+  the 50 MiB default **on Pro** (upgrading does not raise it), so every lesson video over
+  50 MiB died at ~6 MiB — one TUS chunk — while the app blamed the admin's file. Moving
+  together now: `LESSON_VIDEO_MAX_BYTES` ↔ the bucket literal ↔ **the project-wide limit**
+  ↔ `scripts/storage-config.mjs` ↔ the storage section of `scripts/audit-db.mjs` (which
+  imports the cap rather than retyping it) ↔ `test/courseVideoSql.test.mjs`.
+
+  ★ **The upload bearer is attached PER REQUEST via tus's `onBeforeRequest`, and nowhere
+  else.** Raising the ceiling to 2 GiB made hour-long transfers possible, so a 1-hour access
+  token can now expire mid-upload. It must NOT also be declared in `options.headers`:
+  `XMLHttpRequest.setRequestHeader()` **combines** repeated header names, and `headers` is
+  applied before `onBeforeRequest` runs, so declaring both sends
+  `Bearer <stale>, Bearer <fresh>` and Storage 401s every request. `test/uiSafety.test.mjs`
+  pins its absence, because no unit test can reach it.
+
+  ★ **A 413 mid-transfer is `storage-limit`, is NOT retryable, and is never the admin's
+  file.** `validateVideoFile()` already refused an oversize file before a byte was sent, so
+  a transfer-time 413 can only mean the server ceiling is lower than the one we enforce. The
+  message must never quote a limit the client cannot know — Supabase's 413 body carries no
+  number — and the UI must not offer Resume, which re-sends the identical request.
 - **Changing who may READ a lesson video object** → `course_video_object_readable()` ↔ the
   `course_videos_read` policy ↔ `courses_read` (it MIRRORS it — drift is a security bug) ↔ the
   two #27 trainer mirrors ↔ `PLAN_ENTITLEMENTS` ↔ `planScopeAllows()`. Note `db:shadow:verify`
