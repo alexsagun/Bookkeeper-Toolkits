@@ -202,7 +202,12 @@ test('the lesson-video upload attaches its bearer per request, and from exactly 
   // optional quotes matter: 'authorization': and "authorization": are ordinary style for
   // a header object, and without them the ratchet would wave through the exact regression
   // it exists to catch.
-  assert.ok(!/^\s*['"]?authorization['"]?\s*:/im.test(headers),
+  // Strip comments first: this block deliberately EXPLAINS why authorization is absent,
+  // and with the [,{] alternation below a prose example could otherwise trip it.
+  const headerCode = headers.replace(/\/\/.*$/gm, '');
+  // `^` alone would miss the single-line form `headers: { authorization: … }` and a
+  // trailing `, "authorization": …` — both of which reintroduce the duplicate header.
+  assert.ok(!/(?:^|[,{])\s*['"]?authorization['"]?\s*:/im.test(headerCode),
     'authorization is declared in BOTH options.headers and onBeforeRequest. XHR combines '
     + 'repeated header names, so every request would go out as "Bearer <stale>, Bearer '
     + '<fresh>" and Storage would 401 all of them. Set it ONLY in onBeforeRequest.');
