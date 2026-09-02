@@ -25,6 +25,7 @@ import {
   resetShadow,
   runSql,
   seedMember,
+  seedStaff,
   spaceIdFor,
   sqlScalar,
 } from './_harness.mjs';
@@ -42,6 +43,8 @@ let admin, vip, member;
 
 before(async () => {
   admin = await makePersona('admin', { isAdmin: true, fullName: 'Alex Admin' });
+  // #45 re-gated admin_assign_batch / admin_grant_batch_run onto has_staff_permission().
+  await seedStaff(admin, 'super_admin');
   vip = await makePersona('vip-aug', { fullName: 'Vera Vip' });
   member = await makePersona('silver-member', { fullName: 'Silvia Silver' });
 });

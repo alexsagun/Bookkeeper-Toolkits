@@ -29,6 +29,7 @@ import {
   resetShadow,
   runSql,
   seedMember,
+  seedStaff,
   spaceIdFor,
   sqlScalar,
 } from './_harness.mjs';
@@ -90,6 +91,9 @@ const editOk = async (id, over = {}) => {
 
 before(async () => {
   admin = await makePersona('bl-admin', { isAdmin: true, fullName: 'Alex Admin' });
+  // #45 re-gated the admin_* batch RPCs onto has_staff_permission('batches.manage'), which
+  // reads staff_memberships — a row makePersona does not create.
+  await seedStaff(admin, 'super_admin');
   vip = await makePersona('bl-vip', { fullName: 'Vera Vip' });
   member = await makePersona('bl-member', { fullName: 'Mia Member' });
 });

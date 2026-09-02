@@ -32,9 +32,12 @@ are **CSS custom-property references**, with the actual per-theme values in
 **Do:** use the semantic status tokens for pills/banners — `var(--status-warn-bg/-bd/-fg)`,
 `--status-ok-*`, `--status-danger-*`, `--status-info-*`, `--status-neutral-*`, `--status-warn-strong-*`.
 **Do:** use the shell tokens for app chrome — `--sidebar-bg/-border/-edge` (the sidebar `<aside>`),
-`--topbar-bg` (mobile sticky bar), `--section-head-bg` (`SectionHead`), `--table-sticky-bg` +
-`--table-sticky-{soft,deeper,ok,danger}-bg` (sticky table columns, plain + tinted summary rows).
-Inline styles bypass the dark compat layer, so shell surfaces MUST use these vars.
+`--topbar-bg` (mobile sticky bar), `--section-head-bg` (`SectionHead`), `--table-sticky-bg`
+(sticky first-column table cells). Inline styles bypass the dark compat layer, so shell
+surfaces MUST use these vars. Note the four tinted variants
+(`--table-sticky-{soft,deeper,ok,danger}-bg`) were REMOVED by #56 along with the Budgeting
+and Forecasting tools that were their only consumers — `var(--table-sticky-soft-bg)` now
+resolves to nothing in both themes. Add a token back to `index.css` before using it.
 **Don't:** hardcode hex colors, and **never** concat an alpha suffix onto a token
 (`` `${C.primary}66` `` is broken CSS against a var) — use the alpha tokens: `var(--primary-glow)`
 (≈66), `--primary-glow-soft` (55), `--primary-selection` (33), `--primary-halo` (1A),

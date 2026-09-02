@@ -101,6 +101,10 @@ export const APP_ERROR_CODES = [
   'ACCESS_REQUEST_SELF_REVIEW',
   // ── Access-request staff target (#51) ──
   'ACCESS_REQUEST_STAFF_TARGET',
+  // ── #56 community moderation ──
+  'MODERATION_TARGET_NOT_FOUND',
+  'MODERATION_ACTION_INVALID',
+  'MODERATION_STATE_INVALID',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -245,6 +249,15 @@ const COPY = {
   ACCESS_REQUEST_STAFF_TARGET:
     'That account is a staff member, not a student waiting for approval. To take their access '
     + 'away, suspend or revoke their role in Team & Roles — that’s the action that gets recorded.',
+  MODERATION_TARGET_NOT_FOUND:
+    'That post or reply isn’t available in a channel you moderate. Refresh the channel and try '
+    + 'again — it may have been deleted, or moved somewhere you can’t reach.',
+  MODERATION_ACTION_INVALID:
+    'That moderation action isn’t recognised. Reload the page — the app and the server are out '
+    + 'of step.',
+  MODERATION_STATE_INVALID:
+    'The author withdrew this themselves, so a moderator can’t restore it. Only they can post it '
+    + 'again.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };

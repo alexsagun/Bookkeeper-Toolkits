@@ -73,10 +73,6 @@
   --topbar-bg: rgba(255,255,255,0.85);
   --section-head-bg: linear-gradient(180deg, rgba(247,250,255,0.92) 0%, rgba(247,250,255,0.78) 70%, rgba(247,250,255,0.50) 100%);
   --table-sticky-bg: rgba(247,250,255,0.95);
-  --table-sticky-soft-bg: rgba(234,244,255,0.95);   /* blue subtotal rows (= --c-bg-soft at 0.95) */
-  --table-sticky-deeper-bg: rgba(220,233,255,0.95); /* highlight rows, e.g. Ending Cash (= --c-bg-deeper) */
-  --table-sticky-ok-bg: rgba(240,253,244,0.95);     /* green wash (Gross Profit) */
-  --table-sticky-danger-bg: rgba(254,242,242,0.95); /* red wash (Total Outflows) */
 
   /* Text */
   --c-text: #0F1217;
@@ -153,10 +149,6 @@
   --topbar-bg: rgba(16,27,48,0.85);
   --section-head-bg: linear-gradient(180deg, rgba(11,19,34,0.92) 0%, rgba(11,19,34,0.78) 70%, rgba(11,19,34,0.50) 100%);
   --table-sticky-bg: rgba(18,26,41,0.96);
-  --table-sticky-soft-bg: rgba(16,27,48,0.96);      /* = --c-bg-soft #101B30 */
-  --table-sticky-deeper-bg: rgba(22,35,61,0.96);    /* = --c-bg-deeper #16233D */
-  --table-sticky-ok-bg: rgba(17,33,30,0.96);        /* green-tinted navy */
-  --table-sticky-danger-bg: rgba(33,21,27,0.96);    /* red-tinted navy */
 
   --c-text: #E8ECF2;
   --c-text-soft: #A9B2C0;

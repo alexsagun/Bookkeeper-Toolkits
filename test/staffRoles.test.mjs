@@ -110,9 +110,12 @@ test('every permission is held by at least one role', () => {
   }
 });
 
-test('operations_admin runs student operations and nothing else', () => {
+test('operations_admin runs student operations and the community, and nothing else', () => {
   const allowed = ['access_requests.review', 'enrollments.review', 'students.assign_courses',
-    'students.import', 'batches.manage'];
+    'students.import', 'batches.manage', 'student_progress.read',
+    // #56. Granting these is what made the server-side re-gate mandatory: #45 left every
+    // community RPC on is_admin() precisely BECAUSE only super_admin held them.
+    'community.manage', 'community.moderate'];
   for (const key of allowed) assert.ok(staffCan(OPS, key), `Operations Admin must hold ${key}`);
 
   // The four that matter most, named individually so a regression says which one.
@@ -124,10 +127,13 @@ test('operations_admin runs student operations and nothing else', () => {
   assert.equal(staffCan(OPS, 'payment_settings.manage'), false, 'global settings are Super Admin only');
 });
 
-test('trainer authors courses and cannot reach students, money or staff', () => {
+test('trainer authors courses, runs the community, and reaches nothing else', () => {
   assert.ok(staffCan(TRAINER, 'courses.create'), 'a Trainer must be able to start a course');
   assert.ok(staffCan(TRAINER, 'courses.manage_assigned'), 'a Trainer edits their assigned courses');
   assert.ok(staffCan(TRAINER, 'course_trainer.manage'), 'a Trainer indexes their own course for the AI trainer');
+  // #56, an explicit product decision: a Trainer configures AND moderates the community.
+  assert.ok(staffCan(TRAINER, 'community.manage'), 'a Trainer configures community channels');
+  assert.ok(staffCan(TRAINER, 'community.moderate'), 'a Trainer moderates community content');
 
   assert.equal(staffCan(TRAINER, 'courses.manage_all'), false,
     'manage_all would let a Trainer edit another Trainer’s course');
@@ -138,6 +144,40 @@ test('trainer authors courses and cannot reach students, money or staff', () => 
   assert.equal(staffCan(TRAINER, 'enrollments.review'), false, 'a Trainer must never see payment proofs');
   assert.equal(staffCan(TRAINER, 'staff.manage'), false, 'a Trainer must never manage staff');
   assert.equal(staffCan(TRAINER, 'batches.manage'), false, 'a Trainer must never move cohorts');
+  assert.equal(staffCan(TRAINER, 'student_progress.read'), false,
+    'community moderation exposes community identities, not the private progress report');
+  assert.equal(staffCan(TRAINER, 'access_requests.review'), false, 'a Trainer approves no signups');
+  assert.equal(staffCan(TRAINER, 'students.import'), false, 'a Trainer runs no migrations');
+  assert.equal(staffCan(TRAINER, 'sidebar.customize'), false, 'a Trainer renames nothing app-wide');
+  assert.equal(staffCan(TRAINER, 'payment_settings.manage'), false, 'a Trainer touches no money');
+});
+
+test('community authority carries nothing else with it', () => {
+  // The exposure #56 accepts is community identities and private cohort rooms. It must not
+  // become a back door to payment, enrolment, ranking-report or profile administration.
+  for (const ctx of [OPS, TRAINER]) {
+    assert.ok(staffCan(ctx, 'community.manage') && staffCan(ctx, 'community.moderate'));
+    assert.equal(staffCan(ctx, 'staff.manage'), false);
+    assert.equal(staffCan(ctx, 'staff.audit.read'), false);
+    assert.equal(staffCan(ctx, 'students.extend_access'), false);
+    assert.equal(staffCan(ctx, 'courses.manage_all'), false);
+    assert.equal(staffCan(ctx, 'courses.delete'), false);
+    assert.equal(staffCan(ctx, 'courses.publish'), false);
+    assert.equal(staffCan(ctx, 'sidebar.customize'), false);
+    assert.equal(staffCan(ctx, 'payment_settings.manage'), false);
+  }
+});
+
+test('a non-active membership holds no community permission either', () => {
+  for (const status of ['invited', 'suspended', 'revoked']) {
+    for (const role of ['operations_admin', 'trainer', 'super_admin']) {
+      const ctx = normalizeStaffContext({
+        is_staff: true, role_key: role, status, permissions: permissionsForRole(role),
+      });
+      assert.equal(staffCan(ctx, 'community.manage'), false, `${role}/${status}`);
+      assert.equal(staffCan(ctx, 'community.moderate'), false, `${role}/${status}`);
+    }
+  }
 });
 
 test('only super_admin holds the escalation-critical permissions', () => {
@@ -536,6 +576,23 @@ test('a Trainer gains the course catalogs and nothing operational', () => {
   assert.equal(ent.allowsTab('enrollments'), false, 'a Trainer must not reach payment proofs');
   assert.equal(ent.allowsTab('studentimports'), false);
   assert.equal(ent.allowsTab('invoice'), false, 'and gains no student tools');
+});
+
+test('every community-authorised role reaches the Community tab without a subscription', () => {
+  // #56. The tab is deliberately absent from ADMIN_TAB_PERMISSION - adding it there would
+  // make adminTabAllowed() refuse it for students, who are exactly who it is for. The
+  // entitlement union is what lets an unpaid Ops Admin or Trainer open the forum.
+  for (const ctx of [OPS, TRAINER]) {
+    assert.ok(staffEntitlement(ctx, null).allowsTab('community'),
+      'a staff member with NO plan at all still reaches the community they moderate');
+    assert.ok(staffEntitlement(ctx, scopedBase).allowsTab('community'));
+  }
+  const noCommunity = normalizeStaffContext({
+    is_staff: true, role_key: 'trainer', status: 'active',
+    permissions: ['courses.create'],
+  });
+  assert.equal(staffEntitlement(noCommunity, null).allowsTab('community'), false,
+    'and a staff member holding NEITHER community permission does not');
 });
 
 test('a Trainer sees an assigned draft course that their plan would hide', () => {

@@ -32,6 +32,7 @@ import {
   makePersona,
   resetShadow,
   seedMember,
+  seedStaff,
   spaceIdFor,
   sqlScalar,
 } from './_harness.mjs';
@@ -45,6 +46,9 @@ let admin, sampler, silver, vipA, vipB, expired;
 
 before(async () => {
   admin   = await makePersona('ch-admin',   { isAdmin: true, fullName: 'Alex Admin' });
+  // #56: the community RPCs and policies read has_staff_permission() now, which is backed
+  // by staff_memberships — a row makePersona does not create.
+  await seedStaff(admin, 'super_admin');
   sampler = await makePersona('ch-sampler', { fullName: 'Sam Sampler' });
   silver  = await makePersona('ch-silver',  { fullName: 'Silvia Silver' });
   vipA    = await makePersona('ch-vip-a',   { fullName: 'Vera VipA' });
