@@ -268,3 +268,40 @@ test('the uploader never offers Resume on a failure the pure module called perma
   assert.match(region, /state === UPLOAD_STATES\.PAUSED/,
     'PAUSED must stay unconditional — pausing is not a failure');
 });
+
+// ── 12. Every admin screen fences its verdict behind staffDegraded/staffReady ──
+//
+// The house idiom is `staffDegraded ? !!profile?.is_admin : (staffReady && can(...))`.
+// AccessRequests — the screen that approves and rejects accounts — instead carried a bare
+// `can('access_requests.review') || !!profile?.is_admin`, whose second arm fired
+// unconditionally rather than only when the staff context is degraded, and which never
+// waited for staffReady. It therefore rendered off the legacy profiles.is_admin cache
+// regardless of what my_staff_context() actually said.
+//
+// Also pins the other half of that bug: a component that READS staffDegraded must
+// destructure it from useAuth(), or it throws ReferenceError at render — which the build
+// cannot see and no unit test reaches, because this repo has no jsdom.
+test('admin verdicts are fail-closed, and staffDegraded is always in scope', () => {
+  const src = app();
+
+  const bare = src.match(/const\s+\w+\s*=\s*can\('[a-z_.]+'\)\s*\|\|\s*!!?profile\?\.is_admin/g) || [];
+  assert.equal(bare.length, 0,
+    `a bare \`can(...) || is_admin\` admin verdict is back: ${bare.join(' / ')}. The second arm `
+    + 'must be reachable only when staffDegraded, and the first must wait for staffReady.');
+
+  // Split on top-level component declarations and check each one that mentions staffDegraded.
+  const lines = src.split(/\r?\n/);
+  const starts = [];
+  lines.forEach((l, i) => { if (/^(?:function|const)\s+[A-Z][A-Za-z0-9_]*/.test(l)) starts.push(i); });
+  const missing = [];
+  starts.forEach((start, n) => {
+    const body = lines.slice(start, starts[n + 1] ?? lines.length).join('\n');
+    if (!/\bstaffDegraded\b/.test(body)) return;
+    if (!/const\s*\{[^}]*\bstaffDegraded\b[^}]*\}\s*=\s*useAuth\(\)/.test(body)) {
+      missing.push((lines[start].match(/[A-Z][A-Za-z0-9_]*/) || ['?'])[0]);
+    }
+  });
+  assert.deepEqual(missing, [],
+    `these components read staffDegraded without destructuring it from useAuth(), which is a `
+    + 'ReferenceError at render that the build cannot catch');
+});
