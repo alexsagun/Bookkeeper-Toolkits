@@ -21817,6 +21817,12 @@ function CommunityHub() {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [err, setErr] = useState('');
+  // ★ SEPARATE FROM `err` ON PURPOSE. loadFeed() clears `err` synchronously on entry and
+  //   again on success, and handlePublished calls loadFeed in the same call stack right
+  //   after setting the warning — so a warning written into `err` was overwritten before
+  //   it could ever paint. A member whose image failed to attach saw a normal, silent
+  //   success with no picture and no explanation.
+  const [publishWarn, setPublishWarn] = useState('');
   const [schemaGap, setSchemaGap] = useState(null);          // null | 'missing' (#23 not run) | 'upgrade' (#24 not run)
   const [catCounts, setCatCounts] = useState({});            // tag_slug -> active post count
   const [reactMeta, setReactMeta] = useState({});            // post_id -> { counts: {type:n}, mine: Set }
@@ -22793,9 +22799,9 @@ function CommunityHub() {
   function handlePublished(post, warns) {
     setComposerOpen(false); setEditTarget(null);
     setReactMeta(prev => ({ ...prev, [post.id]: { counts: {}, mine: new Set() } }));
-    if (warns && warns.length) {
-      setErr(`Your post is live, but its ${warns.join(' and ')} didn’t save. You can delete the post and try again.`);
-    }
+    setPublishWarn(warns && warns.length
+      ? `Your post is live, but its ${warns.join(' and ')} didn’t save. You can delete the post and try again.`
+      : '');
     // Reset the view so the new post is visible near the top.
     setFilter('latest'); filterRef.current = 'latest';
     setSearchInput(''); searchRef.current = '';
@@ -23094,7 +23100,14 @@ function CommunityHub() {
     [channels],
   );
   const annChannelIdsRef = useRef(annChannelIds);
-  useEffect(() => { annChannelIdsRef.current = annChannelIds; }, [annChannelIds]);
+  // ★ SYNCED DURING RENDER, not in an effect. The bootstrap sets channels and calls
+  //   loadFeed() in the same synchronous block, and loadFeed reads this ref before its
+  //   first await — so an effect-only sync left it holding the render-0 empty Set for the
+  //   whole first load. loadFeed then took its `else` arm and filtered announcements to
+  //   NIL_UUID, so the Announcements rail was empty on EVERY fresh visit to /community and
+  //   only appeared after some unrelated action forced a second load. The value is derived
+  //   purely from `channels`, so assigning it during render is idempotent and safe.
+  annChannelIdsRef.current = annChannelIds;
   const isAnnouncementPost = useCallback((post) => {
     if (!post) return false;
     if (preChannels || !post.channel_id) return post.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG;
@@ -23210,6 +23223,11 @@ function CommunityHub() {
   const emptyCopy = (() => {
     // The feed is intentionally not loaded in this state — don't invite a post.
     if (spacesFailed) return { title: 'Community unavailable', desc: 'We couldn’t work out which communities you have access to, so the feed is paused. Reload the page to try again.' };
+    // ★ An empty list because the LOAD FAILED is not an empty community. Without this the
+    //   red error banner and “Start the first discussion — introduce yourself” rendered
+    //   together, and the silent-refresh path (the "N new discussions" pill) swallowed the
+    //   error entirely, leaving only the invitation.
+    if (err) return { title: 'Couldn’t load discussions', desc: 'Something went wrong fetching the feed. Check your connection and try again — nothing has been lost.' };
     if (searchRef.current) return { title: 'No matches', desc: `No discussions match “${searchRef.current}”. Try a different search.` };
     if (freeTag) return { title: 'Nothing tagged yet', desc: `No discussions tagged #${freeTag} yet.` };
     if (filter === 'unanswered') return { title: 'All caught up', desc: 'No unanswered discussions — every question has a reply.' };
@@ -23271,6 +23289,16 @@ function CommunityHub() {
         </div>
       )}
 
+      {publishWarn && (
+        <div className="mb-4 max-w-3xl mx-auto p-4 rounded-xl border flex items-start gap-3" role="alert"
+          style={{ background: 'var(--status-warn-bg)', borderColor: 'var(--status-warn-bd)' }}>
+          <AlertTriangle size={18} className="mt-0.5 flex-shrink-0" style={{ color: 'var(--status-warn-fg)' }} />
+          <div className="text-sm flex-1" style={{ color: C.text }}>{publishWarn}</div>
+          <button onClick={() => setPublishWarn('')} aria-label="Dismiss" className="transition hover:opacity-70" style={{ color: 'var(--status-warn-fg)' }}>
+            <X size={16} />
+          </button>
+        </div>
+      )}
       {err && (
         <div className="mb-4 max-w-3xl mx-auto p-4 rounded-xl border flex items-start gap-3"
           style={{ background: 'var(--status-danger-bg)', borderColor: 'var(--status-danger-bd)' }}>
