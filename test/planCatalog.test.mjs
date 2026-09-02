@@ -247,6 +247,17 @@ test('rounding up to the next peso carries instead of printing .10', () => {
   assert.equal(phpAmount(999999.999), '₱1,000,000');
 });
 
+// Binary floating point, separately from the carry. `1.005 * 100` is 100.49999999999999, so a
+// plain Math.round takes it DOWN and prints ₱1 for a value the author wrote as ₱1.01. Fixing the
+// product to 2 places first re-materialises the decimal that was actually written.
+test('cent rounding is decimal-safe, not binary-float-safe', () => {
+  assert.equal(phpAmount(1.005), '₱1.01');
+  assert.equal(phpAmount(1.115), '₱1.12');
+  assert.equal(phpAmount(2.675), '₱2.68');
+  // and the carry still works through the same path
+  assert.equal(phpAmount(0.999), '₱1');
+});
+
 test('genuine centavos still render, and never gain a stray zero', () => {
   assert.equal(phpAmount(1234.5), '₱1,234.5');
   assert.equal(phpAmount(1234.56), '₱1,234.56');

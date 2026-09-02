@@ -22503,6 +22503,12 @@ function CommunityHub() {
 
   async function toggleCommentReact(postId, commentId, type) {
     if (!uid) return;
+    // Same race, same table, same lack of a realtime correction as toggleReact — a comment
+    // reaction is not a different kind of row. The `c:` namespace keeps these keys from
+    // colliding with the `p:` ones when a post and a comment share an id space.
+    const busyKey = `c:${commentId}:${type}`;
+    if (reactBusyRef.current.has(busyKey)) return;
+    reactBusyRef.current.add(busyKey);
     const cur = commentReactMeta[commentId];
     const has = !!(cur && cur.mine.has(type));
     setCommentReactMeta(prev => {
@@ -22526,6 +22532,8 @@ function CommunityHub() {
     } catch (e) {
       logDbError('[Community] comment react', e, { commentId, type });
       loadCommentReacts([commentId]);
+    } finally {
+      reactBusyRef.current.delete(busyKey);
     }
   }
 
