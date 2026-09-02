@@ -192,12 +192,17 @@ test('the lesson-video upload attaches its bearer per request, and from exactly 
     if (region[i] === '{') depth += 1;
     else if (region[i] === '}') { depth -= 1; if (depth === 0) { end = i; break; } }
   }
+  assert.ok(depth === 0 && end > h,
+    'could not brace-match the headers block — the scan below would pass vacuously');
   const headers = region.slice(h, end + 1);
 
   // Match an object PROPERTY, not the bare word: the block deliberately explains why
   // authorization is absent, and a ratchet that trips on its own explanation is noise.
-  // A comment line starts with //, so it can never satisfy ^\s*authorization\s*:
-  assert.ok(!/^\s*authorization\s*:/im.test(headers),
+  // A comment line starts with //, so it can never satisfy the property pattern. The
+  // optional quotes matter: 'authorization': and "authorization": are ordinary style for
+  // a header object, and without them the ratchet would wave through the exact regression
+  // it exists to catch.
+  assert.ok(!/^\s*['"]?authorization['"]?\s*:/im.test(headers),
     'authorization is declared in BOTH options.headers and onBeforeRequest. XHR combines '
     + 'repeated header names, so every request would go out as "Bearer <stale>, Bearer '
     + '<fresh>" and Storage would 401 all of them. Set it ONLY in onBeforeRequest.');
@@ -218,6 +223,11 @@ test('the uploader never offers Resume on a failure the pure module called perma
   assert.ok(i > 0, 'the Resume button was not found');
   const region = source.slice(Math.max(0, i - 900), i + 200);
   assert.match(region, /UPLOAD_STATES.INTERRUPTED/, 'wrong region — INTERRUPTED not in it');
-  assert.match(region, /retryable/,
-    'the Resume affordance must be gated on describeUploadError().retryable');
+  // Anchor on the actual expression, not the bare token: /retryable/ alone could not
+  // distinguish `INTERRUPTED && retryable` from `INTERRUPTED && !retryable`, and would
+  // also pass on an unrelated mention nearby.
+  assert.match(region, /UPLOAD_STATES\.INTERRUPTED\s*&&\s*retryable/,
+    'Resume must be gated on describeUploadError().retryable for INTERRUPTED');
+  assert.match(region, /state === UPLOAD_STATES\.PAUSED/,
+    'PAUSED must stay unconditional — pausing is not a failure');
 });

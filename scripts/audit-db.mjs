@@ -893,8 +893,17 @@ async function main() {
   // whole reason the ceiling stayed wrong in production for months.
   let storage;
   try {
-    const cfg = await api('/config/storage', token);
-    const buckets = await q('select id, file_size_limit from storage.buckets order by id', token);
+    // Two different transports, so name them separately: a storage.buckets query that
+    // fails is not "could not read the project Storage config", and reporting it as one
+    // sends the operator to the wrong dashboard page.
+    let cfg;
+    try {
+      cfg = await api('/config/storage', token);
+    } catch (e) { throw new Error(`project Storage config: ${e.message}`); }
+    let buckets;
+    try {
+      buckets = await q('select id, file_size_limit from storage.buckets order by id', token);
+    } catch (e) { throw new Error(`storage.buckets query: ${e.message}`); }
     storage = {
       ...describeStorageLimits({
         projectLimit: cfg?.fileSizeLimit, buckets, required: LESSON_VIDEO_MAX_BYTES,
@@ -936,7 +945,7 @@ async function main() {
 
   console.log('\nProject-wide Storage limit — the ceiling every bucket is silently capped by\n');
   if (storage.err) {
-    console.log(`  FAIL  could not read the project Storage config  (${storage.err})`);
+    console.log(`  FAIL  could not check the project Storage limit  (${storage.err})`);
   } else {
     console.log(
       `  ${storage.belowRequired ? 'FAIL' : 'OK  '}  project-wide upload limit : `

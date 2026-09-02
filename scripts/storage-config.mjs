@@ -165,12 +165,29 @@ async function main() {
   console.log(`Raising the project-wide limit to ${prettyBytes(target)} (${target})…`);
   await api('/config/storage', token, { fileSizeLimit: target });
 
-  // Read back. A PATCH that returns 200 and did not take effect is exactly the kind
-  // of silent success that produced this bug in the first place.
-  const after = Number((await api('/config/storage', token))?.fileSizeLimit);
-  if (after !== target) {
-    console.error(`\n✘ Read-back mismatch: expected ${target}, got ${after}.`);
+  // Read back. A PATCH that returns 200 and did not take effect is exactly the kind of
+  // silent success that produced this bug in the first place.
+  //
+  // ★ AND COMPARE THE WHOLE CONFIG, not just the field we set. The PATCH body carries
+  //   only fileSizeLimit; if the endpoint ever replaced nested objects rather than
+  //   merging them, this call would silently disable imageTransformation / s3Protocol
+  //   and a one-field check would still print a tick. (Verified merging on 2026-09-02 —
+  //   every features value was byte-identical across the write — but "verified once" is
+  //   not a guarantee, and this script exists because a limit nobody re-checked drifted.)
+  const after = await api('/config/storage', token);
+  const gotLimit = Number(after?.fileSizeLimit);
+  if (gotLimit !== target) {
+    console.error(`\n✘ Read-back mismatch: expected ${target}, got ${gotLimit}.`);
     console.error('  On the Free plan the limit cannot exceed 52428800 — check the org plan.\n');
+    process.exit(1);
+  }
+  const beforeRest = JSON.stringify({ ...cfg, fileSizeLimit: null });
+  const afterRest = JSON.stringify({ ...after, fileSizeLimit: null });
+  if (beforeRest !== afterRest) {
+    console.error('\n✘ The PATCH changed more than the size limit. Nested config differs:');
+    console.error(`  before: ${beforeRest.slice(0, 300)}`);
+    console.error(`  after : ${afterRest.slice(0, 300)}`);
+    console.error('  Restore the other settings in Dashboard → Storage → Settings.\n');
     process.exit(1);
   }
   console.log(`\n✔ project-wide fileSizeLimit is now ${prettyBytes(after)} (${after}).`);

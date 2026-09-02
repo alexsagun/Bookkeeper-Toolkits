@@ -15814,25 +15814,39 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
          *
          * ★ WHY THIS IS NOW REQUIRED. Until the project-wide Storage limit was raised, no
          *   upload could exceed 50 MiB, so no transfer could outlive a 1-hour access token.
-         *   At 2 GiB a slow link genuinely can: tus would then PATCH every remaining 6 MiB
-         *   chunk with a dead bearer, take a 401 on each, exhaust the retry ladder, and
-         *   surface as an "expired session" long after the token actually died. Raising the
-         *   ceiling is what made this reachable, so it is fixed in the same change.
+         *   At 2 GiB a slow link genuinely can: the next PATCH would carry a dead bearer
+         *   and take a 401 — which tus does NOT retry (defaultOnShouldRetry refuses the
+         *   whole 400 category bar 409/423), so it surfaces immediately and the admin is
+         *   told their session expired mid-transfer. Raising the ceiling is what made that
+         *   reachable at all, so it is fixed in the same change.
          *
-         * ★ getSession() returns the cached session and refreshes it when it has expired,
-         *   so this is a memory read on all but roughly one call per hour.
+         * ★ getSession() returns the cached session and refreshes it when it is near
+         *   expiry, so this is a memory read on all but roughly one call per hour.
          *
-         * ★ IT NEVER THROWS. Rejecting here makes tus build a DetailedError with no
-         *   response, which classifies as `offline` — the wrong story. Falling back to the
-         *   captured token lets Storage answer, and the classifier report what it said.
+         * ★ AND IT IS RACED, because that once-an-hour call is the dangerous one. The
+         *   refresh is a fetch with no timeout of its own, and this runs BEFORE
+         *   req.send() — so a stalled auth endpoint (captive portal, hung gateway) would
+         *   leave the upload frozen at a fixed percentage with no error, no onError and
+         *   nothing to classify, forever. AuthProvider races every auth call against an
+         *   8s fallback for exactly this reason; 5s here because it repeats per chunk.
+         *
+         * ★ IT NEVER THROWS, structurally — the whole body is wrapped. A rejection here
+         *   makes tus build a DetailedError with no response, which classifies as
+         *   `offline`: the wrong story entirely. Falling back to the captured token lets
+         *   Storage answer, and a real 401 is diagnosable where silence is not.
          */
         onBeforeRequest: async (req) => {
-          let fresh = token;
           try {
-            const { data } = await supabase.auth.getSession();
-            fresh = data?.session?.access_token || token;
-          } catch (_) { /* keep the captured token; Storage will answer honestly */ }
-          req.setHeader('authorization', `Bearer ${fresh}`);
+            let fresh = token;
+            try {
+              const { data } = await Promise.race([
+                supabase.auth.getSession(),
+                new Promise((r) => setTimeout(() => r({ data: null }), 5000)),
+              ]);
+              fresh = data?.session?.access_token || token;
+            } catch (_) { /* keep the captured token; Storage will answer honestly */ }
+            req.setHeader('authorization', `Bearer ${fresh}`);
+          } catch (_) { /* this callback must never reject — see above */ }
         },
         uploadDataDuringCreation: true,
         removeFingerprintOnSuccess: true,               // so the same file can be re-uploaded later

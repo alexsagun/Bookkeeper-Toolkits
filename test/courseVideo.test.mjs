@@ -587,9 +587,14 @@ test('the local cap is checked before a byte moves, which is why a 413 cannot me
 });
 
 test('the 413 copy blames the project-wide setting and invents no ceiling of its own', () => {
-  // The suite otherwise asserts reason codes rather than prose. This one exception is
-  // load-bearing: Supabase’s 413 body (EntityTooLarge) carries NO number, so any figure
-  // here other than our own cap would be fabricated — which is the original bug.
+  // The suite otherwise asserts reason codes rather than prose. This exception exists
+  // because Supabase’s 413 body (EntityTooLarge) carries NO number, so any figure here
+  // beyond our own cap would be fabricated — which is the original bug.
+  //
+  // ★ Honest about what it is: a FORWARD ratchet on the new prose, not a regression
+  //   detector. The old message also matched /project-wide/i and contained "2 GB", so
+  //   this would have passed against it. The reason-code and retryable assertions above
+  //   are what actually catch a regression.
   const m = describeUploadError({ originalResponse: { getStatus: () => 413 } }).message;
   assert.match(m, /project-wide/i, 'the admin must be told which setting is actually wrong');
   assert.ok(m.includes(formatBytes(LESSON_VIDEO_MAX_BYTES)),
@@ -634,6 +639,25 @@ test('a dropped connection is reported as a dropped connection, not as an unknow
   const r = describeUploadError({ name: 'Error', originalRequest: {}, originalResponse: null });
   assert.equal(r.reason, 'offline');
   assert.equal(r.retryable, true);
+});
+
+test('a real 413 carries BOTH a request and a response, and the status still wins', () => {
+  // Every other fixture supplies one signal or the other. A genuine tus HTTP error calls
+  // _emitHttpError(req, res, …), so both are present — and `offline` must not steal it.
+  const r = describeUploadError({
+    originalRequest: {}, originalResponse: { getStatus: () => 413 },
+  });
+  assert.equal(r.reason, 'storage-limit');
+  assert.equal(r.retryable, false);
+});
+
+test('a user cancel outranks every status, so Cancel never reads as a failure', () => {
+  // `aborted` is checked before any status branch. If that ordering ever inverted, a
+  // cancel racing a response would render an error banner for a deliberate action.
+  assert.equal(describeUploadError({
+    name: 'AbortError', originalResponse: { getStatus: () => 413 },
+  }).reason, 'aborted');
+  assert.equal(describeUploadError({ aborted: true, status: 403 }).reason, 'aborted');
 });
 
 test('a status of 0 does not blind the classifier to a status the error does carry', () => {
