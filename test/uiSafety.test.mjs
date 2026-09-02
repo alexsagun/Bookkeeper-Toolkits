@@ -213,6 +213,38 @@ test('the lesson-video upload attaches its bearer per request, and from exactly 
     + '<fresh>" and Storage would 401 all of them. Set it ONLY in onBeforeRequest.');
 });
 
+// ── 6b. The refresh falls back to the LAST GOOD bearer, not the first one ───
+//
+// The 5s race exists so a stalled auth endpoint cannot freeze the upload. But its
+// fallback has to be the freshest bearer that actually WORKED, not the one captured
+// before the transfer began. On a two-hour upload the original is certainly expired:
+// the refresh at ~55min replaced it. Falling back to it sends a token we KNOW is dead,
+// and tus does not retry the 400 category, so the upload ends there — on exactly the
+// long transfers raising the ceiling made possible.
+//
+// Unreachable from a unit test (it needs a real tus request and a stalled endpoint),
+// so the shape is pinned here.
+test('the upload bearer falls back to the last known-good token', () => {
+  const src = app();
+  const start = src.indexOf('new tus.Upload(');
+  assert.ok(start > 0, 'could not find the tus.Upload options object');
+  const region = src.slice(start, start + 4000);
+  const obr = region.indexOf('onBeforeRequest:');
+  assert.ok(obr > 0, 'could not find the onBeforeRequest property');
+  const block = region.slice(obr, obr + 900);
+
+  assert.match(block, /lastGood/,
+    'onBeforeRequest must fall back to the last known-good bearer');
+  assert.ok(block.includes('Bearer ${lastGood}'),
+    'the header must be set from lastGood, not from a per-call temporary');
+  assert.ok(!block.includes('Bearer ${token}'),
+    'falling back to the bearer captured at t=0 sends a token known to be expired on '
+    + 'any transfer longer than its lifetime');
+  assert.match(src, /let lastGood = token;/,
+    'lastGood must live OUTSIDE the callback, or each request resets it and the '
+    + 'fallback is per-call rather than cumulative');
+});
+
 // ── 7. Resume is not offered for failures that cannot be resumed ────────────
 //
 // runTransfer's catch emits INTERRUPT for every non-abort reason, and INTERRUPTED
