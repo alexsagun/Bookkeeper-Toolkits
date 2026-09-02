@@ -69,9 +69,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** One Management API call. `body` present => PATCH. Errors never carry the token. */
 async function api(path, token, body) {
+  let last = null;
   for (let attempt = 0; attempt < 5; attempt++) {
+    let res; let text;
     try {
-      const res = await fetch(`https://api.supabase.com/v1/projects/${LIVE_REF}${path}`, {
+      res = await fetch(`https://api.supabase.com/v1/projects/${LIVE_REF}${path}`, {
         method: body ? 'PATCH' : 'GET',
         headers: {
           Authorization: `Bearer ${token}`,
@@ -79,19 +81,26 @@ async function api(path, token, body) {
         },
         ...(body ? { body: JSON.stringify(body) } : {}),
       });
-      const text = await res.text();
-      if (res.ok) return text ? JSON.parse(text) : {};
-      if (res.status < 500 && res.status !== 429) {
-        let detail = text;
-        try { detail = JSON.parse(text).message || text; } catch { /* raw */ }
-        throw new Error(`HTTP ${res.status}: ${String(detail).slice(0, 300)}`);
-      }
+      text = await res.text();
     } catch (e) {
+      last = e;                                   // transport failure — worth another try
       if (attempt === 4) throw e;
+      await sleep(600 * 2 ** attempt);
+      continue;
     }
+    if (res.ok) return text ? JSON.parse(text) : {};
+    let detail = text;
+    try { detail = JSON.parse(text).message || text; } catch { /* raw */ }
+    last = new Error(`HTTP ${res.status}: ${String(detail).slice(0, 300)}`);
+    // ★ A 4xx that is not 429 will not answer differently on a retry — an expired token
+    //   stays expired. Surface it now instead of after ~19s of silent backoff.
+    if (res.status < 500 && res.status !== 429) throw last;
+    if (attempt === 4) throw last;
     await sleep(600 * 2 ** attempt);
   }
-  throw new Error('unreachable');
+  // ★ Never lose the real status. This used to throw Error('unreachable'), which
+  //   turned five 503s into an audit FAIL line that named no cause.
+  throw last || new Error('unreachable');
 }
 
 async function sql(query, token) {
@@ -103,6 +112,24 @@ async function sql(query, token) {
   const text = await res.text();
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${String(text).slice(0, 300)}`);
   return text ? JSON.parse(text) : [];
+}
+
+/**
+ * The lesson bucket's EFFECTIVE ceiling — min(bucket, project) — and whether it exists.
+ *
+ * ★ A MISSING bucket is not "no own limit". Treating the two alike reported
+ *   "effective ceiling: 2 GiB — verified" for a project where lesson video cannot be
+ *   stored at all.
+ */
+function lessonCeiling(buckets, projectLimit) {
+  const row = buckets.find((b) => b.id === LESSON_VIDEO_BUCKET);
+  if (!row) return { present: false, ceiling: 0 };
+  return {
+    present: true,
+    ceiling: row.file_size_limit == null
+      ? projectLimit
+      : Math.min(Number(row.file_size_limit), projectLimit),
+  };
 }
 
 async function main() {
@@ -139,11 +166,28 @@ async function main() {
   console.log('');
 
   if (!verdict.belowRequired) {
-    console.log(`✔ The project-wide limit already allows ${prettyBytes(target)}. Nothing to do.\n`);
+    // ★ The SAME checks the --apply path runs after writing. They used to live only
+    //   there, so the "already at target" branch — the one a correctly-configured
+    //   project always takes — printed a green tick without ever looking at the lesson
+    //   bucket. A 50 MiB course-videos under a 2 GiB project limit passed silently.
+    const lc = lessonCeiling(buckets, current);
+    const problems = [];
     if (verdict.overPromising.length) {
-      console.log(`  Note: still promising more than the project allows: ${verdict.overPromising.join(', ')}\n`);
+      problems.push(`buckets promising more than the project allows: ${verdict.overPromising.join(', ')}`);
+    }
+    if (!lc.present) {
+      problems.push(`the ${LESSON_VIDEO_BUCKET} bucket does not exist — run db/2026-08-24-course-video-upload-only.sql`);
+    } else if (lc.ceiling < target) {
+      problems.push(`${LESSON_VIDEO_BUCKET} effective ceiling is ${prettyBytes(lc.ceiling)}, below the ${prettyBytes(target)} lesson cap`);
+    }
+    if (problems.length) {
+      console.log(`✘ The project-wide limit allows ${prettyBytes(target)}, but the picture is not consistent:`);
+      for (const p of problems) console.log(`  · ${p}`);
+      console.log('');
       process.exit(1);
     }
+    console.log(`✔ The project-wide limit already allows ${prettyBytes(target)}, and `
+      + `${LESSON_VIDEO_BUCKET} can carry it (effective ${prettyBytes(lc.ceiling)}). Nothing to do.\n`);
     process.exit(0);
   }
 
@@ -208,18 +252,15 @@ async function main() {
   //   10 MB, community-media and course-media 50 MB — and failing them would make this
   //   report permanently red, which is precisely how the #44 external-link check stopped
   //   being read and how this whole class of drift survived.
-  const lesson = afterBuckets.find((b) => b.id === LESSON_VIDEO_BUCKET);
-  const lessonCeiling = lesson && lesson.file_size_limit != null
-    ? Math.min(Number(lesson.file_size_limit), gotLimit)
-    : gotLimit;
+  const lc = lessonCeiling(afterBuckets, gotLimit);
 
-  if (!afterVerdict.ok || lessonCeiling < target) {
+  if (!afterVerdict.ok || !lc.present || lc.ceiling < target) {
     console.error('\n✘ The project limit was raised, but the picture is still not consistent:');
     if (afterVerdict.overPromising.length) {
       console.error(`  buckets promising more than the project allows: ${afterVerdict.overPromising.join(', ')}`);
     }
-    if (lessonCeiling < target) {
-      console.error(`  ${LESSON_VIDEO_BUCKET} effective ceiling is ${prettyBytes(lessonCeiling)}, `
+    if (!lc.present || lc.ceiling < target) {
+      console.error(`  ${LESSON_VIDEO_BUCKET} effective ceiling is ${prettyBytes(lc.ceiling)}, `
         + `below the ${prettyBytes(target)} lesson cap — raise that bucket’s own limit `
         + '(db/2026-08-24-course-video-upload-only.sql sets it).');
     }
@@ -228,7 +269,7 @@ async function main() {
   }
 
   console.log(`\n✔ project-wide fileSizeLimit is now ${prettyBytes(gotLimit)} (${gotLimit}).`);
-  console.log(`  ${LESSON_VIDEO_BUCKET} effective ceiling: ${prettyBytes(lessonCeiling)} — verified after the write.`);
+  console.log(`  ${LESSON_VIDEO_BUCKET} effective ceiling: ${prettyBytes(lc.ceiling)} — verified after the write.`);
   console.log('  Verify the whole picture with: npm run db:audit\n');
   process.exit(0);
 }

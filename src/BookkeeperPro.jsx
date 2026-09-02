@@ -6444,8 +6444,20 @@ function ExtendAccessModal({ user, profile, sub, latestReq, onClose, onSubmitted
   }, [planKey]);
 
   const price = extensionPrice(plan, months);
-  // Auto-fill the "amount paid" with the computed price whenever the duration changes.
-  useEffect(() => { setAmountPaid(String(price.amount || '')); }, [price.amount]);
+  // Auto-fill the "amount paid" with the computed price whenever the duration changes —
+  // but NEVER over a figure the member typed themselves.
+  //
+  // ★ This modal opens against ENROLLMENT_PLANS_FALLBACK and then swaps in the live
+  //   plan row asynchronously, so price.amount changes AFTER the field is editable. The
+  //   unguarded version wiped whatever had been typed in between, and the member then
+  //   ticked "I confirm I sent ₱X" against a number they had not sent — which is what
+  //   lands in amount_paid. The paywall carries the same guard for the same reason.
+  const autoAmountRef = useRef(String(price.amount || ''));
+  useEffect(() => {
+    const next = String(price.amount || '');
+    setAmountPaid((cur) => (cur === autoAmountRef.current || cur === '' ? next : cur));
+    autoAmountRef.current = next;
+  }, [price.amount]);
 
   const a = subAccess(sub);
   const nowMs = Date.now();
@@ -6461,7 +6473,11 @@ function ExtendAccessModal({ user, profile, sub, latestReq, onClose, onSubmitted
     // hand-written regex plus a hardcoded 5 MB, and #42 widened the
     // enrollment-receipts bucket to 10 MB — so an extending member was refused
     // client-side for a receipt the bucket would happily have taken.
-    if (!fileTypeAllowed(f, intakeField('paymentFile'))) {
+    // ★ (field, file) — NOT (file, field). Swapped, `field?.mime` is undefined and
+    //   fileTypeAllowed returns true for everything, so this guard never once fired:
+    //   a .heic straight off an iPhone passed here and 415d against the bucket, and the
+    //   member saw only the generic "Could not submit your extension".
+    if (!fileTypeAllowed(intakeField('paymentFile'), f)) {
       setErr('Please upload your receipt as a PNG, JPG, WEBP or PDF file.'); return;
     }
     if (f.size > MAX_INTAKE_FILE_BYTES) {
@@ -11210,14 +11226,21 @@ function AdminBatches() {
 }
 
 function AccessRequests({ onCountChange }) {
-  const { user, profile, can, staffReady } = useAuth();
+  const { user, profile, can, staffReady, staffDegraded } = useAuth();
   // #45: reviewing signups is its own capability, so an Operations Admin can work
   // this queue without holding any other admin power. `staffReady` gates the first
   // load — rendering before the context settles would show an empty queue and look
   // like "no pending signups" rather than "not loaded yet".
   // The `profile.is_admin` fallback is for a pre-#45 database, where my_staff_context()
   // does not exist and every staff context is legitimately empty.
-  const isAdmin = can('access_requests.review') || !!profile?.is_admin;
+  // ★ The fail-closed idiom every peer admin screen uses — AdminBatches, AdminEnrollments,
+  //   StudentImports, the staff directory and the progress report all read
+  //   `staffDegraded ? is_admin : (staffReady && can(...))`. This screen alone had a bare
+  //   `can(...) || is_admin`, whose second arm fired unconditionally rather than only when
+  //   the staff context is degraded, and never waited for staffReady — so it rendered the
+  //   queue off the legacy profiles.is_admin cache regardless of what my_staff_context()
+  //   actually returned. It is also the screen that approves and rejects accounts.
+  const isAdmin = staffDegraded ? !!profile?.is_admin : (staffReady && can('access_requests.review'));
 
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -13728,7 +13751,21 @@ function MembershipPanel() {
             .order('created_at', { ascending: false }).limit(5),
         ]);
         if (cancelled) return;
-        const s = subRes.error ? null : (subRes.data || null);
+        // ★ A QUERY ERROR IS NOT "NO SUBSCRIPTION".
+        //   supabase-js resolves failures as { data: null, error } and never throws,
+        //   so the catch below could not see this and the retry card it sets was dead
+        //   code. Meanwhile subAccess(null) returns { has:false, valid:false }, and the
+        //   render reads `acc.valid || !acc.has` as Active, prints "No expiry", and
+        //   hides Renew (showRenew needs acc.has). A member three days from expiry was
+        //   told their membership was unlimited and given no way to renew it.
+        if (subRes.error) {
+          console.error('[membership] subscription read failed', subRes.error.message);
+          setFailed(true); setLoaded(false);
+          return;
+        }
+        const s = subRes.data || null;
+        // The request history is decoration: losing it degrades the card, it does not
+        // misstate the membership, so it stays non-fatal.
         const r = reqRes.error ? [] : (reqRes.data || []);
         setSub(s); setReqs(r);
         if (s?.batch_id) fetchBatchRow(s.batch_id).then(b => { if (!cancelled) setBatchRow(b); });
@@ -15727,6 +15764,12 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     let path = buildLessonVideoPath(courseId, crypto.randomUUID(), file.name);
     const { data: sess } = await supabase.auth.getSession();
     const token = sess?.session?.access_token;
+    // ★ The freshest bearer we have actually seen succeed. onBeforeRequest reassigns it
+    //   on every successful getSession(), and falls back to IT rather than to `token`.
+    //   On a two-hour upload `token` is certainly dead by the end: the refresh at ~55min
+    //   produced a new one, so falling back to the original would send a bearer we KNOW
+    //   expired — and tus does not retry the resulting 401.
+    let lastGood = token;
     if (!token) throw Object.assign(new Error('no session'), { status: 401 });
 
     const tus = await import('tus-js-client');          // own chunk — the XLSX/jspdf idiom
@@ -15773,6 +15816,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
          *   leave the upload frozen at a fixed percentage with no error, no onError and
          *   nothing to classify, forever. AuthProvider races every auth call against an
          *   8s fallback for exactly this reason; 5s here because it repeats per chunk.
+         *   The fallback is `lastGood`, NOT the token captured at t=0 — see its declaration.
          *
          * ★ IT NEVER THROWS, structurally — the whole body is wrapped. A rejection here
          *   makes tus build a DetailedError with no response, which classifies as
@@ -15781,15 +15825,15 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
          */
         onBeforeRequest: async (req) => {
           try {
-            let fresh = token;
             try {
               const { data } = await Promise.race([
                 supabase.auth.getSession(),
                 new Promise((r) => setTimeout(() => r({ data: null }), 5000)),
               ]);
-              fresh = data?.session?.access_token || token;
-            } catch (_) { /* keep the captured token; Storage will answer honestly */ }
-            req.setHeader('authorization', `Bearer ${fresh}`);
+              const t = data?.session?.access_token;
+              if (t) lastGood = t;
+            } catch (_) { /* fall through to the last bearer that worked */ }
+            req.setHeader('authorization', `Bearer ${lastGood}`);
           } catch (_) { /* this callback must never reject — see above */ }
         },
         uploadDataDuringCreation: true,
@@ -16816,14 +16860,32 @@ function CourseProgram({
           const storedLessonDraft = await window.storage.get(lessonEditorDraftKey(courseRow.id));
           if (storedLessonDraft?.value) {
             const parsed = JSON.parse(storedLessonDraft.value);
-            const target = parsed?.id ? all.find(l => l.id === parsed.id) : null;
-            if (target) {
+            // v2 shape is { v, baseline, draft }. A pre-v2 draft carries no baseline, so
+            // its freshness cannot be established — and an unprovable draft is discarded,
+            // never trusted. See the persist effect for why that matters.
+            const draft = parsed?.v === 2 ? parsed.draft : null;
+            const baseline = parsed?.v === 2 ? parsed.baseline : null;
+            const target = draft?.id ? all.find(l => l.id === draft.id) : null;
+            const stillFresh = !!(target && baseline
+              && JSON.stringify(lessonComparable(target)) === JSON.stringify(baseline));
+            if (target && stillFresh) {
               // Layer the draft OVER the live row instead of replacing it. A draft written
               // by an older build simply has no key for a newer column, and a wholesale
               // restore would then save that column back as null. Keys the admin actually
               // cleared are present-but-empty, so an intentional clear still wins.
-              setEditingLesson({ ...target, ...parsed });
+              setEditingLesson({ ...target, ...draft });
               setNotice(n => n || 'Restored an unsaved lesson draft from this browser.');
+            } else if (parsed) {
+              // ★ The lesson changed since this draft was written (or the draft predates
+              //   the baseline). Restoring it would put a stale storage_path back on the
+              //   row, and saveLesson would then delete the file that replaced it — so the
+              //   admin loses BOTH videos and sees only a green "Restored a draft" banner.
+              //   Discarding is the only safe answer, and it is said out loud.
+              clearStoredValue(lessonEditorDraftKey(courseRow.id));
+              if (target) {
+                setNotice(n => n || 'An unsaved lesson draft was discarded — that lesson '
+                  + 'changed somewhere else after the draft was written.');
+              }
             }
           }
         } catch {}
@@ -16919,7 +16981,18 @@ function CourseProgram({
 
   useEffect(() => {
     if (!course?.id || !isAdmin || !editingLesson || typeof window === 'undefined' || !window.storage) return;
-    window.storage.set(lessonEditorDraftKey(course.id), JSON.stringify(editingLesson)).catch(() => {});
+    // ★ Store the LIVE row's fingerprint alongside the draft, so a restore can tell
+    //   whether the lesson moved underneath it. The course-meta draft two effects up has
+    //   always carried this guard (courseUpdatedAt); the lesson draft never did, and it is
+    //   the one that can destroy a file. lessonComparable() is reused rather than
+    //   updated_at because that column is not in COURSE_LESSON_SELECT, and widening that
+    //   select means moving four allow-lists that nothing pins together.
+    const payload = {
+      v: 2,
+      baseline: originalEditingLesson ? lessonComparable(originalEditingLesson) : null,
+      draft: editingLesson,
+    };
+    window.storage.set(lessonEditorDraftKey(course.id), JSON.stringify(payload)).catch(() => {});
   }, [course?.id, isAdmin, editingLesson]);
 
   // Opening a different lesson (or closing the editor) must not inherit the last lesson's
@@ -18538,7 +18611,13 @@ function CourseCatalog({
     setCourses(arr);                                           // optimistic
     setBusy(true); setErr('');
     try {
-      await Promise.all(arr.map((c, i) => supabase.from('courses').update({ position: i, updated_at: new Date().toISOString() }).eq('id', c.id)));
+      const results = await Promise.all(arr.map((c, i) => supabase.from('courses')
+        .update({ position: i, updated_at: new Date().toISOString() }).eq('id', c.id)));
+      // ★ Promise.all RESOLVES on a failed write: supabase-js returns { data, error } and
+      //   never rejects, so the catch below was dead code and a refused reorder just snapped
+      //   back with no banner and nothing in the console.
+      const bad = results.find(r => r && r.error);
+      if (bad) throw bad.error;
       await loadCatalog();
     } catch (e) { logDbError('[CourseCatalog] reorder', e, { module: prefix }); setErr(describeDbError(e, 'Could not reorder courses.')); await loadCatalog(); }
     finally { setBusy(false); }
@@ -21721,6 +21800,12 @@ function CommunityHub() {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [err, setErr] = useState('');
+  // ★ SEPARATE FROM `err` ON PURPOSE. loadFeed() clears `err` synchronously on entry and
+  //   again on success, and handlePublished calls loadFeed in the same call stack right
+  //   after setting the warning — so a warning written into `err` was overwritten before
+  //   it could ever paint. A member whose image failed to attach saw a normal, silent
+  //   success with no picture and no explanation.
+  const [publishWarn, setPublishWarn] = useState('');
   const [schemaGap, setSchemaGap] = useState(null);          // null | 'missing' (#23 not run) | 'upgrade' (#24 not run)
   const [catCounts, setCatCounts] = useState({});            // tag_slug -> active post count
   const [reactMeta, setReactMeta] = useState({});            // post_id -> { counts: {type:n}, mine: Set }
@@ -22327,8 +22412,19 @@ function CommunityHub() {
     // eslint-disable-next-line
   }, [searchInput]);
 
+  // ★ One in-flight toggle per (target, reaction). Without this a double-click raced its
+  //   own optimistic state: click 1 fires INSERT, click 2 reads the already-flipped
+  //   `has === true` and fires DELETE. If the DELETE reaches Postgres first it matches no
+  //   rows (no error), the INSERT then commits, and the server holds a reaction the UI is
+  //   not showing. Nothing repairs it either — community_reactions is deliberately NOT in
+  //   the realtime publication, so the drift survives until a full reload.
+  const reactBusyRef = useRef(new Set());
+
   async function toggleReact(postId, type) {
     if (!uid) return;
+    const busyKey = `p:${postId}:${type}`;
+    if (reactBusyRef.current.has(busyKey)) return;
+    reactBusyRef.current.add(busyKey);
     const cur = reactMeta[postId];
     const has = !!(cur && cur.mine.has(type));
     // Optimistic flip; on error, reload that post's meta (server truth wins).
@@ -22353,6 +22449,11 @@ function CommunityHub() {
     } catch (e) {
       logDbError('[Community] react', e, { postId, type });
       loadMeta([postId]);
+    } finally {
+      // Released in `finally`, never on the success path alone: an early return or a
+      // throw would otherwise wedge this reaction as permanently "in flight" and the
+      // member could never toggle it again without reloading.
+      reactBusyRef.current.delete(busyKey);
     }
   }
 
@@ -22378,6 +22479,12 @@ function CommunityHub() {
 
   async function toggleCommentReact(postId, commentId, type) {
     if (!uid) return;
+    // Same race, same table, same lack of a realtime correction as toggleReact — a comment
+    // reaction is not a different kind of row. The `c:` namespace keeps these keys from
+    // colliding with the `p:` ones when a post and a comment share an id space.
+    const busyKey = `c:${commentId}:${type}`;
+    if (reactBusyRef.current.has(busyKey)) return;
+    reactBusyRef.current.add(busyKey);
     const cur = commentReactMeta[commentId];
     const has = !!(cur && cur.mine.has(type));
     setCommentReactMeta(prev => {
@@ -22401,6 +22508,8 @@ function CommunityHub() {
     } catch (e) {
       logDbError('[Community] comment react', e, { commentId, type });
       loadCommentReacts([commentId]);
+    } finally {
+      reactBusyRef.current.delete(busyKey);
     }
   }
 
@@ -22728,9 +22837,9 @@ function CommunityHub() {
   function handlePublished(post, warns) {
     setComposerOpen(false); setEditTarget(null);
     setReactMeta(prev => ({ ...prev, [post.id]: { counts: {}, mine: new Set() } }));
-    if (warns && warns.length) {
-      setErr(`Your post is live, but its ${warns.join(' and ')} didn’t save. You can delete the post and try again.`);
-    }
+    setPublishWarn(warns && warns.length
+      ? `Your post is live, but its ${warns.join(' and ')} didn’t save. You can delete the post and try again.`
+      : '');
     // Reset the view so the new post is visible near the top.
     setFilter('latest'); filterRef.current = 'latest';
     setSearchInput(''); searchRef.current = '';
@@ -23035,7 +23144,14 @@ function CommunityHub() {
     [channels],
   );
   const annChannelIdsRef = useRef(annChannelIds);
-  useEffect(() => { annChannelIdsRef.current = annChannelIds; }, [annChannelIds]);
+  // ★ SYNCED DURING RENDER, not in an effect. The bootstrap sets channels and calls
+  //   loadFeed() in the same synchronous block, and loadFeed reads this ref before its
+  //   first await — so an effect-only sync left it holding the render-0 empty Set for the
+  //   whole first load. loadFeed then took its `else` arm and filtered announcements to
+  //   NIL_UUID, so the Announcements rail was empty on EVERY fresh visit to /community and
+  //   only appeared after some unrelated action forced a second load. The value is derived
+  //   purely from `channels`, so assigning it during render is idempotent and safe.
+  annChannelIdsRef.current = annChannelIds;
   const isAnnouncementPost = useCallback((post) => {
     if (!post) return false;
     if (preChannels || !post.channel_id) return post.tag_slug === COMMUNITY_ANNOUNCEMENTS_SLUG;
@@ -23151,6 +23267,11 @@ function CommunityHub() {
   const emptyCopy = (() => {
     // The feed is intentionally not loaded in this state — don't invite a post.
     if (spacesFailed) return { title: 'Community unavailable', desc: 'We couldn’t work out which communities you have access to, so the feed is paused. Reload the page to try again.' };
+    // ★ An empty list because the LOAD FAILED is not an empty community. Without this the
+    //   red error banner and “Start the first discussion — introduce yourself” rendered
+    //   together, and the silent-refresh path (the "N new discussions" pill) swallowed the
+    //   error entirely, leaving only the invitation.
+    if (err) return { title: 'Couldn’t load discussions', desc: 'Something went wrong fetching the feed. Check your connection and try again — nothing has been lost.' };
     if (searchRef.current) return { title: 'No matches', desc: `No discussions match “${searchRef.current}”. Try a different search.` };
     if (freeTag) return { title: 'Nothing tagged yet', desc: `No discussions tagged #${freeTag} yet.` };
     if (filter === 'unanswered') return { title: 'All caught up', desc: 'No unanswered discussions — every question has a reply.' };
@@ -23212,6 +23333,16 @@ function CommunityHub() {
         </div>
       )}
 
+      {publishWarn && (
+        <div className="mb-4 max-w-3xl mx-auto p-4 rounded-xl border flex items-start gap-3" role="alert"
+          style={{ background: 'var(--status-warn-bg)', borderColor: 'var(--status-warn-bd)' }}>
+          <AlertTriangle size={18} className="mt-0.5 flex-shrink-0" style={{ color: 'var(--status-warn-fg)' }} />
+          <div className="text-sm flex-1" style={{ color: C.text }}>{publishWarn}</div>
+          <button onClick={() => setPublishWarn('')} aria-label="Dismiss" className="transition hover:opacity-70" style={{ color: 'var(--status-warn-fg)' }}>
+            <X size={16} />
+          </button>
+        </div>
+      )}
       {err && (
         <div className="mb-4 max-w-3xl mx-auto p-4 rounded-xl border flex items-start gap-3"
           style={{ background: 'var(--status-danger-bg)', borderColor: 'var(--status-danger-bd)' }}>

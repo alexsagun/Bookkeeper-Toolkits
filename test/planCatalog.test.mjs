@@ -233,6 +233,38 @@ test('the formatter groups thousands the way the pricing cards always did', () =
   assert.equal(phpAmount(1000000), '₱1,000,000');
 });
 
+// The carry. phpAmount used to split the number first and round the fraction on its own:
+// for 2999.999 the fraction rounded to 100 centavos, String(100).padStart(2,'0') was "100",
+// the trailing-zero strip cut it to "10", and the peso figure never incremented — so it
+// printed "₱2,999.10". Every surface this module exists to keep in agreement was wrong at
+// once, including the price on the Training Agreement a student signs.
+test('rounding up to the next peso carries instead of printing .10', () => {
+  assert.equal(phpAmount(2999.999), '₱3,000');
+  assert.equal(phpAmount(16999.999), '₱17,000');
+  assert.equal(phpAmount(0.999), '₱1');
+  assert.equal(phpAmount(999.995), '₱1,000');
+  // and the grouping survives the carry across a thousands boundary
+  assert.equal(phpAmount(999999.999), '₱1,000,000');
+});
+
+// Binary floating point, separately from the carry. `1.005 * 100` is 100.49999999999999, so a
+// plain Math.round takes it DOWN and prints ₱1 for a value the author wrote as ₱1.01. Fixing the
+// product to 2 places first re-materialises the decimal that was actually written.
+test('cent rounding is decimal-safe, not binary-float-safe', () => {
+  assert.equal(phpAmount(1.005), '₱1.01');
+  assert.equal(phpAmount(1.115), '₱1.12');
+  assert.equal(phpAmount(2.675), '₱2.68');
+  // and the carry still works through the same path
+  assert.equal(phpAmount(0.999), '₱1');
+});
+
+test('genuine centavos still render, and never gain a stray zero', () => {
+  assert.equal(phpAmount(1234.5), '₱1,234.5');
+  assert.equal(phpAmount(1234.56), '₱1,234.56');
+  assert.equal(phpAmount(1234.05), '₱1,234.05');
+  assert.equal(phpAmount(-2999.999), '-₱3,000');
+});
+
 test('it matches toLocaleString(en-US) on every live catalog price', () => {
   for (const p of ENROLLMENT_PLANS_FALLBACK) {
     assert.equal(

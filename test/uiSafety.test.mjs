@@ -213,6 +213,38 @@ test('the lesson-video upload attaches its bearer per request, and from exactly 
     + '<fresh>" and Storage would 401 all of them. Set it ONLY in onBeforeRequest.');
 });
 
+// ── 6b. The refresh falls back to the LAST GOOD bearer, not the first one ───
+//
+// The 5s race exists so a stalled auth endpoint cannot freeze the upload. But its
+// fallback has to be the freshest bearer that actually WORKED, not the one captured
+// before the transfer began. On a two-hour upload the original is certainly expired:
+// the refresh at ~55min replaced it. Falling back to it sends a token we KNOW is dead,
+// and tus does not retry the 400 category, so the upload ends there — on exactly the
+// long transfers raising the ceiling made possible.
+//
+// Unreachable from a unit test (it needs a real tus request and a stalled endpoint),
+// so the shape is pinned here.
+test('the upload bearer falls back to the last known-good token', () => {
+  const src = app();
+  const start = src.indexOf('new tus.Upload(');
+  assert.ok(start > 0, 'could not find the tus.Upload options object');
+  const region = src.slice(start, start + 4000);
+  const obr = region.indexOf('onBeforeRequest:');
+  assert.ok(obr > 0, 'could not find the onBeforeRequest property');
+  const block = region.slice(obr, obr + 900);
+
+  assert.match(block, /lastGood/,
+    'onBeforeRequest must fall back to the last known-good bearer');
+  assert.ok(block.includes('Bearer ${lastGood}'),
+    'the header must be set from lastGood, not from a per-call temporary');
+  assert.ok(!block.includes('Bearer ${token}'),
+    'falling back to the bearer captured at t=0 sends a token known to be expired on '
+    + 'any transfer longer than its lifetime');
+  assert.match(src, /let lastGood = token;/,
+    'lastGood must live OUTSIDE the callback, or each request resets it and the '
+    + 'fallback is per-call rather than cumulative');
+});
+
 // ── 7. Resume is not offered for failures that cannot be resumed ────────────
 //
 // runTransfer's catch emits INTERRUPT for every non-abort reason, and INTERRUPTED
@@ -235,4 +267,41 @@ test('the uploader never offers Resume on a failure the pure module called perma
     'Resume must be gated on describeUploadError().retryable for INTERRUPTED');
   assert.match(region, /state === UPLOAD_STATES\.PAUSED/,
     'PAUSED must stay unconditional — pausing is not a failure');
+});
+
+// ── 12. Every admin screen fences its verdict behind staffDegraded/staffReady ──
+//
+// The house idiom is `staffDegraded ? !!profile?.is_admin : (staffReady && can(...))`.
+// AccessRequests — the screen that approves and rejects accounts — instead carried a bare
+// `can('access_requests.review') || !!profile?.is_admin`, whose second arm fired
+// unconditionally rather than only when the staff context is degraded, and which never
+// waited for staffReady. It therefore rendered off the legacy profiles.is_admin cache
+// regardless of what my_staff_context() actually said.
+//
+// Also pins the other half of that bug: a component that READS staffDegraded must
+// destructure it from useAuth(), or it throws ReferenceError at render — which the build
+// cannot see and no unit test reaches, because this repo has no jsdom.
+test('admin verdicts are fail-closed, and staffDegraded is always in scope', () => {
+  const src = app();
+
+  const bare = src.match(/const\s+\w+\s*=\s*can\('[a-z_.]+'\)\s*\|\|\s*!!?profile\?\.is_admin/g) || [];
+  assert.equal(bare.length, 0,
+    `a bare \`can(...) || is_admin\` admin verdict is back: ${bare.join(' / ')}. The second arm `
+    + 'must be reachable only when staffDegraded, and the first must wait for staffReady.');
+
+  // Split on top-level component declarations and check each one that mentions staffDegraded.
+  const lines = src.split(/\r?\n/);
+  const starts = [];
+  lines.forEach((l, i) => { if (/^(?:function|const)\s+[A-Z][A-Za-z0-9_]*/.test(l)) starts.push(i); });
+  const missing = [];
+  starts.forEach((start, n) => {
+    const body = lines.slice(start, starts[n + 1] ?? lines.length).join('\n');
+    if (!/\bstaffDegraded\b/.test(body)) return;
+    if (!/const\s*\{[^}]*\bstaffDegraded\b[^}]*\}\s*=\s*useAuth\(\)/.test(body)) {
+      missing.push((lines[start].match(/[A-Z][A-Za-z0-9_]*/) || ['?'])[0]);
+    }
+  });
+  assert.deepEqual(missing, [],
+    `these components read staffDegraded without destructuring it from useAuth(), which is a `
+    + 'ReferenceError at render that the build cannot catch');
 });

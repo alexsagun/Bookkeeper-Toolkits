@@ -40,8 +40,20 @@ export function phpAmount(n, fallback = '₱0') {
   const v = Number(n);
   if (n == null || n === '' || !Number.isFinite(v)) return fallback;
   const abs = Math.abs(v);
-  const whole = Math.trunc(abs);
-  const cents = Math.round((abs - whole) * 100);
+  // ★ ROUND THE WHOLE AMOUNT ONCE, then split it.
+  //   Splitting first and rounding the fraction separately loses the carry: for
+  //   2999.999 the fraction rounds to 100 centavos, `String(100).padStart(2,0)` is
+  //   "100", the trailing-zero strip makes it "10", and the result printed
+  //   "₱2,999.10" — the peso figure never incremented and the centavos were wrong
+  //   too. Every surface this module exists to keep in agreement was affected,
+  //   including the price on the Training Agreement a student legally signs.
+  // ★ AND ROUND THE CENTS DECIMAL-SAFELY. `abs * 100` is binary floating point, so 1.005
+  //   becomes 100.49999999999999 and Math.round takes it DOWN to 100 — ₱1 instead of ₱1.01.
+  //   Fixing the product to 2 places first re-materialises the decimal the author wrote,
+  //   so the half-up rounding happens on 100.50 as intended. Same for 1.115 -> 112.
+  const totalCents = Math.round(Number((abs * 100).toFixed(2)));
+  const whole = Math.trunc(totalCents / 100);
+  const cents = totalCents - whole * 100;
   const grouped = String(whole).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   const dec = cents ? `.${String(cents).padStart(2, '0').replace(/0$/, '')}` : '';
   return `${v < 0 ? '-₱' : '₱'}${grouped}${dec}`;
