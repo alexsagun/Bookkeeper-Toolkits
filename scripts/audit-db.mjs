@@ -96,24 +96,33 @@ async function q(sql, token) {
  *   nothing in this repo noticed it was wrong for months.
  */
 async function api(path, token) {
+  let last = null;
   for (let attempt = 0; attempt < 5; attempt++) {
+    let res; let text;
     try {
-      const res = await fetch(`https://api.supabase.com/v1/projects/${LIVE_REF}${path}`, {
+      res = await fetch(`https://api.supabase.com/v1/projects/${LIVE_REF}${path}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      const text = await res.text();
-      if (res.ok) return text ? JSON.parse(text) : {};
-      if (res.status < 500 && res.status !== 429) {
-        let detail = text;
-        try { detail = JSON.parse(text).message || text; } catch { /* raw */ }
-        throw new Error(`HTTP ${res.status}: ${String(detail).slice(0, 200)}`);
-      }
+      text = await res.text();
     } catch (e) {
+      last = e;                                   // transport failure — worth another try
       if (attempt === 4) throw e;
+      await sleep(600 * 2 ** attempt);
+      continue;
     }
+    if (res.ok) return text ? JSON.parse(text) : {};
+    let detail = text;
+    try { detail = JSON.parse(text).message || text; } catch { /* raw */ }
+    last = new Error(`HTTP ${res.status}: ${String(detail).slice(0, 300)}`);
+    // ★ A 4xx that is not 429 will not answer differently on a retry — an expired token
+    //   stays expired. Surface it now instead of after ~19s of silent backoff.
+    if (res.status < 500 && res.status !== 429) throw last;
+    if (attempt === 4) throw last;
     await sleep(600 * 2 ** attempt);
   }
-  throw new Error('unreachable');
+  // ★ Never lose the real status. This used to throw Error('unreachable'), which
+  //   turned five 503s into an audit FAIL line that named no cause.
+  throw last || new Error('unreachable');
 }
 
 /**

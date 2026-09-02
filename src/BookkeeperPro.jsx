@@ -15783,6 +15783,12 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     let path = buildLessonVideoPath(courseId, crypto.randomUUID(), file.name);
     const { data: sess } = await supabase.auth.getSession();
     const token = sess?.session?.access_token;
+    // ★ The freshest bearer we have actually seen succeed. onBeforeRequest reassigns it
+    //   on every successful getSession(), and falls back to IT rather than to `token`.
+    //   On a two-hour upload `token` is certainly dead by the end: the refresh at ~55min
+    //   produced a new one, so falling back to the original would send a bearer we KNOW
+    //   expired — and tus does not retry the resulting 401.
+    let lastGood = token;
     if (!token) throw Object.assign(new Error('no session'), { status: 401 });
 
     const tus = await import('tus-js-client');          // own chunk — the XLSX/jspdf idiom
@@ -15829,6 +15835,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
          *   leave the upload frozen at a fixed percentage with no error, no onError and
          *   nothing to classify, forever. AuthProvider races every auth call against an
          *   8s fallback for exactly this reason; 5s here because it repeats per chunk.
+         *   The fallback is `lastGood`, NOT the token captured at t=0 — see its declaration.
          *
          * ★ IT NEVER THROWS, structurally — the whole body is wrapped. A rejection here
          *   makes tus build a DetailedError with no response, which classifies as
@@ -15837,15 +15844,15 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
          */
         onBeforeRequest: async (req) => {
           try {
-            let fresh = token;
             try {
               const { data } = await Promise.race([
                 supabase.auth.getSession(),
                 new Promise((r) => setTimeout(() => r({ data: null }), 5000)),
               ]);
-              fresh = data?.session?.access_token || token;
-            } catch (_) { /* keep the captured token; Storage will answer honestly */ }
-            req.setHeader('authorization', `Bearer ${fresh}`);
+              const t = data?.session?.access_token;
+              if (t) lastGood = t;
+            } catch (_) { /* fall through to the last bearer that worked */ }
+            req.setHeader('authorization', `Bearer ${lastGood}`);
           } catch (_) { /* this callback must never reject — see above */ }
         },
         uploadDataDuringCreation: true,
