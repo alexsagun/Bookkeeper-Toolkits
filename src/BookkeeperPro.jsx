@@ -11278,14 +11278,21 @@ function AdminBatches() {
 }
 
 function AccessRequests({ onCountChange }) {
-  const { user, profile, can, staffReady } = useAuth();
+  const { user, profile, can, staffReady, staffDegraded } = useAuth();
   // #45: reviewing signups is its own capability, so an Operations Admin can work
   // this queue without holding any other admin power. `staffReady` gates the first
   // load — rendering before the context settles would show an empty queue and look
   // like "no pending signups" rather than "not loaded yet".
   // The `profile.is_admin` fallback is for a pre-#45 database, where my_staff_context()
   // does not exist and every staff context is legitimately empty.
-  const isAdmin = can('access_requests.review') || !!profile?.is_admin;
+  // ★ The fail-closed idiom every peer admin screen uses — AdminBatches, AdminEnrollments,
+  //   StudentImports, the staff directory and the progress report all read
+  //   `staffDegraded ? is_admin : (staffReady && can(...))`. This screen alone had a bare
+  //   `can(...) || is_admin`, whose second arm fired unconditionally rather than only when
+  //   the staff context is degraded, and never waited for staffReady — so it rendered the
+  //   queue off the legacy profiles.is_admin cache regardless of what my_staff_context()
+  //   actually returned. It is also the screen that approves and rejects accounts.
+  const isAdmin = staffDegraded ? !!profile?.is_admin : (staffReady && can('access_requests.review'));
 
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -22429,8 +22436,19 @@ function CommunityHub() {
     // eslint-disable-next-line
   }, [searchInput]);
 
+  // ★ One in-flight toggle per (target, reaction). Without this a double-click raced its
+  //   own optimistic state: click 1 fires INSERT, click 2 reads the already-flipped
+  //   `has === true` and fires DELETE. If the DELETE reaches Postgres first it matches no
+  //   rows (no error), the INSERT then commits, and the server holds a reaction the UI is
+  //   not showing. Nothing repairs it either — community_reactions is deliberately NOT in
+  //   the realtime publication, so the drift survives until a full reload.
+  const reactBusyRef = useRef(new Set());
+
   async function toggleReact(postId, type) {
     if (!uid) return;
+    const busyKey = `p:${postId}:${type}`;
+    if (reactBusyRef.current.has(busyKey)) return;
+    reactBusyRef.current.add(busyKey);
     const cur = reactMeta[postId];
     const has = !!(cur && cur.mine.has(type));
     // Optimistic flip; on error, reload that post's meta (server truth wins).
@@ -22455,6 +22473,11 @@ function CommunityHub() {
     } catch (e) {
       logDbError('[Community] react', e, { postId, type });
       loadMeta([postId]);
+    } finally {
+      // Released in `finally`, never on the success path alone: an early return or a
+      // throw would otherwise wedge this reaction as permanently "in flight" and the
+      // member could never toggle it again without reloading.
+      reactBusyRef.current.delete(busyKey);
     }
   }
 
