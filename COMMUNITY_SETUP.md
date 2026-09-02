@@ -281,6 +281,41 @@ resolve, landing in that space's default channel.
 10. Run the **channels** migration **#40** ([`db/2026-08-18-community-channels.sql`](db/2026-08-18-community-channels.sql)) — turns the single per-space feed into grouped channels, and **retires D2 as a space-wide rule** (see the callout above). Needs #32 + #35 + #36 + #37 + #39 + #31. Existing posts backfill automatically: General announcements into `#announcements`, everything else into `#general-discussion`. **Deploy the matching client build with it** — the channel rail, the admin editor and `?channel=` links ship in the app bundle.
 11. Refresh the app — the channel community goes live.
 
+12. Run the **community staff authority** migration **#56**
+    ([`db/2026-09-05-community-staff-authority.sql`](db/2026-09-05-community-staff-authority.sql)) —
+    hands Community configuration and moderation to **Operations Admins and Trainers**, and turns
+    moderation into two bounded, audited RPCs. Needs #45 + #52 + #35 + #36 + #40 + #41 + #43 + #31;
+    the preflight aborts loudly if any of the nine RPCs, the 36 policies, or #43's `p_kind` patch is
+    missing. **Deploy the matching client build with it** — a pre-#56 bundle PATCHes
+    `community_posts` directly, which still works for a Super Admin and 42501s for everyone else.
+    (A **fresh** install gets it from the bootstrap §43.)
+
+    > **What changes for a person, not a table.** Before #56 only Alex could create a channel or hide
+    > a post; the two permissions existed but nobody else held them. Afterwards an Operations Admin
+    > or a Trainer opens *Manage community*, sets plan and batch audiences, previews who gains or
+    > loses access, and pins / locks / hides / deletes — including inside private cohort rooms, which
+    > is what moderating them requires. They still cannot see a payment proof, a batch roster, or the
+    > private progress report.
+    >
+    > **Four things stayed Super-Admin-only, deliberately:** the blanket `FOR ALL` table-write
+    > policies (a moderator reaches other people's content only through the audited RPCs — never a
+    > raw `PATCH`, which could rewrite a body or an `author_id` with no record), backdating a post
+    > (a forged `created_at` self-pins it above the whole activity-sorted feed), blanket deletion of
+    > any object in the `community-media` bucket, and writing `community_spaces` — that table
+    > belongs to the batch lifecycle, and breaking it breaks enrolment approval for a cohort.
+    >
+    > Staff still post as themselves: because they hold no subscription, `is_enrolled()` is false
+    > for them, so the own-row write policies were widened to admit Community staff. Without that an
+    > Operations Admin could moderate the forum and never post in it.
+    >
+    > **Moderation is now audited.** Every pin, lock, hide, restore and delete writes one row to
+    > `community_moderation_events`, readable by Community staff and nobody else — not even the
+    > affected author, because a "moderator X hid your post for reason R" notice is a separate
+    > product decision with a real harassment surface. The ledger is append-only: no client role can
+    > insert, edit or delete a row.
+
+13. Refresh the app — Ops Admins and Trainers see the community controls.
+
 ## Step 1 — Run the community migration (#23, required)
 
 Supabase dashboard → **SQL Editor** → paste **all** of

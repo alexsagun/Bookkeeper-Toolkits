@@ -382,7 +382,7 @@ How it's enforced (two halves that must stay in sync):
   Dashboard tiles are filtered to that scope, and the render chokepoint shows a polished **"This tool
   isn't part of your plan"** screen (with an Upgrade → Dashboard CTA) for any restricted tab reached by
   deep-link, back/forward, or a stale last-tab — so a Sampler member can't reach `/proposal-generator`,
-  `/invoice-creator`, `/budgeting`, `/courses/resume-winning-strategy`, etc. The **CourseCatalog** hides
+  `/invoice-creator`, `/sales-tax`, `/courses/resume-winning-strategy`, etc. The **CourseCatalog** hides
   course cards the plan can't open, and **CourseProgram** shows an upgrade panel on a restricted
   deep-link. The student sees their **access scope** on the Dashboard membership panel and in the
   sidebar ("Access until {date}"); admins see it on each Enrollments card + the approve modal.

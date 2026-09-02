@@ -9,7 +9,7 @@ import {
   MessageSquare, Mic, MicOff, Eye, HelpCircle, User, Target,
   Building2, Landmark, CalendarClock, CalendarCheck, ExternalLink,
   Heart, HeartHandshake, DollarSign, Phone, AlertCircle, Activity, Clock, Wallet,
-  PieChart, ArrowUp, ArrowDown, X, Copy, Check,
+  ArrowUp, ArrowDown, X, Copy, Check,
   TrendingUp as Growth, BookMarked, Globe, Coins, GraduationCap,
   LogOut, Lock, Mail, KeyRound, Menu,
   Plus, Trash2, Save, Play, Video, ArrowRight, ArrowLeft, ChevronUp, MoreVertical,
@@ -49,11 +49,18 @@ import {
 import { appErrorCode, appErrorMessage, isMigrationMissing } from './lib/appErrors';
 import {
   ADMIN_TAB_PERMISSION, STAFF_PERMISSIONS, STAFF_ROLES, STAFF_STATUSES,
-  canManageCourseClient, lastSuperAdminGuard, permissionsForRole,
+  canManageCourseClient, communityAuthority, lastSuperAdminGuard, permissionsForRole,
   staffBypassesPaywall, staffEntitlement, staffInvitationPending, staffLandingTab,
   staffRole, staffStatusLabel,
 } from './lib/staffRoles';
-import { parseInviteHash } from './lib/staffInvite';
+import { parseInviteHash, STAFF_INVITE_PATH } from './lib/staffInvite';
+import {
+  stagesToStorable as stagesToStorableLib,
+  mergeStoredWithDefaults as mergeStoredWithDefaultsLib,
+  normalizeTabOrder as normalizeTabOrderLib,
+  reconcileRenamedLabels as reconcileRenamedLabelsLib,
+  SIDEBAR_VERSION, RENAMED_TAB_LABELS,
+} from './lib/sidebarLayout';
 import {
   INVITE_STATES, EMPTY_INVITATION_STATE, normalizeInvitationState, resolveInviteState,
   invitationNeedsPassword, classifyExchangeError, exchangeErrorIsRetryable,
@@ -167,11 +174,8 @@ const TAB_ROUTES = {
   monthend: '/month-end-checklist',
   sopgen: '/sop-generator',
   salestax: '/sales-tax',
-  budgeting: '/budgeting',
-  forecasting: '/forecasting',
   yearendcheck: '/year-end-checklist',
   form1099: '/1099-prep',
-  niche: '/niche-selector-quiz',
   discovery: '/discovery-call-simulator',
   mockinterview: '/job-interview-mastery?sub=mock',
 };
@@ -314,6 +318,38 @@ function readAppRoute() {
   };
 }
 
+// A path or ?tab= that names no live tab renders the Dashboard (readAppRoute falls back to
+// DEFAULT_APP_TAB), but the address bar was never corrected — so a retired tool's URL kept
+// claiming to be that tool while something else was on screen. Rewrite it to the canonical
+// Dashboard path, preserving every other param and the hash.
+// ★ /staff/invitation is NOT in TAB_ROUTES and must never be normalized: the invitation
+//   token rides in its fragment, and rewriting the path strands a new staff member.
+function normalizeUnknownRoute() {
+  if (typeof window === 'undefined' || !window.history) return false;
+  const path = normalizePath(window.location.pathname);
+  if (path === STAFF_INVITE_PATH) return false;
+
+  const params = new URLSearchParams(window.location.search);
+  const queryTab = params.get('tab');
+  // ★ readAccountPanelParam() deliberately accepts ?tab= as a legacy account-panel alias
+  //   (/?tab=upgrade opens the upgrade paywall), so a panel alias is NOT a stale tab. On
+  //   mount the ordering hides this — initialRouteRef captures the panel during render,
+  //   before the effect runs — but syncRouteState calls this BEFORE readAppRoute(), so on
+  //   popstate a deleted alias would silently stop reopening the panel.
+  const staleQueryTab = queryTab !== null
+    && !VALID_APP_TABS.has(queryTab)
+    && !normalizeInterviewSub(queryTab)
+    && !normalizeAccountPanel(queryTab);
+  const stalePath = path !== '/' && !ROUTE_TO_TAB[path];
+  if (!stalePath && !staleQueryTab) return false;
+
+  if (staleQueryTab) params.delete('tab');
+  const qs = params.toString();
+  const nextPath = stalePath ? '/' : (window.location.pathname || '/');
+  window.history.replaceState(null, '', `${nextPath}${qs ? `?${qs}` : ''}${window.location.hash || ''}`);
+  return true;
+}
+
 function writeAppRoute(tabId, opts = {}) {
   if (typeof window === 'undefined' || !window.history) return;
   const href = tabHref(tabId, opts);
@@ -366,7 +402,6 @@ const VOICE_TAB_INFO = {
   industryacc:  { label: 'Industry Accounting', stage: 'Training & Skills', desc: 'Accounting playbooks for 12 US industries with QuickBooks workflows.' },
   ustax:        { label: 'US Tax 101', stage: 'Training & Skills', desc: 'US tax basics for bookkeepers: key forms, deadlines, and IRS links.' },
   chat:         { label: 'ProAdvisor Chat', stage: 'Training & Skills', desc: 'AI mentor chat for QuickBooks cleanups and day-to-day bookkeeping questions.' },
-  niche:        { label: 'Niche Selector Quiz', stage: 'Training & Skills', desc: 'Eight-question quiz that recommends your best-fit bookkeeping industry niche.' },
   brand:        { label: 'Authentic Branding', stage: 'Job Application', desc: 'Guided questionnaire that builds your authentic personal brand story for applications.' },
   resumestrategy: { label: 'Resume Winning Strategy', stage: 'Job Application', desc: 'Resume video-course catalog with completion certificates.' },
   linkedinopt:  { label: 'Book 1-on-1 with Alex', stage: 'Job Application', desc: 'Booking page for a 1-on-1 profile-optimization session with Alex.' },
@@ -389,8 +424,6 @@ const VOICE_TAB_INFO = {
   monthend:     { label: 'Month-End Checklist', stage: 'Client Management & Delivery', desc: 'Interactive month-end close checklist.' },
   sopgen:       { label: 'SOP Generator', stage: 'Client Management & Delivery', desc: 'AI generator for client-specific standard operating procedures.' },
   salestax:     { label: 'Sales Tax', stage: 'Client Management & Delivery', desc: 'US sales-tax reference and calculator.' },
-  budgeting:    { label: 'Budgeting Tool', stage: 'Client Management & Delivery', desc: 'Client budgeting workbook with variance tracking.' },
-  forecasting:  { label: 'Forecasting Tool', stage: 'Client Management & Delivery', desc: 'Cash-flow and revenue forecasting workbook.' },
   yearendcheck: { label: 'Year-End Checklist', stage: 'Client Management & Delivery', desc: 'Year-end close checklist.' },
   form1099:     { label: '1099 Prep', stage: 'Client Management & Delivery', desc: '1099 contractor prep tracker for year-end filing.' },
   accessrequests: { label: 'Access Requests', stage: 'Admin', desc: 'Admin screen: approve or reject new signups.', adminOnly: true },
@@ -429,8 +462,6 @@ const VOICE_TOOL_ALIASES = {
   'tax 101': { tab: 'ustax' },
   'proadvisor': { tab: 'chat' },
   'pro advisor chat': { tab: 'chat' },
-  'niche quiz': { tab: 'niche' },
-  'niche selector': { tab: 'niche' },
   'branding': { tab: 'brand' },
   'resume': { tab: 'resumestrategy' },
   'resume course': { tab: 'resumestrategy' },
@@ -477,8 +508,6 @@ const VOICE_TOOL_ALIASES = {
   'month end checklist': { tab: 'monthend' },
   'sop': { tab: 'sopgen' },
   'sops': { tab: 'sopgen' },
-  'budget': { tab: 'budgeting' },
-  'forecast': { tab: 'forecasting' },
   'year end': { tab: 'yearendcheck' },
   'year end checklist': { tab: 'yearendcheck' },
   '1099': { tab: 'form1099' },
@@ -550,7 +579,6 @@ const VOICE_FEATURE_HELP = {
   qbo_mastery: { tab: 'qbomastery', blurb: 'Open a course card to watch lessons in order; completing every lesson unlocks a downloadable PDF certificate.' },
   invoice_creator: { tab: 'invoice', blurb: 'Fill in the client details and line items to generate a professional invoice you can download.' },
   discovery_call_simulator: { tab: 'discovery', blurb: 'Practice a simulated discovery call with an AI prospect and get feedback on your answers.' },
-  niche_selector_quiz: { tab: 'niche', blurb: 'Answer eight quick questions to find the bookkeeping industry niche that best fits you.' },
   sop_generator: { tab: 'sopgen', blurb: 'Describe a recurring task; the AI writes a client-specific standard operating procedure you can refine and save.' },
 };
 
@@ -601,7 +629,7 @@ const VOICE_CLIENT_TOOL_SPECS = [
     parameters: {
       type: 'object',
       properties: {
-        feature_id: { type: 'string', description: 'Feature key, e.g. mock_interview_simulator, bank_feed_ai, statement_converter, proposal_generator, chart_of_accounts, qbo_mastery, invoice_creator, discovery_call_simulator, niche_selector_quiz, sop_generator.' },
+        feature_id: { type: 'string', description: 'Feature key, e.g. mock_interview_simulator, bank_feed_ai, statement_converter, proposal_generator, chart_of_accounts, qbo_mastery, invoice_creator, discovery_call_simulator, sop_generator.' },
       },
       required: ['feature_id'],
     },
@@ -1658,7 +1686,6 @@ const loadSalaryData = () => import('./data/salary.js');
 const loadIndustryAccountingData = () => import('./data/industry-accounting.js');
 const loadUsTaxData = () => import('./data/us-tax.js');
 const loadWorkflowsData = () => import('./data/workflows.js');
-const loadNicheData = () => import('./data/niche.js');
 const loadDifficultClientsData = () => import('./data/difficult-clients.js');
 
 function useLazyData(loader) {
@@ -7606,9 +7633,6 @@ function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImport
     case 'linkedinopt': return <LinkedInOptimizer />;
     case 'qbdiag': return <QBDiagnostic />;
     case 'sopgen': return <SOPGenerator />;
-    case 'budgeting': return <BudgetingTool />;
-    case 'forecasting': return <ForecastingTool />;
-    case 'niche': return <NicheSelectorQuiz goto={goto} />;
     case 'discovery': return <DiscoveryCallSimulator />;
     default: return <Dashboard goto={goto} />;
   }
@@ -7792,13 +7816,20 @@ export default function BookkeeperProToolkit() {
   // flag off a submit would insert enrollment_requests rows nobody reviews.
   // Staff accounts are not paying members either, so they get no billing surfaces.
   const showBillingControls = !profile?.is_admin && !staff.isStaff && REQUIRE_ENROLLMENT;
-  // Community notification bell (mentions/replies + unread announcements). Same render gate
-  // as the voice assistant: enrolled members + admins (RLS re-enforces server-side). The
-  // hook lives HERE — bell state never threads through the memoized TabPanel tree; the
-  // dropdown navigates via module-scope writeAppRoute (the setPanelParam precedent).
+  // Community notification bell (mentions/replies + unread announcements). The hook lives
+  // HERE — bell state never threads through the memoized TabPanel tree; the dropdown
+  // navigates via module-scope writeAppRoute (the setPanelParam precedent).
+  // #56: gated on "can this viewer open the Community tab at all", not on the old
+  //   `is_admin || enrolled` test. An Operations Admin or Trainer with no subscription has
+  //   is_admin = false and enroll.state !== 'pass', so the old gate silently disabled the
+  //   bell for exactly the people now expected to answer mentions. entitlement already
+  //   answers this — staffEntitlement() adds the community tab for either community
+  //   permission — and it is memoized, so the gate stays referentially cheap.
   const communityBell = useCommunityBell(
     user?.id,
-    !!user && (profile?.is_admin || !REQUIRE_ENROLLMENT || (enroll.ready && enroll.state === 'pass'))
+    !!user && entitlement.allowsTab('community')
+      && (profile?.is_admin || staffBypassesPaywall(staff) || !REQUIRE_ENROLLMENT
+          || (enroll.ready && enrollPass))
   );
   // A rejected renewal newer than the current term → hand the paywall the prior request so
   // its resubmit notice shows (same rule MembershipPanel used before renew moved to ?panel=).
@@ -7925,8 +7956,13 @@ export default function BookkeeperProToolkit() {
     window.storage.set('nav:lastTab', tab).catch(() => {});
   }, [user?.id, tab]);
 
+  // Strip a retired/unknown route on first paint, so a bookmark to a removed tool does not
+  // sit in the address bar contradicting the Dashboard underneath it.
+  useEffect(() => { normalizeUnknownRoute(); }, []);
+
   useEffect(() => {
     const syncRouteState = (event) => {
+      if (event?.type === 'popstate') normalizeUnknownRoute();
       const next = readAppRoute();
       if (event?.type === APP_ROUTE_CHANGE_EVENT && event?.detail?.kind === 'panel') {
         setAccountPanel(next.panel);
@@ -7994,7 +8030,6 @@ export default function BookkeeperProToolkit() {
         { id: 'industryacc',label: 'Industry Accounting',    icon: Building2 },
         { id: 'ustax',      label: 'US Tax 101',             icon: Landmark },
         { id: 'chat',       label: 'ProAdvisor Chat',        icon: MessageCircle },
-        { id: 'niche',      label: 'Niche Selector Quiz',    icon: Target },
       ],
     },
     {
@@ -8032,7 +8067,7 @@ export default function BookkeeperProToolkit() {
       groups: [
         { key: 'onboarding',  label: 'Client Onboarding',  tabIds: ['engagement', 'onboarding', 'coa', 'invoice'] },
         { key: 'daily',       label: 'Daily Tasks',        tabIds: ['cpaai', 'bankfeed', 'converter', 'emails', 'calculators'] },
-        { key: 'monthly',     label: 'Monthly Tasks',      tabIds: ['workflow', 'monthend', 'sopgen', 'salestax', 'budgeting', 'forecasting'] },
+        { key: 'monthly',     label: 'Monthly Tasks',      tabIds: ['workflow', 'monthend', 'sopgen', 'salestax'] },
         { key: 'yearend',     label: 'Year-End Tasks',     tabIds: ['yearendcheck', 'form1099'] },
       ],
       tabs: [
@@ -8052,8 +8087,6 @@ export default function BookkeeperProToolkit() {
         { id: 'monthend',     label: 'Month-End Checklist',    icon: CheckCircle2 },
         { id: 'sopgen',       label: 'SOP Generator',          icon: BookMarked },
         { id: 'salestax',     label: 'Sales Tax',              icon: Percent },
-        { id: 'budgeting',    label: 'Budgeting Tool',         icon: PieChart },
-        { id: 'forecasting',  label: 'Forecasting Tool',       icon: TrendingUp },
         // Year-End Tasks
         { id: 'yearendcheck', label: 'Year-End Checklist',     icon: CheckCircle2 },
         { id: 'form1099',     label: '1099 Prep',              icon: FileCheck2 },
@@ -8206,99 +8239,14 @@ export default function BookkeeperProToolkit() {
   ].filter((item) => adminTabAllowed(item.id))),
   [pendingCount, enrollPendingCount, importActiveCount, adminTabAllowed]);
 
-  // Helper: serialize stages without icons (icons are components, not serializable)
-  const stagesToStorable = (stgs) => stgs.map(s => ({
-    id: s.id,
-    label: s.label,
-    number: s.number,
-    desc: s.desc,
-    tabs: s.tabs.map(t => ({ id: t.id, label: t.label })),
-  }));
-
-  // Helper: merge stored labels/order with DEFAULT_STAGES (which has icons)
-  const mergeStoredWithDefaults = (stored) => {
-    if (!stored || !Array.isArray(stored)) return DEFAULT_STAGES;
-    // Build a lookup of default tabs (with icons) by id
-    const defaultTabById = {};
-    DEFAULT_STAGES.forEach(s => s.tabs.forEach(t => { defaultTabById[t.id] = t; }));
-    const defaultStageById = {};
-    DEFAULT_STAGES.forEach(s => { defaultStageById[s.id] = s; });
-
-    // Reconstruct stages from stored, falling back to defaults for missing pieces
-    const merged = stored.map(s => {
-      const def = defaultStageById[s.id] || {};
-      return {
-        id: s.id,
-        label: s.label || def.label || '',
-        number: s.number ?? def.number ?? '',
-        desc: s.desc || def.desc || '',
-        // Sub-group metadata always comes from defaults (not stored), so it stays in sync with code updates.
-        ...(def.groups ? { groups: def.groups } : {}),
-        tabs: (s.tabs || []).map(t => {
-          const defTab = defaultTabById[t.id] || {};
-          return {
-            id: t.id,
-            label: t.label || defTab.label || t.id,
-            icon: defTab.icon || LayoutDashboard, // fallback icon
-          };
-        }).filter(t => defaultTabById[t.id]), // drop unknown tab ids
-      };
-    }).filter(s => defaultStageById[s.id]); // drop unknown stage ids
-
-    // Add any default stages/tabs missing from stored (e.g. new tabs added in updates).
-    // Insert a missing tab at its DEFAULT_STAGES-relative position — just after the nearest
-    // preceding default sibling the user already has (else at the front) — instead of dumping
-    // it at the end. Keeps newly-shipped tabs where they belong in the navigation order.
-    DEFAULT_STAGES.forEach(defStage => {
-      const existing = merged.find(s => s.id === defStage.id);
-      if (!existing) {
-        merged.push(defStage);
-      } else {
-        defStage.tabs.forEach((defTab, defIdx) => {
-          if (existing.tabs.some(t => t.id === defTab.id)) return;
-          let insertAt = 0;
-          for (let k = defIdx - 1; k >= 0; k--) {
-            const pos = existing.tabs.findIndex(t => t.id === defStage.tabs[k].id);
-            if (pos !== -1) { insertAt = pos + 1; break; }
-          }
-          existing.tabs.splice(insertAt, 0, defTab);
-        });
-      }
-    });
-
-    return merged;
-  };
-
-  // Bump when a code change should re-reconcile every user's saved sidebar layout (e.g. a new
-  // default tab that must land in a specific spot). On load, a stored version below this triggers
-  // a one-time normalizeTabOrder() pass so already-saved layouts adopt the new default ordering.
-  const SIDEBAR_VERSION = 4;
-
-  // Re-sort each stage's tabs to follow DEFAULT_STAGES order (preserving user renames). Safe:
-  // grouped stages render by explicit tabIds, so only flat stages (e.g. Training) are affected.
-  const normalizeTabOrder = (stgs) => stgs.map(s => {
-    const def = DEFAULT_STAGES.find(d => d.id === s.id);
-    if (!def) return s;
-    const order = def.tabs.map(t => t.id);
-    const rank = (id) => { const i = order.indexOf(id); return i === -1 ? 999 : i; };
-    return { ...s, tabs: [...s.tabs].sort((a, b) => rank(a.id) - rank(b.id)) };
-  });
-
-  // Tabs renamed in code after users may have persisted the old label. The sidebar merges
-  // labels stored-wins (so user renames survive), which would otherwise mask a code rename.
-  // This one-time, version-gated pass overwrites a saved label ONLY when it still equals the
-  // tab's PRIOR default — preserving any genuine user rename of the same tab.
-  const RENAMED_TAB_LABELS = {
-    interview: { from: 'Interview Prep', to: 'Job Interview Mastery' },
-    proposal: { from: 'Proposal Generator', to: 'Cover Letter Generator' },
-  };
-  const reconcileRenamedLabels = (stgs) => stgs.map(s => ({
-    ...s,
-    tabs: s.tabs.map(t => {
-      const r = RENAMED_TAB_LABELS[t.id];
-      return r && t.label === r.from ? { ...t, label: r.to } : t;
-    }),
-  }));
+  // Sidebar layout reconciliation lives in the pure src/lib/sidebarLayout.js (#56) so it can
+  // be unit-tested; DEFAULT_STAGES is built here (its icons are components) and is passed in.
+  // ★ mergeStoredWithDefaults is what drops a RETIRED tab id out of a saved layout, which is
+  //   why retiring a tool needs no storage migration. Pinned by test/sidebarLayout.test.mjs.
+  const stagesToStorable = stagesToStorableLib;
+  const mergeStoredWithDefaults = (stored) => mergeStoredWithDefaultsLib(stored, DEFAULT_STAGES, LayoutDashboard);
+  const normalizeTabOrder = (stgs) => normalizeTabOrderLib(stgs, DEFAULT_STAGES);
+  const reconcileRenamedLabels = (stgs) => reconcileRenamedLabelsLib(stgs, RENAMED_TAB_LABELS);
 
   // Load persisted per-user sidebar layout. Gated on user?.id (NOT []): the storage shim
   // namespaces keys as u:<uid>:* only after AuthProvider calls __setStorageUser(uid). A
@@ -13692,7 +13640,6 @@ function RestrictedTab({ active, goto }) {
     { id: 'industryacc', label: 'Industry Accounting', icon: Building2 },
     { id: 'ustax', label: 'US Tax 101', icon: Landmark },
     { id: 'chat', label: 'ProAdvisor Chat', icon: MessageCircle },
-    { id: 'niche', label: 'Niche Selector Quiz', icon: Target },
   ].filter(t => ent.allowsTab(t.id));
 
   return (
@@ -14102,7 +14049,6 @@ function Dashboard({ goto }) {
         { id: 'industryacc', label: 'Industry Accounting', desc: '12 industries · QBO workflows',   icon: Building2,       color: '#3B82F6' },
         { id: 'ustax',       label: 'US Tax 101',          desc: 'Forms, deadlines, IRS links',     icon: Landmark,        color: '#0A1E3F' },
         { id: 'chat',        label: 'ProAdvisor Chat',     desc: 'Live mentor for clean-ups',       icon: MessageCircle,   color: '#0EA5E9' },
-        { id: 'niche',       label: 'Niche Selector Quiz', desc: 'Find your best-fit industry',     icon: Target,          color: '#2563EB' },
       ],
     },
     {
@@ -14138,7 +14084,7 @@ function Dashboard({ goto }) {
       groups: [
         { label: 'Client Onboarding',  tabIds: ['engagement', 'onboarding', 'coa', 'invoice'] },
         { label: 'Daily Tasks',        tabIds: ['cpaai', 'bankfeed', 'converter', 'emails', 'calculators'] },
-        { label: 'Monthly Tasks',      tabIds: ['workflow', 'monthend', 'sopgen', 'salestax', 'budgeting', 'forecasting'] },
+        { label: 'Monthly Tasks',      tabIds: ['workflow', 'monthend', 'sopgen', 'salestax'] },
         { label: 'Year-End Tasks',     tabIds: ['yearendcheck', 'form1099'] },
       ],
       tiles: [
@@ -14158,8 +14104,6 @@ function Dashboard({ goto }) {
         { id: 'monthend',     label: 'Month-End Checklist',    desc: 'Full close checklist',            icon: CheckCircle2,  color: '#3B82F6' },
         { id: 'sopgen',       label: 'SOP Generator',          desc: 'AI-generated · 18 templates',     icon: BookMarked,    color: '#059669' },
         { id: 'salestax',     label: 'Sales Tax',              desc: 'Nexus, filing, reconciliation',   icon: Percent,       color: '#3B82F6' },
-        { id: 'budgeting',    label: 'Budgeting Tool',         desc: '12-month operating budget',       icon: PieChart,      color: '#1E40AF' },
-        { id: 'forecasting',  label: 'Forecasting Tool',       desc: '13-week cash flow forecast',      icon: TrendingUp,    color: '#059669' },
         // Year-End Tasks
         { id: 'yearendcheck', label: 'Year-End Checklist',     desc: 'Full year-end close playbook',    icon: CheckCircle2,  color: '#1E40AF' },
         { id: 'form1099',     label: '1099 Prep',              desc: 'Year-end 1099-NEC/MISC workflow', icon: FileCheck2,    color: '#3B82F6' },
@@ -19831,7 +19775,7 @@ function AttachmentGallery({ items, signedUrls }) {
 // React.memo'd (custom comparator) so unrelated CommunityHub state churn — above all a
 // search keystroke — doesn't re-render + re-parse every visible row; onOpen's identity is
 // ignored because its behavior is constant (it always opens the row's own post).
-const CommunityTopicRow = React.memo(function CommunityTopicRow({ post, tag, postTags, isAdmin, participants, reactTotal, attachCount, annUnread, isAnnouncement, onOpen }) {
+const CommunityTopicRow = React.memo(function CommunityTopicRow({ post, tag, postTags, canModerate, participants, reactTotal, attachCount, annUnread, isAnnouncement, onOpen }) {
   const hidden = post.status === 'hidden';
   // #40 made the CHANNEL's kind the announcement switch; the tag is only the
   // pre-#40 fallback for a database with no channels. See isAnnouncementPost().
@@ -19915,7 +19859,7 @@ const CommunityTopicRow = React.memo(function CommunityTopicRow({ post, tag, pos
     </article>
   );
 }, (a, b) => (
-  a.post === b.post && a.tag === b.tag && a.isAdmin === b.isAdmin
+  a.post === b.post && a.tag === b.tag && a.canModerate === b.canModerate
   && a.participants === b.participants && a.reactTotal === b.reactTotal
   && a.attachCount === b.attachCount && a.annUnread === b.annUnread
   && a.isAnnouncement === b.isAnnouncement
@@ -20041,7 +19985,7 @@ function CommunityRenameRow({ id, value, placeholder, mono, draft, onDraft, disa
 }
 
 function CommunityChannelRail({
-  groups, activeId, collapsed, onToggleCat, onOpen, isAdmin, onManage,
+  groups, activeId, collapsed, onToggleCat, onOpen, canConfigure, onManage,
   editing = false, draftNames = {}, onDraftName, onToggleEditing, onSaveNames, renaming = false,
   nameErrors = {},
 }) {
@@ -20105,7 +20049,7 @@ function CommunityChannelRail({
           </div>
         );
       })}
-      {isAdmin && (
+      {canConfigure && (
         <div className="mt-1 flex flex-col gap-1.5">
           {editing && onSaveNames ? (
             <div className="flex items-center gap-1.5">
@@ -20147,10 +20091,14 @@ const AUDIENCE_LABELS = {
   plans: 'Selected plans',
   batches: 'Selected batches',
   plans_and_batches: 'Selected plans AND batches',
-  admins_only: 'Admins only',
+  admins_only: 'Community staff only',
 };
 
 function CommunityAdminEditor({ onClose, onSaved }) {
+  const { staff, staffReady, staffDegraded, profile } = useAuth();
+  const { canConfigure } = communityAuthority({
+    staff, staffReady, staffDegraded, isAdmin: profile?.is_admin,
+  });
   const [cfg, setCfg] = useState(null);
   const [state, setState] = useState('loading');   // loading | ready | error
   const [err, setErr] = useState('');
@@ -20177,7 +20125,9 @@ function CommunityAdminEditor({ onClose, onSaved }) {
       setState('error');
     }
   }, []);
-  useEffect(() => { load(); }, [load]);
+  // Do not fire a doomed RPC: the refusal card renders from canConfigure, so leaving
+  // state at 'loading' is never seen.
+  useEffect(() => { if (canConfigure) load(); }, [load, canConfigure]);
 
   const run = async (fn, failCopy) => {
     setBusy(true); setErr('');
@@ -20272,6 +20222,22 @@ function CommunityAdminEditor({ onClose, onSaved }) {
   };
 
   const body = () => {
+    // Defence in depth: the openers are already gated on community.manage, and
+    // admin_community_config() refuses without it. This is the house refusal card every
+    // other admin screen renders, so a deep link or a stale render never shows the editor
+    // chrome to someone the server will refuse.
+    if (!canConfigure) {
+      return (
+        <div className="glass-card p-8 text-center" style={{ borderRadius: 20 }}>
+          <ShieldCheck size={30} style={{ color: C.textMute, margin: '0 auto' }} />
+          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Community staff only</div>
+          <div className="mt-1 text-sm" style={{ color: C.textSoft }}>
+            Configuring channels, categories and audiences needs the Community “Configure the
+            community” permission.
+          </div>
+        </div>
+      );
+    }
     if (state === 'loading') return <AdminListSkeleton rows={4} />;
     if (state === 'error') {
       // A missing migration is a SETUP state, not a failure — say which file to run
@@ -21435,7 +21401,7 @@ function NotificationBell({ bell, placement = 'card' }) {
 // thread with per-comment reactions + a mention-aware composer. Announcements render
 // highlighted and comment-locked (react + mark-as-read only). Comment drafts are card-
 // local state (keep-alive preserves them).
-function CommunityPostCard({ post, tag, postTags, attachments, signedUrls, isAdmin, uid, myName, myAvatar,
+function CommunityPostCard({ post, tag, postTags, attachments, signedUrls, canModerate, uid, myName, myAvatar,
   commentCount, reactions, commentsState, commentReacts, annUnread, isAnnouncement,
   canComment = true, canReact = true, spaceId = null,
   menuOpen, onMenuToggle, onToggleReact, onToggleCommentReact, onAddComment, onEdit, channelId, canPost = false,
@@ -21511,7 +21477,7 @@ function CommunityPostCard({ post, tag, postTags, attachments, signedUrls, isAdm
             ))}
           </div>
         </div>
-        {(isOwn || isAdmin) && (
+        {(isOwn || canModerate) && (
           <div className="relative flex-shrink-0" data-community-menu>
             <button onClick={onMenuToggle} aria-haspopup="menu" aria-expanded={menuOpen} aria-label="Post actions"
               className="p-1.5 rounded-lg transition hover:opacity-75" style={{ color: C.textMute }}>
@@ -21520,28 +21486,28 @@ function CommunityPostCard({ post, tag, postTags, attachments, signedUrls, isAdm
             {menuOpen && (
               <div role="menu" className="absolute right-0 top-8 z-20 w-52 rounded-xl overflow-hidden py-1 shadow-lg"
                 style={{ background: C.white, border: `1px solid ${C.border}` }}>
-                {isOwn && post.status === 'active' && (canPost || isAdmin) && (
+                {isOwn && post.status === 'active' && (canPost || canModerate) && (
                   <button role="menuitem" onClick={() => { onMenuToggle(); onEdit(post); }}
                     className="w-full text-left px-3.5 py-2 text-sm font-medium transition hover:opacity-75 flex items-center gap-2"
                     style={{ color: C.text }}>
                     <Edit3 size={14} /> Edit post
                   </button>
                 )}
-                {isAdmin && (
+                {canModerate && (
                   <button role="menuitem" onClick={() => { onMenuToggle(); onTogglePin(post); }}
                     className="w-full text-left px-3.5 py-2 text-sm font-medium transition hover:opacity-75 flex items-center gap-2"
                     style={{ color: C.text }}>
                     <Pin size={14} /> {post.pinned ? 'Unpin' : 'Pin to top'}
                   </button>
                 )}
-                {isAdmin && (
+                {canModerate && (
                   <button role="menuitem" onClick={() => { onMenuToggle(); onToggleLock(post); }}
                     className="w-full text-left px-3.5 py-2 text-sm font-medium transition hover:opacity-75 flex items-center gap-2"
                     style={{ color: C.text }}>
                     {locked ? <Unlock size={14} /> : <Lock size={14} />} {locked ? 'Unlock comments' : 'Lock comments'}
                   </button>
                 )}
-                {isAdmin && (
+                {canModerate && (
                   <button role="menuitem" onClick={() => { onMenuToggle(); onModerate(post, hidden ? 'active' : 'hidden'); }}
                     className="w-full text-left px-3.5 py-2 text-sm font-medium transition hover:opacity-75 flex items-center gap-2"
                     style={{ color: C.text }}>
@@ -21625,14 +21591,14 @@ function CommunityPostCard({ post, tag, postTags, attachments, signedUrls, isAdm
                         </span>
                       )}
                       <span className="ml-auto inline-flex items-center gap-0.5">
-                        {isAdmin && (
+                        {canModerate && (
                           <button onClick={() => onModerateComment(post.id, cm, cmHidden ? 'active' : 'hidden')}
                             title={cmHidden ? 'Restore comment' : 'Hide comment'} aria-label={cmHidden ? 'Restore comment' : 'Hide comment'}
                             className="p-1 rounded-md transition hover:opacity-70" style={{ color: C.textMute }}>
                             {cmHidden ? <Eye size={12} /> : <EyeOff size={12} />}
                           </button>
                         )}
-                        {(own || isAdmin) && (
+                        {(own || canModerate) && (
                           <button onClick={() => onAskDelete({ kind: 'comment', item: cm, postId: post.id })}
                             title="Delete comment" aria-label="Delete comment"
                             className="p-1 rounded-md transition hover:opacity-70" style={{ color: C.textMute }}>
@@ -21808,8 +21774,18 @@ function CommunityRankingWidget() {
 }
 
 function CommunityHub() {
-  const { user, profile } = useAuth();
-  const isAdmin = !!profile?.is_admin;
+  const { user, profile, staff, staffReady, staffDegraded } = useAuth();
+  // COMMUNITY AUTHORITY IS THREE QUESTIONS, NOT ONE (#56).
+  //   This used to be one `isAdmin = !!profile?.is_admin` — which since #45 means
+  //   "active Super Admin" — and that single flag stood for "may I open the channel
+  //   editor", "may I moderate someone else's post" and "am I staff here at all".
+  //   Operations Admins and Trainers now hold community.manage / community.moderate,
+  //   so the three answers can differ and each gets its own name. The predicates fail
+  //   CLOSED while the staff context loads, and fall back to the legacy is_admin column
+  //   only when the context could not be read at all. The database is the real boundary.
+  const { canConfigure, canModerate, hasStaffAccess } = communityAuthority({
+    staff, staffReady, staffDegraded, isAdmin: profile?.is_admin,
+  });
   const uid = user?.id;
   const myName = (profile?.full_name || '').trim() || (user?.email || 'Member');
   const myAvatar = resolveAvatarUrl(profile?.avatar_url);
@@ -22587,83 +22563,112 @@ function CommunityHub() {
     setDetailPost(prev => (prev && prev.id === postId ? bump(prev) : prev));
   }
 
-  // Admin-only column patches (pin / lock — the community_posts_guard trigger freezes
-  // these for members server-side; this call site is admin-gated in the UI).
-  async function adminPatchPost(post, patch, label) {
+  // MODERATION IS A BOUNDED SERVER ACTION, NOT A CLIENT COLUMN PATCH (#56).
+  //   These used to PATCH community_posts / community_comments directly, which worked only
+  //   because community_*_admin_all was a blanket is_admin() FOR ALL policy — i.e. the
+  //   CLIENT chose the columns. community_moderate_post() takes an id and a strict action
+  //   enum, so it cannot express author_id, body, title, channel_id, created_at or a
+  //   counter; it re-checks that the channel is one the caller may reach; and it writes one
+  //   append-only community_moderation_events row. The response carries the resulting
+  //   state, so the optimistic patch is the server's answer rather than our guess.
+  async function moderatePostAction(post, action, label) {
     try {
-      const { error } = await supabase.from('community_posts').update(patch).eq('id', post.id);
+      const { data, error } = await supabase.rpc('community_moderate_post', {
+        p_post_id: post.id, p_action: action,
+      });
       if (error) throw error;
+      const patch = {
+        status: data?.status ?? post.status,
+        pinned: data?.pinned ?? post.pinned,
+        comments_locked: data?.comments_locked ?? post.comments_locked,
+      };
+      const pinFlipped = patch.pinned !== post.pinned;
       setPosts(prev => prev.map(p => (p.id === post.id ? { ...p, ...patch } : p)));
       setDetailPost(prev => (prev && prev.id === post.id ? { ...prev, ...patch } : prev));
-      if ('pinned' in patch) loadFeed(true);                 // pin flips feed order
+      if (pinFlipped) loadFeed(true);                        // pin flips feed order
     } catch (e) {
-      logDbError('[Community] admin patch', e, { id: post.id, patch });
-      setErr(describeDbError(e, `Could not ${label}.`));
+      logDbError('[Community] moderate post', e, { id: post.id, action });
+      // appErrorMessage, not describeDbError: these raise app_error() codes, and
+      // describeDbError would render "Hint: MODERATION_TARGET_NOT_FOUND" at the moderator.
+      setErr(appErrorMessage(e, `Could not ${label}.`));
     }
   }
-  const togglePin = (post) => adminPatchPost(post, { pinned: !post.pinned }, post.pinned ? 'unpin the post' : 'pin the post');
-  const toggleLock = (post) => adminPatchPost(post, { comments_locked: !post.comments_locked }, post.comments_locked ? 'unlock replies' : 'lock replies');
-
-  async function moderatePost(post, nextStatus) {
-    try {
-      const { error } = await supabase.from('community_posts').update({ status: nextStatus }).eq('id', post.id);
-      if (error) throw error;
-      setPosts(prev => prev.map(p => (p.id === post.id ? { ...p, status: nextStatus } : p)));
-      setDetailPost(prev => (prev && prev.id === post.id ? { ...prev, status: nextStatus } : prev));
-    } catch (e) {
-      logDbError('[Community] moderate', e, { id: post.id, nextStatus });
-      setErr(describeDbError(e, 'Could not update the post.'));
-    }
-  }
+  const togglePin = (post) => moderatePostAction(post, post.pinned ? 'unpin' : 'pin', post.pinned ? 'unpin the post' : 'pin the post');
+  const toggleLock = (post) => moderatePostAction(post, post.comments_locked ? 'unlock' : 'lock', post.comments_locked ? 'unlock replies' : 'lock replies');
+  const moderatePost = (post, nextStatus) => moderatePostAction(
+    post,
+    nextStatus === 'hidden' ? 'hide' : 'restore',
+    nextStatus === 'hidden' ? 'hide the post' : 'restore the post');
 
   async function moderateComment(postId, cm, nextStatus) {
     try {
-      const { error } = await supabase.from('community_comments').update({ status: nextStatus }).eq('id', cm.id);
+      const { data, error } = await supabase.rpc('community_moderate_comment', {
+        p_comment_id: cm.id, p_action: nextStatus === 'hidden' ? 'hide' : 'restore',
+      });
       if (error) throw error;
+      const applied = data?.status ?? nextStatus;
       setComments(prev => ({
         ...prev,
-        [postId]: { ...(prev[postId] || { loading: false, err: '' }), rows: ((prev[postId] || {}).rows || []).map(r => (r.id === cm.id ? { ...r, status: nextStatus } : r)) },
+        [postId]: { ...(prev[postId] || { loading: false, err: '' }), rows: ((prev[postId] || {}).rows || []).map(r => (r.id === cm.id ? { ...r, status: applied } : r)) },
       }));
       // Hide/restore changes the active count (the rollup trigger recomputed it server-side).
-      const delta = nextStatus === 'active' ? 1 : -1;
-      const bump = (p) => (p.id === postId ? { ...p, comment_count: Math.max(0, (p.comment_count || 0) + delta) } : p);
-      setPosts(prev => prev.map(bump));
-      setDetailPost(prev => (prev && prev.id === postId ? bump(prev) : prev));
+      // ★ Skip the delta when the server reports a no-op: our `cm.status` was stale (another
+      //   moderator got there first), the count never moved, and loadMeta() below refreshes
+      //   participants/reactions/attachments but NOT comment_count — so the drift would stick
+      //   until a full feed reload.
+      if (!data?.already) {
+        const delta = applied === 'active' ? 1 : -1;
+        const bump = (p) => (p.id === postId ? { ...p, comment_count: Math.max(0, (p.comment_count || 0) + delta) } : p);
+        setPosts(prev => prev.map(bump));
+        setDetailPost(prev => (prev && prev.id === postId ? bump(prev) : prev));
+      }
       loadMeta([postId]);
     } catch (e) {
       logDbError('[Community] moderate comment', e, { id: cm.id, nextStatus });
-      setErr(describeDbError(e, 'Could not update the comment.'));
+      setErr(appErrorMessage(e, 'Could not update the comment.'));
     }
   }
 
   // Members soft-delete their own rows (status='deleted' — no DELETE policy exists for
-  // them); admins hard-delete (FK cascade clears a post's comments/reactions/attachments,
-  // and the storage files are removed after — attachment files are never shared across
-  // posts, unlike course media, so no removeMediaIfUnreferenced-style refcheck is needed).
+  // them); Community staff hard-delete through the moderation RPC (FK cascade clears a
+  // post's comments/reactions/attachments — attachment files are never shared across posts,
+  // unlike course media, so no removeMediaIfUnreferenced-style refcheck is needed).
+  // SWEEP AFTER THE RPC, NOT BEFORE. The RPC returns the exact storage paths it just
+  //   detached and records them on its audit row; community_media_delete's receipt arm then
+  //   authorizes deleting precisely those, for this actor, for 15 minutes. Reading the paths
+  //   in the client first would race a concurrent upload, and the attachment-join arm stops
+  //   matching the instant the FK cascade removes the rows it joins through.
   async function doDelete() {
     if (!confirmDel || busyDel) return;
     const { kind, item, postId } = confirmDel;
     setBusyDel(true);
     try {
-      const table = kind === 'post' ? 'community_posts' : 'community_comments';
-      let mediaPaths = [];
-      if (kind === 'post' && isAdmin) {
-        mediaPaths = (attachMeta[item.id] || []).filter(a => a.storage_path).map(a => a.storage_path);
-        if (!mediaPaths.length) {
-          try {
-            const { data } = await supabase.from('community_attachments').select('storage_path').eq('post_id', item.id);
-            mediaPaths = (data || []).map(a => a.storage_path).filter(Boolean);
-          } catch { /* pre-#24 database */ }
+      if (canModerate) {
+        const { data, error } = await supabase.rpc(
+          kind === 'post' ? 'community_moderate_post' : 'community_moderate_comment',
+          kind === 'post'
+            ? { p_post_id: item.id, p_action: 'delete' }
+            : { p_comment_id: item.id, p_action: 'delete' });
+        if (error) throw error;
+        const paths = Array.isArray(data?.storage_paths) ? data.storage_paths.filter(Boolean) : [];
+        if (paths.length) {
+          // ★ remove() RESOLVES with { error }; it does not reject, so a bare .catch() would
+          //   drop a failure on the floor. That is not cosmetic here: the receipt arm of
+          //   community_media_delete authorizes this actor for 15 MINUTES, and by then the
+          //   attachment rows have cascaded away, so the join arm can never match either —
+          //   a silent failure is a permanent orphan. Log it; the paths are in the ledger.
+          supabase.storage.from('community-media').remove(paths)
+            .then(({ error: rmErr }) => {
+              if (rmErr) logDbError('[Community] media sweep', rmErr, { postId: item.id, paths });
+            })
+            .catch((rmErr) => logDbError('[Community] media sweep', rmErr, { postId: item.id }));
         }
+      } else {
+        const table = kind === 'post' ? 'community_posts' : 'community_comments';
+        const { error } = await supabase.from(table).update({ status: 'deleted' }).eq('id', item.id);
+        if (error) throw error;
       }
-      const { error } = isAdmin
-        ? await supabase.from(table).delete().eq('id', item.id)
-        : await supabase.from(table).update({ status: 'deleted' }).eq('id', item.id);
-      if (error) throw error;
       if (kind === 'post') {
-        if (isAdmin && mediaPaths.length) {
-          supabase.storage.from('community-media').remove(mediaPaths).catch(() => {});
-        }
         setPosts(prev => prev.filter(p => p.id !== item.id));
         if (selectedPostIdRef.current === item.id) closePost();
       } else {
@@ -22680,7 +22685,9 @@ function CommunityHub() {
       setConfirmDel(null);
     } catch (e) {
       logDbError('[Community] delete', e, { kind, id: item.id });
-      setErr(describeDbError(e, 'Could not delete. Please try again.'));
+      // A member's soft-delete still raises a plain RLS error, which appErrorMessage
+      // passes through unchanged; a moderator's raises a coded one.
+      setErr(appErrorMessage(e, 'Could not delete. Please try again.'));
       setConfirmDel(null);
     } finally { setBusyDel(false); }
   }
@@ -23082,7 +23089,7 @@ function CommunityHub() {
   }, [uid, spaceId, channelId, spacesReady, channelsReady]);
 
   const activeTags = tags.filter(t => t.active);
-  const composerTags = activeTags.filter(t => isAdmin || !t.admin_only);   // Announcements chip = admins only
+  const composerTags = activeTags.filter(t => hasStaffAccess || !t.admin_only);   // Announcements chip = Community staff only
   // ── Effective rights (#40) ─────────────────────────────────────────
   // ★ These come from the SERVER, verbatim. my_community_sidebar() has already
   // fused plan x space x channel, so the client's only job is to render what it
@@ -23109,11 +23116,17 @@ function CommunityHub() {
   const FULL_LEGACY_CAPS = { canRead: true, canPost: true, canComment: true, canReact: true, canAttach: true };
   const caps = preSpaces ? FULL_LEGACY_CAPS
     : (preChannels ? effectiveCaps(currentSpace) : channelCaps);
-  // Admins moderate and answer everywhere (community_*_admin_all RLS).
-  const canComment = !spacesFailed && (isAdmin || caps.canComment);
-  const canPost = !spacesFailed && (isAdmin || caps.canPost);
-  const canReact = !spacesFailed && (isAdmin || caps.canReact);
-  const canAttach = !spacesFailed && (isAdmin || caps.canAttach);
+  // Community staff write everywhere — #announcements and locked threads included.
+  // ★ NOT via community_*_admin_all: #56 deliberately left those five FOR ALL policies on
+  //   is_super_admin(), because with no table-level DML revoke a FOR ALL policy is a raw
+  //   PostgREST write path over every row. The server side of THIS line is the staff arm in
+  //   user_community_channel_capabilities() plus the own-row *_own_insert / *_own_update
+  //   policies (#56 section 8d). Other people's content is reachable only through the
+  //   audited moderation RPCs.
+  const canComment = !spacesFailed && (hasStaffAccess || caps.canComment);
+  const canPost = !spacesFailed && (hasStaffAccess || caps.canPost);
+  const canReact = !spacesFailed && (hasStaffAccess || caps.canReact);
+  const canAttach = !spacesFailed && (hasStaffAccess || caps.canAttach);
   const railGroups = useMemo(() => groupChannelsByCategory(channels), [channels]);
   // ── Announcements are a CHANNEL KIND (#40), not a tag ──────────────────────
   // The rail, header and composer already keyed on community_channels.kind, but
@@ -23262,7 +23275,7 @@ function CommunityHub() {
     if (searchRef.current) return { title: 'No matches', desc: `No discussions match “${searchRef.current}”. Try a different search.` };
     if (freeTag) return { title: 'Nothing tagged yet', desc: `No discussions tagged #${freeTag} yet.` };
     if (filter === 'unanswered') return { title: 'All caught up', desc: 'No unanswered discussions — every question has a reply.' };
-    if (filter === 'announcements') return { title: 'No announcements yet', desc: isAdmin ? 'Post the first announcement — it publishes to every member.' : 'Announcements from Coach Alex’s team will appear here.' };
+    if (filter === 'announcements') return { title: 'No announcements yet', desc: hasStaffAccess ? 'Post the first announcement — it publishes to every member.' : 'Announcements from Coach Alex’s team will appear here.' };
     if (activeTag !== 'all') return { title: 'Nothing here yet', desc: `No discussions in ${(tagBySlug[activeTag] || {}).label || 'this category'} yet — be the first to start one.` };
     return { title: 'No discussions yet', desc: 'Start the first discussion — introduce yourself or ask a question.' };
   })();
@@ -23270,7 +23283,7 @@ function CommunityHub() {
   return (
     <div>
       <SectionHead eyebrow="Member Community" title="Community"
-        desc={isAdmin
+        desc={hasStaffAccess
           ? 'Post announcements, pin important discussions, and moderate the forum inline.'
           : 'A member forum — ask questions, share wins, discuss the courses, and follow announcements.'} gold />
 
@@ -23288,7 +23301,7 @@ function CommunityHub() {
         <SidePanel title="Channels" subtitle="Jump to a conversation" icon={MessagesSquare}
           onClose={() => setRailOpen(false)}>
           <CommunityChannelRail groups={railGroups} activeId={channelId} collapsed={collapsedCats}
-            onToggleCat={toggleCat} onOpen={handleOpenChannel} isAdmin={isAdmin}
+            onToggleCat={toggleCat} onOpen={handleOpenChannel} canConfigure={canConfigure}
             onManage={() => { setRailOpen(false); setAdminEditorOpen(true); }}
             editing={railEditing} draftNames={draftNames} onDraftName={draftName}
             onToggleEditing={toggleRailEditing} onSaveNames={saveRailNames} renaming={renaming}
@@ -23296,7 +23309,7 @@ function CommunityHub() {
         </SidePanel>
       )}
 
-      {spacesReady === 'legacy' && isAdmin && !schemaGap && (
+      {spacesReady === 'legacy' && hasStaffAccess && !schemaGap && (
         <div className="mb-4 max-w-3xl mx-auto">
           <AdminNotice kind="warn">
             Community spaces aren’t set up yet — run <code>db/2026-07-28-community-spaces-batches.sql</code> (#32)
@@ -23313,7 +23326,7 @@ function CommunityHub() {
           fact now, and canComment is the server-computed answer. Posting-off is
           already explained separately below the composer, so this fires only for
           the can-post-but-cannot-reply combination. */}
-      {channelsReady === true && currentChannel && canPost && !canComment && !isAdmin && !selectedPostId && !schemaGap && (
+      {channelsReady === true && currentChannel && canPost && !canComment && !hasStaffAccess && !selectedPostId && !schemaGap && (
         <div className="mb-4 max-w-6xl mx-auto inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold"
           style={{ background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)', color: 'var(--status-info-fg)' }}>
           <ThumbsUp size={12} /> Reactions only — start discussions and react here; member replies are off in #{currentChannel.channel_slug || currentChannel.channel_name}.
@@ -23345,16 +23358,16 @@ function CommunityHub() {
         <div className="mt-6 max-w-3xl mx-auto glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
           <MessagesSquare size={40} className="mx-auto mb-3" style={{ color: ROYAL }} />
           <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">
-            {isAdmin ? 'Finish backend setup' : 'Community is coming soon'}
+            {hasStaffAccess ? 'Finish backend setup' : 'Community is coming soon'}
           </div>
           <div className="text-slate-500 mt-2 text-sm max-w-md mx-auto">
-            {isAdmin
+            {hasStaffAccess
               ? (schemaGap === 'missing'
                 ? 'The community tables aren’t in Supabase yet. Run db/2026-07-20-community.sql (#23) and then db/2026-07-21-community-forum.sql (#24) in the SQL Editor (see COMMUNITY_SETUP.md), then refresh this page.'
                 : 'The forum upgrade hasn’t been applied yet. Run db/2026-07-21-community-forum.sql (#24) in the SQL Editor (see COMMUNITY_SETUP.md), then refresh this page.')
               : 'The member community is being set up — check back soon to introduce yourself, ask questions, and share your wins.'}
           </div>
-          {isAdmin && (
+          {hasStaffAccess && (
             <div className="mt-4 inline-flex items-center gap-2 text-xs font-semibold px-3 py-1.5 rounded-full"
               style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)' }}>
               <AlertTriangle size={13} /> See COMMUNITY_SETUP.md
@@ -23390,7 +23403,7 @@ function CommunityHub() {
               attachments={attachMeta[detailRow.id] || []}
               signedUrls={signedUrls}
               canComment={canComment} canReact={canReact} canPost={canPost} spaceId={spaceId} channelId={channelId}
-              isAdmin={isAdmin} uid={uid} myName={myName} myAvatar={myAvatar}
+              canModerate={canModerate} uid={uid} myName={myName} myAvatar={myAvatar}
               commentCount={typeof detailRow.comment_count === 'number' ? detailRow.comment_count : ((comments[detailRow.id] || {}).rows || []).filter(r => r.status === 'active').length}
               reactions={reactMeta[detailRow.id]}
               commentsState={comments[detailRow.id]}
@@ -23418,7 +23431,7 @@ function CommunityHub() {
             <div className="hidden lg:block">
               {railGroups.length > 0 ? (
                 <CommunityChannelRail groups={railGroups} activeId={channelId} collapsed={collapsedCats}
-                  onToggleCat={toggleCat} onOpen={handleOpenChannel} isAdmin={isAdmin}
+                  onToggleCat={toggleCat} onOpen={handleOpenChannel} canConfigure={canConfigure}
                   onManage={handleManageOpen}
                   editing={railEditing} draftNames={draftNames} onDraftName={draftName}
                   onToggleEditing={toggleRailEditing} onSaveNames={saveRailNames} renaming={renaming}
@@ -23428,7 +23441,7 @@ function CommunityHub() {
                   {/* ★ The Manage button lives INSIDE the rail, so an admin who
                       archives every channel would otherwise lose the only way back
                       into the editor and need SQL to recover. */}
-                  {isAdmin && channelsReady !== null && (
+                  {canConfigure && channelsReady !== null && (
                     <button onClick={() => setAdminEditorOpen(true)}
                       className="mb-3 inline-flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-xs font-bold"
                       style={{ color: C.primary, background: 'var(--wash)' }}>
@@ -23496,7 +23509,7 @@ function CommunityHub() {
               )}
 
               {/* Channel rules, stated before composing rather than after a refusal */}
-              {currentChannel && !canPost && !isAdmin && channelsReady === true && (
+              {currentChannel && !canPost && !hasStaffAccess && channelsReady === true && (
                 <div className="mt-3 p-2.5 rounded-lg text-xs" style={{
                   background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)',
                   color: 'var(--status-info-fg)' }}>
@@ -23560,7 +23573,7 @@ function CommunityHub() {
                     {posts.map(post => (
                       <CommunityTopicRow key={post.id} post={post} tag={tagBySlug[post.tag_slug]}
                         postTags={postTagsMeta[post.id] || []}
-                        isAdmin={isAdmin}
+                        canModerate={canModerate}
                         participants={participantsMeta[post.id]}
                         reactTotal={Object.values((reactMeta[post.id] || {}).counts || {}).reduce((a, b) => a + b, 0)}
                         attachCount={(attachMeta[post.id] || []).length}
@@ -23606,11 +23619,11 @@ function CommunityHub() {
       {confirmDel && (
         <AccountModal
           title={confirmDel.kind === 'post' ? 'Delete this post?' : 'Delete this reply?'}
-          subtitle={isAdmin ? 'Admin delete — permanent' : 'This removes it from the community'}
+          subtitle={canModerate ? 'Staff delete — permanent' : 'This removes it from the community'}
           icon={Trash2} tone="danger" maxW="max-w-sm" canClose={!busyDel}
           onClose={() => setConfirmDel(null)}>
           <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
-            {isAdmin
+            {canModerate
               ? `This permanently removes the ${confirmDel.kind === 'post' ? 'post along with its replies, reactions and attachments' : 'reply'}. This cannot be undone.`
               : `Your ${confirmDel.kind === 'post' ? 'post' : 'reply'} will be removed from the community.`}
           </p>
@@ -29407,148 +29420,6 @@ function AccountingCalculators() {
 
 
 // ═══════════════════════════════════════════════════════════════════
-// COMPONENT: NICHE SELECTOR QUIZ (Training & Skills)
-// ═══════════════════════════════════════════════════════════════════
-
-// NICHE_QUESTIONS now lives in src/data/niche.js (lazy-loaded — see useLazyData).
-
-// NICHE_PROFILES now lives in src/data/niche.js (lazy-loaded — see useLazyData).
-
-function NicheSelectorQuiz(props) {
-  const { mod, err } = useLazyData(loadNicheData);
-  if (!mod) return <DataLoadingCard err={err} />;
-  return <NicheSelectorQuizInner {...props} data={mod} />;
-}
-function NicheSelectorQuizInner({ goto, data }) {
-  const { NICHE_QUESTIONS, NICHE_PROFILES } = data;
-  const [answers, setAnswers] = useState({});
-  const [showResults, setShowResults] = useState(false);
-
-  const answer = (qIdx, optIdx) => {
-    setAnswers({ ...answers, [qIdx]: optIdx });
-  };
-
-  const allAnswered = NICHE_QUESTIONS.every((_, i) => answers[i] !== undefined);
-
-  const computeResults = () => {
-    const scores = {};
-    NICHE_QUESTIONS.forEach((q, qIdx) => {
-      const optIdx = answers[qIdx];
-      if (optIdx === undefined) return;
-      const tags = q.options[optIdx].tags;
-      tags.forEach(t => { scores[t] = (scores[t] || 0) + 1; });
-    });
-    return Object.entries(scores).sort(([, a], [, b]) => b - a).slice(0, 3);
-  };
-
-  const reset = () => { setAnswers({}); setShowResults(false); };
-
-  const results = showResults ? computeResults() : [];
-
-  return (
-    <div>
-      <SectionHead eyebrow="Training & Skills · Tool" title="Niche Selector Quiz" desc="Generalist bookkeepers charge $8-$15/hour. Industry-fluent bookkeepers charge $25-$75/hour. This 8-question quiz matches you to the 3 industries best suited to your skills, personality, and goals — so you stop competing on price." />
-
-      {!showResults ? (
-        <div>
-          <div style={{ background: SHEEN }} className="glass-card p-5 rounded-2xl mt-6 mb-5">
-            <div className="flex gap-3 items-start">
-              <Lightbulb size={20} style={{ color: ROYAL }} className="flex-shrink-0 mt-0.5" />
-              <div className="text-sm text-slate-700 leading-relaxed">
-                <span className="font-bold" style={{ color: NAVY }}>How to use:</span> Answer honestly based on what energizes you, not what you think the "right" answer is. Different personalities thrive in different niches. There's no wrong answer.
-              </div>
-            </div>
-          </div>
-
-          <div className="space-y-4">
-            {NICHE_QUESTIONS.map((q, qIdx) => (
-              <div key={qIdx} className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-                <div style={{ background: `linear-gradient(90deg, ${INK.navy} 0%, ${ROYAL} 100%)` }} className="px-5 py-3 text-white">
-                  <div className="text-[10px] uppercase tracking-wider opacity-80">Question {qIdx + 1} of {NICHE_QUESTIONS.length}</div>
-                  <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">{q.q}</div>
-                </div>
-                <div className="p-3 space-y-2">
-                  {q.options.map((opt, optIdx) => {
-                    const selected = answers[qIdx] === optIdx;
-                    return (
-                      <button key={optIdx} onClick={() => answer(qIdx, optIdx)}
-                        className={`w-full text-left p-4 rounded-xl transition border-2 ${selected ? 'shadow-md' : 'border-slate-200 hover:border-blue-300'}`}
-                        style={selected ? { background: ICE, borderColor: CYAN } : {}}>
-                        <div className="flex items-start gap-3">
-                          <div className={`w-5 h-5 rounded-full flex-shrink-0 mt-0.5 flex items-center justify-center ${selected ? '' : 'border-2 border-slate-300'}`}
-                            style={selected ? { background: ROYAL } : {}}>
-                            {selected && <Check size={12} className="text-white" />}
-                          </div>
-                          <div className={`text-sm leading-relaxed ${selected ? 'font-semibold' : 'text-slate-700'}`} style={selected ? { color: NAVY } : {}}>{opt.label}</div>
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            ))}
-          </div>
-
-          <div className="mt-6 flex justify-end gap-2">
-            {Object.keys(answers).length > 0 && (
-              <button onClick={reset} className="px-5 py-3 rounded-xl bg-white border border-slate-300 text-sm font-bold text-slate-700">Reset</button>
-            )}
-            <button onClick={() => setShowResults(true)} disabled={!allAnswered}
-              className="sheen-btn text-white font-bold px-6 py-3 rounded-xl shadow-lg disabled:opacity-50">
-              See My Top 3 Niches →
-            </button>
-          </div>
-        </div>
-      ) : (
-        <div>
-          <div className="p-7 rounded-2xl text-white shadow-2xl mt-6 mb-5" style={{ background: `linear-gradient(135deg, ${INK.navy} 0%, ${ROYAL} 50%, ${CYAN} 100%)` }}>
-            <div className="text-[10px] uppercase tracking-[0.3em] font-bold text-blue-200 mb-1">Your Match</div>
-            <div style={{ fontFamily: fontDisplay, letterSpacing: '-0.02em' }} className="text-3xl font-bold">Top 3 Niches for You</div>
-            <div className="text-sm text-blue-100 mt-2">Based on your answers, these industries best fit your skills and preferences. Start with #1 — go deep, build expertise, then expand.</div>
-          </div>
-
-          <div className="space-y-4">
-            {results.map(([id, score], i) => {
-              const profile = NICHE_PROFILES[id];
-              if (!profile) return null;
-              return (
-                <div key={id} className="bg-white rounded-2xl border-2 shadow-md overflow-hidden" style={{ borderColor: i === 0 ? CYAN : '#E2E8F0' }}>
-                  <div className="px-5 py-3 flex items-center gap-4" style={{ background: i === 0 ? `linear-gradient(90deg, ${ROYAL} 0%, ${CYAN} 100%)` : '#F8FAFC' }}>
-                    <div className={i === 0 ? 'text-white' : 'text-slate-400'}>
-                      <div style={{ fontFamily: fontDisplay }} className="text-3xl font-bold">#{i + 1}</div>
-                    </div>
-                    <div className="text-4xl">{profile.icon}</div>
-                    <div className="flex-1">
-                      <div className={`text-xs uppercase tracking-wider font-bold ${i === 0 ? 'text-white/80' : 'text-slate-500'}`}>Match Score: {score}/{NICHE_QUESTIONS.length}</div>
-                      <div style={{ fontFamily: fontDisplay }} className={`text-xl font-bold ${i === 0 ? 'text-white' : 'text-slate-800'}`}>{profile.name}</div>
-                    </div>
-                  </div>
-                  <div className="p-5">
-                    <div className="text-sm text-slate-700 leading-relaxed mb-3">{profile.why}</div>
-                    <div className="flex gap-2 flex-wrap">
-                      <button onClick={() => goto && goto('industryacc')} className="text-xs font-bold px-4 py-2 rounded-lg text-white shadow" style={{ background: `linear-gradient(135deg, ${ROYAL} 0%, ${CYAN} 100%)` }}>
-                        → Study this industry's nuances
-                      </button>
-                      <button onClick={() => goto && goto('painpoints')} className="text-xs font-bold px-4 py-2 rounded-lg bg-white border border-slate-300 text-slate-700 hover:border-blue-400">
-                        → Generate pain points for pitching
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          <div className="mt-5 flex justify-end">
-            <button onClick={reset} className="px-5 py-2.5 rounded-xl bg-white border border-slate-300 text-sm font-bold text-slate-700">Retake Quiz</button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════
 // COMPONENT: PROFILE OPTIMIZATION 1-ON-1 BOOKING (Job Application) — "Book 1-on-1 with Alex"
 // ═══════════════════════════════════════════════════════════════════
 
@@ -34272,1014 +34143,6 @@ ${(report.strategicInsights || []).map(s => `
 // ═══════════════════════════════════════════════════════════════════
 // SHARED COMPONENT: SUMMARY CARD
 // ═══════════════════════════════════════════════════════════════════
-
-
-// ═══════════════════════════════════════════════════════════════════
-// COMPONENT: BUDGETING TOOL (Daily & Month-End)
-// 12-month operating budget builder for client deliverables.
-// Persists to localStorage. Exports to CSV + Word.
-// ═══════════════════════════════════════════════════════════════════
-
-const BUDGET_CATEGORIES = {
-  Revenue: [
-    { name: 'Product / Service Sales',   monthly: 0, growth: 0 },
-    { name: 'Other Income',              monthly: 0, growth: 0 },
-  ],
-  'Cost of Goods Sold': [
-    { name: 'Materials / Inventory',     monthly: 0, growth: 0 },
-    { name: 'Direct Labor',              monthly: 0, growth: 0 },
-    { name: 'Shipping / Fulfillment',    monthly: 0, growth: 0 },
-  ],
-  'Operating Expenses': [
-    { name: 'Owner / Officer Salaries',  monthly: 0, growth: 0 },
-    { name: 'Employee Wages',            monthly: 0, growth: 0 },
-    { name: 'Payroll Taxes (~8%)',       monthly: 0, growth: 0 },
-    { name: 'Rent',                      monthly: 0, growth: 0 },
-    { name: 'Utilities',                 monthly: 0, growth: 0 },
-    { name: 'Insurance',                 monthly: 0, growth: 0 },
-    { name: 'Software / Subscriptions',  monthly: 0, growth: 0 },
-    { name: 'Advertising / Marketing',   monthly: 0, growth: 0 },
-    { name: 'Professional Fees',         monthly: 0, growth: 0 },
-    { name: 'Office Supplies',           monthly: 0, growth: 0 },
-    { name: 'Travel & Meals',            monthly: 0, growth: 0 },
-    { name: 'Bank & Card Fees',          monthly: 0, growth: 0 },
-    { name: 'Other Expenses',            monthly: 0, growth: 0 },
-  ],
-};
-
-const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
-function BudgetingTool() {
-  const [companyName, setCompanyName] = useState('');
-  const [budgetYear, setBudgetYear] = useState(new Date().getFullYear() + 1);
-  const [startMonth, setStartMonth] = useState(0); // 0 = Jan
-  const [industry, setIndustry] = useState('');
-  const [groups, setGroups] = useState(() => JSON.parse(JSON.stringify(BUDGET_CATEGORIES)));
-  const [loaded, setLoaded] = useState(false);
-  const [aiBusy, setAiBusy] = useState(false);
-  const [aiNote, setAiNote] = useState(null);
-  const [confirmResetOpen, setConfirmResetOpen] = useState(false);
-
-  // Persistence
-  useEffect(() => {
-    (async () => {
-      try {
-        const saved = await window.storage.get('budget:state');
-        if (saved && saved.value) {
-          const parsed = JSON.parse(saved.value);
-          if (parsed.companyName) setCompanyName(parsed.companyName);
-          if (parsed.budgetYear) setBudgetYear(parsed.budgetYear);
-          if (typeof parsed.startMonth === 'number') setStartMonth(parsed.startMonth);
-          if (parsed.industry) setIndustry(parsed.industry);
-          if (parsed.groups) setGroups(parsed.groups);
-        }
-      } catch {}
-      setLoaded(true);
-    })();
-  }, []);
-
-  useEffect(() => {
-    if (!loaded) return;
-    window.storage.set('budget:state', JSON.stringify({ companyName, budgetYear, startMonth, industry, groups })).catch(() => {});
-  }, [companyName, budgetYear, startMonth, industry, groups, loaded]);
-
-  // Compute monthly values for a row based on monthly base + growth %
-  const rowMonthly = (row, monthIdx) => {
-    const base = Number(row.monthly) || 0;
-    const growth = Number(row.growth) || 0;
-    // Apply growth % cumulatively per month from start
-    return base * Math.pow(1 + (growth / 100), monthIdx);
-  };
-
-  const rowAnnual = (row) => {
-    let sum = 0;
-    for (let m = 0; m < 12; m++) sum += rowMonthly(row, m);
-    return sum;
-  };
-
-  const groupTotal = (group, monthIdx) => {
-    return groups[group].reduce((s, r) => s + rowMonthly(r, monthIdx), 0);
-  };
-
-  const groupAnnual = (group) => {
-    return groups[group].reduce((s, r) => s + rowAnnual(r), 0);
-  };
-
-  // Derived rows
-  const revenueMonth = (m) => groupTotal('Revenue', m);
-  const cogsMonth = (m) => groupTotal('Cost of Goods Sold', m);
-  const opexMonth = (m) => groupTotal('Operating Expenses', m);
-  const grossProfitMonth = (m) => revenueMonth(m) - cogsMonth(m);
-  const netIncomeMonth = (m) => grossProfitMonth(m) - opexMonth(m);
-
-  const totalRevenue = groupAnnual('Revenue');
-  const totalCogs = groupAnnual('Cost of Goods Sold');
-  const totalOpex = groupAnnual('Operating Expenses');
-  const totalGross = totalRevenue - totalCogs;
-  const totalNet = totalGross - totalOpex;
-  const grossMargin = totalRevenue > 0 ? (totalGross / totalRevenue) * 100 : 0;
-  const netMargin = totalRevenue > 0 ? (totalNet / totalRevenue) * 100 : 0;
-
-  const updateRow = (group, idx, field, value) => {
-    setGroups(prev => {
-      const next = { ...prev };
-      next[group] = [...next[group]];
-      next[group][idx] = { ...next[group][idx], [field]: value };
-      return next;
-    });
-  };
-
-  const addRow = (group) => {
-    setGroups(prev => ({ ...prev, [group]: [...prev[group], { name: 'New Line Item', monthly: 0, growth: 0 }] }));
-  };
-
-  const removeRow = (group, idx) => {
-    setGroups(prev => ({ ...prev, [group]: prev[group].filter((_, i) => i !== idx) }));
-  };
-
-  // Confirmed via the in-app AccountModal (confirmResetOpen) — no native confirm().
-  const doResetBudget = () => {
-    setGroups(JSON.parse(JSON.stringify(BUDGET_CATEGORIES)));
-  };
-
-  // Month labels starting from `startMonth`
-  const monthLabel = (idx) => {
-    const m = (startMonth + idx) % 12;
-    const yearOffset = Math.floor((startMonth + idx) / 12);
-    return `${MONTHS_SHORT[m]} ${String(budgetYear + yearOffset).slice(-2)}`;
-  };
-
-  const fmt = (n) => {
-    if (!isFinite(n)) return '$0';
-    const abs = Math.abs(n);
-    if (abs >= 1000000) return `$${(n / 1000000).toFixed(2)}M`;
-    if (abs >= 10000) return `$${(n / 1000).toFixed(0)}K`;
-    return `$${n.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-  };
-
-  const fmtFull = (n) => `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-
-  // AI: suggest industry-specific categories
-  const suggestCategories = async () => {
-    if (!industry.trim()) {
-      setAiNote({ kind: 'error', text: 'Enter an industry first (e.g., "SaaS startup", "Restaurant", "E-commerce").' });
-      return;
-    }
-    setAiBusy(true);
-    setAiNote(null);
-    try {
-      const { text: rawText, data } = await callClaude({
-        max_tokens: 1500,
-        system: `You are a senior US bookkeeper building a 12-month operating budget for a small business client. Return a tight JSON object with industry-relevant line items grouped by Revenue, Cost of Goods Sold, and Operating Expenses. Include realistic monthly starting amounts (USD) for a typical small business in this industry — revenue around $30,000-80,000/month is a reasonable default. Output ONLY JSON, no preamble, no fences. Schema:
-
-{
-  "Revenue": [{ "name": "...", "monthly": <number>, "growth": <number 0-5> }],
-  "Cost of Goods Sold": [{ "name": "...", "monthly": <number>, "growth": <number 0-5> }],
-  "Operating Expenses": [{ "name": "...", "monthly": <number>, "growth": <number 0-5> }]
-}
-
-growth is monthly % growth (0-5). Most expense lines should be 0% growth. Revenue can have 1-2% growth. Include 2-3 revenue lines, 2-4 COGS lines if industry has COGS (otherwise empty array), and 10-14 opex lines covering typical bookkeeping categories.`,
-        messages: [{ role: 'user', content: `Industry: ${industry}\n\nGenerate the budget template JSON.` }],
-      }, { returnData: true });
-      if (data.stop_reason === 'max_tokens') throw new Error('Response truncated. Try a simpler industry name.');
-      const raw = rawText.trim();
-
-      let jsonStr = raw.replace(/```json|```/g, '').trim();
-      const first = jsonStr.indexOf('{');
-      const last = jsonStr.lastIndexOf('}');
-      if (first !== -1 && last !== -1) jsonStr = jsonStr.substring(first, last + 1);
-
-      const parsed = JSON.parse(jsonStr);
-      if (!parsed.Revenue || !parsed['Operating Expenses']) throw new Error('AI response malformed');
-
-      // Normalize
-      const normalized = {
-        Revenue: (parsed.Revenue || []).map(r => ({ name: r.name, monthly: Number(r.monthly) || 0, growth: Number(r.growth) || 0 })),
-        'Cost of Goods Sold': (parsed['Cost of Goods Sold'] || []).map(r => ({ name: r.name, monthly: Number(r.monthly) || 0, growth: Number(r.growth) || 0 })),
-        'Operating Expenses': (parsed['Operating Expenses'] || []).map(r => ({ name: r.name, monthly: Number(r.monthly) || 0, growth: Number(r.growth) || 0 })),
-      };
-      setGroups(normalized);
-      setAiNote({ kind: 'success', text: `Loaded ${normalized.Revenue.length + normalized['Cost of Goods Sold'].length + normalized['Operating Expenses'].length} categories for ${industry}.` });
-    } catch (err) {
-      console.error(err);
-      setAiNote({ kind: 'error', text: 'Could not generate categories — ' + (err.message || 'try again') });
-    }
-    setAiBusy(false);
-  };
-
-  // AI: review the budget for realism
-  const reviewBudget = async () => {
-    if (totalRevenue === 0) {
-      setAiNote({ kind: 'error', text: 'Enter at least some revenue amounts first.' });
-      return;
-    }
-    setAiBusy(true);
-    setAiNote(null);
-    try {
-      const summary = `Company: ${companyName || 'Sample Co'}
-Industry: ${industry || 'Not specified'}
-Year: ${budgetYear}
-
-Annual Revenue: ${fmtFull(totalRevenue)}
-Annual COGS: ${fmtFull(totalCogs)}  (${totalRevenue > 0 ? ((totalCogs/totalRevenue)*100).toFixed(1) : 0}% of revenue)
-Annual Operating Expenses: ${fmtFull(totalOpex)}  (${totalRevenue > 0 ? ((totalOpex/totalRevenue)*100).toFixed(1) : 0}% of revenue)
-Gross Profit: ${fmtFull(totalGross)}  (${grossMargin.toFixed(1)}% margin)
-Net Income: ${fmtFull(totalNet)}  (${netMargin.toFixed(1)}% margin)
-
-Top opex lines: ${groups['Operating Expenses'].sort((a,b) => rowAnnual(b)-rowAnnual(a)).slice(0,5).map(r => `${r.name} ${fmtFull(rowAnnual(r))}`).join('; ')}`;
-
-      const raw = (await callClaude({
-        max_tokens: 800,
-        system: 'You are a US CPA reviewing a small business budget. Give a brief, plain-English review (3-5 sentences) covering: (1) whether margins look realistic for the industry, (2) any line items that seem too high or low, (3) one concrete suggestion to improve. Be specific. No preamble.',
-        messages: [{ role: 'user', content: summary }],
-      })).trim();
-      setAiNote({ kind: 'review', text: raw });
-    } catch (err) {
-      setAiNote({ kind: 'error', text: 'Review failed — ' + (err.message || 'try again') });
-    }
-    setAiBusy(false);
-  };
-
-  // Export to CSV
-  const exportCSV = () => {
-    const header = ['Category', 'Line Item', 'Monthly Base ($)', 'Monthly Growth (%)', ...Array.from({ length: 12 }, (_, i) => monthLabel(i)), 'Annual Total'];
-    const rows = [header];
-
-    ['Revenue', 'Cost of Goods Sold', 'Operating Expenses'].forEach(group => {
-      groups[group].forEach(r => {
-        const months = Array.from({ length: 12 }, (_, i) => rowMonthly(r, i).toFixed(2));
-        rows.push([group, r.name, r.monthly, r.growth, ...months, rowAnnual(r).toFixed(2)]);
-      });
-      // Subtotal row
-      rows.push(['', `Total ${group}`, '', '',
-        ...Array.from({ length: 12 }, (_, i) => groupTotal(group, i).toFixed(2)),
-        groupAnnual(group).toFixed(2)]);
-    });
-
-    // Derived rows
-    rows.push(['', 'Gross Profit', '', '',
-      ...Array.from({ length: 12 }, (_, i) => grossProfitMonth(i).toFixed(2)),
-      totalGross.toFixed(2)]);
-    rows.push(['', 'Net Income', '', '',
-      ...Array.from({ length: 12 }, (_, i) => netIncomeMonth(i).toFixed(2)),
-      totalNet.toFixed(2)]);
-
-    const csv = rows.map(row => row.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
-    downloadFile(csv, `Budget_${(companyName || 'client').replace(/[^a-z0-9]/gi, '_')}_${budgetYear}.csv`, 'text/csv');
-  };
-
-  // Export to Word
-  const exportWord = () => {
-    const safeStr = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    let html = `<!DOCTYPE html><html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'><head><meta charset='utf-8'><title>Budget ${budgetYear}</title>
-<style>
-body { font-family: Calibri, Arial, sans-serif; color: #1f2937; }
-h1 { color: #0A1E3F; font-size: 22pt; margin: 0; }
-.subtitle { color: #64748b; font-size: 11pt; }
-.summary { background: #F0F9FF; border-left: 4px solid #0A84FF; padding: 12pt; margin: 14pt 0; }
-.kpi { display: inline-block; margin-right: 24pt; }
-.kpi .label { font-size: 9pt; text-transform: uppercase; color: #64748b; letter-spacing: 1pt; }
-.kpi .value { font-size: 18pt; font-weight: 700; color: #0A1E3F; }
-table { width: 100%; border-collapse: collapse; margin-top: 12pt; font-size: 9pt; }
-th { background: #0A1E3F; color: white; padding: 6pt 4pt; text-align: right; font-weight: 600; }
-th:first-child, th:nth-child(2) { text-align: left; }
-td { padding: 4pt; border-bottom: 1px solid #e2e8f0; text-align: right; }
-td:first-child, td:nth-child(2) { text-align: left; }
-tr.group { background: #EAF4FF; font-weight: 700; }
-tr.derived { background: #F0F9FF; font-weight: 700; border-top: 2px solid #0A84FF; }
-.footer { color: #64748b; font-size: 9pt; margin-top: 18pt; padding-top: 8pt; border-top: 1px solid #e2e8f0; }
-</style></head><body>
-
-<h1>${safeStr(companyName || 'Operating Budget')}</h1>
-<div class="subtitle">${safeStr(industry || 'Annual Operating Budget')} · ${budgetYear} · Prepared ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}</div>
-
-<div class="summary">
-  <div class="kpi"><div class="label">Annual Revenue</div><div class="value">${fmtFull(totalRevenue)}</div></div>
-  <div class="kpi"><div class="label">Gross Margin</div><div class="value">${grossMargin.toFixed(1)}%</div></div>
-  <div class="kpi"><div class="label">Net Income</div><div class="value">${fmtFull(totalNet)}</div></div>
-  <div class="kpi"><div class="label">Net Margin</div><div class="value">${netMargin.toFixed(1)}%</div></div>
-</div>
-
-<table>
-<thead>
-<tr>
-  <th>Category</th><th>Line Item</th>
-  ${Array.from({ length: 12 }, (_, i) => `<th>${monthLabel(i)}</th>`).join('')}
-  <th>Annual</th>
-</tr>
-</thead>
-<tbody>`;
-
-    ['Revenue', 'Cost of Goods Sold', 'Operating Expenses'].forEach(group => {
-      groups[group].forEach(r => {
-        html += `<tr><td>${safeStr(group)}</td><td>${safeStr(r.name)}</td>`;
-        for (let m = 0; m < 12; m++) html += `<td>${fmt(rowMonthly(r, m))}</td>`;
-        html += `<td><strong>${fmt(rowAnnual(r))}</strong></td></tr>`;
-      });
-      html += `<tr class="group"><td></td><td>Total ${safeStr(group)}</td>`;
-      for (let m = 0; m < 12; m++) html += `<td>${fmt(groupTotal(group, m))}</td>`;
-      html += `<td>${fmt(groupAnnual(group))}</td></tr>`;
-    });
-
-    html += `<tr class="derived"><td></td><td>Gross Profit</td>`;
-    for (let m = 0; m < 12; m++) html += `<td>${fmt(grossProfitMonth(m))}</td>`;
-    html += `<td>${fmt(totalGross)}</td></tr>`;
-    html += `<tr class="derived"><td></td><td>Net Income</td>`;
-    for (let m = 0; m < 12; m++) html += `<td>${fmt(netIncomeMonth(m))}</td>`;
-    html += `<td>${fmt(totalNet)}</td></tr>`;
-
-    html += `</tbody></table>
-<div class="footer">Generated by Get Hired With Alex · US Bookkeeper Toolkit</div>
-</body></html>`;
-
-    downloadFile(html, `Budget_${(companyName || 'client').replace(/[^a-z0-9]/gi, '_')}_${budgetYear}.doc`, 'application/msword');
-  };
-
-  return (
-    <div>
-      <SectionHead eyebrow="Tool" title="Budgeting Tool" desc="Build a 12-month operating budget for any client. AI suggests industry-specific categories. Per-line monthly growth. Real-time gross & net margin tracking. Export to CSV or Word." />
-
-      {/* Setup card */}
-      <div className="glass-card p-5 mt-4 grid grid-cols-1 md:grid-cols-4 gap-3">
-        <div>
-          <label className="gh-label block mb-1">Client / Company</label>
-          <input className="gh-input w-full" placeholder="Acme LLC" value={companyName} onChange={e => setCompanyName(e.target.value)} />
-        </div>
-        <div>
-          <label className="gh-label block mb-1">Budget Year</label>
-          <input type="number" className="gh-input w-full" value={budgetYear} onChange={e => setBudgetYear(parseInt(e.target.value) || new Date().getFullYear())} />
-        </div>
-        <div>
-          <label className="gh-label block mb-1">Start Month</label>
-          <select className="gh-input w-full" value={startMonth} onChange={e => setStartMonth(parseInt(e.target.value))}>
-            {MONTHS_SHORT.map((m, i) => <option key={i} value={i}>{m}</option>)}
-          </select>
-        </div>
-        <div>
-          <label className="gh-label block mb-1">Industry (for AI)</label>
-          <input className="gh-input w-full" placeholder="SaaS · Restaurant · E-commerce" value={industry} onChange={e => setIndustry(e.target.value)} />
-        </div>
-      </div>
-
-      {/* AI actions + reset */}
-      <div className="flex flex-wrap gap-2 mt-3 items-center">
-        <button onClick={suggestCategories} disabled={aiBusy} className="gh-btn-ghost flex items-center gap-1.5 text-xs font-semibold">
-          {aiBusy ? <><Loader2 size={14} className="animate-spin" /> Generating...</> : <><Sparkles size={13} /> Suggest categories for my industry</>}
-        </button>
-        <button onClick={reviewBudget} disabled={aiBusy} className="gh-btn-ghost flex items-center gap-1.5 text-xs font-semibold">
-          {aiBusy ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={13} />} AI review my budget
-        </button>
-        <div className="flex-1" />
-        <button onClick={exportCSV} className="gh-btn-ghost flex items-center gap-1.5 text-xs font-semibold"><Download size={13} /> Export CSV</button>
-        <button onClick={exportWord} className="sheen-btn px-4 py-2 text-xs font-semibold flex items-center gap-1.5"><Download size={13} /> Export Word</button>
-        <button onClick={() => setConfirmResetOpen(true)} className="gh-btn-ghost flex items-center gap-1.5 text-xs font-semibold" style={{ color: C.red }}>Reset</button>
-      </div>
-
-      {/* AI note */}
-      {aiNote && (
-        <div className="mt-3 p-3 rounded-xl text-sm" style={{
-          background: aiNote.kind === 'error' ? 'rgba(208,35,35,0.06)' : 'rgba(10,132,255,0.06)',
-          border: `1px solid ${aiNote.kind === 'error' ? 'rgba(208,35,35,0.2)' : 'rgba(10,132,255,0.18)'}`,
-          color: C.text,
-        }}>
-          <div className="flex gap-2 items-start">
-            <div className="font-semibold flex-shrink-0" style={{ color: aiNote.kind === 'error' ? C.red : C.primary }}>
-              {aiNote.kind === 'review' ? 'CPA Review:' : aiNote.kind === 'error' ? 'Error:' : 'Done:'}
-            </div>
-            <div className="flex-1 whitespace-pre-wrap leading-relaxed">{aiNote.text}</div>
-            <button onClick={() => setAiNote(null)} className="text-xs opacity-50 hover:opacity-100">✕</button>
-          </div>
-        </div>
-      )}
-
-      {/* KPI strip */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-5">
-        {[
-          { label: 'Annual Revenue', value: fmt(totalRevenue), accent: C.primary },
-          { label: 'Gross Margin', value: `${grossMargin.toFixed(1)}%`, accent: grossMargin >= 40 ? C.green : grossMargin >= 20 ? C.amber : C.red },
-          { label: 'Net Income', value: fmt(totalNet), accent: totalNet >= 0 ? C.green : C.red },
-          { label: 'Net Margin', value: `${netMargin.toFixed(1)}%`, accent: netMargin >= 15 ? C.green : netMargin >= 5 ? C.amber : C.red },
-        ].map(k => (
-          <div key={k.label} className="glass-card p-4">
-            <div className="gh-label" style={{ color: C.textMute, fontSize: 10 }}>{k.label}</div>
-            <div className="gh-bignum mt-1" style={{ fontSize: 26, color: k.accent }}>{k.value}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* Budget table */}
-      <div className="glass-card p-0 mt-5 overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-xs" style={{ fontFamily: fontMono }}>
-            <thead style={{ background: 'rgba(10,132,255,0.06)', borderBottom: `1px solid ${GLASS.borderSoft}` }}>
-              <tr>
-                <th className="text-left px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-bg)', minWidth: 220, color: C.textSoft, fontWeight: 600 }}>Line Item</th>
-                <th className="px-2 py-2" style={{ minWidth: 90, color: C.textSoft, fontWeight: 600 }}>Monthly Base</th>
-                <th className="px-2 py-2" style={{ minWidth: 70, color: C.textSoft, fontWeight: 600 }}>Growth %</th>
-                {Array.from({ length: 12 }, (_, i) => (
-                  <th key={i} className="px-2 py-2 text-right" style={{ minWidth: 70, color: C.textSoft, fontWeight: 600 }}>{monthLabel(i)}</th>
-                ))}
-                <th className="px-2 py-2 text-right" style={{ minWidth: 90, color: C.text, fontWeight: 700 }}>Annual</th>
-              </tr>
-            </thead>
-            <tbody>
-              {['Revenue', 'Cost of Goods Sold', 'Operating Expenses'].map(group => (
-                <React.Fragment key={group}>
-                  {/* Group header row */}
-                  <tr style={{ background: 'rgba(10,132,255,0.04)' }}>
-                    <td colSpan={15} className="px-3 py-2">
-                      <div className="flex items-center justify-between">
-                        <span className="gh-label" style={{ color: C.primary, fontSize: 11 }}>{group}</span>
-                        <button onClick={() => addRow(group)} className="text-[10px] font-semibold px-2 py-0.5 rounded-md" style={{ background: 'rgba(10,132,255,0.10)', color: C.primary }}>+ Add line</button>
-                      </div>
-                    </td>
-                  </tr>
-                  {/* Row entries */}
-                  {groups[group].map((r, idx) => (
-                    <tr key={idx} className="hover:bg-blue-50/30">
-                      <td className="px-3 py-1.5 sticky left-0 z-10" style={{ background: 'var(--table-sticky-bg)' }}>
-                        <div className="flex items-center gap-2">
-                          <input className="flex-1 bg-transparent outline-none border-b border-transparent focus:border-blue-300 text-xs" style={{ fontFamily: fontBody, color: C.text }}
-                            value={r.name} onChange={e => updateRow(group, idx, 'name', e.target.value)} />
-                          <button onClick={() => removeRow(group, idx)} className="text-[10px] opacity-30 hover:opacity-100 hover:text-red-500">✕</button>
-                        </div>
-                      </td>
-                      <td className="px-2 py-1.5">
-                        <input type="number" className="w-full bg-transparent outline-none border-b border-transparent focus:border-blue-300 text-right text-xs gh-tnum" style={{ color: C.text }}
-                          value={r.monthly} onChange={e => updateRow(group, idx, 'monthly', parseFloat(e.target.value) || 0)} />
-                      </td>
-                      <td className="px-2 py-1.5">
-                        <input type="number" step="0.1" className="w-full bg-transparent outline-none border-b border-transparent focus:border-blue-300 text-right text-xs gh-tnum" style={{ color: C.textSoft }}
-                          value={r.growth} onChange={e => updateRow(group, idx, 'growth', parseFloat(e.target.value) || 0)} />
-                      </td>
-                      {Array.from({ length: 12 }, (_, m) => (
-                        <td key={m} className="px-2 py-1.5 text-right gh-tnum" style={{ color: C.textSoft }}>{fmt(rowMonthly(r, m))}</td>
-                      ))}
-                      <td className="px-2 py-1.5 text-right gh-tnum font-semibold" style={{ color: C.text }}>{fmt(rowAnnual(r))}</td>
-                    </tr>
-                  ))}
-                  {/* Group subtotal */}
-                  <tr style={{ background: 'rgba(10,132,255,0.04)', fontWeight: 600 }}>
-                    <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-soft-bg)', color: C.text }}>Total {group}</td>
-                    <td colSpan={2}></td>
-                    {Array.from({ length: 12 }, (_, m) => (
-                      <td key={m} className="px-2 py-2 text-right gh-tnum" style={{ color: C.text }}>{fmt(groupTotal(group, m))}</td>
-                    ))}
-                    <td className="px-2 py-2 text-right gh-tnum" style={{ color: C.primary, fontWeight: 700 }}>{fmt(groupAnnual(group))}</td>
-                  </tr>
-                </React.Fragment>
-              ))}
-              {/* Derived: Gross Profit */}
-              <tr style={{ background: 'rgba(40,166,71,0.06)', borderTop: `2px solid ${C.primary}` }}>
-                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-ok-bg)', color: C.text, fontWeight: 700 }}>Gross Profit</td>
-                <td colSpan={2}></td>
-                {Array.from({ length: 12 }, (_, m) => (
-                  <td key={m} className="px-2 py-2 text-right gh-tnum font-semibold" style={{ color: grossProfitMonth(m) >= 0 ? C.green : C.red }}>{fmt(grossProfitMonth(m))}</td>
-                ))}
-                <td className="px-2 py-2 text-right gh-tnum font-bold" style={{ color: totalGross >= 0 ? C.green : C.red }}>{fmt(totalGross)}</td>
-              </tr>
-              {/* Derived: Net Income */}
-              <tr style={{ background: 'rgba(10,132,255,0.06)' }}>
-                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-soft-bg)', color: C.text, fontWeight: 700 }}>Net Income</td>
-                <td colSpan={2}></td>
-                {Array.from({ length: 12 }, (_, m) => (
-                  <td key={m} className="px-2 py-2 text-right gh-tnum font-semibold" style={{ color: netIncomeMonth(m) >= 0 ? C.green : C.red }}>{fmt(netIncomeMonth(m))}</td>
-                ))}
-                <td className="px-2 py-2 text-right gh-tnum font-bold" style={{ color: totalNet >= 0 ? C.green : C.red }}>{fmt(totalNet)}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <div className="text-xs mt-3 px-1" style={{ color: C.textMute }}>
-        Tip: "Growth %" applies monthly compound growth from the base amount. Use 2-5% for growing revenue lines, 0% for fixed expenses. Your work auto-saves as you type.
-      </div>
-
-      {confirmResetOpen && (
-        <AccountModal title="Reset entire budget?" subtitle="All categories and amounts go back to the blank starting template."
-          icon={AlertTriangle} tone="danger" maxW="max-w-sm" onClose={() => setConfirmResetOpen(false)}>
-          <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>This cannot be undone.</p>
-          <div className="mt-4 flex justify-end gap-2.5">
-            <button onClick={() => setConfirmResetOpen(false)} className="gh-btn-ghost text-sm font-semibold px-4 py-2">Cancel</button>
-            <button onClick={() => { doResetBudget(); setConfirmResetOpen(false); }}
-              className="px-4 py-2 rounded-xl text-sm font-bold text-white transition hover:opacity-95"
-              style={{ background: 'linear-gradient(180deg, var(--red-hi), var(--c-red))', boxShadow: '0 4px 12px -3px var(--red-glow)' }}>
-              Reset budget
-            </button>
-          </div>
-        </AccountModal>
-      )}
-    </div>
-  );
-}
-
-
-
-// ═══════════════════════════════════════════════════════════════════
-// COMPONENT: FORECASTING TOOL (Daily & Month-End)
-// 13-week rolling cash flow forecast — the gold-standard CFO deliverable.
-// Persists to localStorage. Cash crunch alerts. Export to CSV + Word.
-// ═══════════════════════════════════════════════════════════════════
-
-const FORECAST_DEFAULTS = {
-  inflows: [
-    { name: 'A/R Collections (Customer Invoices)', weekly: 0, type: 'inflow' },
-    { name: 'New Sales / Cash Receipts',           weekly: 0, type: 'inflow' },
-    { name: 'Other Inflows',                       weekly: 0, type: 'inflow' },
-  ],
-  outflows: [
-    { name: 'Payroll',                             weekly: 0, type: 'outflow', cadence: 2 },     // biweekly
-    { name: 'A/P Vendor Payments',                 weekly: 0, type: 'outflow', cadence: 1 },
-    { name: 'Rent / Lease',                        weekly: 0, type: 'outflow', cadence: 4 },     // monthly
-    { name: 'Insurance',                           weekly: 0, type: 'outflow', cadence: 4 },
-    { name: 'Software / Subscriptions',            weekly: 0, type: 'outflow', cadence: 4 },
-    { name: 'Loan / Debt Service',                 weekly: 0, type: 'outflow', cadence: 4 },
-    { name: 'Estimated Tax Payments',              weekly: 0, type: 'outflow', cadence: 13 },    // quarterly
-    { name: 'Other Outflows',                      weekly: 0, type: 'outflow', cadence: 1 },
-  ],
-};
-
-function ForecastingTool() {
-  const [companyName, setCompanyName] = useState('');
-  const [startDate, setStartDate] = useState(() => {
-    const d = new Date();
-    // Snap to next Monday
-    const dayOfWeek = d.getDay();
-    const daysUntilMonday = dayOfWeek === 0 ? 1 : dayOfWeek === 1 ? 0 : 8 - dayOfWeek;
-    d.setDate(d.getDate() + daysUntilMonday);
-    return d.toISOString().slice(0, 10);
-  });
-  const [openingCash, setOpeningCash] = useState(0);
-  const [minReserve, setMinReserve] = useState(10000);
-  const [inflows, setInflows] = useState(FORECAST_DEFAULTS.inflows);
-  const [outflows, setOutflows] = useState(FORECAST_DEFAULTS.outflows);
-  const [loaded, setLoaded] = useState(false);
-  const [aiBusy, setAiBusy] = useState(false);
-  const [aiNote, setAiNote] = useState(null);
-
-  // Persistence
-  useEffect(() => {
-    (async () => {
-      try {
-        const saved = await window.storage.get('forecast:state');
-        if (saved && saved.value) {
-          const parsed = JSON.parse(saved.value);
-          if (parsed.companyName) setCompanyName(parsed.companyName);
-          if (parsed.startDate) setStartDate(parsed.startDate);
-          if (typeof parsed.openingCash === 'number') setOpeningCash(parsed.openingCash);
-          if (typeof parsed.minReserve === 'number') setMinReserve(parsed.minReserve);
-          if (parsed.inflows) setInflows(parsed.inflows);
-          if (parsed.outflows) setOutflows(parsed.outflows);
-        }
-      } catch {}
-      setLoaded(true);
-    })();
-  }, []);
-
-  useEffect(() => {
-    if (!loaded) return;
-    window.storage.set('forecast:state', JSON.stringify({
-      companyName, startDate, openingCash, minReserve, inflows, outflows
-    })).catch(() => {});
-  }, [companyName, startDate, openingCash, minReserve, inflows, outflows, loaded]);
-
-  const NUM_WEEKS = 13;
-
-  // Compute a row's amount for week w based on weekly base + cadence
-  // cadence 1 = every week, 2 = every 2 weeks, 4 = every 4 weeks, 13 = quarterly
-  const rowAtWeek = (row, w) => {
-    const base = Number(row.weekly) || 0;
-    const cad = Number(row.cadence) || 1;
-    return (w % cad === 0) ? base : 0;
-  };
-
-  const weekLabel = (w) => {
-    const d = new Date(startDate);
-    d.setDate(d.getDate() + w * 7);
-    return `${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
-  };
-
-  // Per-week aggregates
-  const inflowTotal = (w) => inflows.reduce((s, r) => s + rowAtWeek(r, w), 0);
-  const outflowTotal = (w) => outflows.reduce((s, r) => s + rowAtWeek(r, w), 0);
-  const netCash = (w) => inflowTotal(w) - outflowTotal(w);
-
-  // Running cash balance
-  const cashAtWeek = (w) => {
-    let bal = Number(openingCash) || 0;
-    for (let i = 0; i <= w; i++) bal += netCash(i);
-    return bal;
-  };
-
-  // Crunch detection
-  const crunchWeeks = [];
-  for (let w = 0; w < NUM_WEEKS; w++) {
-    const bal = cashAtWeek(w);
-    if (bal < (Number(minReserve) || 0)) {
-      crunchWeeks.push({ week: w, balance: bal });
-    }
-  }
-
-  const totalInflows = Array.from({ length: NUM_WEEKS }, (_, w) => inflowTotal(w)).reduce((a, b) => a + b, 0);
-  const totalOutflows = Array.from({ length: NUM_WEEKS }, (_, w) => outflowTotal(w)).reduce((a, b) => a + b, 0);
-  const endingCash = cashAtWeek(NUM_WEEKS - 1);
-  const minCash = Array.from({ length: NUM_WEEKS }, (_, w) => cashAtWeek(w)).reduce((a, b) => Math.min(a, b), openingCash);
-
-  const updateRow = (kind, idx, field, value) => {
-    if (kind === 'inflow') {
-      setInflows(prev => { const next = [...prev]; next[idx] = { ...next[idx], [field]: value }; return next; });
-    } else {
-      setOutflows(prev => { const next = [...prev]; next[idx] = { ...next[idx], [field]: value }; return next; });
-    }
-  };
-  const addRow = (kind) => {
-    if (kind === 'inflow') setInflows(prev => [...prev, { name: 'New Inflow', weekly: 0, type: 'inflow', cadence: 1 }]);
-    else setOutflows(prev => [...prev, { name: 'New Outflow', weekly: 0, type: 'outflow', cadence: 1 }]);
-  };
-  const removeRow = (kind, idx) => {
-    if (kind === 'inflow') setInflows(prev => prev.filter((_, i) => i !== idx));
-    else setOutflows(prev => prev.filter((_, i) => i !== idx));
-  };
-
-  const fmt = (n) => {
-    if (!isFinite(n)) return '$0';
-    return `$${Number(n).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-  };
-  const fmtFull = (n) => `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-
-  // AI: review the forecast
-  const reviewForecast = async () => {
-    setAiBusy(true);
-    setAiNote(null);
-    try {
-      const summary = `Company: ${companyName || 'Sample Co'}
-Forecast period: ${startDate} for 13 weeks
-
-Opening cash: ${fmtFull(openingCash)}
-Minimum reserve: ${fmtFull(minReserve)}
-
-13-week totals:
-  Total inflows: ${fmtFull(totalInflows)}
-  Total outflows: ${fmtFull(totalOutflows)}
-  Net cash change: ${fmtFull(totalInflows - totalOutflows)}
-  Ending cash: ${fmtFull(endingCash)}
-  Lowest cash balance during period: ${fmtFull(minCash)}
-
-Cash crunch weeks (below reserve): ${crunchWeeks.length > 0 ? crunchWeeks.map(c => `Week ${c.week + 1} (${fmtFull(c.balance)})`).join(', ') : 'None'}
-
-Top inflows: ${inflows.sort((a,b)=>(b.weekly||0)-(a.weekly||0)).slice(0,3).map(r=>`${r.name} ${fmtFull(r.weekly)}/wk`).join('; ')}
-Top outflows: ${outflows.sort((a,b)=>(b.weekly||0)-(a.weekly||0)).slice(0,3).map(r=>`${r.name} ${fmtFull(r.weekly)}/${r.cadence === 1 ? 'wk' : r.cadence + 'wks'}`).join('; ')}`;
-
-      const raw = (await callClaude({
-        max_tokens: 900,
-        system: `You are a US CPA / fractional CFO reviewing a 13-week cash flow forecast for a small business client. Give a brief, plain-English review (4-6 sentences) that covers: (1) the cash position trajectory, (2) whether the cash crunch weeks are real risks or just timing, (3) one concrete operational action the owner should take this week, and (4) one strategic action for next 30-60 days. Be direct and specific. No preamble.`,
-        messages: [{ role: 'user', content: summary }],
-      })).trim();
-      setAiNote({ kind: 'review', text: raw });
-    } catch (err) {
-      setAiNote({ kind: 'error', text: 'Review failed — ' + (err.message || 'try again') });
-    }
-    setAiBusy(false);
-  };
-
-  const exportCSV = () => {
-    const header = ['Type', 'Line Item', 'Weekly Base', 'Cadence (weeks)', ...Array.from({ length: NUM_WEEKS }, (_, i) => `W${i+1} ${weekLabel(i)}`), 'Total'];
-    const rows = [header];
-
-    inflows.forEach(r => {
-      const wk = Array.from({ length: NUM_WEEKS }, (_, i) => rowAtWeek(r, i).toFixed(2));
-      const total = wk.reduce((a, b) => a + Number(b), 0).toFixed(2);
-      rows.push(['Inflow', r.name, r.weekly, r.cadence || 1, ...wk, total]);
-    });
-    rows.push(['', 'Total Inflows', '', '',
-      ...Array.from({ length: NUM_WEEKS }, (_, i) => inflowTotal(i).toFixed(2)),
-      totalInflows.toFixed(2)]);
-
-    outflows.forEach(r => {
-      const wk = Array.from({ length: NUM_WEEKS }, (_, i) => rowAtWeek(r, i).toFixed(2));
-      const total = wk.reduce((a, b) => a + Number(b), 0).toFixed(2);
-      rows.push(['Outflow', r.name, r.weekly, r.cadence || 1, ...wk, total]);
-    });
-    rows.push(['', 'Total Outflows', '', '',
-      ...Array.from({ length: NUM_WEEKS }, (_, i) => outflowTotal(i).toFixed(2)),
-      totalOutflows.toFixed(2)]);
-
-    rows.push(['', 'Net Cash Flow', '', '',
-      ...Array.from({ length: NUM_WEEKS }, (_, i) => netCash(i).toFixed(2)),
-      (totalInflows - totalOutflows).toFixed(2)]);
-    rows.push(['', 'Ending Cash Balance', '', '',
-      ...Array.from({ length: NUM_WEEKS }, (_, i) => cashAtWeek(i).toFixed(2)),
-      endingCash.toFixed(2)]);
-
-    const csv = rows.map(row => row.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
-    downloadFile(csv, `CashFlowForecast_${(companyName || 'client').replace(/[^a-z0-9]/gi, '_')}_${startDate}.csv`, 'text/csv');
-  };
-
-  const exportWord = () => {
-    const safeStr = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    let html = `<!DOCTYPE html><html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'><head><meta charset='utf-8'><title>13-Week Cash Flow Forecast</title>
-<style>
-body { font-family: Calibri, Arial, sans-serif; color: #1f2937; }
-h1 { color: #0A1E3F; font-size: 22pt; margin: 0; }
-.subtitle { color: #64748b; font-size: 11pt; }
-.summary { background: #F0F9FF; border-left: 4px solid #0A84FF; padding: 12pt; margin: 14pt 0; }
-.alert { background: #FEF2F2; border-left: 4px solid #D02323; padding: 12pt; margin: 14pt 0; }
-.kpi { display: inline-block; margin-right: 24pt; }
-.kpi .label { font-size: 9pt; text-transform: uppercase; color: #64748b; letter-spacing: 1pt; }
-.kpi .value { font-size: 18pt; font-weight: 700; color: #0A1E3F; }
-table { width: 100%; border-collapse: collapse; margin-top: 12pt; font-size: 9pt; }
-th { background: #0A1E3F; color: white; padding: 6pt 4pt; text-align: right; font-weight: 600; }
-th:first-child, th:nth-child(2) { text-align: left; }
-td { padding: 4pt; border-bottom: 1px solid #e2e8f0; text-align: right; }
-td:first-child, td:nth-child(2) { text-align: left; }
-tr.section { background: #EAF4FF; font-weight: 700; }
-tr.derived { background: #F0F9FF; font-weight: 700; border-top: 2px solid #0A84FF; }
-tr.cash { background: #E0F2FE; font-weight: 700; }
-.crunch { color: #D02323; font-weight: 700; }
-.footer { color: #64748b; font-size: 9pt; margin-top: 18pt; padding-top: 8pt; border-top: 1px solid #e2e8f0; }
-</style></head><body>
-
-<h1>${safeStr(companyName || '13-Week Cash Flow Forecast')}</h1>
-<div class="subtitle">13-Week Rolling Forecast · Starting ${startDate} · Prepared ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}</div>
-
-<div class="summary">
-  <div class="kpi"><div class="label">Opening Cash</div><div class="value">${fmtFull(openingCash)}</div></div>
-  <div class="kpi"><div class="label">Ending Cash</div><div class="value">${fmtFull(endingCash)}</div></div>
-  <div class="kpi"><div class="label">Net Change</div><div class="value">${fmtFull(totalInflows - totalOutflows)}</div></div>
-  <div class="kpi"><div class="label">Lowest Balance</div><div class="value">${fmtFull(minCash)}</div></div>
-</div>
-
-${crunchWeeks.length > 0 ? `<div class="alert"><strong>⚠ Cash Crunch Warning:</strong> Forecast shows ${crunchWeeks.length} week(s) where cash dips below the ${fmtFull(minReserve)} minimum reserve. Action needed: accelerate A/R collections, delay non-critical A/P, or arrange a credit facility.</div>` : ''}
-
-<table>
-<thead>
-<tr>
-  <th>Type</th><th>Line Item</th>
-  ${Array.from({ length: NUM_WEEKS }, (_, i) => `<th>W${i+1}<br/>${weekLabel(i)}</th>`).join('')}
-  <th>Total</th>
-</tr>
-</thead>
-<tbody>
-
-<tr class="section"><td colspan="${NUM_WEEKS + 3}">Cash Inflows</td></tr>`;
-
-    inflows.forEach(r => {
-      html += `<tr><td>Inflow</td><td>${safeStr(r.name)}</td>`;
-      for (let w = 0; w < NUM_WEEKS; w++) html += `<td>${fmt(rowAtWeek(r, w))}</td>`;
-      const tot = Array.from({ length: NUM_WEEKS }, (_, i) => rowAtWeek(r, i)).reduce((a, b) => a + b, 0);
-      html += `<td><strong>${fmt(tot)}</strong></td></tr>`;
-    });
-    html += `<tr class="derived"><td></td><td>Total Inflows</td>`;
-    for (let w = 0; w < NUM_WEEKS; w++) html += `<td>${fmt(inflowTotal(w))}</td>`;
-    html += `<td>${fmt(totalInflows)}</td></tr>`;
-
-    html += `<tr class="section"><td colspan="${NUM_WEEKS + 3}">Cash Outflows</td></tr>`;
-    outflows.forEach(r => {
-      html += `<tr><td>Outflow</td><td>${safeStr(r.name)}</td>`;
-      for (let w = 0; w < NUM_WEEKS; w++) html += `<td>${fmt(rowAtWeek(r, w))}</td>`;
-      const tot = Array.from({ length: NUM_WEEKS }, (_, i) => rowAtWeek(r, i)).reduce((a, b) => a + b, 0);
-      html += `<td><strong>${fmt(tot)}</strong></td></tr>`;
-    });
-    html += `<tr class="derived"><td></td><td>Total Outflows</td>`;
-    for (let w = 0; w < NUM_WEEKS; w++) html += `<td>${fmt(outflowTotal(w))}</td>`;
-    html += `<td>${fmt(totalOutflows)}</td></tr>`;
-
-    html += `<tr class="derived"><td></td><td>Net Cash Flow</td>`;
-    for (let w = 0; w < NUM_WEEKS; w++) html += `<td>${fmt(netCash(w))}</td>`;
-    html += `<td>${fmt(totalInflows - totalOutflows)}</td></tr>`;
-
-    html += `<tr class="cash"><td></td><td>Ending Cash Balance</td>`;
-    for (let w = 0; w < NUM_WEEKS; w++) {
-      const bal = cashAtWeek(w);
-      const isCrunch = bal < (Number(minReserve) || 0);
-      html += `<td${isCrunch ? ' class="crunch"' : ''}>${fmt(bal)}</td>`;
-    }
-    html += `<td>${fmt(endingCash)}</td></tr>`;
-
-    html += `</tbody></table>
-<div class="footer">Generated by Get Hired With Alex · US Bookkeeper Toolkit · Cash crunch weeks highlighted in red.</div>
-</body></html>`;
-
-    downloadFile(html, `CashFlowForecast_${(companyName || 'client').replace(/[^a-z0-9]/gi, '_')}_${startDate}.doc`, 'application/msword');
-  };
-
-  // Row component
-  const RowEditor = ({ kind, row, idx }) => {
-    const list = kind === 'inflow' ? inflows : outflows;
-    return (
-      <tr className="hover:bg-blue-50/30">
-        <td className="px-3 py-1.5 sticky left-0 z-10" style={{ background: 'var(--table-sticky-bg)' }}>
-          <div className="flex items-center gap-2">
-            <input className="flex-1 bg-transparent outline-none border-b border-transparent focus:border-blue-300 text-xs" style={{ fontFamily: fontBody, color: C.text }}
-              value={row.name} onChange={e => updateRow(kind, idx, 'name', e.target.value)} />
-            <button onClick={() => removeRow(kind, idx)} className="text-[10px] opacity-30 hover:opacity-100 hover:text-red-500">✕</button>
-          </div>
-        </td>
-        <td className="px-2 py-1.5">
-          <input type="number" className="w-full bg-transparent outline-none border-b border-transparent focus:border-blue-300 text-right text-xs gh-tnum" style={{ color: C.text }}
-            value={row.weekly} onChange={e => updateRow(kind, idx, 'weekly', parseFloat(e.target.value) || 0)} />
-        </td>
-        <td className="px-2 py-1.5">
-          <select className="w-full bg-transparent outline-none text-right text-xs gh-tnum" style={{ color: C.textSoft }}
-            value={row.cadence || 1} onChange={e => updateRow(kind, idx, 'cadence', parseInt(e.target.value))}>
-            <option value={1}>Weekly</option>
-            <option value={2}>Biweekly</option>
-            <option value={4}>Monthly</option>
-            <option value={13}>Quarterly</option>
-          </select>
-        </td>
-        {Array.from({ length: NUM_WEEKS }, (_, w) => (
-          <td key={w} className="px-2 py-1.5 text-right gh-tnum" style={{ color: rowAtWeek(row, w) > 0 ? C.textSoft : C.textMute }}>
-            {rowAtWeek(row, w) > 0 ? fmt(rowAtWeek(row, w)) : '—'}
-          </td>
-        ))}
-        <td className="px-2 py-1.5 text-right gh-tnum font-semibold" style={{ color: C.text }}>
-          {fmt(Array.from({ length: NUM_WEEKS }, (_, i) => rowAtWeek(row, i)).reduce((a, b) => a + b, 0))}
-        </td>
-      </tr>
-    );
-  };
-
-  return (
-    <div>
-      <SectionHead eyebrow="Tool" title="13-Week Cash Flow Forecast" desc="The CFO-level deliverable that wins advisory work. Forecast cash 13 weeks out, spot crunch weeks before they happen, and hand clients a forecast they actually use. Auto-saves." />
-
-      {/* Setup card */}
-      <div className="glass-card p-5 mt-4 grid grid-cols-1 md:grid-cols-4 gap-3">
-        <div>
-          <label className="gh-label block mb-1">Client / Company</label>
-          <input className="gh-input w-full" placeholder="Acme LLC" value={companyName} onChange={e => setCompanyName(e.target.value)} />
-        </div>
-        <div>
-          <label className="gh-label block mb-1">Forecast Start (Mon)</label>
-          <input type="date" className="gh-input w-full" value={startDate} onChange={e => setStartDate(e.target.value)} />
-        </div>
-        <div>
-          <label className="gh-label block mb-1">Opening Cash ($)</label>
-          <input type="number" className="gh-input w-full gh-tnum" value={openingCash} onChange={e => setOpeningCash(parseFloat(e.target.value) || 0)} />
-        </div>
-        <div>
-          <label className="gh-label block mb-1">Minimum Reserve ($)</label>
-          <input type="number" className="gh-input w-full gh-tnum" value={minReserve} onChange={e => setMinReserve(parseFloat(e.target.value) || 0)} />
-        </div>
-      </div>
-
-      {/* Action bar */}
-      <div className="flex flex-wrap gap-2 mt-3 items-center">
-        <button onClick={reviewForecast} disabled={aiBusy} className="gh-btn-ghost flex items-center gap-1.5 text-xs font-semibold">
-          {aiBusy ? <><Loader2 size={14} className="animate-spin" /> Reviewing...</> : <><Sparkles size={13} /> AI review forecast</>}
-        </button>
-        <div className="flex-1" />
-        <button onClick={exportCSV} className="gh-btn-ghost flex items-center gap-1.5 text-xs font-semibold"><Download size={13} /> Export CSV</button>
-        <button onClick={exportWord} className="sheen-btn px-4 py-2 text-xs font-semibold flex items-center gap-1.5"><Download size={13} /> Export Word</button>
-      </div>
-
-      {/* AI note */}
-      {aiNote && (
-        <div className="mt-3 p-3 rounded-xl text-sm" style={{
-          background: aiNote.kind === 'error' ? 'rgba(208,35,35,0.06)' : 'rgba(10,132,255,0.06)',
-          border: `1px solid ${aiNote.kind === 'error' ? 'rgba(208,35,35,0.2)' : 'rgba(10,132,255,0.18)'}`,
-        }}>
-          <div className="flex gap-2 items-start">
-            <div className="font-semibold flex-shrink-0" style={{ color: aiNote.kind === 'error' ? C.red : C.primary }}>
-              {aiNote.kind === 'review' ? 'CFO Review:' : 'Error:'}
-            </div>
-            <div className="flex-1 whitespace-pre-wrap leading-relaxed" style={{ color: C.text }}>{aiNote.text}</div>
-            <button onClick={() => setAiNote(null)} className="text-xs opacity-50 hover:opacity-100">✕</button>
-          </div>
-        </div>
-      )}
-
-      {/* Crunch alert banner */}
-      {crunchWeeks.length > 0 && (
-        <div className="mt-4 p-4 rounded-2xl flex items-start gap-3" style={{
-          background: 'rgba(208,35,35,0.06)',
-          border: `1px solid rgba(208,35,35,0.2)`,
-        }}>
-          <AlertTriangle size={20} style={{ color: C.red, flexShrink: 0, marginTop: 2 }} />
-          <div className="flex-1 text-sm">
-            <div className="font-semibold mb-1" style={{ color: C.red }}>
-              Cash crunch detected in {crunchWeeks.length} week{crunchWeeks.length > 1 ? 's' : ''}
-            </div>
-            <div style={{ color: C.text, lineHeight: 1.5 }}>
-              Cash dips below the {fmt(minReserve)} reserve in: {crunchWeeks.map(c => `Week ${c.week + 1} (${weekLabel(c.week)}, ${fmt(c.balance)})`).join(', ')}.
-              Recommended actions: accelerate A/R collections, delay non-critical A/P, or arrange a credit line now.
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* KPI strip */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
-        {[
-          { label: 'Opening Cash', value: fmt(openingCash), accent: C.primary },
-          { label: 'Ending Cash', value: fmt(endingCash), accent: endingCash >= minReserve ? C.green : C.red },
-          { label: 'Lowest Balance', value: fmt(minCash), accent: minCash >= minReserve ? C.green : C.red },
-          { label: 'Net Change', value: fmt(totalInflows - totalOutflows), accent: totalInflows >= totalOutflows ? C.green : C.red },
-        ].map(k => (
-          <div key={k.label} className="glass-card p-4">
-            <div className="gh-label" style={{ color: C.textMute, fontSize: 10 }}>{k.label}</div>
-            <div className="gh-bignum mt-1" style={{ fontSize: 24, color: k.accent }}>{k.value}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* Forecast table */}
-      <div className="glass-card p-0 mt-5 overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-xs" style={{ fontFamily: fontMono }}>
-            <thead style={{ background: 'rgba(10,132,255,0.06)', borderBottom: `1px solid ${GLASS.borderSoft}` }}>
-              <tr>
-                <th className="text-left px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-bg)', minWidth: 240, color: C.textSoft, fontWeight: 600 }}>Line Item</th>
-                <th className="px-2 py-2" style={{ minWidth: 80, color: C.textSoft, fontWeight: 600 }}>Amount</th>
-                <th className="px-2 py-2" style={{ minWidth: 90, color: C.textSoft, fontWeight: 600 }}>Cadence</th>
-                {Array.from({ length: NUM_WEEKS }, (_, w) => (
-                  <th key={w} className="px-2 py-2 text-right" style={{ minWidth: 70, color: C.textSoft, fontWeight: 600 }}>
-                    <div>W{w + 1}</div>
-                    <div className="text-[9px] font-normal" style={{ color: C.textMute }}>{weekLabel(w)}</div>
-                  </th>
-                ))}
-                <th className="px-2 py-2 text-right" style={{ minWidth: 90, color: C.text, fontWeight: 700 }}>Total</th>
-              </tr>
-            </thead>
-            <tbody>
-              {/* Inflows section */}
-              <tr style={{ background: 'rgba(10,132,255,0.04)' }}>
-                <td colSpan={NUM_WEEKS + 4} className="px-3 py-2">
-                  <div className="flex items-center justify-between">
-                    <span className="gh-label" style={{ color: C.primary, fontSize: 11 }}>Cash Inflows</span>
-                    <button onClick={() => addRow('inflow')} className="text-[10px] font-semibold px-2 py-0.5 rounded-md" style={{ background: 'rgba(10,132,255,0.10)', color: C.primary }}>+ Add inflow</button>
-                  </div>
-                </td>
-              </tr>
-              {inflows.map((r, idx) => <RowEditor key={`in-${idx}`} kind="inflow" row={r} idx={idx} />)}
-              <tr style={{ background: 'rgba(10,132,255,0.04)', fontWeight: 600 }}>
-                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-soft-bg)', color: C.text }}>Total Inflows</td>
-                <td colSpan={2}></td>
-                {Array.from({ length: NUM_WEEKS }, (_, w) => (
-                  <td key={w} className="px-2 py-2 text-right gh-tnum" style={{ color: C.text }}>{fmt(inflowTotal(w))}</td>
-                ))}
-                <td className="px-2 py-2 text-right gh-tnum" style={{ color: C.primary, fontWeight: 700 }}>{fmt(totalInflows)}</td>
-              </tr>
-
-              {/* Outflows section */}
-              <tr style={{ background: 'rgba(208,35,35,0.04)' }}>
-                <td colSpan={NUM_WEEKS + 4} className="px-3 py-2">
-                  <div className="flex items-center justify-between">
-                    <span className="gh-label" style={{ color: C.red, fontSize: 11 }}>Cash Outflows</span>
-                    <button onClick={() => addRow('outflow')} className="text-[10px] font-semibold px-2 py-0.5 rounded-md" style={{ background: 'rgba(208,35,35,0.10)', color: C.red }}>+ Add outflow</button>
-                  </div>
-                </td>
-              </tr>
-              {outflows.map((r, idx) => <RowEditor key={`out-${idx}`} kind="outflow" row={r} idx={idx} />)}
-              <tr style={{ background: 'rgba(208,35,35,0.04)', fontWeight: 600 }}>
-                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-danger-bg)', color: C.text }}>Total Outflows</td>
-                <td colSpan={2}></td>
-                {Array.from({ length: NUM_WEEKS }, (_, w) => (
-                  <td key={w} className="px-2 py-2 text-right gh-tnum" style={{ color: C.text }}>{fmt(outflowTotal(w))}</td>
-                ))}
-                <td className="px-2 py-2 text-right gh-tnum" style={{ color: C.red, fontWeight: 700 }}>{fmt(totalOutflows)}</td>
-              </tr>
-
-              {/* Net cash flow */}
-              <tr style={{ borderTop: `2px solid ${C.primary}` }}>
-                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-bg)', color: C.text, fontWeight: 700 }}>Net Cash Flow</td>
-                <td colSpan={2}></td>
-                {Array.from({ length: NUM_WEEKS }, (_, w) => (
-                  <td key={w} className="px-2 py-2 text-right gh-tnum font-semibold" style={{ color: netCash(w) >= 0 ? C.green : C.red }}>{fmt(netCash(w))}</td>
-                ))}
-                <td className="px-2 py-2 text-right gh-tnum font-bold" style={{ color: (totalInflows - totalOutflows) >= 0 ? C.green : C.red }}>{fmt(totalInflows - totalOutflows)}</td>
-              </tr>
-
-              {/* Ending cash — the punchline */}
-              <tr style={{ background: 'rgba(10,132,255,0.08)' }}>
-                <td className="px-3 py-2 sticky left-0 z-10" style={{ background: 'var(--table-sticky-deeper-bg)', color: C.text, fontWeight: 700 }}>Ending Cash Balance</td>
-                <td colSpan={2}></td>
-                {Array.from({ length: NUM_WEEKS }, (_, w) => {
-                  const bal = cashAtWeek(w);
-                  const isCrunch = bal < (Number(minReserve) || 0);
-                  return (
-                    <td key={w} className="px-2 py-2 text-right gh-tnum font-bold" style={{
-                      color: isCrunch ? C.red : bal >= (Number(minReserve) || 0) * 2 ? C.green : C.text,
-                      background: isCrunch ? 'rgba(208,35,35,0.08)' : 'transparent',
-                    }}>{fmt(bal)}</td>
-                  );
-                })}
-                <td className="px-2 py-2 text-right gh-tnum font-bold" style={{ color: endingCash >= minReserve ? C.green : C.red }}>{fmt(endingCash)}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <div className="text-xs mt-3 px-1" style={{ color: C.textMute }}>
-        Tip: "Cadence" controls how often a line item recurs. Payroll = Biweekly. Rent = Monthly. Quarterly tax = Quarterly. Your work auto-saves.
-      </div>
-    </div>
-  );
-}
-
 
 function SummaryCard({ label, value, sub, highlight }) {
   return (

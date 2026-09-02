@@ -1,10 +1,10 @@
 # Ultimate Remote Bookkeeper Toolkits
 
-**Get Hired With Alex** — an all-in-one web app for aspiring and working **remote bookkeepers / accountants serving US clients**. It bundles 40+ tools across three career stages:
+**Get Hired With Alex** — an all-in-one web app for aspiring and working **remote bookkeepers / accountants serving US clients**. It bundles ~30 tools across three career stages:
 
 - **Training & Skills** — Accounting 101 course, Industry Accounting playbooks, US Tax 101, ProAdvisor chat.
 - **Job Application** — authentic branding, resume & LinkedIn optimizers, interview prep, mock-interview simulator, free QuickBooks diagnostic, pain-points & proposal generators.
-- **Client Management & Delivery** — engagement letters, onboarding, Chart of Accounts generator, invoice creator, bank-feed AI, statement → CSV converter, email templates, accounting calculators, monthly/year-end checklists, SOP generator, sales tax, budgeting & forecasting.
+- **Client Management & Delivery** — engagement letters, onboarding, Chart of Accounts generator, invoice creator, bank-feed AI, statement → CSV converter, email templates, accounting calculators, monthly/year-end checklists, SOP generator, sales tax.
 
 The UI is a single large React component (`src/BookkeeperPro.jsx`) styled with Tailwind.
 
@@ -79,7 +79,11 @@ src/
   main.jsx            Mounts the app; window.storage + Anthropic fetch shims
   BookkeeperPro.jsx   The full application component (unmodified source)
 standalone/
-  index.html          Standalone single-file build, set up for Google Apps Script deployment
+  index.html          LEGACY single-file Google-Apps-Script build. Not maintained: it has
+                      not been regenerated since the initial scaffold, predates Supabase
+                      auth / plans / the community, keeps the Anthropic key in browser
+                      localStorage, and still contains tools the app has retired. No script
+                      regenerates it — treat it as an archived artifact.
 .env.example          Template for your Anthropic API key
 ```
 

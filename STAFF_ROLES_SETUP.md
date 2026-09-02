@@ -59,8 +59,9 @@ running it.
 
 ## 3. The permission matrix
 
-Three fixed roles, 19 permissions, 28 grants. #45 seeded 18 permissions and 26 grants; #52 added
-`student_progress.read` for Super Admin and Operations Admin. Mirrored in
+Three fixed roles, 19 permissions, **32 grants**. #45 seeded 18 permissions and 26 grants; #52 added
+`student_progress.read` for Super Admin and Operations Admin; **#56 gave both community
+permissions to Operations Admin AND Trainer**. Mirrored in
 [src/lib/staffRoles.js](src/lib/staffRoles.js); `test/staffRolesSql.test.mjs` fails if the two drift.
 
 | Permission | Super Admin | Operations Admin | Trainer |
@@ -80,8 +81,8 @@ Three fixed roles, 19 permissions, 28 grants. #45 seeded 18 permissions and 26 g
 | `courses.publish` — publish and withdraw | ✅ | — | — |
 | `courses.delete` — delete a course and its media | ✅ | — | — |
 | `course_trainer.manage` — AI trainer indexing | ✅ | — | ✅ |
-| `community.manage` — channels and audiences | ✅ | — | — |
-| `community.moderate` — pin/lock/hide/delete | ✅ | — | — |
+| `community.manage` — channels and audiences | ✅ | ✅ | ✅ |
+| `community.moderate` — pin/lock/hide/delete | ✅ | ✅ | ✅ |
 | `sidebar.customize` — global navigation labels | ✅ | — | — |
 | `payment_settings.manage` — payment instructions | ✅ | — | — |
 
@@ -97,6 +98,29 @@ Three fixed roles, 19 permissions, 28 grants. #45 seeded 18 permissions and 26 g
 
 Both are additive later: insert a `staff_role_permissions` row. Neither can be worked around from the
 client, because RLS reads the table, not the JS mirror.
+
+**Why the two Community rows are not a footnote (#56).** They were Super-Admin-only from #45 until
+#56, and #45 left every community RPC and policy on `is_admin()` **because of that** — with one
+holder, `is_admin()` and `has_staff_permission('community.manage')` were the same question. Granting
+them to two more roles removed that equivalence, so #56 also had to re-gate nine RPCs, thirty-three
+RLS policies and three storage policies. **Inserting a `staff_role_permissions` row is never the whole
+change**: name the policy or function the key actually gates, or the role looks able in the UI and is
+refused at the first server call.
+
+**What Community authority does and does not carry.** An Operations Admin or Trainer can open
+*Manage community*, create/rename/reorder/archive channels and categories, set plan and batch
+audiences, preview a privacy change, and pin / lock / hide / restore / permanently delete posts and
+replies — including in private cohort rooms, which is what moderating them requires. They cannot
+review payments, run batches, import students, read the private progress report, publish or delete a
+course, manage staff, or rename the sidebar. **Four** things stayed Super-Admin-only inside the
+community itself: **the blanket table-write policies** (the five `community_*_admin_all`
+`FOR ALL` policies — those tables have no table-level DML revoke, so a `FOR ALL` policy is a raw
+PostgREST write path over every row; Ops Admins and Trainers reach other people's content only
+through the audited RPCs, and get an own-row write path of their own), **backdating a post**
+(`community_posts_guard()` keeps that on `is_super_admin()` — forging `created_at` self-pins a
+post above the activity-sorted feed), **blanket deletion of any object in the `community-media`
+bucket**, and **writing `community_spaces`** (that belongs to the batch lifecycle, and breaking
+it breaks enrolment approval).
 
 ---
 

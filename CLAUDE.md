@@ -10,7 +10,7 @@ tools across three career stages:
 
 1. **Training & Skills** — Accounting 101 course, Industry Accounting playbooks, US Tax 101, ProAdvisor chat.
 2. **Job Application** — authentic branding, resume/LinkedIn optimizers, interview prep, mock-interview & discovery-call simulators, QuickBooks diagnostic, pain-points & cover-letter generators.
-3. **Client Management & Delivery** — engagement letters, onboarding, Chart of Accounts generator, invoice creator, bank-feed AI, statement→CSV converter, email templates, accounting calculators, monthly/year-end checklists, SOP generator, sales tax, budgeting & forecasting, plus growth tools (pricing, upsell, capacity, payment tracking).
+3. **Client Management & Delivery** — engagement letters, onboarding, Chart of Accounts generator, invoice creator, bank-feed AI, statement→CSV converter, email templates, accounting calculators, monthly/year-end checklists, SOP generator, sales tax, plus growth tools (pricing, upsell, capacity, payment tracking).
 
 Many tools are **AI-assisted** (call Claude); the rest (calculators, checklists, Chart of Accounts,
 templates) run fully offline with no API key. Alongside the tools sits the in-app **Community**
@@ -80,7 +80,7 @@ two shims that the tool code depends on:
    in Claude artifacts and calls `window.storage` directly for all persistence. **Now per-user
    namespaced:** [AuthProvider](src/auth/AuthProvider.jsx) calls `window.__setStorageUser(uid)` on
    every session change, so each get/set transparently reads/writes `u:<uid>:<key>` — isolating each
-   account's data with **zero changes to the ~60 tools** (they still pass plain keys). Supabase's own
+   account's data with **zero changes to every tool** (they still pass plain keys). Supabase's own
    `sb-*` session key is written directly by supabase-js and is **not** namespaced.
 2. **fetch shim** → rewrites any request to `https://api.anthropic.com` → `/api/anthropic`. Tool
    code calls the *real* Anthropic URL; this shim redirects it to the proxy so the API key stays
@@ -108,6 +108,10 @@ The sanctioned exceptions to the single-file rule (same spirit as the `main.jsx`
   signed document can never state a price the catalog does not charge.
 - `src/lib/planCatalog.js` — the membership catalog + entitlement rules (pure; shared by the app,
   the voice-knowledge generator, and `node --test`). See Plan-based access.
+- `src/lib/sidebarLayout.js` — the per-user sidebar layout reconciler (pure; extracted from the
+  monolith by #56 so it could be tested). `mergeStoredWithDefaults()` is what DROPS a retired
+  tab id out of a saved layout, which is why retiring a tool needs no storage migration —
+  pinned by `test/sidebarLayout.test.mjs` instead of being an unverified comment.
 - `src/index.css` — the **global theme-token layer** (all CSS custom properties for light + dark,
   the shared `.gh-app-bg`/glass/button/input classes, and the Tailwind dark compat layer). See
   Styling conventions.
@@ -558,7 +562,7 @@ detector) and `src/lib/partialJson.js` (tolerant JSON + truncated-prefix recover
 `npm test`), `EngagementLetter` 15168, `EmailTemplates` 15717,
 `PainPointsGenerator` 15970, `IndustryAccounting` 16330, `USTax101` 16466,
 `MonthlyWorkflow` 16560, `MonthEndChecklist` 16650, `InvoiceCreator` 16881, `CoachAlexChat` 17369,
-`CPAAIChat` 17399, `AccountingCalculators` 18201, `NicheSelectorQuiz` 18267,
+`CPAAIChat` 17399, `AccountingCalculators` 18201,
 `LinkedInOptimizer` 18405, `MockInterviewSimulator` 18561 (a **guided-video + external-link page** —
 admin-uploaded explainer video + a "Open Mock Interview Simulator" button to the external
 `https://app.sesame.com/`; Supabase-backed via the `feature_guides` table — **not** the old internal
@@ -570,7 +574,7 @@ Mastery), not a standalone sidebar item; when `embedded` it drops its own `Secti
 `mockinterview` tab id is kept only as a defensive render-switch redirect → `<InterviewPrep initialSub="mock" />`),
 `DiscoveryCallSimulator` 18973,
 `SOPGenerator` 19280, `ClientHealthScore` 19945, `CapacityPlanner` 21029, `PaymentTracker` 21213,
-`QBDiagnostic` 21965, `BudgetingTool` 23162, `ForecastingTool` 23653. (Note: `ClientHealthScore`,
+`QBDiagnostic` 21965. (Note: `ClientHealthScore`,
 `CapacityPlanner`, and `PaymentTracker` are among ~10 components currently defined but wired to no
 route/sidebar entry — see the 2026-07-14 cleanup audit; pending a product call to delete or restore.)
 
@@ -926,7 +930,14 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   dropped AFTER — with NO CASCADE, so a policy that still depends on it errors the file instead
   of being silently stripped. ★ The publish trigger is delta-scoped by a `WHEN` clause; the
   lesson trigger is monotonic on `video_url` and published-gated on INSERT. Three new
-  `app_error` codes. Needs #39+#35+#31+#19+#15. Folded verbatim as §31).
+  `app_error` codes. Needs #39+#35+#31+#19+#15. Folded verbatim as §31) →
+  **staff-authorization (#45) → course-staff-assignments (#46) → special-extension (#47) →
+  authorization-hardening (#48) → staff-invitation-acceptance (#49) →
+  staff-activation-consistency (#50) → access-request-staff-target (#51) →
+  student-progress-rankings (#52) → progress-rankings-followup (#53) →
+  progress-course-family-scoping (#54) → approve-rpc-grant-revoke (#55) →
+  community-staff-authority (#56)** — see the Staff-authorization and Progress & Rankings
+  sections for what each does. #56 is the last fold, §43.
   **#35/#36 applied to production 2026-07-29; both verified against a disposable shadow project first — see
   [docs/db/shadow-project.md](docs/db/shadow-project.md) and `npm run test:db`.**
   **Expiry-warning policy:** student-facing surfaces (menu pill, Dashboard `MembershipPanel`, the
@@ -1290,6 +1301,77 @@ role `is_admin = true`.**
   path and never revoked what it left behind. **Client-neutral**, so it applies in either order
   relative to a deploy. Pinned by `test/approveGrantSql.test.mjs` (both the dated file and the fold)
   and by a `#55` check in `npm run db:audit`.
+- **Community authority is no longer Super-Admin-only (#56,
+  `db/2026-09-05-community-staff-authority.sql`).** `community.manage` and
+  `community.moderate` existed from #45 but were held only by `super_admin`, which is
+  exactly why #45 left every community RPC and policy on `is_admin()` and said so at
+  `db/2026-08-25-staff-authorization.sql:1279`: the two predicates were **equivalent for
+  the only role that held them**. #56 grants both keys to **Operations Admin AND Trainer**
+  (28 → **32** grants), which removes that precondition — so the grant is not the change,
+  it is the trigger for it. Granting alone would have shipped two roles that look able in
+  the UI and 403 at the first server call.
+  ★ **The nine config RPCs are re-gated IN PLACE, not restated.** One idempotent,
+  self-verifying `do $regate$` block reads `pg_get_functiondef()`, asserts the legacy guard
+  appears exactly once, replaces that one string and executes the result. Two reasons:
+  `admin_save_community_channel()` has **no current body in this repo** (#41 is its last
+  `create or replace`; #43 then TEXT-PATCHES it at runtime), so retyping it would drop
+  #43's fix — the #33/#34 failure mode; and a DO block is ONE statement, whereas nine
+  separate CREATEs sent by `apply-db-files.mjs` (one per HTTP round trip, no transaction)
+  could fail at the fifth and leave a **mixed authorization state with no rollback**.
+  ★ **`community_posts_guard()`'s `created_at` bypass stays `is_super_admin()`** — the one
+  deliberate departure from #45's single-predicate rule. Backdating is forgery, not
+  moderation: a forged `created_at` launders into `last_activity_at` and self-pins a post
+  above the whole activity-sorted feed. The other three guards (pin, lock, and the UPDATE
+  freeze) move to `community.moderate`; **without the fourth the moderation RPCs would
+  silently no-op** and still return success.
+  ★ **Moderation is now a bounded server action.** `community_moderate_post` /
+  `community_moderate_comment` take an id and a strict action enum, so they cannot express
+  `author_id`, `body`, `title`, `channel_id`, `created_at` or a counter; the client used to
+  PATCH the tables directly, which worked only because `community_*_admin_all` is a blanket
+  FOR ALL policy — i.e. the CLIENT chose the columns. Every state change writes one
+  append-only `community_moderation_events` row; a no-op writes none, because the ledger
+  answers *when did this become pinned* and a double-click must not corrupt that.
+  `restore` and `hide` both refuse a `status='deleted'` row: that is the author's own
+  withdrawal, and allowing `hide` would launder it back into the feed in two calls while
+  stranding the author behind `status <> 'hidden'`.
+  ★ **The five `community_*_admin_all` FOR ALL policies stay `is_super_admin()`, and that
+  is the load-bearing half of the above.** None of those tables carries a table-level DML
+  revoke, so `authenticated` keeps Supabase's default INSERT/UPDATE/DELETE grants and a
+  FOR ALL policy is a raw PostgREST write path over every row. Re-gating them onto
+  `community.moderate` — the obvious edit — would have let a Trainer rewrite another
+  member's `body`, set `author_id`, or `DELETE` a post with no ledger row and no captured
+  storage paths, leaving its private objects permanently unreachable; the bounded RPCs
+  would have been one optional route of two. Ops Admins and Trainers instead get an
+  OWN-ROW write path (§8d): the `*_own_insert`/`*_own_update` policies' enrolment-standing
+  conjunct is widened to admit `is_community_staff()`, because `is_enrolled()` is false for
+  a staff account with no subscription and without it an Operations Admin could moderate
+  the forum and never post in it.
+  ★ **`user_is_community_staff(uuid)` vs `is_community_staff()`** is the #45 two-form split,
+  and using the caller-pinned form inside a `user_community_*(p_user)` body is the single
+  most dangerous mistake available here — it answers about the CALLER, not the subject, and
+  it fails **OPEN**. `test/communityStaffSql.test.mjs` pins against it.
+  ★ **Storage deletes are bounded.** `community_media_delete` keeps today's blanket bucket
+  reach as `is_super_admin()` and adds two narrower moderator arms: an attachment→post join
+  (so a nameable object always belongs to a live post — an ORPHAN is unreachable), and a
+  15-minute **receipt** arm limited to the paths this actor's own audited hard-delete just
+  produced. The receipt arm is what lets the client sweep **after** the RPC; the FK cascade
+  removes the rows the join arm needs the instant the post is gone.
+  ★ **What did NOT widen:** `community_spaces_admin_all` stays on `batches.manage` (a space
+  is created and destroyed by the batch lifecycle, and `admin_finalize_enrollment` refuses
+  with `NO_SPACE_FOR_SEGMENT` when a batch has none — write access there could break
+  enrolment approval for a whole cohort); `is_enrolled()`; `is_approved()`;
+  `community_stamp_author()`; and the *eligibility* reads in `search_community_members()`
+  and both notify triggers, which ask whether an account is in good standing, not whether
+  it has authority.
+  ★ **`admins_only` is a compatibility identifier.** The stored value is unchanged; its
+  meaning is now "authorized Community staff only", and ordinary staff holding neither
+  community permission do not reach it.
+  ★ **Client:** `communityAuthority()` in `src/lib/staffRoles.js` replaces the single
+  overloaded `isAdmin` in `CommunityHub` with `canConfigure` / `canModerate` /
+  `hasStaffAccess`. It fails CLOSED while `staffReady` is false and falls back to the
+  legacy `profile.is_admin` only when the context is degraded — never to "assume staff".
+  ★ **Ship the SQL and the client together.** A pre-#56 bundle PATCHes `community_posts`
+  directly, which still works for a Super Admin and 42501s for everyone else.
 - Setup + the full permission matrix: **[STAFF_ROLES_SETUP.md](STAFF_ROLES_SETUP.md)**.
 
 ## Progress & Rankings — learning analytics and privacy-safe leaderboards (#52)
@@ -1601,7 +1683,9 @@ explain/quiz/practice/recap the Supabase-hosted courses. Full setup:
   (the sidebar `<aside>` — expanded, collapsed rail, and mobile drawer), `--topbar-bg` (mobile sticky
   top bar), `--section-head-bg` (the shared `SectionHead` sticky page header), and `--table-sticky-bg`
   plus its tinted variants `--table-sticky-{soft,deeper,ok,danger}-bg` (sticky first-column table
-  cells in Budgeting/Forecasting — plain rows vs blue subtotal / highlight / green / red summary rows). Defined in both theme blocks (light =
+  cells in the wide financial tables). ★ #56 removed the four tinted variants
+  (`--table-sticky-{soft,deeper,ok,danger}-bg`) along with the Budgeting and Forecasting
+  tools that were their only consumers; only `--table-sticky-bg` remains. Defined in both theme blocks (light =
   the original glass literals; dark = navy glass from the `#101B30`/`#0B1322` family) — reuse these
   for any new shell chrome instead of hardcoding light rgba values, which the dark compat layer
   cannot fix on inline styles.
@@ -1670,8 +1754,14 @@ explain/quiz/practice/recap the Supabase-hosted courses. Full setup:
 
 - **Vercel:** push to GitHub → import project → set `ANTHROPIC_API_KEY` (Production + Preview) → deploy.
   The serverless function at `api/anthropic/v1/messages.js` replaces the dev proxy automatically.
-- **Google Apps Script (alternate):** [standalone/index.html](standalone/index.html) is a self-contained
-  build for embedding in Google Sheets.
+- **Google Apps Script (alternate) — LEGACY, NOT MAINTAINED:**
+  [standalone/index.html](standalone/index.html) is a self-contained build for embedding in
+  Google Sheets. ★ It has not been regenerated since the initial Vite scaffold (2026-06-07):
+  it contains **no** Supabase auth, no community, no plans and no staff roles, it holds the
+  Anthropic key in browser localStorage, and it still ships tools the app has retired
+  (Budgeting and Forecasting). There is **no script that generates it**, so it cannot be
+  re-cut from source; treat it as an archived artifact, not a shipping distribution, and do
+  not hand-patch its minified bundle to keep it in step.
 - `dist/` is build output and is gitignored — don't edit it by hand.
 
 ## Conventions & guardrails
@@ -1727,11 +1817,15 @@ docs **in the same change**:
   the five channel-scoped write policies ↔ `effectiveChannelCaps()` ↔ both suites. The client
   must consume the server-computed `can_*` verbatim and fail closed while they load — the
   pre-#40 bug was a re-derivation from raw space flags that failed OPEN.
-- **Changing community write permissions** → four places move together: the `enrollment_plans`
+- **Changing community write permissions** → five places move together: the `enrollment_plans`
   capability columns (#36) ↔ `user_community_capabilities()` ↔ the five community write policies ↔ the per-channel flags (#40) ↔
   `capabilitiesFor()`/`effectiveCaps()` in `src/lib/communityCapabilities.js`
   (`test/communityCapabilities.test.mjs` pins the truth table — 3 plans x 2 space kinds x 4 actions
-  since #39; it was 5 x 3 x 4 under #36).
+  since #39; it was 5 x 3 x 4 under #36) ↔ **the STAFF write bypass** in
+  `user_community_capabilities()` / `user_community_channel_capabilities()`, which since #56
+  is `user_is_community_staff(p_user)` rather than `is_admin`. That bypass is a confirmed
+  product decision: Community staff post, comment, react and attach in ANY channel,
+  `#announcements` included — a moderator who can hide a reply can also write one.
 - **Changing how many cohorts a plan grants** → `plan_batch_count()` ↔
   `enrollment_plans.eligible_batch_count` ↔ `planBatchCount()` in `src/lib/batchEntitlements.js`
   (`test/batchEntitlements.test.mjs` pins it).
@@ -1902,6 +1996,34 @@ docs **in the same change**:
   the `week` window's exclusion — a fabricated zero makes Most Improved a mislabelled copy of the
   overall board). ★ Current scores must never read `student_progress_daily`: it is history, and a
   learner has to see a completion on the next request, not the next cron run.
+- **Changing who may CONFIGURE or MODERATE the community** → five places move together:
+  `user_is_community_staff()` / `is_community_staff()` (the #45 two-form split) ↔ the nine
+  community config RPCs' `has_staff_permission('community.manage')` guard ↔ the 33 RLS
+  policies + the three `community-media` storage policies ↔ `communityAuthority()` in
+  [src/lib/staffRoles.js](src/lib/staffRoles.js) ↔ `test/communityStaffSql.test.mjs` +
+  `test/communityAuthority.test.mjs` + `test-db/communityStaffRls.dbtest.mjs`.
+  ★ **Never repair a missed check by handing a non-super role `is_admin = true`.** That
+  column is a trigger-maintained cache meaning "active super_admin" and it is what ~74
+  legacy `is_admin()` references read; the whole safety argument of #45 is that a check we
+  failed to find UNDER-grants rather than over-grants.
+  ★ **Never restate one of the nine RPC bodies.** `admin_save_community_channel()` has no
+  current body in the repo — #41 defines it and #43 text-patches it at runtime — so the
+  `do $regate$` block in #56 is the only correct instrument. `test/communityStaffSql.test.mjs`
+  fails if the migration contains `create or replace function public.admin_…` for any of
+  the nine.
+  ★ A future migration that re-creates one of those nine from the #40/#41/#43 text and is
+  folded AFTER §43 silently reverts the guard. The `#56` entries in
+  `scripts/audit-db.mjs` are the only live tripwire — `db:shadow:verify` compares
+  `proname/args/prosecdef/proconfig` and never `prosrc`, and filters `pg_policies` to
+  `schemaname='public'`, so it cannot see either storage policy.
+- **Changing what a MODERATOR may do** → `community_moderate_post` /
+  `community_moderate_comment` ↔ `community_posts_guard()`'s three `community.moderate`
+  gates ↔ the `community_*_admin_all` policies ↔ `community_moderation_events` ↔ the client
+  handlers in `CommunityHub`. The RPCs are safe because their ARGUMENTS cannot name a
+  content column — keep it that way; the moment one takes a patch object, the bound is gone.
+  ★ The `created_at` bypass stays `is_super_admin()`. Backdating is forgery, not moderation.
+  ★ The UPDATE-branch freeze in `community_posts_guard()` must stay gated on
+  `community.moderate`: without it the RPCs silently no-op and still return success.
 - **Adding, removing or re-granting a STAFF PERMISSION** → four places move together:
   the `staff_permissions` + `staff_role_permissions` seed in a dated migration ↔ the **bootstrap
   fold** ↔ `STAFF_PERMISSIONS` / `ROLE_PERMISSIONS` in [src/lib/staffRoles.js](src/lib/staffRoles.js)

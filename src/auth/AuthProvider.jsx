@@ -58,7 +58,6 @@ const LEGACY_KEYS = [
   'payments:invoices',
   'persfin:transactions',
   'qbdiag:name', 'qbdiag:firm', 'qbdiag:email',
-  'budget:state', 'forecast:state',
   'nav:lastTab', 'nav:interviewSub',
   'enroll:soundAlert',
   'community:lastSpace', 'community:lastChannel', 'community:railGroups',

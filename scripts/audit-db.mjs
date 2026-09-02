@@ -376,7 +376,7 @@ export const OBJECT_CHECKS = [
       (to_regclass('public.staff_roles')), (to_regclass('public.staff_permissions')),
       (to_regclass('public.staff_role_permissions')), (to_regclass('public.staff_memberships')),
       (to_regclass('public.staff_role_events'))) as v(t)`],
-  ['#45/#52 role x permission matrix is seeded', `select count(*) = 28 as ok
+  ['#45/#56 role x permission matrix is seeded', `select count(*) = 32 as ok
       from public.staff_role_permissions`],
   ['#45/#52 all 19 permissions are seeded', `select count(*) = 19 as ok from public.staff_permissions`],
   // The caller-scoped helpers MUST be executable by authenticated: an RLS qual is
@@ -869,6 +869,127 @@ export const OBJECT_CHECKS = [
       and not has_function_privilege('anon', p.oid, 'EXECUTE')), false) as ok
     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
     where n.nspname = 'public' and p.proname in ('approve_subscription','approve_extension')`],
+  // #56 — Community authority moved off is_admin() and onto community.manage /
+  // community.moderate, which operations_admin and trainer now hold. Every check below is
+  // a TRIPWIRE: a later migration that re-creates one of these nine RPCs from the
+  // #40/#41/#43 text would silently put it back on Super-Admin-only, and nothing else in
+  // the toolchain would notice — db:shadow:verify compares proname/args/prosecdef/proconfig
+  // and never prosrc, and it filters pg_policies to schemaname='public', so the two
+  // community-media policies are invisible to it entirely.
+  ['#56    both community permissions reach both non-super roles', `select count(*) = 6 as ok
+    from public.staff_role_permissions
+   where permission_key in ('community.manage','community.moderate')`],
+  ['#56    the nine community RPCs are on community.manage', `select count(*) = 9 as ok
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public'
+     and p.prosrc like '%has_staff_permission(''community.manage'')%'
+     and p.proname in ('admin_community_config','admin_save_community_settings',
+                       'admin_save_channel_category','admin_move_channel_category',
+                       'admin_save_community_channel','admin_move_community_channel',
+                       'admin_set_community_channel_status','admin_channel_privacy_preview',
+                       'admin_community_media_orphans')`],
+  ['#56    no community RPC still carries the legacy guard', `select count(*) = 0 as ok
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public'
+     and (p.prosrc like '%if not public.is_admin() then%'
+          or p.prosrc like '%where public.is_admin()%')
+     and p.proname in ('admin_community_config','admin_save_community_settings',
+                       'admin_save_channel_category','admin_move_channel_category',
+                       'admin_save_community_channel','admin_move_community_channel',
+                       'admin_set_community_channel_status','admin_channel_privacy_preview',
+                       'admin_community_media_orphans')`],
+  // The re-gate rewrites each function through pg_get_functiondef(). If it ever ran against
+  // a body that had lost #43's runtime patch, this is what would say so.
+  ['#56    the re-gate preserved #43 p_kind conjunct', `select prosrc like '%p_kind           is not null%' as ok
+    from pg_proc where proname = 'admin_save_community_channel'`],
+  ['#56    backdating a post is still Super-Admin-only', `select
+      prosrc like '%is_super_admin()%' and prosrc not like '%if not public.is_admin() then%' as ok
+    from pg_proc where proname = 'community_posts_guard'`],
+  ['#56    the per-user community-staff helper is internal only', `select count(*) = 1 and coalesce(bool_and(
+      not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')), false) as ok
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public' and p.proname = 'user_is_community_staff'`],
+  ['#56    the caller-pinned helper IS granted, or RLS fails closed for all', `select
+      has_function_privilege('authenticated', p.oid, 'EXECUTE') as ok
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public' and p.proname = 'is_community_staff'`],
+  ['#56    the moderation RPCs are callable by a signed-in staff member', `select count(*) = 2 and coalesce(bool_and(
+      has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')), false) as ok
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public'
+     and p.proname in ('community_moderate_post','community_moderate_comment')`],
+  ['#56    the moderation ledger is append-only from a client', `select
+      not has_table_privilege('authenticated','public.community_moderation_events','insert')
+      and not has_table_privilege('authenticated','public.community_moderation_events','update')
+      and not has_table_privilege('authenticated','public.community_moderation_events','delete') as ok`],
+  ['#56    the moderation ledger has exactly one policy, a select', `select count(*) = 1 as ok
+    from pg_policies where schemaname='public' and tablename='community_moderation_events'`],
+  // ★ The blanket FOR ALL policies must stay SUPER-ADMIN-ONLY. These tables carry no
+  // table-level DML revoke, so a FOR ALL policy is a raw PostgREST write path over every
+  // row: gating one on community.moderate would let a Trainer rewrite another member's
+  // body, set author_id, or DELETE a post with no ledger row and no captured storage
+  // paths. Ops Admins and Trainers reach other people's content only through the RPCs.
+  // ★ BOTH CLAUSES, AND with_check IS THE ONE THAT MATTERS. These are FOR ALL policies on
+  // tables with no DML revoke, so with_check IS the blanket write path — the exact thing
+  // #56 argues must not reach a non-super role. A check reading only `qual` would pass a
+  // future migration that re-gated the write half alone. `count(*) = 5` is asserted beside
+  // bool_and because bool_and over a PARTIAL set is true over the survivors: one policy
+  // renamed or dropped would otherwise pass clean.
+  ['#56    the blanket FOR ALL policies stay Super-Admin-only', `select
+      count(*) = 5 and coalesce(bool_and(
+        qual ilike '%is_super_admin%'
+        and coalesce(with_check, '') ilike '%is_super_admin%'
+        and qual not ilike '%community.moderate%'
+        and coalesce(with_check, '') not ilike '%community.moderate%'
+        and qual not ilike '%is_community_staff%'
+        and coalesce(with_check, '') not ilike '%is_community_staff%'), false) as ok
+    from pg_policies where schemaname='public'
+      and policyname in ('community_posts_admin_all','community_comments_admin_all',
+                         'community_reactions_admin_all','community_attachments_admin_all',
+                         'community_post_tags_admin_all')`],
+  ['#56    community_tags_admin_all stays Super-Admin-only too', `select
+      count(*) = 1 and coalesce(bool_and(
+        qual ilike '%is_super_admin%'
+        and coalesce(with_check, '') ilike '%is_super_admin%'), false) as ok
+    from pg_policies where schemaname='public' and policyname = 'community_tags_admin_all'`],
+  ['#56    staff own-row writes admit staff standing, and stay own-row', `select count(*) = 7 and coalesce(bool_and(
+      with_check ilike '%is_community_staff%'
+      and with_check ilike '%is_enrolled%'
+      and with_check ilike '%auth.uid()%'), false) as ok
+    from pg_policies where schemaname='public'
+      and policyname in ('community_posts_own_insert','community_posts_own_update',
+                         'community_comments_own_insert','community_comments_own_update',
+                         'community_reactions_own_insert','community_attachments_own_insert',
+                         'community_post_tags_own_insert')`],
+  // The storage half of the same rule, in a different schema so the query above cannot see
+  // it. Both matter: the ROW policy lets staff record an attachment, the OBJECT policy lets
+  // them upload the file, and community_media_delete's member arm lets them clear the
+  // orphan when a publish fails. Widening any one alone is a broken feature.
+  ['#56    staff can upload community media, and clear their own orphan', `select
+      count(*) = 2 and coalesce(bool_and(
+        coalesce(with_check, qual) ilike '%is_community_staff%'), false) as ok
+    from pg_policies where schemaname='storage'
+      and policyname in ('community_media_own_insert','community_media_delete')`],
+  ['#56    the channel audience maps are community.manage only', `select count(*) = 2 and coalesce(bool_and(
+      qual ilike '%community.manage%'), false) as ok
+    from pg_policies where schemaname='public'
+      and policyname in ('community_channel_plans_admin_select',
+                         'community_channel_batches_admin_select')`],
+  ['#56    community reads admit staff and keep the channel scope', `select count(*) = 4 and coalesce(bool_and(
+      qual ilike '%is_community_staff%' and qual ilike '%my_community_channel_ids%'), false) as ok
+    from pg_policies where schemaname='public'
+      and policyname in ('community_posts_read','community_comments_read',
+                         'community_attachments_read','community_post_tags_read')`],
+  ['#56    a moderator storage delete is bounded, blanket stays super', `select
+      qual ilike '%is_super_admin%' and qual ilike '%community_moderation_events%'
+      and qual ilike '%a.storage_path = name%' and qual not ilike '%is_admin()%' as ok
+    from pg_policies where schemaname='storage' and policyname='community_media_delete'`],
+  ['#56    community_spaces_admin_all is still the batch lifecycle', `select
+      qual ilike '%batches.manage%' as ok
+    from pg_policies where schemaname='public' and policyname='community_spaces_admin_all'`],
+
 ];
 
 async function main() {

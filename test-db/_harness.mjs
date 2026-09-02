@@ -132,6 +132,38 @@ export async function makePersona(label, { isAdmin = false, fullName = null } = 
   return persona;
 }
 
+/**
+ * Give a persona a real, ACTIVE staff membership.
+ *
+ * ★ makePersona({isAdmin:true}) writes profiles.is_admin DIRECTLY and creates NO
+ *   staff_memberships row. Since #45 that column is a trigger-maintained CACHE meaning
+ *   "has an active super_admin membership", so such a persona satisfies is_admin() but
+ *   has_staff_permission() answers FALSE for every key. Before #56 that did not matter —
+ *   the community surface asked is_admin(). It matters now: a suite that re-gates onto
+ *   has_staff_permission and keeps the old fixture would see every admin path 403.
+ *
+ * Writing the membership directly (rather than through admin_upsert_staff_membership) is
+ * the scripts/bootstrap-super-admin.mjs idiom: the Management API runs as postgres with no
+ * JWT, so auth.uid() is null and the RPC's own guard would refuse. The trigger still fires,
+ * so profiles.is_admin lands correctly for a super_admin and stays false for the others.
+ */
+export async function seedStaff(persona, roleKey, status = 'active') {
+  await runSql(`
+    insert into public.staff_memberships (user_id, role_key, status, activated_at, invited_at)
+    values ('${persona.id}'::uuid, ${lit(roleKey)}, ${lit(status)},
+            ${status === 'active' ? 'now()' : 'null'}, now())
+    on conflict (user_id) do update
+      set role_key = excluded.role_key,
+          status = excluded.status,
+          activated_at = excluded.activated_at,
+          updated_at = now()`);
+}
+
+/** Remove any staff membership, so a persona is a plain member again. */
+export async function clearStaff(persona) {
+  await runSql(`delete from public.staff_memberships where user_id = '${persona.id}'::uuid`);
+}
+
 /** SQL string literal with quote escaping. Fixtures only — never user input. */
 export function lit(v) {
   if (v === null || v === undefined) return 'null';
@@ -311,6 +343,7 @@ export async function resetShadow() {
       public.community_post_tags,
       public.community_notifications,
       public.community_announcement_reads,
+      public.community_moderation_events,
       public.community_comments,
       public.community_posts,
       public.subscriptions,

@@ -74,7 +74,12 @@ export function normalizeChannelSlug(input) {
  */
 export function channelAudienceAllows(input) {
   const o = input || {};
-  if (o.isAdmin === true) return true;
+  // #56: the SQL disjunct this mirrors was `m.is_admin` (an active Super Admin) and is now
+  // `public.user_is_community_staff(p_user)` — a holder of community.manage OR
+  // community.moderate. The parameter is renamed to match, because "admin" no longer
+  // describes who reaches an admins_only room. `isAdmin` is still accepted so an older
+  // caller cannot silently start failing closed on a renamed key.
+  if (o.isCommunityStaff === true || o.isAdmin === true) return true;
 
   const status = o.status === undefined || o.status === null ? 'active' : o.status;
   if (status !== 'active') return false;
@@ -233,7 +238,9 @@ export function channelAccessSummary(input) {
   const kind = o.kind === 'announcement' ? 'announcement' : 'text';
 
   if (o.mode === 'admins_only') {
-    return 'Only administrators can see this channel. It stays hidden from every member.';
+    // The stored value stays 'admins_only' — a compatibility identifier, not a claim about
+    // Super Admins. Since #56 it means "authorized Community staff only".
+    return 'Only Community staff can see this channel. It stays hidden from every member.';
   }
 
   let who;

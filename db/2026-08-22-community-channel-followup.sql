@@ -360,7 +360,7 @@ begin
     raise exception 'admin_save_community_channel is missing — run #40 then #41.';
   end if;
 
-  if position('or p_kind is not null' in v_src) > 0 then
+  if position('or p_kind           is not null' in v_src) > 0 then
     raise notice '#43: v_touched already accounts for p_kind — nothing to do.';
     return;
   end if;

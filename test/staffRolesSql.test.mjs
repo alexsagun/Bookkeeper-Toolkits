@@ -35,7 +35,7 @@ const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => readFileSync(join(REPO, rel), 'utf8').replace(/\r\n/g, '\n');
 
 const MIGRATION = 'db/2026-08-25-staff-authorization.sql';
-const CURRENT_SEED_MIGRATION = 'db/2026-09-01-student-progress-rankings.sql';
+const CURRENT_SEED_MIGRATION = 'db/2026-09-05-community-staff-authority.sql';
 const BOOTSTRAP = 'db/000_full_database_bootstrap.sql';
 const SQL_FILES = [MIGRATION, BOOTSTRAP];
 const SEED_SQL_FILES = [CURRENT_SEED_MIGRATION, BOOTSTRAP];
@@ -103,6 +103,33 @@ for (const file of SEED_SQL_FILES) {
   });
 }
 
+
+/**
+ * Every single-quoted SQL string on one line, with '' un-doubled. Deliberately a hand
+ * tokenizer rather than a regex: a description contains commas, apostrophes and em
+ * dashes, and a regex that tries to hold all three is how the assertion silently starts
+ * matching zero rows and passing.
+ */
+const LF = String.fromCharCode(10);
+
+const sqlStringsOf = (line) => {
+  const out = [];
+  let i = 0;
+  while (i < line.length) {
+    if (line[i] !== "'") { i += 1; continue; }
+    let j = i + 1;
+    let buf = '';
+    while (j < line.length) {
+      if (line[j] === "'" && line[j + 1] === "'") { buf += "'"; j += 2; continue; }
+      if (line[j] === "'") break;
+      buf += line[j];
+      j += 1;
+    }
+    out.push(buf);
+    i = j + 1;
+  }
+  return out;
+};
 // ── Roles ────────────────────────────────────────────────────────────────────
 
 let roleComparisons = 0;
@@ -125,6 +152,28 @@ for (const file of SEED_SQL_FILES) {
       assert.equal(Number(rank), js.rank, `${key}: rank disagrees between SQL and JS`);
       assert.equal(isProtected === 'true', js.isProtected,
         `${key}: is_protected disagrees — the last-Super-Admin guard keys off this`);
+    }
+  });
+
+  // Descriptions were pinned by NOTHING before #56, so the sentence Team & Roles shows
+  // and the sentence the database holds could drift apart silently. They are the same
+  // claim about what a role may do, and the staff invitation email quotes one of them.
+  test(`${file}: staff_roles seeds the same description as the JS mirror`, () => {
+    const rows = lastValuesBlock(read(file), 'staff_roles')
+      .split(LF)
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith("('"))
+      .map(sqlStringsOf)
+      .filter((parts) => parts.length >= 3);
+    assert.equal(rows.length, STAFF_ROLE_KEYS.length,
+      'every role row must parse into key, label and description');
+    for (const parts of rows) {
+      const key = parts[0];
+      const description = parts[parts.length - 1];
+      const js = STAFF_ROLES.find((r) => r.key === key);
+      assert.ok(js, `${key} is seeded in SQL but absent from STAFF_ROLES`);
+      assert.equal(description, js.description,
+        `${key}: the role description disagrees between SQL and src/lib/staffRoles.js`);
     }
   });
 }
@@ -153,9 +202,11 @@ for (const file of SEED_SQL_FILES) {
   });
 }
 
-test('the matrix is pinned in both current seed definitions, all 28 grants', () => {
-  assert.equal(JS_PAIRS.length, 28,
-    '19 super_admin + 6 operations_admin + 3 trainer; a change here must be deliberate');
+test('the matrix is pinned in both current seed definitions, all 32 grants', () => {
+  assert.equal(JS_PAIRS.length, 32,
+    '19 super_admin + 8 operations_admin + 5 trainer; a change here must be deliberate. '
+    + '#56 added community.manage + community.moderate to BOTH non-super roles, which is '
+    + 'what made its server-side re-gate mandatory rather than optional.');
   assert.equal(permissionComparisons, SEED_SQL_FILES.length, 'permissions unchecked in one file');
   assert.equal(roleComparisons, SEED_SQL_FILES.length, 'roles unchecked in one file');
   assert.equal(matrixComparisons, SEED_SQL_FILES.length, 'the matrix is unchecked in one file');

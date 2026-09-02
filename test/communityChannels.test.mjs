@@ -63,11 +63,26 @@ test('admins_only admits no member, whatever their plan or cohort', () => {
   }
 });
 
-test('an admin reaches every mode, including archived channels', () => {
+test('Community staff reach every mode, including archived channels', () => {
   for (const mode of AUDIENCE_MODES) {
     assert.equal(
+      channelAudienceAllows({ mode, isCommunityStaff: true, status: 'archived' }), true,
+      `Community staff should reach ${mode}`,
+    );
+    // #56 renamed the key; the legacy one must keep working so an older caller cannot
+    // silently start failing closed on a rename.
+    assert.equal(
       channelAudienceAllows({ mode, isAdmin: true, status: 'archived' }), true,
-      `admin should reach ${mode}`,
+      `the legacy isAdmin key should still reach ${mode}`,
+    );
+  }
+});
+
+test('neither staff key is satisfied by a falsy or truthy-but-not-true value', () => {
+  for (const bad of [false, undefined, null, 0, '', 'yes', 1]) {
+    assert.equal(
+      channelAudienceAllows({ mode: 'admins_only', isCommunityStaff: bad, inSpace: true }), false,
+      `isCommunityStaff=${JSON.stringify(bad)} must not open an admins_only channel`,
     );
   }
 });
@@ -298,7 +313,7 @@ test('an announcement channel is described as read-and-react', () => {
 
 test('an admins_only channel is described as hidden from members', () => {
   const s = channelAccessSummary({ mode: 'admins_only', planLabels: ['VIP'] });
-  assert.match(s, /Only administrators/);
+  assert.match(s, /Only Community staff/);
   assert.match(s, /hidden from every member/);
 });
 

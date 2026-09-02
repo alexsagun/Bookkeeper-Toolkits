@@ -218,7 +218,7 @@ Parameters:
 
 | name | type | required | description |
 |---|---|---|---|
-| `feature_id` | string | yes | Feature key, e.g. `mock_interview_simulator`, `bank_feed_ai`, `statement_converter`, `proposal_generator`, `chart_of_accounts`, `qbo_mastery`, `invoice_creator`, `discovery_call_simulator`, `niche_selector_quiz`, `sop_generator`. |
+| `feature_id` | string | yes | Feature key, e.g. `mock_interview_simulator`, `bank_feed_ai`, `statement_converter`, `proposal_generator`, `chart_of_accounts`, `qbo_mastery`, `invoice_creator`, `discovery_call_simulator`, `sop_generator`. |
 
 **5. `get_user_membership_summary`** — No parameters.
 Description: `Returns the signed-in user's own plan, membership status, expiry/days left, scope, and pending-request state. Use for any question about their plan, access, or expiry.`

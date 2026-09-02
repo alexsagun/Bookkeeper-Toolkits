@@ -319,8 +319,8 @@ to the support email shown on the payment screen or to Coach Alex.
   interview simulator is its second sub-tab (watch the guide video to unlock the launch
   button).
 - **"What should I do first as a beginner?"** → start with Accounting 101 and QuickBooks
-  Online Mastery in Training & Skills, take the Niche Selector Quiz, then move to the Job
-  Application stage (Authentic Branding → Resume → Interview prep).
+  Online Mastery in Training & Skills, then move to the Job Application stage (Authentic
+  Branding → Resume → Interview prep).
 - **"Show me the resume course."** → navigate to \`resumestrategy\`.
 - **"Book a session with Alex."** → \`linkedinopt\` (1-on-1 profile optimization) or
   \`coachalex\` (personalized coaching).

@@ -1,5 +1,5 @@
 <!-- GENERATED FILE — do not hand-edit. Regenerate with `npm run ai:knowledge`
-     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-08-30 -->
+     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-09-01 -->
 
 # Toolkits by Alex — Voice Assistant Knowledge
 
@@ -12,7 +12,7 @@ paths never change.
 
 ## 1. App overview
 
-- The toolkit bundles **37 tools** across three career stages: **01 Training &
+- The toolkit bundles **34 tools** across three career stages: **01 Training &
   Skills** (build your foundation), **02 Job Application** (land US clients), and
   **03 Client Management & Delivery** (onboard, operate, close the year), plus a Home
   dashboard.
@@ -56,7 +56,6 @@ paths never change.
 | Industry Accounting | `industryacc` | `/industry-accounting` | Accounting playbooks for 12 US industries with QuickBooks workflows. |
 | US Tax 101 | `ustax` | `/us-tax-101` | US tax basics for bookkeepers: key forms, deadlines, and IRS links. |
 | ProAdvisor Chat | `chat` | `/proadvisor-chat` | AI mentor chat for QuickBooks cleanups and day-to-day bookkeeping questions. |
-| Niche Selector Quiz | `niche` | `/niche-selector-quiz` | Eight-question quiz that recommends your best-fit bookkeeping industry niche. |
 
 ### Job Application
 
@@ -89,8 +88,6 @@ paths never change.
 | Month-End Checklist | `monthend` | `/month-end-checklist` | Interactive month-end close checklist. |
 | SOP Generator | `sopgen` | `/sop-generator` | AI generator for client-specific standard operating procedures. |
 | Sales Tax | `salestax` | `/sales-tax` | US sales-tax reference and calculator. |
-| Budgeting Tool | `budgeting` | `/budgeting` | Client budgeting workbook with variance tracking. |
-| Forecasting Tool | `forecasting` | `/forecasting` | Cash-flow and revenue forecasting workbook. |
 | Year-End Checklist | `yearendcheck` | `/year-end-checklist` | Year-end close checklist. |
 | 1099 Prep | `form1099` | `/1099-prep` | 1099 contractor prep tracker for year-end filing. |
 
@@ -211,8 +208,8 @@ to the support email shown on the payment screen or to Coach Alex.
   interview simulator is its second sub-tab (watch the guide video to unlock the launch
   button).
 - **"What should I do first as a beginner?"** → start with Accounting 101 and QuickBooks
-  Online Mastery in Training & Skills, take the Niche Selector Quiz, then move to the Job
-  Application stage (Authentic Branding → Resume → Interview prep).
+  Online Mastery in Training & Skills, then move to the Job Application stage (Authentic
+  Branding → Resume → Interview prep).
 - **"Show me the resume course."** → navigate to `resumestrategy`.
 - **"Book a session with Alex."** → `linkedinopt` (1-on-1 profile optimization) or
   `coachalex` (personalized coaching).

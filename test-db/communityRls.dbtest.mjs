@@ -33,6 +33,7 @@ import {
   resetShadow,
   runSql,
   seedMember,
+  seedStaff,
   spaceIdFor,
   sqlScalar,
 } from './_harness.mjs';
@@ -44,6 +45,10 @@ let admin, sampler, silver, vip;
 
 before(async () => {
   admin = await makePersona('c-admin', { isAdmin: true, fullName: 'Alex Admin' });
+  // #56: makePersona writes profiles.is_admin directly and creates NO staff_memberships
+  // row, but the community surface now asks has_staff_permission(), which reads that
+  // table. Without this the "admin" persona satisfies is_admin() and nothing else.
+  await seedStaff(admin, 'super_admin');
   sampler = await makePersona('c-sampler', { fullName: 'Sam Sampler' });
   silver = await makePersona('c-silver', { fullName: 'Silvia Silver' });
   vip = await makePersona('c-vip', { fullName: 'Vera Vip' });

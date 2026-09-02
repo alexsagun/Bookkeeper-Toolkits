@@ -118,14 +118,14 @@ export const STAFF_ROLES = [
     label: 'Operations Admin',
     rank: 50,
     isProtected: false,
-    description: 'Reviews access requests and payment proofs, grants courses, and runs batches and imports.',
+    description: 'Reviews access requests and payment proofs, grants courses, runs batches and imports, and configures and moderates the community.',
   },
   {
     key: 'trainer',
     label: 'Trainer',
     rank: 20,
     isProtected: false,
-    description: 'Creates courses and edits the ones assigned to them. No access to payments or students.',
+    description: 'Creates courses and edits the ones assigned to them, and configures and moderates the community. No access to payments or students.',
   },
 ];
 
@@ -152,6 +152,18 @@ export const SUPER_ADMIN_ROLE = 'super_admin';
  *
  * Both are additive later — insert a staff_role_permissions row — and neither can
  * be worked around from the client, because RLS reads the table, not this file.
+ *
+ * #56 added `community.manage` + `community.moderate` to BOTH non-super roles, taking
+ * the matrix from 28 grants to 32. That is a deliberate product decision, and it is what
+ * made #56's server work mandatory rather than optional: #45 left every community RPC and
+ * policy on `is_admin()` precisely BECAUSE only super_admin held these two keys, so the
+ * two predicates were equivalent (db/2026-08-25-staff-authorization.sql:1279). Granting
+ * them here without re-gating the server would have produced roles that look able in the
+ * UI and are refused at the first server call.
+ *
+ * Community authority deliberately carries nothing else with it. A Trainer who moderates
+ * the forum still cannot review payments, run batches, read progress reports, publish or
+ * delete a course, manage staff, or rename the sidebar.
  */
 export const ROLE_PERMISSIONS = {
   super_admin: [...STAFF_PERMISSION_KEYS],
@@ -162,11 +174,15 @@ export const ROLE_PERMISSIONS = {
     'students.import',
     'batches.manage',
     'student_progress.read',
+    'community.manage',
+    'community.moderate',
   ],
   trainer: [
     'courses.create',
     'courses.manage_assigned',
     'course_trainer.manage',
+    'community.manage',
+    'community.moderate',
   ],
 };
 
@@ -520,6 +536,41 @@ export const ADMIN_TAB_PERMISSION = {
 
 /** Tab ids a Trainer needs in order to reach the course builder at all. */
 export const COURSE_AUTHORING_TABS = ['course', 'qbomastery', 'resumestrategy', 'interview'];
+
+/**
+ * The Community authority a viewer holds, as three NAMED predicates.
+ *
+ * ★ WHY THIS REPLACES ONE BOOLEAN. Until #56 the whole Community suite branched on a
+ *   single `isAdmin = !!profile?.is_admin` — which since #45 means "active Super Admin"
+ *   — and that one flag stood for three different questions: may I open the channel
+ *   editor, may I moderate someone else's post, and am I staff here at all. Once
+ *   Operations Admins and Trainers hold the community permissions those answers can
+ *   differ, so they get separate names.
+ *
+ * ★ FAIL CLOSED WHILE LOADING. `!staffReady` returns false for both, never true.
+ *   Absent permission data means "no". The pre-#40 community bug was a client that
+ *   re-derived capabilities and failed OPEN while they loaded.
+ *
+ * ★ DEGRADED FALLS BACK TO is_admin, NOT TO "assume staff". A staff context we could
+ *   not read is answered by the legacy column — the same idiom as adminTabAllowed()
+ *   and gateScreen.js's passesAsStaff().
+ *
+ * staffCan() already requires `status === 'active'`, so an invited, suspended or
+ * revoked membership confers nothing here.
+ *
+ * NOTE: this is a MIRROR. The database is the boundary — has_staff_permission() in the
+ * community RPCs and RLS policies (#56). Hiding a control is a courtesy, not a gate.
+ */
+export function communityAuthority({ staff, staffReady, staffDegraded, isAdmin } = {}) {
+  if (staffDegraded) {
+    const legacy = Boolean(isAdmin);
+    return { canConfigure: legacy, canModerate: legacy, hasStaffAccess: legacy };
+  }
+  if (!staffReady) return { canConfigure: false, canModerate: false, hasStaffAccess: false };
+  const canConfigure = staffCan(staff, 'community.manage');
+  const canModerate = staffCan(staff, 'community.moderate');
+  return { canConfigure, canModerate, hasStaffAccess: canConfigure || canModerate };
+}
 
 /** True when this context should bypass the student paywall for staff work. */
 export function staffBypassesPaywall(ctx) {
