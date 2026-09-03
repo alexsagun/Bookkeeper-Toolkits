@@ -78,6 +78,21 @@ export const LESSON_VIDEO_RESIGN_MARGIN_MS = 5 * 60 * 1000;
 /** How long a lesson-video signed URL lasts. */
 export const LESSON_VIDEO_SIGN_TTL_SECONDS = 3600;
 
+/**
+ * How long the post-upload playback check may take.
+ *
+ * This was 20 s and it was the whole reported bug: it is the FIRST read of a
+ * just-uploaded object, so it always lands on a cold CDN, and the file it was reading
+ * kept its index at the end. Measured on this project's Storage with an 859 MB lesson,
+ * that cold tail seek took ~50 s — the check could not pass, ever, and the timeout was
+ * then reported as a codec fault.
+ *
+ * Faststart is enforced before upload now, so this probe reads the HEAD (~1.7 s cold),
+ * and 90 s is headroom rather than a wait anyone should see. Do not treat it as the fix
+ * for a slow verify: if this is being hit, something upstream is wrong.
+ */
+export const LESSON_VIDEO_VERIFY_TIMEOUT_MS = 90 * 1000;
+
 /** Exactly the values course_lessons_video_guard() refuses on INSERT. */
 export const LEGACY_VIDEO_PROVIDERS = Object.freeze(['youtube', 'vimeo', 'mp4']);
 
@@ -183,6 +198,317 @@ export function validateVideoFile(file) {
     return { ok: false, reason: 'too-large', message: validationMessage('too-large', formatBytes(size)) };
   }
   return { ok: true, reason: null, message: '' };
+}
+
+// ── Container inspection: codec + faststart, before a single byte is sent ──
+
+/**
+ * Why this exists, and why `validateVideoFile` was never enough.
+ *
+ * `validateVideoFile` checks the NAME, the MIME type and the SIZE. All three are
+ * properties of the container, and every one of them is satisfied by an H.265/HEVC
+ * file: `.mp4`, `video/mp4`, under the cap. So the only thing standing between an
+ * admin and a lesson no student can play was `probeVideoMetadata` on the local blob
+ * — which asks THE ADMIN'S OWN BROWSER whether it can decode the file.
+ *
+ * That is the wrong browser. Chrome on a Windows 11 machine with the HEVC extensions
+ * answers `canPlayType('video/mp4; codecs="hvc1…"') === 'probably'`, so an HEVC file
+ * sails through; Firefox ships no HEVC decoder on any platform, and neither do plenty
+ * of the phones and older laptops students actually use. The verify step exists
+ * precisely so an admin never publishes a lesson "broken only for the people who paid
+ * for it", and on codec it was measuring the one machine guaranteed not to be theirs.
+ *
+ * The container itself already carries the answer, so read it: `moov → trak → mdia →
+ * stbl → stsd` names the video codec outright, and the position of `moov` relative to
+ * `mdat` says whether the file is "faststart".
+ *
+ * ★ Faststart is NOT cosmetic here, and it is what made the reported bug unfixable.
+ *   With `moov` at the END, a player must seek to the tail before it knows anything.
+ *   Measured against this project's own Storage on an 859 MB lesson: a cold 2 MiB
+ *   tail range took ~50 s (CDN MISS), the same range warm took ~1.9 s, and a range at
+ *   the HEAD took ~1.7 s cold. The upload's own verification is by construction the
+ *   first-ever read of that object, so it always pays the cold price — and so does the
+ *   first student to press play. Moving `moov` to the front turns 50 s into 1.7 s.
+ *
+ * ★ Blocks only on a POSITIVE identification. If the container cannot be parsed, or
+ *   carries no video track we recognise, this reports `unknown` and lets the file
+ *   through to the existing decode probe — i.e. exactly today's behaviour, never worse.
+ *   Wrongly refusing a good H.264 lesson costs the admin their work; letting an
+ *   unparseable oddity reach a probe that already exists costs nothing new.
+ */
+
+/** The only video codecs a lesson may use. `avc1`/`avc3` are both plain H.264. */
+export const LESSON_VIDEO_CODECS = Object.freeze(['avc1', 'avc3']);
+
+/** Enough for ftyp + a front-loaded moov on any sane encoder. */
+const MP4_HEAD_SCAN_BYTES = 256 * 1024;
+/** Enough for a trailing moov: 1.68 MiB on the 36-minute file that prompted this. */
+const MP4_TAIL_SCAN_BYTES = 16 * 1024 * 1024;
+
+/** Human names for what we refuse, so the banner can say what the file actually is. */
+const CODEC_LABELS = Object.freeze({
+  avc1: 'H.264 / AVC', avc3: 'H.264 / AVC',
+  hvc1: 'H.265 / HEVC', hev1: 'H.265 / HEVC', dvh1: 'Dolby Vision (H.265)', dvhe: 'Dolby Vision (H.265)',
+  av01: 'AV1', vp09: 'VP9', vp08: 'VP8',
+  mp4v: 'MPEG-4 Part 2', 's263': 'H.263', 'jpeg': 'Motion JPEG', mjpa: 'Motion JPEG',
+  apch: 'Apple ProRes', apcn: 'Apple ProRes', apcs: 'Apple ProRes', apco: 'Apple ProRes',
+  ap4h: 'Apple ProRes 4444', ap4x: 'Apple ProRes 4444',
+});
+
+const FOURCC_RE = /^[\x20-\x7e]{4}$/;
+/** Boxes that contain other boxes, so the walker knows where to descend. */
+const CONTAINER_BOXES = Object.freeze(['moov', 'trak', 'mdia', 'minf', 'stbl']);
+
+function readU32(bytes, off) {
+  // Not `<<24`: that is a SIGNED 32-bit shift, so any box at or above 2 GiB — an
+  // 898 MB mdat is fine, a 2 GiB one is not — would come back negative.
+  return bytes[off] * 0x1000000 + ((bytes[off + 1] << 16) | (bytes[off + 2] << 8) | bytes[off + 3]);
+}
+
+function readU64(bytes, off) {
+  return readU32(bytes, off) * 0x100000000 + readU32(bytes, off + 4);
+}
+
+function fourccAt(bytes, off) {
+  return String.fromCharCode(bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]);
+}
+
+/**
+ * Walk one level of ISO-BMFF boxes out of `bytes`, returning them in file order.
+ *
+ * `baseOffset` is where `bytes[0]` sits in the whole file, so `.fileStart` is absolute
+ * even when the caller handed us a window from the middle or the tail. `totalSize`
+ * resolves the `size === 0` ("runs to end of file") form.
+ *
+ * A box may legitimately be LARGER than the window — an `mdat` almost always is — so
+ * a box is recorded from its header alone and `.complete` says whether its bytes are
+ * actually present here. Anything malformed stops the walk rather than guessing: a
+ * misparse that keeps going would invent boxes out of video payload.
+ */
+export function readBoxes(bytes, opts = {}) {
+  const { baseOffset = 0, totalSize = null, start = 0, end = bytes.length } = opts;
+  const limit = Math.min(end, bytes.length);
+  const boxes = [];
+  let off = start;
+  while (off + 8 <= limit) {
+    let size = readU32(bytes, off);
+    const type = fourccAt(bytes, off + 4);
+    let header = 8;
+    if (size === 1) {
+      if (off + 16 > limit) break;
+      size = readU64(bytes, off + 8);
+      header = 16;
+    } else if (size === 0) {
+      const fileEnd = totalSize == null ? baseOffset + limit : totalSize;
+      size = fileEnd - (baseOffset + off);
+    }
+    if (!FOURCC_RE.test(type) || size < header || !Number.isFinite(size)) break;
+    boxes.push({
+      type,
+      size,
+      header,
+      start: off,
+      dataStart: off + header,
+      dataEnd: off + size,
+      fileStart: baseOffset + off,
+      fileEnd: baseOffset + off + size,
+      complete: off + size <= limit,
+    });
+    off += size;
+  }
+  return boxes;
+}
+
+function findBox(bytes, boxes, type) {
+  for (const b of boxes) if (b.type === type) return b;
+  return null;
+}
+
+function childrenOf(bytes, box) {
+  if (!CONTAINER_BOXES.includes(box.type)) return [];
+  return readBoxes(bytes, { start: box.dataStart, end: Math.min(box.dataEnd, bytes.length) });
+}
+
+/**
+ * The video track's sample-entry fourcc, read out of `moov`.
+ *
+ * `bytes` is a window that CONTAINS the moov box; `moov` is its descriptor from
+ * `readBoxes`. Walks trak → mdia → (hdlr, minf → stbl → stsd) and returns the first
+ * sample entry belonging to a track whose handler is `vide`.
+ *
+ * ★ Walks the tree; never scans for the literal bytes `avc1`. A scan matches the
+ *   string wherever it appears — inside a `free` box, a filename in `udta`, or by
+ *   coincidence in compressed payload — so it can report H.264 for an HEVC file, which
+ *   is the exact failure this whole function exists to prevent.
+ */
+export function videoSampleEntryFourcc(bytes, moov) {
+  if (!moov) return null;
+  for (const trak of childrenOf(bytes, moov)) {
+    if (trak.type !== 'trak') continue;
+    const mdia = findBox(bytes, childrenOf(bytes, trak), 'mdia');
+    if (!mdia) continue;
+    const mdiaKids = childrenOf(bytes, mdia);
+    const hdlr = findBox(bytes, mdiaKids, 'hdlr');
+    // hdlr payload: version+flags(4), pre_defined(4), handler_type(4)
+    if (!hdlr || hdlr.dataStart + 12 > bytes.length) continue;
+    if (fourccAt(bytes, hdlr.dataStart + 8) !== 'vide') continue;
+    const minf = findBox(bytes, mdiaKids, 'minf');
+    if (!minf) continue;
+    const stbl = findBox(bytes, childrenOf(bytes, minf), 'stbl');
+    if (!stbl) continue;
+    const stsd = findBox(bytes, childrenOf(bytes, stbl), 'stsd');
+    // stsd payload: version+flags(4), entry_count(4), then the first sample entry box.
+    if (!stsd || stsd.dataStart + 16 > bytes.length) continue;
+    const entry = readBoxes(bytes, { start: stsd.dataStart + 8, end: Math.min(stsd.dataEnd, bytes.length) })[0];
+    if (entry && FOURCC_RE.test(entry.type)) return entry.type.toLowerCase();
+  }
+  return null;
+}
+
+/**
+ * Inspect an MP4 without reading it all: `readSlice(start, end)` must resolve to the
+ * bytes in `[start, end)` as a Uint8Array (in the browser, `file.slice(...)`).
+ *
+ * Reads the head; if `moov` is not there, walks straight to where the top-level boxes
+ * say it must be rather than hunting for it. Total read is a few hundred KB plus the
+ * moov itself — instant against a local File, which is the entire point of doing this
+ * before the upload rather than after.
+ *
+ * Never throws: an unreadable file resolves with `codec: null`, and the caller treats
+ * that as "unknown", not "bad".
+ */
+export async function inspectLessonVideo(fileSize, readSlice) {
+  const out = { codec: null, codecLabel: null, faststart: null, moovOffset: null, brands: [], readable: false };
+  const size = Number(fileSize);
+  if (!Number.isFinite(size) || size <= 0 || typeof readSlice !== 'function') return out;
+
+  const readAt = async (start, end) => {
+    const a = Math.max(0, Math.min(start, size));
+    const b = Math.max(a, Math.min(end, size));
+    if (b <= a) return new Uint8Array(0);
+    const raw = await readSlice(a, b);
+    return raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+  };
+
+  try {
+    const head = await readAt(0, Math.min(MP4_HEAD_SCAN_BYTES, size));
+    const headBoxes = readBoxes(head, { baseOffset: 0, totalSize: size });
+    if (!headBoxes.length) return out;
+    out.readable = true;
+
+    const ftyp = findBox(head, headBoxes, 'ftyp');
+    if (ftyp && ftyp.complete) {
+      for (let o = ftyp.dataStart; o + 4 <= ftyp.dataEnd && o + 4 <= head.length; o += 4) {
+        const brand = fourccAt(head, o).trim();
+        if (brand && FOURCC_RE.test(fourccAt(head, o))) out.brands.push(brand);
+      }
+    }
+
+    const mdat = findBox(head, headBoxes, 'mdat');
+    let moovBytes = head;
+    let moov = findBox(head, headBoxes, 'moov');
+
+    if (moov && !moov.complete) {
+      // Front-loaded but bigger than the head window — read exactly the moov.
+      moovBytes = await readAt(moov.fileStart, moov.fileEnd);
+      moov = readBoxes(moovBytes, { baseOffset: moov.fileStart, totalSize: size })[0] || null;
+      if (moov && moov.type !== 'moov') moov = null;
+    } else if (!moov) {
+      // Not in the head. The last box we parsed tells us exactly where the next one
+      // begins, so read from there rather than guessing at the tail — for the file
+      // that prompted this, that lands on byte 898,618,813 precisely.
+      const last = headBoxes[headBoxes.length - 1];
+      const nextStart = last ? last.fileEnd : 0;
+      if (nextStart > 0 && nextStart < size) {
+        const tail = await readAt(nextStart, Math.min(nextStart + MP4_TAIL_SCAN_BYTES, size));
+        const tailBoxes = readBoxes(tail, { baseOffset: nextStart, totalSize: size });
+        const found = findBox(tail, tailBoxes, 'moov');
+        if (found) {
+          if (found.complete) { moovBytes = tail; moov = found; }
+          else {
+            moovBytes = await readAt(found.fileStart, found.fileEnd);
+            const re = readBoxes(moovBytes, { baseOffset: found.fileStart, totalSize: size })[0];
+            moov = re && re.type === 'moov' ? re : null;
+          }
+        }
+      }
+    }
+
+    if (!moov) return out;
+    out.moovOffset = moov.fileStart;
+    // No mdat parsed at all (rare, e.g. fragmented) => nothing for moov to sit behind.
+    out.faststart = mdat ? moov.fileStart < mdat.fileStart : true;
+
+    const codec = videoSampleEntryFourcc(moovBytes, moov);
+    if (codec) {
+      out.codec = codec;
+      out.codecLabel = CODEC_LABELS[codec] || null;
+    }
+    return out;
+  } catch (_) {
+    return out;                    // unreadable is "unknown", never "bad"
+  }
+}
+
+/**
+ * The object's TOTAL size out of a `Content-Range: bytes 0-65535/900376169` header.
+ *
+ * ★ `Content-Length` is NOT an acceptable substitute and must never be used as a fallback.
+ *   On a 206 it is the length of the RANGE, not of the object — 65536 for the probe read
+ *   above. Worse, `Content-Range` is not a CORS-safelisted response header and Supabase
+ *   Storage does not expose it, so in the browser this returns null on every real call
+ *   while `Content-Length` cheerfully returns the chunk size. Substituting one for the
+ *   other compares 64 KiB against the whole upload and declares EVERY upload incomplete.
+ *   Verified from the live app origin on 2026-09-03: status 206, 65536 bytes returned,
+ *   `content-range` null.
+ *
+ * Returns null when the header is absent or unparseable — the caller must then skip the
+ * completeness check rather than invent a number.
+ */
+export function parseObjectTotalBytes(contentRange) {
+  const m = /^\s*bytes\s+\d+\s*-\s*\d+\s*\/\s*(\d+)\s*$/i.exec(String(contentRange || ''));
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+const FASTSTART_FIX = 'ffmpeg -i input.mp4 -c copy -movflags +faststart output.mp4';
+const REENCODE_FIX = 'ffmpeg -i input.mp4 -c:v libx264 -crf 23 -c:a aac -movflags +faststart output.mp4';
+
+/**
+ * Turn an inspection into the same `{ ok, reason, message }` shape `validateVideoFile`
+ * returns, so `handlePick` treats both identically and neither needs a new state.
+ */
+export function describeVideoContent(inspection) {
+  const ok = { ok: true, reason: null, message: '' };
+  if (!inspection || !inspection.readable) return ok;
+
+  if (inspection.codec && !LESSON_VIDEO_CODECS.includes(inspection.codec)) {
+    const named = inspection.codecLabel
+      ? `${inspection.codecLabel} (${inspection.codec})`
+      : `“${inspection.codec}”, which is not H.264,`;
+    return {
+      ok: false,
+      reason: 'codec-unsupported',
+      message: `This video is ${named}. It may well play on this computer, but Firefox has no `
+        + 'decoder for it at all and many phones, tablets and older laptops do not either — those '
+        + 'students would get a black player. Lesson videos must be H.264 video with AAC audio. '
+        + `Re-encode it first — in HandBrake pick a “Fast 1080p30” preset, or run: ${REENCODE_FIX}`,
+    };
+  }
+
+  if (inspection.faststart === false) {
+    return {
+      ok: false,
+      reason: 'not-faststart',
+      message: 'This MP4 keeps its index at the END of the file, so a player has to reach the very '
+        + 'end before it can start — about 50 seconds for a file this size, for you now and for '
+        + 'every student on their first play. Moving the index to the front is lossless and takes '
+        + `seconds: ${FASTSTART_FIX}`,
+    };
+  }
+
+  return ok;
 }
 
 // ── The upload state machine ───────────────────────────────────────────────

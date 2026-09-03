@@ -305,3 +305,79 @@ test('admin verdicts are fail-closed, and staffDegraded is always in scope', () 
     `these components read staffDegraded without destructuring it from useAuth(), which is a `
     + 'ReferenceError at render that the build cannot catch');
 });
+
+// ── 13. A verification TIMEOUT must never be reported as a bad file ────────────
+//
+// This is the third time this repo has blamed the admin's file for something the app
+// did. 95bd53d fixed it for the 413 ("stop blaming the admin's file") and left a
+// standing comment in courseVideo.js that there must never again be a 'too-large'
+// upload reason. The identical mistake then survived one state later, in verification:
+//
+//   setErrMsg(e?.message === 'timeout' || e?.code === 3
+//     ? 'The file uploaded, but the browser could not read it back as video.
+//        Re-export it as MP4 (H.264 + AAC) and upload again.'
+//     : '...')
+//
+// A timeout and a decode failure are not the same event and do not have the same
+// remedy. Measured on this project's Storage, the cold read of a freshly uploaded
+// 859 MB lesson took ~50 s against a 20 s budget — so the check timed out every time,
+// and the admin was told to spend hours re-encoding a file whose encoding was not what
+// stopped it, then re-upload gigabytes into the same wall, orphaning an object per pass.
+//
+// No unit test can reach this branch: it needs a real MediaError from a real <video>
+// against a real signed URL. So the SHAPE is pinned here instead. Mutation-tested:
+// putting `e?.message === 'timeout'` back into the re-encode branch fails this.
+test('a verification timeout is never answered with re-encode advice', () => {
+  const src = app();
+  const i = src.indexOf('function describeVerifyFailure');
+  assert.ok(i > 0, 'describeVerifyFailure was not found — verification error copy must stay centralised');
+  const end = src.indexOf('\n  }', src.indexOf('return \'The file uploaded, but it could not be authorized', i));
+  assert.ok(end > i, 'could not delimit describeVerifyFailure');
+  const body = src.slice(i, end);
+
+  // The timeout arm exists, and says the bytes are safe rather than accusing the file.
+  const timeoutArm = /e\?\.message === 'timeout'\)?\s*\{([\s\S]*?)\n    \}/.exec(body);
+  assert.ok(timeoutArm, 'no timeout branch found in describeVerifyFailure');
+  assert.doesNotMatch(timeoutArm[1], /re-encode|re-export|H\.264|AAC/i,
+    'the timeout branch must not tell the admin to re-encode: the file uploaded fine and '
+    + 'the encoding is not what timed out');
+  assert.match(timeoutArm[1], /saved|uploaded/i,
+    'the timeout branch must reassure the admin the bytes are not lost');
+
+  // Re-encode advice is allowed in exactly one place: a genuine format rejection, which
+  // the browser reports as MEDIA_ERR_SRC_NOT_SUPPORTED (4). The old code tested code 3
+  // and never 4, so it could not detect the one case it actually named.
+  assert.match(body, /e\?\.code === 4/,
+    'SRC_NOT_SUPPORTED (4) is the code a real format rejection produces and must be handled');
+  assert.match(body, /e\?\.code === 3/, 'DECODE (3) must stay distinct from a format rejection');
+  const reencodeArms = body.split('\n').filter((l) => /re-encode/i.test(l));
+  assert.ok(reencodeArms.length >= 1, 'a genuine format rejection should still advise re-encoding');
+});
+
+// ── 14. "Check again" must reuse its signed URL ────────────────────────────────
+//
+// Supabase Storage sits behind a CDN keyed on the FULL url, and re-signing changes the
+// query string. Measured on the 859 MB lesson: a cold tail range took 49.4 s, the SAME
+// signed url again took 1.9 s (CDN HIT), and a NEWLY signed url took 52.1 s — a fresh
+// MISS. Minting a URL per attempt is why pressing "Check again" could never succeed no
+// matter how many times it was pressed, which is exactly what the bug report showed.
+test('the verification retry reuses its signed URL instead of minting a cold one', () => {
+  const src = app();
+  assert.match(src, /signedRef\s*=\s*useRef\(null\)/,
+    'the signed URL must be cached across attempts');
+  const i = src.indexOf('async function signedUrlFor');
+  assert.ok(i > 0, 'signedUrlFor was not found');
+  const body = src.slice(i, i + 900);
+  assert.match(body, /cached\.path === path/,
+    'a cached URL may only be reused for the SAME object path');
+  assert.match(body, /LESSON_VIDEO_RESIGN_MARGIN_MS/,
+    'reuse must stop before the TTL expires, not at it');
+
+  // And verification must go through it, not straight to signLessonVideo.
+  const v = src.indexOf('async function verifyPrivateObject');
+  assert.ok(v > 0, 'verifyPrivateObject was not found');
+  const vb = src.slice(v, v + 1200);
+  assert.match(vb, /signedUrlFor\(path\)/, 'verification must use the cached signer');
+  assert.doesNotMatch(vb, /await signLessonVideo\(/,
+    'calling signLessonVideo directly here re-mints per attempt and guarantees a cold CDN miss');
+});

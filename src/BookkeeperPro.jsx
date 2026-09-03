@@ -79,10 +79,12 @@ import { ZOOM_HOST_SUFFIXES, parseReplayUrl } from './lib/lessonReplay';
 import {
   LESSON_VIDEO_BUCKET, LESSON_VIDEO_ACCEPT, LESSON_VIDEO_MAX_BYTES, LESSON_VIDEO_MIME,
   LESSON_VIDEO_CHUNK_BYTES, LESSON_VIDEO_RETRY_DELAYS, LESSON_VIDEO_SIGN_TTL_SECONDS,
+  LESSON_VIDEO_RESIGN_MARGIN_MS, LESSON_VIDEO_VERIFY_TIMEOUT_MS,
   UPLOAD_STATES, UPLOAD_EVENTS, nextUploadState, isUploadInFlight, hasUnfinishedUpload,
   blocksLessonSave, needsCloseConfirmation, sanitizeVideoFileName, buildLessonVideoPath,
   isLessonVideoPath, validateVideoFile, classifyLessonVideo, coursePublishBlockers,
   lessonVideoPayload, shouldResignPlayback, describeUploadError, formatBytes, formatMediaDuration,
+  inspectLessonVideo, describeVideoContent, parseObjectTotalBytes,
 } from './lib/courseVideo';
 import {
   INTAKE_FIELDS, INTAKE_SECTIONS,
@@ -15681,6 +15683,13 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
   const inputRef = useRef(null);
   const liveStepRef = useRef(-1);
   const mountedRef = useRef(true);
+  // ★ The signed URL for the object being verified, REUSED across "Check again".
+  //   Supabase Storage sits behind a CDN keyed on the full URL, and re-signing changes
+  //   the query string — so a retry with a fresh URL is a fresh cache MISS every time.
+  //   Measured on an 859 MB lesson: cold tail range 49.4 s, the SAME url again 1.9 s, a
+  //   NEW signed url 52.1 s. Minting one per attempt is why "Check again" could never
+  //   succeed no matter how many times it was pressed. { url, signedAt, path }.
+  const signedRef = useRef(null);
 
   const go = useCallback((event) => {
     setState((prev) => {
@@ -15880,12 +15889,81 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     return path;
   }
 
-  async function verifyPrivateObject(path) {
+  /**
+   * The signed URL for `path`, reused while it is comfortably inside its TTL.
+   *
+   * Re-signing per attempt is not free: it changes the CDN cache key, so every retry
+   * pays the full cold-miss cost again. See the note on signedRef.
+   */
+  async function signedUrlFor(path) {
+    const cached = signedRef.current;
+    const ttlMs = LESSON_VIDEO_SIGN_TTL_SECONDS * 1000;
+    if (cached && cached.path === path && Date.now() - cached.signedAt < ttlMs - LESSON_VIDEO_RESIGN_MARGIN_MS) {
+      return cached.url;
+    }
+    const { url, signedAt } = await signLessonVideo(path);
+    signedRef.current = { url, signedAt, path };
+    return url;
+  }
+
+  /**
+   * Prove the object is THERE, is AUTHORIZED, and is COMPLETE — cheaply.
+   *
+   * A ranged GET of the first 64 KiB answers all three: the status separates a refusal
+   * from a hit, `content-range` carries the object's true total length to compare against
+   * what we sent, and the leading bytes must be a real `ftyp` box so a JSON error body can
+   * never be mistaken for a video. Measured cold against this project's Storage: ~1.7 s,
+   * versus ~50 s to reach the tail of an 859 MB object.
+   *
+   * Throws an Error carrying a `.reason` the caller maps to copy. Never guesses.
+   *
+   * ★ FAILS OPEN when the request itself cannot be made. A definite answer from storage
+   *   (403, 404, a length that disagrees with what we sent) is a verdict and blocks. But a
+   *   fetch that never completes — CORS, an extension, a corporate proxy — says nothing
+   *   about the object, and treating it as a verdict would invent a NEW way to reject a
+   *   perfectly good upload. The decode probe still runs and is still the gate, so falling
+   *   through here is exactly the old behaviour.
+   */
+  async function confirmSignedObject(url, expectedBytes) {
+    let res;
+    try {
+      res = await fetch(url, { headers: { Range: 'bytes=0-65535' } });
+    } catch (_) {
+      return;                                  // cannot ask ≠ bad answer
+    }
+    if (res.status === 401 || res.status === 403) throw Object.assign(new Error('forbidden'), { reason: 'forbidden' });
+    if (res.status === 404) throw Object.assign(new Error('missing'), { reason: 'missing' });
+    if (!res.ok) throw Object.assign(new Error(`http ${res.status}`), { reason: 'http', status: res.status });
+
+    // Completeness, but ONLY when the object's true length is actually knowable. CORS does
+    // not expose Content-Range, so in the browser this is usually null and the check is
+    // skipped — never substituted with Content-Length, which on a 206 is the size of the
+    // range we asked for and would fail every upload. tus only calls onSuccess once the
+    // server has acknowledged the full declared length, so this is a second opinion, not
+    // the only one.
+    const total = parseObjectTotalBytes(res.headers.get('content-range'));
+    const expected = Number(expectedBytes);
+    if (total != null && Number.isFinite(expected) && expected > 0 && total !== expected) {
+      throw Object.assign(new Error('incomplete'), { reason: 'incomplete', total, expected });
+    }
+    const head = new Uint8Array(await res.arrayBuffer());
+    if (head.length >= 8 && String.fromCharCode(head[4], head[5], head[6], head[7]) !== 'ftyp') {
+      throw Object.assign(new Error('not-mp4'), { reason: 'not-mp4' });
+    }
+  }
+
+  async function verifyPrivateObject(path, expectedBytes) {
     // "Ready" has to mean the object EXISTS, can be AUTHORIZED, and DECODES from the very
     // URL a student will get. Anything less and the admin publishes a lesson that is broken
     // only for the people who paid for it.
-    const { url } = await signLessonVideo(path);
-    return probeVideoMetadata(url);
+    //
+    // The three halves are now proved separately, because collapsing them made every
+    // distinct failure look identical — and the one message they all shared blamed the
+    // admin's file. Presence/authorization/completeness come from a cheap ranged read;
+    // decoding still comes from the signed URL itself, so the invariant is unchanged.
+    const url = await signedUrlFor(path);
+    await confirmSignedObject(url, expectedBytes);
+    return probeVideoMetadata(url, LESSON_VIDEO_VERIFY_TIMEOUT_MS);
   }
 
   async function handlePick(file) {
@@ -15902,6 +15980,21 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
 
     const verdict = validateVideoFile(file);
     if (!verdict.ok) { setErrMsg(verdict.message); go(UPLOAD_EVENTS.VALIDATE_FAIL); announce(verdict.message); return; }
+
+    // What the CONTAINER says, before a single byte is sent. validateVideoFile can only
+    // see the name, the MIME type and the size — all of which an H.265 file satisfies —
+    // so this is the one place the codec and the index position are actually checked.
+    // Reads ~2 MB of the local file; measured at single-digit milliseconds.
+    const content = describeVideoContent(
+      await inspectLessonVideo(file.size, (start, end) => file.slice(start, end).arrayBuffer()),
+    );
+    if (!mountedRef.current) return;
+    if (!content.ok) {
+      setErrMsg(content.message);
+      go(UPLOAD_EVENTS.VALIDATE_FAIL);
+      announce(content.message);
+      return;
+    }
 
     releaseBlob();
     blobUrlRef.current = URL.createObjectURL(file);
@@ -15930,7 +16023,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
       if (!mountedRef.current) return;
       go(UPLOAD_EVENTS.UPLOAD_DONE);
       announce('Upload finished. Checking playback.');
-      await runVerification(uploadedPath);
+      await runVerification(uploadedPath, file?.size);
     } catch (e) {
       if (!mountedRef.current) return;
       const d = describeUploadError(e);
@@ -15942,9 +16035,53 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     }
   }
 
-  async function runVerification(path) {
+  /**
+   * Every distinct verification failure gets its own sentence.
+   *
+   * ★ A TIMEOUT MUST NEVER ADVISE RE-ENCODING. The old code was
+   *     e.message === 'timeout' || e.code === 3  ->  "Re-export it as MP4 (H.264 + AAC)"
+   *   which sent the admin off to re-encode for hours and re-upload gigabytes against a
+   *   deadline the file could not have met however it was encoded — leaving an orphaned
+   *   object in the bucket on every pass. It also tested code 3 (DECODE) but never code 4
+   *   (SRC_NOT_SUPPORTED), which is the code a browser actually returns when it rejects a
+   *   format — so it could not detect the one case it named.
+   */
+  function describeVerifyFailure(e) {
+    if (e?.reason === 'forbidden') {
+      return 'The file uploaded, but this account was not allowed to read it back. '
+        + 'Admin access to course videos is required.';
+    }
+    if (e?.reason === 'missing') {
+      return 'The file finished uploading but is not in storage yet. Wait a few seconds and check again.';
+    }
+    if (e?.reason === 'incomplete') {
+      return `Storage has ${formatBytes(e.total)} of this video but ${formatBytes(e.expected)} was sent, `
+        + 'so the upload did not finish cleanly. Upload it again.';
+    }
+    if (e?.reason === 'not-mp4') {
+      return 'What came back from storage is not the video file. Upload it again.';
+    }
+    if (e?.reason === 'network' || e?.reason === 'http') {
+      return 'The file uploaded, but storage could not be reached to confirm it. Check again in a moment.';
+    }
+    if (e?.message === 'timeout') {
+      // The bytes are safe. This is storage still distributing a large object, not a bad file.
+      return 'The file uploaded and is saved — storage is still making it available for playback, '
+        + 'which can take a moment for a large video. Check again.';
+    }
+    if (e?.code === 4) {                       // MEDIA_ERR_SRC_NOT_SUPPORTED
+      return 'The file uploaded, but the browser will not play it back. It must be MP4 with H.264 '
+        + 'video and AAC audio — re-encode it and upload again.';
+    }
+    if (e?.code === 3) {                       // MEDIA_ERR_DECODE
+      return 'The file uploaded, but the stored video is corrupt and cannot be decoded. Upload it again.';
+    }
+    return 'The file uploaded, but it could not be authorized for playback yet. Try the check again.';
+  }
+
+  async function runVerification(path, expectedBytes) {
     try {
-      const secs = await verifyPrivateObject(path);
+      const secs = await verifyPrivateObject(path, expectedBytes);
       if (!mountedRef.current) return;
       if (secs != null) setDuration(secs);
       pendingPathRef.current = path;
@@ -15953,9 +16090,10 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
       announce('Video uploaded and ready to save.');
     } catch (e) {
       if (!mountedRef.current) return;
-      setErrMsg(e?.message === 'timeout' || e?.code === 3
-        ? 'The file uploaded, but the browser could not read it back as video. Re-export it as MP4 (H.264 + AAC) and upload again.'
-        : 'The file uploaded, but it could not be authorized for playback yet. Try the check again.');
+      // The object stays put on purpose — "Check again" needs it, and it is what the
+      // orphan panel cleans up if the admin walks away instead.
+      pendingPathRef.current = path;
+      setErrMsg(describeVerifyFailure(e));
       go(UPLOAD_EVENTS.VERIFY_FAIL);
       announce('Upload finished, but the playback check failed.');
     }
@@ -16023,7 +16161,8 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
               onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) handlePick(f); }} />
           </label>
           <div className="text-[11px] mt-2 leading-relaxed" style={{ color: C.textSoft }}>
-            MP4 only — H.264 video, AAC audio. Up to {formatBytes(LESSON_VIDEO_MAX_BYTES)}.
+            MP4 only — H.264 video, AAC audio, index at the front (“faststart”).
+            Up to {formatBytes(LESSON_VIDEO_MAX_BYTES)}. All three are checked before anything uploads.
             <br />Students stream it from private storage; it is never published to a public link.
           </div>
         </>
@@ -16105,7 +16244,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
             {errMsg}
             {state === UPLOAD_STATES.STORAGE_OR_SIGNING_ERROR && pendingPathRef.current && (
               <button type="button" className="ml-2 underline font-semibold"
-                onClick={() => { go(UPLOAD_EVENTS.RETRY); runVerification(pendingPathRef.current); }}>
+                onClick={() => { go(UPLOAD_EVENTS.RETRY); runVerification(pendingPathRef.current, fileRef.current?.size); }}>
                 Check again
               </button>
             )}

@@ -1883,6 +1883,45 @@ docs **in the same change**:
   ↔ the `#44` `OBJECT_CHECKS` in `scripts/audit-db.mjs`. The SQL-parity suite exists because a
   client cap above the bucket's makes the browser promise a size Storage will 413 — after the file
   has already spent ten minutes transferring.
+  ★ **The CODEC and the index position are checked before the upload, not after it, and they
+  are checked in the FILE — never by asking a browser.** `validateVideoFile()` reads the name,
+  the MIME type and the size, and an H.265/HEVC file satisfies all three, so for the whole life
+  of #44 the only thing keeping HEVC out of a paid course was `probeVideoMetadata` on the local
+  blob — which asks **the admin's own browser** whether it can decode the file. That is the one
+  machine guaranteed not to be a student's: Chrome on Windows 11 with the HEVC extensions
+  answers `'probably'`, while Firefox ships no HEVC decoder on any platform. On 2026-09-03 an
+  859 MB `hvc1` lesson passed that gate. `inspectLessonVideo()` / `describeVideoContent()` now
+  read `moov → trak → mdia → stbl → stsd` out of the container itself and refuse anything that
+  is not `avc1`/`avc3`. Moving together: `LESSON_VIDEO_CODECS` ↔ `describeVideoContent()` ↔
+  `handlePick`'s gate in BookkeeperPro.jsx ↔ `test/courseVideoContent.test.mjs` ↔ the uploader's
+  helper copy. **Walk the boxes; never scan for the literal bytes `avc1`** — a scan matches the
+  string inside a `free` box, a filename in `udta`, or by luck in compressed payload, and
+  reporting H.264 for an HEVC file is the exact bug the module exists to prevent (pinned).
+  ★ It **fails OPEN on unknown**: an unparseable container reports `codec: null` and is allowed
+  through to the decode probe, i.e. exactly the old behaviour. Blocking on "we could not parse
+  it" would refuse good lessons whenever the walker meets a shape it does not know; the cost of
+  a wrong refusal is the admin's work, the cost of a miss is a probe that already runs.
+  ★ **Faststart is enforced, and it is not cosmetic.** With `moov` at the end of the file a
+  player must reach the tail before it knows anything. Measured against this project's Storage
+  on the 859 MB lesson: a cold 2 MiB tail range **49.4 s**, the same range warm 1.9 s, a range
+  at the head 1.7 s cold. That is paid by the verification probe — which is by construction the
+  first-ever read of a just-uploaded object, so it is always the cold case — and again by the
+  first student to press play.
+  ★ **Verification proves three things separately, and a TIMEOUT MUST NEVER ADVISE
+  RE-ENCODING.** `verifyPrivateObject` now does `signedUrlFor` → `confirmSignedObject` (a ranged
+  read of the first 64 KiB: status, `content-range` total vs the bytes sent, and a real `ftyp`
+  box, so a JSON error body can never pass as a video) → `probeVideoMetadata` at
+  `LESSON_VIDEO_VERIFY_TIMEOUT_MS`. `READY_TO_SAVE` still has exactly ONE inbound edge; only
+  what that edge proves has changed, and it is strictly more. The old code was
+  `e.message === 'timeout' || e.code === 3 ? 'Re-export it as MP4 (H.264 + AAC)…'`, which
+  collapsed a storage delay into a codec accusation — and tested code 3 (DECODE) but never
+  code 4 (`SRC_NOT_SUPPORTED`), the code a real format rejection actually produces, so it could
+  not detect the one case it named. `describeVerifyFailure()` is now the ONE place that copy
+  lives; `test/uiSafety.test.mjs` §13 ratchets it and is mutation-tested.
+  ★ **"Check again" reuses its signed URL** (`signedRef` + `signedUrlFor`). Storage sits behind
+  a CDN keyed on the full URL, so re-signing per attempt is a fresh cache MISS every time —
+  49.4 s cold, 1.9 s on the same URL, **52.1 s on a newly signed one**. That is why the retry
+  button could never succeed however many times it was pressed. Pinned by `uiSafety` §14.
   ★ **And the one limit that is in NO SQL file.** Supabase enforces
   `min(bucket file_size_limit, PROJECT-WIDE fileSizeLimit)`. The project-wide value is
   storage-api configuration: it is not in any `db/*.sql`, not in `storage.buckets`, and
