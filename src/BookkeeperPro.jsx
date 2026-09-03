@@ -15754,6 +15754,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
   const discardPending = useCallback(async () => {
     const path = pendingPathRef.current;
     pendingPathRef.current = null;
+    signedRef.current = null;              // don't hold a signed URL for an object we are dropping
     if (!path || path === savedPath) return;
     // Reference-aware even here: a duplicated course can legitimately share a path.
     await removeMediaIfUnreferenced([path]);
