@@ -557,6 +557,64 @@ test('a Super Admin keeps the base entitlement — the pre-#45 behaviour', () =>
   assert.equal(staffEntitlement(SUPER, fullBase), fullBase);
 });
 
+// ── The case that blanked production ────────────────────────────────────────
+//
+// staffEntitlement(ctx, null) WAS tested here — but only for OPS and TRAINER,
+// both of which fall past the Super Admin early return into the object-building
+// branch. The one combination that could return null was the one never asserted,
+// and it ran on every page load where my_staff_context() beat the profiles SELECT.
+// The root then did entitlement.allowsTab('community') in its component body, with
+// no ErrorBoundary anywhere, and React emptied #root: a blank white page.
+test('a Super Admin with NO plan still resolves to a usable entitlement', () => {
+  const ent = staffEntitlement(SUPER, null);
+  assert.notEqual(ent, null, 'returning the null base is what white-screened the app');
+  assert.equal(typeof ent.allowsTab, 'function');
+  assert.ok(ent.full, 'a Super Admin IS the profiles.is_admin branch (#45), which resolves FULL');
+  assert.ok(ent.allowsTab('community'), 'the exact call that threw');
+  assert.ok(ent.allowsTab('enrollments'), 'and every admin surface stays reachable');
+  assert.ok(ent.allowsTab('bankfeed'), 'including the ordinary tools a union would have dropped');
+});
+
+// A Super Admin who ALSO bought a scoped plan must not end up MORE restricted than
+// one who bought nothing. `base || FULL` would have returned the scoped object here
+// and refused every admin tab.
+test('a scoped base never narrows a Super Admin', () => {
+  const ent = staffEntitlement(SUPER, scopedBase);
+  assert.ok(ent.full, 'a paying Super Admin is not less privileged than a non-paying one');
+  assert.ok(ent.allowsTab('enrollments'));
+  assert.ok(ent.allowsTab('bankfeed'));
+});
+
+// The invariant, stated once over the whole input space. Anything nullish reaching
+// the root becomes `entitlement`, and the Provider passes it as an EXPLICIT value —
+// which overrides createContext(FULL_ENTITLEMENT) rather than falling back to it.
+test('staffEntitlement is total for active staff — no input yields a nullish entitlement', () => {
+  for (const [label, ctx] of [['super', SUPER], ['ops', OPS], ['trainer', TRAINER]]) {
+    for (const [baseLabel, base] of [['null', null], ['undefined', undefined], ['scoped', scopedBase], ['full', fullBase]]) {
+      const ent = staffEntitlement(ctx, base);
+      assert.ok(ent, `${label} + ${baseLabel} returned ${ent}`);
+      for (const fn of ['allowsTab', 'allowsStage', 'allowsCourse']) {
+        assert.equal(typeof ent[fn], 'function', `${label} + ${baseLabel} has no ${fn}()`);
+      }
+      // Calling them must not throw either — the chokepoint invokes all three.
+      ent.allowsTab('dashboard'); ent.allowsStage('home'); ent.allowsCourse({ id: 'x' });
+    }
+  }
+});
+
+// The union rule the fix must not have widened: bypassing the paywall is not the
+// same as buying the toolkit. Only super_admin may ever be `full`.
+test('the fix does not hand a Trainer or Ops Admin full access', () => {
+  for (const [label, ctx] of [['ops', OPS], ['trainer', TRAINER]]) {
+    for (const base of [null, undefined, scopedBase]) {
+      const ent = staffEntitlement(ctx, base);
+      assert.equal(ent.full, false, `${label} must never resolve full: true`);
+      assert.equal(ent.allowsTab('bankfeed'), false, `${label} gains no student tools`);
+      assert.equal(ent.allowsTab('invoice'), false);
+    }
+  }
+});
+
 test('an Operations Admin gains their admin tabs on top of their own plan', () => {
   const ent = staffEntitlement(OPS, scopedBase);
   assert.ok(ent.allowsTab('enrollments'), 'the Ops tabs are added');

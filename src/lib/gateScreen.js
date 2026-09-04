@@ -57,6 +57,9 @@ export const GATE_SCREENS = Object.freeze({
   MEMBERSHIP_EXPIRED: 'membership_expired',
   RENEWAL_PAYWALL: 'renewal_paywall',
   PAYWALL: 'paywall',
+  // The profile READ failed (not "there is no profile"). Every membership fact is
+  // unknown, so no price may be quoted — see the PROFILE_UNAVAILABLE arm below.
+  PROFILE_UNAVAILABLE: 'profile_unavailable',
   APPROVAL_PENDING: 'approval_pending',
   APP: 'app',
 });
@@ -113,7 +116,7 @@ export function resolveGateScreen(state) {
     loading, recovery, user, profileReady, profile,
     staffReady = true, staffDegraded = false, staffMembership,
     staff, enroll, renewNow = false, inviteDismissed = false, hasInviteToken = false,
-    inviteDeferred = false,
+    inviteDeferred = false, profileFailed = false,
     requireApproval = true, requireEnrollment = true,
   } = s;
 
@@ -246,6 +249,31 @@ export function resolveGateScreen(state) {
         // because the staff answer has not arrived yet.
         if (!staffReady && PRICING_SCREENS.has(decided.screen)) {
           return { screen: GATE_SCREENS.SPLASH, reason: 'staff_context_loading' };
+        }
+        // ★ IDENTITY UNKNOWN — DO NOT QUOTE A PRICE.
+        //   The profile READ failed, so `profile` is null and every fact this
+        //   verdict rests on was read off a row we never saw: is_admin is falsy,
+        //   is_paid is falsy, and enrollGateState() therefore falls all the way
+        //   through to 'paywall'. That is indistinguishable from a brand-new unpaid
+        //   signup, which is how the account that OWNS this product was shown its
+        //   own pricing cards. Hold on a recoverable screen instead; AuthProvider
+        //   retries the read on focus and on an interval, so the hold ends by
+        //   itself. This grants nothing — authority still fails closed.
+        //
+        //   PAYWALL only, NOT the whole PRICING_SCREENS set — the same distinction
+        //   staffOnlyWouldSeeAPrice() draws above. MEMBERSHIP_EXPIRED and
+        //   RENEWAL_PAYWALL show a price only to someone who already bought, and
+        //   they are the only surfaces carrying Renew / Extend / Upgrade; replacing
+        //   them would strand a lapsed member away from the one screen that can
+        //   restore their membership. (With profile === null they are unreachable
+        //   anyway — enrollGateState needs profile.is_paid to return 'expired'.)
+        //
+        //   And it sits HERE, after enroll.ready / enroll.configured and after
+        //   `decided`, not in front of them: checking it earlier would replace
+        //   SPLASH and ENROLL_PENDING, which are already correct and already
+        //   price-free. That is the #50 mistake this file has made once.
+        if (profileFailed && decided.screen === GATE_SCREENS.PAYWALL) {
+          return { screen: GATE_SCREENS.PROFILE_UNAVAILABLE, reason: 'profile_unavailable' };
         }
         return decided;
       }

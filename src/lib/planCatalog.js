@@ -171,7 +171,7 @@ export function planEntitlement(planKey) {
     full: false, planKey, label, scopeLabel: cfg.scopeLabel,
     allowsStage: (id) => stageSet.has(id),
     // Home is unconditionally allowed — RestrictedTab's "Back to Dashboard" fallback (and
-    // the stale-lastTab reset) must never dead-end, even if a future plan omits it.
+    // must never dead-end, even if a future plan omits it.
     allowsTab: (id) => id === 'dashboard' || tabSet.has(id),
     // Course-level scope within an allowed catalog. No `courseTier` → all courses the tab
     // allows. `sampler` → only `access_tier='essentials'` courses. RLS is the real boundary;
@@ -182,6 +182,14 @@ export function planEntitlement(planKey) {
 }
 
 export const FULL_ENTITLEMENT = planEntitlement(null);
+
+// The fail-CLOSED counterpart: Home/Dashboard only, never full. Used where an
+// entitlement is structurally required but could not be resolved — the caller
+// must not be able to reach for `FULL_ENTITLEMENT` as a "safe" default, because
+// for a staff member with no plan `planEntitlement(null)` IS full, and handing a
+// Trainer the whole paid toolkit is exactly what the union rule forbids.
+// `__no_access__` is not a real plan key, so it lands on UNKNOWN_PLAN_ENTITLEMENT.
+export const NO_ACCESS_ENTITLEMENT = planEntitlement('__no_access__');
 
 // Drop stages/tabs a plan can't access. Keeps stable stage/tab ids + group keys, so
 // per-user collapse state and admin `effLabel` overrides are unaffected. Empty groups

@@ -34,7 +34,7 @@
 //  4. One-time adopt any pre-auth ("legacy") global localStorage data into the
 //     first signed-in user's namespace.
 // ---------------------------------------------------------------------------
-import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { supabase, supabaseConfigured } from '../lib/supabase';
 import {
   EMPTY_STAFF_CONTEXT, EMPTY_STAFF_MEMBERSHIP, staffCan, staffContextFromRpc,
@@ -58,7 +58,9 @@ const LEGACY_KEYS = [
   'payments:invoices',
   'persfin:transactions',
   'qbdiag:name', 'qbdiag:firm', 'qbdiag:email',
-  'nav:lastTab', 'nav:interviewSub',
+  // 'nav:lastTab' was retired when "/" became unconditionally the Dashboard — it
+  // has no reader and no writer, so migrating it would adopt a dead key.
+  'nav:interviewSub',
   'enroll:soundAlert',
   'community:lastSpace', 'community:lastChannel', 'community:railGroups',
   // Theme pref. Note: useTheme also keeps a BARE localStorage mirror of this key
@@ -144,6 +146,10 @@ function applyStorageUser(uid) {
 // call would strand the whole app on AuthSplash. Mirrors the profile-fetch (8s) and
 // enrollment-gate (7s) fail-open idiom.
 const AUTH_CALL_TIMEOUT_MS = 8000;
+// How often to re-attempt a profile read that failed. Slow on purpose: the focus /
+// visibilitychange listeners carry the common case (the user comes back and it just
+// works), and this is only the backstop for a tab left open on a dead connection.
+const PROFILE_RETRY_MS = 15000;
 const withTimeout = (promise, ms, fallback) =>
   Promise.race([promise, new Promise((res) => setTimeout(() => res(fallback), ms))]);
 
@@ -188,6 +194,19 @@ export function AuthProvider({ children }) {
   // (so a pending user never briefly sees the dashboard) without an extra loading flag —
   // and stays set across refreshProfile() refetches (profile is non-null then, so no flash).
   const [profileFetchedFor, setProfileFetchedFor] = useState(null);
+  // ★ "The fetch FAILED" is NOT the same fact as "this account has no profile row",
+  //   and conflating them is how the owner of the product got shown its pricing page.
+  //   The fetch below deliberately fails OPEN (profile=null, profileFetchedFor=uid) so
+  //   the gate can never hang — but every membership fact downstream is then read off a
+  //   profile we could not read, and enrollGateState() bottoms out at 'paywall'. This
+  //   flag lets the gate tell the two apart and hold instead of quoting a price.
+  //   It grants nothing; authority still fails closed.
+  const [profileFailed, setProfileFailed] = useState(false);
+  // The LIVE signed-in uid, for async writes that must not land after a session
+  // change. refreshProfile() closes over `session` from its own render, so it
+  // cannot detect a sign-out that happened while its request was in flight — see
+  // the guard in refreshProfile() for why that suddenly matters.
+  const uidRef = useRef(null);
   const [loading, setLoading] = useState(true);
   // Staff authority (#45). Starts EMPTY and stays EMPTY unless the server says
   // otherwise — absent permission data means "no", never "yes".
@@ -301,6 +320,7 @@ export function AuthProvider({ children }) {
     if (!uid) {
       setProfile(null);
       setProfileFetchedFor(null);
+      setProfileFailed(false);
       return;
     }
     let active = true;
@@ -317,6 +337,7 @@ export function AuthProvider({ children }) {
       }
       if (!active) return;
       if (res.error) console.error('[auth] profile fetch failed — proceeding without profile:', res.error.message);
+      setProfileFailed(Boolean(res.error));
       setProfile(res.data ?? null);
       setProfileFetchedFor(uid); // mark "first fetch done" even on error (fail open, don't hang the gate)
     })();
@@ -400,9 +421,45 @@ export function AuthProvider({ children }) {
       console.error('[auth] profile refresh failed:', error.message);
       return null;
     }
+    // ★ DROP A RESPONSE FOR AN ACCOUNT THAT IS NO LONGER SIGNED IN. The initial
+    //   fetch has always guarded its write with an `active` flag; this one never
+    //   needed to, because it only ever ran from an explicit user action (a poll
+    //   button, the avatar uploader). The profileFailed retry effect below now
+    //   calls it UNATTENDED every PROFILE_RETRY_MS and on every focus — and only
+    //   while the connection is already bad, i.e. exactly when a reply is most
+    //   likely to outlive the session. Without this, signing out and straight back
+    //   in as someone else could land account A's row — including its is_admin —
+    //   on account B, and the root memo's first branch turns that into FULL access.
+    if (uidRef.current !== uid) return null;
     setProfile(data ?? null);
+    setProfileFailed(false);   // a successful read clears the "identity unknown" hold
     return data ?? null;
   }
+
+  // Keep uidRef pointing at the live session for the guard in refreshProfile().
+  useEffect(() => { uidRef.current = session?.user?.id ?? null; }, [session?.user?.id]);
+
+  // ── Self-heal a failed profile read ───────────────────────────────────────
+  // The gate holds an unknown identity on a recoverable screen rather than
+  // quoting it a price, so that hold MUST be able to end on its own — otherwise a
+  // transient blip strands the user until they think to reload. Retry when the tab
+  // comes back to the foreground, and on a slow interval in case it never does.
+  // Inert unless a fetch actually failed, so this costs a healthy session nothing.
+  useEffect(() => {
+    if (!profileFailed || !session?.user?.id) return;
+    let stop = false;
+    const retry = () => { if (!stop && !document.hidden) refreshProfile(); };
+    const id = setInterval(retry, PROFILE_RETRY_MS);
+    window.addEventListener('focus', retry);
+    document.addEventListener('visibilitychange', retry);
+    return () => {
+      stop = true;
+      clearInterval(id);
+      window.removeEventListener('focus', retry);
+      document.removeEventListener('visibilitychange', retry);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profileFailed, session?.user?.id]);
 
   const value = {
     session,
@@ -412,6 +469,10 @@ export function AuthProvider({ children }) {
     // True once the first profile fetch for the current user has settled (or there's no user).
     // The gate waits on this so it never renders the app/approval screens with a stale null profile.
     profileReady: !session?.user || profileFetchedFor === session?.user?.id,
+    // True when the first profile read for this user ERRORED (as opposed to
+    // returning no row). The gate uses it to refuse to show a PRICE for an identity
+    // it could not read — see resolveGateScreen()'s PROFILE_UNAVAILABLE arm.
+    profileFailed,
     refreshProfile,
 
     // ── Staff authority (#45) ──

@@ -17,6 +17,7 @@ import {
   PLAN_ENTITLEMENTS,
   PLAN_LABELS,
   FULL_ENTITLEMENT,
+  NO_ACCESS_ENTITLEMENT,
   extensionPrice,
   filterStagesForEntitlement,
   planEntitlement,
@@ -305,4 +306,23 @@ test('numeric strings are accepted, because price_php is a numeric column', () =
   // which only accepted numbers would render ₱0 for a real price.
   assert.equal(phpAmount('16999'), '₱16,999');
   assert.equal(phpAmount('2999.50'), '₱2,999.5');
+});
+
+// ── The fail-CLOSED constant ────────────────────────────────────────────────
+//
+// It exists so that a caller needing "an entitlement, whatever happens" has
+// something safe to reach for. Without it the obvious default is FULL_ENTITLEMENT
+// — or `planEntitlement(planKey)`, which for a staff member with no plan means
+// planEntitlement(null), which IS full. Either one silently hands a Trainer the
+// entire paid toolkit, and that is precisely the rule this module enforces.
+test('NO_ACCESS_ENTITLEMENT grants Home and nothing else', () => {
+  assert.equal(NO_ACCESS_ENTITLEMENT.full, false, 'it must never be a full entitlement');
+  assert.equal(NO_ACCESS_ENTITLEMENT.allowsTab('dashboard'), true, 'Home must never dead-end');
+  for (const tab of ['bankfeed', 'invoice', 'community', 'qbomastery', 'enrollments']) {
+    assert.equal(NO_ACCESS_ENTITLEMENT.allowsTab(tab), false, `${tab} must be refused`);
+  }
+  assert.equal(NO_ACCESS_ENTITLEMENT.allowsCourse({ access_tier: 'essentials' }), false);
+  assert.equal(NO_ACCESS_ENTITLEMENT.allowsCourse({ access_tier: 'standard' }), false);
+  assert.notEqual(NO_ACCESS_ENTITLEMENT.full, FULL_ENTITLEMENT.full,
+    'the two constants must not be the same thing');
 });

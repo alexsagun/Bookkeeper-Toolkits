@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import './index.css';                 // Tailwind (compiled via PostCSS) — replaces the old CDN <script>
 import BookkeeperProToolkit from './BookkeeperPro.jsx';
 import { AuthProvider } from './auth/AuthProvider.jsx';
+import AppErrorBoundary from './AppErrorBoundary.jsx';
 
 // ---------------------------------------------------------------------------
 // Adapters — these let the unchanged artifact component run in a normal browser.
@@ -76,10 +77,16 @@ if (typeof window !== 'undefined' && !window.__anthropicFetchPatched) {
   window.__anthropicFetchPatched = true;
 }
 
+// 3) Error boundary
+//    OUTSIDE AuthProvider, so a crash in the provider itself is caught too. Without
+//    this, any uncaught render error empties #root and the user gets a blank white
+//    page with no message and no way back. See src/AppErrorBoundary.jsx.
 createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <AuthProvider>
-      <BookkeeperProToolkit />
-    </AuthProvider>
+    <AppErrorBoundary>
+      <AuthProvider>
+        <BookkeeperProToolkit />
+      </AuthProvider>
+    </AppErrorBoundary>
   </React.StrictMode>
 );

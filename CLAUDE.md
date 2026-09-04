@@ -71,10 +71,10 @@ SQL-parity suites that read `db/*.sql` (`approveGrantSql`, `studentProgressSql`,
 The app is intentionally a **single-file monolith**. Keep it that way unless a refactor is
 explicitly requested (see Roadmap, Phase 3).
 
-### [src/main.jsx](src/main.jsx) — entry + two critical shims (do not remove)
+### [src/main.jsx](src/main.jsx) — entry + three critical pieces (do not remove)
 
-Mounts `<BookkeeperProToolkit />` (wrapped in `<AuthProvider>` — see Authentication) and installs
-two shims that the tool code depends on:
+Mounts `<BookkeeperProToolkit />` (wrapped in `<AuthProvider>` — see Authentication, and that pair
+wrapped in **`<AppErrorBoundary>`** — see below) and installs two shims that the tool code depends on:
 
 1. **`window.storage`** → wraps `localStorage` with an async `get`/`set` API. The app was authored
    in Claude artifacts and calls `window.storage` directly for all persistence. **Now per-user
@@ -87,7 +87,24 @@ two shims that the tool code depends on:
    server-side. (It only matches `api.anthropic.com`, so Supabase calls to `*.supabase.co` pass
    through untouched.) **Removing either shim breaks persistence or AI calls.**
 
-A third do-not-remove piece lives in [index.html](index.html): a tiny inline **theme boot script**
+3. **[src/AppErrorBoundary.jsx](src/AppErrorBoundary.jsx)** → the app's ONLY React error boundary,
+   mounted **outside** `AuthProvider` so a crash in the provider is caught too. Before it existed,
+   any uncaught render error unmounted the whole tree and left `#root` empty: a blank white page
+   with no message and no way back — which is exactly how the 2026-09-03 null-entitlement crash
+   presented to the account that owns the product (found only by opening DevTools). It renders the
+   logo, "Something went wrong", **Reload**, **Sign out**, and a collapsed `<details>` with the
+   error + component stack.
+   ★ It **imports nothing from BookkeeperPro.jsx** — a safety net that pulls in the 35k-line
+   monolith shares every module-scope hazard of the thing it is catching. It uses only React, the
+   `src/index.css` tokens, `/logo-alex.png`, and the Supabase client (so Sign out can clear a
+   wedged session).
+   ★ **One boundary, at the root — do NOT add per-`TabPanel` boundaries.** `TabPanel` and
+   `RestrictedTab` each apply `hidden={!active}` to their OWN root div, so a boundary wrapping one
+   *replaces* that div when it catches: the fallback loses `hidden` and a crashed **background** tab
+   paints its error card over the tab you are actually looking at.
+   Pinned by `test/uiSafety.test.mjs` §16.
+
+A fourth do-not-remove piece lives in [index.html](index.html): a tiny inline **theme boot script**
 that reads the bare `localStorage['ui:theme']` pref (falling back to `prefers-color-scheme`) and sets
 `data-theme` on `<html>` **before first paint** — this is what makes dark mode flicker-free. The
 `useTheme` hook in BookkeeperPro.jsx keeps that key in sync (see Styling conventions → Theme).
@@ -604,9 +621,18 @@ keep-alive** (see below). Four pieces must stay in sync when adding/removing a t
   (admin, or enrollment flag off) so the param never strands in the URL — deliberately not keyed
   on gate state, so a pending student's `?panel=settings` still opens after approval.
   `vercel.json` rewrites all non-`/api` paths to `/`, so pretty-path deep links never 404. The
-  root restores the tab from the URL **after** the auth gate, persists the last tab to
-  `window.storage` (`nav:lastTab`), and handles Back/Forward via a `popstate` listener (which also
-  re-syncs `accountPanel`).
+  root seeds `tab` from the URL at mount (`initialRouteRef`) and handles Back/Forward via a
+  `popstate` listener (which also re-syncs `accountPanel`).
+  ★ **The bare root URL ALWAYS renders the Dashboard, and there is no "resume last tab".**
+  A `nav:lastTab` restore effect used to redirect `/` to whatever the user last opened and rewrite
+  the address bar with `replaceState` while doing it. It was removed on 2026-09-03 because both
+  halves were broken: its deps were `[user?.id]`, so the `entitlement` it closed over came from the
+  render in which the uid first appeared — before `enroll.ready`, before `staffReady`, usually
+  before the profile — where `planEntitlement(null)` is **FULL**, making the "skip a tab their plan
+  can't open" guard permanently inert; and its sibling writer persisted `tab` on the **first
+  commit**, seeded from the URL, while the gate was still showing a splash, so one deep-link visit
+  to `/courses/quickbooks-online-mastery` permanently made `/` open the course catalog. The key is
+  gone from `LEGACY_KEYS` too. `test/uiSafety.test.mjs` §17 pins its absence.
 - **Sidebar items are real `<a href={tabHref(id)}>` links.** Plain left-click navigates in-app
   (`shouldHandleInAppClick(e)` then `preventDefault` + `setTab`); Ctrl/Cmd/middle-click opens the
   section in a new browser tab natively; a hover `ExternalLink` icon opens it in a new tab explicitly.
@@ -648,8 +674,13 @@ The whole app sits behind a **Supabase email/password auth gate**. Anonymous vis
 full-screen login/signup screen; only signed-in users reach the toolkit.
 
 - **Provider/hook:** [src/auth/AuthProvider.jsx](src/auth/AuthProvider.jsx) wraps the app in
-  [main.jsx](src/main.jsx). Any component reads auth via `const { session, user, profile, loading,
-  profileReady, configured, signUp, signIn, signOut, resetPassword, refreshProfile } = useAuth()`.
+  [main.jsx](src/main.jsx) (inside `<AppErrorBoundary>` — see the Deployment section). Any component
+  reads auth via `const { session, user, profile, loading, profileReady, profileFailed, configured,
+  signUp, signIn, signOut, resetPassword, refreshProfile } = useAuth()`.
+  **`profileFailed`** is "the first profile read for this user ERRORED", which is deliberately NOT
+  the same fact as "this account has no profile row" — the fetch fails open, so only this flag can
+  tell the gate that an unknown identity must not be quoted a price. See the auth-gate bullet in
+  "Keeping docs current".
   `profile` is the row from the Supabase `profiles` table and carries `is_paid` / `plan` (used by the
   planned Phase-2 paywall), `is_admin` (course-authoring gate — see the Course platform section), and
   `approval_status` / `rejection_reason` (the temporary admin-approval gate — see below). `profileReady`
@@ -1064,6 +1095,26 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   silver + vip = explicit `full:true`) → `planEntitlement(key)` → `{ full, label, scopeLabel,
   allowsStage(id), allowsTab(id), allowsCourse(course) }` (`allowsCourse` gates individual courses
   **within** a catalog by `course.access_tier` — the QBO Essentials/Mastery split).
+  ★ **AN ENTITLEMENT IS NEVER NULLISH, and on 2026-09-03 one was.** `staffEntitlement(ctx, base)`
+  returned its `base` verbatim for a Super Admin, and the root calls it as
+  `staffEntitlement(staff, enrollPass ? planEntitlement(planKey) : null)` — where `enrollPass` is
+  **permanently false for a Super Admin**, because `useEnrollmentGate` fires its queries for any uid
+  and a Super Admin holds no `subscriptions` row, so `enrollGateState()` returns `'paywall'`. The
+  null became `entitlement` and was dereferenced by `entitlement.allowsTab('community')` in the
+  root's **component body** — ~800 lines above the gate that would have rendered a splash — so
+  React unmounted the tree and production served a **blank white page**. It only appeared when
+  `my_staff_context()` beat the `profiles` SELECT (two independent parallel effects on the same
+  `[uid]` in AuthProvider), which is why it looked intermittent; after a *failed* profile fetch it
+  was durable for the whole session. Fixed in three places, all of which must stay:
+  `staffEntitlement` returns `base && base.full ? base : FULL_ENTITLEMENT` for a Super Admin (they
+  ARE the `profiles.is_admin` branch — #45 makes that column mean exactly "active super_admin", so
+  the two must never disagree, and a truthy-but-**scoped** base must not narrow them either); the
+  root memo has a loud fail-CLOSED `if (!resolved)` fallback; and `src/AppErrorBoundary.jsx` now
+  catches any render error instead of blanking the page. ★ That fallback may **never** be
+  `|| FULL_ENTITLEMENT` or `|| planEntitlement(planKey)` — for a non-super staff member `planKey`
+  is null and `planEntitlement(null)` **is** FULL, so either one hands a Trainer the whole paid
+  toolkit. Use `NO_ACCESS_ENTITLEMENT`. Pinned by `test/staffRoles.test.mjs`,
+  `test/planCatalog.test.mjs` and `test/uiSafety.test.mjs` §15–16.
   ★ **`planEntitlement` is three-way and FAILS CLOSED.** A null/empty key → FULL (admins, flag off,
   grandfathered terms with no plan string). A known key → its config. An **unknown non-null key**
   (a deleted plan, a typo, stale local state) → **Home/Dashboard only**, labelled "Plan no longer
@@ -1076,8 +1127,8 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   open; CourseProgram has a deep-link guard). The root resolves `entitlement` once (memoized on
   `enroll.sub?.plan_key || profile.plan`; admins/flag-off → FULL) and wraps the app shell in the
   provider. **Enforcement is a single chokepoint** — the `visitedTabs.map` render (the old "Phase 2
-  paywall hooks" seam): a disallowed active tab reached ANY way (deep-link, popstate, stale
-  `nav:lastTab`, programmatic `goto`) renders **`RestrictedTab`** (a polished upsell → Dashboard)
+  paywall hooks" seam): a disallowed active tab reached ANY way (deep-link, popstate,
+  programmatic `goto`) renders **`RestrictedTab`** (a polished upsell → Dashboard)
   instead of the tool. The sidebar (`visibleStages`, both passes) and Dashboard tiles are filtered
   cosmetically; the aspirational Career Roadmap strip stays full. **Server half** =
   `db/2026-07-11-sampler-essentials-access.sql` (`courses.access_tier` + `plan_is_sampler()` →
@@ -1096,7 +1147,9 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   note). Tools need no changes. A one-time migration in `AuthProvider` adopts any pre-auth global
   keys into the first signed-in account (guarded by `auth:legacyMigratedTo`). The canonical legacy-key
   list lives in `AuthProvider.jsx` (`LEGACY_KEYS`) — **add to it whenever a tool introduces a new
-  persisted key.** One special case: `ui:theme` is per-user via `window.storage` *and* mirrored to a
+  persisted key**, and remove one when its last reader goes (`nav:lastTab` was dropped on
+  2026-09-03 with the resume-last-tab effect; migrating a key nothing reads just adopts dead data).
+  One special case: `ui:theme` is per-user via `window.storage` *and* mirrored to a
   bare `localStorage` key on every change (the `index.html` boot script + signed-out screens read the
   bare copy; `useTheme` adopts it into a fresh account on first sign-in).
 - **Startup is parallelized (and can't hang):** `AuthProvider` applies the cached session
@@ -1985,11 +2038,33 @@ docs **in the same change**:
   handed a Trainer FULL — which `staffEntitlement()` returns unchanged, silently turning the union
   into a replacement. The rule the union exists to enforce is that bypassing the paywall is NOT the
   same as buying the toolkit: staff who also hold a valid term keep their plan's tabs, staff who do
-  not get their role's tools and nothing else (a `null` base means "grants nothing").
-  `test/staffInvite.test.mjs` pins it.
+  not get their role's tools and nothing else (a `null` base means "grants nothing" — for every
+  role EXCEPT super_admin, who resolves FULL because `profiles.is_admin` already means exactly
+  that). ★ And whatever it computes must be **non-nullish**: it is dereferenced unguarded at two
+  sites and handed to `EntitlementContext.Provider` as an EXPLICIT value, which **overrides**
+  `createContext(FULL_ENTITLEMENT)` for all four consumers rather than falling back to it — so a
+  null there is a blank white page, not a degraded render. See the entitlement bullet in
+  "Plan-based access". `test/staffInvite.test.mjs` + `test/staffRoles.test.mjs` +
+  `test/uiSafety.test.mjs` §15 pin it.
 - **Changing WHO the auth gate holds, or in what order** → `resolveGateScreen()` in
   [src/lib/gateScreen.js](src/lib/gateScreen.js) ↔ the switch in `BookkeeperProToolkit` ↔
-  `test/gateMatrix.test.mjs`. The ordering is load-bearing (a ban outranks the paywall, imported
+  `test/gateMatrix.test.mjs`.
+  ★ **NEVER QUOTE A PRICE FOR AN IDENTITY YOU COULD NOT READ.** The profile fetch fails OPEN by
+  design (`profile = null`, `profileReady = true`) so the gate can never hang — but with a null
+  profile `is_admin` is falsy, `is_paid` is falsy, and `enrollGateState()` bottoms out at
+  `'paywall'`, which is indistinguishable from a brand-new unpaid signup. That is how the account
+  that OWNS this product was shown its own ₱1,499 pricing cards, and how a paying student could be
+  asked to buy what they already have. `AuthProvider` therefore exposes **`profileFailed`** ("the
+  read errored", NOT "there is no row"), and the gate answers it with
+  `GATE_SCREENS.PROFILE_UNAVAILABLE` — a hold with Retry + Sign out, which AuthProvider clears by
+  itself by retrying on focus/visibility and on `PROFILE_RETRY_MS`. Three constraints, all pinned
+  by `test/gateMatrix.test.mjs`: it is checked **inside** the `enroll.configured` block and
+  **after** `decided` (checking earlier replaces `SPLASH` and `ENROLL_PENDING`, which are already
+  correct and already price-free — the #50 mistake); it fires on **`PAYWALL` only**, not the whole
+  `PRICING_SCREENS` set, following `staffOnlyWouldSeeAPrice()`'s precedent, because
+  `MEMBERSHIP_EXPIRED`/`RENEWAL_PAYWALL` carry the only Renew/Extend/Upgrade actions and belong to
+  someone who already bought; and it grants nothing — authority still fails closed, a ban and the
+  staff bypass both still outrank it. The ordering is load-bearing (a ban outranks the paywall, imported
   onboarding outranks the membership gate, the legacy approval gate comes last) and for years none
   of it was a test. Add the case to the matrix in the same change. ★ There is no jsdom or RTL in
   this repo, so the suite pins the DECISION, not the render — a new `GATE_SCREENS` value still

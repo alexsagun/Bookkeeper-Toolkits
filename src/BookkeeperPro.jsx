@@ -69,7 +69,7 @@ import {
 import { GATE_SCREENS, resolveGateScreen } from './lib/gateScreen';
 import {
   ENROLLMENT_PLANS_FALLBACK, PLAN_LABELS, PLAN_ENTITLEMENTS, planEntitlement,
-  FULL_ENTITLEMENT, filterStagesForEntitlement, extensionPrice, phpAmount,
+  FULL_ENTITLEMENT, NO_ACCESS_ENTITLEMENT, filterStagesForEntitlement, extensionPrice, phpAmount,
 } from './lib/planCatalog';
 import {
   COVER_INDUSTRIES, DEFAULT_INDUSTRY_ID, getIndustry, detectIndustry, scrubDashes,
@@ -309,6 +309,11 @@ function readAppRoute() {
   return {
     tab: VALID_APP_TABS.has(tab) ? tab : DEFAULT_APP_TAB,
     interviewSub,
+    // "the URL names something specific, not just the bare root". Currently READ BY
+    // NOTHING: its only consumer was the resume-last-tab effect, deleted when "/"
+    // became unconditionally the Dashboard. Kept because it is a fact about the
+    // route, not a leftover of that feature — but do not reintroduce that effect
+    // (test/uiSafety.test.mjs §17 forbids it).
     explicit: path !== '/' || params.has('tab') || params.has('sub') || params.has('course') || params.has('lesson') || params.has('post') ||
       params.has('space') || params.has('channel') || params.has('panel') || params.has('accountPanel') || params.has('account_panel') || params.has('account'),
     courseId: params.get('course') || null,
@@ -3137,6 +3142,87 @@ function RejectedScreen({ email, reason, onSignOut }) {
             style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
             <Mail size={15} /> Contact support
           </a>
+
+          <button onClick={onSignOut}
+            className="mt-2.5 w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition hover:opacity-90"
+            style={{ background: C.white, border: `1px solid ${C.border}`, color: C.textSoft }}>
+            <LogOut size={15} /> Sign out
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// "We couldn't load your account" — the screen for an identity we could not READ.
+//
+// ★ WHY THIS EXISTS RATHER THAN JUST SHOWING THE PAYWALL. The profile fetch fails
+//   OPEN by design (profile = null, profileReady = true) so the gate can never
+//   hang. But with profile === null, is_admin is falsy, is_paid is falsy, and
+//   enrollGateState() falls all the way through to 'paywall' — which is
+//   indistinguishable from a brand-new unpaid signup. That is how the account that
+//   OWNS this product got shown its own ₱1,499 pricing cards on a flaky
+//   connection, and how a paying student could be asked to buy what they already
+//   have. A wrong price is a far more expensive mistake than a wrong "try again".
+//
+//   It grants nothing. It is a HOLD, and AuthProvider retries the read on focus
+//   and on an interval, so it clears itself without the user doing anything.
+// ───────────────────────────────────────────────────────────────────────────
+function ProfileUnavailableScreen({ email, onRetry, onSignOut }) {
+  const [checking, setChecking] = useState(false);
+  const retry = async () => {
+    setChecking(true);
+    try { await onRetry?.(); } finally { setChecking(false); }
+  };
+  return (
+    <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
+      <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
+        background: GLASS.cardDeep,
+        backdropFilter: 'blur(30px) saturate(180%)',
+        WebkitBackdropFilter: 'blur(30px) saturate(180%)',
+        border: `1px solid ${GLASS.border}`,
+        boxShadow: '0 24px 60px -12px rgba(10,30,80,0.22), inset 0 1px 0 rgba(255,255,255,0.6)',
+      }}>
+        <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+          <img src={LOGO_DATA_URI} alt="Toolkits by Alex" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
+          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>We couldn&rsquo;t load your account</div>
+          <div className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>Toolkits by Alex</div>
+        </div>
+
+        <div className="px-8 py-7">
+          <div className="flex justify-center">
+            <div className="flex items-center justify-center rounded-2xl" style={{
+              width: 64, height: 64,
+              background: 'rgba(214,150,0,0.10)', border: '1px solid rgba(214,150,0,0.22)',
+            }}>
+              <AlertTriangle size={28} style={{ color: C.amber }} />
+            </div>
+          </div>
+
+          <p className="mt-5 text-center" style={{ fontSize: 13.5, color: C.textSoft, lineHeight: 1.6 }}>
+            We couldn&rsquo;t reach your account details just now, so we&rsquo;ve paused here rather
+            than show you the wrong thing. This is almost always a connection hiccup &mdash;
+            your membership is unaffected.
+          </p>
+
+          <p className="mt-3 text-center" style={{ fontSize: 12.5, color: C.textMute, lineHeight: 1.6 }}>
+            We keep retrying in the background. You can also try again now.
+          </p>
+
+          {email && (
+            <div className="mt-4 flex items-center justify-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+              <Mail size={14} style={{ color: C.textMute }} />
+              <span className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{email}</span>
+            </div>
+          )}
+
+          <button onClick={retry} disabled={checking}
+            className="mt-5 w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-70"
+            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
+            {checking ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
+            {checking ? 'Checking\u2026' : 'Try again'}
+          </button>
 
           <button onClick={onSignOut}
             className="mt-2.5 w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition hover:opacity-90"
@@ -7653,7 +7739,7 @@ const TabPanel = React.memo(function TabPanel({ tabId, active, goto, onAccessCou
 
 export default function BookkeeperProToolkit() {
   const {
-    user, profile, loading, profileReady, recovery, signOut, refreshProfile,
+    user, profile, loading, profileReady, profileFailed, recovery, signOut, refreshProfile,
     // #45 staff authority. `can(key)` is the ONE question every admin surface asks;
     // `staff` carries the role label and the Trainer's assigned course ids. Both are
     // EMPTY until my_staff_context() answers, and `staffReady` says when that is —
@@ -7758,8 +7844,10 @@ export default function BookkeeperProToolkit() {
   //   silently mean "gets the whole toolkit". It returns whatever the person's own plan
   //   entitles them to PLUS the tabs their permissions actually require, so an Ops Admin
   //   who also bought VIP keeps their VIP tabs and a Trainer gets the course catalogs and
-  //   nothing else. A Super Admin resolves to the base entitlement unchanged, which for
-  //   the admin branch is FULL — exactly the pre-#45 behaviour for is_admin accounts.
+  //   nothing else. A Super Admin resolves to FULL — they ARE the profile.is_admin branch
+  //   above (#45 makes that column mean exactly "active super_admin"), so the two must
+  //   never disagree. It used to return the base UNCHANGED, which is how a null base
+  //   became `entitlement` and white-screened the app; see staffRoles.js.
   //
   // ★ THIS MAY NOT KEY OFF enroll.active ANY MORE, AND THAT IS A #49 TRAP.
   //   The old expression read `enroll.active ? planEntitlement(...) : FULL`, which
@@ -7780,10 +7868,29 @@ export default function BookkeeperProToolkit() {
 
       if (staffBypassesPaywall(staff)) {
         // Staff who ALSO hold a valid term keep their plan's tabs on top of their
-        // role's; staff who do not get their role's tools and nothing else.
-        // staffEntitlement() treats a null base as "grants nothing", so the union
-        // starts from zero rather than from everything.
-        return staffEntitlement(staff, enrollPass ? planEntitlement(planKey) : null);
+        // role's; staff who do not get their role's tools and nothing else. A null
+        // base means "holds no plan", so the union starts from zero rather than
+        // from everything — except for a Super Admin, for whom staffEntitlement()
+        // returns FULL (they ARE the profile.is_admin branch above; see #45).
+        const base = enrollPass ? planEntitlement(planKey) : null;
+        const resolved = staffEntitlement(staff, base);
+        // ★ BELT AND BRACES, AND IT USED TO BE NEITHER. `entitlement` is read
+        //   unguarded at two sites below (filterStagesForEntitlement is null-safe
+        //   by construction), and the Provider passes it as an
+        //   EXPLICIT value — which overrides createContext(FULL_ENTITLEMENT) for
+        //   all four consumers rather than falling back to it. So a nullish result
+        //   here is a blank white page, not a degraded one. staffEntitlement() is
+        //   now total for active staff, so this branch is unreachable; keep it
+        //   loud so a future regression is reported instead of re-blanking the app.
+        if (!resolved) {
+          console.error('[entitlement] staffEntitlement returned nothing — falling back',
+            { roleKey: staff.roleKey, enrollPass });
+          // ★ NOT `|| FULL_ENTITLEMENT` and NOT `|| planEntitlement(planKey)`.
+          //   Both read as safe defaults and both are the #49 trap: a non-super
+          //   staff member has planKey === null, and planEntitlement(null) is FULL.
+          return staff.isSuperAdmin ? FULL_ENTITLEMENT : NO_ACCESS_ENTITLEMENT;
+        }
+        return resolved;
       }
       return planEntitlement(planKey);
     },
@@ -7938,25 +8045,30 @@ export default function BookkeeperProToolkit() {
     activeTabRef.current = tab;
   }, [tab]);
 
-  useEffect(() => {
-    if (!user?.id || initialRouteRef.current.explicit) return;
-    let active = true;
-    window.storage.get('nav:lastTab')
-      .then(r => {
-        const saved = r?.value;
-        // Skip a stale last-tab their plan can't open (the chokepoint would show the
-        // upsell) — leave them on the Dashboard instead. Chokepoint is the real guard.
-        if (active && saved && VALID_APP_TABS.has(saved) && saved !== tab && entitlement.allowsTab(saved)) setTab(saved, { replace: true });
-      })
-      .catch(() => {});
-    return () => { active = false; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user?.id]);
-
-  useEffect(() => {
-    if (!user?.id) return;
-    window.storage.set('nav:lastTab', tab).catch(() => {});
-  }, [user?.id, tab]);
+  // ★ THE BARE ROOT URL ALWAYS RENDERS THE DASHBOARD, and the "resume last tab"
+  //   effect that used to live here is GONE ON PURPOSE. Do not reinstate it.
+  //
+  //   It read `nav:lastTab` from window.storage on [user?.id] and called
+  //   setTab(saved, { replace: true }) whenever the initial route was not explicit
+  //   — i.e. on "/" and only on "/". Two things were wrong with it:
+  //
+  //   1. Its entitlement guard was INERT. The effect's deps were [user?.id] alone,
+  //      so the `entitlement` it closed over came from the render in which the uid
+  //      first appeared — before enroll.ready, before staffReady, usually before
+  //      the profile. At that moment enrollPlanKey is null and profile?.plan is
+  //      undefined, so planEntitlement(null) returns FULL and allowsTab() is true
+  //      for everything. The comment claimed it skipped a tab the plan could not
+  //      open; it never once did.
+  //   2. Its writer (below) persisted `tab` on the FIRST commit, seeded from the
+  //      URL, while the gate was still showing a splash. So a single deep-link
+  //      visit to /courses/quickbooks-online-mastery permanently made "/" open the
+  //      course catalog — and setTab rewrites the address bar with replaceState, so
+  //      Back did not undo it and the URL never showed that "/" had been requested.
+  //
+  //   readAppRoute() already resolves "/" to DEFAULT_APP_TAB ('dashboard') and
+  //   deep links still resolve through ROUTE_TO_TAB, so nothing else was needed.
+  //   `nav:lastTab` has no reader and no writer anywhere now; it was also dropped
+  //   from LEGACY_KEYS in AuthProvider.jsx.
 
   // Strip a retired/unknown route on first paint, so a bookmark to a removed tool does not
   // sit in the address bar contradicting the Dashboard underneath it.
@@ -8608,7 +8720,7 @@ export default function BookkeeperProToolkit() {
   //   resolveGateScreen() is a pure function over this state, so
   //   test/gateMatrix.test.mjs asserts the whole table; this switch only renders.
   const gate = resolveGateScreen({
-    loading, recovery, user, profileReady, profile,
+    loading, recovery, user, profileReady, profile, profileFailed,
     staffReady, staffDegraded, staffMembership, staff,
     enroll, renewNow, inviteDismissed: staffInviteDismissed,
     hasInviteToken: !!staffInvite,
@@ -8658,6 +8770,11 @@ export default function BookkeeperProToolkit() {
 
     case GATE_SCREENS.REJECTED:
       return <RejectedScreen email={user?.email} reason={profile?.rejection_reason} onSignOut={signOut} />;
+
+    case GATE_SCREENS.PROFILE_UNAVAILABLE:
+      // The profile READ failed, so we do not know who this is — hold rather than
+      // quote a price. refreshProfile() clears profileFailed on success.
+      return <ProfileUnavailableScreen email={user?.email} onRetry={refreshProfile} onSignOut={signOut} />;
 
     case GATE_SCREENS.ENROLL_PENDING:
       // 'finalizing' = request approved while the profile/subscription flip is
@@ -9276,7 +9393,7 @@ export default function BookkeeperProToolkit() {
           </div>
         </div>
         {/* Entitlement chokepoint — the SINGLE enforcement point for tab access.
-            A disallowed tab reached ANY way (deep-link seed, popstate, stale nav:lastTab,
+            A disallowed tab reached ANY way (deep-link seed, popstate,
             programmatic goto, the mockinterview alias) renders RestrictedTab instead of the
             tool, so the sidebar/tile hiding above is pure UX. RestrictedTab is kept OUT of
             TabPanel's memoized prop set, so hidden panels still skip root re-renders.
@@ -13630,7 +13747,7 @@ function ImportStatusPill({ status }) {
 // COMPONENT: RESTRICTED TAB — plan-gated upsell shown at the render chokepoint
 // ═══════════════════════════════════════════════════════════════════
 // Rendered in place of a tool when the active tab isn't in the user's plan (reached via
-// deep-link, popstate, stale lastTab, etc.). Polished upsell — never a blank screen:
+// deep-link, popstate, programmatic goto). Polished upsell — never a blank screen:
 // current plan + access scope, quick links to what they CAN open, and an Upgrade/Renew
 // CTA that routes to the Dashboard (where MembershipPanel hosts the renew/upgrade flow).
 // Reads the shared entitlement from context. Themed via tokens; light + dark safe.

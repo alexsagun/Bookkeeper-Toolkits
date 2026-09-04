@@ -572,3 +572,100 @@ test('a lapsed member who declines reaches the renewal screen, not a deferral', 
   });
   assert.equal(screenOf(s), GATE_SCREENS.MEMBERSHIP_EXPIRED);
 });
+
+// ── An identity we could not READ is never quoted a price ───────────────────
+//
+// The profile fetch fails OPEN by design (profile = null, profileReady = true) so
+// the gate can never hang. But with profile === null, is_admin is falsy, is_paid is
+// falsy, and enrollGateState() bottoms out at 'paywall' — indistinguishable from a
+// brand-new unpaid signup. That is how the account that OWNS this product was shown
+// its own pricing cards, and how a paying student could be asked to buy what they
+// already have. `profileFailed` is the fact that tells the two apart.
+//
+// It is a HOLD, not a grant: authority still fails closed everywhere else.
+const unknownIdentity = (over = {}) => student({
+  profile: null,
+  profileFailed: true,
+  ...over,
+});
+
+test('a profile READ failure is held, not priced', () => {
+  assert.equal(
+    screenOf(unknownIdentity({ enroll: { active: true, ready: true, configured: true, state: 'paywall' } })),
+    GATE_SCREENS.PROFILE_UNAVAILABLE,
+  );
+  assert.equal(
+    screenOf(unknownIdentity({ enroll: { active: true, ready: true, configured: true, state: 'paywall_notice' } })),
+    GATE_SCREENS.PROFILE_UNAVAILABLE,
+  );
+});
+
+test('a healthy profile is unaffected by the profileFailed arm', () => {
+  // The ordinary unpaid signup must still reach the pricing cards.
+  assert.equal(
+    screenOf(student({ enroll: { active: true, ready: true, configured: true, state: 'paywall' } })),
+    GATE_SCREENS.PAYWALL,
+  );
+  // And an explicit profileFailed: false changes nothing.
+  assert.equal(
+    screenOf(student({
+      profileFailed: false,
+      enroll: { active: true, ready: true, configured: true, state: 'paywall' },
+    })),
+    GATE_SCREENS.PAYWALL,
+  );
+});
+
+// ★ THE #50 REGRESSION THIS ARM MUST NOT REPEAT. Checking profileFailed before
+//   enroll.ready / enroll.configured / `decided` would replace three screens that
+//   are already correct AND already price-free.
+test('profileFailed does not pre-empt the screens that show no price', () => {
+  assert.equal(
+    screenOf(unknownIdentity({ enroll: { active: true, ready: false, configured: true, state: 'paywall' } })),
+    GATE_SCREENS.SPLASH,
+    'still loading the enrollment gate — that splash is correct',
+  );
+  assert.equal(
+    screenOf(unknownIdentity({ enroll: { active: true, ready: true, configured: false, state: 'paywall' } })),
+    GATE_SCREENS.APP,
+    'an unconfigured enrollment gate falls through exactly as before',
+  );
+  assert.equal(
+    screenOf(unknownIdentity({ enroll: { active: true, ready: true, configured: true, state: 'pending' } })),
+    GATE_SCREENS.ENROLL_PENDING,
+    'a submitted request is price-free and must survive',
+  );
+});
+
+// MEMBERSHIP_EXPIRED and RENEWAL_PAYWALL show a price only to someone who already
+// bought, and they carry the ONLY Renew / Extend / Upgrade actions. Replacing them
+// would strand a lapsed member away from the screen that restores their membership.
+test('the hold does not strand a lapsed member away from Renew', () => {
+  assert.equal(
+    screenOf(student({
+      profileFailed: true,
+      profile: { is_paid: true, is_admin: false, approval_status: 'approved' },
+      enroll: { active: true, ready: true, configured: true, state: 'expired' },
+    })),
+    GATE_SCREENS.MEMBERSHIP_EXPIRED,
+  );
+});
+
+test('a ban and a staff bypass both still outrank the unavailable hold', () => {
+  assert.equal(
+    screenOf(unknownIdentity({
+      profile: { approval_status: 'rejected' },
+      enroll: { active: true, ready: true, configured: true, state: 'paywall' },
+    })),
+    GATE_SCREENS.REJECTED,
+    'a ban cannot be waited out any more than it can be paid around',
+  );
+  assert.equal(
+    screenOf(unknownIdentity({
+      staff: staffCtx('operations_admin'),
+      enroll: { active: true, ready: true, configured: true, state: 'paywall' },
+    })),
+    GATE_SCREENS.APP,
+    'active staff were never being priced, so nothing changes for them',
+  );
+});

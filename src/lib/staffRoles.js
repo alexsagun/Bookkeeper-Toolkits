@@ -5,12 +5,13 @@
 // serverless handlers (api/_lib/staffAuth.js and every api/admin/* route), and
 // the node:test suites (test/staffRoles.test.mjs, test/staffRolesSql.test.mjs).
 // NO side effects, NO DOM/Node/Supabase — the same rules must run identically in
-// all three places. The one import is another pure sibling (the house pattern:
+// all three places. Both imports are pure siblings (the house pattern:
 // batchLifecycle.js imports communitySpaces.js, trainingAgreement.js imports
-// planCatalog.js), so that "is this error a missing migration?" has exactly one
-// definition in the codebase.
+// planCatalog.js), so that "is this error a missing migration?" and "what does
+// full toolkit access mean?" each have exactly one definition in the codebase.
 
 import { isMigrationMissing } from './appErrors.js';
+import { FULL_ENTITLEMENT } from './planCatalog.js';
 //
 // ★ THIS FILE IS A MIRROR, NOT THE AUTHORITY. The database is the boundary:
 //   staff_roles / staff_permissions / staff_role_permissions are seeded from
@@ -630,13 +631,49 @@ export function staffLandingTab(ctx) {
  *     members too — an Ops Admin who bought VIP keeps their VIP tabs), and
  *   - the tabs their permissions actually require.
  *
- * A Super Admin resolves to the base entitlement unchanged, which for the root's
- * admin branch is FULL — exactly the pre-#45 behaviour for accounts that had
- * is_admin = true.
+ * A Super Admin resolves to FULL, which is exactly the pre-#45 behaviour for
+ * accounts that had is_admin = true.
+ *
+ * ★ THIS FUNCTION MUST NEVER RETURN A NULLISH ENTITLEMENT FOR ACTIVE STAFF, and
+ *   for two years it could. `if (ctx.isSuperAdmin) return base;` handed back
+ *   whatever it was given, and the root calls it as
+ *   `staffEntitlement(staff, enrollPass ? planEntitlement(planKey) : null)` —
+ *   where enrollPass is PERMANENTLY false for a Super Admin, because
+ *   useEnrollmentGate fires its queries for any uid and a Super Admin holds no
+ *   subscriptions row, so enrollGateState returns 'paywall'. The null therefore
+ *   flowed out of here, became `entitlement`, and was dereferenced unguarded by
+ *   `entitlement.allowsTab('community')` in the root's COMPONENT BODY — ~800
+ *   lines above the gate that would have rendered a splash, with no ErrorBoundary
+ *   anywhere in the app. React unmounted the tree and the user got a blank white
+ *   page. It only ever appeared when the my_staff_context() RPC beat the profiles
+ *   SELECT (they are two independent parallel effects on the same [uid]), which
+ *   is why it looked intermittent.
  */
 export function staffEntitlement(ctx, base) {
+  // A pass-through for a NON-staff context: whatever the caller had is what they
+  // keep. Note this is the one line that is still partial — it returns a nullish
+  // `base` unchanged. That is safe only because the sole caller invokes this
+  // INSIDE its own staffBypassesPaywall() branch, so it never reaches here. A new
+  // caller must either guard its own result or pass a real entitlement.
   if (!staffBypassesPaywall(ctx)) return base;
-  if (ctx.isSuperAdmin) return base;
+  // ★ ONE FACT EXPRESSED TWICE. #45 makes profiles.is_admin a trigger-maintained
+  //   cache meaning EXACTLY "has an ACTIVE super_admin staff membership", and the
+  //   root already returns FULL_ENTITLEMENT for that column unconditionally. So
+  //   this branch must return FULL too, or the same person gets two different
+  //   answers depending on which of two racing fetches landed first.
+  //
+  //   The base is honoured only when it is ALREADY full — that keeps the
+  //   reference identity test/staffRoles.test.mjs asserts. A truthy-but-SCOPED
+  //   base (a Super Admin who also bought Sampler) must NOT be returned: it would
+  //   refuse every admin tab, making a PAYING Super Admin more restricted than a
+  //   non-paying one.
+  //
+  //   This cannot leak. normalizeStaffContext() derives isSuperAdmin from the
+  //   role key alone, and only after a non-'active' status has already collapsed
+  //   to EMPTY_STAFF_CONTEXT — so no Trainer or Operations Admin reaches this
+  //   line. They fall through to the union builder below, which returns an object
+  //   on every path and never sets full: true.
+  if (ctx.isSuperAdmin) return base && base.full ? base : FULL_ENTITLEMENT;
   if (base && base.full) return base;
 
   const extra = new Set(['dashboard', 'progress']);

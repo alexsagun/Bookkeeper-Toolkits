@@ -381,3 +381,92 @@ test('the verification retry reuses its signed URL instead of minting a cold one
   assert.doesNotMatch(vb, /await signLessonVideo\(/,
     'calling signLessonVideo directly here re-mints per attempt and guarantees a cold CDN miss');
 });
+
+// ── 15. The entitlement can never be nullish ────────────────────────────────
+//
+// On 2026-09-03 production blanked to a white page for the account that owns it:
+//
+//   TypeError: Cannot read properties of null (reading 'allowsTab')
+//
+// staffEntitlement(ctx, base) returned its null `base` verbatim for a Super Admin,
+// the root calls it as `staffEntitlement(staff, enrollPass ? … : null)`, and
+// enrollPass is PERMANENTLY false for a Super Admin (no subscriptions row). The
+// null became `entitlement` and was dereferenced in the COMPONENT BODY, ~800 lines
+// above the gate that would have rendered a splash — with no ErrorBoundary
+// anywhere, React emptied #root.
+//
+// The unit test in staffRoles.test.mjs pins the pure function. This pins the CALL
+// SITE, because the dangerous part is not the null — it is what a future fixer
+// reaches for as a "safe" default.
+test('the root never lets a nullish entitlement reach the render', () => {
+  const src = app();
+  const call = src.indexOf('staffEntitlement(staff,');
+  assert.ok(call > 0, 'the root no longer calls staffEntitlement — re-point this ratchet');
+
+  // Strip `//` comments before asserting: this block DOCUMENTS the two forbidden
+  // fallbacks by name, so a naive scan matches its own warning.
+  // Split on /\r?\n/ and anchor-free: this repo's sources are CRLF, and `.` does
+  // not match \r, so a `//.*$` strip silently does nothing on a CRLF line.
+  const window = src.slice(call, call + 1800)
+    .split(/\r?\n/).map((l) => l.replace(/\/\/.*/, '')).join('\n');
+
+  assert.ok(/if \(!resolved\)/.test(window),
+    'the memo must test staffEntitlement()\'s result before returning it — a nullish '
+    + 'entitlement is a blank white page, not a degraded render');
+
+  // ★ THE ACTUAL TRAP. For a non-super staff member planKey is null, and
+  //   planEntitlement(null) returns FULL via NO_PLAN_SENTINELS. So both of the
+  //   obvious fallbacks silently hand a Trainer the whole paid toolkit.
+  assert.ok(!/\|\|\s*FULL_ENTITLEMENT/.test(window),
+    'the fallback must not be `|| FULL_ENTITLEMENT` — that grants a Trainer full access');
+  assert.ok(!/resolved\s*\|\|\s*planEntitlement/.test(window),
+    'the fallback must not be `|| planEntitlement(planKey)` — planEntitlement(null) IS full');
+  assert.ok(/NO_ACCESS_ENTITLEMENT/.test(window),
+    'the non-super fallback must fail CLOSED, via NO_ACCESS_ENTITLEMENT');
+});
+
+// ── 16. The app has an error boundary ───────────────────────────────────────
+//
+// Without one, ANY uncaught render error unmounts the whole tree and leaves #root
+// empty — a blank page with no message and no way back, which is exactly how the
+// crash above presented. The boundary must sit OUTSIDE AuthProvider so a crash in
+// the provider itself is still caught.
+test('the app is wrapped in an error boundary, outside AuthProvider', () => {
+  const main = readFileSync(join(REPO, 'src/main.jsx'), 'utf8');
+  assert.ok(/<AppErrorBoundary>/.test(main), 'main.jsx must mount the error boundary');
+
+  const b = main.indexOf('<AppErrorBoundary>');
+  const p = main.indexOf('<AuthProvider>');
+  assert.ok(b > 0 && p > 0 && b < p,
+    'the boundary must wrap AuthProvider, not sit inside it — a provider crash '
+    + 'blanks the page just as thoroughly as a component one');
+
+  const boundary = readFileSync(join(REPO, 'src/AppErrorBoundary.jsx'), 'utf8');
+  assert.ok(/getDerivedStateFromError/.test(boundary),
+    'a boundary without getDerivedStateFromError renders nothing on a crash');
+  // ★ It must not import the 35k-line monolith: the safety net would then share
+  //   every module-scope hazard of the thing it is catching.
+  assert.ok(!/from '\.\/BookkeeperPro/.test(boundary),
+    'the error boundary must not import BookkeeperPro.jsx');
+});
+
+// ── 17. "/" is the Dashboard ────────────────────────────────────────────────
+//
+// A `nav:lastTab` restore effect used to redirect the bare root URL to whatever tab
+// the user last opened, and rewrite the address bar with replaceState while doing
+// it. Its entitlement guard was inert (deps were [user?.id], so it closed over a
+// FULL entitlement resolved before the plan had loaded), and its sibling writer
+// persisted the tab on the FIRST commit — so a single deep-link visit permanently
+// made "/" open that course. Both effects are gone; keep them gone.
+test('the bare root URL is not silently redirected to a remembered tab', () => {
+  const src = app();
+  assert.ok(!/nav:lastTab['"]\s*\)/.test(src),
+    'nothing may read or write nav:lastTab — "/" resolves to DEFAULT_APP_TAB');
+  assert.ok(!/window\.storage\.get\(['"]nav:lastTab/.test(src));
+  assert.ok(!/window\.storage\.set\(['"]nav:lastTab/.test(src));
+
+  const legacy = readFileSync(join(REPO, 'src/auth/AuthProvider.jsx'), 'utf8');
+  const keys = legacy.slice(legacy.indexOf('LEGACY_KEYS'), legacy.indexOf('LEGACY_MARKER'));
+  assert.ok(!/^\s*'nav:lastTab'/m.test(keys),
+    'a retired key must not stay in LEGACY_KEYS — migrating it would adopt dead data');
+});
