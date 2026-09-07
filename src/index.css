@@ -659,3 +659,450 @@ button { font-family: inherit; }
 .enroll-intake :focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
 .enroll-intake .intake-pill:focus-within { outline: 2px solid var(--c-primary); outline-offset: 2px; }
 .enroll-intake .intake-drop:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 3px; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   COURSE LEARNER WORKSPACE — the resizable two-pane lesson page
+   ═══════════════════════════════════════════════════════════════════════════
+   Replaces `mt-6 grid grid-cols-1 lg:grid-cols-3 gap-6` in CourseProgram's
+   renderLearner(). Measured before this change, at 1440x900 with the sidebar
+   expanded: viewport 1440 -> main 1152 -> TabPanel lg:p-10 -> 1072 of content ->
+   a 1/3 column of 341px and a 2/3 player column of 707px -> minus the card's
+   sm:p-6 -> a 659px video box, 370px tall. The `maxHeight: 460` clamp on the
+   <video> needed an 818px-wide box before it could bind, so it had never once
+   fired in production. The GRID was the entire problem; the clamp was a red
+   herring, and removing it alone would have changed nothing.
+
+   Numbers here are mirrored from src/lib/coursePlayerLayout.js and pinned
+   against it by test/coursePlayerLayout.test.mjs.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.course-workspace {
+  /* ★ THE CONTAINER, and the reason this is not a media query. The sidebar is 288px
+     expanded, 76px collapsed to the icon rail, and 0 below lg (where it is `fixed`).
+     So at ONE viewport width the lesson page can have 1072px, 1284px or 1360px of
+     room, and only a container query can see the difference. It also costs nothing:
+     a ResizeObserver would re-render CourseProgram on every sidebar animation frame.
+
+     REQUIRES Chrome 105 / Safari 16 / Firefox 110 (2022-23). Older engines drop every
+     @container rule below and get the stacked base layout: player first, full-width
+     stage, curriculum underneath. That is still a bigger video than the grid it
+     replaces, so the degrade is a downgrade in layout, never in function. */
+  container-type: inline-size;
+  container-name: coursework;
+
+  /* Mirrors of the constants in src/lib/coursePlayerLayout.js. --course-rail is
+     written inline by React (from state) and imperatively by the drag handler (from a
+     ref, via style.setProperty, once per animation frame). */
+  --course-splitter-w: 10px;
+  --course-col-gap: 20px;
+  --course-stage-min: 600px;
+  --course-rail: 320px;
+}
+
+/* ── Narrow: the panel OVERLAYS the player. It never stacks. ──────────────── */
+/* ★ THE BUG THIS REPLACES. The base layout used to put the rail in a second grid ROW,
+   under the stage — so at any workspace below the container-query threshold a 42-lesson
+   course appended roughly two thousand pixels of list to the page and the learner had to
+   scroll past all of it. A "Hide lessons" button could not help, because at that width
+   there was no side rail to hide.
+   The rail now shares ONE grid cell with the stage and floats over it, capped to the
+   viewport with its own scroll. The page does not grow past a screenful. */
+.course-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+}
+.course-grid > .course-stage-col { grid-area: 1 / 1; min-width: 0; }
+/* The splitter only exists where there are two real panes to split. */
+.course-grid > .course-splitter { display: none; }
+/* The edge tab is a closed-state control; .is-rail-closed below turns it on. */
+.course-grid > .course-rail-tab { display: none; }
+
+.course-grid > .course-rail {
+  grid-area: 1 / 1;
+  min-width: 0;
+  justify-self: end;
+  width: min(380px, 92%);
+  /* Sticky, not absolute. Absolute would keep the grid row at the stage's height, but the
+     panel would then scroll away the moment the learner moved the page — which is the one
+     thing a drawer must not do. The row grows to at most a screenful; the old stacked
+     layout grew it by the entire lesson list. */
+  position: sticky;
+  top: var(--course-rail-top, 1.5rem);
+  max-height: calc(100vh - var(--course-rail-top, 1.5rem) - 1.5rem);
+  /* Two rows: a fixed header and a scrolling body. The rail itself must NOT scroll — that
+     is what made the sticky header bleed. See .course-rail-head. */
+  display: flex;
+  flex-direction: column;
+  z-index: 2;
+  /* Only in the overlay state does the rail need a surface of its own — in two-pane mode
+     it is a transparent stack of cards on the page background. Over a video it would
+     otherwise read as floating text. */
+  padding: 10px;
+  border-radius: 18px;
+  background: var(--sidebar-bg);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--glass-border);
+  box-shadow: 0 18px 48px rgba(15, 18, 23, 0.22);
+}
+
+/* Dims the player behind an open overlay and gives touch users a large dismiss target.
+   Same cell as the stage, one layer below the rail. */
+.course-grid > .course-rail-scrim {
+  grid-area: 1 / 1;
+  align-self: stretch;
+  z-index: 1;
+  border: 0;
+  padding: 0;
+  border-radius: 18px;
+  background: rgba(15, 18, 23, 0.42);
+  cursor: pointer;
+}
+
+/* ── Two-pane ────────────────────────────────────────────────────────────── */
+@container coursework (min-width: 890px) {
+  .course-grid {
+    /* Player first, panel on the RIGHT — the Udemy arrangement, and it keeps the video
+       adjacent to the app's own left-hand nav instead of sandwiched between two rails. */
+    grid-template-columns:
+      minmax(0, 1fr)
+      var(--course-splitter-w)
+      /* ★ The min() second arm is a BACKSTOP, not the driver. React clamps a drag
+         against the workspace's measured width; this makes the identical guarantee to
+         a width restored from storage on a narrower screen, and to a window resized
+         after the fact — with no resize listener anywhere. It can only bite between a
+         970px and a 1110px workspace, where the design maximum does not fit; above
+         that the clamp() alone decides. */
+      minmax(0, min(
+        clamp(240px, var(--course-rail), 420px),
+        calc(100% - var(--course-stage-min) - var(--course-splitter-w) - (var(--course-col-gap) * 2))
+      ));
+    column-gap: var(--course-col-gap);
+    row-gap: 0;
+  }
+  /* Explicit placement, so a future reorder of the JSX cannot silently transpose the
+     panes. */
+  .course-grid > .course-stage-col { grid-column: 1; grid-row: 1; }
+  .course-grid > .course-splitter  { grid-column: 2; grid-row: 1; display: block; }
+  .course-grid > .course-rail      { grid-column: 3; grid-row: 1; }
+  /* Two real panes side by side: no overlay, so no scrim and none of the floating
+     surface the narrow state needs. */
+  .course-grid > .course-rail-scrim { display: none; }
+
+  /* ★ top: 1.5rem, not the 6rem the old lg:top-24 reserved. CourseProgram's
+     `showHead` is `!embedded && !onBack`, and the catalog ALWAYS passes onBack — so
+     no SectionHead has ever rendered on the lesson page, and 6rem of clearance was
+     being held for a header that does not exist. The rail gets 4.5rem more list. */
+  .course-grid > .course-rail {
+    justify-self: stretch;
+    width: auto;
+    /* In two-pane mode the rail is a column on the page, not a floating panel — drop the
+       overlay surface the narrow state gives it. */
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    box-shadow: none;
+    z-index: auto;
+    position: sticky;
+    /* ★ NOT a hard-coded offset. A tab may render its own sticky SectionHead above this
+       workspace — InterviewPrep does, unconditionally, ~200px tall — and container-type's
+       containment makes the workspace a stacking context, so no z-index here can lift the
+       rail back out from under it. CourseProgram measures that header when `embedded` and
+       sets the variable; the 1.5rem default is for the two standalone course tabs, where
+       `showHead` really is false and nothing sticky sits above. */
+    top: var(--course-rail-top, 1.5rem);
+    align-self: start;
+    max-height: calc(100vh - var(--course-rail-top, 1.5rem) - 1.5rem);
+    /* Scrolling belongs to .course-rail-body in BOTH states — the header is a sibling
+       flex row, never something the list can pass beneath. */
+  }
+}
+
+/* ── Closed ──────────────────────────────────────────────────────────────── */
+/* ★ CSS ONLY, and that is the whole design. The player element is never re-parented,
+   never re-keyed and never moved into a second JSX branch, so opening or closing the
+   panel cannot remount <video> — which would lose currentTime and, for an uploaded
+   lesson, force SignedLessonVideo to mint a fresh signed URL and re-buffer from zero.
+   It is one class on the workspace and `display: none` on the RAIL — display, not
+   visibility, so focus can never land inside a curriculum nobody can see. */
+.course-workspace.is-rail-closed .course-rail,
+.course-workspace.is-rail-closed .course-rail-scrim,
+.course-workspace.is-rail-closed .course-splitter { display: none; }
+
+/* ★ Narrow + closed: the tab FLOATS in the player's top-right corner. Giving it a track
+   of its own here costs ~55px of a 390px screen — measured, the video came out 301px
+   closed against 347px open, so closing the panel made the picture SMALLER, which is the
+   opposite of what the control is for. The top-right corner is safe to cover: a video
+   element's controls live along the bottom edge. */
+.course-workspace.is-rail-closed .course-grid > .course-stage-col { grid-area: 1 / 1; }
+.course-workspace.is-rail-closed .course-grid > .course-rail-tab {
+  display: inline-flex;
+  grid-area: 1 / 1;
+  justify-self: end;
+  align-self: start;
+  margin: 10px;
+  /* Reads against the picture rather than the page, since here it sits on top of one. */
+  color: #fff;
+  background: rgba(15, 18, 23, 0.62);
+  border-color: rgba(255, 255, 255, 0.28);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.course-workspace.is-rail-closed .course-grid > .course-rail-tab:hover {
+  color: #fff;
+  background: rgba(15, 18, 23, 0.78);
+}
+
+/* Wide + closed: there is room, so the tab takes a track and covers nothing. */
+@container coursework (min-width: 890px) {
+  .course-workspace.is-rail-closed .course-grid {
+    grid-template-columns: minmax(0, 1fr) auto;
+    column-gap: 12px;
+  }
+  .course-workspace.is-rail-closed .course-grid > .course-stage-col { grid-area: 1 / 1; }
+  .course-workspace.is-rail-closed .course-grid > .course-rail-tab {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: end;
+    margin: 0;
+    color: var(--c-text-soft);
+    background: var(--wash);
+    border-color: var(--glass-border-soft);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+  .course-workspace.is-rail-closed .course-grid > .course-rail-tab:hover {
+    color: var(--c-text);
+    background: var(--wash-strong);
+  }
+}
+
+/* ── The edge tab ────────────────────────────────────────────────────────── */
+/* The only control that reopens the panel. Sticky so it stays reachable however far the
+   learner has scrolled down a lesson. */
+.course-rail-tab {
+  position: sticky;
+  top: var(--course-rail-top, 1.5rem);
+  align-self: start;
+  justify-self: end;
+  align-items: center;
+  gap: 6px;
+  height: 40px;
+  padding: 0 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--c-text-soft);
+  background: var(--wash);
+  border: 1px solid var(--glass-border-soft);
+  cursor: pointer;
+}
+.course-rail-tab:hover { color: var(--c-text); background: var(--wash-strong); }
+/* The label is hidden by WIDTH, not by display, so the control keeps one accessible name
+   and one hit target whether or not the label is showing. */
+.course-rail-tab-label {
+  max-width: 0;
+  opacity: 0;
+  overflow: hidden;
+  transition: max-width 220ms var(--ease), opacity 160ms var(--ease);
+}
+/* ★ The first `(hover: hover)` query in this stylesheet, and it earns its place: on a
+   touch screen a tap leaves :hover latched, so the label would open on tap and then sit
+   there behind the panel it just opened. Keyboard reveal is deliberately OUTSIDE the
+   query — a focus ring with no label is the case that most needs one. */
+@media (hover: hover) {
+  .course-rail-tab:hover .course-rail-tab-label { max-width: 12rem; opacity: 1; }
+}
+.course-rail-tab:focus-visible .course-rail-tab-label { max-width: 12rem; opacity: 1; }
+
+/* ── The panel header ────────────────────────────────────────────────────── */
+/* ★ A FLEX ROW, NOT A STICKY BOX — and that is the fix, not a preference. It used to be
+   `position: sticky; top: 0` with a transparent background inside the rail's own
+   scroller, so the lesson list scrolled visibly THROUGH it: "COURSE CONTENT" and
+   "Lesson 1.1…" painted on top of one another. It was the only sticky header in this
+   stylesheet without an opaque backdrop (the mobile topbar, four <thead>s and
+   SectionHead are all opaque or ≥0.85 alpha + blur), and even an opaque one would not
+   have been enough — the header sat in a `space-y-4` stack, so a 16px transparent gap
+   under it showed content regardless.
+   The rail is now a two-row flex column, exactly as SidePanel is: this header, then
+   .course-rail-body as the ONLY scroller. CLAUDE.md already said so — "a drawer never
+   needs `sticky top-0` … those only ever worked by accident inside a single scroller."
+   With nothing scrolling underneath, transparent is now correct rather than a bug. */
+.course-rail-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 2px 10px;
+  border-bottom: 1px solid var(--glass-border-soft);
+}
+
+/* The rail's only scroll container. `min-height: 0` is what actually lets it scroll: a
+   flex item's default `min-height: auto` refuses to shrink below its content, so the
+   overflow would push the rail past its max-height instead of scrolling inside it. */
+.course-rail-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  /* duration_label is admin-authored free text; in a 240px rail a long one would
+     otherwise force a horizontal scrollbar inside the list. */
+  overflow-x: hidden;
+  /* The rail lives inside <main>, the app's only scroll container. Without this a flick
+     past the end of the module list scroll-chains into the page. */
+  overscroll-behavior: contain;
+}
+
+/* ── The splitter ────────────────────────────────────────────────────────── */
+/* A div[role="separator"][tabIndex=0] — the APG window-splitter shape. NOT a <button>:
+   ARIA-in-HTML does not allow `separator` on a button, so a re-roled one is an
+   aria-allowed-role violation. */
+.course-splitter {
+  align-self: stretch;        /* overrides .course-grid's align-items: start */
+  width: var(--course-splitter-w);
+  min-height: 140px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  cursor: col-resize;
+  /* The pointer drag owns the gesture outright; without this a touch drag scrolls the
+     page instead of moving the splitter. */
+  touch-action: none;
+  position: relative;
+}
+/* ★ The POINTER target, widened to 28px without thickening the 3px line and without
+   overlapping either pane. The grab area may only grow into the 20px column gaps on
+   each side — which belong to nobody — so ±9px is the ceiling. Reaching a "nicer" 44px
+   would put 17px of invisible, click-swallowing overlay on top of the video's left
+   edge, which is where its play button lives.
+   WCAG 2.2 SC 2.5.8 is satisfied either way via the spacing exception: a 24px circle
+   centred on the track clears the lesson buttons and the stage by the gap. */
+.course-splitter::after {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0;
+  left: -9px; right: -9px;
+}
+/* The visible line. Purely decorative — the ::after above is what gets grabbed. */
+.course-splitter::before {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0; left: 50%;
+  width: 3px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: var(--c-border);
+  transition: background 160ms var(--ease);
+}
+.course-splitter:hover::before,
+.course-splitter:focus-visible::before,
+.course-splitter[data-dragging='true']::before { background: var(--c-primary); }
+
+/* Applied to <body> for the duration of a pointer drag, and removed on pointerup,
+   pointercancel AND component unmount — all three via window-level listeners, so a
+   failed pointer capture cannot strand it. */
+body.is-col-resizing { cursor: col-resize; user-select: none; -webkit-user-select: none; }
+/* ★ The legacy YouTube/Vimeo <iframe> is a separate browsing context. Pointer capture
+   is set on the splitter, which should be enough — but capture across a cross-origin
+   iframe has never been uniformly reliable, and the failure mode is a drag that dies
+   the moment the cursor crosses the video. Belt to the braces, and only while dragging. */
+body.is-col-resizing iframe { pointer-events: none; }
+
+/* ── The media stage ─────────────────────────────────────────────────────── */
+/* ONE frame for every state a video lesson can be in — signing, playing, failed, and
+   "nothing uploaded yet". Before this, 'signing' was a 240px-tall box, 'error' was a
+   dashed card of whatever height its message ran to, and 'ready' was a <video> at its
+   intrinsic ratio — so a lesson that failed to sign made the whole page jump, and so
+   did every lesson change. Text lessons deliberately never get this frame. */
+.course-stage {
+  position: relative;
+  /* ★ Cap the WIDTH, not the height. `aspect-ratio: 16/9` + `max-height` leaves the
+     box full-width and merely shorter, so the video pillarboxes inside black bars it
+     does not need — which is exactly what maxHeight: 460 would have done had the box
+     ever grown wide enough to bind. Capping width lets the ratio derive a height that
+     already respects the viewport budget, and margin-inline centres the result. */
+  width: min(100%, calc(min(78vh, 900px) * 16 / 9));
+  margin-inline: auto;
+  aspect-ratio: 16 / 9;
+  background: #000;
+  overflow: hidden;
+  /* No border-radius of its own: both call sites clip it — the learner card is
+     `glass-card rounded-2xl overflow-hidden`, and the admin preview is
+     `rounded-xl overflow-hidden max-w-md`. */
+}
+/* ★ #000 in BOTH themes on purpose. This is a video frame, the same reason the dark
+   compat layer explicitly does NOT remap bg-black. Everything painted on it is
+   therefore fixed light-on-black, not a theme token: --status-danger-fg is #D02323 in
+   light mode, which measures about 2.3:1 on black. */
+.course-stage > video,
+.course-stage > iframe {
+  position: absolute;
+  top: 0; right: 0; bottom: 0; left: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  border: 0;
+  background: #000;
+  /* A non-16:9 legacy upload letterboxes instead of stretching or cropping. */
+  object-fit: contain;
+}
+.course-stage-msg {
+  position: absolute;
+  top: 0; right: 0; bottom: 0; left: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  /* `safe` centring: with plain `center` the overflow is split both ways and whatever is
+     pushed past the content-box START is unreachable, because scrollTop cannot go
+     negative. On a 320px phone that silently crops the top of the admin sign-failure
+     message even though overflow-y below makes the button at the bottom reachable. */
+  justify-content: safe center;
+  gap: 8px;
+  padding: 24px;
+  text-align: center;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.82);
+  /* ★ The stage clips to 16:9. On a 320px phone that frame is only 180px tall, and the
+     admin sign-failure message plus its "Try again" button do not fit — without this the
+     one recovery affordance is cropped away with no way to reach it. */
+  overflow-y: auto;
+}
+.course-stage-btn {
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  background: rgba(255, 255, 255, 0.10);
+  color: #fff;
+  border-radius: 10px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.course-stage-btn:hover { background: rgba(255, 255, 255, 0.18); }
+
+/* ── Scoped a11y ─────────────────────────────────────────────────────────── */
+/* Scoped for the same reason .cl-tool and .enroll-intake are: the app-wide focus pass
+   is still its own change (~64 elements, no visual test coverage). This scope is not
+   discretionary though — the splitter is a KEYBOARD control whose entire operation is
+   invisible without a ring, and the browser gives a role="separator" no indicator of
+   its own. It ships with the control, as those two did. */
+.course-workspace :focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+/* The splitter track is only 10px wide; a 2px offset would read as a second rail. */
+.course-splitter:focus-visible { outline-offset: 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  /* Only the splitter's hover tint. NOT a blanket `* { animation: none }` — that would
+     still the .animate-spin Loader2 inside the "Loading video…" stage, making the
+     signing state visually identical to a dead black rectangle for exactly the users
+     who opted out of motion. Same reasoning as the .cl-tool block above. */
+  .course-splitter::before { transition: none; }
+  /* The edge tab's label still REVEALS on hover and focus — only the sliding is removed.
+     Killing the reveal outright would leave these users a bare chevron with no visible
+     name, which is the opposite of the accommodation. */
+  .course-rail-tab-label { transition: none; }
+}
