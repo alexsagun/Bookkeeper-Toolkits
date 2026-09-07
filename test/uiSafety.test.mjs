@@ -470,3 +470,274 @@ test('the bare root URL is not silently redirected to a remembered tab', () => {
   assert.ok(!/^\s*'nav:lastTab'/m.test(keys),
     'a retired key must not stay in LEGACY_KEYS — migrating it would adopt dead data');
 });
+
+// ── 18. The lesson player is never re-parented ──────────────────────────────
+//
+// Theater mode and the resizable rail are CSS. If either ever becomes a second JSX
+// branch, React unmounts the <video> and mounts a new one: the learner loses their
+// place, and an uploaded lesson mints a fresh signed URL and re-buffers from zero.
+// There is no jsdom in this repo, so nothing in node --test can observe that
+// happening — the shape is pinned here instead.
+test('closing the curriculum is CSS, not a second render branch', () => {
+  const src = app();
+  assert.ok(/course-workspace mt-6\$\{curriculumCollapsed \? ' is-rail-closed' : ''\}/.test(src),
+    'open/closed must be ONE class on the workspace. A `curriculumCollapsed ? <A/> : <B/>` '
+    + 'branch around the player remounts <video> on every toggle.');
+  assert.ok(/\.course-workspace\.is-rail-closed \.course-rail/.test(css()),
+    'the collapse must be a display rule on the RAIL, in src/index.css');
+  // display, not visibility: a visibility-hidden rail is still laid out, and focus
+  // inside a curriculum nobody can see is exactly the trap this avoids.
+  const closed = css().slice(css().indexOf('.course-workspace.is-rail-closed'));
+  assert.ok(/display:\s*none/.test(closed.slice(0, 260)),
+    'the collapsed rail must be display:none so it leaves the tab order');
+});
+
+// The narrow layout must OVERLAY the player, never stack under it. Stacking is what
+// appended ~2000px of lesson list to the page and produced the endless scrolling this
+// panel replaced — and it is a one-line CSS regression to reintroduce.
+test('a narrow workspace overlays the curriculum instead of stacking it', () => {
+  const sheet = css();
+  const base = sheet.slice(sheet.indexOf('.course-grid {'), sheet.indexOf('@container coursework'));
+  assert.ok(/\.course-grid > \.course-rail\s*\{[^}]*grid-area:\s*1\s*\/\s*1/s.test(base),
+    'outside the container query the rail must share the stage\'s grid cell — a second '
+    + 'grid ROW is the stacked layout that made a 42-lesson course unscrollable');
+  assert.ok(/\.course-grid > \.course-stage-col\s*\{[^}]*grid-area:\s*1\s*\/\s*1/s.test(base),
+    'the stage must hold that same cell, at full width');
+  assert.ok(/position:\s*sticky/.test(base.slice(base.indexOf('.course-grid > .course-rail'))),
+    'the overlay panel must be sticky, or it scrolls away the moment the page moves');
+});
+
+// The header used to be `position: sticky; top: 0` with a transparent background inside
+// the rail's own scroller, so the lesson list scrolled visibly THROUGH it — "COURSE
+// CONTENT" and "Lesson 1.1…" painted over each other. CLAUDE.md already forbade the shape
+// ("a drawer never needs `sticky top-0` … those only ever worked by accident inside a
+// single scroller") and it shipped anyway, so pin it.
+test('the rail header is a flex row, not a sticky box over its own scroller', () => {
+  const sheet = css();
+  const head = sheet.slice(sheet.indexOf('.course-rail-head {'));
+  const block = head.slice(0, head.indexOf('}'));
+  assert.ok(!/position:\s*sticky/.test(block),
+    'the header must not be sticky — inside the rail\'s scroller the list passes under it, '
+    + 'and it was the only sticky header in this sheet without an opaque backdrop');
+  assert.ok(/flex:\s*0 0 auto/.test(block),
+    'the header must be a non-shrinking flex row of the rail');
+  const body = sheet.slice(sheet.indexOf('.course-rail-body {'));
+  const bodyBlock = body.slice(0, body.indexOf('}'));
+  assert.ok(/overflow-y:\s*auto/.test(bodyBlock) && /min-height:\s*0/.test(bodyBlock),
+    '.course-rail-body must be the ONLY scroller, and needs min-height:0 or a flex item '
+    + 'refuses to shrink below its content and overflows the rail instead of scrolling');
+  // The rail itself must have stopped scrolling, or both would scroll and the header
+  // would drift again.
+  const railWide = sheet.slice(sheet.indexOf('.course-grid > .course-rail {'));
+  assert.ok(/display:\s*flex/.test(railWide.slice(0, railWide.indexOf('}'))),
+    'the rail must be the flex column that holds the header and the body');
+});
+
+test('the edge tab keeps a static accessible name', () => {
+  const src = app();
+  const i = src.indexOf('className="course-rail-tab"');
+  assert.ok(i > 0, 'the edge tab was not found');
+  const tag = src.slice(i - 400, i + 400);
+  assert.ok(/aria-label="Show course content"/.test(tag),
+    'the visible label is a hover reveal and must never BE the accessible name — a control '
+    + 'whose name appears only on hover has no name for anyone not hovering');
+  assert.ok(/aria-expanded=\{!curriculumCollapsed\}/.test(tag), 'the tab must report its state');
+  // The reveal is width-based; `display: none` on the label would drop it from the
+  // accessibility tree entirely on the browsers that honour that.
+  assert.ok(/\.course-rail-tab-label\s*\{[^}]*max-width:\s*0/s.test(css()),
+    'the label must collapse by width, not by display');
+});
+
+test('all three SignedLessonVideo states share one media stage frame', () => {
+  const src = app();
+  const i = src.indexOf('function SignedLessonVideo');
+  assert.ok(i > 0, 'SignedLessonVideo was not found');
+  const body = src.slice(i, src.indexOf('\nfunction resumableUploadEndpoint', i));
+  assert.equal((body.match(/className="course-stage"/g) || []).length, 3,
+    'error, signing and ready must each return the SAME .course-stage wrapper — otherwise '
+    + 'a signing failure resizes the page under the learner, as it did before');
+  // Comments stripped first, as §6 does: the code's own prose explains what the removed
+  // clamp was, and a naive scan matches that explanation and fails on the right answer.
+  const code = body.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+  assert.ok(!/maxHeight: 460/.test(code),
+    'the 460px clamp is gone: it needed an 818px-wide box to bind and never once fired');
+});
+
+test('a text lesson never gets the black video frame', () => {
+  const src = app();
+  const i = src.indexOf('function renderVideo(lesson)');
+  assert.ok(i > 0, 'renderVideo was not found');
+  const textBranch = src.slice(i, src.indexOf("video_provider === 'upload'", i));
+  assert.ok(!/course-stage/.test(textBranch),
+    'the type === "text" branch must not render a media stage — its prose and its '
+    + '"No content yet." card would sit in a black video box');
+  assert.ok(/lessonUsesMediaStage\(activeLesson\)/.test(src),
+    'renderLearner must gate the full-bleed stage slot on lessonUsesMediaStage');
+});
+
+test('only course tabs get the wide canvas, and only the max-width is conditional', () => {
+  const src = app();
+  const m = /const WIDE_CANVAS_TABS = new Set\(\[([^\]]*)\]\)/.exec(src);
+  assert.ok(m, 'WIDE_CANVAS_TABS was not found');
+  const ids = m[1].split(',').map((s) => s.trim().replace(/['"]/g, '')).filter(Boolean);
+  assert.ok(ids.length > 0 && ids.length <= 3, 'this is a course exception, not a redesign');
+  for (const id of ids) {
+    assert.ok(['qbomastery', 'resumestrategy', 'interview'].includes(id),
+      `${id} does not host a course catalog`);
+  }
+  assert.ok(/p-4 sm:p-6 lg:p-10 \$\{WIDE_CANVAS_TABS/.test(src),
+    "ONLY the max-width may be conditional — SectionHead's -mx-10/-mt-10/px-10 band is "
+    + 'hard-coupled to the lg:p-10 padding and tears if it moves');
+  // Tailwind's JIT scans source text, so a class built by concatenation is never emitted.
+  assert.ok(/'max-w-\[1800px\]'/.test(src) && /'max-w-7xl'/.test(src),
+    'both canvas widths must appear as complete literals for the JIT scanner');
+});
+
+// ── 19. The in-browser faststart remux ──────────────────────────────────────
+//
+// Uploading a lesson used to cost the admin an ffmpeg pass every single time: all nine
+// lesson objects in production are named `*_faststart.mp4`. planFaststartRemux does that
+// rearrangement in the browser instead — losslessly, in milliseconds. The properties
+// below are the ones no unit test can reach, because they live in the component.
+//
+// The failure this section exists to prevent is specific and quiet: a 1.45 GiB paid
+// lesson that uploads clean, verifies clean, and plays as noise for students. Every
+// downstream check is structurally blind to it — the size cannot change, the ftyp sniff
+// still passes, and `loadedmetadata` fires from the index alone without decoding a sample.
+
+const uploaderBody = () => {
+  const src = app();
+  const i = src.indexOf('function LessonVideoUploader(');
+  assert.ok(i > 0, 'LessonVideoUploader was not found');
+  return src.slice(i, src.indexOf('\nfunction ', i + 10));
+};
+
+const fnBody = (src, signature) => {
+  const i = src.indexOf(signature);
+  assert.ok(i > 0, `${signature} was not found`);
+  return src.slice(i, src.indexOf('\n  }', i));
+};
+
+test('the remux is attempted for a bad INDEX only, never for a bad codec', () => {
+  const pick = fnBody(uploaderBody(), 'async function handlePick(');
+  assert.match(pick, /content\.reason === 'not-faststart'/, 'only not-faststart is ours to repair');
+  const call = pick.indexOf('planFaststartRemux');
+  const guard = pick.indexOf("content.reason === 'not-faststart'");
+  assert.ok(guard > 0 && guard < call,
+    'remuxing an HEVC file yields a faststart HEVC file — still a black player for every '
+    + 'student without a decoder, and the admin sent off to fix the wrong thing');
+});
+
+test('the decode probe runs against the REMUXED file, not the one that was picked', () => {
+  const pick = fnBody(uploaderBody(), 'async function handlePick(');
+  assert.match(pick, /createObjectURL\(upload\)/,
+    'probing the picked file would validate bytes we are not going to send');
+  assert.ok(!/createObjectURL\(file\)/.test(pick),
+    'handlePick must never probe the original file once a remux may have replaced it');
+});
+
+test('a successful remux repoints fileRef and transfers the remuxed bytes', () => {
+  const pick = fnBody(uploaderBody(), 'async function handlePick(');
+  assert.match(pick, /fileRef\.current = upload;/,
+    'fileRef is what resume() re-enters runTransfer with and what "Check again" sizes '
+    + 'against — a stale one feeds storage the old layout from the new offset');
+  assert.match(pick, /runTransfer\(upload\)/);
+  assert.ok(!/runTransfer\(file\)/.test(pick), 'the picked file must never be the one uploaded');
+});
+
+test('buildFaststartFile is SYNCHRONOUS, so it cannot materialise the file', () => {
+  const src = app();
+  const i = src.indexOf('function buildFaststartFile(');
+  assert.ok(i > 0, 'buildFaststartFile was not found');
+  assert.ok(!/async\s+function buildFaststartFile/.test(src),
+    'an async builder invites `await part.arrayBuffer()`, which turns a 1.45 GiB '
+    + 'by-reference Blob into a heap allocation and kills the tab');
+  const body = src.slice(i, src.indexOf('\n}', i));
+  assert.ok(!/\bawait\b/.test(body), 'no await: a sync function physically cannot read the bytes');
+  assert.ok(!/arrayBuffer\(/.test(body), 'File.slice() must stay a lazy reference, never a read');
+  assert.match(body, /file\.slice\(p\.start, p\.end\)/);
+});
+
+test('the remuxed File carries the SOURCE lastModified, or resume silently breaks', () => {
+  const src = app();
+  const body = src.slice(src.indexOf('function buildFaststartFile('));
+  assert.match(body.slice(0, 1400), /lastModified: file\.lastModified/,
+    'new File() defaults lastModified to Date.now(); the tus fingerprint depends on it, '
+    + 'so letting it default means findPreviousUploads() never matches and "choose the '
+    + 'same file again to pick up where it left off" re-sends the whole file from zero');
+  const at = src.indexOf('fingerprint:');
+  assert.match(src.slice(at, at + 200), /lastModified/, 'the fingerprint really does depend on it');
+});
+
+test('a file WE rearranged that will not decode gets the manual remedy, not re-encode advice', () => {
+  const pick = fnBody(uploaderBody(), 'async function handlePick(');
+  const i = pick.indexOf('if (remuxed) {');
+  assert.ok(i > 0, 'the remuxed branch of the probe catch was not found');
+  // Strip comments first: the comment ON this branch explains that re-encode advice is
+  // wrong here, so a naive scan matches the explanation and fails on the right answer.
+  // (§18 hit the identical trap.)
+  const arm = pick.slice(i, i + 500).split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+  assert.ok(!/re-encode|re-export|libx264/i.test(arm),
+    'the encoding was never the problem — this is OUR rearrangement failing, and the '
+    + 'remedy is the lossless remux. Same rule §13 enforces one state later');
+  assert.match(arm, /setErrMsg\(content\.message\)/);
+});
+
+test('the remux adds no state and no event to the machine', () => {
+  const lib = readFileSync(join(REPO, 'src/lib/courseVideo.js'), 'utf8');
+  // Read the two frozen maps themselves rather than scanning the file for a word — the
+  // module now legitimately mentions the remux in prose, and the thing being pinned is
+  // the machine's shape, not its vocabulary.
+  for (const name of ['UPLOAD_STATES', 'UPLOAD_EVENTS']) {
+    const m = new RegExp(`export const ${name} = Object\\.freeze\\(\\{([\\s\\S]*?)\\n\\}\\)`).exec(lib);
+    assert.ok(m, `${name} was not found`);
+    assert.ok(!/REMUX|FASTSTART/i.test(m[1]),
+      `${name} must not grow an entry for the remux — READY_TO_SAVE keeps exactly one `
+      + 'inbound edge, from VERIFYING_PRIVATE_OBJECT, and the remux runs inside '
+      + 'LOCAL_VALIDATING where the picker is already disabled and Save is already blocked');
+  }
+  assert.ok(!/UPLOAD_STATES\.[A-Z_]*(REMUX|FASTSTART)/i.test(app()));
+});
+
+test('"Upload anyway" walks real transitions instead of inventing one', () => {
+  const body = fnBody(uploaderBody(), 'function uploadAnyway(');
+  for (const ev of ['SELECT_FILE', 'VALIDATE_START', 'VALIDATE_OK']) {
+    assert.match(body, new RegExp(`UPLOAD_EVENTS\\.${ev}`),
+      `UNSUPPORTED_FILE reaches UPLOADING only via ${ev} — do not add a transition`);
+  }
+  assert.match(body, /acknowledgedRef\.current = true/);
+});
+
+test('an acknowledged file is not re-blocked AFTER its upload finishes', () => {
+  const body = fnBody(uploaderBody(), 'async function verifyPrivateObject(');
+  assert.match(body, /acknowledgedRef\.current && \(e\?\.code === 3 \|\| e\?\.code === 4\)/,
+    'this probe runs in the SAME browser that already said it cannot decode this codec. '
+    + 'Warning at pick time, then refusing twenty minutes later on the answer we already '
+    + 'predicted, is worse than never having offered the choice');
+  assert.match(body, /await confirmSignedObject\(url, expectedBytes\);/,
+    'presence, authorization and byte-completeness are still proven for every file');
+  assert.ok(body.indexOf('confirmSignedObject') < body.indexOf('acknowledgedRef.current &&'),
+    'the existence/size check must run BEFORE any leniency, never be skipped by it');
+});
+
+test('the oversize note is advisory and cannot block a save', () => {
+  const body = uploaderBody();
+  assert.match(body, /setWeightNote\(describeVideoWeight\(/);
+  assert.ok(!/weightNote[\s\S]{0,200}VALIDATE_FAIL/.test(body),
+    'a heavy file still uploads — this is a heads-up, not a gate');
+});
+
+test('an abandoned upload is swept when the drawer closes', () => {
+  const src = app();
+  const body = fnBody(src, 'const closeLessonEditor = ');
+  assert.match(body, /pendingVideoPathRef\.current/,
+    'closing the drawer unmounts the uploader, taking its ref with it — that is where '
+    + '1.60 GiB of orphans came from');
+  assert.match(body, /removeMediaIfUnreferenced\(\[orphan\]\)/,
+    'and it must go through the reference-aware helper, since a duplicated course can '
+    + 'legitimately share a path');
+  assert.ok(!/useEffect\([^)]*\)[\s\S]{0,200}discardPending\(\)[\s\S]{0,80}\}, \[\]\)/.test(src),
+    'NOT an unmount cleanup: that fires on a successful save too, where the pending path '
+    + 'is the one just written to the row');
+  assert.match(src, /onPendingPath=\{notePendingVideoPath\}/, 'the drawer must be told the path');
+});

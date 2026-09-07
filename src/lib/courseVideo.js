@@ -478,9 +478,24 @@ const REENCODE_FIX = 'ffmpeg -i input.mp4 -c:v libx264 -crf 23 -c:a aac -movflag
 /**
  * Turn an inspection into the same `{ ok, reason, message }` shape `validateVideoFile`
  * returns, so `handlePick` treats both identically and neither needs a new state.
+ *
+ * ★ `severity` says what the caller may DO about it, and both findings here are `'warn'`.
+ *   Neither is a refusal any more:
+ *
+ *   `not-faststart` is repaired in the browser by planFaststartRemux() — losslessly, in
+ *   milliseconds — so it only ever reaches a human when that planner declined a file it
+ *   could not prove it was safe to rearrange. And a non-faststart video still PLAYS; it
+ *   just starts slowly. Refusing it outright was never proportionate.
+ *
+ *   `codec-unsupported` cannot be repaired without a real transcode, which is not
+ *   available here — so it is stated plainly, names who it breaks, and is left to the
+ *   admin. Blocking it forced an hours-long re-encode for a file that plays for most
+ *   students; the admin, who knows their own audience, gets the decision instead.
+ *
+ *   `validateVideoFile` still holds the hard refusals: not an MP4, empty, or over the cap.
  */
 export function describeVideoContent(inspection) {
-  const ok = { ok: true, reason: null, message: '' };
+  const ok = { ok: true, reason: null, severity: null, message: '' };
   if (!inspection || !inspection.readable) return ok;
 
   if (inspection.codec && !LESSON_VIDEO_CODECS.includes(inspection.codec)) {
@@ -490,10 +505,11 @@ export function describeVideoContent(inspection) {
     return {
       ok: false,
       reason: 'codec-unsupported',
+      severity: 'warn',
       message: `This video is ${named}. It may well play on this computer, but Firefox has no `
         + 'decoder for it at all and many phones, tablets and older laptops do not either — those '
-        + 'students would get a black player. Lesson videos must be H.264 video with AAC audio. '
-        + `Re-encode it first — in HandBrake pick a “Fast 1080p30” preset, or run: ${REENCODE_FIX}`,
+        + 'students would get a black player. H.264 plays everywhere. To convert it, in HandBrake '
+        + `pick a “Fast 1080p30” preset, or run: ${REENCODE_FIX}`,
     };
   }
 
@@ -501,14 +517,50 @@ export function describeVideoContent(inspection) {
     return {
       ok: false,
       reason: 'not-faststart',
+      severity: 'warn',
       message: 'This MP4 keeps its index at the END of the file, so a player has to reach the very '
-        + 'end before it can start — about 50 seconds for a file this size, for you now and for '
-        + 'every student on their first play. Moving the index to the front is lossless and takes '
-        + `seconds: ${FASTSTART_FIX}`,
+        + 'end before it can start — for you now and for every student on their first play. Moving '
+        + 'the index to the front is lossless, but this file is shaped in a way this app will not '
+        + `rearrange on its own. Doing it externally takes seconds: ${FASTSTART_FIX}`,
     };
   }
 
   return ok;
+}
+
+/**
+ * Is this file far larger than its running time justifies? Advisory only — it never
+ * blocks anything and never gates a save.
+ *
+ * Screen recordings are the pathological case and they are what this course is made of.
+ * A 1080p screen capture needs 1-3 Mbps; the recorders in use here have produced 30 Mbps
+ * (a 124 MB local test file holding 35 seconds) and a 1.45 GiB lesson that is 72% of the
+ * whole 2 GiB ceiling. That is minutes of extra upload per lesson, and the next thing to
+ * break as recordings get longer — so it is worth a sentence at pick time, when the admin
+ * can still do something about it, rather than a 413 twenty minutes in.
+ *
+ * Returns `{ heavy: false }` when the duration is unknown: a guess made without a
+ * denominator would tell people their file is wrong on no evidence.
+ */
+export const LESSON_VIDEO_HEAVY_BPS = 8 * 1000 * 1000;
+
+export function describeVideoWeight(byteLength, durationSeconds) {
+  const bytes = Number(byteLength);
+  const seconds = Number(durationSeconds);
+  if (!Number.isFinite(bytes) || bytes <= 0 || !Number.isFinite(seconds) || seconds <= 0) {
+    return { heavy: false, bitsPerSecond: null, message: '' };
+  }
+  const bitsPerSecond = (bytes * 8) / seconds;
+  if (bitsPerSecond < LESSON_VIDEO_HEAVY_BPS) return { heavy: false, bitsPerSecond, message: '' };
+  const mbps = Math.round(bitsPerSecond / 100000) / 10;
+  return {
+    heavy: true,
+    bitsPerSecond,
+    message: `Heads-up: this is ${formatBytes(bytes)} for ${Math.round(seconds / 60)} minutes `
+      + `(${mbps} Mbps). Screen recordings normally need 1-3 Mbps, so this will take far longer to `
+      + 'upload than it needs to, and students will use more data watching it. It will upload fine '
+      + `either way. To shrink it without a visible difference: ${REENCODE_FIX}`,
+  };
 }
 
 // ── The upload state machine ───────────────────────────────────────────────

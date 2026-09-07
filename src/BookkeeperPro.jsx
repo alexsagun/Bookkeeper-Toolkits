@@ -1,9 +1,9 @@
-import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useContext, useDeferredValue } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useContext, useDeferredValue, useId } from 'react';
 import {
   LayoutDashboard, BookOpen, FileSpreadsheet, Receipt, FileText,
   MessageCircle, FileCheck2, Percent, ClipboardList, Sparkles,
   Download, Upload, Send, CheckCircle2, Circle, AlertTriangle,
-  Lightbulb, ChevronDown, ChevronRight, Search, Crown, Loader2,
+  Lightbulb, ChevronDown, ChevronRight, ChevronLeft, Search, Crown, Loader2,
   TrendingUp, Shield, Award, Zap, Quote, TrendingDown, Calculator,
   Image as ImageIcon, FileType2, Printer, Edit3, Briefcase,
   MessageSquare, Mic, MicOff, Eye, HelpCircle, User, Target,
@@ -77,6 +77,12 @@ import {
 import { parseLooseJson } from './lib/partialJson';
 import { ZOOM_HOST_SUFFIXES, parseReplayUrl } from './lib/lessonReplay';
 import {
+  COURSE_RAIL_MIN, COURSE_RAIL_MAX, COURSE_RAIL_DEFAULT,
+  COURSE_RAIL_STEP, COURSE_RAIL_STEP_COARSE, COURSE_LAYOUT_STORAGE_KEY,
+  clampRailWidth, maxRailWidth, supportsTwoPane, lessonUsesMediaStage,
+  parseLearnerLayout, serializeLearnerLayout,
+} from './lib/coursePlayerLayout';
+import {
   LESSON_VIDEO_BUCKET, LESSON_VIDEO_ACCEPT, LESSON_VIDEO_MAX_BYTES, LESSON_VIDEO_MIME,
   LESSON_VIDEO_CHUNK_BYTES, LESSON_VIDEO_RETRY_DELAYS, LESSON_VIDEO_SIGN_TTL_SECONDS,
   LESSON_VIDEO_RESIGN_MARGIN_MS, LESSON_VIDEO_VERIFY_TIMEOUT_MS,
@@ -84,8 +90,9 @@ import {
   blocksLessonSave, needsCloseConfirmation, sanitizeVideoFileName, buildLessonVideoPath,
   isLessonVideoPath, validateVideoFile, classifyLessonVideo, coursePublishBlockers,
   lessonVideoPayload, shouldResignPlayback, describeUploadError, formatBytes, formatMediaDuration,
-  inspectLessonVideo, describeVideoContent, parseObjectTotalBytes,
+  inspectLessonVideo, describeVideoContent, describeVideoWeight, parseObjectTotalBytes,
 } from './lib/courseVideo';
+import { planFaststartRemux } from './lib/mp4Faststart';
 import {
   INTAKE_FIELDS, INTAKE_SECTIONS,
   validateIntake, parseAmountPaid, normalizePhone,
@@ -7726,12 +7733,26 @@ function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImport
   }
 }
 
+// Course pages get a wider canvas than the 1280px TabPanel default. A lesson page is a
+// two-pane workspace (curriculum + a 16:9 media stage), and max-w-7xl was capping the
+// video at 744px on a 1920px screen — there the max-width, not the viewport, was the
+// binding constraint. Every other tool is a form or a document and reads worse wider.
+//
+// ★ ONLY the max-width is conditional. The `p-4 sm:p-6 lg:p-10` padding stays exactly as
+//   it is: SectionHead's full-bleed band uses `-mx-10 -mt-10 px-10`, hard-coupled to the
+//   lg:p-10 value across ~70 call sites, and would tear if it moved.
+// ★ 'interview' hosts the Interview Winning Strategy course catalog as one of seven
+//   subtabs, so the other six render on the wider canvas too — checked at 1920 when this
+//   shipped. Both class strings must stay COMPLETE LITERALS for Tailwind's JIT scanner;
+//   never build one by concatenation.
+const WIDE_CANVAS_TABS = new Set(['qbomastery', 'resumestrategy', 'interview']);
+
 const TabPanel = React.memo(function TabPanel({ tabId, active, goto, onAccessCount, onEnrollCount, onImportCount, interviewSub }) {
   return (
     <div
       hidden={!active}
       aria-hidden={!active}
-      className={`${active ? 'fade-in ' : ''}p-4 sm:p-6 lg:p-10 max-w-7xl mx-auto`}>
+      className={`${active ? 'fade-in ' : ''}p-4 sm:p-6 lg:p-10 ${WIDE_CANVAS_TABS.has(tabId) ? 'max-w-[1800px]' : 'max-w-7xl'} mx-auto`}>
       {renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImportCount, interviewSub })}
     </div>
   );
@@ -15660,36 +15681,53 @@ function SignedLessonVideo({ lesson, isAdmin = false }) {
       message: decision.reason === 'decode'
         ? (isAdmin
           ? 'The browser can’t decode this file. Re-export it as MP4 (H.264 video, AAC audio) and upload it again.'
-          : 'This video can’t be played in this browser. Please let support know.')
+          // Naming the browsers matters now that a lesson may legitimately be H.265: the
+          // commonest cause of this screen is a codec the viewer's browser lacks, and
+          // switching browser is something the student can actually act on tonight.
+          : 'This video can’t be played in this browser. Try Chrome, Edge or Safari — '
+            + 'if it still won’t play, let support know.')
         : 'This video stopped loading.',
     });
     setState('error');
   }
 
+  // ★ ALL THREE returns below render the SAME .course-stage frame, and that is the
+  //   point. Before this, 'signing' was a fixed 240px box, 'error' was a dashed card
+  //   of whatever height its message ran to, and 'ready' was a <video> at its intrinsic
+  //   ratio — so a signing failure reflowed the whole lesson page under the learner,
+  //   and so did every lesson change. One frame, three children.
   if (state === 'error') {
     return (
-      <div className="rounded-xl border-2 border-dashed p-8 text-center"
-        style={{ borderColor: 'var(--status-danger-bd)', background: 'var(--status-danger-bg)' }}>
-        <AlertCircle size={24} className="mx-auto mb-2" style={{ color: 'var(--status-danger-fg)' }} />
-        <div className="text-sm" style={{ color: 'var(--status-danger-fg)' }}>{problem?.message}</div>
-        {!problem?.fatal && (
-          <button type="button" className="mt-3 px-3 py-1.5 rounded-lg text-xs font-semibold border"
-            style={{ borderColor: 'var(--status-danger-bd)', color: 'var(--status-danger-fg)' }}
-            onClick={() => { attemptRef.current = 0; sign('retry'); }}>
-            Try again
-          </button>
-        )}
+      <div className="course-stage">
+        {/* Fixed light-on-black, not the status tokens: the frame is #000 in BOTH
+            themes, and --status-danger-fg is #D02323 in light mode — about 2.3:1
+            against black, which is unreadable exactly where the message matters. */}
+        <div className="course-stage-msg" role="alert">
+          <AlertCircle size={24} aria-hidden="true" style={{ color: '#FF8A84' }} />
+          <div>{problem?.message}</div>
+          {!problem?.fatal && (
+            <button type="button" className="course-stage-btn"
+              onClick={() => { attemptRef.current = 0; sign('retry'); }}>
+              Try again
+            </button>
+          )}
+        </div>
       </div>
     );
   }
   if (state === 'signing' || !src) {
     return (
-      <div className="rounded-xl bg-black/80 flex items-center justify-center gap-2 text-white/70 text-sm" style={{ height: 240 }}>
-        <Loader2 size={16} className="animate-spin" /> Loading video…
+      <div className="course-stage">
+        <div className="course-stage-msg" role="status">
+          <span className="inline-flex items-center gap-2">
+            <Loader2 size={16} className="animate-spin" aria-hidden="true" /> Loading video…
+          </span>
+        </div>
       </div>
     );
   }
   return (
+    <div className="course-stage">
     <video
       ref={videoRef}
       key={`${lesson.id}:${path}`}
@@ -15716,9 +15754,11 @@ function SignedLessonVideo({ lesson, isAdmin = false }) {
         }
       }}
       onError={handleMediaError}
-      className="w-full rounded-xl bg-black"
-      style={{ maxHeight: 460 }}
+      // Sizing is .course-stage > video's job now. The old `w-full rounded-xl bg-black`
+      // + `maxHeight: 460` needed an 818px-wide box before the clamp could bind, and
+      // the 1/3-2/3 grid never gave it one — so it had never fired in production.
     />
+    </div>
   );
 }
 
@@ -15768,6 +15808,89 @@ function probeVideoMetadata(url, timeoutMs = 20000) {
 }
 
 /**
+ * Decode a REAL frame, at a REAL chunk offset, from a local blob.
+ *
+ * ★ This is the only check anywhere in the pipeline that can notice a wrong chunk offset
+ *   after a faststart remux, and the reason it has to exist:
+ *     • confirmSignedObject compares sizes, and a remux cannot change the size.
+ *     • the ftyp sniff reads bytes 4-8, which a broken remux still gets right.
+ *     • probeVideoMetadata resolves on `loadedmetadata`, which fires once `moov` has been
+ *       PARSED and has decoded zero samples — so a file whose every offset is wrong still
+ *       reports the right duration, dimensions and codec.
+ *   Seeking past the first chunk forces the demuxer to read at a patched offset and hand
+ *   the bytes to the decoder.
+ *
+ * ★ A MediaError REJECTS (the caller then falls back to the manual remedy); a timeout
+ *   RESOLVES false. They are different facts. "The decoder refused these bytes" is
+ *   evidence the remux is wrong. "We ran out of patience seeking inside a 1.5 GB file on
+ *   a slow external drive" is not evidence of anything, and treating it as a refusal
+ *   would break the feature for the largest files — the ones that need it most.
+ */
+function probeVideoFrame(url, durationSeconds, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const el = document.createElement('video');
+    el.preload = 'auto';
+    el.muted = true;
+    let done = false;
+    const finish = (fn, arg) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      el.removeAttribute('src');
+      try { el.load(); } catch (_) { /* detached element */ }
+      fn(arg);
+    };
+    const timer = setTimeout(() => finish(resolve, false), timeoutMs);
+    // HAVE_CURRENT_DATA or better plus real dimensions means a frame actually decoded.
+    const settle = () => {
+      if (el.readyState >= 2 && el.videoWidth > 0) finish(resolve, true);
+      else finish(reject, el.error || new Error('decode'));
+    };
+    el.onerror = () => finish(reject, el.error || new Error('decode'));
+    el.onloadedmetadata = () => {
+      const d = Number.isFinite(durationSeconds) ? durationSeconds : Number(el.duration);
+      // Past the first chunk and past any leading black, but never past the end. Too
+      // short to seek meaningfully? `loadeddata` alone still proves a frame decoded.
+      if (Number.isFinite(d) && d > 4) el.currentTime = Math.min(d / 2, 30);
+      else el.onloadeddata = settle;
+    };
+    el.onseeked = settle;
+    el.src = url;
+  });
+}
+
+/**
+ * Turn a faststart plan into the File we actually upload.
+ *
+ * ★ SYNCHRONOUS, AND IT MUST STAY THAT WAY. `File.slice()` is a lazy by-reference view of
+ *   bytes on disk, and the Blob constructor concatenates those references without reading
+ *   them — so a 1.45 GiB lesson costs nothing here but the patched index. A single
+ *   `await part.arrayBuffer()` would turn that into a 1.45 GiB heap allocation and kill
+ *   the tab. A function with no `await` in it physically cannot do that, which is why
+ *   test/uiSafety.test.mjs §19 pins the absence of `async`/`await` in this body.
+ *
+ * ★ `lastModified` IS CARRIED OVER, and it is load-bearing. startUpload's tus fingerprint
+ *   is `…-${f.size}-${f.lastModified}`, and `new File()` defaults that to Date.now(). Let
+ *   it default and every re-pick mints a fresh fingerprint, findPreviousUploads() never
+ *   matches, and "choose the same file again to pick up where it left off" — which the
+ *   close-confirm dialog explicitly promises — silently re-sends the whole file from zero.
+ *   Carrying it over is sound because the remux is a deterministic function of the source
+ *   bytes: same file in, byte-identical file out.
+ *
+ * Returns null rather than throwing if the arithmetic did not close.
+ */
+function buildFaststartFile(file, plan) {
+  const parts = plan.parts.map((p) => (p.kind === 'bytes' ? p.data : file.slice(p.start, p.end)));
+  const out = new File(parts, file.name, {
+    type: file.type || LESSON_VIDEO_MIME,
+    lastModified: file.lastModified,
+  });
+  // A rearrangement cannot change the length. If it somehow did, confirmSignedObject and
+  // runVerification would be comparing the upload against a number that is a lie.
+  return out.size === file.size ? out : null;
+}
+
+/**
  * The lesson-video uploader. Module scope, NOT declared inside CourseProgram: a component
  * defined in the parent gets a fresh type identity on every render, so React would unmount
  * and remount it on each keystroke elsewhere in the drawer — losing an upload in progress.
@@ -15779,9 +15902,13 @@ function probeVideoMetadata(url, timeoutMs = 20000) {
  *   savedPath       the path currently stored on the row — never deleted by this component
  *   onChange        (patch) => void, applied to the draft
  *   onStateChange   (uploadState) => void, so the drawer can gate Save and Close
+ *   onPendingPath   (path|null) => void, the object uploaded but NOT yet saved. The
+ *                   drawer needs this because closing it unmounts this component, and
+ *                   an abandoned upload is otherwise an object nothing on earth points
+ *                   at — which is exactly how 1.60 GiB accumulated in production.
  *   disabled        the drawer is busy saving
  */
-function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChange, disabled }) {
+function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChange, onPendingPath, disabled }) {
   const hasSaved = isLessonVideoPath(value?.storage_path);
   const [state, setState] = useState(hasSaved ? UPLOAD_STATES.SAVED_AND_PLAYABLE : UPLOAD_STATES.EMPTY);
   const [progress, setProgress] = useState({ loaded: 0, total: 0 });
@@ -15792,6 +15919,14 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
   // 403 or 404 cannot be resumed away, and the old UI offered the button regardless.
   const [retryable, setRetryable] = useState(true);
   const [live, setLive] = useState('');                  // throttled aria-live text
+  // "Preparing the video…" while the index is being moved to the front. Set BEFORE the
+  // await so React paints it: on a network share the moov read is the slow part, and a
+  // picker that sits inert for two seconds reads as a hang.
+  const [remuxNote, setRemuxNote] = useState('');
+  // Findings the admin may override: { file, notes: [{ reason, message }] }. Not an
+  // error — the upload is ready to go the moment they say so.
+  const [advisory, setAdvisory] = useState(null);
+  const [weightNote, setWeightNote] = useState('');      // oversize heads-up, never blocks
 
   const uploadRef = useRef(null);                        // the tus.Upload instance
   const fileRef = useRef(null);                          // the File, for pause/resume
@@ -15807,6 +15942,12 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
   //   NEW signed url 52.1 s. Minting one per attempt is why "Check again" could never
   //   succeed no matter how many times it was pressed. { url, signedAt, path }.
   const signedRef = useRef(null);
+  // ★ The admin accepted a warning about this file (an unusual codec, or an index we
+  //   could not move) and chose to upload anyway. It has to survive into verification:
+  //   that step probes the signed URL in THIS SAME browser, so for a file we already
+  //   told them this browser may not decode, a decode failure there is the answer we
+  //   predicted — not a new discovery, and not grounds to refuse a finished upload.
+  const acknowledgedRef = useRef(false);
 
   const go = useCallback((event) => {
     setState((prev) => {
@@ -15867,15 +16008,28 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     if (blobUrlRef.current) { URL.revokeObjectURL(blobUrlRef.current); blobUrlRef.current = null; }
   };
 
+  /**
+   * Record the object that is in storage but not yet on the row.
+   *
+   * ★ Kept in TWO places on purpose. `pendingPathRef` is what this component uses; the
+   *   drawer needs its own copy because closing it UNMOUNTS this component, taking the
+   *   ref with it and leaving a real object nothing points at. Every write goes through
+   *   here so the two cannot drift.
+   */
+  const notePendingPath = useCallback((path) => {
+    pendingPathRef.current = path;
+    onPendingPath?.(path);
+  }, [onPendingPath]);
+
   /** Delete an object we uploaded but never saved. Never touches the saved path. */
   const discardPending = useCallback(async () => {
     const path = pendingPathRef.current;
-    pendingPathRef.current = null;
+    notePendingPath(null);
     signedRef.current = null;              // don't hold a signed URL for an object we are dropping
     if (!path || path === savedPath) return;
     // Reference-aware even here: a duplicated course can legitimately share a path.
     await removeMediaIfUnreferenced([path]);
-  }, [savedPath]);
+  }, [savedPath, notePendingPath]);
 
   function announce(text, step) {
     // Throttled on purpose: announcing every progress tick makes a screen reader unusable.
@@ -15980,7 +16134,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
           announce(`Uploading, ${pct}% complete.`, Math.floor(pct / 25));
         },
         onError: (err) => reject(err),
-        onSuccess: () => { pendingPathRef.current = path; resolve(); },
+        onSuccess: () => { notePendingPath(path); resolve(); },
       });
       uploadRef.current = upload;
       upload.findPreviousUploads().then((prev) => {
@@ -16078,14 +16232,30 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     // The three halves are now proved separately, because collapsing them made every
     // distinct failure look identical — and the one message they all shared blamed the
     // admin's file. Presence/authorization/completeness come from a cheap ranged read;
-    // decoding still comes from the signed URL itself, so the invariant is unchanged.
+    // decoding comes from the signed URL itself — except for a file the admin was warned
+    // about and accepted anyway, where THIS browser's decoder is not the authority. See
+    // the acknowledged branch below; the first two halves are never relaxed.
     const url = await signedUrlFor(path);
     await confirmSignedObject(url, expectedBytes);
-    return probeVideoMetadata(url, LESSON_VIDEO_VERIFY_TIMEOUT_MS);
+    try {
+      return await probeVideoMetadata(url, LESSON_VIDEO_VERIFY_TIMEOUT_MS);
+    } catch (e) {
+      // ★ An ACKNOWLEDGED file may fail the decode half here, and ONLY that half.
+      //   This probe runs in the same browser that already told us it cannot play this
+      //   codec, so refusing here would mean warning the admin at pick time, letting
+      //   them choose, taking twenty minutes of their upload — and then blocking them
+      //   anyway on the answer we had already predicted. Presence, authorization,
+      //   byte-completeness and a real ftyp box are all still proven above by
+      //   confirmSignedObject; a timeout or a network fault still fails as before.
+      if (acknowledgedRef.current && (e?.code === 3 || e?.code === 4)) return null;
+      throw e;
+    }
   }
 
   async function handlePick(file) {
     setErrMsg(''); setRetryable(true); liveStepRef.current = -1;
+    setAdvisory(null); setWeightNote(''); setRemuxNote('');
+    acknowledgedRef.current = false;
     if (!file) return;
     await discardPending();                              // replacing? drop the last orphan first
     fileRef.current = file;
@@ -16096,6 +16266,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     go(UPLOAD_EVENTS.VALIDATE_START);
     announce('Checking the file.');
 
+    // The hard refusals, and the only ones left: not an MP4, empty, or over the cap.
     const verdict = validateVideoFile(file);
     if (!verdict.ok) { setErrMsg(verdict.message); go(UPLOAD_EVENTS.VALIDATE_FAIL); announce(verdict.message); return; }
 
@@ -16103,35 +16274,124 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     // see the name, the MIME type and the size — all of which an H.265 file satisfies —
     // so this is the one place the codec and the index position are actually checked.
     // Reads ~2 MB of the local file; measured at single-digit milliseconds.
-    const content = describeVideoContent(
-      await inspectLessonVideo(file.size, (start, end) => file.slice(start, end).arrayBuffer()),
-    );
+    const readSlice = (start, end) => file.slice(start, end).arrayBuffer();
+    const inspection = await inspectLessonVideo(file.size, readSlice);
     if (!mountedRef.current) return;
-    if (!content.ok) {
-      setErrMsg(content.message);
-      go(UPLOAD_EVENTS.VALIDATE_FAIL);
-      announce(content.message);
-      return;
+    const content = describeVideoContent(inspection);
+
+    let upload = file;
+    let remuxed = false;
+    const notes = [];
+
+    // ★ CODEC OUTRANKS THE INDEX, and that ordering is describeVideoContent's, not ours
+    //   — it is pinned by test/courseVideoContent.test.mjs. Remuxing an HEVC file yields
+    //   a faststart HEVC file: still a black player for every student without a decoder,
+    //   and the admin sent off to fix the wrong thing. Only `not-faststart` is ours to
+    //   repair; everything else is reported as it always was.
+    if (!content.ok && content.reason === 'not-faststart') {
+      setRemuxNote('Preparing the video — moving its index to the front so it starts instantly '
+        + 'for students. Nothing is re-encoded and no quality is lost.');
+      announce('Preparing the video. Moving its index to the front.');
+      const plan = await planFaststartRemux(file.size, readSlice);
+      if (!mountedRef.current) return;
+      setRemuxNote('');
+      // planFaststartRemux declines anything it cannot prove it is safe to rearrange, so
+      // a refusal is never a guess — it falls through to the note below.
+      const built = plan.ok ? buildFaststartFile(file, plan) : null;
+      if (built) {
+        upload = built;
+        remuxed = true;
+        // fileRef is what resume() re-enters runTransfer with and what "Check again"
+        // reads its size from. It has to be the bytes we actually SEND, or a resumed
+        // transfer would feed storage the old layout from the new offset.
+        fileRef.current = upload;
+        setFileInfo({ name: upload.name, size: upload.size });
+        setProgress({ loaded: 0, total: upload.size });
+        announce('Index moved to the front. Checking the video plays.');
+      } else {
+        notes.push({ reason: content.reason, message: content.message });
+      }
+    } else if (!content.ok) {
+      notes.push({ reason: content.reason, message: content.message });
     }
 
     releaseBlob();
-    blobUrlRef.current = URL.createObjectURL(file);
+    // Probe the bytes we are about to SEND, not the ones that were picked.
+    blobUrlRef.current = URL.createObjectURL(upload);
+    let secs = null;
     try {
-      const secs = await probeVideoMetadata(blobUrlRef.current);
+      secs = await probeVideoMetadata(blobUrlRef.current);
       if (!mountedRef.current) return;
-      setDuration(secs);
+      // Metadata parsing is NOT proof of a correct remux — see probeVideoFrame. Only
+      // remuxed files pay for this, so the untouched path is byte-for-byte as before.
+      if (remuxed) await probeVideoFrame(blobUrlRef.current, secs);
+      if (!mountedRef.current) return;
     } catch (_) {
+      if (!mountedRef.current) return;
       releaseBlob();
-      setErrMsg('This browser can’t play that file, so students wouldn’t be able to either. '
-        + 'Re-export it as MP4 (H.264 video, AAC audio) and try again.');
-      go(UPLOAD_EVENTS.VALIDATE_FAIL);
-      announce('That file can’t be played.');
-      return;
+      if (remuxed) {
+        // A file WE rearranged that will not decode is our fault, not the encoding's, so
+        // the remedy is the manual remux — never re-encode advice. Same rule as §13
+        // enforces one state later.
+        setErrMsg(content.message);
+        go(UPLOAD_EVENTS.VALIDATE_FAIL);
+        announce('That file could not be prepared.');
+        return;
+      }
+      if (!inspection.readable || !inspection.codec) {
+        // We learned nothing from the container AND the browser will not play it. That
+        // is the one case where refusing is better than guessing.
+        setErrMsg('This browser can’t play that file, so students wouldn’t be able to either. '
+          + 'Re-export it as MP4 (H.264 video, AAC audio) and try again.');
+        go(UPLOAD_EVENTS.VALIDATE_FAIL);
+        announce('That file can’t be played.');
+        return;
+      }
+      // We DO know what this file is. This browser's opinion is one data point, not a
+      // verdict on every student's browser, so it becomes a warning rather than a wall.
+      notes.push({
+        reason: 'local-decode',
+        message: 'This browser could not play the file back, so you will not be able to preview '
+          + 'it here. Students on other browsers may still be able to watch it.',
+      });
     }
     releaseBlob();
+    setDuration(secs);
+    setWeightNote(describeVideoWeight(upload.size, secs).message);
+
+    if (notes.length) {
+      // Not an error — a decision. UNSUPPORTED_FILE re-enables the picker and keeps Save
+      // blocked, which is exactly the state to be in while the admin chooses.
+      setAdvisory({ file: upload, notes });
+      go(UPLOAD_EVENTS.VALIDATE_FAIL);
+      announce(notes[0].message);
+      return;
+    }
     go(UPLOAD_EVENTS.VALIDATE_OK);
     announce('Upload started.');
-    await runTransfer(file);
+    await runTransfer(upload);
+  }
+
+  /**
+   * "Upload anyway" — the admin read the warning and made the call.
+   *
+   * Walks the machine back through its normal edges rather than inventing a transition:
+   * UNSUPPORTED_FILE -SELECT_FILE-> FILE_SELECTED -VALIDATE_START-> LOCAL_VALIDATING
+   * -VALIDATE_OK-> UPLOADING. UPLOAD_TRANSITIONS is untouched, and READY_TO_SAVE keeps
+   * its single inbound edge from VERIFYING_PRIVATE_OBJECT.
+   */
+  function uploadAnyway() {
+    const pending = advisory;
+    if (!pending) return;
+    setAdvisory(null);
+    setErrMsg('');
+    acknowledgedRef.current = true;
+    fileRef.current = pending.file;
+    go(UPLOAD_EVENTS.SELECT_FILE);
+    go(UPLOAD_EVENTS.VALIDATE_START);
+    go(UPLOAD_EVENTS.VALIDATE_OK);
+    announce('Upload started.');
+    runTransfer(pending.file);
   }
 
   /** The transfer + verification half, shared by a fresh pick and by a retry. */
@@ -16188,8 +16448,9 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
         + 'which can take a moment for a large video. Check again.';
     }
     if (e?.code === 4) {                       // MEDIA_ERR_SRC_NOT_SUPPORTED
-      return 'The file uploaded, but the browser will not play it back. It must be MP4 with H.264 '
-        + 'video and AAC audio — re-encode it and upload again.';
+      return 'The file uploaded, but this browser will not play it back — its video or audio format '
+        + 'is one this browser has no decoder for. Re-encode it as H.264 video with AAC audio, '
+        + 'which plays everywhere, and upload again.';
     }
     if (e?.code === 3) {                       // MEDIA_ERR_DECODE
       return 'The file uploaded, but the stored video is corrupt and cannot be decoded. Upload it again.';
@@ -16202,7 +16463,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
       const secs = await verifyPrivateObject(path, expectedBytes);
       if (!mountedRef.current) return;
       if (secs != null) setDuration(secs);
-      pendingPathRef.current = path;
+      notePendingPath(path);
       onChange?.({ storage_path: path, video_provider: 'upload', video_url: null, __durationSeconds: secs });
       go(UPLOAD_EVENTS.VERIFY_OK);
       announce('Video uploaded and ready to save.');
@@ -16210,7 +16471,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
       if (!mountedRef.current) return;
       // The object stays put on purpose — "Check again" needs it, and it is what the
       // orphan panel cleans up if the admin walks away instead.
-      pendingPathRef.current = path;
+      notePendingPath(path);
       setErrMsg(describeVerifyFailure(e));
       go(UPLOAD_EVENTS.VERIFY_FAIL);
       announce('Upload finished, but the playback check failed.');
@@ -16279,8 +16540,11 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
               onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) handlePick(f); }} />
           </label>
           <div className="text-[11px] mt-2 leading-relaxed" style={{ color: C.textSoft }}>
-            MP4 only — H.264 video, AAC audio, index at the front (“faststart”).
-            Up to {formatBytes(LESSON_VIDEO_MAX_BYTES)}. All three are checked before anything uploads.
+            MP4, up to {formatBytes(LESSON_VIDEO_MAX_BYTES)}. No need to prepare it first — if the
+            index sits at the end of the file it is moved to the front here automatically, losslessly
+            and without re-encoding.
+            <br />H.264 video with AAC audio plays on every student’s device; anything else still
+            uploads, with a warning about who it may not reach.
             <br />Students stream it from private storage; it is never published to a public link.
           </div>
         </>
@@ -16351,6 +16615,55 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
               className="px-2.5 py-1 rounded-lg text-xs font-semibold border"
               style={{ borderColor: 'var(--status-danger-bd)', color: 'var(--status-danger-fg)' }}>Remove</button>
           </span>
+        </div>
+      )}
+
+      {/* ★ Everything from here down renders AFTER the Pause/Resume row on purpose.
+          test/uiSafety.test.mjs §7 scans a 900-character window BACKWARDS from
+          `onClick={resume}` for `UPLOAD_STATES.INTERRUPTED`; inserting above that row
+          would push the anchor out of its own window and break a passing ratchet on a
+          correct change. */}
+      {remuxNote && (
+        <div className="mt-3 rounded-lg px-3 py-2 text-xs flex items-start gap-2" role="status"
+          style={{ background: 'var(--wash-strong)', border: '1px solid var(--glass-border)', color: C.textSoft }}>
+          <Loader2 size={14} className="mt-0.5 shrink-0 animate-spin" />
+          <span>{remuxNote}</span>
+        </div>
+      )}
+
+      {/* A decision, not an error: the file is ready to upload the moment they say so.
+          Styled as a warning rather than a failure because nothing here is broken —
+          these are things students on SOME devices may not be able to play. */}
+      {advisory && (
+        <div className="mt-3 rounded-xl px-3 py-2.5 text-xs" role="alert"
+          style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
+          <div className="font-semibold flex items-center gap-1.5">
+            <AlertTriangle size={13} /> Worth checking before you upload
+          </div>
+          <ul className="mt-1 space-y-1 leading-relaxed">
+            {advisory.notes.map((n) => <li key={n.reason}>{n.message}</li>)}
+          </ul>
+          <div className="mt-2.5 flex items-center gap-2 flex-wrap">
+            <button type="button" onClick={uploadAnyway} disabled={busy}
+              className="px-3 py-1.5 rounded-lg text-xs font-bold text-white disabled:opacity-60"
+              style={ADMIN_BTN_OK}>
+              Upload anyway
+            </button>
+            <label className="gh-btn-ghost px-3 py-1.5 text-xs font-bold cursor-pointer">
+              Choose a different file
+              <input type="file" accept={LESSON_VIDEO_ACCEPT} className="sr-only" disabled={busy}
+                onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) handlePick(f); }} />
+            </label>
+          </div>
+        </div>
+      )}
+
+      {/* Advisory only — it never blocks a save and never gates anything. */}
+      {weightNote && !advisory && (
+        <div className="mt-3 rounded-lg px-3 py-2 text-xs flex items-start gap-2" role="status"
+          style={{ background: 'var(--wash-strong)', border: '1px solid var(--glass-border)', color: C.textSoft }}>
+          <Info size={14} className="mt-0.5 shrink-0" />
+          <span>{weightNote}</span>
         </div>
       )}
 
@@ -16989,6 +17302,13 @@ function CourseProgram({
   // The uploader owns its own transfer state and reports it up so the drawer can gate Save
   // and warn before a close would discard transferred bytes. It is NOT threaded back down.
   const [videoUploadState, setVideoUploadState] = useState(UPLOAD_STATES.EMPTY);
+  // An object that has been UPLOADED but not yet saved to the row. A ref, not state: it
+  // exists only so closeLessonEditor can delete what an abandoned upload left behind, and
+  // nothing renders from it. See the sweep in closeLessonEditor.
+  const pendingVideoPathRef = useRef(null);
+  // Stable identity: LessonVideoUploader lists this in a useCallback dependency array, and
+  // a new function every render would rebuild discardPending on every keystroke.
+  const notePendingVideoPath = useCallback((path) => { pendingVideoPathRef.current = path; }, []);
   const [metaBusy, setMetaBusy] = useState(false);           // saving course details / toggling publish
   const [structBusy, setStructBusy] = useState(false);       // adding a module or lesson
   // ── Errors raised from inside the lesson drawer ───────────────────────────────
@@ -17016,6 +17336,403 @@ function CourseProgram({
   const certScaleRef = useRef(null);   // outer responsive wrapper (measured)
   const [certScale, setCertScale] = useState(1);
   const [certBoxH, setCertBoxH]   = useState(0);
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // LESSON-PAGE LAYOUT — the resizable rail, the splitter, and theater mode.
+  // ══════════════════════════════════════════════════════════════════════════
+  // Numbers, clamping and the persisted shape live in src/lib/coursePlayerLayout.js;
+  // the layout itself is CSS (.course-workspace in src/index.css), driven by ONE
+  // custom property. Nothing here measures anything except at the instant a drag
+  // starts — the responsive behaviour is a container query, so collapsing the toolkit
+  // sidebar re-lays the page out with no React render at all.
+  const [railWidth, setRailWidth] = useState(COURSE_RAIL_DEFAULT);
+  const [curriculumCollapsed, setCurriculumCollapsed] = useState(false);
+  // (There is deliberately no `layoutReady` gate here. It existed to stop a write EFFECT
+  // firing on the first commit with the defaults; persistence is now driven by the
+  // interaction handlers instead, so nothing writes until the learner does something.)
+  // ★ Unique per instance, not a literal. The three course tabs are keep-alive, so a
+  //   learner who opens a QBO course and then a Resume course has TWO mounted rails; a
+  //   shared id="course-curriculum" would duplicate in the document and every
+  //   aria-controls would resolve to whichever came first — quite possibly the one
+  //   inside the hidden tab.
+  const curriculumId = useId();
+  const workspaceRef = useRef(null);
+  const splitterRef = useRef(null);
+  const railTabRef = useRef(null);
+  // { pointerId, startX, startWidth, max, width, frame } while a drag is in flight.
+  const railDragRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (typeof window !== 'undefined' && window.storage) {
+        try {
+          const stored = await window.storage.get(COURSE_LAYOUT_STORAGE_KEY);
+          // parseLearnerLayout is total — null, '' and any non-JSON string all yield the
+          // shipped defaults, and a stale width is clamped into this build's bounds.
+          const layout = parseLearnerLayout(stored?.value);
+          if (!cancelled) {
+            setRailWidth(layout.curriculumWidth);
+            setCurriculumCollapsed(layout.curriculumCollapsed);
+          }
+        } catch { /* window.storage.get never throws, but a host shim might */ }
+      }
+      if (!cancelled) setLayoutLoaded(true);
+      // A fire-and-forget async IIFE is an unhandled-rejection hazard even when every
+      // await is already inside a try: a setState landing after the component has been
+      // replaced (React Refresh does exactly this in dev) rejects outside it.
+    })().catch(() => {});
+    return () => { cancelled = true; };
+  }, [user?.id]);
+
+  // ★ PERSIST FROM THE INTERACTION, NOT FROM A STATE EFFECT. An effect watching
+  //   [railWidth, curriculumCollapsed] fires on EVERY mounted CourseProgram, and the
+  //   three course tabs are keep-alive — so opening a QBO course, dragging its rail to
+  //   400, then merely toggling theater on an already-mounted Resume course would make
+  //   that second instance write its own stale 320 over the 400 the learner just chose.
+  //   Only the instance the learner actually touched may write, and it reads-modifies-
+  //   writes so it can never clobber the field it did not change.
+  const persistLayout = useCallback((patch) => {
+    if (typeof window === 'undefined' || !window.storage) return;
+    (async () => {
+      try {
+        const stored = await window.storage.get(COURSE_LAYOUT_STORAGE_KEY);
+        const current = parseLearnerLayout(stored?.value);
+        await window.storage.set(COURSE_LAYOUT_STORAGE_KEY,
+          serializeLearnerLayout({ ...current, ...patch }));
+      } catch { /* storage unavailable — the layout is a convenience, never a blocker */ }
+    })().catch(() => {});
+  }, []);
+
+  const commitRailWidth = useCallback((px) => {
+    setRailWidth(px);
+    persistLayout({ curriculumWidth: px });
+  }, [persistLayout]);
+
+  // The rail is sticky inside <main>. A tab may render its OWN sticky SectionHead above
+  // us — InterviewPrep does, unconditionally, and it measures ~200px — and containment
+  // from container-type makes the workspace a stacking context, so no z-index on the rail
+  // can lift it back out from under that header. Measure the offset instead of assuming
+  // there is none: `showHead` is false here because the catalog passes onBack, which is
+  // exactly the reasoning that made a hard-coded 1.5rem look safe and is only true for
+  // the two standalone course tabs.
+  const [railTop, setRailTop] = useState(24);
+  // The rail ceiling this workspace can actually afford. It is the design maximum until
+  // something measures the workspace, and it is what aria-valuemax reports — announcing a
+  // static 420 that ArrowRight can never reach is a lie to exactly the users who cannot
+  // see that the rail stopped moving.
+  const [railMax, setRailMax] = useState(COURSE_RAIL_MAX);
+  // null until the workspace has been measured once — "not yet known" is distinct from
+  // "narrow", because the arrival rule below must not fire on an unmeasured guess.
+  const [twoPane, setTwoPane] = useState(null);
+  // ★ The arrival rule has to wait for the STORED preference too, not just the
+  //   measurement. The ResizeObserver measures synchronously on mount while
+  //   window.storage.get resolves a tick later, so an arrival rule gated on the
+  //   measurement alone sets "closed" and is then immediately overwritten by the stored
+  //   `open` — leaving the panel covering the video, which is the exact thing it exists
+  //   to prevent. Measured in-browser before this flag was added.
+  const [layoutLoaded, setLayoutLoaded] = useState(false);
+  const arrivalRef = useRef(false);
+  const moveFocusToTabRef = useRef(false);
+  useEffect(() => {
+    // ★ A ResizeObserver, not a window `resize` listener, and the distinction is the whole
+    //   fix. Collapsing the toolkit sidebar changes <main>'s width by 212px and fires NO
+    //   resize event — which is the same reason the layout itself is a container query —
+    //   so a resize listener misses the one width change that actually reflows this
+    //   header. It also fires when an element regains size after display:none, which is
+    //   how a hidden keep-alive tab re-measures on the way back.
+    const measure = () => {
+      let panel = workspaceRef.current;
+      // ★ Scoped to OUR OWN TabPanel. Every visited tab stays mounted inside <main>, so
+      //   main.querySelector('.gh-section-head') returns whichever header comes first in
+      //   the document — quite possibly one belonging to a hidden tab.
+      while (panel?.parentElement && panel.parentElement.tagName !== 'MAIN') panel = panel.parentElement;
+      // ★ A hidden tab measures 0x0. Writing that would clobber a good offset with the
+      //   24px default and, since the deps below cannot see a tab switch, it would never
+      //   be re-measured — silently restoring the very bug this effect exists to fix.
+      //   Zero means "unmeasurable", never "no header".
+      if (!panel || panel.hidden) return;
+      const ws = workspaceRef.current;
+      if (ws?.clientWidth) {
+        setRailMax(maxRailWidth(ws.clientWidth));
+        // Mirrors the @container threshold, from the same constant, so the two cannot
+        // disagree about which layout is on screen. It drives BEHAVIOUR only — the layout
+        // itself is still pure CSS — but two behaviours genuinely need to know: a panel
+        // that overlays the video must not be open on arrival, and it should get out of
+        // the way once a lesson has been chosen.
+        setTwoPane(supportsTwoPane(ws.clientWidth));
+      }
+      if (!embedded) { setRailTop(24); return; }
+      const head = panel.querySelector('.gh-section-head');
+      const h = head ? Math.round(head.getBoundingClientRect().height) : 0;
+      if (h > 0) setRailTop(h + 12);
+    };
+    measure();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(measure);
+    if (workspaceRef.current) ro.observe(workspaceRef.current);
+    let panel = workspaceRef.current;
+    while (panel?.parentElement && panel.parentElement.tagName !== 'MAIN') panel = panel.parentElement;
+    const head = panel?.querySelector('.gh-section-head');
+    if (head) ro.observe(head);
+    return () => ro.disconnect();
+    // ★ `loading` is a dependency because it has to be. On mount this component renders a
+    //   spinner, not the workspace, so workspaceRef.current is still null when the effect
+    //   first runs and there is nothing to observe. Without a dep that changes once the
+    //   course lands, the offset stays at its 24px default forever and the rail parks
+    //   behind the header — which is exactly what shipped until it was measured in-browser.
+  }, [embedded, mode, loading]);
+
+  // Keep a restored width honest against the workspace it actually landed in. Without
+  // this, a 420px rail saved on a 1920px monitor reports 420 through aria-valuenow on a
+  // 1366px laptop while the CSS backstop renders it at 308.
+  useEffect(() => {
+    setRailWidth(w => clampRailWidth(w, railMax));
+  }, [railMax]);
+
+  // ★ ARRIVAL RULE, once per mount. On a narrow workspace the panel OVERLAYS the player,
+  //   so honouring a stored `open` would greet the learner with the lesson list covering
+  //   the video they came to watch. Start closed there instead — and deliberately do NOT
+  //   persist it, so the preference they set on a wide screen survives a trip through a
+  //   small one. It fires only after the first real measurement (twoPane is null before
+  //   that), and only once, so it can never fight a deliberate toggle.
+  useEffect(() => {
+    if (twoPane === null || !layoutLoaded || arrivalRef.current) return;
+    arrivalRef.current = true;
+    if (!twoPane) setCurriculumCollapsed(true);
+  }, [twoPane, layoutLoaded]);
+
+  // A drag interrupted by an unmount (the learner hits "All courses" mid-drag) must not
+  // leave <body> stuck in col-resize with text selection disabled app-wide, and must not
+  // leave window listeners bound to a dead component.
+  useEffect(() => () => {
+    const d = railDragRef.current;
+    if (d) {
+      if (d.frame) cancelAnimationFrame(d.frame);
+      if (d.onMove) window.removeEventListener('pointermove', d.onMove);
+      if (d.onUp) {
+        window.removeEventListener('pointerup', d.onUp);
+        window.removeEventListener('pointercancel', d.onUp);
+      }
+      railDragRef.current = null;
+    }
+    if (typeof document !== 'undefined') document.body.classList.remove('is-col-resizing');
+  }, []);
+
+  function beginRailDrag(e) {
+    if (e.button !== 0) return;
+    // ★ One drag at a time. A second pointerdown (a second finger, or a mouse button while
+    //   a touch drag is live) would otherwise overwrite railDragRef and orphan the first
+    //   drag's window listeners — and if a render happened in between, those are a
+    //   DIFFERENT function identity, so the surviving drag's cleanup cannot remove them and
+    //   every subsequent pointermove runs the handler twice.
+    if (railDragRef.current) return;
+    const ws = workspaceRef.current;
+    if (!ws) return;
+    // The ONLY measurement this feature takes. Read once, at drag start, so a
+    // pointermove never touches layout.
+    const max = maxRailWidth(ws.clientWidth);
+    // ★ The origin is the RENDERED width, not the state. There is no resize listener, so
+    //   state and render legitimately disagree whenever the CSS backstop is binding — a
+    //   420px rail saved on a 1920px monitor renders at 308px on a 1366px laptop. Seeding
+    //   startWidth from the stale 420 makes every clamp return 308 until the learner has
+    //   dragged 112px left: the handle simply does not move, and the control reads as
+    //   broken. Clamping the origin first makes the first pixel of drag move the rail.
+    const origin = clampRailWidth(railWidth, max);
+    const d = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startWidth: origin,
+      max,
+      width: origin,
+      frame: 0,
+      onMove: dragRail,
+      onUp: endRailDrag,
+    };
+    railDragRef.current = d;
+    // ★ Window-level listeners, and they are the ONLY ones — the element carries no
+    //   pointermove/up, or a captured pointer would bubble and run the handler twice.
+    //   They live on `window` because setPointerCapture is an enhancement that can fail
+    //   (see the catch below) and a context menu opened mid-drag can swallow pointerup:
+    //   either would leave the pointer moving outside a splitter that never hears about
+    //   it, with body.is-col-resizing — an app-wide user-select:none — stuck on.
+    // ★ The exact references are stashed on `d` because these are plain function
+    //   declarations: every render makes new ones, so removeEventListener(dragRail) from
+    //   a LATER render would silently remove nothing and leak the drag forever.
+    window.addEventListener('pointermove', d.onMove);
+    window.addEventListener('pointerup', d.onUp);
+    window.addEventListener('pointercancel', d.onUp);
+    // ★ setPointerCapture THROWS NotFoundError when the id has no active pointer — which
+    //   happens for a synthetic event, and for a real one whose pointer was released
+    //   between dispatch and handler. Uncaught, it aborted the rest of this function and
+    //   left a drag half-armed: railDragRef set, so pointermove still resized, but with
+    //   no body class, so text selected across the page as the learner dragged.
+    //   Capture is an enhancement (it keeps the drag alive off-element); losing it is
+    //   survivable, losing the guards below is not.
+    try { e.currentTarget.setPointerCapture?.(e.pointerId); } catch { /* no active pointer */ }
+    e.currentTarget.dataset.dragging = 'true';
+    document.body.classList.add('is-col-resizing');
+    e.preventDefault();
+    // ★ preventDefault on pointerdown suppresses a <button>'s default focus, so the
+    //   splitter has to take it explicitly — otherwise a learner who drags the handle
+    //   cannot then nudge it with the arrow keys.
+    e.currentTarget.focus?.();
+  }
+
+  function dragRail(e) {
+    const d = railDragRef.current;
+    if (!d || e.pointerId !== d.pointerId) return;
+    // ★ MINUS, because the panel is on the RIGHT: dragging the splitter left has to make
+    //   the thing to its right bigger. A plus here sends the rail the opposite way to the
+    //   pointer, which reads as a broken control rather than an inverted one.
+    d.width = clampRailWidth(d.startWidth - (e.clientX - d.startX), d.max);
+    if (d.frame) return;
+    d.frame = requestAnimationFrame(() => {
+      d.frame = 0;
+      // ★ THE WHOLE POINT. A setState here re-renders CourseProgram — every lesson
+      //   button, the progress card, the player subtree — once per pointer pixel.
+      //   Writing the custom property moves one grid track and touches no React state.
+      workspaceRef.current?.style.setProperty('--course-rail', `${d.width}px`);
+    });
+  }
+
+  function endRailDrag(e) {
+    const d = railDragRef.current;
+    if (!d) return;
+    if (e?.pointerId !== undefined && e.pointerId !== d.pointerId) return;
+    if (d.frame) { cancelAnimationFrame(d.frame); d.frame = 0; }
+    // Nulled BEFORE releasing capture: releasePointerCapture fires lostpointercapture,
+    // which re-enters this function — and now finds nothing to do.
+    railDragRef.current = null;
+    if (d.onMove) window.removeEventListener('pointermove', d.onMove);
+    if (d.onUp) {
+      window.removeEventListener('pointerup', d.onUp);
+      window.removeEventListener('pointercancel', d.onUp);
+    }
+    const el = splitterRef.current;
+    if (el) {
+      try {
+        if (e?.pointerId !== undefined && el.hasPointerCapture?.(e.pointerId)) {
+          el.releasePointerCapture(e.pointerId);
+        }
+      } catch { /* the browser already released it (pointercancel) */ }
+      delete el.dataset.dragging;
+    }
+    document.body.classList.remove('is-col-resizing');
+    // ★ Write the property here rather than trusting the render to do it. React bails out
+    //   of a setState to an equal value, and even when it renders, diffProperties compares
+    //   the style STRING and writes nothing when it matches. So a drag out and back to the
+    //   starting width — with the final rAF cancelled just above — would leave the DOM at
+    //   whatever the last APPLIED frame was while state said otherwise, permanently, and
+    //   poison the next drag's origin. This makes the end of the gesture authoritative.
+    workspaceRef.current?.style.setProperty('--course-rail', `${d.width}px`);
+    // One render, one persist, at the end of the gesture.
+    commitRailWidth(d.width);
+  }
+
+  function onRailKeyDown(e) {
+    const ws = workspaceRef.current;
+    if (!ws) return;
+    const max = maxRailWidth(ws.clientWidth);
+    // ★ A <button> swallowed Space; a div[tabIndex=0] does not, and the nearest scroll
+    //   container is <main>. Without this, a keyboard user exploring the splitter jumps
+    //   the whole lesson page instead of doing nothing.
+    if (e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); return; }
+    const step = e.shiftKey ? COURSE_RAIL_STEP_COARSE : COURSE_RAIL_STEP;
+    let next = null;
+    // ★ Inverted, because the panel is on the RIGHT. The arrow keys move the SPLITTER, so
+    //   dragging it left enlarges what is to its right. Left-narrows would move the handle
+    //   the opposite way to the key that was pressed.
+    if (e.key === 'ArrowLeft') next = railWidth + step;
+    else if (e.key === 'ArrowRight') next = railWidth - step;
+    else if (e.key === 'Home') next = COURSE_RAIL_MIN;
+    else if (e.key === 'End') next = max;
+    else if (e.key === 'Enter') next = COURSE_RAIL_DEFAULT;   // same as the dblclick reset
+    else return;
+    e.preventDefault();
+    commitRailWidth(clampRailWidth(next, max));
+  }
+
+  function resetRail() { commitRailWidth(COURSE_RAIL_DEFAULT); }
+
+  // ★ Picking a lesson dismisses an OVERLAYING panel — the standard drawer contract, and
+  //   the whole point of the gesture: you opened the list to choose, and the thing you
+  //   chose is underneath it. Two-pane mode leaves the panel alone, because there it sits
+  //   beside the player and covers nothing. Not persisted: this is a transient dismissal,
+  //   not the learner saying they want the panel shut.
+  function selectLesson(id) {
+    setActiveLessonId(id);
+    if (twoPane === false) setCurriculumCollapsed(true);
+  }
+
+  function toggleCurriculum() {
+    const next = !curriculumCollapsed;
+    // ★ Closing removes the splitter, the close button and the whole rail from the
+    //   document (display:none). Whichever of them the learner just activated takes the
+    //   focus down with it and drops it on <body>, so the next Tab restarts at the top of
+    //   the page. The tab is the control that replaces them, so focus belongs there — but
+    //   it does not exist until the render that closes the panel, hence the flag.
+    if (next) moveFocusToTabRef.current = true;
+    setCurriculumCollapsed(next);
+    // ★ Persisted only from the two-pane layout. There the panel is a column the learner
+    //   is deliberately choosing to keep or drop; in overlay mode closing it is just
+    //   dismissing something that was covering the video, and remembering that would mean
+    //   a wide screen inherits a preference set by a narrow one.
+    if (twoPane !== false) persistLayout({ curriculumCollapsed: next });
+  }
+
+  useEffect(() => {
+    if (!moveFocusToTabRef.current) return;
+    moveFocusToTabRef.current = false;
+    if (curriculumCollapsed) railTabRef.current?.focus();
+  }, [curriculumCollapsed]);
+
+  // ★ Escape DISMISSES AN OPEN OVERLAY — and the condition is inverted from what it used
+  //   to be, deliberately. The old panel was a full-width "theater" you escaped OUT of, so
+  //   this bound while collapsed; the panel now floats over the player, so the thing a
+  //   learner wants Escape to do is put it away. It stays out of two-pane mode entirely
+  //   (`twoPane !== false`): there the panel is a column beside the video, covers nothing,
+  //   and has no dismissal to perform — taking the key there would steal it from whatever
+  //   else is going on. It is still the fourth handler with a claim, so it declines four
+  //   times before acting.
+  useEffect(() => {
+    if (curriculumCollapsed || twoPane !== false) return undefined;
+    const onKey = (e) => {
+      if (e.key !== 'Escape') return;
+      // 1. This CourseProgram may be sitting in a HIDDEN keep-alive TabPanel (`hidden`
+      //    -> display:none, still mounted). Escape pressed in an unrelated tool would
+      //    otherwise flip an invisible course's layout. A display:none element reports
+      //    zero client rects.
+      if (!workspaceRef.current || workspaceRef.current.getClientRects().length === 0) return;
+      // 2. Native video fullscreen owns Escape. Most engines exit fullscreen and never
+      //    dispatch the key to us; Safari does dispatch it. Either way it is not ours.
+      if (typeof document !== 'undefined'
+        && (document.fullscreenElement || document.webkitFullscreenElement)) return;
+      // 3. A modal is on top — the lesson-editor SidePanel, an AccountModal, the welcome
+      //    overlay. Its own Escape handler owns the key, and collapsing the workspace
+      //    behind a scrim is a state change the learner cannot see happen.
+      if (document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+      // 4. An open dropdown — the account kebab, the notification bell, the course ⋮
+      //    menu. They dismiss on Escape via the house document-level idiom and do NOT
+      //    stopPropagation, so without this one keypress would close the menu AND the
+      //    panel: two things the learner asked for one of.
+      //    ★ Scoped to the VISIBLE panel: every tab stays mounted, and the house dismissal
+      //      idiom is a pointerdown listener, so a menu opened in another tab and left
+      //      behind by Back/Forward or a voice-assistant navigation is still in the
+      //      document. A document-wide probe would let that invisible menu block Escape.
+      let panel = workspaceRef.current;
+      while (panel?.parentElement && panel.parentElement.tagName !== 'MAIN') panel = panel.parentElement;
+      if (panel?.querySelector('[role="menu"]')) return;
+      // Not persisted, and focus follows the same path as the close button — this is the
+      // overlay branch, where dismissing is transient (see toggleCurriculum).
+      moveFocusToTabRef.current = true;
+      setCurriculumCollapsed(true);
+    };
+    // No preventDefault: every case where someone else is owed this key has already
+    // been declined above, so there is nothing left to suppress.
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [curriculumCollapsed, twoPane]);
 
   const courseDraftFromRow = (row) => ({
     title: row?.title || '',
@@ -17213,6 +17930,24 @@ function CourseProgram({
       && !window.confirm('This lesson\'s video is still uploading.\n\nClose anyway? The transfer stops, '
         + 'and choosing the same file again later picks up where it left off.')) return;
     if (lessonDraftDirty && !window.confirm('Discard unsaved lesson changes?')) return;
+    // ★ Sweep an upload that FINISHED but was never saved. This is where the orphans came
+    //   from: the transfer completes, the object is written, the only thing that knows its
+    //   path is a ref inside LessonVideoUploader, and closing the drawer unmounts that
+    //   component. saveLesson's own cleanup cannot reach it — it compares the row's OLD
+    //   storage_path against the new one, and for an abandoned upload the row never had
+    //   one. Three such objects were sitting in production, 1.60 GiB, 29% of the bucket.
+    //
+    //   Deliberately HERE and not in a useEffect unmount cleanup: this function runs only
+    //   on Cancel / X / Escape, never from saveLesson — whereas an unmount fires on a
+    //   SUCCESSFUL save too, where the pending path is the one just written to the row.
+    //   removeMediaIfUnreferenced would refuse to delete it, but relying on that is a
+    //   safety net standing in for a design.
+    const orphan = pendingVideoPathRef.current;
+    pendingVideoPathRef.current = null;
+    if (orphan && orphan !== originalEditingLesson?.storage_path) {
+      // Best-effort and reference-aware: a duplicated course can legitimately share a path.
+      Promise.resolve(removeMediaIfUnreferenced([orphan])).catch(() => { /* best effort */ });
+    }
     clearLessonDraft();
     setVideoUploadState(UPLOAD_STATES.EMPTY);
     setEditingLesson(null);
@@ -17555,6 +18290,10 @@ function CourseProgram({
       // If a previously-uploaded file was replaced or removed, purge the old object — but only if no
       // other course (e.g. a duplicate that reused this path) still references it (copy-on-write).
       if (oldPath && oldPath !== payload.storage_path) await removeMediaIfUnreferenced([oldPath]);
+      // The row now cites this object, so it is no longer pending and closeLessonEditor
+      // must not sweep it. (removeMediaIfUnreferenced would refuse to delete a referenced
+      // path anyway — this keeps the bookkeeping honest rather than leaning on that.)
+      pendingVideoPathRef.current = null;
       setVideoUploadState(UPLOAD_STATES.EMPTY);
       clearLessonDraft();
       setEditingLesson(null);
@@ -17643,10 +18382,14 @@ function CourseProgram({
     //   proven to be an absolute https URL first, by the same parseReplayUrl() that guards
     //   the Zoom field two sections down.
     if (classifyLessonVideo(lesson) === 'legacy-link') {
+      // Margins, not just mb-2: the stage below is now FULL-BLEED in the player card,
+      // so this notice is the only thing between it and the card edge and has to inset
+      // itself. (This branch is unreachable from the admin preview at the bottom of
+      // renderBuilder, which is gated on video_provider === 'upload'.)
       const notice = isAdmin ? (
-        <div className="rounded-lg px-3 py-2 mb-2 text-xs flex items-start gap-2"
+        <div className="rounded-lg mx-5 mt-5 sm:mx-6 sm:mt-6 mb-3 px-3 py-2 text-xs flex items-start gap-2"
           style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
-          <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+          <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
           <span><b>Upload replacement required.</b> This lesson still plays from an external
             {' '}{lesson.video_provider} link. Edit it and upload the video file — the course can’t be
             published or duplicated until you do.</span>
@@ -17656,10 +18399,14 @@ function CourseProgram({
       // The stored value is not usable as a media source. ONE fallback for every reason,
       // so no branch below can quietly fall through to binding the raw value.
       const unusable = (
-        <>{notice}<div className="rounded-xl border-2 border-dashed border-slate-200 p-10 text-center text-slate-400">
-          {isAdmin
-            ? 'This lesson’s stored video link isn’t one this player can use. Upload the video file.'
-            : 'This lesson is being updated. Please check back shortly.'}
+        // No role="status": this is the lesson's permanent state, not a live region, and
+        // announcing it on every lesson change is noise.
+        <>{notice}<div className="course-stage">
+          <div className="course-stage-msg">
+            {isAdmin
+              ? 'This lesson’s stored video link isn’t one this player can use. Upload the video file.'
+              : 'This lesson is being updated. Please check back shortly.'}
+          </div>
         </div></>
       );
 
@@ -17668,8 +18415,9 @@ function CourseProgram({
         // proven result carries a `url` — the same primitive the Zoom field is built on.
         const checked = parseReplayUrl(lesson.video_url);
         if (checked.kind !== 'zoom' && checked.kind !== 'external') return unusable;
-        return <>{notice}<video key={lesson.id} controls preload="metadata" playsInline
-          className="w-full rounded-xl bg-black" style={{ maxHeight: 460 }} src={checked.url} /></>;
+        return <>{notice}<div className="course-stage">
+          <video key={lesson.id} controls preload="metadata" playsInline src={checked.url} />
+        </div></>;
       }
 
       // ★ Gate on the PROVIDER parseVideoUrl returned, not merely on embedUrl being truthy.
@@ -17684,10 +18432,15 @@ function CourseProgram({
       if ((parsed.provider !== 'youtube' && parsed.provider !== 'vimeo') || !parsed.embedUrl) return unusable;
       return (
         <>{notice}
-          <div style={{ position: 'relative', paddingBottom: '56.25%', height: 0 }} className="rounded-xl overflow-hidden bg-black">
+          {/* ★ THE COMMON CASE, and the one that gains most. On 2026-08-24, 101 of 102
+              live video lessons were YouTube links, and this box was width-driven with
+              no height clamp at all — so the `maxHeight: 460` everyone reached for was
+              never even in this path. The hand-rolled `paddingBottom: 56.25%` hack is
+              now .course-stage's aspect-ratio, which also gives it the viewport cap and
+              the identical frame an uploaded video gets. */}
+          <div className="course-stage">
             <iframe src={parsed.embedUrl} title={lesson.title} loading="lazy"
-              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen
-              style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', border: 0 }} />
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen />
           </div>
         </>
       );
@@ -17695,9 +18448,11 @@ function CourseProgram({
     // ═════════════════════ END TEMPORARY LEGACY BLOCK ═════════════════════════════
 
     return (
-      <div className="rounded-xl border-2 border-dashed border-slate-200 p-10 text-center text-slate-400">
-        <Video size={28} className="mx-auto mb-2 opacity-60" />
-        {isAdmin ? 'No video uploaded yet.' : 'No video added yet.'}
+      <div className="course-stage">
+        <div className="course-stage-msg">
+          <Video size={28} className="opacity-60" aria-hidden="true" />
+          {isAdmin ? 'No video uploaded yet.' : 'No video added yet.'}
+        </div>
       </div>
     );
   }
@@ -17724,10 +18479,40 @@ function CourseProgram({
       );
     }
     const activeIdx = activeLesson ? allLessons.findIndex(l => l.id === activeLesson.id) : -1;
+    // A text lesson gets no black frame — see lessonUsesMediaStage's comment.
+    const stageLesson = lessonUsesMediaStage(activeLesson);
     return (
-      <div className="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Curriculum — below the player on mobile, sticky sidebar on desktop */}
-        <div className="order-2 lg:order-1 lg:col-span-1 space-y-4 lg:sticky lg:top-24 lg:self-start lg:max-h-[calc(100vh-7rem)] lg:overflow-y-auto">
+      <div
+        ref={workspaceRef}
+        className={`course-workspace mt-6${curriculumCollapsed ? ' is-rail-closed' : ''}`}
+        // ★ React writes a custom property through style.setProperty, and — critically —
+        //   only when the value CHANGED between renders. railWidth does not move until
+        //   pointerup, so an unrelated re-render mid-drag (markComplete, a notice) writes
+        //   nothing and cannot snap the rail back to its pre-drag width.
+        style={{ '--course-rail': `${railWidth}px`, '--course-rail-top': `${railTop}px` }}>
+
+        <div className="course-grid">
+        {/* Curriculum — a sticky column beside the player when there is room for two
+            panes, a panel floating OVER the player when there is not. It never stacks
+            below. Both states are CSS; this element never moves in the DOM. */}
+        <div id={curriculumId} role="region" aria-label="Course curriculum"
+          className="course-rail">
+          <div className="course-rail-head">
+            <div className="text-xs uppercase tracking-[0.18em] font-bold" style={{ color: C.textSoft }}>
+              Course content
+            </div>
+            <button type="button" onClick={toggleCurriculum}
+              aria-expanded={!curriculumCollapsed} aria-controls={curriculumId}
+              title="Hide course content" aria-label="Hide course content"
+              className="flex items-center justify-center rounded-lg transition hover:opacity-70"
+              style={{ width: 30, height: 30, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}`, color: C.textMute }}>
+              <X size={16} aria-hidden="true" />
+            </button>
+          </div>
+          {/* The ONLY scroller in the rail. `space-y-4` lives here rather than on the rail
+              itself: as a sibling of the header it left a 16px transparent gap the list
+              showed through. */}
+          <div className="course-rail-body space-y-4">
           <div style={{ background: SHEEN }} className="glass-card p-5 rounded-2xl">
             <div className="flex items-center justify-between mb-2">
               <div className="text-xs uppercase tracking-[0.2em] font-bold text-slate-600">Your Progress</div>
@@ -17759,31 +18544,88 @@ function CourseProgram({
                   const done = doneIds.has(l.id);
                   const active = l.id === activeLessonId;
                   return (
-                    <button key={l.id} onClick={() => setActiveLessonId(l.id)}
-                      className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left transition-colors hover:bg-slate-50"
+                    <button key={l.id} onClick={() => selectLesson(l.id)}
+                      // Kept for the hover tooltip on the rare title long enough to still
+                      // clip at three lines. It is NOT restoring an accessible name — the
+                      // button's name comes from its contents, which hold the full string
+                      // regardless of CSS clipping.
+                      title={l.title}
+                      aria-current={active ? 'true' : undefined}
+                      // items-start, not items-center: the status dot aligns to the FIRST
+                      // line of a title that now wraps.
+                      className="w-full flex items-start gap-2.5 px-3 py-2.5 rounded-xl text-left transition-colors hover:bg-slate-50"
                       style={active ? { background: ICE } : undefined}>
-                      {done ? <CheckCircle2 size={18} style={{ color: ROYAL }} className="flex-shrink-0" />
-                            : <Circle size={18} className="text-slate-300 flex-shrink-0" />}
-                      <span className="flex-1 text-sm truncate" style={{ color: active ? NAVY : C.text, fontWeight: active ? 700 : 500 }}>{l.title}</span>
-                      {l.type === 'video' ? <Play size={13} className="text-slate-400 flex-shrink-0" /> : <FileText size={13} className="text-slate-400 flex-shrink-0" />}
-                      {l.duration_label && <span className="text-[11px] text-slate-400 flex-shrink-0">{l.duration_label}</span>}
+                      {done ? <CheckCircle2 size={18} style={{ color: ROYAL }} className="flex-shrink-0 mt-px" aria-hidden="true" />
+                            : <Circle size={18} className="text-slate-300 flex-shrink-0 mt-px" aria-hidden="true" />}
+                      {/* ★ TWO ROWS, and the reason is arithmetic. On one row the title was
+                          a flex sibling of the type icon and an unshrinkable duration, so
+                          in a 240px rail it got ~133px — sixteen characters before
+                          `truncate` bit, which is why every lesson read "Lesson 1.1: How
+                          T…". Moving the metadata to its own line hands the title the whole
+                          width and lets it wrap. min-w-0 because a flex child will not
+                          shrink below its content without it. */}
+                      <span className="flex-1 min-w-0">
+                        <span className="block text-sm leading-snug line-clamp-3"
+                          style={{ color: active ? NAVY : C.text, fontWeight: active ? 700 : 500 }}>{l.title}</span>
+                        <span className="mt-0.5 flex items-center gap-1.5 text-[11px] text-slate-400">
+                          {l.type === 'video' ? <Play size={11} className="flex-shrink-0" aria-hidden="true" /> : <FileText size={11} className="flex-shrink-0" aria-hidden="true" />}
+                          {/* truncate: admin-authored free text, and on its own line it is
+                              the only thing that could still overflow. */}
+                          {l.duration_label && <span className="truncate">{l.duration_label}</span>}
+                        </span>
+                      </span>
                     </button>
                   );
                 })}
               </div>
             </div>
           ))}
+          </div>
         </div>
 
+        {/* ★ A div, NOT a <button>. ARIA-in-HTML allows only a fixed list of roles on a
+            button — checkbox, combobox, link, menuitem, option, radio, switch, tab,
+            treeitem — and `separator` is not among them, so a re-roled button is an
+            aria-allowed-role violation any audit will flag. A focusable separator is the
+            APG window-splitter pattern, and it needs an explicit tabIndex because a
+            splitter has no native element to be — unlike every other control on this page,
+            which is a real <button>. */}
+        <div
+          ref={splitterRef}
+          tabIndex={0}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize the lesson list"
+          aria-controls={curriculumId}
+          aria-valuemin={COURSE_RAIL_MIN}
+          // The ceiling this workspace can afford, not the design constant — measured by
+          // the ResizeObserver above. Announcing 420 where End stops at 308 is a lie.
+          aria-valuemax={railMax}
+          aria-valuenow={railWidth}
+          aria-valuetext={`Lesson list ${railWidth} pixels wide`}
+          title="Drag, or use the arrow keys, to resize the lesson list"
+          className="course-splitter"
+          onPointerDown={beginRailDrag}
+          onKeyDown={onRailKeyDown}
+          onDoubleClick={resetRail} />
+
         {/* Player */}
-        <div className="order-1 lg:order-2 lg:col-span-2">
+        <div className="course-stage-col">
           {activeLesson ? (
             // C.white (var(--surface-2)), not a literal '#fff': a hex here out-cascades both
             // .glass-card and the dark compat layer, leaving the card white — and its
             // text-slate-700 body copy illegible — in dark mode.
-            <div className="glass-card rounded-2xl p-5 sm:p-6" style={{ background: C.white }}>
-              {renderVideo(activeLesson)}
-              <div className="mt-5">
+            // overflow-hidden is new: it clips the now FULL-BLEED media stage to the card's
+            // radius. The card's own p-5 sm:p-6 moved to the inner wrapper below, which is
+            // worth ~48px of video width at every breakpoint — the difference between
+            // missing and clearing the 700px target at 1440x900.
+            <div className="glass-card rounded-2xl overflow-hidden" style={{ background: C.white }}>
+              {stageLesson && renderVideo(activeLesson)}
+              <div className="p-5 sm:p-6">
+              {/* A text lesson's body is prose, so it renders INSIDE the padding rather
+                  than edge-to-edge. Reading order is unchanged either way. */}
+              {!stageLesson && renderVideo(activeLesson)}
+              <div className={stageLesson ? undefined : 'mt-5'}>
                 <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">{activeLesson.title}</div>
                 {activeLesson.duration_label && <div className="text-xs text-slate-400 mt-0.5">{activeLesson.duration_label}</div>}
                 {activeLesson.type === 'video' && activeLesson.text_content && (
@@ -17822,10 +18664,30 @@ function CourseProgram({
                   </div>
                 </div>
               </div>
+              </div>
             </div>
           ) : (
             <div className="glass-card rounded-2xl p-10 text-center text-slate-400">Select a lesson to begin.</div>
           )}
+        </div>
+
+        {/* Dismiss target behind an OPEN overlay panel. A real <button> rather than a bare
+            div so it is reachable and operable without a pointer; CSS hides it entirely in
+            two-pane mode, where nothing is overlaid and there is nothing to dismiss. */}
+        <button type="button" className="course-rail-scrim" tabIndex={-1} aria-hidden="true"
+          onClick={toggleCurriculum} />
+
+        {/* The ONLY control that reopens the panel, and the last thing in the DOM because
+            when the panel is closed it is also the last thing on screen — to the right of
+            the player. `aria-label` is static and complete; the visible label is a hover
+            reveal and must never be the accessible name. */}
+        <button type="button" ref={railTabRef} onClick={toggleCurriculum}
+          className="course-rail-tab"
+          aria-expanded={!curriculumCollapsed} aria-controls={curriculumId}
+          aria-label="Show course content">
+          <ChevronLeft size={16} aria-hidden="true" />
+          <span className="course-rail-tab-label">Course content</span>
+        </button>
         </div>
       </div>
     );
@@ -18050,6 +18912,7 @@ function CourseProgram({
                 courseId={course.id}
                 value={d}
                 savedPath={originalEditingLesson?.storage_path || null}
+                onPendingPath={notePendingVideoPath}
                 onChange={applyVideoPatch}
                 onStateChange={setVideoUploadState}
                 disabled={savingLesson}
@@ -18898,7 +19761,11 @@ function CourseCatalog({
 
   // ── Open one course in the shared engine (key forces clean state per course) ──
   if (selectedId) {
-    return <CourseProgram key={selectedId} courseId={selectedId}
+    // ★ `embedded` is forwarded so the lesson page knows it is rendering UNDER a sticky
+    //   SectionHead its caller owns (InterviewPrep renders one unconditionally, ~200px
+    //   tall). It does not change showHead — `onBack` already forces that false — it only
+    //   tells the sticky curriculum rail how much to clear.
+    return <CourseProgram key={selectedId} courseId={selectedId} embedded={embedded}
       eyebrow={eyebrow} courseTitle={title} comingSoonText={comingSoonDesc}
       initialLessonId={deepLinkLessonId}
       initialNotice={selectedId === lastDuplicatedId
@@ -34418,7 +35285,10 @@ function SummaryCard({ label, value, sub, highlight }) {
 
 function SectionHead({ eyebrow, title, desc, gold }) {
   return (
-    <div className="sticky top-0 z-30 -mx-10 -mt-10 px-10 pt-8 pb-6 mb-7"
+    // gh-section-head is a marker, not a style hook: it is how a sticky pane BELOW this
+    // header (the course lesson rail) measures the offset it has to clear. Nothing sets
+    // any property on it.
+    <div className="gh-section-head sticky top-0 z-30 -mx-10 -mt-10 px-10 pt-8 pb-6 mb-7"
       style={{
         background: 'var(--section-head-bg)',
         backdropFilter: 'blur(24px) saturate(160%)',

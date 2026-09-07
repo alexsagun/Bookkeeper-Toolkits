@@ -30,7 +30,9 @@ import {
   videoSampleEntryFourcc,
   inspectLessonVideo,
   describeVideoContent,
+  describeVideoWeight,
   LESSON_VIDEO_CODECS,
+  LESSON_VIDEO_HEAVY_BPS,
   LESSON_VIDEO_VERIFY_TIMEOUT_MS,
   parseObjectTotalBytes,
 } from '../src/lib/courseVideo.js';
@@ -164,7 +166,7 @@ test('inspectLessonVideo identifies a web-ready H.264 file', async () => {
   assert.equal(insp.readable, true);
   assert.equal(insp.codec, 'avc1');
   assert.equal(insp.faststart, true);
-  assert.deepEqual(describeVideoContent(insp), { ok: true, reason: null, message: '' });
+  assert.deepEqual(describeVideoContent(insp), { ok: true, reason: null, severity: null, message: '' });
 });
 
 test('inspectLessonVideo finds a TRAILING moov without reading the whole file', async () => {
@@ -181,22 +183,22 @@ test('inspectLessonVideo finds a TRAILING moov without reading the whole file', 
 
 // ── The verdicts ────────────────────────────────────────────────────────────
 
-test('H.265/HEVC is refused, and the reason names the codec rather than the symptom', async () => {
+test('H.265/HEVC is flagged, and the reason names the codec rather than the symptom', async () => {
   for (const codec of ['hvc1', 'hev1']) {
     const { readSlice, size } = reader(mp4({ codec }));
     const v = describeVideoContent(await inspectLessonVideo(size, readSlice));
-    assert.equal(v.ok, false, `${codec} must be refused`);
+    assert.equal(v.ok, false, `${codec} must be flagged`);
     assert.equal(v.reason, 'codec-unsupported');
     assert.match(v.message, /H\.265|HEVC/, 'the admin must be told what the file actually is');
     assert.match(v.message, /Firefox/, 'and which students it would fail for');
   }
 });
 
-test('AV1, VP9, ProRes and MPEG-4 Part 2 are refused too — the allowlist is H.264 only', async () => {
+test('AV1, VP9, ProRes and MPEG-4 Part 2 are flagged too — the allowlist is H.264 only', async () => {
   for (const codec of ['av01', 'vp09', 'apch', 'ap4h', 'mp4v', 'dvh1']) {
     const { readSlice, size } = reader(mp4({ codec }));
     const v = describeVideoContent(await inspectLessonVideo(size, readSlice));
-    assert.equal(v.reason, 'codec-unsupported', `${codec} must not be accepted`);
+    assert.equal(v.reason, 'codec-unsupported', `${codec} must not pass silently`);
   }
 });
 
@@ -209,7 +211,7 @@ test('both spellings of H.264 are accepted', async () => {
   }
 });
 
-test('a non-faststart H.264 file is refused, and told the LOSSLESS remedy', async () => {
+test('a non-faststart H.264 file is flagged, and told the LOSSLESS remedy', async () => {
   const { readSlice, size } = reader(mp4({ codec: 'avc1', faststart: false }));
   const v = describeVideoContent(await inspectLessonVideo(size, readSlice));
   assert.equal(v.ok, false);
@@ -217,6 +219,22 @@ test('a non-faststart H.264 file is refused, and told the LOSSLESS remedy', asyn
   assert.match(v.message, /faststart/, 'the fix must be named, not merely implied');
   assert.doesNotMatch(v.message, /libx264/,
     'moving the index is a remux (-c copy), not a re-encode — the wrong advice costs hours');
+});
+
+test('★ NEITHER finding is a hard refusal — both are warnings the admin may override', async () => {
+  // The hard blocks live in validateVideoFile (not an MP4, empty, over the cap). These
+  // two do not: `not-faststart` is repaired in-browser by planFaststartRemux and only
+  // reaches a human when that declines, and `codec-unsupported` is a judgement about the
+  // admin's own audience. Blocking either one is what made every upload cost an ffmpeg
+  // pass — nine lesson objects in production are named `*_faststart.mp4` because of it.
+  for (const opts of [{ codec: 'hvc1' }, { codec: 'avc1', faststart: false }]) {
+    const { readSlice, size } = reader(mp4(opts));
+    const v = describeVideoContent(await inspectLessonVideo(size, readSlice));
+    assert.equal(v.severity, 'warn', `${JSON.stringify(opts)} must be overridable, not fatal`);
+  }
+  const { readSlice, size } = reader(mp4({ codec: 'avc1', faststart: true }));
+  assert.equal(describeVideoContent(await inspectLessonVideo(size, readSlice)).severity, null,
+    'a clean file carries no severity at all');
 });
 
 test('a bad codec outranks a bad index — re-encoding fixes both, remuxing fixes one', async () => {
@@ -295,6 +313,42 @@ test('a Content-Length value is never mistaken for the object total', () => {
   // The exact shape of the near-miss: the chunk length arriving where the total belongs.
   assert.equal(parseObjectTotalBytes('65536'), null,
     'a bare length must not parse as a total — that is Content-Length, and it is the range size');
+});
+
+// ── The oversize advisory ───────────────────────────────────────────────────
+// Advisory ONLY. It never blocks and never gates a save. It exists because the
+// recorders in use here produce screen captures at ~30 Mbps — a 124 MB local test file
+// holds 35 seconds — and one live lesson is 1.45 GiB, 72% of the whole 2 GiB ceiling.
+
+test('a normal screen recording is not called heavy', () => {
+  // 40 minutes at ~2 Mbps — a typical faststart H.264 lesson.
+  const w = describeVideoWeight(600 * 1000 * 1000, 40 * 60);
+  assert.equal(w.heavy, false);
+  assert.equal(w.message, '');
+});
+
+test('a wildly over-bitrate recording is flagged, with the number that shows it', () => {
+  const w = describeVideoWeight(130472525, 34.95);          // the real 124 MB test file
+  assert.equal(w.heavy, true);
+  assert.ok(w.bitsPerSecond > 29 * 1000 * 1000, 'that file really is ~30 Mbps');
+  assert.match(w.message, /Mbps/, 'the admin must see the number, not just an adjective');
+  assert.match(w.message, /upload fine/, 'it must be unmistakably advisory, never a refusal');
+});
+
+test('an unknown duration produces no opinion at all', () => {
+  // The duration comes from a decode probe that is allowed to fail. Without a
+  // denominator any verdict would be a guess, and it would be told to the admin as fact.
+  for (const secs of [null, undefined, 0, -1, NaN, 'abc']) {
+    assert.equal(describeVideoWeight(2 * 1000 * 1000 * 1000, secs).heavy, false,
+      `duration ${JSON.stringify(secs)} must yield no verdict`);
+  }
+  assert.equal(describeVideoWeight(0, 60).heavy, false);
+  assert.equal(describeVideoWeight(null, 60).heavy, false);
+});
+
+test('the heavy threshold sits well above a real lesson and well below the pathological one', () => {
+  assert.ok(LESSON_VIDEO_HEAVY_BPS > 3 * 1000 * 1000, 'must not nag about ordinary 1080p');
+  assert.ok(LESSON_VIDEO_HEAVY_BPS < 29 * 1000 * 1000, 'must catch the 30 Mbps captures');
 });
 
 // ── Purity ──────────────────────────────────────────────────────────────────

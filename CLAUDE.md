@@ -51,7 +51,7 @@ npm run ai:knowledge       # regenerate docs/ai/toolkits-voice-agent-knowledge.m
 npm run ai:knowledge:check # rebuild the knowledge doc in memory + diff vs disk; exit 1 on drift (writes nothing)
 npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge base
 npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
-npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, bootstrapFolds, courseVideo, courseVideoSql, studentProgress, studentProgressSql, uiSafety, coaIntegrity,
+npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, bootstrapFolds, courseVideo, courseVideoSql, courseVideoContent, mp4Faststart, studentProgress, studentProgressSql, uiSafety, coaIntegrity,
                            approveGrantSql, …)
 npm run storage:config     # read the PROJECT-WIDE Supabase Storage upload limit and the effective
                            # limit of every bucket; --apply raises it to LESSON_VIDEO_MAX_BYTES.
@@ -129,6 +129,16 @@ The sanctioned exceptions to the single-file rule (same spirit as the `main.jsx`
   monolith by #56 so it could be tested). `mergeStoredWithDefaults()` is what DROPS a retired
   tab id out of a saved layout, which is why retiring a tool needs no storage migration —
   pinned by `test/sidebarLayout.test.mjs` instead of being an unverified comment.
+- `src/lib/coursePlayerLayout.js` — the lesson-page track arithmetic (pure): rail bounds,
+  the derived two-pane threshold, the drag clamp, and the persisted layout shape. See
+  "Course lesson workspace" below.
+- `src/lib/mp4Faststart.js` — the in-browser faststart remux (pure; the ONE module that imports
+  another lib module, `readBoxes` from `courseVideo.js`). `planFaststartRemux()` moves an MP4's
+  `moov` index in front of its `mdat` and corrects every chunk offset, so the admin never has to
+  run `ffmpeg -movflags +faststart` by hand — which, before 2026-09-07, they had done on all nine
+  lesson videos in production. A byte move, never a transcode; it never throws and refuses with a
+  stable code rather than guessing. **No SQL half**, which is why it is not part of the
+  SQL-mirrored `courseVideo.js`. See "Changing what a course lesson video may be".
 - `src/index.css` — the **global theme-token layer** (all CSS custom properties for light + dark,
   the shared `.gh-app-bg`/glass/button/input classes, and the Tailwind dark compat layer). See
   Styling conventions.
@@ -205,6 +215,72 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
   like every other content column — the copy is a draft the admin reviews, and a replay is often
   evergreen). It then opens the copy in the builder with a one-time success banner (`CourseProgram`'s
   `initialNotice` prop).
+- **Course lesson workspace (the learner player).** `renderLearner()` is a **container-query**
+  grid — media stage | splitter | curriculum rail, the panel on the **RIGHT** — not the old
+  `lg:grid-cols-3`. Numbers live in `src/lib/coursePlayerLayout.js`; the layout itself is CSS
+  (`.course-workspace` in `src/index.css`), driven by one `--course-rail` custom property.
+  ★ **THE THRESHOLD IS 890px OF WORKSPACE, AND THAT NUMBER IS LOAD-BEARING.** It was 970,
+  which sits just above the **912px** a 1280px screen has with the toolkit sidebar expanded —
+  and 1280 CSS px is what a 1920 monitor reports at the 150% Windows scaling most people
+  run. So one ordinary desktop docked cleanly with the sidebar collapsed and flipped to a
+  panel COVERING THE VIDEO the moment the sidebar was opened. `COURSE_STAGE_MIN` is not
+  advisory: whenever the CSS backstop binds, the rail is capped so the stage lands EXACTLY
+  on it, so at 912px it *is* the video width — 600px beside a 262px rail.
+  ★ **BELOW THE THRESHOLD THE PANEL OVERLAYS THE PLAYER; IT NEVER STACKS.** The rail shares
+  ONE grid cell with the stage (`grid-area: 1 / 1`) and floats over it, capped to a screenful
+  with its own scroll. The first version put it in a second grid ROW, which appended ~2,000px
+  of lesson list to a 42-lesson course and made the page unscrollable — and "Hide lessons"
+  could not help, because at that width there was no side rail to hide. Pinned by `uiSafety`
+  §18. Three behaviours belong to the overlay state only, and all read the workspace width
+  the existing `ResizeObserver` already measures, through `supportsTwoPane()`: it **starts
+  closed** (a panel covering the video on arrival is wrong), it **auto-closes when a lesson
+  is picked**, and **Escape dismisses it** — the Escape condition is deliberately INVERTED
+  from the old theater mode, which you escaped *out of*. None of the three persists; the
+  stored preference describes the two-pane layout, so closing there **does** persist.
+  ★ **The edge tab is the only control that reopens it** (`.course-rail-tab`). Its
+  `aria-label` is static and complete — the visible "Course content" label is a width-based
+  hover/focus reveal and must never BE the accessible name. It floats in the player's
+  top-right corner when narrow and takes its own track when wide: giving it a track on a
+  390px screen cost ~55px and made the CLOSED video *smaller* than the open one (301 vs 347,
+  measured).
+  ★ **The old `maxHeight: 460` on the `<video>` was a red herring** — it needed an 818px-wide
+  box to bind and the 1/3-2/3 grid never gave it one, so it had never fired. The TRACKS were
+  the constraint. Measured at 1440x900 with the sidebar open: **651px → 691px** with the
+  panel open, **1005px** with it closed; at 1920x1080, **743px → 1171px**; at 1280x800 with
+  the sidebar open, **599px docked** where the panel used to cover the picture entirely.
+  ★ **The rail is a two-row flex column — header, then `.course-rail-body` as the ONLY
+  scroller.** The header was `position: sticky; top: 0` with a transparent background inside
+  the rail's own scroller, so the lesson list scrolled visibly THROUGH it and "COURSE
+  CONTENT" painted on top of "Lesson 1.1…". It was the only sticky header in `index.css`
+  without an opaque backdrop, and it sat in a `space-y-4` stack so even an opaque one would
+  have left a 16px gap. This is the shape CLAUDE.md already prescribed for `SidePanel` —
+  "a drawer never needs `sticky top-0` … those only ever worked by accident inside a single
+  scroller" — and the rail is now that shape. `.course-rail-body` needs `min-height: 0` or
+  a flex item refuses to shrink below its content and overflows instead of scrolling.
+  Pinned by `uiSafety` §18.
+  ★ **Lesson rows are two lines**: title on its own, duration + type icon beneath. On one row
+  the title was a flex sibling of an unshrinkable duration label and got ~133px in a 240px
+  rail — sixteen characters before `truncate` bit, which is why every entry read
+  "Lesson 1.1: How T…".
+  ★ **Open/closed and the drag are CSS-only, and that is load-bearing.** The player is never
+  re-parented, re-keyed or moved into a second JSX branch, so neither can remount `<video>` —
+  which would lose `currentTime` and force `SignedLessonVideo` to mint a fresh signed URL.
+  Verified in-browser: a full drag plus six open/close toggles during playback produced **zero**
+  `/object/sign/` requests, while a lesson change correctly produced two. The drag writes
+  `--course-rail` through a ref on a rAF, never `setState`; `endRailDrag` writes the property
+  itself because React bails out of a `setState` to an equal value.
+  ★ **All three `SignedLessonVideo` states share one `.course-stage` frame**, so a signing
+  failure no longer reflows the page. The stage caps its **WIDTH** at `min(78vh,900px)*16/9` —
+  capping `max-height` on a `aspect-ratio: 16/9` box leaves it full-width and pillarboxes the
+  video, which is exactly the bug the old clamp would have caused.
+  ★ **Text lessons never get the black frame** (`lessonUsesMediaStage`), and `renderVideo`'s
+  second caller — the admin `max-w-md` lesson-editor preview — stays width-bounded.
+  ★ **The rail's sticky offset is MEASURED, not assumed.** `showHead` is false on a lesson page,
+  but `InterviewPrep` renders its OWN sticky `SectionHead` (~200px) above the embedded catalog,
+  and `container-type`'s containment means no z-index can lift the rail out from under it. The
+  `embedded` prop is forwarded from `CourseCatalog` for exactly this, and the lookup is scoped
+  to the owning TabPanel because every visited tab stays mounted in `<main>`.
+  Pinned by `test/coursePlayerLayout.test.mjs` (incl. CSS↔JS drift) and `uiSafety` §18.
 - **Zoom Live Replay (#37b):** `course_lessons.zoom_replay_url` is an **optional supplementary** link
   to the recording of a lesson's live session — one per lesson, nullable, **not** a fifth
   `video_provider`. Admins set it in the lesson editor; learners get the `LessonReplayLink` card
@@ -226,6 +302,19 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
   The same helper guards `uploadCover()` and `CourseProgram`'s `saveLesson()`/`deleteLesson()` (always
   called *after* the row update/delete). This is how dummy/test content is removed — admins delete it
   in-app.
+  ★ **An ABANDONED upload is a fifth case, and `saveLesson` structurally cannot reach it.** The
+  transfer completes, the object is written, and the drawer is closed before Save. `saveLesson`
+  compares the row's OLD `storage_path` against the new one — but for an abandoned upload the row
+  never had one, so `if (oldPath && …)` short-circuits on its first term. The only thing that knew
+  the path was a ref inside `LessonVideoUploader`, which closing the drawer unmounts. Three such
+  objects were sitting in production on 2026-09-07 — **1.60 GiB, 29% of the bucket**, each a
+  byte-identical duplicate of a live lesson. `closeLessonEditor` now sweeps
+  `pendingVideoPathRef` (fed by the uploader's `onPendingPath`) through the same reference-aware
+  helper. ★ Deliberately **not** a `useEffect` unmount cleanup: that fires on a SUCCESSFUL save
+  too, where the pending path is the one just written to the row — `removeMediaIfUnreferenced`
+  would refuse to delete it, but relying on that is a safety net standing in for a design.
+  `LessonVideoOrphans` remains the backstop for the cases no client code can reach (a crashed
+  tab, a closed laptop). Pinned by `test/uiSafety.test.mjs` §19.
 - **Storage (two buckets):** PAID lesson **videos** live in the **private** `course-videos` bucket
   (`lessons/{course.id}/…`), served via short-lived **signed URLs** gated by `is_enrolled()` RLS —
   because a *public* Supabase bucket serves every object publicly and bypasses RLS on read, so a
@@ -1944,8 +2033,8 @@ docs **in the same change**:
   machine guaranteed not to be a student's: Chrome on Windows 11 with the HEVC extensions
   answers `'probably'`, while Firefox ships no HEVC decoder on any platform. On 2026-09-03 an
   859 MB `hvc1` lesson passed that gate. `inspectLessonVideo()` / `describeVideoContent()` now
-  read `moov → trak → mdia → stbl → stsd` out of the container itself and refuse anything that
-  is not `avc1`/`avc3`. Moving together: `LESSON_VIDEO_CODECS` ↔ `describeVideoContent()` ↔
+  read `moov → trak → mdia → stbl → stsd` out of the container itself. Moving together:
+  `LESSON_VIDEO_CODECS` ↔ `describeVideoContent()` ↔
   `handlePick`'s gate in BookkeeperPro.jsx ↔ `test/courseVideoContent.test.mjs` ↔ the uploader's
   helper copy. **Walk the boxes; never scan for the literal bytes `avc1`** — a scan matches the
   string inside a `free` box, a filename in `udta`, or by luck in compressed payload, and
@@ -1954,12 +2043,64 @@ docs **in the same change**:
   through to the decode probe, i.e. exactly the old behaviour. Blocking on "we could not parse
   it" would refuse good lessons whenever the walker meets a shape it does not know; the cost of
   a wrong refusal is the admin's work, the cost of a miss is a probe that already runs.
-  ★ **Faststart is enforced, and it is not cosmetic.** With `moov` at the end of the file a
-  player must reach the tail before it knows anything. Measured against this project's Storage
-  on the 859 MB lesson: a cold 2 MiB tail range **49.4 s**, the same range warm 1.9 s, a range
-  at the head 1.7 s cold. That is paid by the verification probe — which is by construction the
-  first-ever read of a just-uploaded object, so it is always the cold case — and again by the
-  first student to press play.
+  ★ **NEITHER container finding is a hard refusal any more — `severity` is `'warn'` on both**
+  (2026-09-07). The only hard blocks left are `validateVideoFile`'s: not an `.mp4`, empty, or
+  over the cap. `not-faststart` is repaired in the browser (below) and only reaches a human when
+  the planner declines; `codec-unsupported` is stated plainly, names who it breaks, and offers
+  **"Upload anyway"**. The reason is evidence, not sentiment: refusing cost the admin an ffmpeg
+  pass on **every single upload** — all nine lesson objects in production are named
+  `*_faststart.mp4` — for a property most students' browsers would not have noticed. The person
+  who knows the audience makes the call; the app makes sure they know what they are deciding.
+  ★ **An ACKNOWLEDGED file must not be re-blocked after its upload finishes.** Relaxing the
+  pick-time gate alone would be worse than useless: `verifyPrivateObject` runs
+  `probeVideoMetadata` against the signed URL **in the same browser that just said it cannot
+  decode this codec**, so an HEVC lesson would upload for twenty minutes and then be refused by
+  `describeVerifyFailure`'s code-4 arm. `acknowledgedRef` therefore makes MediaError **3** and
+  **4** — and only those two — non-fatal at that step. Presence, authorization, byte-completeness
+  and a real `ftyp` box are still proven for every file by `confirmSignedObject`, which runs
+  first and is never skipped; timeouts and network faults still fail as before. `READY_TO_SAVE`
+  keeps its single inbound edge — what that edge proves is now conditional on a choice the admin
+  made explicitly. Pinned by `uiSafety` §19, mutation-tested.
+  ★ **Faststart is REPAIRED, not demanded** ([src/lib/mp4Faststart.js](src/lib/mp4Faststart.js),
+  2026-09-07). With `moov` at the end of the file a player must reach the tail before it knows
+  anything. Measured against this project's Storage on the 859 MB lesson: a cold 2 MiB tail range
+  **49.4 s**, the same range warm 1.9 s, a range at the head 1.7 s cold. That is paid by the
+  verification probe — by construction the first-ever read of a just-uploaded object, so always
+  the cold case — and again by the first student to press play. `planFaststartRemux()` now moves
+  the index to the front **in the browser, before the upload**, and the admin never sees it:
+  measured on the real 5.8 MB reproduction file, **2.0 ms**, reading 5% of it.
+  ★ **It is a BYTE MOVE, not a transcode, and that is what makes it safe.** Region A (`[ftyp,
+  moov)`) shifts by `+moovSize`, region B does not move, every `stco`/`co64` is patched
+  `o' = o < M ? o + S : o`, and the output size is **identical**. Proven end to end: ffmpeg
+  decoded both the source and the output of the real file and the video and audio streams hash
+  **byte-identical** (`d71890bd…` / `06f8377a…`). It **refuses rather than guesses** — 15 stable
+  codes (`fragmented`, `encrypted`, `aux-offsets`, `external-media`, `item-offsets`,
+  `chunk-table-missing`, `offset-out-of-range`, …), each falling back to the manual remedy.
+  ★ **Three properties of the remux are load-bearing and each has a ratchet.**
+  (1) `buildFaststartFile` is **synchronous** — `File.slice()` is a lazy by-reference view, and
+  one `await part.arrayBuffer()` would turn a 1.45 GiB by-reference Blob into a heap allocation
+  and kill the tab; a function with no `await` in it physically cannot do that. (2) It carries
+  **`lastModified` from the source**, because the tus fingerprint is `…-${size}-${lastModified}`
+  and `new File()` defaults it to `Date.now()` — letting it default silently disables
+  resume-by-re-picking, which the close-confirm dialog explicitly promises works. (3)
+  `tablesPatched === stblCount` is a **structural interlock**: a track we skipped keeps offsets
+  into the old layout, which for the audio trak plays as noise while the video looks perfect,
+  and **no probe anywhere would catch it**.
+  ★ **`probeVideoFrame` is the only check that can see a bad remux, and it fails CLOSED on a
+  MediaError but OPEN on a timeout.** `confirmSignedObject` compares sizes and a remux cannot
+  change the size; the `ftyp` sniff still passes; `probeVideoMetadata` resolves on
+  `loadedmetadata`, which parses `moov` and decodes **zero** samples — so a file whose every
+  offset is wrong still reports the right duration, codec and dimensions. Seeking past the first
+  chunk forces a real read at a patched offset. A decoder refusing the bytes is evidence; running
+  out of patience seeking inside a 1.5 GB file on a slow external drive is not, and treating it
+  as one would break the feature for exactly the files that need it most.
+  Lockstep: `src/lib/mp4Faststart.js` ↔ `handlePick`'s remux branch ↔
+  `test/mp4Faststart.test.mjs` ↔ `test/uiSafety.test.mjs` §19. **There is no SQL half** — a
+  faststart remux has no server mirror, which is why it is its own module rather than more of
+  the SQL-mirrored `courseVideo.js`.
+  ★ **`describeVideoWeight()` is advisory and must stay that way.** Screen recordings here have
+  come in at 30 Mbps (a 124 MB file holding 35 seconds) and one live lesson is 1.45 GiB, 72% of
+  the whole ceiling. Above 8 Mbps the uploader says so, with the number — and uploads anyway.
   ★ **Verification proves three things separately, and a TIMEOUT MUST NEVER ADVISE
   RE-ENCODING.** `verifyPrivateObject` now does `signedUrlFor` → `confirmSignedObject` (a ranged
   read of the first 64 KiB: status, `content-range` total vs the bytes sent, and a real `ftyp`
