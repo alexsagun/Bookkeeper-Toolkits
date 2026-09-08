@@ -33,7 +33,7 @@ import { dirname, join } from 'node:path';
 // ★ The audit's threshold is the CLIENT's own cap, imported rather than retyped, so
 //   raising LESSON_VIDEO_MAX_BYTES moves this check with it. Precedent for a script
 //   importing from src/lib: scripts/generate-voice-agent-knowledge.mjs.
-import { LESSON_VIDEO_MAX_BYTES } from '../src/lib/courseVideo.js';
+import { LESSON_VIDEO_MAX_BYTES, LESSON_VIDEO_UPLOAD_MIMES } from '../src/lib/courseVideo.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..');
@@ -352,8 +352,13 @@ export const OBJECT_CHECKS = [
   ['#44    the video bucket is private and capped at 2 GiB', `select coalesce(bool_and(
         not public and file_size_limit >= 2147483648), false) as ok
       from storage.buckets where id='course-videos'`],
-  ['#44    the video bucket accepts mp4 and nothing else', `select coalesce(bool_and(
-        allowed_mime_types = array['video/mp4']), false) as ok
+  // ★ Built from LESSON_VIDEO_UPLOAD_MIMES, not retyped — the same reason the size check
+  //   above imports the cap. #57 widened this to accept QuickTime and this line was the
+  //   ONE place still asserting the old list; it failed the audit within the hour, which
+  //   is the check working, but it should not have been possible to miss it by hand.
+  [`#57    the video bucket accepts exactly ${LESSON_VIDEO_UPLOAD_MIMES.join(' + ')}`,
+    `select coalesce(bool_and(allowed_mime_types = array[${
+      LESSON_VIDEO_UPLOAD_MIMES.map((m) => `'${m}'`).join(', ')}]), false) as ok
       from storage.buckets where id='course-videos'`],
   // Assert ABSENCE, the #39 idiom. A published course playing from an external
   // link is exactly the state #44 exists to eliminate, and nothing else in the

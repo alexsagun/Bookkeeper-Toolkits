@@ -165,6 +165,22 @@ test('★ the bucket ends up accepting exactly what the file picker offers', () 
     'the canonical stored type must remain one of the accepted upload types');
 });
 
+test('db:audit builds the bucket MIME check from the module, never retypes it', () => {
+  // #57 widened the list and this was the one place still asserting ['video/mp4'] —
+  // caught by `npm run db:audit` within the hour, which is the check doing its job, but
+  // a hand-typed literal in a lockstep site is a trap that resets every time. The size
+  // check next to it has imported LESSON_VIDEO_MAX_BYTES for exactly this reason.
+  const audit = read('scripts/audit-db.mjs');
+  assert.match(audit, /import \{[^}]*LESSON_VIDEO_UPLOAD_MIMES[^}]*\} from '\.\.\/src\/lib\/courseVideo\.js'/,
+    'audit-db must import the accepted MIME list');
+  const check = /course-videos[\s\S]{0,200}/.exec(audit);
+  assert.ok(check, 'the course-videos bucket check was not found');
+  const hardcoded = /allowed_mime_types = array\[\s*'video\//.exec(audit);
+  assert.equal(hardcoded, null,
+    'the MIME list must be interpolated from LESSON_VIDEO_UPLOAD_MIMES, not written out — '
+    + `found: ${hardcoded && hardcoded[0]}`);
+});
+
 // ── The storage path ────────────────────────────────────────────────────────
 
 test('a path the client builds is a path the #44 trigger accepts', () => {
