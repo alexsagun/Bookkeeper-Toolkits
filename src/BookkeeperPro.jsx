@@ -84,6 +84,7 @@ import {
 } from './lib/coursePlayerLayout';
 import {
   LESSON_VIDEO_BUCKET, LESSON_VIDEO_ACCEPT, LESSON_VIDEO_MAX_BYTES, LESSON_VIDEO_MIME,
+  LESSON_VIDEO_UPLOAD_MIMES,
   LESSON_VIDEO_CHUNK_BYTES, LESSON_VIDEO_RETRY_DELAYS, LESSON_VIDEO_SIGN_TTL_SECONDS,
   LESSON_VIDEO_RESIGN_MARGIN_MS, LESSON_VIDEO_VERIFY_TIMEOUT_MS,
   UPLOAD_STATES, UPLOAD_EVENTS, nextUploadState, isUploadInFlight, hasUnfinishedUpload,
@@ -15680,7 +15681,12 @@ function SignedLessonVideo({ lesson, isAdmin = false }) {
       fatal: decision.reason === 'decode',
       message: decision.reason === 'decode'
         ? (isAdmin
-          ? 'The browser can’t decode this file. Re-export it as MP4 (H.264 video, AAC audio) and upload it again.'
+          // ★ NOT "re-export it" any more. A lesson may legitimately be H.265 now, and this
+          //   is one browser on one machine failing to decode it — not a verdict on the file
+          //   and not a verdict on students. Telling the admin to re-upload would send them
+          //   to redo work that was very likely fine.
+          ? 'This browser can’t decode this file, so it won’t preview here. Students on a device '
+            + 'with a decoder for it can still watch it — H.264 is the format that needs none.'
           // Naming the browsers matters now that a lesson may legitimately be H.265: the
           // commonest cause of this screen is a codec the viewer's browser lacks, and
           // switching browser is something the student can actually act on tonight.
@@ -15923,9 +15929,12 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
   // await so React paints it: on a network share the moov read is the slow part, and a
   // picker that sits inert for two seconds reads as a hang.
   const [remuxNote, setRemuxNote] = useState('');
-  // Findings the admin may override: { file, notes: [{ reason, message }] }. Not an
-  // error — the upload is ready to go the moment they say so.
-  const [advisory, setAdvisory] = useState(null);
+  // ★ Things worth SAYING about the file being uploaded — never a question.
+  //   [{ reason, message }]. This was a two-button card that halted the flow, and the
+  //   admin who met it read it as a refusal and pressed neither button: a finding that
+  //   interrupts IS a block, whatever we call it. It is now a footnote to an upload
+  //   that is already running.
+  const [notice, setNotice] = useState(null);
   const [weightNote, setWeightNote] = useState('');      // oversize heads-up, never blocks
 
   const uploadRef = useRef(null);                        // the tus.Upload instance
@@ -15942,12 +15951,12 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
   //   NEW signed url 52.1 s. Minting one per attempt is why "Check again" could never
   //   succeed no matter how many times it was pressed. { url, signedAt, path }.
   const signedRef = useRef(null);
-  // ★ The admin accepted a warning about this file (an unusual codec, or an index we
-  //   could not move) and chose to upload anyway. It has to survive into verification:
-  //   that step probes the signed URL in THIS SAME browser, so for a file we already
-  //   told them this browser may not decode, a decode failure there is the answer we
-  //   predicted — not a new discovery, and not grounds to refuse a finished upload.
-  const acknowledgedRef = useRef(false);
+  // ★ We already identified a codec THIS browser may not be able to decode, and said so.
+  //   It has to survive into verification, because that step probes the signed URL in the
+  //   SAME browser — so a decode failure there is the answer we already predicted, not a
+  //   new discovery, and not grounds to refuse a finished upload. Nothing to do with the
+  //   admin having clicked anything: there is no longer anything to click.
+  const codecRiskRef = useRef(false);
 
   const go = useCallback((event) => {
     setState((prev) => {
@@ -16122,7 +16131,12 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
         metadata: {
           bucketName: LESSON_VIDEO_BUCKET,
           objectName: path,
-          contentType: LESSON_VIDEO_MIME,
+          // ★ The file's REAL type, not a blanket 'video/mp4'. This is what Storage
+          //   checks against the bucket's allowed_mime_types, so hardcoding mp4 would
+          //   let a .mov through only by MISLABELLING it — the bucket would never see
+          //   what it was actually storing. Windows frequently reports '' for a picked
+          //   file, so an unknown type still falls back to the canonical one.
+          contentType: LESSON_VIDEO_UPLOAD_MIMES.includes(file?.type) ? file.type : LESSON_VIDEO_MIME,
           cacheControl: '3600',
         },
         // Supabase requires EXACTLY this. It is not a tuning knob.
@@ -16240,22 +16254,30 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     try {
       return await probeVideoMetadata(url, LESSON_VIDEO_VERIFY_TIMEOUT_MS);
     } catch (e) {
-      // ★ An ACKNOWLEDGED file may fail the decode half here, and ONLY that half.
-      //   This probe runs in the same browser that already told us it cannot play this
-      //   codec, so refusing here would mean warning the admin at pick time, letting
-      //   them choose, taking twenty minutes of their upload — and then blocking them
-      //   anyway on the answer we had already predicted. Presence, authorization,
-      //   byte-completeness and a real ftyp box are all still proven above by
-      //   confirmSignedObject; a timeout or a network fault still fails as before.
-      if (acknowledgedRef.current && (e?.code === 3 || e?.code === 4)) return null;
+      // ★ A file whose codec we already flagged may fail the DECODE half here, and only
+      //   that half. This probe runs in the same browser that already told us it cannot
+      //   play this codec, so refusing would mean saying so at pick time, uploading for
+      //   twenty minutes, and then blocking on the answer we had already predicted.
+      //   Presence, authorization, byte-completeness and a real ftyp box are all still
+      //   proven above by confirmSignedObject, which runs first and is never skipped.
+      //
+      //   ★ The TIMEOUT is forgiven here too, and it has to be. probeVideoMetadata
+      //     rejects a timeout with a bare Error carrying no `.code`, so testing only for
+      //     3 and 4 left a completed upload stuck at "Video not ready" — and a browser
+      //     with PARTIAL HEVC support (it starts the fetch, then stalls) produces exactly
+      //     a timeout rather than a clean error. A decode stall on a codec we already
+      //     named is not evidence of a storage fault. Timeouts stay fatal for every
+      //     other file, where they really do mean storage is still distributing it.
+      const undecodable = e?.code === 3 || e?.code === 4 || e?.message === 'timeout';
+      if (codecRiskRef.current && undecodable) return null;
       throw e;
     }
   }
 
   async function handlePick(file) {
     setErrMsg(''); setRetryable(true); liveStepRef.current = -1;
-    setAdvisory(null); setWeightNote(''); setRemuxNote('');
-    acknowledgedRef.current = false;
+    setNotice(null); setWeightNote(''); setRemuxNote('');
+    codecRiskRef.current = false;
     if (!file) return;
     await discardPending();                              // replacing? drop the last orphan first
     fileRef.current = file;
@@ -16359,39 +16381,25 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     setDuration(secs);
     setWeightNote(describeVideoWeight(upload.size, secs).message);
 
+    // ★ FINDINGS NEVER STOP THE UPLOAD. They are recorded and shown beside a transfer
+    //   that is already running. The previous version rendered exactly these notes in a
+    //   card with an "Upload anyway" button and waited — every state transition behind
+    //   that button was correct and the button worked, and the admin still read it as a
+    //   refusal and pressed neither option. Anything that interrupts the flow is a block
+    //   in practice, so the only honest fix was to stop interrupting.
+    //
+    //   Only validateVideoFile still refuses, and only for things no upload could
+    //   survive: not an MP4/MOV, empty, or over the cap.
     if (notes.length) {
-      // Not an error — a decision. UNSUPPORTED_FILE re-enables the picker and keeps Save
-      // blocked, which is exactly the state to be in while the admin chooses.
-      setAdvisory({ file: upload, notes });
-      go(UPLOAD_EVENTS.VALIDATE_FAIL);
+      setNotice(notes);
+      // Verification probes the signed URL in THIS browser. If we already know it may
+      // not decode this file, that later failure is not news — see verifyPrivateObject.
+      codecRiskRef.current = notes.some(n => n.reason === 'codec-unsupported' || n.reason === 'local-decode');
       announce(notes[0].message);
-      return;
     }
     go(UPLOAD_EVENTS.VALIDATE_OK);
     announce('Upload started.');
     await runTransfer(upload);
-  }
-
-  /**
-   * "Upload anyway" — the admin read the warning and made the call.
-   *
-   * Walks the machine back through its normal edges rather than inventing a transition:
-   * UNSUPPORTED_FILE -SELECT_FILE-> FILE_SELECTED -VALIDATE_START-> LOCAL_VALIDATING
-   * -VALIDATE_OK-> UPLOADING. UPLOAD_TRANSITIONS is untouched, and READY_TO_SAVE keeps
-   * its single inbound edge from VERIFYING_PRIVATE_OBJECT.
-   */
-  function uploadAnyway() {
-    const pending = advisory;
-    if (!pending) return;
-    setAdvisory(null);
-    setErrMsg('');
-    acknowledgedRef.current = true;
-    fileRef.current = pending.file;
-    go(UPLOAD_EVENTS.SELECT_FILE);
-    go(UPLOAD_EVENTS.VALIDATE_START);
-    go(UPLOAD_EVENTS.VALIDATE_OK);
-    announce('Upload started.');
-    runTransfer(pending.file);
   }
 
   /** The transfer + verification half, shared by a fresh pick and by a retry. */
@@ -16540,11 +16548,11 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
               onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) handlePick(f); }} />
           </label>
           <div className="text-[11px] mt-2 leading-relaxed" style={{ color: C.textSoft }}>
-            MP4, up to {formatBytes(LESSON_VIDEO_MAX_BYTES)}. No need to prepare it first — if the
-            index sits at the end of the file it is moved to the front here automatically, losslessly
-            and without re-encoding.
-            <br />H.264 video with AAC audio plays on every student’s device; anything else still
-            uploads, with a warning about who it may not reach.
+            MP4 or MOV, up to {formatBytes(LESSON_VIDEO_MAX_BYTES)}. No need to convert or prepare
+            anything — whatever you picked starts uploading straight away. If its index sits at the
+            end of the file it is moved to the front here automatically, losslessly.
+            <br />H.264 is the one format that plays on every device, so if yours is something else
+            we say so while it uploads. That is a note, not a hold-up.
             <br />Students stream it from private storage; it is never published to a public link.
           </div>
         </>
@@ -16631,35 +16639,26 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
         </div>
       )}
 
-      {/* A decision, not an error: the file is ready to upload the moment they say so.
-          Styled as a warning rather than a failure because nothing here is broken —
-          these are things students on SOME devices may not be able to play. */}
-      {advisory && (
-        <div className="mt-3 rounded-xl px-3 py-2.5 text-xs" role="alert"
-          style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
-          <div className="font-semibold flex items-center gap-1.5">
-            <AlertTriangle size={13} /> Worth checking before you upload
-          </div>
-          <ul className="mt-1 space-y-1 leading-relaxed">
-            {advisory.notes.map((n) => <li key={n.reason}>{n.message}</li>)}
-          </ul>
-          <div className="mt-2.5 flex items-center gap-2 flex-wrap">
-            <button type="button" onClick={uploadAnyway} disabled={busy}
-              className="px-3 py-1.5 rounded-lg text-xs font-bold text-white disabled:opacity-60"
-              style={ADMIN_BTN_OK}>
-              Upload anyway
-            </button>
-            <label className="gh-btn-ghost px-3 py-1.5 text-xs font-bold cursor-pointer">
-              Choose a different file
-              <input type="file" accept={LESSON_VIDEO_ACCEPT} className="sr-only" disabled={busy}
-                onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) handlePick(f); }} />
-            </label>
-          </div>
+      {/* ★ A FOOTNOTE TO AN UPLOAD THAT IS ALREADY RUNNING — never a question.
+          `role="status"` and the neutral wash, deliberately NOT `role="alert"` and the
+          amber warning tokens: this renders beside a live progress bar, and the amber
+          card with two buttons that used to stand here stopped the flow so convincingly
+          that the admin it was written for pressed neither button and reported being
+          blocked. Nothing to accept, nothing to dismiss, no decision to make. */}
+      {notice && (
+        <div className="mt-3 rounded-lg px-3 py-2 text-xs flex items-start gap-2" role="status"
+          style={{ background: 'var(--wash-strong)', border: '1px solid var(--glass-border)', color: C.textSoft }}>
+          <Info size={14} className="mt-0.5 shrink-0" />
+          <span>
+            {notice.length === 1 ? notice[0].message : (
+              <ul className="space-y-1">{notice.map((n) => <li key={n.reason}>{n.message}</li>)}</ul>
+            )}
+          </span>
         </div>
       )}
 
       {/* Advisory only — it never blocks a save and never gates anything. */}
-      {weightNote && !advisory && (
+      {weightNote && !notice && (
         <div className="mt-3 rounded-lg px-3 py-2 text-xs flex items-start gap-2" role="status"
           style={{ background: 'var(--wash-strong)', border: '1px solid var(--glass-border)', color: C.textSoft }}>
           <Info size={14} className="mt-0.5 shrink-0" />
@@ -16677,6 +16676,15 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
               <button type="button" className="ml-2 underline font-semibold"
                 onClick={() => { go(UPLOAD_EVENTS.RETRY); runVerification(pendingPathRef.current, fileRef.current?.size); }}>
                 Check again
+              </button>
+            )}
+            {/* The escape hatch for saveLesson's refused-pick guard. Without it, picking a
+                file we cannot accept would leave the drawer unsaveable with no way out
+                except reloading the page and losing the draft. */}
+            {state === UPLOAD_STATES.UNSUPPORTED_FILE && (
+              <button type="button" className="ml-2 underline font-semibold"
+                onClick={() => { setErrMsg(''); fileRef.current = null; setFileInfo(null); go(UPLOAD_EVENTS.RESET); }}>
+                Dismiss
               </button>
             )}
           </span>
@@ -18249,6 +18257,18 @@ function CourseProgram({
     if (blocksLessonSave(videoUploadState)) {
       setLessonErr('Wait for the video upload to finish before saving.'); return;
     }
+    // ★ A REFUSED PICK MUST NOT SAVE SILENTLY. UNSUPPORTED_FILE is deliberately not in the
+    //   UNFINISHED set above — that set also drives hasUnfinishedUpload, and adding it would
+    //   relabel Save "Video not ready" on a lesson whose EXISTING video is perfectly fine.
+    //   But that left the worst possible outcome: the admin picks a file, it is refused, they
+    //   press an enabled blue "Save lesson", it succeeds, the drawer closes, and NOTHING has
+    //   changed — the lesson keeps its old link, stays un-publishable, and no error is ever
+    //   shown. Reported as "I can't upload this video", which is exactly what it looks like.
+    if (videoUploadState === UPLOAD_STATES.UNSUPPORTED_FILE && !d.storage_path) {
+      setLessonErr('The file you chose was not uploaded, so this lesson still has no video. '
+        + 'Pick a different file, or press Dismiss under the uploader to leave the lesson as it is.');
+      return;
+    }
     if (!isVideo && !hasText) { setLessonErr('Add some lesson content before saving.'); return; }
     // Supplementary replay link. Returning here leaves the modal open with the draft intact,
     // because clearLessonDraft()/setEditingLesson(null) are further down.
@@ -18812,7 +18832,12 @@ function CourseProgram({
     const d = editingLesson;
     // A pre-#44 row still carrying an external link. It is READ-ONLY here — shown so the
     // admin can find the source file, never editable back into a working link.
-    const legacyLink = classifyLessonVideo(d) === 'legacy-link';
+    // ★ It stops demanding a replacement the moment one exists. `classifyLessonVideo`
+    //   reads the SAVED shape, so during the replacement upload this banner kept insisting
+    //   "the course cannot be published until it is replaced" directly above the uploader
+    //   that was replacing it — two contradictory amber cards, which is a large part of why
+    //   the whole screen read as a refusal.
+    const legacyLink = classifyLessonVideo(d) === 'legacy-link' && !d.storage_path;
     const replay = parseReplayUrl(d.zoom_replay_url);
     const replayOk = replay.kind === 'zoom' || replay.kind === 'external';
     // saveLesson omits the column on a pre-#37b database, so offering the field there would

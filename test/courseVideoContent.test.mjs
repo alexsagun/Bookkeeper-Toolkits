@@ -3,13 +3,24 @@
 //
 // Why this suite exists. `validateVideoFile` reads the NAME, the MIME type and the SIZE.
 // An H.265/HEVC file satisfies all three — it is a `.mp4`, it is `video/mp4`, it is under
-// the cap — so the only thing keeping HEVC out of a paid course was a decode probe run in
-// THE ADMIN'S OWN browser. On a Windows 11 machine with the HEVC extensions Chrome answers
-// `canPlayType(...) === 'probably'`, so the file sailed through; Firefox ships no HEVC
-// decoder on any platform, and neither do plenty of the phones and older laptops students
-// use. The verify step exists so an admin never publishes a lesson "broken only for the
-// people who paid for it", and on codec it was measuring the one machine guaranteed not to
-// be theirs.
+// the cap — so the only thing that knew what was actually inside was a decode probe run in
+// THE ADMIN'S OWN browser, which answers for its own GPU and nobody else's. The inspection
+// reads the container instead, so the admin is told what they have rather than guessing.
+//
+// ★ IT REPORTS; IT DOES NOT REFUSE (2026-09-08). Two earlier versions got this wrong in
+//   opposite directions and both cost the same admin real time. The first blocked HEVC
+//   outright. The second downgraded it to a warning — but kept it as a card with two
+//   buttons that halted the flow, and the admin read that as a refusal and pressed
+//   neither. The findings are now shown beside a running upload.
+//
+// ★ AND THE FACTS HAVE TO BE TRUE. The blocking message claimed "Firefox has no decoder
+//   for it at all", which has been false since Firefox 134 (Windows, January 2025); 136
+//   added macOS and 137 Linux. Chrome and Edge have decoded HEVC since 107, Safari for
+//   years. What is actually true in 2026 is narrower and checkable: every major browser
+//   decodes it, but only with a HARDWARE decoder, so roughly one viewer in eight cannot —
+//   older or budget Android, laptops from before about 2015, and Edge on Windows without
+//   Microsoft's HEVC Video Extensions (Chrome on Windows needs no such extension).
+//   A test below pins the message against the claim that was wrong.
 //
 // Faststart is here for a different reason, and it is not cosmetic. With the index at the
 // END of the file a player must reach the tail before it knows anything at all. Measured
@@ -190,8 +201,23 @@ test('H.265/HEVC is flagged, and the reason names the codec rather than the symp
     assert.equal(v.ok, false, `${codec} must be flagged`);
     assert.equal(v.reason, 'codec-unsupported');
     assert.match(v.message, /H\.265|HEVC/, 'the admin must be told what the file actually is');
-    assert.match(v.message, /Firefox/, 'and which students it would fail for');
   }
+});
+
+test('★ the codec message states what is TRUE in 2026, not the 2024 version of it', () => {
+  const { readSlice, size } = reader(mp4({ codec: 'hvc1' }));
+  return inspectLessonVideo(size, readSlice).then((insp) => {
+    const m = describeVideoContent(insp).message;
+    // The claim that was wrong, and was shown to an admin for five days.
+    assert.doesNotMatch(m, /Firefox has no decoder|no decoder for it at all/i,
+      'Firefox has decoded HEVC since 134 (Windows, Jan 2025), 136 (macOS), 137 (Linux)');
+    // What replaced it has to be specific enough to act on.
+    assert.match(m, /hardware/i, 'the real constraint is a hardware decoder, not a browser');
+    assert.match(m, /Android/i, 'name a group that genuinely cannot play it');
+    assert.match(m, /Edge/i, 'Edge on Windows needs the HEVC extension; Chrome does not');
+    // And it must not read as an instruction.
+    assert.match(m, /optional/i, 'converting is a choice — the upload proceeds either way');
+  });
 });
 
 test('AV1, VP9, ProRes and MPEG-4 Part 2 are flagged too — the allowlist is H.264 only', async () => {

@@ -45,14 +45,29 @@ const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];
 export const LESSON_VIDEO_BUCKET = 'course-videos';
 
 /**
- * MP4 / H.264 + AAC is the authoring standard. Supabase Storage stores bytes
- * and never transcodes, so whatever is uploaded must decode as-is in the
- * student's browser — and MP4/H.264 is the only combination that does so
- * everywhere, including older iOS Safari.
+ * H.264 + AAC in MP4 is the authoring STANDARD, not a requirement. Supabase
+ * Storage stores bytes and never transcodes, so whatever is uploaded has to
+ * decode as-is in the student's browser, and H.264 is the one codec that needs
+ * no hardware decoder anywhere. Anything else still uploads — see
+ * describeVideoContent, which reports rather than refuses.
  */
 export const LESSON_VIDEO_MIME = 'video/mp4';
 export const LESSON_VIDEO_EXTENSION = '.mp4';
-export const LESSON_VIDEO_ACCEPT = 'video/mp4,.mp4';
+
+/**
+ * What the picker accepts.
+ *
+ * ★ QuickTime is admitted deliberately. A `.mov` is the SAME ISO-BMFF container
+ *   an `.mp4` is — the box tree parses identically, `mp4Faststart.js` already
+ *   handles QuickTime's non-FullBox `meta` alignment, and iPhone / Mac screen
+ *   recordings are `.mov` and usually HEVC. Refusing them told the admin their
+ *   file "must be MP4 (H.264 video, AAC audio)", which is the exact opposite of
+ *   the policy the rest of this module now implements, and offered no override.
+ *   The stored object is still renamed to `.mp4` by sanitizeVideoFileName.
+ */
+export const LESSON_VIDEO_UPLOAD_MIMES = Object.freeze(['video/mp4', 'video/quicktime']);
+export const LESSON_VIDEO_UPLOAD_EXTENSIONS = Object.freeze(['.mp4', '.mov']);
+export const LESSON_VIDEO_ACCEPT = 'video/mp4,video/quicktime,.mp4,.mov';
 
 /**
  * 2 GiB. Must equal course-videos.file_size_limit in the migration, and the
@@ -157,10 +172,14 @@ export function lessonVideoPathCourseId(path) {
 const VALIDATION_MESSAGES = Object.freeze({
   missing: 'Choose a video file to upload.',
   empty: 'That file is empty. Re-export it and try again.',
-  'unsupported-type': 'Lesson videos must be MP4 (H.264 video, AAC audio). '
-    + 'Convert the file with HandBrake or CloudConvert, then upload the MP4.',
-  'unsupported-extension': 'Lesson videos must be an .mp4 file. '
-    + 'Convert it with HandBrake or CloudConvert, then upload the MP4.',
+  // ★ These say WHAT IS ACCEPTED, not what the file must be re-encoded into.
+  //   They used to demand "MP4 (H.264 video, AAC audio)", which refused an
+  //   ordinary .mov outright and contradicted the codec policy one section down.
+  'unsupported-type': 'Lesson videos must be an MP4 or MOV file. '
+    + 'Other containers (.mkv, .webm, .avi) need converting first — HandBrake or '
+    + 'CloudConvert will do it.',
+  'unsupported-extension': 'Lesson videos must end in .mp4 or .mov. '
+    + 'Other containers need converting first — HandBrake or CloudConvert will do it.',
   'too-large': '',      // built below — it needs the cap
 });
 
@@ -188,10 +207,11 @@ export function validateVideoFile(file) {
   // Browsers report file.type inconsistently (Windows often sends '' for .mp4),
   // so an empty type is judged on the extension alone rather than refused.
   const type = String(file.type || '').toLowerCase().split(';')[0].trim();
-  if (type && type !== LESSON_VIDEO_MIME) {
+  if (type && !LESSON_VIDEO_UPLOAD_MIMES.includes(type)) {
     return { ok: false, reason: 'unsupported-type', message: validationMessage('unsupported-type') };
   }
-  if (!/\.mp4$/i.test(String(file.name || ''))) {
+  const name = String(file.name || '').toLowerCase();
+  if (!LESSON_VIDEO_UPLOAD_EXTENSIONS.some(ext => name.endsWith(ext))) {
     return { ok: false, reason: 'unsupported-extension', message: validationMessage('unsupported-extension') };
   }
   if (size > LESSON_VIDEO_MAX_BYTES) {
@@ -211,12 +231,17 @@ export function validateVideoFile(file) {
  * admin and a lesson no student can play was `probeVideoMetadata` on the local blob
  * — which asks THE ADMIN'S OWN BROWSER whether it can decode the file.
  *
- * That is the wrong browser. Chrome on a Windows 11 machine with the HEVC extensions
- * answers `canPlayType('video/mp4; codecs="hvc1…"') === 'probably'`, so an HEVC file
- * sails through; Firefox ships no HEVC decoder on any platform, and neither do plenty
- * of the phones and older laptops students actually use. The verify step exists
- * precisely so an admin never publishes a lesson "broken only for the people who paid
- * for it", and on codec it was measuring the one machine guaranteed not to be theirs.
+ * That is the wrong browser: it is the one machine guaranteed not to be a student's.
+ * It answers for its own GPU, and HEVC needs a HARDWARE decoder — so the admin's
+ * laptop saying "probably" tells you nothing about the older Android phone or the
+ * pre-2015 machine a student is watching on. The inspection exists so an admin is
+ * never surprised by a lesson that is "broken only for the people who paid for it".
+ *
+ * ★ It REPORTS; it does not refuse (2026-09-08). The codec finding is `severity:
+ *   'warn'` and the uploader uploads anyway — see describeVideoContent. An earlier
+ *   version blocked, and the message it blocked with claimed "Firefox has no decoder
+ *   for it at all", which has been false since Firefox 134 (January 2025). Say what
+ *   is measurable and let the person who knows the audience decide.
  *
  * The container itself already carries the answer, so read it: `moov → trak → mdia →
  * stbl → stsd` names the video codec outright, and the position of `moov` relative to
@@ -492,7 +517,15 @@ const REENCODE_FIX = 'ffmpeg -i input.mp4 -c:v libx264 -crf 23 -c:a aac -movflag
  *   admin. Blocking it forced an hours-long re-encode for a file that plays for most
  *   students; the admin, who knows their own audience, gets the decision instead.
  *
- *   `validateVideoFile` still holds the hard refusals: not an MP4, empty, or over the cap.
+ *   `validateVideoFile` still holds the hard refusals: not an MP4 or MOV, empty, or over
+ *   the cap.
+ *
+ * ★ AND THE CALLER MUST NOT STOP FOR IT (2026-09-08). `'warn'` means "say this while the
+ *   upload runs", NOT "ask a question". The first attempt at this rendered the message in
+ *   an `AlertTriangle` card with an "Upload anyway" button and halted the flow — every
+ *   transition was wired correctly and the button worked, and the admin still read it as
+ *   a refusal and stopped without pressing anything. A finding that interrupts IS a block,
+ *   whatever its severity field says. `handlePick` now always reaches `runTransfer`.
  */
 export function describeVideoContent(inspection) {
   const ok = { ok: true, reason: null, severity: null, message: '' };
@@ -506,10 +539,18 @@ export function describeVideoContent(inspection) {
       ok: false,
       reason: 'codec-unsupported',
       severity: 'warn',
-      message: `This video is ${named}. It may well play on this computer, but Firefox has no `
-        + 'decoder for it at all and many phones, tablets and older laptops do not either — those '
-        + 'students would get a black player. H.264 plays everywhere. To convert it, in HandBrake '
-        + `pick a “Fast 1080p30” preset, or run: ${REENCODE_FIX}`,
+      // ★ FACTUAL, AND CHECKED. Every major browser decodes HEVC in 2026 — Chrome and
+      //   Edge since 107, Safari for years, Firefox since 134 (Windows, Jan 2025), 136
+      //   (macOS) and 137 (Linux). But all of them need a HARDWARE decoder, so the
+      //   residual failures are real and specific rather than "Firefox users get
+      //   nothing", which is what this message used to say. Roughly one viewer in eight.
+      message: `This video is ${named}, not H.264. Most students can still play it — Chrome, `
+        + 'Edge, Safari and Firefox all decode H.265 now — but only on hardware that has an '
+        + 'H.265 decoder, so roughly one student in eight gets a black player: older or budget '
+        + 'Android phones, laptops from before about 2015, and anyone on Edge for Windows who '
+        + 'has never installed Microsoft’s HEVC Video Extensions. H.264 needs no such decoder '
+        + `and plays everywhere. Converting is optional — in HandBrake pick a “Fast 1080p30” `
+        + `preset, or run: ${REENCODE_FIX}`,
     };
   }
 

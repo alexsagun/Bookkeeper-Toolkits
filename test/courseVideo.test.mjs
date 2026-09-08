@@ -30,6 +30,7 @@ import {
   LESSON_VIDEO_EXTENSION,
   LESSON_VIDEO_ACCEPT,
   LESSON_VIDEO_MAX_BYTES,
+  LESSON_VIDEO_UPLOAD_MIMES,
   LESSON_VIDEO_CHUNK_BYTES,
   LESSON_VIDEO_RETRY_DELAYS,
   LESSON_VIDEO_MAX_RESIGN,
@@ -187,12 +188,29 @@ test('a valid MP4 passes', () => {
   assert.equal(r.reason, null);
 });
 
+test('★ a QuickTime .mov is accepted — it is the same container an .mp4 is', () => {
+  // iPhone recordings and Mac screen captures are .mov, and usually HEVC. Refusing them
+  // said "Lesson videos must be MP4 (H.264 video, AAC audio)" with no override — the
+  // exact opposite of the codec policy this module implements one section further down,
+  // and a genuine wall for the files this app is most likely to be handed.
+  for (const file of [
+    { name: 'lesson.mov', size: 1024, type: 'video/quicktime' },
+    { name: 'lesson.MOV', size: 1024, type: 'video/quicktime' },
+    { name: 'lesson.mov', size: 1024, type: '' },              // Windows reports no type
+  ]) {
+    const r = validateVideoFile(file);
+    assert.equal(r.ok, true, `${JSON.stringify(file)} must be accepted`);
+  }
+  assert.deepEqual([...LESSON_VIDEO_UPLOAD_MIMES], ['video/mp4', 'video/quicktime']);
+});
+
 test('each rejection carries its own stable reason code', () => {
   const cases = [
     [null, 'missing'],
     [{ name: 'a.mp4', size: 0, type: 'video/mp4' }, 'empty'],
-    [{ name: 'a.mov', size: 10, type: 'video/quicktime' }, 'unsupported-type'],
     [{ name: 'a.webm', size: 10, type: 'video/webm' }, 'unsupported-type'],
+    [{ name: 'a.mkv', size: 10, type: 'video/x-matroska' }, 'unsupported-type'],
+    [{ name: 'a.avi', size: 10, type: '' }, 'unsupported-extension'],
     [{ name: 'a.mp4', size: LESSON_VIDEO_MAX_BYTES + 1, type: 'video/mp4' }, 'too-large'],
   ];
   for (const [file, reason] of cases) {
@@ -203,8 +221,19 @@ test('each rejection carries its own stable reason code', () => {
   }
 });
 
-test('a file whose MIME lies but whose extension is wrong is still refused', () => {
-  const r = validateVideoFile({ name: 'movie.mov', size: 10, type: 'video/mp4' });
+test('the refusal messages say what IS accepted, not what to re-encode into', () => {
+  // They used to demand "MP4 (H.264 video, AAC audio)", which is a codec instruction
+  // wearing a container's clothes — and this gate cannot see a codec at all.
+  for (const name of ['a.webm', 'a.mkv']) {
+    const r = validateVideoFile({ name, size: 10, type: '' });
+    assert.match(r.message, /\.mp4 or \.mov|MP4 or MOV/i, `${name}: name the accepted containers`);
+    assert.doesNotMatch(r.message, /H\.264|AAC/,
+      'this gate reads the NAME and the MIME type — it has no idea what codec is inside');
+  }
+});
+
+test('a file whose MIME lies but whose extension is unusable is still refused', () => {
+  const r = validateVideoFile({ name: 'movie.mkv', size: 10, type: 'video/mp4' });
   assert.equal(r.ok, false, 'browsers report file.type inconsistently — the extension is a second gate');
   assert.equal(r.reason, 'unsupported-extension');
 });
@@ -212,7 +241,14 @@ test('a file whose MIME lies but whose extension is wrong is still refused', () 
 test('a file with an empty MIME type is judged on its extension alone', () => {
   // Windows sometimes reports '' for .mp4. Refusing it outright would block real work.
   assert.equal(validateVideoFile({ name: 'a.mp4', size: 10, type: '' }).ok, true);
-  assert.equal(validateVideoFile({ name: 'a.mov', size: 10, type: '' }).reason, 'unsupported-extension');
+  assert.equal(validateVideoFile({ name: 'a.webm', size: 10, type: '' }).reason, 'unsupported-extension');
+});
+
+test('a .mov is still STORED as .mp4, so nothing downstream sees a new shape', () => {
+  // buildLessonVideoPath / the #44 path regex / course_video_object_readable all expect
+  // the existing key shape. Accepting a new container must not change the key.
+  assert.equal(sanitizeVideoFileName('Screen Recording.mov'), 'Screen_Recording.mp4');
+  assert.equal(sanitizeVideoFileName('clip.MOV'), 'clip.mp4');
 });
 
 test('the size boundary is inclusive at exactly the cap', () => {

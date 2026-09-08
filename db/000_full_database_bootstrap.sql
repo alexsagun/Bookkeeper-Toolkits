@@ -24502,3 +24502,44 @@ on conflict (filename) do nothing;
 --
 -- 10) npm run db:audit   -> clean, including the new #56 checks.
 
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- §44) FOLDED VERBATIM — 2026-09-08-lesson-video-quicktime.sql   (#57)
+-- ═════════════════════════════════════════════════════════════════════════════
+-- The course-videos bucket accepts QuickTime as well as MP4, so an iPhone or Mac
+-- screen recording uploads instead of being refused with advice to convert it.
+-- ★ RE-FOLD whenever db/2026-09-08-lesson-video-quicktime.sql changes.
+-- ★ It must stay AFTER §31 (#44), which creates the bucket this widens.
+-- ★ A .mov is the same ISO base media container an .mp4 is; only the declared
+--   content type differs, and the stored object is still renamed to .mp4 by
+--   sanitizeVideoFileName(). allowed_mime_types is read ONLY on upload, so this
+--   cannot affect how any existing object is read.
+
+do $blk$
+begin
+  -- Mirrors #44's assertion exactly, including its privilege fallback: on a hosted
+  -- Supabase project the SQL editor may not own storage.buckets, and a NOTICE that
+  -- tells the operator what to click beats a migration that dies half-applied.
+  update storage.buckets
+     set allowed_mime_types = array['video/mp4', 'video/quicktime']
+   where id = 'course-videos';
+
+  if not found then
+    raise notice '#57: bucket course-videos does not exist yet — run #44 first.';
+  end if;
+exception
+  when insufficient_privilege then
+    raise notice '#57: could not update course-videos from SQL. In Dashboard → Storage → '
+                 'course-videos → Settings, set allowed MIME types to: video/mp4, video/quicktime';
+end
+$blk$;
+
+insert into public.schema_migrations (filename, checksum, notes) values
+ ('2026-09-08-lesson-video-quicktime.sql', null,
+  'lesson video quicktime (#57): widen course-videos.allowed_mime_types to '
+  'video/mp4 + video/quicktime, so an iPhone/Mac .mov recording uploads instead of '
+  'being refused with advice to convert it. Additive; upload-path only; no policy, '
+  'function or column changes. Pairs with the client change that stops gating on '
+  'codec and starts sending the file''s real content type.')
+on conflict (filename) do nothing;
+

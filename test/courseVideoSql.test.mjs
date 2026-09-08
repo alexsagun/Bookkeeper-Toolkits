@@ -38,6 +38,8 @@ import { describeStorageLimits } from '../scripts/audit-db.mjs';
 import {
   LESSON_VIDEO_MAX_BYTES,
   LESSON_VIDEO_MIME,
+  LESSON_VIDEO_ACCEPT,
+  LESSON_VIDEO_UPLOAD_MIMES,
   LESSON_VIDEO_BUCKET,
   buildLessonVideoPath,
   isLessonVideoPath,
@@ -51,6 +53,13 @@ const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 // can silently truncate (see test/bootstrapFolds.test.mjs).
 const SQL_FILES = [
   'db/2026-08-24-course-video-upload-only.sql',
+  'db/000_full_database_bootstrap.sql',
+];
+
+// #57 widened the same bucket. Both halves again: the dated file an existing install
+// runs, and the fold (§44) a fresh install runs after §31 has created the bucket.
+const QUICKTIME_SQL_FILES = [
+  'db/2026-09-08-lesson-video-quicktime.sql',
   'db/000_full_database_bootstrap.sql',
 ];
 
@@ -113,17 +122,47 @@ test('the bucket re-asserts its limits, which #15 never did', () => {
 
 // ── The format ──────────────────────────────────────────────────────────────
 
-test('the bucket accepts exactly the one MIME type the file picker offers', () => {
+test('#44 set the bucket to MP4 only — the state #57 supersedes', () => {
+  // History, pinned so it cannot drift underneath #57. On a fresh install §31 runs
+  // this and §44 then widens it; on an existing install the dated files run in the
+  // same order. Either way this is the intermediate state, not the final one.
   for (const file of SQL_FILES) {
     const values = bucketValues(read(file), 'course-videos');
     const arr = /array\[([^\]]*)\]/i.exec(values || '');
     assert.ok(arr, `${file} must set allowed_mime_types as an array literal`);
     const mimes = arr[1].split(',').map(s => s.trim().replace(/^'|'$/g, '')).filter(Boolean);
-    assert.deepEqual(mimes, [LESSON_VIDEO_MIME],
-      `${file} must allow exactly ['${LESSON_VIDEO_MIME}'] — anything the picker offers and the `
-      + 'bucket refuses fails after the file is chosen, and anything the bucket allows and the '
-      + 'picker refuses is a format we never promised would play');
+    assert.deepEqual(mimes, [LESSON_VIDEO_MIME], `${file} must still create the bucket as MP4-only`);
   }
+});
+
+test('★ the bucket ends up accepting exactly what the file picker offers', () => {
+  // THE INVARIANT THAT MATTERS, and the one that silently went stale when #57 widened
+  // the picker: anything the picker offers and the bucket refuses fails the instant a
+  // file is chosen, and anything the bucket allows but the picker refuses is a format
+  // we never promised would play. Checked against the LAST file to set the list, not
+  // the first — #44's literal is history and the test above owns it.
+  for (const file of QUICKTIME_SQL_FILES) {
+    // Scope to #57's own statement. The bootstrap configures five buckets, and an
+    // unscoped match finds the avatars image list — which would pass or fail for
+    // reasons that have nothing to do with lesson video.
+    const whole = statementsOf(read(file));
+    const at = whole.indexOf("where id = 'course-videos'");
+    assert.ok(at > 0, `${file} must contain #57's course-videos update`);
+    const sql = whole.slice(0, at);
+    const all = [...sql.matchAll(/allowed_mime_types\s*=\s*array\[([^\]]*)\]/gi)];
+    assert.ok(all.length, `${file} must set allowed_mime_types as an array literal`);
+    const m = all[all.length - 1];                 // the LAST write wins at run time
+    const mimes = m[1].split(',').map(s => s.trim().replace(/^'|'$/g, '')).filter(Boolean);
+    assert.deepEqual(mimes, [...LESSON_VIDEO_UPLOAD_MIMES],
+      `${file} must allow exactly what LESSON_VIDEO_ACCEPT offers`);
+  }
+  // And the picker itself really does offer both, in the same order.
+  for (const mime of LESSON_VIDEO_UPLOAD_MIMES) {
+    assert.ok(LESSON_VIDEO_ACCEPT.includes(mime),
+      `LESSON_VIDEO_ACCEPT must offer ${mime}, which the bucket now allows`);
+  }
+  assert.ok(LESSON_VIDEO_UPLOAD_MIMES.includes(LESSON_VIDEO_MIME),
+    'the canonical stored type must remain one of the accepted upload types');
 });
 
 // ── The storage path ────────────────────────────────────────────────────────

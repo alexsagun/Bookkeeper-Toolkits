@@ -699,25 +699,85 @@ test('the remux adds no state and no event to the machine', () => {
   assert.ok(!/UPLOAD_STATES\.[A-Z_]*(REMUX|FASTSTART)/i.test(app()));
 });
 
-test('"Upload anyway" walks real transitions instead of inventing one', () => {
-  const body = fnBody(uploaderBody(), 'function uploadAnyway(');
-  for (const ev of ['SELECT_FILE', 'VALIDATE_START', 'VALIDATE_OK']) {
-    assert.match(body, new RegExp(`UPLOAD_EVENTS\\.${ev}`),
-      `UNSUPPORTED_FILE reaches UPLOADING only via ${ev} — do not add a transition`);
-  }
-  assert.match(body, /acknowledgedRef\.current = true/);
+test('★ a container finding NEVER stops the upload', () => {
+  // THE REGRESSION THIS SECTION EXISTS FOR. The previous version rendered these exact
+  // findings in an amber card with an "Upload anyway" button and waited. Every state
+  // transition behind that button was correct and the button worked — and the admin it
+  // was written for read it as a refusal and pressed NEITHER option, then reported that
+  // the toolkit would not let them upload an H.265 video. A finding that interrupts is
+  // a block in practice, whatever its severity field says.
+  const pick = fnBody(uploaderBody(), 'async function handlePick(');
+  const i = pick.indexOf('if (notes.length)');
+  assert.ok(i > 0, 'handlePick must still collect notes');
+  const arm = pick.slice(i, pick.indexOf('go(UPLOAD_EVENTS.VALIDATE_OK)', i));
+  assert.ok(!/VALIDATE_FAIL/.test(arm),
+    'a note must not route to VALIDATE_FAIL — that lands on UNSUPPORTED_FILE and waits');
+  assert.ok(!/\breturn\b/.test(arm),
+    'the notes branch must fall through to the upload, never return early');
+  // And there is nothing left to click. Strip comments first: the comments explaining
+  // WHY the button was removed necessarily name it, and a naive scan matches the
+  // explanation and fails on the correct answer (§18 and §19 have both hit this).
+  const code = app().split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+  assert.ok(!/uploadAnyway|Upload anyway/.test(code),
+    'the accept/decline card is gone; a note is a footnote, not a question');
 });
 
-test('an acknowledged file is not re-blocked AFTER its upload finishes', () => {
+test('the notice is a status line, not an alert', () => {
+  const body = uploaderBody();
+  const i = body.indexOf('{notice && (');
+  assert.ok(i > 0, 'the notice block was not found');
+  const block = body.slice(i, i + 700);
+  assert.match(block, /role="status"/, 'a note about a running upload is not an alert');
+  assert.ok(!/role="alert"/.test(block) && !/AlertTriangle/.test(block),
+    'amber + AlertTriangle is what made a non-blocking note read as a refusal');
+  assert.ok(!/status-warn/.test(block), 'the warning tokens belong to things that are wrong');
+});
+
+test('a flagged codec is not re-blocked AFTER its upload finishes', () => {
   const body = fnBody(uploaderBody(), 'async function verifyPrivateObject(');
-  assert.match(body, /acknowledgedRef\.current && \(e\?\.code === 3 \|\| e\?\.code === 4\)/,
+  assert.match(body, /codecRiskRef\.current && undecodable/,
     'this probe runs in the SAME browser that already said it cannot decode this codec. '
-    + 'Warning at pick time, then refusing twenty minutes later on the answer we already '
-    + 'predicted, is worse than never having offered the choice');
+    + 'Saying so at pick time, uploading for twenty minutes and then refusing on the '
+    + 'answer we had already predicted is worse than never having said anything');
+  assert.match(body, /e\?\.message === 'timeout'/,
+    'a timeout carries no MediaError code, so testing only 3 and 4 left a completed '
+    + 'upload stuck at "Video not ready" — and partial HEVC support stalls rather than '
+    + 'erroring, which is exactly a timeout');
   assert.match(body, /await confirmSignedObject\(url, expectedBytes\);/,
     'presence, authorization and byte-completeness are still proven for every file');
-  assert.ok(body.indexOf('confirmSignedObject') < body.indexOf('acknowledgedRef.current &&'),
+  assert.ok(body.indexOf('confirmSignedObject') < body.indexOf('codecRiskRef.current'),
     'the existence/size check must run BEFORE any leniency, never be skipped by it');
+});
+
+test('★ a refused pick can never save silently', () => {
+  // UNSUPPORTED_FILE is deliberately absent from the UNFINISHED set, so Save stays
+  // enabled beside the refusal — and used to succeed while changing nothing: drawer
+  // closed, lesson unchanged, still un-publishable, no error anywhere.
+  const src = app();
+  const body = fnBody(src, 'async function saveLesson(');
+  // Anchored on `if (` and the whole arm, so a `false &&` or an inverted test cannot
+  // leave the condition text in place while disabling it.
+  const guard = /if \(videoUploadState === UPLOAD_STATES\.UNSUPPORTED_FILE && !d\.storage_path\) \{\s*setLessonErr\([\s\S]{0,400}?return;\s*\}/
+    .exec(body);
+  assert.ok(guard,
+    'saving a lesson whose only picked file was refused must set lessonErr and RETURN, '
+    + 'not no-op: the drawer used to close on an unchanged, still-un-publishable lesson '
+    + 'with no error anywhere, which is indistinguishable from "the upload is broken"');
+  const lib = readFileSync(join(REPO, 'src/lib/courseVideo.js'), 'utf8');
+  const unfinished = lib.slice(lib.indexOf('const UNFINISHED'), lib.indexOf('const CLOSE_CONFIRM'));
+  assert.ok(unfinished.length > 0 && !/UNSUPPORTED_FILE/.test(unfinished),
+    'do NOT fix this by adding UNSUPPORTED_FILE to UNFINISHED — that set also drives '
+    + 'hasUnfinishedUpload and would relabel Save "Video not ready" on a lesson whose '
+    + 'existing video is perfectly fine');
+  // And the guard must be escapable, or a bad pick makes the drawer unsaveable.
+  assert.match(src, /Dismiss/, 'the refusal needs a way out that is not reloading the page');
+});
+
+test('the legacy-link banner stops demanding a replacement once one exists', () => {
+  const src = app();
+  assert.match(src, /classifyLessonVideo\(d\) === 'legacy-link' && !d\.storage_path/,
+    'during the replacement upload this banner kept insisting the course could not be '
+    + 'published until the video was replaced — directly above the uploader replacing it');
 });
 
 test('the oversize note is advisory and cannot block a save', () => {

@@ -1056,8 +1056,14 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   staff-activation-consistency (#50) → access-request-staff-target (#51) →
   student-progress-rankings (#52) → progress-rankings-followup (#53) →
   progress-course-family-scoping (#54) → approve-rpc-grant-revoke (#55) →
-  community-staff-authority (#56)** — see the Staff-authorization and Progress & Rankings
-  sections for what each does. #56 is the last fold, §43.
+  community-staff-authority (#56) → lesson-video-quicktime (#57)** — see the Staff-authorization
+  and Progress & Rankings sections for what each does. **#57**
+  ([db/2026-09-08-lesson-video-quicktime.sql](db/2026-09-08-lesson-video-quicktime.sql), fold
+  **§44**, the last one) widens `course-videos.allowed_mime_types` to
+  `video/mp4 + video/quicktime` so an iPhone/Mac `.mov` uploads instead of being refused.
+  Additive, upload-path only, no policy/function/column change — but **run it before or with the
+  deploy**: the new client sends the file's real content type, so a `.mov` against an unwidened
+  bucket 400s. An old client against the widened bucket is unaffected.
   **#35/#36 applied to production 2026-07-29; both verified against a disposable shadow project first — see
   [docs/db/shadow-project.md](docs/db/shadow-project.md) and `npm run test:db`.**
   **Expiry-warning policy:** student-facing surfaces (menu pill, Dashboard `MembershipPanel`, the
@@ -2030,12 +2036,13 @@ docs **in the same change**:
   the MIME type and the size, and an H.265/HEVC file satisfies all three, so for the whole life
   of #44 the only thing keeping HEVC out of a paid course was `probeVideoMetadata` on the local
   blob — which asks **the admin's own browser** whether it can decode the file. That is the one
-  machine guaranteed not to be a student's: Chrome on Windows 11 with the HEVC extensions
-  answers `'probably'`, while Firefox ships no HEVC decoder on any platform. On 2026-09-03 an
-  859 MB `hvc1` lesson passed that gate. `inspectLessonVideo()` / `describeVideoContent()` now
-  read `moov → trak → mdia → stbl → stsd` out of the container itself. Moving together:
+  machine guaranteed not to be a student's, and it answers for its own GPU: HEVC needs a
+  **hardware** decoder, so "probably" on a 2023 laptop says nothing about a budget Android phone.
+  On 2026-09-03 an 859 MB `hvc1` lesson passed that gate. `inspectLessonVideo()` /
+  `describeVideoContent()` now read `moov → trak → mdia → stbl → stsd` out of the container
+  itself — and REPORT rather than refuse (see below). Moving together:
   `LESSON_VIDEO_CODECS` ↔ `describeVideoContent()` ↔
-  `handlePick`'s gate in BookkeeperPro.jsx ↔ `test/courseVideoContent.test.mjs` ↔ the uploader's
+  `handlePick` in BookkeeperPro.jsx ↔ `test/courseVideoContent.test.mjs` ↔ the uploader's
   helper copy. **Walk the boxes; never scan for the literal bytes `avc1`** — a scan matches the
   string inside a `free` box, a filename in `udta`, or by luck in compressed payload, and
   reporting H.264 for an HEVC file is the exact bug the module exists to prevent (pinned).
@@ -2043,14 +2050,47 @@ docs **in the same change**:
   through to the decode probe, i.e. exactly the old behaviour. Blocking on "we could not parse
   it" would refuse good lessons whenever the walker meets a shape it does not know; the cost of
   a wrong refusal is the admin's work, the cost of a miss is a probe that already runs.
-  ★ **NEITHER container finding is a hard refusal any more — `severity` is `'warn'` on both**
-  (2026-09-07). The only hard blocks left are `validateVideoFile`'s: not an `.mp4`, empty, or
-  over the cap. `not-faststart` is repaired in the browser (below) and only reaches a human when
-  the planner declines; `codec-unsupported` is stated plainly, names who it breaks, and offers
-  **"Upload anyway"**. The reason is evidence, not sentiment: refusing cost the admin an ffmpeg
-  pass on **every single upload** — all nine lesson objects in production are named
-  `*_faststart.mp4` — for a property most students' browsers would not have noticed. The person
-  who knows the audience makes the call; the app makes sure they know what they are deciding.
+  ★ **NEITHER container finding is a hard refusal, AND NEITHER MAY INTERRUPT** (2026-09-08).
+  `severity` is `'warn'` on both, and `'warn'` means *say this while the upload runs* — never
+  *ask a question*. `handlePick` always reaches `runTransfer`. The only hard blocks left are
+  `validateVideoFile`'s: not an `.mp4`/`.mov`, empty, or over the cap.
+  ★ **This took two attempts, and the second failure is the instructive one.** #44 blocked HEVC
+  outright. 2026-09-07 downgraded it to a warning — but kept it as an amber `role="alert"` card
+  with an "Upload anyway" button that halted the flow. Every transition behind that button was
+  correct and the button worked; the admin it was written for read it as a refusal, pressed
+  **neither** option, and reported that the toolkit would not let them upload an H.265 video.
+  **A finding that interrupts is a block in practice, whatever its severity field says.** The
+  notes now render in the neutral `role="status"` strip beside a live progress bar. There is
+  nothing to accept and nothing to dismiss. Pinned by `uiSafety` §19, mutation-tested.
+  ★ **And say true things.** The blocking message claimed *"Firefox has no decoder for it at
+  all"* — false since **Firefox 134** (Windows, Jan 2025); 136 added macOS, 137 Linux. Chrome
+  and Edge have decoded HEVC since 107, Safari for years. What is true in 2026 is narrower and
+  checkable: every major browser decodes it, but only with a **hardware** decoder, so roughly
+  **one viewer in eight** cannot — older/budget Android, laptops from before ~2015, and **Edge
+  on Windows without Microsoft's HEVC Video Extensions** (**Chrome on Windows needs no such
+  extension**). `test/courseVideoContent.test.mjs` pins the message against the old claim.
+  ★ **`.mov` is accepted (#57, `db/2026-09-08-lesson-video-quicktime.sql`, fold §44).** A `.mov`
+  is the same ISO base media container an `.mp4` is — `mp4Faststart.js` already handles
+  QuickTime's non-FullBox `meta`, and `sanitizeVideoFileName` still stores it as `.mp4`. It was
+  refused with *"must be MP4 (H.264 video, AAC audio)"*, which is a codec instruction from a
+  gate that cannot see a codec, and iPhone/Mac recordings are exactly `.mov` + HEVC. Moving
+  together: `LESSON_VIDEO_UPLOAD_MIMES` / `LESSON_VIDEO_ACCEPT` / `validateVideoFile()` ↔ the tus
+  `contentType` ↔ the bucket's `allowed_mime_types` ↔ `test/courseVideoSql.test.mjs`.
+  ★ **The client now sends the file's REAL content type.** It used to send a hardcoded
+  `video/mp4` for everything, so a `.mov` would have passed the bucket check *by being
+  mislabelled*. Passing by mislabelling is not a grant; it is a bug nobody has noticed yet.
+  ★ **A REFUSED PICK MUST NOT SAVE SILENTLY.** `UNSUPPORTED_FILE` is deliberately **not** in the
+  `UNFINISHED` set — that set also drives `hasUnfinishedUpload`, and adding it would relabel Save
+  "Video not ready" on a lesson whose *existing* video is fine. But that left `blocksLessonSave`
+  false beside the refusal, so an enabled blue **Save lesson** succeeded while changing nothing:
+  drawer closed, lesson unchanged, still link-backed, still un-publishable, no error anywhere —
+  which is indistinguishable from "the upload is broken". `saveLesson` now refuses with an
+  explanation, and the refusal card carries a **Dismiss** (`RESET` → `EMPTY`) so the guard can
+  never trap anyone. Pinned by `uiSafety` §19, mutation-tested.
+  ★ **The legacy-link banner hides once `d.storage_path` is set.** During a replacement upload it
+  kept insisting *"the course cannot be published until it is replaced"* directly above the
+  uploader replacing it — two contradictory amber cards, and a large part of why the screen read
+  as a wall.
   ★ **An ACKNOWLEDGED file must not be re-blocked after its upload finishes.** Relaxing the
   pick-time gate alone would be worse than useless: `verifyPrivateObject` runs
   `probeVideoMetadata` against the signed URL **in the same browser that just said it cannot
