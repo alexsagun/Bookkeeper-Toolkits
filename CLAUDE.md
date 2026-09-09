@@ -9,7 +9,7 @@ aspiring and working **remote bookkeepers serving US clients**. It bundles ~60 f
 tools across three career stages:
 
 1. **Training & Skills** — Accounting 101 course, Industry Accounting playbooks, US Tax 101, ProAdvisor chat.
-2. **Job Application** — authentic branding, resume/LinkedIn optimizers, interview prep, mock-interview & discovery-call simulators, QuickBooks diagnostic, pain-points & cover-letter generators.
+2. **Job Application** — authentic branding, resume/LinkedIn optimizers, a portfolio-website generator, interview prep, mock-interview & discovery-call simulators, QuickBooks diagnostic, pain-points & cover-letter generators.
 3. **Client Management & Delivery** — engagement letters, onboarding, Chart of Accounts generator, invoice creator, bank-feed AI, statement→CSV converter, email templates, accounting calculators, monthly/year-end checklists, SOP generator, sales tax, plus growth tools (pricing, upsell, capacity, payment tracking).
 
 Many tools are **AI-assisted** (call Claude); the rest (calculators, checklists, Chart of Accounts,
@@ -51,7 +51,7 @@ npm run ai:knowledge       # regenerate docs/ai/toolkits-voice-agent-knowledge.m
 npm run ai:knowledge:check # rebuild the knowledge doc in memory + diff vs disk; exit 1 on drift (writes nothing)
 npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge base
 npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
-npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, bootstrapFolds, courseVideo, courseVideoSql, courseVideoContent, mp4Faststart, studentProgress, studentProgressSql, uiSafety, coaIntegrity,
+npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, bootstrapFolds, courseVideo, courseVideoSql, courseVideoContent, mp4Faststart, studentProgress, studentProgressSql, uiSafety, coaIntegrity, portfolioGenerator,
                            approveGrantSql, …)
 npm run storage:config     # read the PROJECT-WIDE Supabase Storage upload limit and the effective
                            # limit of every bucket; --apply raises it to LESSON_VIDEO_MAX_BYTES.
@@ -139,6 +139,16 @@ The sanctioned exceptions to the single-file rule (same spirit as the `main.jsx`
   lesson videos in production. A byte move, never a transcode; it never throws and refuses with a
   stable code rather than guessing. **No SQL half**, which is why it is not part of the
   SQL-mirrored `courseVideo.js`. See "Changing what a course lesson video may be".
+- `src/lib/portfolioGenerator.js` — the Portfolio Generator engine (pure). Owns the draft shape,
+  link/photo validation, the ordered section table, and the builder that emits the downloadable
+  one-file portfolio. It exists because the standalone artifact it was ported from escaped
+  `& < > "` and **not `:`**, so a CTA of `javascript:alert(1)` reached FOUR hrefs in a page the
+  student then hosts — stored XSS against their own prospects. `safeLinkHref()` follows the
+  `lessonReplay.js` rule (the parsed `protocol` is the only scheme authority; no base argument;
+  `hostname` not `host`; an invalid result carries no href) and adds one explicit `https://` retry
+  for the scheme-less input everybody actually types. **No `Date`, no `toLocaleString`** — the year
+  and the filename date are parameters, so the same draft is byte-identical everywhere. See
+  "Changing what the Portfolio Generator may emit".
 - `src/index.css` — the **global theme-token layer** (all CSS custom properties for light + dark,
   the shared `.gh-app-bg`/glass/button/input classes, and the Tailwind dark compat layer). See
   Styling conventions.
@@ -638,7 +648,7 @@ as the other admin tabs). Migration **#26**
   degrade). After completion the imported subscription flows through `useEnrollmentGate → is_enrolled`
   with zero special-casing. Import state is server-side — nothing goes in `LEGACY_KEYS`.
 
-### [src/BookkeeperPro.jsx](src/BookkeeperPro.jsx) — the entire app (~35.1k lines)
+### [src/BookkeeperPro.jsx](src/BookkeeperPro.jsx) — the entire app (~36.8k lines)
 
 > Note: lines are long; prefer `Grep` over reading the whole file. Line numbers below are anchors,
 > approximate as the file evolves.
@@ -665,7 +675,18 @@ replaced the old 7-document-type `ProposalGenerator`; paste a job post → indus
 variations + a timecoded video-intro script + an interview-prep pack from ONE `callClaude` call at
 `max_tokens: 8000`. Pure logic lives in `src/lib/coverLetterIndustry.js` (industry table + keyword
 detector) and `src/lib/partialJson.js` (tolerant JSON + truncated-prefix recovery), both covered by
-`npm test`), `EngagementLetter` 15168, `EmailTemplates` 15717,
+`npm test`), `BookkeeperPortfolioGenerator` ~20000 (tab id `portfoliogenerator`, route
+`/profile-optimization/portfolio-generator`, sidebar Job Application → Profile Optimization between
+Resume Winning Strategy and Book 1-on-1 — a **two-pane authoring workspace**: 13 editor sections on
+the left, a live sandboxed preview on the right, one self-contained downloadable HTML file out the
+other end. 9 themes, 10 industry presets, optional PDF résumé import, optional photo. **Fully
+offline — no Supabase, no `callClaude`, no `api/` route, nothing uploaded**, which is deliberate:
+the inputs are a CV and a headshot. Presets live in `src/data/portfolio-generator.js` and the whole
+engine in `src/lib/portfolioGenerator.js`; **both are lazy-loaded together** by
+`loadPortfolioGeneratorModules`, and `pdfjs-dist` is a third dynamic import that only fetches when
+somebody picks a file. Layout is the `.pf-tool` **container query** in `src/index.css`, not a media
+query. Pinned by `test/portfolioGenerator.test.mjs``test/portfolioGenerator.test.mjs` (151 tests, incl. source scans of all seven
+wiring sites and of the iframe sandbox)), `EngagementLetter` 15168, `EmailTemplates` 15717,
 `PainPointsGenerator` 15970, `IndustryAccounting` 16330, `USTax101` 16466,
 `MonthlyWorkflow` 16560, `MonthEndChecklist` 16650, `InvoiceCreator` 16881, `CoachAlexChat` 17369,
 `CPAAIChat` 17399, `AccountingCalculators` 18201,
@@ -2181,6 +2202,75 @@ docs **in the same change**:
   a transfer-time 413 can only mean the server ceiling is lower than the one we enforce. The
   message must never quote a limit the client cannot know — Supabase's 413 body carries no
   number — and the UI must not offer Resume, which re-sends the identical request.
+- **Changing what the Portfolio Generator may emit** → the rules live in ONE pure module and are
+  mirrored in the stylesheet. Move together: `src/lib/portfolioGenerator.js` ↔
+  `src/data/portfolio-generator.js` (the 9 themes, whose hexes the contrast floors are computed
+  from, and the example draft the honesty guard is measured against) ↔ the `.pf-tool` block in
+  `src/index.css` (the `@container` threshold, the editor track, `align-items:start`) ↔ the
+  `PortfolioGeneratorInner` component and its 7 wiring sites in `src/BookkeeperPro.jsx` ↔
+  `test/portfolioGenerator.test.mjs`. There is **no SQL half** — nothing about this tool touches
+  Supabase, which is why it is not on the migration list.
+  ★ **CONTRAST IS DERIVED, NOT HAND-TUNED, AND THE PAIR YOU MEASURE IS THE WHOLE ANSWER.**
+  `themeCssVars` emits three computed tokens — `--glow-on-panel`, `--focus-ring`, `--tlab-before`
+  / `--tlab-after` — each chosen by `pickReadable()` as the first candidate clearing its WCAG
+  floor against the surface a reader actually sees. `mixHex()` exists because several surfaces are
+  a tint over a tint over the page (`.tside.after` is `rgba(accent,.14)` over `--glass` over
+  `--pg2`), so a ratio taken against `--accent` or `--pg2` alone is not the ratio anyone gets:
+  measuring the wrong pair is how eleven of eighteen Before/After label pairs sat below 4.5:1
+  while looking checked, and how the one light theme shipped a 1.80:1 focus ring. Adding a theme
+  requires no colour tuning, but `redblack`'s accent is pinned at `#d93333` (not `#e23b3b`)
+  because its `on` is white and 4.27:1 fails AA on the CTA. The 12-pair × 9-theme audit in
+  `test/portfolioGenerator.test.mjs` is the guard; it reads the tokens the sheet actually emits.
+  ★ **`safeLinkHref()` IS THE ONLY AUTHORITY FOR ANY href THE GENERATED FILE CONTAINS**, and the
+  file is one the student HOSTS. The artifact's `esc()` escaped `& < > "` and not `:`, so a CTA of
+  `javascript:alert(1)` landed verbatim in four hrefs — the nav button, the hero button, every
+  package card and the contact panel. Never validate a scheme with a regex on the raw string:
+  WHATWG strips tab/LF/CR *before* parsing, so `"java\nscript:alert(1)"` parses as `javascript:`
+  and sails through `/^javascript:/`. Never pass a base to `new URL()`. `mailtoHref`/`telHref`
+  **synthesise** and never accept a raw value — the mailto threat is mail-header injection
+  (`?bcc=`), which escaping cannot see.
+  ★ **THE PREVIEW IFRAME IS `sandbox="allow-scripts"` AND NOTHING ELSE.** A `srcdoc` document
+  normally INHERITS its embedder's origin, which is exactly how the artifact's preview could read
+  the app's `localStorage` — where the Supabase session lives. `allow-same-origin` is the only
+  thing that clears the sandboxed-origin flag, so it is never present; nor is
+  `allow-top-navigation`. A source scan asserts the flag list is EXACTLY `['allow-scripts']`.
+  Note a srcdoc document also inherits its embedder's **CSP**: the app ships none today, so if one
+  is ever added to `vercel.json` the preview inherits it and that is the first place to look.
+  ★ **The CSP in the generated file DIFFERS BY MODE, on purpose.** `default-src 'none'` is right
+  for a preview of content we just escaped and actively hostile in a file the bookkeeper owns and
+  will edit — the moment they add a Google Font, host their headshot, or paste a Calendly embed,
+  everything fails silently with no error a non-developer can read. The download policy allows
+  `https:` images, fonts and styles and keeps `connect-src 'none'`.
+  ★ **A photo is RE-ENCODED through a canvas, never stored as picked.** That strips the EXIF block
+  — which carries GPS coordinates on almost every phone photo, i.e. a home address, on a page the
+  student publishes — caps the bytes so the draft fits the storage quota, and forces JPEG output.
+  SVG is refused explicitly: it carries script and the preview frame runs scripts.
+  ★ **`window.storage.set` RESOLVES `false` on a quota error and never rejects** (`src/main.jsx`),
+  so the autosave checks the resolved value, retries without the photo, and says so. A bare
+  `.catch()` would report a silent success and the student would lose the draft on reload having
+  been told it saved.
+  ★ **The example draft is never the initial draft.** The artifact loaded its sample on mount, so
+  every new user's first view was somebody else's name over invented testimonials. The editor
+  starts empty and the autosave is gated on a `seedRef` comparison — the draft must differ from
+  what the tool itself put on screen, and the seed is **re-stamped on every successful write**, so
+  the gate means "differs from storage". Two earlier gates were both wrong and both were caught in
+  the browser: `draftCompletion(d).pct > 0` never blocked anything (an untouched draft scores 8%,
+  because `showSamples` defaults on), and `draftHasContent(d)` fired on a bare VISIT, because the
+  prefilled `profile.full_name` is content — so merely opening the tab left a storage row in every
+  user's browser. Re-stamping is the third fix: without it the seed stayed the MOUNT-time value,
+  so reverting an edit was gated out while the last dirty value stayed on disk under a "Saved"
+  indicator. `sampleFieldsStillPresent()` **names every field still holding example text** in the
+  download dialog — a banner at the top of a form is not read at download time. It derives the
+  checked set from the sample by EXCLUDING known shared defaults, rather than from a hand-typed
+  include list that omitted `email`, `phone`, `website` and `credentials`; and it compares a list
+  **per item**, because editing one of two testimonials used to drop the whole field off the
+  warning while the other invented quote still shipped.
+  ★ **`financialSampleRows()` returns ROWS, NOT MARKUP**, and that is what caught the artifact's
+  cash-flow statement not tying out: its operating components summed to 96,200 against a printed
+  96,800, under a footnote calling the figures "internally consistent", for an audience of
+  accountants. Depreciation is 13,200 here — the fix had to be a COMPONENT because ending cash
+  86,300 correctly ties to balance-sheet cash. Every subtotal and both cross-statement links are
+  asserted.
 - **Changing who may READ a lesson video object** → `course_video_object_readable()` ↔ the
   `course_videos_read` policy ↔ `courses_read` (it MIRRORS it — drift is a security bug) ↔ the
   two #27 trainer mirrors ↔ `PLAN_ENTITLEMENTS` ↔ `planScopeAllows()`. Note `db:shadow:verify`

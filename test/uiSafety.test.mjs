@@ -575,15 +575,25 @@ test('a text lesson never gets the black video frame', () => {
     'renderLearner must gate the full-bleed stage slot on lessonUsesMediaStage');
 });
 
-test('only course tabs get the wide canvas, and only the max-width is conditional', () => {
+// Only a TWO-PANE WORKSPACE gets the wide canvas, and each member had to earn it with a
+// measurement. Two kinds qualify, named separately so the reason survives the next
+// addition — a bare count would let anything in as long as the list stayed short, and a
+// stale "does not host a course catalog" message would then contradict the code.
+const COURSE_CATALOG_TABS = ['qbomastery', 'resumestrategy', 'interview'];
+const TWO_PANE_TABS = ['portfoliogenerator'];
+
+test('only two-pane workspaces get the wide canvas, and only the max-width is conditional', () => {
   const src = app();
   const m = /const WIDE_CANVAS_TABS = new Set\(\[([^\]]*)\]\)/.exec(src);
   assert.ok(m, 'WIDE_CANVAS_TABS was not found');
   const ids = m[1].split(',').map((s) => s.trim().replace(/['"]/g, '')).filter(Boolean);
-  assert.ok(ids.length > 0 && ids.length <= 3, 'this is a course exception, not a redesign');
+  const allowed = [...COURSE_CATALOG_TABS, ...TWO_PANE_TABS];
+  assert.ok(ids.length > 0 && ids.length <= allowed.length,
+    'this is an exception list, not a redesign — every other tool is a form or a document '
+    + 'and reads worse wider');
   for (const id of ids) {
-    assert.ok(['qbomastery', 'resumestrategy', 'interview'].includes(id),
-      `${id} does not host a course catalog`);
+    assert.ok(allowed.includes(id),
+      `${id} is neither a course catalog nor a two-pane authoring workspace`);
   }
   assert.ok(/p-4 sm:p-6 lg:p-10 \$\{WIDE_CANVAS_TABS/.test(src),
     "ONLY the max-width may be conditional — SectionHead's -mx-10/-mt-10/px-10 band is "

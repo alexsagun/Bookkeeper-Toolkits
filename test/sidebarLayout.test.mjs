@@ -79,6 +79,30 @@ const STORED_PRE_56 = [
 
 const idsOf = (stages) => stages.flatMap((s) => s.tabs.map((t) => t.id));
 
+/**
+ * The shape of the real Job Application stage's Profile Optimization group after the
+ * Portfolio Generator was added between its two siblings. Mirrors DEFAULT_STAGES, and
+ * exists to prove the claim that shipping a new tab into a GROUPED stage needs no
+ * SIDEBAR_VERSION bump.
+ */
+const JOBSEARCH_GROUPS = [
+  { key: 'profile-opt', label: 'Profile Optimization', tabIds: ['resumestrategy', 'portfoliogenerator', 'linkedinopt'] },
+];
+const JOBSEARCH_DEFAULTS = [
+  {
+    id: 'jobsearch',
+    label: 'Job Application',
+    number: '02',
+    desc: 'Land US clients',
+    groups: JOBSEARCH_GROUPS,
+    tabs: [
+      { id: 'resumestrategy', label: 'Resume Winning Strategy', icon: ICON },
+      { id: 'portfoliogenerator', label: 'Portfolio Generator', icon: ICON },
+      { id: 'linkedinopt', label: 'Book 1-on-1 with Alex', icon: ICON },
+    ],
+  },
+];
+
 test('a stored layout drops the three retired tab ids and keeps everything else', () => {
   const merged = mergeStoredWithDefaults(STORED_PRE_56, DEFAULTS, FALLBACK);
   const ids = idsOf(merged);
@@ -173,6 +197,60 @@ test('reconcileRenamedLabels only overwrites a label still equal to the OLD defa
   const out = reconcileRenamedLabels(stages, RENAMED_TAB_LABELS);
   assert.equal(out[0].tabs[0].label, 'Job Interview Mastery');
   assert.equal(out[0].tabs[1].label, 'My Cover Letters');
+});
+
+test('a new tab in a GROUPED stage joins the group with no SIDEBAR_VERSION bump', () => {
+  // ★ WHY THIS IS THE HONEST TEST. For a grouped stage, render order comes from
+  //   `groups[].tabIds`, which mergeStoredWithDefaults ALWAYS takes from the defaults —
+  //   so position inside the merged `tabs` array does not decide what the sidebar shows.
+  //   What matters is that the tab OBJECT joins `tabs`, because the sidebar renders
+  //   `g.tabIds.map(id => tabById[id]).filter(Boolean)` and tabById is built from
+  //   stage.tabs. A tab named in the group but absent from tabs is silently dropped,
+  //   with no error anywhere. The insertion loop that puts it there runs unconditionally
+  //   at every stored version, which is what makes the no-bump claim true.
+  const stored = [{
+    id: 'jobsearch',
+    label: 'Job Application',
+    number: '02',
+    desc: 'Land US clients',
+    tabs: [
+      { id: 'resumestrategy', label: 'Resume Winning Strategy' },
+      { id: 'linkedinopt', label: 'Book 1-on-1 with Alex' },
+    ],
+  }];
+  const merged = mergeStoredWithDefaults(stored, JOBSEARCH_DEFAULTS, FALLBACK);
+  const stage = merged.find((s) => s.id === 'jobsearch');
+  assert.ok(stage, 'the stage itself must survive the merge');
+
+  const tab = stage.tabs.find((t) => t.id === 'portfoliogenerator');
+  assert.ok(tab, 'without an entry in stage.tabs the grouped render resolves tabById[id] '
+    + 'to undefined and .filter(Boolean) drops the tab entirely');
+  assert.equal(tab.icon, ICON, 'the icon always comes from the defaults, never from storage');
+  assert.equal(tab.label, 'Portfolio Generator');
+
+  assert.deepEqual(stage.tabs.map((t) => t.id),
+    ['resumestrategy', 'portfoliogenerator', 'linkedinopt'],
+    'it belongs between its two siblings, where DEFAULT_STAGES puts it');
+  assert.deepEqual(stage.groups, JOBSEARCH_GROUPS,
+    'group tabIds always come from the defaults — which is the other half of why no '
+    + 'SIDEBAR_VERSION bump is needed');
+});
+
+test('a user rename in a grouped stage still survives the new tab arriving', () => {
+  const stored = [{
+    id: 'jobsearch',
+    label: 'Getting Hired',
+    number: '02',
+    desc: 'Land US clients',
+    tabs: [
+      { id: 'resumestrategy', label: 'My Resume Course' },
+      { id: 'linkedinopt', label: 'Book 1-on-1 with Alex' },
+    ],
+  }];
+  const stage = mergeStoredWithDefaults(stored, JOBSEARCH_DEFAULTS, FALLBACK)
+    .find((s) => s.id === 'jobsearch');
+  assert.equal(stage.label, 'Getting Hired', 'a renamed stage must not be reset by an addition');
+  assert.equal(stage.tabs.find((t) => t.id === 'resumestrategy').label, 'My Resume Course');
 });
 
 test('SIDEBAR_VERSION is an integer the loader can compare', () => {

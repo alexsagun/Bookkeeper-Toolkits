@@ -1,5 +1,5 @@
 <!-- GENERATED FILE — do not hand-edit. Regenerate with `npm run ai:knowledge`
-     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-09-01 -->
+     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-09-08 -->
 
 # Toolkits by Alex — Voice Assistant Knowledge
 
@@ -12,7 +12,7 @@ paths never change.
 
 ## 1. App overview
 
-- The toolkit bundles **34 tools** across three career stages: **01 Training &
+- The toolkit bundles **35 tools** across three career stages: **01 Training &
   Skills** (build your foundation), **02 Job Application** (land US clients), and
   **03 Client Management & Delivery** (onboard, operate, close the year), plus a Home
   dashboard.
@@ -63,6 +63,7 @@ paths never change.
 |---|---|---|---|
 | Authentic Branding | `brand` | `/authentic-branding` | Guided questionnaire that builds your authentic personal brand story for applications. |
 | Resume Winning Strategy | `resumestrategy` | `/courses/resume-winning-strategy` | Resume video-course catalog with completion certificates. |
+| Portfolio Generator | `portfoliogenerator` | `/profile-optimization/portfolio-generator` | Build a client-ready bookkeeping portfolio website and download it as one self-contained file. Nine designs, ten industry presets, optional resume import — everything stays in the browser. |
 | Book 1-on-1 with Alex | `linkedinopt` | `/profile-optimization/book-with-alex` | Booking page for a 1-on-1 profile-optimization session with Alex. |
 | Personalized Coaching With Alex | `coachalex` | `/booking/coach-alex` | Booking page for personalized coaching sessions with Coach Alex. |
 | Job Interview Mastery | `interview` | `/job-interview-mastery` | Interview prep hub: winning-strategy courses, mock interview simulator, common and accounting questions, body language, JD question generator, and salary negotiation. |

@@ -166,6 +166,7 @@ const TAB_ROUTES = {
   coachalex: '/booking/coach-alex',
   cpaai: '/booking/us-cpa',
   resumestrategy: '/courses/resume-winning-strategy',
+  portfoliogenerator: '/profile-optimization/portfolio-generator',
   linkedinopt: '/profile-optimization/book-with-alex',
   interview: '/job-interview-mastery',
   brand: '/authentic-branding',
@@ -419,6 +420,7 @@ const VOICE_TAB_INFO = {
   chat:         { label: 'ProAdvisor Chat', stage: 'Training & Skills', desc: 'AI mentor chat for QuickBooks cleanups and day-to-day bookkeeping questions.' },
   brand:        { label: 'Authentic Branding', stage: 'Job Application', desc: 'Guided questionnaire that builds your authentic personal brand story for applications.' },
   resumestrategy: { label: 'Resume Winning Strategy', stage: 'Job Application', desc: 'Resume video-course catalog with completion certificates.' },
+  portfoliogenerator: { label: 'Portfolio Generator', stage: 'Job Application', desc: 'Build a client-ready bookkeeping portfolio website and download it as one self-contained file. Nine designs, ten industry presets, optional resume import — everything stays in the browser.' },
   linkedinopt:  { label: 'Book 1-on-1 with Alex', stage: 'Job Application', desc: 'Booking page for a 1-on-1 profile-optimization session with Alex.' },
   coachalex:    { label: 'Personalized Coaching With Alex', stage: 'Job Application', desc: 'Booking page for personalized coaching sessions with Coach Alex.' },
   interview:    { label: 'Job Interview Mastery', stage: 'Job Application', desc: 'Interview prep hub: winning-strategy courses, mock interview simulator, common and accounting questions, body language, JD question generator, and salary negotiation.' },
@@ -481,6 +483,16 @@ const VOICE_TOOL_ALIASES = {
   'resume': { tab: 'resumestrategy' },
   'resume course': { tab: 'resumestrategy' },
   'resume strategy': { tab: 'resumestrategy' },
+  // Not 'profile optimization' — that is already bound to linkedinopt below, and not
+  // 'profile', which is bound to the account settings panel.
+  portfolio: { tab: 'portfoliogenerator' },
+  'portfolio generator': { tab: 'portfoliogenerator' },
+  'portfolio builder': { tab: 'portfoliogenerator' },
+  'bookkeeper portfolio': { tab: 'portfoliogenerator' },
+  'bookkeeping portfolio': { tab: 'portfoliogenerator' },
+  'create my portfolio': { tab: 'portfoliogenerator' },
+  'build my portfolio': { tab: 'portfoliogenerator' },
+  'personal website': { tab: 'portfoliogenerator' },
   'book with alex': { tab: 'linkedinopt' },
   'book a session': { tab: 'linkedinopt' },
   'one on one': { tab: 'linkedinopt' },
@@ -7712,6 +7724,7 @@ function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImport
     case 'coachalex': return <CoachAlexChat />;
     case 'cpaai': return <CPAAIChat />;
     case 'resumestrategy': return <ResumeStrategy />;
+    case 'portfoliogenerator': return <BookkeeperPortfolioGenerator />;
     case 'interview': return <InterviewPrep initialSub={interviewSub || undefined} />;
     case 'brand': return <AuthenticBranding standalone />;
     case 'painpoints': return <PainPointsGenerator />;
@@ -7734,10 +7747,19 @@ function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImport
   }
 }
 
-// Course pages get a wider canvas than the 1280px TabPanel default. A lesson page is a
-// two-pane workspace (curriculum + a 16:9 media stage), and max-w-7xl was capping the
-// video at 744px on a 1920px screen — there the max-width, not the viewport, was the
-// binding constraint. Every other tool is a form or a document and reads worse wider.
+// TWO-PANE WORKSPACES get a wider canvas than the 1280px TabPanel default. Every other
+// tool is a form or a document and reads worse wider, so this stays an exception list.
+// Two kinds of tool qualify, and each earned its place with a measurement:
+//
+//   · A COURSE PAGE (`qbomastery`, `resumestrategy`, `interview`) is curriculum plus a
+//     16:9 media stage. max-w-7xl was capping the video at 744px on a 1920px screen —
+//     there the max-width, not the viewport, was the binding constraint.
+//   · The PORTFOLIO GENERATOR is a thirteen-section editor beside a live preview of the
+//     document being built. At max-w-7xl the tool has ~1200px of content, so a 460px
+//     editor leaves a 716px preview — below the GENERATED document's own 760px
+//     breakpoint, where it hides its nav and collapses its about grid. The student would
+//     be designing a desktop site through a mobile viewport with nothing on screen to
+//     say so. The wider canvas is also what keeps the preview's zoom near 1:1.
 //
 // ★ ONLY the max-width is conditional. The `p-4 sm:p-6 lg:p-10` padding stays exactly as
 //   it is: SectionHead's full-bleed band uses `-mx-10 -mt-10 px-10`, hard-coupled to the
@@ -7746,7 +7768,7 @@ function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImport
 //   subtabs, so the other six render on the wider canvas too — checked at 1920 when this
 //   shipped. Both class strings must stay COMPLETE LITERALS for Tailwind's JIT scanner;
 //   never build one by concatenation.
-const WIDE_CANVAS_TABS = new Set(['qbomastery', 'resumestrategy', 'interview']);
+const WIDE_CANVAS_TABS = new Set(['qbomastery', 'resumestrategy', 'interview', 'portfoliogenerator']);
 
 const TabPanel = React.memo(function TabPanel({ tabId, active, goto, onAccessCount, onEnrollCount, onImportCount, interviewSub }) {
   return (
@@ -8175,7 +8197,7 @@ export default function BookkeeperProToolkit() {
       desc: 'Land US clients',
       groups: [
         { key: 'self-discovery', label: 'Self Discovery',          tabIds: ['brand'] },
-        { key: 'profile-opt',    label: 'Profile Optimization',    tabIds: ['resumestrategy', 'linkedinopt'] },
+        { key: 'profile-opt',    label: 'Profile Optimization',    tabIds: ['resumestrategy', 'portfoliogenerator', 'linkedinopt'] },
         { key: 'interview',      label: 'Interview',               tabIds: ['coachalex', 'interview', 'qbdiag'] },
         { key: 'proposal',       label: 'Proposal / Cover Letters', tabIds: ['painpoints', 'proposal', 'discovery'] },
       ],
@@ -8184,6 +8206,7 @@ export default function BookkeeperProToolkit() {
         { id: 'brand',         label: 'Authentic Branding',       icon: User },
         // Profile Optimization
         { id: 'resumestrategy', label: 'Resume Winning Strategy',  icon: GraduationCap },
+        { id: 'portfoliogenerator', label: 'Portfolio Generator',  icon: Briefcase },
         { id: 'linkedinopt',   label: 'Book 1-on-1 with Alex',     icon: CalendarCheck },
         // Interview
         { id: 'coachalex',     label: 'Personalized Coaching With Alex', icon: HeartHandshake },
@@ -14198,7 +14221,7 @@ function Dashboard({ goto }) {
       desc: 'Land US remote clients',
       groups: [
         { label: 'Self Discovery',          tabIds: ['brand'] },
-        { label: 'Profile Optimization',    tabIds: ['resumestrategy', 'linkedinopt'] },
+        { label: 'Profile Optimization',    tabIds: ['resumestrategy', 'portfoliogenerator', 'linkedinopt'] },
         { label: 'Interview',               tabIds: ['coachalex', 'interview', 'qbdiag'] },
         { label: 'Proposal / Cover Letters', tabIds: ['painpoints', 'proposal', 'discovery'] },
       ],
@@ -14207,6 +14230,7 @@ function Dashboard({ goto }) {
         { id: 'brand',         label: 'Authentic Branding',       desc: 'Psychological deep-dive to your brand', icon: User,      color: '#0A1E3F' },
         // Profile Optimization
         { id: 'resumestrategy', label: 'Resume Winning Strategy',  desc: 'Video courses · certificates',           icon: GraduationCap, color: '#1E40AF' },
+        { id: 'portfoliogenerator', label: 'Portfolio Generator',  desc: 'Build and download a client-ready bookkeeping portfolio.', icon: Briefcase, color: '#2563EB' },
         { id: 'linkedinopt',   label: 'Book 1-on-1 with Alex',     desc: '1-on-1 profile optimization session with Alex',  icon: CalendarCheck,  color: '#0EA5E9' },
         // Interview
         { id: 'coachalex',     label: 'Personalized Coaching With Alex', desc: 'Personalized 1-on-1 coaching with Alex',  icon: HeartHandshake, color: '#0EA5E9' },
@@ -19986,6 +20010,1410 @@ function ResumeStrategy() {
       newCourseTitle="New Resume Strategy Course"
       comingSoonDesc="Your Resume Winning Strategy training is being prepared. Check back soon."
     />
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PORTFOLIO GENERATOR — the `portfoliogenerator` tab in Profile Optimization
+// ═══════════════════════════════════════════════════════════════════════════
+// A two-pane authoring workspace: thirteen editor sections on the left, a live
+// sandboxed preview on the right, and a single self-contained HTML file out the
+// other end. Every rule about what may end up in that file — escaping, link and
+// image validation, the section table, the document builder — lives in the pure
+// src/lib/portfolioGenerator.js and is pinned by test/portfolioGenerator.test.mjs.
+// This component owns the form, the frame, and the two things that cannot be pure:
+// reading a PDF and re-encoding a photo through a canvas.
+//
+// ★ NOTHING LEAVES THE BROWSER. No Supabase call, no callClaude, no api/ route.
+//   The résumé is read locally and its bytes are released; the photo is re-encoded
+//   locally. A student's CV and headshot are exactly the kind of thing that must
+//   not be uploaded as a side effect of previewing a layout.
+//
+// ★ THE PREVIEW FRAME IS sandbox="allow-scripts" AND NOTHING ELSE. A `srcdoc`
+//   document normally INHERITS its embedder's origin — which is why the standalone
+//   artifact this was ported from could read the app's localStorage, where the
+//   Supabase session lives. The sandbox attribute sets the sandboxed-origin flag at
+//   document creation and overrides that inheritance; `allow-same-origin` is the
+//   only thing that clears it, so it is never present. No allow-top-navigation
+//   either, so a hostile URL can never repaint the toolkit.
+//   NOTE: a srcdoc document also inherits its embedder's CSP. The app ships none
+//   today (index.html and vercel.json are clean); if one is ever added, the preview
+//   inherits it and this is the first place to look.
+
+const loadPortfolioGeneratorModules = () => Promise.all([
+  import('./data/portfolio-generator.js'),
+  import('./lib/portfolioGenerator.js'),
+  // Two keys rather than a spread: a spread would let one module silently shadow
+  // an export of the other the day their names collide.
+]).then(([data, lib]) => ({ data, lib }));
+
+const PF_DRAFT_KEY = 'portfolio:draft:v1';
+const PF_RESUME_MAX_BYTES = 10 * 1024 * 1024;
+const PF_RESUME_MAX_PAGES = 20;
+const PF_PHOTO_MAX_BYTES = 12 * 1024 * 1024;
+// ★ SVG is absent deliberately, not forgotten: it carries script, and the preview
+//   frame runs scripts. The re-encoder below only ever emits JPEG.
+const PF_PHOTO_MIMES = ['image/jpeg', 'image/png', 'image/webp'];
+const PF_PHOTO_ACCEPT = 'image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp';
+const PF_PHOTO_MAX_EDGE = 640;
+const PF_DEVICES = [
+  { id: 'desktop', label: 'Desktop' },
+  { id: 'tablet', label: 'Tablet' },
+  { id: 'mobile', label: 'Mobile' },
+];
+// The footer year. The generated document's own runtime refreshes it, so a file
+// opened in a later year is still correct; this is only the value baked at build.
+const PF_YEAR = new Date().getFullYear();
+
+// ── Editor primitives ───────────────────────────────────────────────────────
+// Declared at module scope, never inside a render: a component type created during
+// render is a new type on every keystroke, so React unmounts and remounts the
+// subtree and every input loses focus mid-word.
+
+// ★ THE HINT AND THE ERROR ARE WIRED TO THE CONTROL HERE, ONCE, FOR EVERY FIELD.
+//   They used to be plain sibling <p>s with no ids, and the control carried no
+//   aria-describedby and no aria-invalid — so a screen-reader user heard the label and
+//   nothing else. The hints are not decorative ("Loading a preset fills in the pain
+//   points below", "PDF only · up to 10 MB"), and the error was worse than missing:
+//   role="alert" announces on INSERTION, so anyone arriving at a field that was already
+//   invalid — the normal case when validation runs at download — was told nothing at all.
+//   Doing it by hand at ~30 call sites is how it stays half-done, so PfField clones the
+//   control instead. cloneElement is not a new component type, so the no-types-in-render
+//   rule is untouched.
+function PfField({ id, label, hint, children, error }) {
+  const hintId = hint ? `${id}-hint` : null;
+  const errId = error ? `${id}-err` : null;
+  // Error first: a screen reader should say what is wrong before repeating the guidance.
+  const describedBy = [errId, hintId].filter(Boolean).join(' ') || undefined;
+  const control = React.isValidElement(children)
+    ? React.cloneElement(children, {
+      'aria-describedby': children.props['aria-describedby'] || describedBy,
+      'aria-invalid': error ? true : children.props['aria-invalid'],
+    })
+    : children;
+  return (
+    <div className="mt-3">
+      <label htmlFor={id} className="block mb-1.5 text-[11px] font-semibold" style={{ color: C.textSoft }}>
+        {label}
+      </label>
+      {control}
+      {hint && <p id={hintId} className="mt-1 text-[11px]" style={{ color: C.textMute }}>{hint}</p>}
+      {error && (
+        <p id={errId} role="alert" className="mt-1 text-[11px] font-medium"
+          style={{ color: 'var(--status-danger-fg)' }}>
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function PfInput({ id, value, onChange, ...rest }) {
+  return (
+    <input id={id} className="gh-input w-full" value={value}
+      onChange={(e) => onChange(e.target.value)} {...rest} />
+  );
+}
+
+function PfTextarea({ id, value, onChange, rows = 3, ...rest }) {
+  return (
+    <textarea id={id} className="gh-input w-full" rows={rows} value={value}
+      onChange={(e) => onChange(e.target.value)} style={{ resize: 'vertical' }} {...rest} />
+  );
+}
+
+// An accordion section. The header is a real button with aria-expanded and
+// aria-controls — the artifact used a <div onclick>, which no keyboard or screen
+// reader could operate at all.
+function PfSection({ num, title, panelId, open, onToggle, children }) {
+  return (
+    <div className="glass-card mt-3" style={{ padding: 0 }}>
+      {/* ★ h2, NOT h3. SectionHead renders the page's only h1, so an h3 here skips a
+          level — Lighthouse flagged `heading-order` on exactly this. These thirteen
+          accordions ARE the page's top-level sections, so h2 is also the honest level. */}
+      <h2 style={{ margin: 0 }}>
+        <button type="button" className="pf-acc-head" aria-expanded={open}
+          aria-controls={panelId} onClick={onToggle}>
+          <span className="pf-acc-num" aria-hidden="true">{num}</span>
+          <span className="text-sm font-semibold">{title}</span>
+          <ChevronRight size={16} className="pf-acc-chev" aria-hidden="true" />
+        </button>
+      </h2>
+      <div id={panelId} hidden={!open} className="px-3.5 pb-4">{children}</div>
+    </div>
+  );
+}
+
+// A repeater row. `removeLabel` is the whole point of this component existing: the
+// artifact's remove control was a bare multiplication sign, which a screen reader
+// announces as "times" with no indication of what it removes.
+function PfRow({ removeLabel, onRemove, children }) {
+  return (
+    <div className="pf-row">
+      <button type="button" className="pf-row-remove" onClick={onRemove} aria-label={removeLabel}>
+        <Trash2 size={13} aria-hidden="true" />
+      </button>
+      <div className="pr-8">{children}</div>
+    </div>
+  );
+}
+
+function PfAdd({ onClick, children }) {
+  return (
+    <button type="button" onClick={onClick}
+      className="gh-btn-ghost mt-3 px-3 py-1.5 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5">
+      <Plus size={13} aria-hidden="true" /> {children}
+    </button>
+  );
+}
+
+function BookkeeperPortfolioGenerator() {
+  const { mod, err } = useLazyData(loadPortfolioGeneratorModules);
+  if (!mod) return <DataLoadingCard err={err} />;
+  return <PortfolioGeneratorInner data={mod.data} lib={mod.lib} />;
+}
+
+function PortfolioGeneratorInner({ data, lib }) {
+  const { PORTFOLIO_THEMES, PORTFOLIO_THEME_ORDER, PORTFOLIO_INDUSTRIES, SAMPLE_DRAFT } = data;
+  const { user, profile } = useAuth();
+  const uid = useId();
+
+  const [draft, setDraft] = useState(() => lib.emptyDraft());
+  const [previewDraft, setPreviewDraft] = useState(() => lib.emptyDraft());
+  // Bumped with previewDraft; used as the preview iframe's key. See pushPreview below.
+  const [previewSeq, setPreviewSeq] = useState(0);
+  // ★ THE ONLY WAY TO CHANGE THE PREVIEW, because the two writes must never come apart.
+  //   The sequence number is the iframe's `key`. Measured in Chrome: assigning `srcdoc` to
+  //   an EXISTING iframe adds one entry to the joint session history PER ASSIGNMENT (5
+  //   rebuilds → +5), so after typing a sentence the browser Back button walked backwards
+  //   through stale previews and never left the tool — the URL did not even change.
+  //   Creating a FRESH iframe adds none (39 rebuilds → +0 verified), because the first
+  //   navigation of a new browsing context is a replace. Bumping the key is what makes
+  //   React create one instead of mutating the attribute.
+  //   ★ This is a FUNCTION because setPreviewDraft was called at five sites and the bump
+  //   at only ONE of them — the typing path. Load Sample, Clear, the mount restore and the
+  //   résumé import each mutated the live iframe and left a stray history entry, so Back
+  //   stopped behaving predictably after any of them. One entry each rather than one per
+  //   keystroke, which is why it survived the original measurement.
+  //   Remounting is safe here and would NOT be in the course player: there is no playback
+  //   position to lose, and the scroll offset is restored from `data-pf-scroll` in the
+  //   markup — which is exactly what that mechanism is for.
+  const pushPreview = useCallback((next) => {
+    setPreviewDraft(next);
+    setPreviewSeq((n) => n + 1);
+  }, []);
+  const [loaded, setLoaded] = useState(false);
+  const [open, setOpen] = useState({ 1: true, 2: true });
+  const [device, setDevice] = useState('desktop');
+  const [pane, setPane] = useState('edit');
+  const [twoPane, setTwoPane] = useState(false);
+  const [headOffset, setHeadOffset] = useState(lib.PF_HEAD_FALLBACK);
+  const [scale, setScale] = useState(1);
+  const [saveState, setSaveState] = useState('idle');
+  const [resume, setResume] = useState({ status: 'idle', message: '' });
+  const [photoErr, setPhotoErr] = useState('');
+  const [notice, setNotice] = useState('');
+  const [err2, setErr2] = useState('');
+  const [dialog, setDialog] = useState(null);
+  const [touched, setTouched] = useState({});
+  const [industryPick, setIndustryPick] = useState('');
+
+  const toolRef = useRef(null);
+  const paneRef = useRef(null);
+  const frameRef = useRef(null);
+  const scrollRef = useRef(0);
+  const resumeInputRef = useRef(null);
+  const photoInputRef = useRef(null);
+  const pendingResumeRef = useRef(null);
+  // A JSON snapshot of the draft as first established — the restored draft, or the empty
+  // one plus the prefilled name. The autosave compares against it, so merely opening the
+  // tab never writes a storage row. Re-stamped by Clear.
+  const seedRef = useRef(null);
+
+  const patch = useCallback((fields) => setDraft((d) => ({ ...d, ...fields })), []);
+  const setList = useCallback((key, next) => setDraft((d) => ({ ...d, [key]: next })), []);
+  const setItem = useCallback((key, i, fields) => setDraft((d) => ({
+    ...d,
+    [key]: d[key].map((row, j) => (j === i
+      ? (typeof row === 'object' && row !== null ? { ...row, ...fields } : fields)
+      : row)),
+  })), []);
+  const addItem = useCallback((key, blank) => setDraft((d) => ({ ...d, [key]: [...d[key], blank] })), []);
+  const removeItem = useCallback((key, i) => setDraft((d) => ({
+    ...d, [key]: d[key].filter((_, j) => j !== i),
+  })), []);
+  const toggle = (n) => setOpen((o) => ({ ...o, [n]: !o[n] }));
+  const fid = (name) => `${uid}-${name}`;
+
+  // ── Restore, or seed from the profile ─────────────────────────────────────
+  // ★ THE EDITOR STARTS EMPTY. The artifact loaded its sample on mount, so every
+  //   new user's first view was somebody else's name over invented testimonials.
+  //   Only `full_name` is seeded; the email is offered as a one-click action
+  //   instead, because it ends up printed on a page the student publishes and that
+  //   should be a decision rather than a default nobody noticed.
+  useEffect(() => {
+    let on = true;
+    (async () => {
+      if (typeof window === 'undefined' || !window.storage) {
+        // No storage shim: still establish a seed, or the autosave gate below would
+        // never open and the Saved indicator would stay blank forever with no reason given.
+        if (on) { seedRef.current = JSON.stringify(lib.emptyDraft()); setLoaded(true); }
+        return;
+      }
+      const row = await window.storage.get(PF_DRAFT_KEY).catch(() => null);
+      if (!on) return;
+      const parsed = lib.parseStoredDraft(row && row.value);
+      if (parsed.recovered) {
+        seedRef.current = JSON.stringify(parsed.draft);
+        setDraft(parsed.draft);
+        pushPreview(parsed.draft);
+        if (parsed.dropped.length) {
+          setNotice(`Your saved draft came back, but the ${parsed.dropped.join(' and ')} could not be restored. Add it again below.`);
+        }
+      } else {
+        const seeded = lib.normalizeDraft({ ...lib.emptyDraft(), fullName: (profile && profile.full_name) || '' });
+        seedRef.current = JSON.stringify(seeded);
+        setDraft(seeded);
+        pushPreview(seeded);
+      }
+      setLoaded(true);
+    })();
+    return () => { on = false; };
+    // Mount-only: a later profile change must not overwrite what the student typed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Debounced preview ────────────────────────────────────────────────────
+  useEffect(() => {
+    const t = setTimeout(() => pushPreview(draft), 300);
+    return () => clearTimeout(t);
+  }, [draft, pushPreview]);
+
+  // ── Debounced autosave ───────────────────────────────────────────────────
+  // ★ window.storage.set RESOLVES `false` on a quota error — it never rejects
+  //   (src/main.jsx). A `.catch()` alone would therefore report a silent success,
+  //   and the student would lose their work on reload having been told it saved.
+  //   The photo is by far the largest field, so it is dropped and the write
+  //   retried before anything is called a failure.
+  useEffect(() => {
+    if (!loaded) return undefined;
+    // ★ NOTHING IS WRITTEN UNTIL THE DRAFT DIFFERS FROM WHAT WE PUT THERE, and the
+    //   comparison is against the SEED rather than against "is anything filled in".
+    //   Two earlier gates were both wrong, and both were caught in the browser:
+    //     · `draftCompletion(d).pct === 0` never fired at all — an untouched draft
+    //       scores 8%, because showSamples defaults on and that section counts as done.
+    //     · `draftHasContent(d)` fired on a bare VISIT, because the prefilled
+    //       `profile.full_name` is content by any reasonable definition. Merely opening
+    //       the tab then left a storage row in every user's browser.
+    //   The seed is the empty draft plus that prefilled name, or the restored draft when
+    //   there was one — so a restore does not immediately rewrite itself either.
+    if (seedRef.current === null || JSON.stringify(draft) === seedRef.current) return undefined;
+    setSaveState('saving');
+    const t = setTimeout(async () => {
+      if (typeof window === 'undefined' || !window.storage) { setSaveState('idle'); return; }
+      const write = (payload) => window.storage
+        .set(PF_DRAFT_KEY, JSON.stringify(payload))
+        .then((r) => r !== false)
+        .catch(() => false);
+      // ★ RE-STAMP THE SEED WITH WHAT WAS ACTUALLY STORED. Without this the seed stays
+      //   the MOUNT-time value forever, so the gate above means "differs from what was on
+      //   screen at mount" rather than "differs from storage" — and any edit that returns
+      //   the draft to that value is gated out while the last DIRTY value stays on disk.
+      //   Reproduced: restore a draft, add a service, remove it again; storage kept the
+      //   two-service version, the editor showed one, and the indicator said "Saved".
+      //   A student who deletes a testimonial and reloads gets it back, having been told
+      //   it saved. It also fixes the hand-emptied draft, where every field is cleared
+      //   individually rather than with Clear.
+      if (await write({ v: 1, draft })) {
+        seedRef.current = JSON.stringify(draft);
+        setSaveState('saved');
+        return;
+      }
+      if (draft.photo) {
+        // Stamp the TRIMMED draft, because that is what storage now holds. The effect
+        // does not re-run on a ref write, so this cannot loop; the next real edit
+        // changes `draft` and writes normally.
+        const trimmed = { ...draft, photo: '' };
+        if (await write({ v: 1, draft: trimmed })) {
+          seedRef.current = JSON.stringify(trimmed);
+          setSaveState('saved-no-photo');
+          return;
+        }
+      }
+      setSaveState('failed');
+    }, 600);
+    return () => clearTimeout(t);
+  }, [draft, loaded, lib]);
+
+  // ── Measure the sticky offset and the preview scale ──────────────────────
+  // ★ A ResizeObserver, not a window `resize` listener. Collapsing the toolkit
+  //   sidebar changes <main>'s width by 212px and fires NO resize event — the same
+  //   reason the layout itself is a container query.
+  useEffect(() => {
+    const ownPanel = () => {
+      let node = toolRef.current;
+      while (node && node.parentElement && node.parentElement.tagName !== 'MAIN') node = node.parentElement;
+      return node;
+    };
+    const measure = () => {
+      const panel = ownPanel();
+      // ★ Scoped to OUR OWN TabPanel: every visited tab stays mounted in <main>, so
+      //   a document-wide query could measure a hidden tab's header instead. And a
+      //   hidden tab measures 0x0 — writing that would clobber a good offset with
+      //   the fallback and never re-measure, because the deps cannot see a tab
+      //   switch. Zero means "unmeasurable", never "no header".
+      if (!panel || panel.hidden) return;
+      const tool = toolRef.current;
+      if (tool && tool.clientWidth) setTwoPane(tool.clientWidth >= lib.PF_TWO_PANE_MIN);
+      const head = panel.querySelector('.gh-section-head');
+      const h = head ? Math.round(head.getBoundingClientRect().height) : 0;
+      if (h > 0) setHeadOffset(h + 12);
+      const box = paneRef.current;
+      if (box && box.clientWidth) {
+        const logical = lib.PF_LOGICAL_WIDTHS[device] || lib.PF_LOGICAL_WIDTHS.desktop;
+        setScale(Math.min(1, Math.max(0.2, box.clientWidth / logical)));
+      }
+    };
+    measure();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(measure);
+    if (toolRef.current) ro.observe(toolRef.current);
+    if (paneRef.current) ro.observe(paneRef.current);
+    const head = ownPanel() && ownPanel().querySelector('.gh-section-head');
+    if (head) ro.observe(head);
+    return () => ro.disconnect();
+  }, [device, loaded, pane, lib]);
+
+  // ── The frame reports its scroll position back ────────────────────────────
+  useEffect(() => {
+    const onMessage = (e) => {
+      // ★ event.source, NEVER event.origin. A sandboxed frame's origin serialises
+      //   to the STRING "null", which every other opaque-origin context on the
+      //   page shares — so an origin check here authenticates nothing at all.
+      if (!frameRef.current || e.source !== frameRef.current.contentWindow) return;
+      const payload = e.data;
+      if (!payload || payload.t !== 'pf-scroll') return;
+      const y = Number(payload.y);
+      if (Number.isFinite(y)) scrollRef.current = Math.max(0, Math.min(200000, Math.round(y)));
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
+
+  const theme = useMemo(
+    () => lib.resolveTheme(previewDraft.theme, PORTFOLIO_THEMES),
+    [previewDraft.theme, PORTFOLIO_THEMES, lib],
+  );
+  const previewHtml = useMemo(
+    () => lib.buildPortfolioHtml(previewDraft, {
+      theme, mode: 'preview', year: PF_YEAR, scrollY: scrollRef.current,
+    }),
+    [previewDraft, theme, lib],
+  );
+  const completion = useMemo(() => lib.draftCompletion(draft), [draft, lib]);
+  const validation = useMemo(() => lib.validateDraft(draft), [draft, lib]);
+  const fieldErr = (name) => (touched[name] && validation.fields[name] ? validation.fields[name].message : '');
+  const blur = (name) => setTouched((t) => ({ ...t, [name]: true }));
+
+  // ── Résumé import ────────────────────────────────────────────────────────
+  async function extractResumeLines(file) {
+    // Both modules are dynamic, so neither pdf.js nor its worker is fetched until
+    // somebody actually picks a file.
+    const [pdfjs, workerMod] = await Promise.all([
+      import('pdfjs-dist/legacy/build/pdf.mjs'),
+      import('pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'),
+    ]);
+    pdfjs.GlobalWorkerOptions.workerSrc = workerMod.default;
+    let buffer = await file.arrayBuffer();
+    let pdf = null;
+    try {
+      pdf = await pdfjs.getDocument({
+        data: buffer,
+        // No eval, and no cMap/standard-font fetches: text extraction for Latin
+        // scripts needs neither, and both would be network requests.
+        isEvalSupported: false,
+        useWorkerFetch: false,
+      }).promise;
+      const lines = [];
+      const pages = Math.min(pdf.numPages, PF_RESUME_MAX_PAGES);
+      for (let p = 1; p <= pages; p += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        const page = await pdf.getPage(p);
+        // eslint-disable-next-line no-await-in-loop
+        const content = await page.getTextContent();
+        const rows = new Map();
+        for (const item of content.items) {
+          if (!item || !item.str || !item.transform) continue;
+          // Bucket to ~2pt: a sub-pixel baseline would otherwise split one visual
+          // line into two or three, and no heading would ever match.
+          const key = Math.round(item.transform[5] / 2) * 2;
+          if (!rows.has(key)) rows.set(key, []);
+          rows.get(key).push(item);
+        }
+        const keys = [...rows.keys()].sort((a, b) => b - a);
+        for (const key of keys) {
+          // ★ Sort by x. pdf.js item order is USUALLY reading order and is not
+          //   guaranteed to be for tagged or multi-column documents.
+          const text = rows.get(key)
+            .sort((a, b) => a.transform[4] - b.transform[4])
+            .map((i) => i.str).join(' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (text) lines.push(text);
+        }
+        page.cleanup();
+      }
+      return { lines, truncated: pdf.numPages > pages, pages: pdf.numPages };
+    } finally {
+      // Release both the parsed document and the raw bytes. A 10 MB ArrayBuffer
+      // held by a closure is 10 MB pinned for the life of the tab.
+      if (pdf) { try { await pdf.destroy(); } catch { /* already gone */ } }
+      buffer = null;
+    }
+  }
+
+  async function applyResume(file, mode) {
+    setResume({ status: 'reading', message: `Reading ${file.name}…` });
+    try {
+      const { lines, truncated } = await extractResumeLines(file);
+      const report = lib.parseResumeLines(lines);
+      if (report.confidence === 'none') {
+        setResume({
+          status: 'warn',
+          message: 'We could not read any text from that PDF. It is most likely a scan or an '
+            + 'image export, which needs OCR to read. Fill the sections in below instead — '
+            + 'everything works the same way.',
+        });
+        return;
+      }
+      setDraft((d) => {
+        // ★ MERGE NEVER OVERWRITES. A field the student has already typed into wins
+        //   over anything the parser found, because the parser is a heuristic and
+        //   the student is not.
+        const base = mode === 'replace' ? lib.emptyDraft() : d;
+        const next = { ...base };
+        for (const [key, value] of Object.entries(report.patch)) {
+          const existing = base[key];
+          const empty = Array.isArray(existing) ? existing.length === 0 : !existing;
+          if (mode === 'replace' || empty) next[key] = value;
+        }
+        return lib.normalizeDraft(next);
+      });
+      const skipped = report.skipped.length
+        ? ` We left ${report.skipped.map((s) => s.field).join(', ')} for you to check.`
+        : '';
+      setResume({
+        status: 'ok',
+        message: `Filled in ${report.applied.join(', ')} from your résumé.${skipped}`
+          + (truncated ? ` Only the first ${PF_RESUME_MAX_PAGES} pages were read.` : '')
+          + ' Review every section before you download.',
+      });
+      setOpen((o) => ({ ...o, 2: true, 5: true }));
+    } catch (e) {
+      console.error('[portfolio] résumé read failed', e && e.name);
+      const name = e && e.name;
+      setResume({
+        status: 'error',
+        message: name === 'PasswordException'
+          ? 'That PDF is password-protected. Save an unlocked copy and try again, or fill the sections in below.'
+          : name === 'InvalidPDFException'
+            ? 'That file is not a readable PDF — it may be damaged or renamed. Try exporting it again.'
+            : 'We could not read that PDF. You can still fill in every section below by hand.',
+      });
+    }
+  }
+
+  function pickResume(file) {
+    setResume({ status: 'idle', message: '' });
+    if (!file) return;
+    const looksPdf = /\.pdf$/i.test(file.name) && (!file.type || file.type === 'application/pdf');
+    if (!looksPdf) {
+      setResume({ status: 'error', message: 'Please choose a PDF. A Word file or an image cannot be read here.' });
+      return;
+    }
+    if (!file.size) {
+      setResume({ status: 'error', message: 'That file is empty.' });
+      return;
+    }
+    if (file.size > PF_RESUME_MAX_BYTES) {
+      setResume({
+        status: 'error',
+        message: `That file is ${(file.size / 1024 / 1024).toFixed(1)} MB — the limit is 10 MB. `
+          + 'Export a text-based PDF rather than a scan and it will be far smaller.',
+      });
+      return;
+    }
+    // ★ If the draft already holds work, ask before touching it. The artifact
+    //   overwrote silently, so one curious click could erase an afternoon.
+    if (lib.draftHasContent(draft)) {
+      pendingResumeRef.current = file;
+      setDialog({ kind: 'resume', name: file.name });
+      return;
+    }
+    applyResume(file, 'replace');
+  }
+
+  // ── Photo ────────────────────────────────────────────────────────────────
+  // ★ RE-ENCODED THROUGH A CANVAS, NOT STORED AS PICKED. That strips the EXIF
+  //   block (which carries GPS coordinates on almost every phone photo — a home
+  //   address, on a page the student publishes), caps a 6 MB portrait at a few
+  //   tens of kilobytes so it fits the storage quota, and guarantees the output is
+  //   a JPEG regardless of what went in.
+  async function pickPhoto(file) {
+    setPhotoErr('');
+    if (!file) return;
+    if (!PF_PHOTO_MIMES.includes(file.type)) {
+      setPhotoErr('Choose a JPG, PNG or WEBP image. Other formats, including SVG, are not accepted.');
+      return;
+    }
+    if (file.size > PF_PHOTO_MAX_BYTES) {
+      setPhotoErr(`That image is ${(file.size / 1024 / 1024).toFixed(1)} MB — please keep it under 12 MB.`);
+      return;
+    }
+    const url = URL.createObjectURL(file);
+    try {
+      const img = await new Promise((resolve, reject) => {
+        const el = new Image();
+        el.onload = () => resolve(el);
+        el.onerror = () => reject(new Error('decode'));
+        el.src = url;
+      });
+      const longest = Math.max(img.naturalWidth, img.naturalHeight);
+      if (!longest) throw new Error('decode');
+      const k = Math.min(1, PF_PHOTO_MAX_EDGE / longest);
+      const w = Math.max(1, Math.round(img.naturalWidth * k));
+      const h = Math.max(1, Math.round(img.naturalHeight * k));
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('canvas');
+      // ★ FILL WHITE BEFORE DRAWING. The output is forced to JPEG (that is what strips the
+      //   EXIF block), and JPEG has no alpha channel — so every transparent pixel of a
+      //   cut-out PNG or WebP headshot composites against the canvas's default, which is
+      //   transparent black. A studio portrait saved with its background removed came out
+      //   as a black silhouette. Both formats are accepted, so this is a likely file, not
+      //   an exotic one; white reads as a backdrop rather than as a fault.
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
+      const out = canvas.toDataURL('image/jpeg', 0.82);
+      // The pure gatekeeper runs on our own output too — if the re-encode ever
+      // produced something the renderer would refuse, this is where it stops.
+      if (!lib.isSafePhotoDataUrl(out)) {
+        setPhotoErr('That image could not be prepared for the portfolio. Try a different file.');
+        return;
+      }
+      patch({ photo: out });
+    } catch {
+      setPhotoErr('That image could not be read. Try re-saving it as a JPG or PNG.');
+    } finally {
+      // ★ Always. A blob URL left open pins the whole file in memory.
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  // ── Industry preset ──────────────────────────────────────────────────────
+  function applyIndustry(force) {
+    const ind = PORTFOLIO_INDUSTRIES.find((i) => i.key === industryPick);
+    if (!ind) {
+      setErr2('Choose an industry from the list first.');
+      return;
+    }
+    if (!force && (draft.painPoints.length || draft.transformations.length)) {
+      setDialog({ kind: 'industry', label: ind.label });
+      return;
+    }
+    setErr2('');
+    setDraft((d) => lib.normalizeDraft({
+      ...d,
+      industry: ind.label,
+      painPoints: ind.pains.slice(),
+      transformations: ind.transforms.map((t) => ({ before: t.before, after: t.after })),
+      industries: d.industries.includes(ind.label) ? d.industries : [ind.label, ...d.industries],
+    }));
+    setDialog(null);
+    setOpen((o) => ({ ...o, 3: true, 4: true }));
+  }
+
+  // ── Download ─────────────────────────────────────────────────────────────
+  const staleSampleFields = useMemo(
+    () => lib.sampleFieldsStillPresent(draft, SAMPLE_DRAFT),
+    [draft, SAMPLE_DRAFT, lib],
+  );
+
+  function runDownload() {
+    const html = lib.buildPortfolioHtml(draft, {
+      theme: lib.resolveTheme(draft.theme, PORTFOLIO_THEMES),
+      mode: 'download',
+      year: PF_YEAR,
+    });
+    const ok = downloadFile(html, lib.portfolioFileName(draft, todayISODate()), 'text/html');
+    setDialog(null);
+    if (ok) setNotice('Downloaded. Open the file in any browser — it works offline, with no other files needed.');
+  }
+
+  function requestDownload() {
+    if (!validation.ok || staleSampleFields.length) {
+      setTouched((t) => ({ ...t, ...Object.fromEntries(validation.blocking.map((k) => [k, true])) }));
+      setDialog({ kind: 'download' });
+      return;
+    }
+    runDownload();
+  }
+
+  const themeList = PORTFOLIO_THEME_ORDER.map((k) => PORTFOLIO_THEMES[k]).filter(Boolean);
+  const showEditor = twoPane || pane === 'edit';
+  const showPreview = twoPane || pane === 'preview';
+  const saveLabel = saveState === 'saving' ? 'Saving…'
+    : saveState === 'saved' ? 'Saved in this browser'
+      : saveState === 'saved-no-photo' ? 'Saved — photo too large to store'
+        : saveState === 'failed' ? 'Could not save your draft' : '';
+
+  return (
+    <div className="pf-tool" ref={toolRef} style={{ '--pf-head': `${headOffset}px` }}>
+      {/* The title matches the sidebar item, the Dashboard tile and VOICE_TAB_INFO. */}
+      <SectionHead
+        eyebrow="Job Application · Tool"
+        title="Bookkeeper Portfolio Generator"
+        desc="Build a client-ready portfolio website and download it as one self-contained file. Pick a design and an industry, fill in the thirteen sections, and everything stays in your browser until you download it."
+      />
+
+      {/* ★ SAY THAT THE DRAFT DOES NOT FOLLOW THEM. Every other tool in this toolkit
+          keeps its data in Supabase and follows the student to any device, which makes
+          "it saved, so it is safe" a reasonable and WRONG assumption to leave them
+          holding here. The draft is `window.storage` — this browser, this profile, and
+          gone if they clear site data. One line is cheaper than one lost afternoon. */}
+      <p className="mb-3 flex items-start gap-2 text-[11.5px] leading-relaxed"
+        style={{ color: C.textMute }}>
+        <Info size={13} className="mt-0.5 flex-shrink-0" aria-hidden="true" />
+        <span>
+          Your draft saves automatically <strong style={{ color: C.textSoft }}>in this browser
+          only</strong> — it will not appear on another device or after clearing site data.
+          Download the portfolio to keep a copy you own.
+        </span>
+      </p>
+
+      {/* ── Action bar. Wraps rather than overflowing: the standalone version put
+          these beside a brand block in a fixed-height header and clipped its own
+          Download button below 700px. ─────────────────────────────────────── */}
+      <div className="flex flex-wrap items-center gap-2 mb-4">
+        <div className="flex items-center gap-2 mr-auto">
+          <div className="text-[11px] font-semibold" style={{ color: C.textSoft }}>
+            {completion.pct}% complete
+          </div>
+          <div aria-hidden="true" style={{
+            width: 90, height: 6, borderRadius: 4, background: 'var(--wash-strong)', overflow: 'hidden',
+          }}>
+            <div style={{
+              width: `${completion.pct}%`, height: '100%', background: C.primary, transition: 'width 300ms',
+            }} />
+          </div>
+          <span className="sr-only" role="status">{saveLabel}</span>
+          {saveLabel && (
+            <span className="text-[11px]" style={{
+              color: saveState === 'failed' ? 'var(--status-danger-fg)' : C.textMute,
+            }}>{saveLabel}</span>
+          )}
+        </div>
+        <button type="button" onClick={() => setDialog({ kind: 'sample' })}
+          className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5">
+          <Sparkles size={13} aria-hidden="true" /> Load example
+        </button>
+        <button type="button" onClick={() => setDialog({ kind: 'clear' })}
+          className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5">
+          <RotateCcw size={13} aria-hidden="true" /> Clear
+        </button>
+        <button type="button" onClick={requestDownload}
+          className="sheen-btn px-4 py-2 text-xs font-bold inline-flex items-center gap-1.5">
+          <Download size={14} aria-hidden="true" /> Download portfolio
+        </button>
+      </div>
+
+      {/* Edit | Preview, below the two-pane threshold only. Both panes stay
+          mounted and are hidden with the `hidden` CLASS — the `hidden` ATTRIBUTE
+          loses to a display utility, because Tailwind's [hidden] rule sits in the
+          base layer and .grid/.flex come later at equal specificity. Keeping the
+          frame mounted is also what stops the preview reloading on every switch. */}
+      {!twoPane && (
+        <div className="flex gap-1.5 mb-3" role="group" aria-label="Choose editor or preview">
+          <button type="button" onClick={() => setPane('edit')} aria-pressed={pane === 'edit'}
+            className={`gh-pill px-3.5 py-1.5 text-xs font-semibold${pane === 'edit' ? ' is-active' : ''}`}>
+            <Edit3 size={12} aria-hidden="true" /> Edit
+          </button>
+          <button type="button" onClick={() => setPane('preview')} aria-pressed={pane === 'preview'}
+            className={`gh-pill px-3.5 py-1.5 text-xs font-semibold${pane === 'preview' ? ' is-active' : ''}`}>
+            <Eye size={12} aria-hidden="true" /> Preview
+          </button>
+        </div>
+      )}
+
+      <div role="status">
+        {notice && (
+          <div className="mb-3 flex items-start gap-3 p-3.5 rounded-xl" style={{
+            background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)',
+          }}>
+            <Info size={16} className="mt-0.5 flex-shrink-0" style={{ color: 'var(--status-info-fg)' }} />
+            <div className="text-xs flex-1" style={{ color: 'var(--status-info-fg)' }}>{notice}</div>
+            <button type="button" onClick={() => setNotice('')} aria-label="Dismiss message"
+              style={{ color: 'var(--status-info-fg)' }}><X size={14} /></button>
+          </div>
+        )}
+      </div>
+      <div role="alert"><ErrorNote msg={err2} onClose={() => setErr2('')} className="mb-3" /></div>
+
+      <div className="pf-grid">
+        {/* ── EDITOR ──────────────────────────────────────────────────────── */}
+        <div className={showEditor ? 'block' : 'hidden'}>
+          {/* Résumé import */}
+          <div className="glass-card p-4">
+            <div className="text-sm font-semibold mb-1" style={{ color: C.text }}>
+              Start from your résumé (optional)
+            </div>
+            <p className="text-[11px] mb-2.5" style={{ color: C.textMute }}>
+              We read the PDF here in your browser and fill in what we can find. It is never
+              uploaded anywhere and it is not saved.
+            </p>
+            {/* ★ The accessible name must CONTAIN the visible text, or axe reports
+                `label-content-name-mismatch` — a real problem for voice control, where
+                the user says what they can see. Both lines are referenced, so the name
+                is "Upload your résumé (PDF) PDF only · up to 10 MB". */}
+            <div role="button" tabIndex={0}
+              aria-labelledby={`${fid('resume-label')} ${fid('resume-hint')}`}
+              onClick={() => resumeInputRef.current && resumeInputRef.current.click()}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  if (resumeInputRef.current) resumeInputRef.current.click();
+                }
+              }}
+              onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
+              onDrop={(e) => {
+                e.preventDefault(); e.stopPropagation();
+                pickResume(e.dataTransfer.files && e.dataTransfer.files[0]);
+              }}
+              className="rounded-2xl p-4 text-center cursor-pointer transition"
+              style={{
+                border: `2px dashed ${resume.status === 'ok' ? 'var(--green-ring)' : 'rgba(10,132,255,0.30)'}`,
+                background: resume.status === 'ok' ? 'var(--green-ring-faint)' : 'rgba(10,132,255,0.03)',
+              }}>
+              {/* ★ `hidden`, NOT `sr-only`, and that is the opposite of the lesson-video
+                  uploader's rule for a good reason: THERE the input was the only control,
+                  so dropping it from the tab order removed the feature. Here the wrapper
+                  above is a real role="button" with tabIndex=0, so an sr-only input is a
+                  SECOND, unlabelled tab stop for the same action — which is what
+                  Lighthouse reported as a missing form label. Matches IntakeFileDrop. */}
+              <input ref={resumeInputRef} type="file" className="hidden" tabIndex={-1}
+                aria-hidden="true"
+                accept="application/pdf,.pdf"
+                onChange={(e) => {
+                  const f = e.target.files && e.target.files[0];
+                  // Reset BEFORE handling, so the same file can be retried even if
+                  // the handler throws.
+                  e.target.value = '';
+                  pickResume(f);
+                }} />
+              <Upload size={18} className="mx-auto" style={{ color: C.primary }} aria-hidden="true" />
+              <div id={fid('resume-label')} className="mt-1.5 text-[13px] font-semibold" style={{ color: C.text }}>
+                Upload your résumé (PDF)
+              </div>
+              <div id={fid('resume-hint')} className="text-[11px]" style={{ color: C.textMute }}>PDF only · up to 10 MB</div>
+            </div>
+            <div role="status" aria-live="polite">
+              {resume.message && (
+                <div className="mt-2.5 flex items-start gap-2 p-3 rounded-xl text-[11.5px]" style={{
+                  background: resume.status === 'error' ? 'var(--status-danger-bg)'
+                    : resume.status === 'warn' ? 'var(--status-warn-bg)'
+                      : resume.status === 'ok' ? 'var(--status-ok-bg)' : 'var(--wash)',
+                  border: `1px solid ${resume.status === 'error' ? 'var(--status-danger-bd)'
+                    : resume.status === 'warn' ? 'var(--status-warn-bd)'
+                      : resume.status === 'ok' ? 'var(--status-ok-bd)' : GLASS.borderSoft}`,
+                  color: resume.status === 'error' ? 'var(--status-danger-fg)'
+                    : resume.status === 'warn' ? 'var(--status-warn-fg)'
+                      : resume.status === 'ok' ? 'var(--status-ok-fg)' : C.textSoft,
+                }}>
+                  {resume.status === 'reading'
+                    ? <Loader2 size={14} className="animate-spin mt-0.5 flex-shrink-0" aria-hidden="true" />
+                    : <Info size={14} className="mt-0.5 flex-shrink-0" aria-hidden="true" />}
+                  <span className="flex-1">{resume.message}</span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* 1 — Design & industry */}
+          <PfSection num={1} title="Design & industry" panelId={fid('s1')} open={!!open[1]} onToggle={() => toggle(1)}>
+            <div className="gh-label mt-2" style={{ fontSize: 11 }}>Design theme</div>
+            <div className="grid grid-cols-3 gap-2 mt-1.5" role="group" aria-label="Choose a design theme">
+              {themeList.map((t) => (
+                <button key={t.key} type="button" className="pf-swatch"
+                  aria-pressed={draft.theme === t.key}
+                  onClick={() => patch({ theme: t.key })}>
+                  <span className="pf-swatch-band block" aria-hidden="true"
+                    style={{ background: `linear-gradient(135deg, ${t.d1}, ${t.accent})` }} />
+                  <span className="pf-swatch-name block">{t.name}</span>
+                </button>
+              ))}
+            </div>
+            <PfField id={fid('industry')} label="Industry you serve"
+              hint="Loading a preset fills in the pain points and before/after rows below. You can edit every line afterwards.">
+              <select id={fid('industry')} className="gh-input w-full" value={industryPick}
+                onChange={(e) => setIndustryPick(e.target.value)}>
+                <option value="">— Select an industry —</option>
+                {PORTFOLIO_INDUSTRIES.map((i) => (
+                  <option key={i.key} value={i.key}>{i.label}</option>
+                ))}
+              </select>
+            </PfField>
+            <PfAdd onClick={() => applyIndustry(false)}>Load pain points &amp; transformations</PfAdd>
+          </PfSection>
+
+          {/* 2 — Profile & contact */}
+          <PfSection num={2} title="Profile & contact" panelId={fid('s2')} open={!!open[2]} onToggle={() => toggle(2)}>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <PfField id={fid('fullName')} label="Full name" error={fieldErr('fullName')}>
+                <PfInput id={fid('fullName')} value={draft.fullName} name="name" autoComplete="name"
+                  onChange={(v) => patch({ fullName: v })} onBlur={() => blur('fullName')} />
+              </PfField>
+              <PfField id={fid('credentials')} label="Credentials (CPA, CB, MBA…)">
+                <PfInput id={fid('credentials')} value={draft.credentials}
+                  onChange={(v) => patch({ credentials: v })} />
+              </PfField>
+            </div>
+            <PfField id={fid('title')} label="Professional title" error={fieldErr('title')}>
+              <PfInput id={fid('title')} value={draft.title} autoComplete="organization-title"
+                onChange={(v) => patch({ title: v })} onBlur={() => blur('title')} />
+            </PfField>
+            <PfField id={fid('location')} label="Location / availability">
+              <PfInput id={fid('location')} value={draft.location}
+                onChange={(v) => patch({ location: v })} />
+            </PfField>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <PfField id={fid('email')} label="Email" error={fieldErr('email')}>
+                <PfInput id={fid('email')} type="email" inputMode="email" autoComplete="email"
+                  value={draft.email} onChange={(v) => patch({ email: v })} onBlur={() => blur('email')} />
+                {/* ★ The account email is OFFERED, not prefilled. It ends up printed on
+                    a page the student publishes, so it should be a decision. */}
+                {user && user.email && draft.email !== user.email && (
+                  <button type="button" onClick={() => patch({ email: user.email })}
+                    className="mt-1.5 text-[11px] font-semibold underline" style={{ color: C.primary }}>
+                    Use my account email ({user.email})
+                  </button>
+                )}
+              </PfField>
+              <PfField id={fid('phone')} label="Phone" error={fieldErr('phone')}
+                hint="Digits and a country code only — an extension or a note stops it being tappable.">
+                <PfInput id={fid('phone')} type="tel" inputMode="tel" autoComplete="tel"
+                  value={draft.phone} onChange={(v) => patch({ phone: v })} onBlur={() => blur('phone')} />
+              </PfField>
+            </div>
+            <PfField id={fid('website')} label="LinkedIn or website" error={fieldErr('website')}
+              hint={(() => {
+                const site = lib.safeLinkHref(draft.website);
+                return site.kind === 'external'
+                  ? `Visitors will go to ${site.host}${site.upgraded ? ' (we added https://)' : ''}.`
+                  : 'https:// links only.';
+              })()}>
+              <PfInput id={fid('website')} type="url" inputMode="url" value={draft.website}
+                onChange={(v) => patch({ website: v })} onBlur={() => blur('website')} />
+            </PfField>
+            <div className="flex items-center gap-3 mt-3">
+              <div aria-hidden="true" style={{
+                width: 52, height: 52, borderRadius: '50%', flex: 'none',
+                background: draft.photo ? `center/cover url("${draft.photo}")` : 'var(--wash-strong)',
+                boxShadow: `0 0 0 1px ${GLASS.border}`,
+              }} />
+              <div className="flex flex-wrap items-center gap-2">
+                {/* `hidden` for the same reason as the résumé input: the visible button
+                    beside it is the control, so an sr-only input is a duplicate,
+                    unlabelled tab stop. */}
+                <input ref={photoInputRef} type="file" className="hidden" tabIndex={-1}
+                  aria-hidden="true" accept={PF_PHOTO_ACCEPT}
+                  onChange={(e) => {
+                    const f = e.target.files && e.target.files[0];
+                    e.target.value = '';
+                    pickPhoto(f);
+                  }} />
+                <button type="button" onClick={() => photoInputRef.current && photoInputRef.current.click()}
+                  className="gh-btn-ghost px-3 py-1.5 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5">
+                  <Camera size={13} aria-hidden="true" /> {draft.photo ? 'Replace photo' : 'Add a photo (optional)'}
+                </button>
+                {draft.photo && (
+                  <button type="button" onClick={() => patch({ photo: '' })}
+                    className="gh-btn-ghost px-3 py-1.5 rounded-xl text-xs font-semibold">Remove photo</button>
+                )}
+              </div>
+            </div>
+            <p className="mt-1.5 text-[11px]" style={{ color: C.textMute }}>
+              JPG, PNG or WEBP. We resize it to {PF_PHOTO_MAX_EDGE}px and strip the camera data
+              (which includes GPS location) before it goes anywhere near your portfolio.
+            </p>
+            <div role="alert">
+              {photoErr && (
+                <p className="mt-1.5 text-[11px] font-medium" style={{ color: 'var(--status-danger-fg)' }}>{photoErr}</p>
+              )}
+            </div>
+          </PfSection>
+
+          {/* 3 — Hero & pain points */}
+          <PfSection num={3} title="Hero & pain points" panelId={fid('s3')} open={!!open[3]} onToggle={() => toggle(3)}>
+            <PfField id={fid('heroHeadline')} label="Headline (the promise)" error={fieldErr('heroHeadline')}>
+              <PfTextarea id={fid('heroHeadline')} value={draft.heroHeadline} rows={2}
+                onChange={(v) => patch({ heroHeadline: v })} onBlur={() => blur('heroHeadline')} />
+            </PfField>
+            <PfField id={fid('heroSub')} label="Sub-line (who you help, and how)">
+              <PfTextarea id={fid('heroSub')} value={draft.heroSub} rows={3}
+                onChange={(v) => patch({ heroSub: v })} />
+            </PfField>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <PfField id={fid('ctaText')} label="Button text">
+                <PfInput id={fid('ctaText')} value={draft.ctaText} onChange={(v) => patch({ ctaText: v })} />
+              </PfField>
+              <PfField id={fid('ctaLink')} label="Button link (e.g. your Calendly)" error={fieldErr('ctaLink')}
+                hint="Leave empty and the button scrolls to your contact section.">
+                <PfInput id={fid('ctaLink')} type="url" inputMode="url" value={draft.ctaLink}
+                  onChange={(v) => patch({ ctaLink: v })} onBlur={() => blur('ctaLink')} />
+              </PfField>
+            </div>
+            <p className="mt-3 text-[11px]" style={{ color: C.textMute }}>
+              The problems your ideal client already feels. These appear under “Does this sound familiar?”.
+            </p>
+            {draft.painPoints.map((p, i) => (
+              <PfRow key={i} removeLabel={`Remove pain point ${i + 1}`} onRemove={() => removeItem('painPoints', i)}>
+                <PfField id={fid(`pain-${i}`)} label={`Pain point ${i + 1}`}>
+                  <PfInput id={fid(`pain-${i}`)} value={p}
+                    onChange={(v) => setList('painPoints', draft.painPoints.map((x, j) => (j === i ? v : x)))} />
+                </PfField>
+              </PfRow>
+            ))}
+            <PfAdd onClick={() => addItem('painPoints', '')}>Add pain point</PfAdd>
+          </PfSection>
+
+          {/* 4 — Transformations */}
+          <PfSection num={4} title="Transformations (before → after)" panelId={fid('s4')} open={!!open[4]} onToggle={() => toggle(4)}>
+            <p className="mt-2 text-[11px]" style={{ color: C.textMute }}>
+              The change you deliver. Each row shows the problem beside the result.
+            </p>
+            {draft.transformations.map((t, i) => (
+              <PfRow key={i} removeLabel={`Remove transformation ${i + 1}`} onRemove={() => removeItem('transformations', i)}>
+                <PfField id={fid(`tf-b-${i}`)} label={`Before ${i + 1} — the problem`}>
+                  <PfInput id={fid(`tf-b-${i}`)} value={t.before}
+                    onChange={(v) => setItem('transformations', i, { before: v })} />
+                </PfField>
+                <PfField id={fid(`tf-a-${i}`)} label={`After ${i + 1} — the result`}>
+                  <PfInput id={fid(`tf-a-${i}`)} value={t.after}
+                    onChange={(v) => setItem('transformations', i, { after: v })} />
+                </PfField>
+              </PfRow>
+            ))}
+            <PfAdd onClick={() => addItem('transformations', { before: '', after: '' })}>Add transformation</PfAdd>
+          </PfSection>
+
+          {/* 5 — About you */}
+          <PfSection num={5} title="About you" panelId={fid('s5')} open={!!open[5]} onToggle={() => toggle(5)}>
+            <PfField id={fid('summary')} label="Professional summary" error={fieldErr('summary')}>
+              <PfTextarea id={fid('summary')} value={draft.summary} rows={6}
+                onChange={(v) => patch({ summary: v })} onBlur={() => blur('summary')} />
+            </PfField>
+          </PfSection>
+
+          {/* 6 — Services */}
+          <PfSection num={6} title="Services" panelId={fid('s6')} open={!!open[6]} onToggle={() => toggle(6)}>
+            <p className="mt-2 text-[11px]" style={{ color: C.textMute }}>
+              What you do, written as the outcome the owner gets — not as a task list.
+            </p>
+            {draft.services.map((s, i) => (
+              <PfRow key={i} removeLabel={`Remove service ${i + 1}`} onRemove={() => removeItem('services', i)}>
+                <PfField id={fid(`svc-n-${i}`)} label={`Service ${i + 1} name`}>
+                  <PfInput id={fid(`svc-n-${i}`)} value={s.name}
+                    onChange={(v) => setItem('services', i, { name: v })} />
+                </PfField>
+                <PfField id={fid(`svc-d-${i}`)} label={`Service ${i + 1} description`}>
+                  <PfTextarea id={fid(`svc-d-${i}`)} value={s.desc} rows={3}
+                    onChange={(v) => setItem('services', i, { desc: v })} />
+                </PfField>
+              </PfRow>
+            ))}
+            <PfAdd onClick={() => addItem('services', { name: '', desc: '' })}>Add service</PfAdd>
+          </PfSection>
+
+          {/* 7 — Sample reports */}
+          <PfSection num={7} title="Sample works (P&amp;L · Balance Sheet · Cash Flow)" panelId={fid('s7')} open={!!open[7]} onToggle={() => toggle(7)}>
+            <label className="flex items-center gap-2 mt-3 text-[13px] font-semibold" style={{ color: C.text }}>
+              <input type="checkbox" checked={draft.showSamples}
+                onChange={(e) => patch({ showSamples: e.target.checked })} />
+              Show sample financial reports
+            </label>
+            <p className="mt-2 text-[11px]" style={{ color: C.textMute }}>
+              Three polished statements that show the quality of reporting you deliver. The figures
+              are illustrative, they tie out to each other, and the portfolio labels them as a sample
+              for a fictional company.
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <PfField id={fid('sampleCompany')} label="Sample company name">
+                <PfInput id={fid('sampleCompany')} value={draft.sampleCompany}
+                  onChange={(v) => patch({ sampleCompany: v })} />
+              </PfField>
+              <PfField id={fid('samplePeriod')} label="Reporting period">
+                <PfInput id={fid('samplePeriod')} value={draft.samplePeriod}
+                  onChange={(v) => patch({ samplePeriod: v })} />
+              </PfField>
+            </div>
+          </PfSection>
+
+          {/* 8 — Packages */}
+          <PfSection num={8} title="Packages &amp; rates" panelId={fid('s8')} open={!!open[8]} onToggle={() => toggle(8)}>
+            <p className="mt-2 text-[11px]" style={{ color: C.textMute }}>
+              Optional. Leave this empty and the pricing section is left out entirely.
+            </p>
+            {draft.packages.map((p, i) => (
+              <PfRow key={i} removeLabel={`Remove package ${i + 1}`} onRemove={() => removeItem('packages', i)}>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <PfField id={fid(`pkg-n-${i}`)} label={`Package ${i + 1} name`}>
+                    <PfInput id={fid(`pkg-n-${i}`)} value={p.name}
+                      onChange={(v) => setItem('packages', i, { name: v })} />
+                  </PfField>
+                  <PfField id={fid(`pkg-p-${i}`)} label="Price">
+                    <PfInput id={fid(`pkg-p-${i}`)} value={p.price}
+                      onChange={(v) => setItem('packages', i, { price: v })} />
+                  </PfField>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <PfField id={fid(`pkg-per-${i}`)} label="Period (/mo, one-time…)">
+                    <PfInput id={fid(`pkg-per-${i}`)} value={p.period}
+                      onChange={(v) => setItem('packages', i, { period: v })} />
+                  </PfField>
+                  <div className="mt-3 flex items-center">
+                    <label className="flex items-center gap-2 text-[12px] font-semibold" style={{ color: C.text }}>
+                      <input type="checkbox" checked={p.featured}
+                        onChange={(e) => setItem('packages', i, { featured: e.target.checked })} />
+                      Highlight as most popular
+                    </label>
+                  </div>
+                </div>
+                <PfField id={fid(`pkg-f-${i}`)} label="What is included (one per line)">
+                  <PfTextarea id={fid(`pkg-f-${i}`)} rows={4} value={p.features.join('\n')}
+                    onChange={(v) => setItem('packages', i, { features: v.split('\n') })} />
+                </PfField>
+              </PfRow>
+            ))}
+            <PfAdd onClick={() => addItem('packages', { name: '', price: '', period: '/mo', features: [''], featured: false })}>
+              Add package
+            </PfAdd>
+          </PfSection>
+
+          {/* 9 — Tools */}
+          <PfSection num={9} title="Tools &amp; proficiency" panelId={fid('s9')} open={!!open[9]} onToggle={() => toggle(9)}>
+            {draft.tools.map((t, i) => (
+              <PfRow key={i} removeLabel={`Remove tool ${i + 1}`} onRemove={() => removeItem('tools', i)}>
+                <PfField id={fid(`tool-n-${i}`)} label={`Tool ${i + 1}`}>
+                  <PfInput id={fid(`tool-n-${i}`)} value={t.name}
+                    onChange={(v) => setItem('tools', i, { name: v })} />
+                </PfField>
+                <PfField id={fid(`tool-l-${i}`)} label={`Proficiency — ${t.level}%`}>
+                  <input id={fid(`tool-l-${i}`)} type="range" min="10" max="100" step="5"
+                    className="w-full" value={t.level}
+                    onChange={(e) => setItem('tools', i, { level: Number(e.target.value) })} />
+                </PfField>
+              </PfRow>
+            ))}
+            <PfAdd onClick={() => addItem('tools', { name: '', level: 75 })}>Add tool</PfAdd>
+          </PfSection>
+
+          {/* 10 — Client industries */}
+          <PfSection num={10} title="Client industries" panelId={fid('s10')} open={!!open[10]} onToggle={() => toggle(10)}>
+            {draft.industries.map((ind, i) => (
+              <PfRow key={i} removeLabel={`Remove industry ${i + 1}: ${ind || 'blank'}`} onRemove={() => removeItem('industries', i)}>
+                <PfField id={fid(`ind-${i}`)} label={`Industry ${i + 1}`}>
+                  <PfInput id={fid(`ind-${i}`)} value={ind}
+                    onChange={(v) => setList('industries', draft.industries.map((x, j) => (j === i ? v : x)))} />
+                </PfField>
+              </PfRow>
+            ))}
+            <PfAdd onClick={() => addItem('industries', '')}>Add industry</PfAdd>
+          </PfSection>
+
+          {/* 11 — Results */}
+          <PfSection num={11} title="Results &amp; key numbers" panelId={fid('s11')} open={!!open[11]} onToggle={() => toggle(11)}>
+            <p className="mt-2 text-[11px]" style={{ color: C.textMute }}>
+              These animate as counters. Publish only numbers you can stand behind — a prospect
+              may ask about any of them.
+            </p>
+            {draft.metrics.map((m, i) => (
+              <PfRow key={i} removeLabel={`Remove result ${i + 1}`} onRemove={() => removeItem('metrics', i)}>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <PfField id={fid(`met-v-${i}`)} label={`Result ${i + 1} value`}>
+                    {/* ★ The raw string, NOT Number(v). `Number('')` is 0, so clearing the
+                        field snapped it straight back to 0 and a lone leading "-" was
+                        swallowed before it could become "-4". The engine's num() already
+                        treats '' and undefined as ABSENT — that was an earlier fix, made
+                        because num(null) once published an unrated tool as "10%" — so the
+                        coercion belongs at render, where it already is, not in the editor.
+                        ★ RESIDUAL, on purpose: normalizeDraft still rounds '' to 0, so an
+                        empty value reappears as 0 after a reload. Letting '' through would
+                        change the emitted data-count and the counter runtime reads it
+                        directly, so that is a wider change than this fix needs. */}
+                    <PfInput id={fid(`met-v-${i}`)} type="number" inputMode="numeric" value={m.value}
+                      onChange={(v) => setItem('metrics', i, { value: v })} />
+                  </PfField>
+                  <PfField id={fid(`met-s-${i}`)} label="Suffix (+, %, yrs)">
+                    <PfInput id={fid(`met-s-${i}`)} value={m.suffix}
+                      onChange={(v) => setItem('metrics', i, { suffix: v })} />
+                  </PfField>
+                </div>
+                <PfField id={fid(`met-l-${i}`)} label="Label">
+                  <PfInput id={fid(`met-l-${i}`)} value={m.label}
+                    onChange={(v) => setItem('metrics', i, { label: v })} />
+                </PfField>
+              </PfRow>
+            ))}
+            <PfAdd onClick={() => addItem('metrics', { value: 0, suffix: '+', label: '' })}>Add number</PfAdd>
+          </PfSection>
+
+          {/* 12 — Testimonials */}
+          <PfSection num={12} title="Testimonials" panelId={fid('s12')} open={!!open[12]} onToggle={() => toggle(12)}>
+            <p className="mt-2 text-[11px]" style={{ color: C.textMute }}>
+              Real quotes from real clients only, and ask before you publish a name. An invented
+              testimonial is the fastest way to lose a prospect who checks.
+            </p>
+            {draft.testimonials.map((t, i) => (
+              <PfRow key={i} removeLabel={`Remove testimonial ${i + 1}`} onRemove={() => removeItem('testimonials', i)}>
+                <PfField id={fid(`tst-q-${i}`)} label={`Testimonial ${i + 1} quote`}>
+                  <PfTextarea id={fid(`tst-q-${i}`)} rows={3} value={t.quote}
+                    onChange={(v) => setItem('testimonials', i, { quote: v })} />
+                </PfField>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <PfField id={fid(`tst-n-${i}`)} label="Name">
+                    <PfInput id={fid(`tst-n-${i}`)} value={t.name}
+                      onChange={(v) => setItem('testimonials', i, { name: v })} />
+                  </PfField>
+                  <PfField id={fid(`tst-r-${i}`)} label="Role / company">
+                    <PfInput id={fid(`tst-r-${i}`)} value={t.role}
+                      onChange={(v) => setItem('testimonials', i, { role: v })} />
+                  </PfField>
+                </div>
+              </PfRow>
+            ))}
+            <PfAdd onClick={() => addItem('testimonials', { quote: '', name: '', role: '' })}>Add testimonial</PfAdd>
+          </PfSection>
+
+          {/* 13 — Education */}
+          <PfSection num={13} title="Education &amp; certifications" panelId={fid('s13')} open={!!open[13]} onToggle={() => toggle(13)}>
+            <p className="mt-2 text-[11px]" style={{ color: C.textMute }}>
+              List only credentials you actually hold. These are checkable.
+            </p>
+            {draft.education.map((e, i) => (
+              <PfRow key={i} removeLabel={`Remove credential ${i + 1}`} onRemove={() => removeItem('education', i)}>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <PfField id={fid(`edu-c-${i}`)} label={`Credential ${i + 1}`}>
+                    <PfInput id={fid(`edu-c-${i}`)} value={e.credential}
+                      onChange={(v) => setItem('education', i, { credential: v })} />
+                  </PfField>
+                  <PfField id={fid(`edu-d-${i}`)} label="Detail (school, issuer, year)">
+                    <PfInput id={fid(`edu-d-${i}`)} value={e.detail}
+                      onChange={(v) => setItem('education', i, { detail: v })} />
+                  </PfField>
+                </div>
+              </PfRow>
+            ))}
+            <PfAdd onClick={() => addItem('education', { credential: '', detail: '' })}>Add credential</PfAdd>
+          </PfSection>
+
+          <p className="mt-4 mb-2 text-[11px] leading-relaxed" style={{ color: C.textMute }}>
+            Publish only what is true. Real credentials, real client results, real testimonials with
+            permission. A portfolio that overstates is worse than one that is modest — the first
+            client who checks is the one you most wanted.
+          </p>
+        </div>
+
+        {/* ── PREVIEW ─────────────────────────────────────────────────────── */}
+        <div className={`pf-preview ${showPreview ? 'flex' : 'hidden'}`}>
+          <div className="flex flex-wrap items-center gap-1.5 mb-2">
+            <div className="flex gap-1.5" role="group" aria-label="Preview width">
+              {PF_DEVICES.map((d) => (
+                <button key={d.id} type="button" onClick={() => setDevice(d.id)}
+                  aria-pressed={device === d.id}
+                  className={`gh-pill px-3 py-1 text-[11px] font-semibold${device === d.id ? ' is-active' : ''}`}>
+                  {d.label}
+                </button>
+              ))}
+            </div>
+            <span className="ml-auto text-[10.5px]" style={{ color: C.textMute }}>
+              {lib.PF_LOGICAL_WIDTHS[device]}px{scale < 0.995 ? ` · ${Math.round(scale * 100)}% zoom` : ''}
+            </span>
+          </div>
+          <div className="pf-frame-wrap" ref={paneRef}
+            style={{ '--pf-frame-bg': theme.pg1 }}>
+            <div className="pf-frame-scaler"
+              style={{ '--pf-vw': `${lib.PF_LOGICAL_WIDTHS[device]}px`, '--pf-scale': scale }}>
+              {/* ★ sandbox="allow-scripts" AND NOTHING ELSE — see the block comment
+                  above this component. allow-same-origin would restore srcdoc's
+                  origin inheritance and hand the previewed document the app's
+                  localStorage, where the Supabase session lives. */}
+              <iframe
+                key={previewSeq}
+                ref={frameRef}
+                title="Portfolio preview"
+                sandbox="allow-scripts"
+                srcDoc={previewHtml}
+                loading="lazy"
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Dialogs ───────────────────────────────────────────────────────── */}
+      {dialog && dialog.kind === 'clear' && (
+        <AccountModal title="Clear this portfolio?" icon={Trash2} tone="danger"
+          subtitle="Every section, your photo and the saved draft in this browser."
+          onClose={() => setDialog(null)}>
+          <p className="text-sm" style={{ color: C.textSoft }}>
+            This cannot be undone, and there is no copy anywhere else — the draft only ever
+            existed in this browser.
+          </p>
+          <div className="flex justify-end gap-2 mt-5">
+            <button type="button" onClick={() => setDialog(null)}
+              className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold">Keep editing</button>
+            <button type="button" style={ADMIN_BTN_DANGER}
+              className="px-4 py-2 rounded-xl text-sm font-semibold text-white"
+              onClick={() => {
+                const blank = lib.emptyDraft();
+                // Re-seed, or the next keystroke would compare against the pre-Clear
+                // snapshot and look dirty when it is not.
+                seedRef.current = JSON.stringify(blank);
+                setDraft(blank);
+                pushPreview(blank);
+                setTouched({});
+                setResume({ status: 'idle', message: '' });
+                setSaveState('idle');
+                if (typeof window !== 'undefined' && window.storage) {
+                  window.storage.set(PF_DRAFT_KEY, '').catch(() => {});
+                }
+                setDialog(null);
+                setNotice('Cleared. Nothing was kept.');
+              }}>Clear everything</button>
+          </div>
+        </AccountModal>
+      )}
+
+      {dialog && dialog.kind === 'sample' && (
+        <AccountModal title="Load the worked example?" icon={Sparkles}
+          subtitle="Every name, number and quote in it is invented."
+          onClose={() => setDialog(null)}>
+          <p className="text-sm" style={{ color: C.textSoft }}>
+            The example is here to show you what a finished portfolio reads like. “Jordan Reyes”
+            is not a real person, the two testimonials were written for this file, and the results
+            were chosen to look plausible — nobody measured them.
+          </p>
+          <p className="text-sm mt-3 font-semibold" style={{ color: C.text }}>
+            Replace all of it with your own before you download. We will remind you which
+            sections still hold example text.
+          </p>
+          {lib.draftHasContent(draft) && (
+            <p className="text-sm mt-3" style={{ color: 'var(--status-warn-fg)' }}>
+              This will replace what you have already written.
+            </p>
+          )}
+          <div className="flex justify-end gap-2 mt-5">
+            <button type="button" onClick={() => setDialog(null)}
+              className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold">Cancel</button>
+            <button type="button" className="sheen-btn px-4 py-2 text-sm font-semibold"
+              onClick={() => {
+                const sample = lib.normalizeDraft(SAMPLE_DRAFT);
+                setDraft(sample);
+                pushPreview(sample);
+                setDialog(null);
+                setNotice('Example loaded. Every field is fictional — replace it with your own.');
+              }}>Load the example</button>
+          </div>
+        </AccountModal>
+      )}
+
+      {dialog && dialog.kind === 'industry' && (
+        <AccountModal title={`Replace with ${dialog.label} content?`} icon={RefreshCw}
+          onClose={() => setDialog(null)}>
+          <p className="text-sm" style={{ color: C.textSoft }}>
+            This replaces the pain points and before/after rows you have now. Everything else
+            you have written stays exactly as it is.
+          </p>
+          <div className="flex justify-end gap-2 mt-5">
+            <button type="button" onClick={() => setDialog(null)}
+              className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold">Keep mine</button>
+            <button type="button" className="sheen-btn px-4 py-2 text-sm font-semibold"
+              onClick={() => applyIndustry(true)}>Replace them</button>
+          </div>
+        </AccountModal>
+      )}
+
+      {dialog && dialog.kind === 'resume' && (
+        <AccountModal title="You have already written something" icon={Upload}
+          subtitle={dialog.name} onClose={() => { pendingResumeRef.current = null; setDialog(null); }}>
+          <p className="text-sm" style={{ color: C.textSoft }}>
+            Filling in the blanks keeps everything you have typed and only fills empty fields.
+            Starting over clears the form first and uses the résumé alone.
+          </p>
+          <div className="flex flex-wrap justify-end gap-2 mt-5">
+            <button type="button" className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold"
+              onClick={() => { pendingResumeRef.current = null; setDialog(null); }}>Cancel</button>
+            <button type="button" className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold"
+              onClick={() => {
+                const f = pendingResumeRef.current;
+                pendingResumeRef.current = null;
+                setDialog(null);
+                if (f) applyResume(f, 'replace');
+              }}>Start over</button>
+            <button type="button" className="sheen-btn px-4 py-2 text-sm font-semibold"
+              onClick={() => {
+                const f = pendingResumeRef.current;
+                pendingResumeRef.current = null;
+                setDialog(null);
+                if (f) applyResume(f, 'merge');
+              }}>Fill in the blanks</button>
+          </div>
+        </AccountModal>
+      )}
+
+      {dialog && dialog.kind === 'download' && (
+        <AccountModal title="Before you download" icon={AlertTriangle} tone="danger"
+          onClose={() => setDialog(null)}>
+          {validation.blocking.length > 0 && (
+            <div className="mb-4">
+              <div className="text-sm font-semibold mb-1.5" style={{ color: C.text }}>Still needed</div>
+              <ul className="text-sm list-disc pl-5" style={{ color: 'var(--status-danger-fg)' }}>
+                {validation.blocking.map((k) => <li key={k}>{validation.fields[k].message}</li>)}
+              </ul>
+            </div>
+          )}
+          {/* ★ THE FIELDS ARE NAMED, not gestured at. A student who loads the example,
+              edits three fields and downloads has published invented client
+              testimonials under their own name. A banner at the top of the form is
+              not read at download time; this list is. */}
+          {staleSampleFields.length > 0 && (
+            <div>
+              <div className="text-sm font-semibold mb-1.5" style={{ color: C.text }}>
+                These still hold the example content
+              </div>
+              <ul className="text-sm list-disc pl-5" style={{ color: 'var(--status-warn-fg)' }}>
+                {staleSampleFields.map((f) => <li key={f}>{f}</li>)}
+              </ul>
+              <p className="text-[12.5px] mt-2.5" style={{ color: C.textSoft }}>
+                Publishing invented testimonials, results or credentials as your own is
+                misrepresentation, and the first prospect who checks is the one you most wanted.
+              </p>
+            </div>
+          )}
+          <div className="flex flex-wrap justify-end gap-2 mt-5">
+            <button type="button" className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold"
+              onClick={() => setDialog(null)}>Back to editing</button>
+            {validation.blocking.length === 0 && (
+              <button type="button" className="sheen-btn px-4 py-2 text-sm font-semibold"
+                onClick={runDownload}>Download anyway</button>
+            )}
+          </div>
+        </AccountModal>
+      )}
+    </div>
   );
 }
 

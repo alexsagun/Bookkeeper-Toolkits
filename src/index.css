@@ -1106,3 +1106,257 @@ body.is-col-resizing iframe { pointer-events: none; }
      name, which is the opposite of the accommodation. */
   .course-rail-tab-label { transition: none; }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   PORTFOLIO GENERATOR (.pf-tool) — the two-pane editor + live preview
+   ═══════════════════════════════════════════════════════════════════════════
+   Numbers here mirror src/lib/portfolioGenerator.js and are pinned against it by
+   test/portfolioGenerator.test.mjs — the same contract the .course-* block above
+   keeps with coursePlayerLayout.js.
+
+   ★ A CONTAINER QUERY, NOT A MEDIA QUERY — the same reason as .course-workspace.
+     The sidebar is 288px expanded, 76px collapsed to the icon rail, and 0 below
+     lg, so at ONE viewport width this tool has a different amount of room three
+     times over. Measured: a 1024px viewport with the sidebar expanded leaves
+     656px of content, where an `lg:` grid would hand the preview 172px and still
+     call it a preview. REQUIRES Chrome 105 / Safari 16 / Firefox 110; older
+     engines drop every @container rule and get the stacked layout with the
+     Edit|Preview toggle, which is a downgrade in layout and never in function.
+
+   ★ container-type: inline-size implies `contain: inline-size layout style` —
+     NOT paint containment, so position:sticky below still works. It does make
+     .pf-tool a stacking context (which is what keeps the preview under the z-30
+     SectionHead) and a containing block for position:fixed descendants, so NO
+     hand-rolled fixed overlay may be rendered inside this tool. AccountModal and
+     SidePanel portal to document.body and are unaffected.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.pf-tool {
+  container-type: inline-size;
+  container-name: portfolio;
+  /* Mirrors of the constants in src/lib/portfolioGenerator.js. --pf-head is
+     written inline by React from the measured .gh-section-head height; --pf-vw
+     and --pf-scale are written from the measured pane width. */
+  --pf-gap: 24px;
+  --pf-head: 24px;
+  --pf-vw: 1200px;
+  --pf-scale: 1;
+}
+
+/* ── Stacked: one column. Both panes stay mounted. ────────────────────────── */
+.pf-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 20px;
+  /* ★ NOT NEGOTIABLE. The grid default `align-items: stretch` makes the preview
+     item exactly as tall as its row — i.e. as tall as the editor column — so the
+     sticky element would equal its own containing block and could never move.
+     This is THE sticky bug, and .course-grid sets the same property for it. */
+  align-items: start;
+}
+/* A grid item's automatic minimum size is its content, so one pasted
+   900-character URL would blow the track out and horizontally scroll <main>. */
+.pf-grid > * { min-width: 0; }
+
+.pf-preview {
+  /* ★ NO `display` HERE, DELIBERATELY. This file is emitted AFTER @tailwind
+     utilities, so a `display: flex` on this class out-cascades Tailwind's
+     `.hidden` at equal specificity — and the mobile Edit|Preview toggle hides the
+     preview with exactly that class. Measured at 390px: the pane stayed
+     `display: flex` in the Edit state, so both panes rendered stacked and the
+     toggle only ever hid the editor. This is the SAME hazard as the `hidden`
+     ATTRIBUTE losing to a display utility, one layer down, and it is why the JSX
+     supplies `flex` or `hidden` itself: `showPreview` is true whenever the layout
+     is two-pane, so a visible preview always gets `flex` from the class list.
+     `flex-direction` is inert while display is none, so it stays. */
+  flex-direction: column;
+  /* Stacked, the preview is a fixed-height card rather than a sticky rail: there
+     is no second column for it to stick beside. */
+  height: min(72vh, 640px);
+}
+
+/* ── Two-pane ────────────────────────────────────────────────────────────── */
+@container portfolio (min-width: 984px) {   /* = PF_TWO_PANE_MIN, derived */
+  .pf-grid {
+    grid-template-columns:
+      minmax(400px, 460px)                  /* PF_EDITOR_MIN / PF_EDITOR_MAX */
+      minmax(0, 1fr);
+    column-gap: var(--pf-gap);
+  }
+  .pf-preview {
+    position: sticky;
+    /* ★ MEASURED, NOT ASSUMED. This tool renders its own sticky SectionHead, whose
+       h1 is clamp(24px,5vw,32px) and whose description wraps, so its height
+       changes with the window. Containment above makes .pf-tool a stacking
+       context, which means no z-index here could lift the preview out from under
+       that header even if the offset were wrong. */
+    top: var(--pf-head);
+    /* ★ HEIGHT, NOT MAX-HEIGHT. The iframe is height:100%, which resolves against
+       its parent's CONTENT height — zero in a max-height-only box. .course-rail
+       can use max-height because its content is a list with a height of its own;
+       a frame has none. <main> is exactly 100vh (the app root is h-screen +
+       overflow-hidden), so this is the real budget. */
+    height: calc(100vh - var(--pf-head) - var(--pf-gap));
+    min-height: 420px;
+    align-self: start;
+  }
+}
+
+/* The clipped, rounded surface lives INSIDE .pf-preview. Wrapping it AROUND would
+   make it the sticky element's scrollport and kill sticky outright — an
+   `overflow: hidden` on any ancestor up to <main> is fatal to position:sticky. */
+.pf-frame-wrap {
+  flex: 1 1 auto;
+  /* A flex item defaults to min-height:auto and refuses to shrink below its
+     content; the frame's intrinsic 150px then overflows the height budget. */
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 16px;
+  border: 1px solid var(--glass-border);
+  /* The theme's own page colour, so a srcdoc rebuild does not flash white. */
+  background: var(--pf-frame-bg, #0b1f34);
+  position: relative;
+}
+
+/* ★ THE PREVIEW IS SCALED, NOT SHRUNK. The generated document has breakpoints of
+   its own at 760px (it hides its nav and collapses the about grid) and 640px (the
+   transformation cards stack). A 460px editor plus the gap needs 1184px of tool
+   width before the pane clears 760px — which a 1440px laptop with the sidebar
+   open does not have. Sizing the frame to the pane would therefore show the
+   MOBILE portfolio to somebody designing the desktop one, with nothing on screen
+   to reveal it. Rendering at a fixed logical width and scaling to fit is what
+   every site builder does, and it is what makes the Desktop/Tablet/Mobile
+   control mean anything. */
+.pf-frame-scaler {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: var(--pf-vw);
+  height: calc(100% / var(--pf-scale));
+  transform: scale(var(--pf-scale));
+  transform-origin: top left;
+}
+.pf-frame-scaler iframe {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+/* ── Editor chrome ───────────────────────────────────────────────────────── */
+/* The accordion header is a real <button> filling its row; the surrounding card
+   supplies the border, so the button carries no box of its own. */
+.pf-acc-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 13px 14px;
+  text-align: left;
+  background: none;
+  border: 0;
+  font: inherit;
+  cursor: pointer;
+  color: var(--c-text);
+  border-radius: 12px;
+}
+.pf-acc-head:hover { background: var(--wash); }
+.pf-acc-num {
+  flex: none;
+  width: 22px; height: 22px;
+  display: grid; place-items: center;
+  border-radius: 6px;
+  background: var(--wash-strong);
+  color: var(--c-text-soft);
+  font-size: 11px; font-weight: 700;
+}
+.pf-acc-head[aria-expanded="true"] .pf-acc-num {
+  background: var(--primary-tint);
+  color: var(--c-primary);
+}
+.pf-acc-chev { margin-left: auto; flex: none; transition: transform 200ms var(--ease); }
+.pf-acc-head[aria-expanded="true"] .pf-acc-chev { transform: rotate(90deg); }
+
+/* A repeater row. The remove control sits in the corner and needs a real
+   accessible name — "Remove service 2", never a bare multiplication sign. */
+.pf-row {
+  position: relative;
+  padding: 12px 12px 14px;
+  margin-top: 10px;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: var(--wash);
+}
+.pf-row-remove {
+  position: absolute;
+  top: 8px; right: 8px;
+  width: 26px; height: 26px;
+  display: grid; place-items: center;
+  border-radius: 7px;
+  border: 1px solid var(--status-danger-bd);
+  background: var(--status-danger-bg);
+  color: var(--status-danger-fg);
+  cursor: pointer;
+}
+.pf-row-remove:hover { filter: brightness(0.96); }
+
+/* A theme swatch is a button with a selected state, not a coloured div. */
+.pf-swatch {
+  padding: 0;
+  overflow: hidden;
+  cursor: pointer;
+  /* --c-bg-soft, NOT --c-white: that token does not exist anywhere in this stylesheet,
+     so the declaration resolved to nothing and all nine swatches rendered with a
+     transparent background. It read as almost-right because .pf-swatch-name uses
+     --c-text-soft and themes correctly on its own, which is exactly why nobody saw it. */
+  background: var(--c-bg-soft);
+  border: 2px solid transparent;
+  border-radius: 10px;
+  box-shadow: 0 2px 6px rgba(15, 18, 23, 0.08);
+  transition: transform 150ms var(--ease), box-shadow 150ms var(--ease);
+}
+.pf-swatch:hover { transform: translateY(-2px); }
+.pf-swatch[aria-pressed="true"] {
+  border-color: var(--c-primary);
+  box-shadow: 0 4px 14px var(--primary-glow-soft);
+}
+.pf-swatch-band { height: 34px; }
+.pf-swatch-name {
+  padding: 5px 4px;
+  font-size: 10.5px; font-weight: 600;
+  text-align: center;
+  color: var(--c-text-soft);
+}
+
+/* ── Scoped a11y ─────────────────────────────────────────────────────────── */
+/* Scoped for the same reason .cl-tool, .enroll-intake and .course-workspace are:
+   the app-wide focus pass is still its own change (~64 elements, no visual test
+   coverage). This tool is a form of roughly ninety controls, so it ships with
+   its own rather than waiting for that pass. */
+.pf-tool :focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+.pf-tool .gh-input:focus-visible { outline-offset: 4px; }
+.pf-tool .sheen-btn:focus-visible { outline-color: var(--c-text); }
+
+/* ★ A CONTRAST FIX, SCOPED. .gh-pill.is-active is a gradient on --c-primary-hi
+   (#3D8BFF) behind white text = 3.31:1, below the WCAG AA 4.5:1 floor — and it is
+   invisible to uiSafety section 3, which can only see the FLAT `C.primary`
+   pattern. --primary-solid is 4.78:1. Overriding it app-wide would restyle six
+   shipped Community controls with no visual test coverage, so this new tool takes
+   the correct colour and the app-wide pass stays its own change. */
+.pf-tool .gh-pill.is-active {
+  background: var(--primary-solid);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25), 0 4px 12px -2px var(--primary-glow-soft);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Only the decorative transitions. NOT a blanket `* { animation: none }` — that
+     would still the Loader2 spinner shown while pdf.js reads a resume, leaving
+     exactly these users unable to tell a working import from a dead one. Same
+     reasoning as the .cl-tool and .course-workspace blocks above. The motion
+     inside the preview frame is handled by the generated document's own
+     prefers-reduced-motion block, which also ships in every download. */
+  .pf-tool .gh-pill,
+  .pf-acc-chev,
+  .pf-swatch { transition: none; }
+  .pf-swatch:hover { transform: none; }
+}

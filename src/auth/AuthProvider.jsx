@@ -61,6 +61,11 @@ const LEGACY_KEYS = [
   // 'nav:lastTab' was retired when "/" became unconditionally the Dashboard — it
   // has no reader and no writer, so migrating it would adopt a dead key.
   'nav:interviewSub',
+  // Portfolio Generator draft. Listed per the standing rule ("add to it whenever a
+  // tool introduces a new persisted key"), though it is a RULE-COMPLIANCE entry
+  // rather than a live migration: the tool shipped after the auth gate, so no
+  // un-namespaced copy of this key can exist and the loop below always skips it.
+  'portfolio:draft:v1',
   'enroll:soundAlert',
   'community:lastSpace', 'community:lastChannel', 'community:railGroups',
   // Theme pref. Note: useTheme also keeps a BARE localStorage mirror of this key
