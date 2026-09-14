@@ -24964,15 +24964,25 @@ create table if not exists public.finance_bank_transactions (
   --   Digits are KEPT in the description: a reference number is the strongest
   --   natural key in the string, and stripping it would merge two genuinely
   --   different same-day transfers of the same amount into one.
+  -- ★ md5(text), NOT sha256(convert_to(...)). A generated column accepts only
+  --   IMMUTABLE functions and convert_to is STABLE, so the first production apply of
+  --   this file was refused with "generation expression is not immutable" — and
+  --   rolled back whole, which is the only reason that was harmless. The normalized
+  --   string is pure ASCII, so md5 over the text has no encoding to depend on. This
+  --   is a DUPLICATE-DETECTION key, not a security boundary: nobody gains anything
+  --   by colliding two lines of their own bank statement.
+  --   Do not "upgrade" it to sha256(<expr>::bytea). That cast runs byteain, which
+  --   parses backslash escapes, and it is safe only while the regexp below happens
+  --   to strip every backslash.
   fingerprint     text generated always as (
-                    encode(sha256(convert_to(
+                    md5(
                       account_id::text || '|' ||
                       (extract(year from posted_on)::int * 10000
                        + extract(month from posted_on)::int * 100
                        + extract(day from posted_on)::int)::text || '|' ||
                       ((amount * 100)::bigint)::text || '|' ||
                       btrim(regexp_replace(lower(description_raw), '[^a-z0-9]+', ' ', 'g'))
-                    , 'UTF8')), 'hex')
+                    )
                   ) stored,
   status          text not null default 'unmatched'
                     check (status in ('unmatched','matched','excluded','duplicate')),

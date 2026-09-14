@@ -55,6 +55,29 @@ const FINANCE_TABLES = [
   'finance_reconciliation_items', 'finance_recurring_templates',
 ];
 
+/** Each `generated always as (…)` expression, walked to its balanced close paren.
+ *  ★ `\s+`, not a literal space: normal_balance breaks the line between `as` and `(`,
+ *  and a one-space pattern silently skipped it — the count assertion is what noticed.
+ *  `generated always as identity` has no paren and is correctly not matched. */
+function generatedExpressions(code) {
+  const out = [];
+  for (const m of code.matchAll(/generated\s+always\s+as\s*\(/g)) {
+    let i = m.index + m[0].length, depth = 1, inStr = false;
+    for (; i < code.length && depth > 0; i++) {
+      const ch = code[i];
+      if (inStr) { if (ch === "'") inStr = false; continue; }
+      if (ch === "'") inStr = true; else if (ch === '(') depth++; else if (ch === ')') depth--;
+    }
+    out.push(code.slice(m.index, i));
+  }
+  return out;
+}
+
+/** Functions Postgres marks STABLE or VOLATILE that are easy to reach for in a generated column.
+ *  Verified on PG 17.6: to_char, convert_to and textsend are STABLE; md5(text), sha256(bytea),
+ *  extract(text, date), lower, regexp_replace, btrim and encode are IMMUTABLE. */
+const NOT_IMMUTABLE_IN_GENERATED = /\b(to_char|to_date|convert_to|convert_from|textsend|now|current_date|current_timestamp|localtimestamp|clock_timestamp|statement_timestamp|random|gen_random_uuid)\b/i;
+
 for (const file of FILES) {
   const sql = () => codeOf(financeSection(file));
 
@@ -286,10 +309,28 @@ for (const file of FILES) {
     }
   });
 
-  test(`${file}: generated columns are immutable-safe`, () => {
-    assert.ok(!/generated always as \([\s\S]{0,500}?to_char/.test(sql()),
-      'to_char is STABLE, not IMMUTABLE. A generated column using it is rejected at apply time '
-      + 'with "generation expression is not immutable", which reads like a Postgres bug and is not.');
+  // ★ WALK EACH GENERATED EXPRESSION TO ITS CLOSING PAREN. The first version of this
+  //   pin searched a fixed 500-character window for to_char ALONE — and passed while
+  //   the bank fingerprint used convert_to, which is STABLE too. The first production
+  //   apply of #58 was refused on exactly that ("generation expression is not
+  //   immutable"), which reads like a Postgres bug and is not. It rolled back whole
+  //   only because it was sent as one transaction.
+  test(`${file}: generated columns use IMMUTABLE functions only`, () => {
+    const exprs = generatedExpressions(sql());
+    assert.ok(exprs.length >= 3,
+      `expected normal_balance, period_key and fingerprint to be generated, found ${exprs.length}`);
+    for (const e of exprs) {
+      const bad = NOT_IMMUTABLE_IN_GENERATED.exec(e);
+      assert.ok(!bad, `"${bad?.[0]}" is not IMMUTABLE, so this generated column is refused at apply `
+        + `time: ${e.replace(/\s+/g, ' ').slice(0, 140)}`);
+    }
+    const fp = exprs.find((e) => e.includes('description_raw'));
+    assert.ok(fp, 'the bank fingerprint is no longer a generated column');
+    assert.ok(/^generated\s+always\s+as\s*\(\s*md5\(/.test(fp),
+      'the fingerprint must be md5(<normalized text>) — IMMUTABLE, and no encoding step');
+    assert.ok(!/::bytea/.test(fp),
+      'text::bytea runs byteain, which parses backslash escapes: it is safe only while the '
+      + 'description regexp happens to strip every backslash');
   });
 
   test(`${file}: a period can only be locked once it has elapsed, in the business timezone`, () => {
