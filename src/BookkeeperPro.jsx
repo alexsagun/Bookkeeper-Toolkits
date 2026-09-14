@@ -11416,6 +11416,7 @@ const FINANCE_SUBTABS = [
   { key: 'pl',         label: 'Profit & Loss' },
   { key: 'audit',      label: 'Audit trail' },
   // Setup is where the books go live and where a broken default account is repaired.
+  { key: 'bank',       label: 'Bank & Reconciliation' },
   { key: 'setup',      label: 'Setup' },
 ];
 
@@ -12332,6 +12333,589 @@ function FinanceRecurringPanel({ call, onChanged }) {
   );
 }
 
+// ── Bank statements ───────────────────────────────────────────────────────────
+// ★ THE DATE FORMAT IS DECLARED BY A HUMAN BEFORE ANY ROW IS READ. "03/04/2026" is
+//   March in one bank's export and April in another's; the legacy importer kept raw
+//   strings and never resolved it. A row whose date does not fit the declared format
+//   is reported, never guessed.
+function financeStatementDate(value, format) {
+  const s = String(value || '').trim();
+  let y; let m; let d;
+  if (format === 'ISO') {
+    const hit = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s);
+    if (!hit) return null;
+    [, y, m, d] = hit;
+  } else {
+    const hit = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2}|\d{4})$/.exec(s);
+    if (!hit) return null;
+    [d, m] = format === 'DMY' ? [hit[1], hit[2]] : [hit[2], hit[1]];
+    y = hit[3].length === 2 ? `20${hit[3]}` : hit[3];
+  }
+  const iso = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  const check = new Date(`${iso}T00:00:00Z`);
+  // Rejects 2026-02-31 instead of rolling it into March.
+  return Number.isNaN(check.getTime()) || check.toISOString().slice(0, 10) !== iso ? null : iso;
+}
+
+// "(1,234.50)" is NEGATIVE. The legacy parser stripped every non-digit and imported it
+// as +1234, landing a payment on the wrong side of the P&L.
+function financeStatementAmount(value) {
+  const s = String(value ?? '').trim();
+  if (!s) return null;
+  const negative = /^\(.*\)$/.test(s) || /^-/.test(s) || /-$/.test(s);
+  const n = Number(s.replace(/[^0-9.]/g, ''));
+  if (!Number.isFinite(n) || n === 0) return null;
+  return Math.round((negative ? -n : n) * 100) / 100;
+}
+
+function FinanceBankImportCard({ call, onChanged }) {
+  const [accounts, setAccounts] = useState([]);
+  const [imports, setImports] = useState(null);
+  const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
+  const [busyKey, setBusyKey] = useState('');
+  const [form, setForm] = useState({ accountId: '', format: 'DMY', opening: '', closing: '' });
+  const [parsed, setParsed] = useState(null);      // { name, sha256, size, headers, rows }
+  const [map, setMap] = useState({ date: '', desc: '', amount: '', moneyIn: '', moneyOut: '', balance: '', mode: 'single' });
+  const [reviewId, setReviewId] = useState(null);
+  const [txns, setTxns] = useState(null);
+  const [excludeFor, setExcludeFor] = useState(null);
+  const [excludeReason, setExcludeReason] = useState('');
+  const [discardFor, setDiscardFor] = useState(null);
+  const [discardReason, setDiscardReason] = useState('');
+
+  const loadImports = useCallback(async () => {
+    try {
+      const [acc, imp] = await Promise.all([call('finance_accounts_list'), call('finance_bank_imports_list', { p_limit: 50 })]);
+      setAccounts((acc || []).filter((a) => ['cash', 'card'].includes(a.cash_flow_class)));
+      setImports(imp || []);
+    } catch (e) {
+      setErr(appErrorMessage(e, 'Could not load the bank imports.')); setImports((p) => p || []);
+    }
+  }, [call]);
+  const loadTxns = useCallback(async (id) => {
+    setTxns(null);
+    try { setTxns(await call('finance_bank_transactions_list', { p_import_id: id, p_limit: 500 }) || []); }
+    catch (e) { setErr(appErrorMessage(e, 'Could not load the transactions.')); setTxns([]); }
+  }, [call]);
+  useEffect(() => { loadImports(); }, [loadImports]);
+  useEffect(() => { if (reviewId) loadTxns(reviewId); }, [reviewId, loadTxns]);
+
+  const act = async (key, fn, args, done) => {
+    setBusyKey(key); setErr(''); setNotice('');
+    try {
+      const out = await call(fn, args);
+      setNotice(typeof done === 'function' ? done(out) : done);
+      await loadImports(); if (reviewId) await loadTxns(reviewId);
+      onChanged?.();
+      return out ?? true;
+    } catch (e) {
+      console.error('[finance] bank write failed', { fn, code: e?.code, message: e?.message });
+      setErr(appErrorMessage(e, 'That change was not saved.'));
+      return null;
+    } finally { setBusyKey(''); }
+  };
+
+  const pickFile = async (file) => {
+    setErr(''); setParsed(null);
+    if (!file) return;
+    try {
+      if (file.size > 8 * 1024 * 1024) throw new Error('That file is over 8 MB. Export a shorter date range.');
+      const buf = await file.arrayBuffer();
+      const sha256 = await sha256Hex(buf);
+      let table;
+      if (/\.xlsx?$/i.test(file.name)) {
+        const XLSX = await import('xlsx');
+        const wb = XLSX.read(buf, { type: 'array' });
+        const arr = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, raw: false, defval: '' });
+        const hdr = (arr[0] || []).map((h) => String(h).trim());
+        table = { headers: hdr, rows: arr.slice(1).filter((r) => r.some((c) => String(c).trim() !== ''))
+          .map((r) => Object.fromEntries(hdr.map((h, i) => [h, r[i] != null ? String(r[i]) : '']))) };
+      } else {
+        table = parseCsv(new TextDecoder('utf-8').decode(buf));
+      }
+      if (!table.headers.length) throw new Error('No columns found. Is there a header row?');
+      if (table.rows.length > 5000) throw new Error(`That file has ${table.rows.length} rows. Split it into files of 5,000 or fewer.`);
+      const guess = (re) => table.headers.find((h) => re.test(h)) || '';
+      setMap({ date: guess(/date/i), desc: guess(/desc|particular|detail|narr|memo/i), amount: guess(/^amount$/i),
+        moneyIn: guess(/credit|deposit|in$/i), moneyOut: guess(/debit|withdraw|out$/i), balance: guess(/balance/i),
+        mode: guess(/^amount$/i) ? 'single' : 'split' });
+      setParsed({ name: file.name, sha256, size: file.size, ...table });
+    } catch (e) {
+      setErr(e?.message || 'Could not read that file.');
+    }
+  };
+
+  // Rows the declared mapping can read, and the ones it cannot — both shown.
+  const preview = (() => {
+    if (!parsed) return null;
+    const good = []; const bad = [];
+    parsed.rows.forEach((r, i) => {
+      const posted = financeStatementDate(r[map.date], form.format);
+      const amt = map.mode === 'single'
+        ? financeStatementAmount(r[map.amount])
+        : (financeStatementAmount(r[map.moneyIn]) ? Math.abs(financeStatementAmount(r[map.moneyIn]))
+          : financeStatementAmount(r[map.moneyOut]) ? -Math.abs(financeStatementAmount(r[map.moneyOut])) : null);
+      if (!posted || amt === null) bad.push(i + 2);
+      else good.push({ posted_on: posted, description: String(r[map.desc] || '').trim(), amount: amt,
+        balance_after: map.balance ? financeStatementAmount(r[map.balance]) : null });
+    });
+    return { good, bad };
+  })();
+
+  const stage = async () => {
+    const id = await act('stage', 'finance_stage_bank_import', {
+      p_account_id: form.accountId, p_file_name: parsed.name, p_file_sha256: parsed.sha256,
+      p_file_size_bytes: parsed.size, p_date_format: form.format,
+      p_opening: form.opening === '' ? null : Number(form.opening),
+      p_closing: form.closing === '' ? null : Number(form.closing), p_rows: preview.good,
+    }, `Staged ${preview.good.length} transaction(s) for review. Nothing counts until you commit it.`);
+    if (id) { setParsed(null); setReviewId(id); }
+  };
+
+  const colSelect = (key, label, optional) => (
+    <label className="block"><span style={FINANCE_LABEL_STYLE}>{label}</span>
+      <select value={map[key]} onChange={(e) => setMap((m) => ({ ...m, [key]: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+        <option value="">{optional ? '— none —' : '— choose —'}</option>
+        {parsed.headers.map((h) => <option key={h} value={h}>{h}</option>)}
+      </select></label>
+  );
+  const reviewing = (imports || []).find((i) => i.id === reviewId);
+
+  return (
+    <div className="space-y-4">
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
+
+      <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+        <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Import a bank statement</div>
+        <div className="mb-3" style={{ fontSize: 11.5, color: C.textMute }}>
+          CSV or Excel. The file is read in your browser; only the rows you confirm are sent. The same file can never be
+          imported into the same account twice.
+        </div>
+        <div className="grid gap-3 sm:grid-cols-4">
+          <label className="block sm:col-span-2"><span style={FINANCE_LABEL_STYLE}>Account</span>
+            <select value={form.accountId} onChange={(e) => setForm((f) => ({ ...f, accountId: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+              <option value="">— choose —</option>
+              {accounts.map((a) => <option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
+            </select></label>
+          <label className="block sm:col-span-2"><span style={FINANCE_LABEL_STYLE}>Dates in this file look like</span>
+            <select value={form.format} onChange={(e) => setForm((f) => ({ ...f, format: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+              <option value="DMY">31/12/2026 — day first</option>
+              <option value="MDY">12/31/2026 — month first</option>
+              <option value="ISO">2026-12-31</option>
+            </select></label>
+          <label className="block"><span style={FINANCE_LABEL_STYLE}>Opening balance</span>
+            <input type="number" step="0.01" value={form.opening} onChange={(e) => setForm((f) => ({ ...f, opening: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+          <label className="block"><span style={FINANCE_LABEL_STYLE}>Closing balance</span>
+            <input type="number" step="0.01" value={form.closing} onChange={(e) => setForm((f) => ({ ...f, closing: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+          <label className="block sm:col-span-2"><span style={FINANCE_LABEL_STYLE}>File</span>
+            <input type="file" accept=".csv,.xlsx,.xls" onChange={(e) => pickFile(e.target.files?.[0])} className="block w-full mt-1 text-sm" /></label>
+        </div>
+
+        {parsed && preview && (
+          <div className="mt-4 rounded-xl p-3" style={{ background: 'var(--wash)' }}>
+            <div className="mb-2" style={{ fontSize: 12.5, color: C.text }}>{parsed.name} · {parsed.rows.length} row(s)</div>
+            <div className="grid gap-3 sm:grid-cols-3">
+              {colSelect('date', 'Date column')}
+              {colSelect('desc', 'Description column')}
+              <label className="block"><span style={FINANCE_LABEL_STYLE}>Amounts are</span>
+                <select value={map.mode} onChange={(e) => setMap((m) => ({ ...m, mode: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+                  <option value="single">One column, negative = money out</option>
+                  <option value="split">Two columns: money in / money out</option>
+                </select></label>
+              {map.mode === 'single' ? colSelect('amount', 'Amount column') : (<>{colSelect('moneyIn', 'Money in column')}{colSelect('moneyOut', 'Money out column')}</>)}
+              {colSelect('balance', 'Running balance column', true)}
+            </div>
+            <div className="mt-3" style={{ fontSize: 12.5, color: preview.bad.length ? C.amber : C.textSoft }}>
+              {preview.good.length} row(s) read.
+              {preview.bad.length > 0 && ` ${preview.bad.length} row(s) will be left out because their date or amount could not be read with this format — spreadsheet row(s) ${preview.bad.slice(0, 8).join(', ')}${preview.bad.length > 8 ? '…' : ''}. Check the date format before continuing.`}
+            </div>
+            <div className="mt-3 flex justify-end gap-2">
+              <button type="button" onClick={() => setParsed(null)} className="gh-btn-ghost px-3 py-1.5 text-sm">Cancel</button>
+              <button type="button" disabled={!form.accountId || preview.good.length === 0 || busyKey === 'stage'} onClick={stage}
+                className="gh-btn-primary px-3 py-1.5 text-sm disabled:opacity-60">
+                {busyKey === 'stage' ? 'Staging…' : `Stage ${preview.good.length} row(s) for review`}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+        <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }} className="mb-2">Imported statements</div>
+        {imports === null ? <FinanceLoading /> : imports.length === 0 ? (
+          <div style={{ fontSize: 13, color: C.textMute }}>No statements imported yet.</div>
+        ) : (
+          <table className="w-full text-sm" style={{ color: C.text }}>
+            <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+              <th scope="col" className="py-1">File</th><th scope="col">Account</th><th scope="col">Rows</th>
+              <th scope="col">To review</th><th scope="col">Status</th><th scope="col"><span className="sr-only">Actions</span></th>
+            </tr></thead>
+            <tbody>
+              {imports.map((i) => (
+                <tr key={i.id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                  <td className="py-1.5" style={{ maxWidth: 200 }}>{i.file_name || '—'}</td>
+                  <td style={{ fontSize: 12 }}>{i.account_code} · {i.account_name}</td>
+                  <td>{i.row_count}{Number(i.duplicate_row_count) > 0 && <span style={{ fontSize: 11, color: C.textMute }}> ({i.duplicate_row_count} dup)</span>}</td>
+                  <td>{i.unmatched_count}{Number(i.likely_duplicate_count) > 0 && <span className="gh-pill ml-1" style={{ fontSize: 10, color: C.amber }}>{i.likely_duplicate_count} likely dup</span>}</td>
+                  <td><span className="gh-pill" style={{ fontSize: 11 }}>{i.status}</span></td>
+                  <td className="text-right whitespace-nowrap">
+                    <button type="button" onClick={() => setReviewId(reviewId === i.id ? null : i.id)} className="gh-btn-ghost px-2 py-1 text-xs">
+                      {reviewId === i.id ? 'Close' : 'Review'}</button>
+                    {i.status === 'parsed' && (<>
+                      <button type="button" disabled={!!busyKey} className="gh-btn-ghost px-2 py-1 text-xs ml-1"
+                        onClick={() => act('commit', 'finance_commit_bank_import', { p_import_id: i.id },
+                          (o) => `Committed. ${o?.exact_duplicates ?? 0} exact duplicate(s) set aside; ${o?.likely_flagged ?? 0} possible duplicate(s) flagged for you to check.`)}>
+                        Commit</button>
+                      <button type="button" disabled={!!busyKey} onClick={() => { setDiscardFor(i); setDiscardReason(''); }} className="gh-btn-ghost px-2 py-1 text-xs ml-1">Discard</button>
+                    </>)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {reviewing && (
+        <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+          <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>{reviewing.file_name || 'Statement'} — transactions</div>
+          <div className="mb-2" style={{ fontSize: 11.5, color: C.textMute }}>
+            An exact duplicate of an earlier statement is set aside automatically; a possible duplicate is only flagged,
+            because dropping a real payment is worse than checking one twice. Matching happens in Reconciliation.
+          </div>
+          {txns === null ? <FinanceLoading /> : txns.length === 0 ? (
+            <div style={{ fontSize: 13, color: C.textMute }}>No transactions in this import.</div>
+          ) : (
+            <table className="w-full text-sm" style={{ color: C.text }}>
+              <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+                <th scope="col" className="py-1">Date</th><th scope="col">Description</th><th scope="col">Amount</th>
+                <th scope="col">Status</th><th scope="col"><span className="sr-only">Actions</span></th>
+              </tr></thead>
+              <tbody>
+                {txns.map((t) => (
+                  <tr key={t.id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                    <td className="py-1.5" style={{ fontSize: 12 }}>{t.posted_on}</td>
+                    <td style={{ maxWidth: 280, fontSize: 12.5 }}>{t.description_raw}{t.excluded_reason && <div style={{ fontSize: 11, color: C.textMute }}>Excluded: {t.excluded_reason}</div>}</td>
+                    <td style={{ fontWeight: 600, color: Number(t.amount) < 0 ? C.red : C.green }}>{phpFmt(Number(t.amount) || 0)}</td>
+                    <td>
+                      <span className="gh-pill" style={{ fontSize: 11 }}>{t.status}</span>
+                      {t.duplicate_kind === 'likely' && t.status === 'unmatched' && <span className="gh-pill ml-1" style={{ fontSize: 10, color: C.amber }}>possible duplicate</span>}
+                    </td>
+                    <td className="text-right whitespace-nowrap">
+                      {t.status === 'matched' ? <span style={{ fontSize: 11, color: C.textMute }}>matched</span> : (<>
+                        {t.status !== 'unmatched' && (
+                          <button type="button" disabled={!!busyKey} className="gh-btn-ghost px-2 py-1 text-xs"
+                            onClick={() => act(`txn:${t.id}`, 'finance_bank_txn_set_status', { p_id: t.id, p_status: 'unmatched' }, 'Transaction restored.')}>Restore</button>
+                        )}
+                        {t.status === 'unmatched' && (<>
+                          <button type="button" disabled={!!busyKey} className="gh-btn-ghost px-2 py-1 text-xs"
+                            onClick={() => act(`txn:${t.id}`, 'finance_bank_txn_set_status', { p_id: t.id, p_status: 'duplicate' }, 'Marked as a duplicate.')}>Duplicate</button>
+                          <button type="button" disabled={!!busyKey} className="gh-btn-ghost px-2 py-1 text-xs ml-1"
+                            onClick={() => { setExcludeFor(t); setExcludeReason(''); }}>Exclude</button>
+                        </>)}
+                      </>)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {excludeFor && (
+        <AccountModal title="Exclude this transaction?" subtitle={`${excludeFor.posted_on} · ${phpFmt(Number(excludeFor.amount) || 0)}`}
+          icon={EyeOff} canClose={!busyKey} onClose={() => setExcludeFor(null)}>
+          <label className="block mb-1.5" style={FINANCE_LABEL_STYLE}>Reason (required)</label>
+          <textarea value={excludeReason} onChange={(e) => setExcludeReason(e.target.value)} rows={3}
+            className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
+            style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button type="button" onClick={() => setExcludeFor(null)} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+            <button type="button" disabled={!!busyKey || !excludeReason.trim()} className="gh-btn-primary px-4 py-2 text-sm disabled:opacity-60"
+              onClick={async () => { if (await act('exclude', 'finance_bank_txn_set_status', { p_id: excludeFor.id, p_status: 'excluded', p_reason: excludeReason.trim() }, 'Transaction excluded.')) setExcludeFor(null); }}>
+              Exclude</button>
+          </div>
+        </AccountModal>
+      )}
+
+      {discardFor && (
+        <AccountModal title="Discard this import?" subtitle={discardFor.file_name} icon={Trash2} tone="danger"
+          canClose={!busyKey} onClose={() => setDiscardFor(null)}>
+          <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>Its staged rows are removed. The record that it was imported, and why it was discarded, stays in the audit trail.</p>
+          <label className="block mt-4 mb-1.5" style={FINANCE_LABEL_STYLE}>Reason</label>
+          <textarea value={discardReason} onChange={(e) => setDiscardReason(e.target.value)} rows={2}
+            className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
+            style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button type="button" onClick={() => setDiscardFor(null)} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+            <button type="button" disabled={!!busyKey || !discardReason.trim()} style={ADMIN_BTN_DANGER}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-60"
+              onClick={async () => {
+                if (await act('discard', 'finance_discard_bank_import', { p_import_id: discardFor.id, p_reason: discardReason.trim() }, 'Import discarded.')) {
+                  if (reviewId === discardFor.id) setReviewId(null);
+                  setDiscardFor(null);
+                }
+              }}>Discard import</button>
+          </div>
+        </AccountModal>
+      )}
+    </div>
+  );
+}
+
+// Reconcile an account against its statement. A reconciliation that does not reconcile
+// cannot close — every open transaction is matched or excluded with a reason first, so
+// a zero difference is always explained rather than merely zero.
+function FinanceReconcileCard({ call, onChanged }) {
+  const [accounts, setAccounts] = useState([]);
+  const [list, setList] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [openId, setOpenId] = useState(null);
+  const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
+  const [busyKey, setBusyKey] = useState('');
+  const [form, setForm] = useState({ accountId: '', start: '', end: '', opening: '', closing: '' });
+  const [choice, setChoice] = useState({});        // bank transaction id -> journal line id ('' = none)
+  const [balances, setBalances] = useState(null);  // { opening, closing } while editing
+  const [reopenReason, setReopenReason] = useState(null);
+
+  const loadList = useCallback(async () => {
+    try {
+      const [acc, recs] = await Promise.all([call('finance_accounts_list'), call('finance_reconciliations_list', { p_limit: 50 })]);
+      setAccounts((acc || []).filter((a) => ['cash', 'card'].includes(a.cash_flow_class)));
+      setList(recs || []);
+    } catch (e) { setErr(appErrorMessage(e, 'Could not load reconciliations.')); setList((p) => p || []); }
+  }, [call]);
+  const loadDetail = useCallback(async (id) => {
+    if (!id) { setDetail(null); return; }
+    try { setDetail(await call('finance_reconciliation_detail', { p_id: id })); }
+    catch (e) { setErr(appErrorMessage(e, 'Could not load that reconciliation.')); }
+  }, [call]);
+  useEffect(() => { loadList(); }, [loadList]);
+  useEffect(() => { setChoice({}); loadDetail(openId); }, [openId, loadDetail]);
+
+  const act = async (key, fn, args, done) => {
+    setBusyKey(key); setErr(''); setNotice('');
+    try {
+      const out = await call(fn, args);
+      if (done) setNotice(typeof done === 'function' ? done(out) : done);
+      await loadList(); await loadDetail(openId);
+      onChanged?.();
+      return out ?? true;
+    } catch (e) {
+      console.error('[finance] reconciliation write failed', { fn, code: e?.code, message: e?.message });
+      setErr(appErrorMessage(e, 'That change was not saved.'));
+      return null;
+    } finally { setBusyKey(''); }
+  };
+
+  const rec = detail?.reconciliation;
+  const isOpen = rec?.status === 'open';
+  const candidates = detail?.candidate_lines || [];
+  // The best guess for a bank row is a ledger line of the SAME signed amount, nearest in date.
+  const suggest = (t) => candidates
+    .filter((c) => Math.abs(Number(c.amount) - Number(t.amount)) < 0.005)
+    .sort((a, b) => Math.abs(new Date(a.entry_date) - new Date(t.posted_on)) - Math.abs(new Date(b.entry_date) - new Date(t.posted_on)))[0];
+
+  return (
+    <div className="space-y-4">
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
+
+      <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+        <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Reconciliations</div>
+        <div className="mb-3" style={{ fontSize: 11.5, color: C.textMute }}>
+          One open reconciliation per account. Enter the opening and closing balances exactly as the statement shows them.
+        </div>
+        <div className="grid gap-2 sm:grid-cols-6 items-end mb-3">
+          <label className="block sm:col-span-2"><span style={FINANCE_LABEL_STYLE}>Account</span>
+            <select value={form.accountId} onChange={(e) => setForm((f) => ({ ...f, accountId: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+              <option value="">— choose —</option>
+              {accounts.map((a) => <option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
+            </select></label>
+          {[['start', 'From', 'date'], ['end', 'To', 'date'], ['opening', 'Statement opening', 'number'], ['closing', 'Statement closing', 'number']].map(([k, label, type]) => (
+            <label key={k} className="block"><span style={FINANCE_LABEL_STYLE}>{label}</span>
+              <input type={type} step={type === 'number' ? '0.01' : undefined} value={form[k]}
+                onChange={(e) => setForm((f) => ({ ...f, [k]: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+          ))}
+        </div>
+        <div className="flex justify-end mb-3">
+          <button type="button" className="gh-btn-primary px-3 py-1.5 text-sm disabled:opacity-60"
+            disabled={!!busyKey || !form.accountId || !form.start || !form.end || form.opening === '' || form.closing === '' || form.end < form.start}
+            onClick={async () => {
+              const id = await act('open', 'finance_open_reconciliation', {
+                p_account_id: form.accountId, p_period_start: form.start, p_period_end: form.end,
+                p_statement_opening: Number(form.opening), p_statement_closing: Number(form.closing),
+              }, 'Reconciliation opened.');
+              if (id) { setForm({ accountId: '', start: '', end: '', opening: '', closing: '' }); setOpenId(id); }
+            }}>{busyKey === 'open' ? 'Opening…' : 'Start reconciliation'}</button>
+        </div>
+        {list === null ? <FinanceLoading /> : list.length === 0 ? (
+          <div style={{ fontSize: 13, color: C.textMute }}>No reconciliations yet.</div>
+        ) : (
+          <table className="w-full text-sm" style={{ color: C.text }}>
+            <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+              <th scope="col" className="py-1">Account</th><th scope="col">Period</th><th scope="col">Matched</th>
+              <th scope="col">Still open</th><th scope="col">Status</th><th scope="col"><span className="sr-only">Actions</span></th>
+            </tr></thead>
+            <tbody>
+              {list.map((r) => (
+                <tr key={r.id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                  <td className="py-1.5" style={{ fontSize: 12.5 }}>{r.account_code} · {r.account_name}</td>
+                  <td style={{ fontSize: 12 }}>{r.period_start} → {r.period_end}</td>
+                  <td>{r.matched_count}</td>
+                  <td style={{ color: Number(r.unmatched_count) > 0 ? C.amber : C.textMute }}>{r.unmatched_count}</td>
+                  <td><span className="gh-pill" style={{ fontSize: 11 }}>{r.status}</span></td>
+                  <td className="text-right">
+                    <button type="button" onClick={() => setOpenId(openId === r.id ? null : r.id)} className="gh-btn-ghost px-2 py-1 text-xs">
+                      {openId === r.id ? 'Close view' : 'Open'}</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {openId && !detail && <FinanceLoading label="Loading reconciliation…" />}
+      {detail && rec && (
+        <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+          <div className="flex flex-wrap items-center gap-3 mb-2">
+            <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>
+              {detail.account?.code} · {detail.account?.name} — {rec.period_start} → {rec.period_end}
+            </div>
+            <div className="ml-auto flex gap-2">
+              {isOpen ? (<>
+                <button type="button" disabled={!!busyKey} className="gh-btn-ghost px-3 py-1.5 text-xs"
+                  onClick={() => setBalances({ opening: rec.statement_opening ?? '', closing: rec.statement_closing ?? '' })}>Edit balances</button>
+                <button type="button" disabled={!!busyKey || detail.difference === null || Number(detail.difference) !== 0 || (detail.open_transactions || []).length > 0}
+                  className="px-3 py-1.5 rounded-xl text-xs font-bold text-white disabled:opacity-50" style={ADMIN_BTN_OK}
+                  onClick={() => act('close', 'finance_close_reconciliation', { p_id: rec.id }, 'Reconciliation closed — it balances.')}>
+                  Close reconciliation</button>
+              </>) : (
+                <button type="button" disabled={!!busyKey} className="gh-btn-ghost px-3 py-1.5 text-xs" onClick={() => setReopenReason('')}>Reopen</button>
+              )}
+            </div>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-4 mb-3">
+            {[['Statement opening', rec.statement_opening], ['Statement closing', rec.statement_closing], ['Cleared', detail.cleared]].map(([label, v]) => (
+              <div key={label} className="rounded-xl px-3 py-2" style={{ background: 'var(--wash)' }}>
+                <div style={{ fontSize: 11, color: C.textMute }}>{label}</div>
+                <div style={{ fontWeight: 700 }}>{v === null || v === undefined ? '—' : phpFmt(Number(v))}</div>
+              </div>
+            ))}
+            <div className="rounded-xl px-3 py-2" style={{ background: 'var(--wash)' }}>
+              <div style={{ fontSize: 11, color: C.textMute }}>Difference</div>
+              <div style={{ fontWeight: 700, color: detail.difference === null ? C.textMute : Number(detail.difference) === 0 ? C.green : C.amber }}>
+                {detail.difference === null ? 'Needs both balances' : phpFmt(Number(detail.difference))}
+              </div>
+            </div>
+          </div>
+
+          <div style={{ fontWeight: 600, fontSize: 13, color: C.text }} className="mb-1">Still to match ({(detail.open_transactions || []).length})</div>
+          {(detail.open_transactions || []).length === 0 ? (
+            <div className="mb-3" style={{ fontSize: 12.5, color: C.textMute }}>Every transaction in this period has been matched or excluded.</div>
+          ) : (
+            <table className="w-full text-sm mb-4" style={{ color: C.text }}>
+              <tbody>
+                {detail.open_transactions.map((t) => {
+                  const picked = choice[t.id] ?? (suggest(t)?.line_id || '');
+                  return (
+                    <tr key={t.id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                      <td className="py-1.5" style={{ fontSize: 12 }}>{t.posted_on}</td>
+                      <td style={{ fontSize: 12.5, maxWidth: 240 }}>{t.description}</td>
+                      <td style={{ fontWeight: 600 }}>{phpFmt(Number(t.amount) || 0)}</td>
+                      <td>
+                        <select value={picked} disabled={!isOpen} aria-label={`Ledger line for ${t.description}`}
+                          onChange={(e) => setChoice((c) => ({ ...c, [t.id]: e.target.value }))} className="gh-input" style={{ fontSize: 12, maxWidth: 260 }}>
+                          <option value="">No ledger line</option>
+                          {candidates.map((c) => <option key={c.line_id} value={c.line_id}>#{c.entry_no} {c.entry_date} · {phpFmt(Number(c.amount))} · {c.memo || ''}</option>)}
+                        </select>
+                      </td>
+                      <td className="text-right">
+                        {isOpen && (
+                          <button type="button" disabled={!!busyKey} className="gh-btn-ghost px-2 py-1 text-xs"
+                            onClick={() => act(`match:${t.id}`, 'finance_match_reconciliation_item', {
+                              p_reconciliation_id: rec.id, p_bank_transaction_id: t.id, p_journal_line_id: picked || null,
+                            })}>Match</button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+
+          <div style={{ fontWeight: 600, fontSize: 13, color: C.text }} className="mb-1">Matched ({(detail.items || []).length})</div>
+          {(detail.items || []).length === 0 ? (
+            <div style={{ fontSize: 12.5, color: C.textMute }}>Nothing matched yet.</div>
+          ) : (
+            <table className="w-full text-sm" style={{ color: C.text }}>
+              <tbody>
+                {detail.items.map((i) => (
+                  <tr key={i.id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                    <td className="py-1.5" style={{ fontSize: 12 }}>{i.posted_on}</td>
+                    <td style={{ fontSize: 12.5, maxWidth: 240 }}>{i.description}</td>
+                    <td style={{ fontWeight: 600 }}>{phpFmt(Number(i.matched_amount) || 0)}</td>
+                    <td style={{ fontSize: 12, color: C.textMute }}>{i.entry_no ? `#${i.entry_no} · ${i.entry_memo || ''}` : 'no ledger line'}</td>
+                    <td className="text-right">
+                      {isOpen && (
+                        <button type="button" disabled={!!busyKey} className="gh-btn-ghost px-2 py-1 text-xs"
+                          onClick={() => act(`unmatch:${i.id}`, 'finance_unmatch_reconciliation_item', { p_item_id: i.id }, 'Match undone.')}>Unmatch</button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {balances && rec && (
+        <AccountModal title="Statement balances" subtitle={`${rec.period_start} → ${rec.period_end}`} icon={Pencil}
+          canClose={!busyKey} onClose={() => setBalances(null)}>
+          <div className="grid gap-3 grid-cols-2">
+            {[['opening', 'Opening'], ['closing', 'Closing']].map(([k, label]) => (
+              <label key={k} className="block"><span style={FINANCE_LABEL_STYLE}>{label}</span>
+                <input type="number" step="0.01" value={balances[k]} onChange={(e) => setBalances((b) => ({ ...b, [k]: e.target.value }))}
+                  className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+            ))}
+          </div>
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button type="button" onClick={() => setBalances(null)} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+            <button type="button" disabled={!!busyKey || balances.opening === '' || balances.closing === ''} className="gh-btn-primary px-4 py-2 text-sm disabled:opacity-60"
+              onClick={async () => {
+                if (await act('balances', 'finance_update_reconciliation_statement',
+                  { p_id: rec.id, p_statement_opening: Number(balances.opening), p_statement_closing: Number(balances.closing) }, 'Balances saved.')) setBalances(null);
+              }}>Save balances</button>
+          </div>
+        </AccountModal>
+      )}
+
+      {reopenReason !== null && rec && (
+        <AccountModal title="Reopen this reconciliation?" icon={RotateCcw} tone="danger" canClose={!busyKey} onClose={() => setReopenReason(null)}>
+          <label className="block mb-1.5" style={FINANCE_LABEL_STYLE}>Reason (required)</label>
+          <textarea value={reopenReason} onChange={(e) => setReopenReason(e.target.value)} rows={3}
+            className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
+            style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button type="button" onClick={() => setReopenReason(null)} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+            <button type="button" disabled={!!busyKey || !reopenReason.trim()} style={ADMIN_BTN_DANGER}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-60"
+              onClick={async () => { if (await act('reopen', 'finance_reopen_reconciliation', { p_id: rec.id, p_reason: reopenReason.trim() }, 'Reconciliation reopened.')) setReopenReason(null); }}>
+              Reopen</button>
+          </div>
+        </AccountModal>
+      )}
+    </div>
+  );
+}
+
 function FinancialManagement() {
   // ★ staffDegraded MUST be destructured here. A component that reads it without
   //   destructuring throws a ReferenceError at render that the build cannot see and
@@ -12403,7 +12987,7 @@ function FinancialManagement() {
   // the tab you are looking at.
   useEffect(() => {
     // Setup loads itself: it is a form over live state, not a report over a date range.
-    if (!allowed || needsSetup || sub === 'setup') return;
+    if (!allowed || needsSetup || sub === 'setup' || sub === 'bank') return;
     const has = { overview: summary, sales: sales, ledger, pl, audit }[sub];
     if (has === null || has === undefined) load(sub);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -12773,6 +13357,14 @@ function FinancialManagement() {
 
           {/* ── Setup ──────────────────────────────────────────────────────── */}
           {sub === 'setup' && <FinanceSetupPanel call={call} onChanged={invalidateReports} />}
+
+          {/* ── Bank & Reconciliation ─────────────────────────────────────── */}
+          {sub === 'bank' && (
+            <div className="space-y-6">
+              <FinanceBankImportCard call={call} onChanged={invalidateReports} />
+              <FinanceReconcileCard call={call} onChanged={invalidateReports} />
+            </div>
+          )}
 
           {/* ── Audit ──────────────────────────────────────────────────────── */}
           {sub === 'audit' && !busy && audit && (

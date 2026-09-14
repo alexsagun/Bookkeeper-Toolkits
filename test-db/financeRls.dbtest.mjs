@@ -70,6 +70,8 @@ const FINANCE_RPCS = [
   ['finance_reconciliation_detail', { p_id: '00000000-0000-4000-8000-000000000000' }],
   ['finance_map_plan_income_account', { p_plan_key: 'sampler', p_account_id: null }],
   ['finance_unmatch_reconciliation_item', { p_item_id: '00000000-0000-4000-8000-000000000000' }],
+  ['finance_update_reconciliation_statement', {
+    p_id: '00000000-0000-4000-8000-000000000000', p_statement_opening: 0, p_statement_closing: 0 }],
   ['finance_save_recurring_template', {
     p_id: null, p_name: 'x', p_account_id: '00000000-0000-4000-8000-000000000000',
     p_contra_account_id: '00000000-0000-4000-8000-000000000001', p_amount: 1,

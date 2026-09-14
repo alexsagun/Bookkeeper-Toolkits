@@ -1559,8 +1559,15 @@ Charts are hand-rolled inline `<svg role="img">` modelled on `ProgressTrendChart
 
 - **`finance.manage`** — the 20th staff permission, held by **super_admin only**. Not by Operations
   Admin, who reviews payment proofs: *causing* a finance write is not *reading the books*.
-- **12 tables**, 47 functions (counting the restated `app_error_catalog()`), **33 client-callable
-  RPCs** (14 readers + 19 writers), plus the internal `finance_request_collected()` helper.
+- **12 tables**, 48 functions (counting the restated `app_error_catalog()`), **34 client-callable
+  RPCs** (14 readers + 20 writers), plus the internal `finance_request_collected()` helper.
+- **Seven sub-tabs**, all one component tree: Overview · Sales & Receivables · Income & Expenses (record
+  income/expense, reverse, recurring proposals) · Profit & Loss · Audit trail · **Bank & Reconciliation**
+  (client-side CSV/XLSX parse with a human-declared date format, stage → commit, exclude-with-reason,
+  match/unmatch, correct statement balances, close/reopen) · **Setup** (whether approvals can post,
+  default accounts, per-plan income accounts, backfill, month close/reopen, chart of accounts, go-live
+  opening balances). ★ `financeSql.test.mjs` asserts every `call('finance_…')` in the monolith names a
+  function #58 defines AND grants — with no linter or jsdom, that scan is the only guard on an RPC typo.
 - ★ **ZERO CLIENT WRITE PATHS.** Every finance table has **exactly one policy** — a SELECT gated on
   `finance.manage` — and **no** insert/update/delete policy anywhere; grants are revoked and only
   SELECT is given back. All mutation goes through SECURITY DEFINER RPCs, so the legacy system's 30

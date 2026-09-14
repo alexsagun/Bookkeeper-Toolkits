@@ -558,7 +558,7 @@ create table if not exists public.finance_audit_events (
                    'period_lock','period_unlock','bank_import_stage','bank_import_commit',
                    'bank_import_discard','bank_txn_status','reconciliation_open',
                    'reconciliation_match','reconciliation_close','reconciliation_reopen',
-                   'recurring_post','recurring_save','reconciliation_unmatch',
+                   'recurring_post','recurring_save','reconciliation_unmatch','reconciliation_update',
                    'plan_income_map','backfill_run')),
   target_kind    text not null,
   -- ★ NO FK, deliberately — the community_moderation_events reasoning. CASCADE
@@ -2854,6 +2854,46 @@ end;
 $fn$;
 revoke all on function public.finance_reopen_reconciliation(uuid, text) from public, anon, authenticated;
 grant execute on function public.finance_reopen_reconciliation(uuid, text) to authenticated;
+
+-- ★ A MISTYPED STATEMENT BALANCE MUST BE CORRECTABLE. Nothing else can change one, and a
+--   reconciliation cannot be deleted, so a single typo at open made that account
+--   permanently unreconcilable — while the close refusal told the admin to "enter both
+--   figures" through a function that did not exist. OPEN reconciliations only: a closed
+--   one stays frozen until it is reopened with a reason (finance_reconciliation_guard).
+create or replace function public.finance_update_reconciliation_statement(
+  p_id uuid, p_statement_opening numeric, p_statement_closing numeric
+) returns jsonb language plpgsql volatile security definer set search_path = public, pg_temp as $fn$
+declare v_rec public.finance_reconciliations%rowtype; v_actor uuid := auth.uid(); v_email text;
+begin
+  if not public.has_staff_permission('finance.manage') then
+    perform public.app_error('FORBIDDEN',
+      'Financial Management requires the finance.manage permission.', 403, null);
+  end if;
+  select * into v_rec from public.finance_reconciliations where id = p_id;
+  if not found or v_rec.status <> 'open' then
+    perform public.app_error('FINANCE_RECONCILIATION_CLOSED',
+      'Only an open reconciliation''s statement balances can be changed. Reopen it with a reason first.', 409, null);
+  end if;
+  if p_statement_opening is null or p_statement_closing is null then
+    perform public.app_error('FINANCE_RECONCILIATION_UNBALANCED',
+      'Enter both the opening and the closing balance from the statement.', 422, null);
+  end if;
+
+  update public.finance_reconciliations
+     set statement_opening = round(p_statement_opening, 2), statement_closing = round(p_statement_closing, 2)
+   where id = p_id;
+
+  select email into v_email from public.profiles where id = v_actor;
+  insert into public.finance_audit_events
+    (actor_user_id, actor_email, action, target_kind, target_id, detail)
+  values (v_actor, v_email, 'reconciliation_update', 'reconciliation', p_id,
+          jsonb_build_object('before', jsonb_build_object('opening', v_rec.statement_opening, 'closing', v_rec.statement_closing),
+                             'after',  jsonb_build_object('opening', round(p_statement_opening, 2), 'closing', round(p_statement_closing, 2))));
+  return jsonb_build_object('ok', true);
+end;
+$fn$;
+revoke all on function public.finance_update_reconciliation_statement(uuid, numeric, numeric) from public, anon, authenticated;
+grant execute on function public.finance_update_reconciliation_statement(uuid, numeric, numeric) to authenticated;
 
 -- A template PROPOSES. This is the only thing that turns one into a posting, and a
 -- human calls it. The key is per template per OCCURRENCE — per period for a monthly,
