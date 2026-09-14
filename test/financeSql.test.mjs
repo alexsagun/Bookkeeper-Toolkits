@@ -469,6 +469,39 @@ test('every financeModel constant the app uses is actually imported', () => {
     + 'That is a ReferenceError at render which the build cannot see and no unit test reaches.');
 });
 
+// ★ THE ONLY GUARD ON AN RPC NAME. There is no jsdom and no linter, so a typo in
+//   call('finance_…') builds, passes every other test, and fails only when a Super
+//   Admin clicks the button. Every finance function the app names must exist in #58
+//   AND be granted — and an internal one (never granted) must never be called.
+test('every finance RPC the app calls exists and is granted to authenticated', () => {
+  const app = read('src/BookkeeperPro.jsx');
+  const sql = codeOf(read(MIGRATION));
+  const called = [...new Set([...app.matchAll(/(?:call|supabase\.rpc)\(\s*'(finance_\w+)'/g)].map((m) => m[1]))];
+  assert.ok(called.length >= 6, `expected the app to call the finance RPCs, found ${called.length}`);
+  for (const name of called) {
+    assert.ok(sql.includes(`create or replace function public.${name}(`), `the app calls ${name}, which #58 does not define`);
+    assert.ok(sql.includes(`grant execute on function public.${name}(`),
+      `the app calls ${name}, which is not granted — it would 403 for the Super Admin too`);
+  }
+});
+
+// The Add-account form offers only pairs the CHECK accepts. A drift here is a form
+// whose every submission of the drifted pair fails with a bare 23514.
+test('the UI subtype pairs match the SQL pairing CHECK exactly', () => {
+  const app = read('src/BookkeeperPro.jsx');
+  const literal = /const FINANCE_SUBTYPES_BY_TYPE = \{([\s\S]*?)\n\};/.exec(app)?.[1];
+  assert.ok(literal, 'FINANCE_SUBTYPES_BY_TYPE could not be found in the monolith');
+  const ui = Object.fromEntries([...literal.matchAll(/(\w+): \[([^\]]*)\]/g)]
+    .map((m) => [m[1], [...m[2].matchAll(/'(\w+)'/g)].map((x) => x[1])]));
+
+  const check = /constraint finance_accounts_subtype_matches_type check \(([\s\S]*?)\)\),/.exec(codeOf(read(MIGRATION)))?.[1];
+  assert.ok(check, 'the pairing CHECK could not be found');
+  const db = Object.fromEntries([...check.matchAll(/account_type = '(\w+)'\s+and subtype in \(([^)]*)\)/g)]
+    .map((m) => [m[1], [...m[2].matchAll(/'(\w+)'/g)].map((x) => x[1])]));
+
+  assert.deepEqual(ui, db, 'FINANCE_SUBTYPES_BY_TYPE has drifted from finance_accounts_subtype_matches_type');
+});
+
 test('financeModel stays small — the studentProgress.js lesson', () => {
   const src = read('src/lib/financeModel.js');
   const exports = [...src.matchAll(/^export (?:const|function) (\w+)/gm)].map((m) => m[1]);

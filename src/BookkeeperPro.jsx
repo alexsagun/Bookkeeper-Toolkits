@@ -71,7 +71,7 @@ import {
   ENROLLMENT_PLANS_FALLBACK, PLAN_LABELS, PLAN_ENTITLEMENTS, planEntitlement,
   FULL_ENTITLEMENT, NO_ACCESS_ENTITLEMENT, filterStagesForEntitlement, extensionPrice, phpAmount,
 } from './lib/planCatalog';
-import { FINANCE_AGING_BUCKETS } from './lib/financeModel';
+import { FINANCE_ACCOUNT_TYPES, FINANCE_AGING_BUCKETS } from './lib/financeModel';
 import {
   COVER_INDUSTRIES, DEFAULT_INDUSTRY_ID, getIndustry, detectIndustry, scrubDashes,
 } from './lib/coverLetterIndustry';
@@ -11415,6 +11415,8 @@ const FINANCE_SUBTABS = [
   { key: 'ledger',     label: 'Income & Expenses' },
   { key: 'pl',         label: 'Profit & Loss' },
   { key: 'audit',      label: 'Audit trail' },
+  // Setup is where the books go live and where a broken default account is repaired.
+  { key: 'setup',      label: 'Setup' },
 ];
 
 /** One headline figure. `note` is where a metric says what it is NOT. */
@@ -11503,6 +11505,488 @@ function FinanceLoading({ label = 'Loading…' }) {
   );
 }
 
+// ── Financial Management: Setup ───────────────────────────────────────────────
+// Everything a Super Admin needs to take the books live and keep approvals posting.
+// ★ This panel is the in-app recovery for FINANCE_ACCOUNTS_NOT_CONFIGURED. Without it a
+//   deactivated default account stops EVERY Operations Admin approving ANY student,
+//   and the only fix was the SQL editor.
+// Every write is an RPC; every number comes back from SQL. `call` is the parent's
+// wrapper, so a missing migration still lands on the one "finish setup" card.
+const FINANCE_LABEL_STYLE = { fontSize: 11, fontWeight: 600, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.08em' };
+
+function FinanceSetupPanel({ call, onChanged }) {
+  const [state, setState] = useState(null);
+  const [accounts, setAccounts] = useState(null);
+  const [locks, setLocks] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
+  const [saving, setSaving] = useState('');
+  const [defaults, setDefaults] = useState({ income: '', cash: '', draw: '' });
+  const [lockPeriod, setLockPeriod] = useState('');
+  const [lockNote, setLockNote] = useState('');
+  const [unlockFor, setUnlockFor] = useState(null);
+  const [unlockReason, setUnlockReason] = useState('');
+  const [backfill, setBackfill] = useState(null);
+
+  const load = useCallback(async () => {
+    setLoading(true); setErr('');
+    try {
+      const [st, acc, lk] = await Promise.all([
+        call('finance_setup_state'),
+        call('finance_accounts_list', { p_include_inactive: true }),
+        call('finance_period_locks_list'),
+      ]);
+      setState(st); setAccounts(acc || []); setLocks(lk || []);
+      const cfg = st?.settings || {};
+      setDefaults({ income: cfg.default_income_account_id || '', cash: cfg.default_cash_account_id || '',
+        draw: cfg.default_owner_draw_account_id || '' });
+    } catch (e) {
+      console.error('[finance] setup load failed', { code: e?.code, message: e?.message });
+      setErr(appErrorMessage(e, 'Could not load the finance setup.'));
+    } finally {
+      setLoading(false);
+    }
+  }, [call]);
+
+  useEffect(() => { load(); }, [load]);
+
+  // One runner for every write: busy key, error copy from the catalog, reload, notify parent.
+  const run = async (key, fn, args, done) => {
+    setSaving(key); setErr(''); setNotice('');
+    try {
+      const out = await call(fn, args);
+      if (done) setNotice(typeof done === 'function' ? done(out) : done);
+      await load();
+      onChanged?.();
+      return out;
+    } catch (e) {
+      console.error('[finance] setup write failed', { fn, code: e?.code, message: e?.message });
+      setErr(appErrorMessage(e, 'That change was not saved.'));
+      return null;
+    } finally {
+      setSaving('');
+    }
+  };
+
+  if (loading && !state) return <FinanceLoading label="Loading setup…" />;
+  if (!state) {
+    return (
+      <div className="glass-card rounded-2xl p-6 text-center" style={{ background: GLASS.card }}>
+        {err && <AdminNotice kind="danger">{err}</AdminNotice>}
+        <button type="button" onClick={load} className="gh-btn-ghost mt-4 px-3 py-1.5 text-sm">Try again</button>
+      </div>
+    );
+  }
+
+  const active = (accounts || []).filter((a) => a.active);
+  const incomeAccounts = active.filter((a) => a.account_type === 'income');
+  const cashAccounts = active.filter((a) => a.account_type === 'asset' && ['cash', 'bank'].includes(a.subtype));
+  const drawAccounts = active.filter((a) => a.subtype === 'owner_draw');
+  const acctLabel = (a) => `${a.code} · ${a.name}`;
+  const lastClosable = (() => {
+    const [y, m] = String(state.current_period || '').split('-').map(Number);
+    if (!y || !m) return '';
+    const d = new Date(Date.UTC(y, m - 2, 1));
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+  })();
+
+  return (
+    <div className="space-y-4">
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
+
+      {state.approvals_can_post ? (
+        <AdminNotice kind="ok">
+          Approvals are posting: each approved payment records a balanced collection automatically.
+        </AdminNotice>
+      ) : (
+        <AdminNotice kind="danger">
+          <strong>Approvals are failing right now.</strong> The default income or cash account below is missing or
+          switched off, so approving a payment is refused until you fix it here.
+        </AdminNotice>
+      )}
+
+      {/* ── Default accounts ─────────────────────────────────────────────── */}
+      <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+        <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Default accounts</div>
+        <div className="mb-3" style={{ fontSize: 11.5, color: C.textMute }}>
+          Where an approved payment lands when its plan has no income account of its own.
+          Reporting timezone: {state.settings?.reporting_timezone} · currency {state.settings?.currency}.
+        </div>
+        <div className="grid gap-3 sm:grid-cols-3">
+          {[
+            ['income', 'Income account', incomeAccounts],
+            ['cash', 'Cash / bank account', cashAccounts],
+            ['draw', "Owner's draw account", drawAccounts],
+          ].map(([key, label, list]) => (
+            <label key={key} className="block">
+              <span style={FINANCE_LABEL_STYLE}>{label}</span>
+              <select value={defaults[key]} onChange={(e) => setDefaults((d) => ({ ...d, [key]: e.target.value }))}
+                className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+                <option value="">— choose —</option>
+                {list.map((a) => <option key={a.id} value={a.id}>{acctLabel(a)}</option>)}
+              </select>
+            </label>
+          ))}
+        </div>
+        <div className="mt-3 flex justify-end">
+          <button type="button" disabled={saving === 'defaults' || !defaults.income || !defaults.cash}
+            onClick={() => run('defaults', 'finance_save_settings', {
+              p_default_income_account_id: defaults.income || null,
+              p_default_cash_account_id: defaults.cash || null,
+              p_default_owner_draw_account_id: defaults.draw || null,
+            }, 'Default accounts saved.')}
+            className="gh-btn-primary px-3 py-1.5 text-sm disabled:opacity-60">
+            {saving === 'defaults' ? 'Saving…' : 'Save defaults'}
+          </button>
+        </div>
+      </div>
+
+      {/* ── Per-plan income accounts ─────────────────────────────────────── */}
+      <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+        <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Income account by plan</div>
+        <div className="mb-3" style={{ fontSize: 11.5, color: C.textMute }}>
+          So the profit & loss shows which programme earned what. A change applies to approvals from now on;
+          entries already posted stay where they are.
+        </div>
+        <table className="w-full text-sm" style={{ color: C.text }}>
+          <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+            <th scope="col" className="py-1">Plan</th><th scope="col">Posts to</th>
+          </tr></thead>
+          <tbody>
+            {(state.plans || []).map((p) => (
+              <tr key={p.key} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                <td className="py-1.5">{p.name}{!p.active && <span className="gh-pill ml-2" style={{ fontSize: 10 }}>inactive</span>}</td>
+                <td>
+                  <select value={p.income_account_id || ''} disabled={saving === `plan:${p.key}`}
+                    aria-label={`Income account for ${p.name}`}
+                    onChange={(e) => run(`plan:${p.key}`, 'finance_map_plan_income_account',
+                      { p_plan_key: p.key, p_account_id: e.target.value || null }, `${p.name} updated.`)}
+                    className="gh-input" style={{ fontSize: 13 }}>
+                    <option value="">Default income account</option>
+                    {incomeAccounts.map((a) => <option key={a.id} value={a.id}>{acctLabel(a)}</option>)}
+                  </select>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* ── Approvals not yet in the books ───────────────────────────────── */}
+      <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+        <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Approvals not yet in the books</div>
+        <div className="mb-3" style={{ fontSize: 11.5, color: C.textMute }}>
+          {Number(state.backfill_candidates) === 0
+            ? 'Every approved payment is already recorded.'
+            : `${state.backfill_candidates} approved payment(s) were approved before finance was switched on. Check first, then record them — running it twice never duplicates a payment.`}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button type="button" disabled={!!saving}
+            onClick={async () => setBackfill(await run('backfill-dry', 'finance_backfill_enrollment_collections', { p_dry_run: true }))}
+            className="gh-btn-ghost px-3 py-1.5 text-sm disabled:opacity-60">
+            {saving === 'backfill-dry' ? 'Checking…' : 'Check'}
+          </button>
+          {backfill?.dry_run && Number(backfill.candidates) > 0 && (
+            <button type="button" disabled={!!saving}
+              onClick={async () => setBackfill(await run('backfill', 'finance_backfill_enrollment_collections',
+                { p_dry_run: false }, (o) => `Recorded ${o?.posted ?? 0} payment(s).`))}
+              className="px-3 py-1.5 rounded-xl text-sm font-bold text-white disabled:opacity-60" style={ADMIN_BTN_OK}>
+              {saving === 'backfill' ? 'Recording…' : `Record ${backfill.candidates} payment(s)`}
+            </button>
+          )}
+          {backfill?.dry_run && Number(backfill.candidates) === 0 && (
+            <span style={{ fontSize: 12, color: C.textMute }}>Nothing to record.</span>
+          )}
+        </div>
+      </div>
+
+      {/* ── Closing a month ──────────────────────────────────────────────── */}
+      <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+        <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Close a month</div>
+        <div className="mb-3" style={{ fontSize: 11.5, color: C.textMute }}>
+          A closed month's figures can no longer move; corrections land in the next open month. Only a month that has
+          fully ended can be closed, so closing the books never blocks today's approvals.
+        </div>
+        <div className="flex flex-wrap items-end gap-2 mb-3">
+          <label className="text-xs" style={{ color: C.textMute }}>
+            Month<br />
+            <input type="month" value={lockPeriod} max={lastClosable} onChange={(e) => setLockPeriod(e.target.value)}
+              className="gh-input mt-0.5" style={{ fontSize: 13 }} />
+          </label>
+          <label className="text-xs flex-1 min-w-[10rem]" style={{ color: C.textMute }}>
+            Note (optional)<br />
+            <input value={lockNote} onChange={(e) => setLockNote(e.target.value)} className="gh-input mt-0.5 w-full" style={{ fontSize: 13 }} />
+          </label>
+          <button type="button" disabled={!lockPeriod || !!saving}
+            onClick={async () => {
+              const ok = await run('lock', 'finance_lock_period', { p_period_key: lockPeriod, p_note: lockNote || null },
+                `${lockPeriod} is closed.`);
+              if (ok) { setLockPeriod(''); setLockNote(''); }
+            }}
+            className="gh-btn-primary px-3 py-1.5 text-sm disabled:opacity-60">
+            <Lock size={14} className="inline -mt-0.5 mr-1" />{saving === 'lock' ? 'Closing…' : 'Close month'}
+          </button>
+        </div>
+        {(locks || []).length === 0 ? (
+          <div style={{ fontSize: 13, color: C.textMute }}>No month has been closed yet.</div>
+        ) : (
+          <table className="w-full text-sm" style={{ color: C.text }}>
+            <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+              <th scope="col" className="py-1">Month</th><th scope="col">Status</th><th scope="col">By</th>
+              <th scope="col">Note / reason</th><th scope="col"><span className="sr-only">Action</span></th>
+            </tr></thead>
+            <tbody>
+              {locks.map((l) => (
+                <tr key={l.period_key} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                  <td className="py-1.5" style={{ fontFamily: fontMono, fontSize: 12 }}>{l.period_key}</td>
+                  <td><span className="gh-pill" style={{ fontSize: 11 }}>{l.locked ? 'closed' : 'reopened'}</span></td>
+                  <td style={{ fontSize: 12 }}>{(l.locked ? l.locked_by_email : l.unlocked_by_email) || '—'}</td>
+                  <td style={{ fontSize: 12, color: C.textMute }}>{(l.locked ? l.note : l.unlock_reason) || '—'}</td>
+                  <td className="text-right">
+                    {l.locked && (
+                      <button type="button" onClick={() => { setUnlockFor(l); setUnlockReason(''); }}
+                        className="gh-btn-ghost px-2 py-1 text-xs"><Unlock size={12} className="inline -mt-0.5 mr-1" />Reopen</button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <FinanceAccountsCard accounts={accounts || []} saving={saving} run={run} />
+
+      {state.ledger_empty && !state.opening_balance_posted && (
+        <FinanceOpeningBalanceCard accounts={accounts || []} today={state.today} run={run} saving={saving} />
+      )}
+
+      {unlockFor && (
+        <AccountModal title={`Reopen ${unlockFor.period_key}?`} icon={Unlock} tone="danger"
+          canClose={saving !== 'unlock'} onClose={() => setUnlockFor(null)}>
+          <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+            Reopening lets that month's figures change again. The reason is kept on the record permanently.
+          </p>
+          <label className="block mt-4 mb-1.5" style={FINANCE_LABEL_STYLE}>Reason (required)</label>
+          <textarea value={unlockReason} onChange={(e) => setUnlockReason(e.target.value)} rows={3}
+            className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
+            style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button type="button" onClick={() => setUnlockFor(null)} disabled={saving === 'unlock'}
+              className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+            <button type="button" disabled={saving === 'unlock' || !unlockReason.trim()}
+              onClick={async () => {
+                const ok = await run('unlock', 'finance_unlock_period',
+                  { p_period_key: unlockFor.period_key, p_reason: unlockReason.trim() }, `${unlockFor.period_key} reopened.`);
+                if (ok) setUnlockFor(null);
+              }}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-60" style={ADMIN_BTN_DANGER}>
+              {saving === 'unlock' ? 'Reopening…' : 'Reopen month'}
+            </button>
+          </div>
+        </AccountModal>
+      )}
+    </div>
+  );
+}
+
+// The legal account_type -> subtype pairs. MIRRORS finance_accounts_subtype_matches_type
+// in #58, and financeSql.test.mjs fails if the two drift — the UI must never offer a
+// pair the CHECK refuses.
+const FINANCE_SUBTYPES_BY_TYPE = {
+  asset: ['cash', 'bank', 'other_current_asset', 'fixed_asset'],
+  liability: ['credit_card', 'accounts_payable', 'loan', 'other_liability'],
+  equity: ['owner_contribution', 'owner_draw', 'retained_earnings'],
+  income: ['operating_income', 'other_income'],
+  expense: ['cost_of_sales', 'operating_expense', 'other_expense'],
+};
+
+function FinanceAccountsCard({ accounts, saving, run }) {
+  const blank = { code: '', name: '', type: 'expense', subtype: 'operating_expense' };
+  const [adding, setAdding] = useState(null);
+  const saveAccount = (a, patch) => run(`acct:${a.id || 'new'}`, 'finance_save_account', {
+    p_id: a.id || null, p_code: a.code, p_name: a.name, p_account_type: a.account_type,
+    p_subtype: a.subtype, p_reporting_class: a.reporting_class, p_cash_flow_class: a.cash_flow_class,
+    p_parent_account_id: a.parent_account_id || null, p_sort_order: a.sort_order || 0,
+    p_active: a.active, p_description: a.description || null, ...patch,
+  });
+  const submitNew = async () => {
+    const subtype = adding.subtype;
+    const ok = await saveAccount({ code: adding.code.trim(), name: adding.name.trim(), account_type: adding.type,
+      subtype, active: true,
+      // Derived, never chosen: the CHECKs tie both to the subtype, so offering them
+      // as free choices would only offer ways to be refused.
+      reporting_class: subtype === 'owner_draw' ? 'owner_draw' : 'business',
+      cash_flow_class: ['cash', 'bank'].includes(subtype) ? 'cash' : subtype === 'credit_card' ? 'card' : 'none',
+    }, {});
+    if (ok) setAdding(null);
+  };
+
+  return (
+    <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+      <div className="flex items-center gap-2 mb-1">
+        <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Chart of accounts</div>
+        <button type="button" onClick={() => setAdding(blank)} className="gh-btn-ghost ml-auto px-3 py-1.5 text-xs">
+          <Plus size={13} className="inline -mt-0.5 mr-1" />Add account
+        </button>
+      </div>
+      <div className="mb-3" style={{ fontSize: 11.5, color: C.textMute }}>
+        Accounts are switched off, never deleted, so history always has somewhere to point. Built-in accounts and
+        any account a default or a plan posts to cannot be switched off.
+      </div>
+      <table className="w-full text-sm" style={{ color: C.text }}>
+        <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+          <th scope="col" className="py-1">Code</th><th scope="col">Name</th><th scope="col">Type</th>
+          <th scope="col">Balance</th><th scope="col">Status</th>
+        </tr></thead>
+        <tbody>
+          {accounts.map((a) => {
+            const locked = a.active && (a.is_system || a.in_use);
+            return (
+              <tr key={a.id} style={{ borderTop: `1px solid ${GLASS.border}`, opacity: a.active ? 1 : 0.55 }}>
+                <td className="py-1.5" style={{ fontFamily: fontMono, fontSize: 12 }}>{a.code}</td>
+                <td>{a.name}</td>
+                <td style={{ fontSize: 12, color: C.textMute }}>{a.account_type} · {String(a.subtype).replace(/_/g, ' ')}</td>
+                <td>{phpFmt(Number(a.balance) || 0)}</td>
+                <td>
+                  <button type="button" disabled={locked || saving === `acct:${a.id}`}
+                    title={locked ? (a.is_system ? 'Built-in account' : 'A default or a plan posts to this account') : ''}
+                    onClick={() => saveAccount(a, { p_active: !a.active })}
+                    className="gh-btn-ghost px-2 py-1 text-xs disabled:opacity-50">
+                    {a.active ? (locked ? 'In use' : 'Switch off') : 'Switch on'}
+                  </button>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+
+      {adding && (
+        <AccountModal title="Add an account" icon={Plus} canClose={saving !== 'acct:new'} onClose={() => setAdding(null)}>
+          <div className="grid gap-3">
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Code</span>
+              <input value={adding.code} onChange={(e) => setAdding((s) => ({ ...s, code: e.target.value }))}
+                placeholder="e.g. 5090" className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Name</span>
+              <input value={adding.name} onChange={(e) => setAdding((s) => ({ ...s, name: e.target.value }))}
+                className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Type</span>
+              <select value={adding.type} className="gh-input w-full mt-1" style={{ fontSize: 13 }}
+                onChange={(e) => setAdding((s) => ({ ...s, type: e.target.value, subtype: FINANCE_SUBTYPES_BY_TYPE[e.target.value][0] }))}>
+                {FINANCE_ACCOUNT_TYPES.map((t) => <option key={t.key} value={t.key}>{t.label || t.key}</option>)}
+              </select></label>
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Subtype</span>
+              <select value={adding.subtype} className="gh-input w-full mt-1" style={{ fontSize: 13 }}
+                onChange={(e) => setAdding((s) => ({ ...s, subtype: e.target.value }))}>
+                {(FINANCE_SUBTYPES_BY_TYPE[adding.type] || []).map((st) => <option key={st} value={st}>{st.replace(/_/g, ' ')}</option>)}
+              </select></label>
+            {adding.subtype === 'owner_draw' && (
+              <div style={{ fontSize: 12, color: C.textMute }}>Personal spending goes here, not to an expense — it leaves the P&amp;L.</div>
+            )}
+          </div>
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button type="button" onClick={() => setAdding(null)} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+            <button type="button" disabled={saving === 'acct:new' || !adding.code.trim() || !adding.name.trim()}
+              onClick={submitNew} className="gh-btn-primary px-4 py-2 text-sm disabled:opacity-60">
+              {saving === 'acct:new' ? 'Saving…' : 'Add account'}
+            </button>
+          </div>
+        </AccountModal>
+      )}
+    </div>
+  );
+}
+
+// Go-live balances: one balanced entry, cash and card against owner's equity, so the
+// cash position is true on day one rather than slowly becoming true.
+function FinanceOpeningBalanceCard({ accounts, today, run, saving }) {
+  const [open, setOpen] = useState(false);
+  const [date, setDate] = useState(today || todayISODate());
+  const [amounts, setAmounts] = useState({});
+  const [equityId, setEquityId] = useState('');
+  // ★ Minted when the dialog OPENS, not on submit, so a retry of the same dialog
+  //   reuses it and cannot post the balances twice.
+  const keyRef = useRef(null);
+
+  const balanceAccounts = accounts.filter((a) => a.active && ['cash', 'card'].includes(a.cash_flow_class));
+  const equity = accounts.filter((a) => a.active && a.subtype === 'owner_contribution');
+  const cents = (v) => Math.round((Number(v) || 0) * 100) / 100;
+
+  const lines = [];
+  let net = 0;
+  for (const a of balanceAccounts) {
+    const amt = cents(amounts[a.id]);
+    if (amt <= 0) continue;
+    if (a.cash_flow_class === 'card') { lines.push({ account_id: a.id, debit: 0, credit: amt }); net -= amt; }
+    else { lines.push({ account_id: a.id, debit: amt, credit: 0 }); net += amt; }
+  }
+  net = cents(net);
+  const eq = equityId || equity[0]?.id || '';
+  if (lines.length && net !== 0 && eq) {
+    lines.push(net > 0 ? { account_id: eq, debit: 0, credit: net } : { account_id: eq, debit: -net, credit: 0 });
+  }
+  const postable = lines.length >= 2 && !!eq;
+
+  const openDialog = () => { keyRef.current = crypto.randomUUID(); setAmounts({}); setDate(today || todayISODate()); setOpen(true); };
+  const submit = async () => {
+    const ok = await run('opening', 'finance_post_manual_entry', {
+      p_entry_date: date, p_entry_kind: 'opening_balance', p_memo: 'Opening balances',
+      p_lines: lines, p_idempotency_key: keyRef.current,
+    }, 'Opening balances recorded.');
+    if (ok) setOpen(false);
+  };
+
+  return (
+    <div className="glass-card rounded-2xl p-4" style={{ background: SHEEN }}>
+      <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Start with the right balances</div>
+      <div className="mt-1 mb-3" style={{ fontSize: 12, color: C.textSoft }}>
+        The books are empty. Enter what each bank, wallet and card actually holds or owes today, so the cash position
+        is right from day one. This card disappears once they are recorded.
+      </div>
+      <button type="button" onClick={openDialog} className="gh-btn-primary px-3 py-1.5 text-sm">Enter opening balances</button>
+
+      {open && (
+        <AccountModal title="Opening balances" icon={Wallet} maxW="max-w-lg" canClose={saving !== 'opening'} onClose={() => setOpen(false)}>
+          <label className="block mb-3"><span style={FINANCE_LABEL_STYLE}>As of</span>
+            <input type="date" value={date} max={today || undefined} onChange={(e) => setDate(e.target.value)}
+              className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+          <div className="grid gap-2">
+            {balanceAccounts.map((a) => (
+              <label key={a.id} className="flex items-center gap-3">
+                <span className="flex-1" style={{ fontSize: 13, color: C.text }}>
+                  {a.code} · {a.name}
+                  <span style={{ fontSize: 11, color: C.textMute }}>{a.cash_flow_class === 'card' ? ' (owed)' : ' (held)'}</span>
+                </span>
+                <input type="number" min="0" step="0.01" inputMode="decimal" value={amounts[a.id] ?? ''}
+                  aria-label={`Opening balance for ${a.name}`}
+                  onChange={(e) => setAmounts((m) => ({ ...m, [a.id]: e.target.value }))}
+                  className="gh-input w-36 text-right" style={{ fontSize: 13 }} />
+              </label>
+            ))}
+          </div>
+          <label className="block mt-3"><span style={FINANCE_LABEL_STYLE}>Balanced against</span>
+            <select value={eq} onChange={(e) => setEquityId(e.target.value)} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+              {equity.map((a) => <option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
+            </select></label>
+          <div className="mt-3" style={{ fontSize: 12, color: C.textMute }}>
+            Net {net >= 0 ? 'held' : 'owed'}: {phpFmt(Math.abs(net))} — recorded as owner's equity, not income.
+          </div>
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button type="button" onClick={() => setOpen(false)} disabled={saving === 'opening'} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+            <button type="button" disabled={!postable || saving === 'opening'} onClick={submit}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-60" style={ADMIN_BTN_OK}>
+              {saving === 'opening' ? 'Recording…' : 'Record balances'}
+            </button>
+          </div>
+        </AccountModal>
+      )}
+    </div>
+  );
+}
+
 function FinancialManagement() {
   // ★ staffDegraded MUST be destructured here. A component that reads it without
   //   destructuring throws a ReferenceError at render that the build cannot see and
@@ -11570,7 +12054,8 @@ function FinancialManagement() {
   // Lazy per sub-tab: nothing loads until it is opened, and the range re-loads only
   // the tab you are looking at.
   useEffect(() => {
-    if (!allowed || needsSetup) return;
+    // Setup loads itself: it is a form over live state, not a report over a date range.
+    if (!allowed || needsSetup || sub === 'setup') return;
     const has = { overview: summary, sales: sales, ledger, pl, audit }[sub];
     if (has === null || has === undefined) load(sub);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -11579,6 +12064,12 @@ function FinancialManagement() {
     //   nothing — and the table then asserted "Nobody has an outstanding balance in
     //   this view" from a filter that had never run.
   }, [sub, allowed, needsSetup, bucket]);
+
+  // A write anywhere changes every report, so drop the cached ones and let the
+  // lazy effect re-load whichever tab is opened next.
+  const invalidateReports = useCallback(() => {
+    setSummary(null); setSales(null); setRecv(null); setLedger(null); setPl(null); setAudit(null);
+  }, []);
 
   const exportReceivables = () => {
     const rows = (recv || []).map((r) => ({
@@ -11896,6 +12387,9 @@ function FinancialManagement() {
               )}
             </div>
           )}
+
+          {/* ── Setup ──────────────────────────────────────────────────────── */}
+          {sub === 'setup' && <FinanceSetupPanel call={call} onChanged={invalidateReports} />}
 
           {/* ── Audit ──────────────────────────────────────────────────────── */}
           {sub === 'audit' && !busy && audit && (
