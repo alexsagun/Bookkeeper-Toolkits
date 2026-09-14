@@ -59,9 +59,10 @@ running it.
 
 ## 3. The permission matrix
 
-Three fixed roles, 19 permissions, **32 grants**. #45 seeded 18 permissions and 26 grants; #52 added
+Three fixed roles, 20 permissions, **33 grants**. #45 seeded 18 permissions and 26 grants; #52 added
 `student_progress.read` for Super Admin and Operations Admin; **#56 gave both community
-permissions to Operations Admin AND Trainer**. Mirrored in
+permissions to Operations Admin AND Trainer**; **#58 added `finance.manage` for Super Admin
+alone**. Mirrored in
 [src/lib/staffRoles.js](src/lib/staffRoles.js); `test/staffRolesSql.test.mjs` fails if the two drift.
 
 | Permission | Super Admin | Operations Admin | Trainer |
@@ -85,8 +86,14 @@ permissions to Operations Admin AND Trainer**. Mirrored in
 | `community.moderate` — pin/lock/hide/delete | ✅ | ✅ | ✅ |
 | `sidebar.customize` — global navigation labels | ✅ | — | — |
 | `payment_settings.manage` — payment instructions | ✅ | — | — |
+| `finance.manage` — Financial Management (the business books) | ✅ | — | — |
 
-**Two omissions people ask about, both deliberate:**
+**Three omissions people ask about, all deliberate:**
+
+- **Neither Operations Admin nor Trainer holds `finance.manage`.** An Operations Admin approves
+  payment proofs, and each approval *posts* a collection to the ledger through a trigger. But
+  causing a finance write is not reading the books. Neither role sees the Financial Management
+  row, the direct URL renders the restricted screen, and every finance table and RPC refuses them.
 
 - **Operations Admin does not hold `students.extend_access`.** A discretionary extension creates paid
   access with no payment behind it, so it stays with the role that owns the money. Ops Admins extend

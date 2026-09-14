@@ -105,6 +105,35 @@ export const APP_ERROR_CODES = [
   'MODERATION_TARGET_NOT_FOUND',
   'MODERATION_ACTION_INVALID',
   'MODERATION_STATE_INVALID',
+  // ── Financial management (#58) ──
+  'FINANCE_ENTRY_UNBALANCED',
+  'FINANCE_ENTRY_IMMUTABLE',
+  'FINANCE_ENTRY_ALREADY_REVERSED',
+  'FINANCE_ENTRY_NOT_FOUND',
+  'FINANCE_ENTRY_FUTURE_DATED',
+  'FINANCE_ENTRY_KIND_INVALID',
+  'FINANCE_PERIOD_LOCKED',
+  'FINANCE_PERIOD_NOT_ELAPSED',
+  'FINANCE_PERIOD_INVALID',
+  'FINANCE_PERIOD_REASON_REQUIRED',
+  'FINANCE_REVERSAL_REASON_REQUIRED',
+  'FINANCE_ACCOUNTS_NOT_CONFIGURED',
+  'FINANCE_ACCOUNT_NOT_FOUND',
+  'FINANCE_SYSTEM_ACCOUNT',
+  'FINANCE_EVENT_AMOUNT_MISMATCH',
+  'FINANCE_AUDIT_IMMUTABLE',
+  'FINANCE_IDEMPOTENCY_REQUIRED',
+  'FINANCE_TIMEZONE_INVALID',
+  'FINANCE_BANK_TXN_IMMUTABLE',
+  'FINANCE_BANK_IMPORT_DUPLICATE',
+  'FINANCE_RECONCILIATION_CLOSED',
+  'FINANCE_RECONCILIATION_UNBALANCED',
+  'FINANCE_COLLECTION_RACE',
+  'FINANCE_BANK_IMPORT_STATE',
+  'FINANCE_BANK_TXN_NOT_FOUND',
+  'FINANCE_BANK_EXCLUDE_REASON_REQUIRED',
+  'FINANCE_ACCOUNT_IN_USE',
+  'FINANCE_RECURRING_INVALID',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -258,6 +287,76 @@ const COPY = {
   MODERATION_STATE_INVALID:
     'The author withdrew this themselves, so a moderator can’t restore it. Only they can post it '
     + 'again.',
+  // Financial management (#58). Read by the one person who can act on them, so
+  // each names the next move rather than restating the rule.
+  FINANCE_ENTRY_UNBALANCED:
+    'That entry doesn’t balance — every posting needs at least two lines, and the debits must equal '
+    + 'the credits. Nothing was saved.',
+  FINANCE_ENTRY_IMMUTABLE:
+    'Posted entries can’t be edited or deleted — that’s what makes the ledger trustworthy. Reverse '
+    + 'it instead and post a correction; both stay on the record.',
+  FINANCE_ENTRY_ALREADY_REVERSED:
+    'This entry has already been reversed. If the correction itself is wrong, reverse the reversal.',
+  FINANCE_ENTRY_NOT_FOUND: 'That journal entry no longer exists — refresh the ledger.',
+  FINANCE_ENTRY_FUTURE_DATED:
+    'An entry can’t be dated in the future. If this is a cost that repeats, set it up as a recurring '
+    + 'template — it will be offered to you when it falls due.',
+  FINANCE_ENTRY_KIND_INVALID: 'That entry type isn’t valid for this action.',
+  FINANCE_PERIOD_LOCKED:
+    'That month is closed, so its figures can’t move. Post the correction in an open period — the '
+    + 'ledger will tell you which one it lands in.',
+  FINANCE_PERIOD_NOT_ELAPSED:
+    'That month hasn’t finished yet. Only a completed month can be closed.',
+  FINANCE_PERIOD_INVALID: 'Periods look like 2026-09, and that one isn’t currently locked.',
+  FINANCE_PERIOD_REASON_REQUIRED:
+    'Reopening a closed month needs a reason — it’s the only record of why the books were changed '
+    + 'after they were closed.',
+  FINANCE_REVERSAL_REASON_REQUIRED:
+    'A reversal needs a reason. Six months from now it’s the only explanation of why this was undone.',
+  FINANCE_ACCOUNTS_NOT_CONFIGURED:
+    'Finance isn’t set up yet: the default income or cash account is missing or switched off. Set '
+    + 'them in Financial Management → Settings before approving any more payments.',
+  FINANCE_ACCOUNT_NOT_FOUND: 'That account no longer exists — refresh the chart of accounts.',
+  FINANCE_SYSTEM_ACCOUNT:
+    'That’s a built-in account the ledger depends on, so it can’t be switched off or retyped. You '
+    + 'can rename it.',
+  FINANCE_EVENT_AMOUNT_MISMATCH:
+    'The payment amount doesn’t match its journal entry, so nothing was saved. This is a bug — '
+    + 'please report it rather than retrying.',
+  FINANCE_AUDIT_IMMUTABLE: 'The finance audit trail is append-only; entries in it can never be changed.',
+  FINANCE_IDEMPOTENCY_REQUIRED:
+    'Reload the page and try again — the app didn’t send the safety key that stops a retry posting '
+    + 'the same amount twice.',
+  FINANCE_TIMEZONE_INVALID: 'That isn’t a timezone the server recognises. Pick one from the list.',
+  FINANCE_BANK_TXN_IMMUTABLE:
+    'The date, amount and description come from the statement and can’t be edited. If the row '
+    + 'shouldn’t count, exclude it and say why.',
+  FINANCE_BANK_IMPORT_DUPLICATE:
+    'That exact statement file has already been imported into this account. Importing it again '
+    + 'would double every transaction in it.',
+  FINANCE_RECONCILIATION_CLOSED:
+    'That reconciliation is closed and its items are frozen. Reopen it with a reason first.',
+  FINANCE_RECONCILIATION_UNBALANCED:
+    'This doesn’t reconcile yet — the difference isn’t zero. Match or exclude the remaining '
+    + 'transactions, then close it.',
+  FINANCE_COLLECTION_RACE:
+    'Another request recorded this payment a moment ago, so nothing was duplicated. Refresh and '
+    + 'check the enrollment before approving again.',
+  FINANCE_BANK_IMPORT_STATE:
+    'That import isn’t at a stage where this is possible — it may already be committed or '
+    + 'discarded. Refresh the imports list to see where it actually stands.',
+  FINANCE_BANK_TXN_NOT_FOUND:
+    'That transaction is no longer there — refresh the statement and try again.',
+  FINANCE_BANK_EXCLUDE_REASON_REQUIRED:
+    'Say why this transaction is excluded. Without a reason it’s indistinguishable from one that '
+    + 'simply went missing, which is exactly what you’ll be trying to work out when the account '
+    + 'fails to reconcile.',
+  FINANCE_ACCOUNT_IN_USE:
+    'That account is in use — it’s a default in Settings or the income account for a plan — so '
+    + 'switching it off would stop payments being recorded. Point those at another account first.',
+  FINANCE_RECURRING_INVALID:
+    'That recurring template isn’t complete. It needs a name, two different active accounts, an '
+    + 'amount above zero, and a schedule that matches its frequency.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };

@@ -93,6 +93,13 @@ export const STAFF_PERMISSIONS = [
     description: 'Rename stages, groups and tabs for every user in the app.' },
   { key: 'payment_settings.manage', category: 'Settings', label: 'Edit payment settings',
     description: 'Change the manual-payment instructions and the notification address.' },
+
+  // ── Finance (#58) ──────────────────────────────────────────────────────────
+  // ★ LAST, because the SQL seed lists it last and test/staffRolesSql.test.mjs
+  //   asserts deepEqual on ORDER, not set membership. Moving it moves nothing
+  //   about authorization and breaks the parity test.
+  { key: 'finance.manage', category: 'Finance', label: 'Manage business finances',
+    description: 'Open the Financial Management dashboard: the ledger, receivables, bank imports, reconciliation, the cash-basis P&L and the finance audit trail.' },
 ];
 
 /** Fast membership test + the canonical ordering. */
@@ -533,7 +540,44 @@ export const ADMIN_TAB_PERMISSION = {
   studentimports: 'students.import',
   batches: 'batches.manage',
   staffroles: 'staff.manage',
+  // Super Admin only. An Operations Admin reviews payment proofs — and CAUSES a
+  // finance write when they approve one — but may not read the books.
+  financialmanagement: 'finance.manage',
 };
+
+/**
+ * May this viewer SEE an admin nav row, and mount its screen?
+ *
+ * A RENDER decision only — every admin screen re-asks the database, and RLS plus
+ * the SECURITY DEFINER permission checks are the actual boundary.
+ *
+ * ★ WHY AN ACTIVE SUPER ADMIN PASSES WITHOUT THE KEY. The permission list is read
+ *   live from staff_role_permissions, which has no Super-Admin shortcut — so a key
+ *   that a not-yet-applied migration will CREATE is absent even for the one role that
+ *   will hold it. On 2026-09-14 that hid Financial Management from the Super Admin it
+ *   was built for: `finance.manage` is seeded by #58, #58 had not run, and the row was
+ *   silently filtered out of both rails with nothing on screen to say why. Passing
+ *   the Super Admin lets the screen render its own "finish database setup" card
+ *   instead, and it renders guidance, never data: the RPCs do not exist yet.
+ *
+ * ★ IT CANNOT LEAK. isSuperAdmin is derived by normalizeStaffContext() from the role
+ *   key alone, and only after a non-active status has collapsed to
+ *   EMPTY_STAFF_CONTEXT; this function re-checks both anyway, like staffCan(). No
+ *   Operations Admin or Trainer reaches the isSuperAdmin arm, and staffEntitlement()
+ *   already resolves FULL for exactly the role that does.
+ *
+ * Order is load-bearing: degraded → the legacy is_admin cache (which since #45 means
+ * "active Super Admin"); not ready → no, because absent permission data means "no";
+ * then Super Admin; then the permission itself.
+ */
+export function adminTabVisible(ctx, { staffReady = false, staffDegraded = false, profileIsAdmin = false } = {}, tabId) {
+  const perm = ADMIN_TAB_PERMISSION[tabId];
+  if (!perm) return true;
+  if (staffDegraded) return !!profileIsAdmin;
+  if (!staffReady) return false;
+  if (ctx && ctx.isStaff && ctx.status === 'active' && ctx.isSuperAdmin === true) return true;
+  return staffCan(ctx, perm);
+}
 
 /** Tab ids a Trainer needs in order to reach the course builder at all. */
 export const COURSE_AUTHORING_TABS = ['course', 'qbomastery', 'resumestrategy', 'interview'];

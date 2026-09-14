@@ -49,7 +49,7 @@ import {
 import { appErrorCode, appErrorMessage, isMigrationMissing } from './lib/appErrors';
 import {
   ADMIN_TAB_PERMISSION, STAFF_PERMISSIONS, STAFF_ROLES, STAFF_STATUSES,
-  canManageCourseClient, communityAuthority, lastSuperAdminGuard, permissionsForRole,
+  adminTabVisible, canManageCourseClient, communityAuthority, lastSuperAdminGuard, permissionsForRole,
   staffBypassesPaywall, staffEntitlement, staffInvitationPending, staffLandingTab,
   staffRole, staffStatusLabel,
 } from './lib/staffRoles';
@@ -71,6 +71,7 @@ import {
   ENROLLMENT_PLANS_FALLBACK, PLAN_LABELS, PLAN_ENTITLEMENTS, planEntitlement,
   FULL_ENTITLEMENT, NO_ACCESS_ENTITLEMENT, filterStagesForEntitlement, extensionPrice, phpAmount,
 } from './lib/planCatalog';
+import { FINANCE_AGING_BUCKETS } from './lib/financeModel';
 import {
   COVER_INDUSTRIES, DEFAULT_INDUSTRY_ID, getIndustry, detectIndustry, scrubDashes,
 } from './lib/coverLetterIndustry';
@@ -158,6 +159,7 @@ const TAB_ROUTES = {
   studentimports: '/admin/student-imports',
   batches: '/admin/batches',
   staffroles: '/admin/team',
+  financialmanagement: '/admin/financial-management',
   course: '/courses/accounting-101',
   qbomastery: '/courses/quickbooks-online-mastery',
   industryacc: '/industry-accounting',
@@ -207,7 +209,7 @@ const VALID_APP_TABS = new Set(Object.keys(TAB_ROUTES));
 // admin-only screens, the member community (a space, not a tool), and the legacy
 // mockinterview alias (a redirect, not a tool). Derived so the number can never drift
 // from the actual toolkit again.
-const NON_TOOL_TAB_IDS = new Set(['dashboard', 'progress', 'community', 'accessrequests', 'enrollments', 'studentimports', 'batches', 'staffroles', 'mockinterview']);
+const NON_TOOL_TAB_IDS = new Set(['dashboard', 'progress', 'community', 'accessrequests', 'enrollments', 'studentimports', 'batches', 'staffroles', 'financialmanagement', 'mockinterview']);
 const TOOL_COUNT = Object.keys(TAB_ROUTES).filter((id) => !NON_TOOL_TAB_IDS.has(id)).length;
 const INTERVIEW_SUBTAB_IDS = new Set(['winstrat', 'mock', 'common', 'accounting', 'body', 'jdgen', 'salary']);
 const APP_ROUTE_CHANGE_EVENT = 'bookkeeper:route-change';
@@ -444,6 +446,9 @@ const VOICE_TAB_INFO = {
   yearendcheck: { label: 'Year-End Checklist', stage: 'Client Management & Delivery', desc: 'Year-end close checklist.' },
   form1099:     { label: '1099 Prep', stage: 'Client Management & Delivery', desc: '1099 contractor prep tracker for year-end filing.' },
   accessrequests: { label: 'Access Requests', stage: 'Admin', desc: 'Admin screen: approve or reject new signups.', adminOnly: true },
+  // Navigation only. No amounts, balances, customer details or financial facts may
+  // ever appear here — this literal is published to the ElevenLabs knowledge base.
+  financialmanagement: { label: 'Financial Management', stage: 'Admin', desc: 'Admin screen: the business finance dashboard. Super Admin only.', adminOnly: true },
   enrollments:  { label: 'Enrollments', stage: 'Admin', desc: 'Admin screen: review payment receipts, approve subscriptions, and manage renewals.', adminOnly: true },
   studentimports: { label: 'Student Imports', stage: 'Admin', desc: 'Admin screen: migrate legacy Thinkific students — validate, map course-combos to plans, dry-run, and import accounts + memberships.', adminOnly: true },
   staffroles: { label: 'Team & Roles', stage: 'Admin', desc: 'Admin screen: invite staff and manage who they are — assign the Super Admin, Operations Admin and Trainer roles, suspend or revoke access, and read the audit trail of every role change. Super Admin only.', adminOnly: true },
@@ -7713,6 +7718,7 @@ function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImport
     case 'studentimports': return <StudentImports onCountChange={onImportCount} />;
     case 'batches': return <AdminBatches />;
     case 'staffroles': return <AdminStaffRoles />;
+    case 'financialmanagement': return <FinancialManagement />;
     case 'coa': return <CoaGenerator />;
     case 'course': return <Course />;
     case 'qbomastery': return <QBOMastery />;
@@ -7956,13 +7962,13 @@ export default function BookkeeperProToolkit() {
   //   This is a RENDER decision only. Every one of these screens re-asks the
   //   database, and RLS plus api/_lib/staffAuth.js are the actual boundary — that
   //   gate deliberately fails CLOSED, because it is protecting the service-role key.
-  const adminTabAllowed = useCallback((tabId) => {
-    const perm = ADMIN_TAB_PERMISSION[tabId];
-    if (!perm) return true;
-    if (staffDegraded) return !!profile?.is_admin;
-    if (!staffReady) return false;   // absent permission data means "no", not "yes"
-    return can(perm);
-  }, [staffReady, staffDegraded, profile?.is_admin, can]);
+  //   The decision itself lives in adminTabVisible() (src/lib/staffRoles.js) so the
+  //   truth table is a unit test rather than a comment — including the one arm this
+  //   callback used to lack: an active Super Admin sees a row whose permission key a
+  //   pending migration will create, and the screen explains the missing setup.
+  const adminTabAllowed = useCallback((tabId) => adminTabVisible(staff, {
+    staffReady, staffDegraded, profileIsAdmin: !!profile?.is_admin,
+  }, tabId), [staff, staffReady, staffDegraded, profile?.is_admin]);
 
   // Billing surfaces (membership/upgrade/extend/renew + the menu's billing items) exist only
   // for non-admins under an enforced enrollment — admins have no subscription, and with the
@@ -8392,6 +8398,9 @@ export default function BookkeeperProToolkit() {
   const adminNavItems = useMemo(() => ([
     { id: 'accessrequests', label: 'Access Requests', Icon: ShieldCheck, count: pendingCount, tone: C.amber },
     { id: 'enrollments', label: 'Enrollments', Icon: Receipt, count: enrollPendingCount, tone: C.amber },
+    // Directly after Enrollments, by owner decision: approving a payment there is what
+    // posts the collection into these books.
+    { id: 'financialmanagement', label: 'Financial Management', Icon: Landmark, count: 0, tone: C.primary },
     { id: 'studentimports', label: 'Student Imports', Icon: UploadCloud, count: importActiveCount, tone: C.primary },
     { id: 'batches', label: 'Batches', Icon: CalendarCheck, count: 0, tone: C.primary },
     { id: 'staffroles', label: 'Team & Roles', Icon: Users, count: 0, tone: C.primary },
@@ -11384,6 +11393,543 @@ function AdminBatches() {
             </button>
           </div>
         </AccountModal>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Financial Management (#58) — Super Admin only.
+// ─────────────────────────────────────────────────────────────────────────────
+// The native replacement for the Google Apps Script finance app. Every number on
+// this screen is computed in SQL and read off the response: the client re-derives
+// no total, no balance, no aging and no rate. See src/lib/financeModel.js for why
+// that discipline is enforced rather than encouraged.
+//
+// ★ Money renders through phpFmt, which KEEPS CENTAVOS. The legacy app formatted
+//   with maximumFractionDigits: 0 everywhere, so a ₱20,750.50 cost displayed as
+//   ₱20,751 in the ledger, the P&L and every export.
+const FINANCE_SUBTABS = [
+  { key: 'overview',   label: 'Overview' },
+  { key: 'sales',      label: 'Sales & Receivables' },
+  { key: 'ledger',     label: 'Income & Expenses' },
+  { key: 'pl',         label: 'Profit & Loss' },
+  { key: 'audit',      label: 'Audit trail' },
+];
+
+/** One headline figure. `note` is where a metric says what it is NOT. */
+function FinanceStat({ label, value, amount, note, tone, prior }) {
+  // ★ `value` is the FORMATTED string for display; `amount` is the raw number, and
+  //   the delta MUST be computed from `amount`. Computing it from `value` gives
+  //   Number("₱1,234.50") === NaN — then NaN >= 0 is false and phpFmt(NaN) returns
+  //   its "₱0" fallback, so every card with a prior period silently read
+  //   "▼ ₱0 vs previous": a confident, plausible "flat" that was never true. That is
+  //   precisely the fabricated zero the #52/#53 rule below exists to forbid, and
+  //   nothing in this repo could have caught it — it does not throw and does not
+  //   look broken.
+  const priorNum = Number(prior);
+  const amountNum = Number(amount);
+  const delta = (prior === null || prior === undefined
+    || !Number.isFinite(priorNum) || !Number.isFinite(amountNum))
+    ? null
+    : amountNum - priorNum;
+  return (
+    <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: C.textMute, textTransform: 'uppercase', letterSpacing: '0.07em' }}>
+        {label}
+      </div>
+      <div className="mt-1" style={{ fontFamily: fontDisplay, fontSize: 25, fontWeight: 800, color: tone || C.text, letterSpacing: '-0.02em' }}>
+        {value}
+      </div>
+      {/* ★ A missing prior window renders "—", never "0%". A fabricated zero reports
+          "flat" where the truth is "not yet measured" — the #52/#53 rule. */}
+      {prior !== undefined && (
+        <div className="mt-0.5" style={{ fontSize: 11.5, color: C.textMute }}>
+          {delta === null ? 'No prior period to compare' : `${delta >= 0 ? '▲' : '▼'} ${phpFmt(Math.abs(delta))} vs previous`}
+        </div>
+      )}
+      {note && <div className="mt-1" style={{ fontSize: 11, color: C.textMute, lineHeight: 1.4 }}>{note}</div>}
+    </div>
+  );
+}
+
+/** Collections vs expenses, hand-rolled inline SVG — no chart library, no CDN. */
+function FinanceTrend({ points }) {
+  const clean = (points || []).filter((p) => p && p.period);
+  if (clean.length < 2) {
+    return (
+      <div className="rounded-xl px-4 py-8 text-center" style={{ background: 'var(--wash)', color: C.textMute, fontSize: 12.5 }}>
+        A trend appears once there are two months of posted entries.
+      </div>
+    );
+  }
+  const W = 640; const H = 170; const pad = 26;
+  const vals = clean.flatMap((p) => [Number(p.collections) || 0, Number(p.expenses) || 0]);
+  const max = Math.max(1, ...vals);
+  const x = (i) => pad + (i * (W - pad * 2)) / Math.max(1, clean.length - 1);
+  const y = (v) => H - pad - ((Number(v) || 0) * (H - pad * 2)) / max;
+  const path = (key) => clean.map((p, i) => `${i ? 'L' : 'M'} ${x(i)} ${y(p[key])}`).join(' ');
+  const first = clean[0]; const last = clean[clean.length - 1];
+  return (
+    <figure aria-label="Collections and expenses by month">
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ minHeight: 150 }} role="img"
+        aria-label={`Collections moved from ${phpFmt(first.collections)} in ${first.period} to ${phpFmt(last.collections)} in ${last.period}, across ${clean.length} months.`}>
+        {[0, 0.5, 1].map((t) => (
+          <line key={t} x1={pad} x2={W - pad} y1={y(max * t)} y2={y(max * t)}
+            stroke="var(--glass-border-soft)" strokeDasharray="4 5" />
+        ))}
+        <path d={path('expenses')} fill="none" stroke={C.amber} strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+        <path d={path('collections')} fill="none" stroke={C.primary} strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
+        {clean.map((p, i) => (
+          <circle key={p.period} cx={x(i)} cy={y(p.collections)} r="3.5" fill={C.primaryHi} stroke={GLASS.card} strokeWidth="2" />
+        ))}
+      </svg>
+      <figcaption className="flex justify-between gap-3 text-[10px]" style={{ color: C.textMute }}>
+        <span>{first.period}</span>
+        <span style={{ color: C.primary }}>● Collections</span>
+        <span style={{ color: C.amber }}>● Expenses</span>
+        <span>{last.period}</span>
+      </figcaption>
+    </figure>
+  );
+}
+
+function FinanceLoading({ label = 'Loading…' }) {
+  return (
+    <div className="rounded-2xl p-8 flex items-center justify-center gap-2 text-sm"
+      style={{ background: 'var(--wash)', color: C.textMute }} role="status">
+      <Loader2 size={17} className="animate-spin" /> {label}
+    </div>
+  );
+}
+
+function FinancialManagement() {
+  // ★ staffDegraded MUST be destructured here. A component that reads it without
+  //   destructuring throws a ReferenceError at render that the build cannot see and
+  //   no unit test reaches — uiSafety.test.mjs §12 pins exactly this.
+  const { profile, staff, staffReady, staffDegraded } = useAuth();
+  // The same decision as the nav row, so the row and the screen can never disagree. An
+  // active Super Admin passes before #58 exists; the RPCs then return PGRST202 and the
+  // "Finish backend setup" card renders instead of any data.
+  const allowed = adminTabVisible(staff, {
+    staffReady, staffDegraded, profileIsAdmin: !!profile?.is_admin,
+  }, 'financialmanagement');
+
+  const [sub, setSub] = useState('overview');
+  const [from, setFrom] = useState(() => `${todayISODate().slice(0, 7)}-01`);
+  const [to, setTo] = useState(() => todayISODate());
+  const [needsSetup, setNeedsSetup] = useState(false);
+  const [err, setErr] = useState('');
+
+  const [summary, setSummary] = useState(null);
+  const [sales, setSales] = useState(null);
+  const [recv, setRecv] = useState(null);
+  const [bucket, setBucket] = useState('');
+  const [ledger, setLedger] = useState(null);
+  const [pl, setPl] = useState(null);
+  const [audit, setAudit] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const call = useCallback(async (fn, args) => {
+    const { data, error } = await supabase.rpc(fn, args);
+    if (error) {
+      // A missing migration is guidance, never a red error — the AdminBatches idiom.
+      if (isMigrationMissing(error)) { setNeedsSetup(true); return null; }
+      throw error;
+    }
+    return data;
+  }, []);
+
+  const load = useCallback(async (which) => {
+    if (!allowed) return;
+    setBusy(true); setErr('');
+    try {
+      if (which === 'overview') {
+        setSummary(await call('finance_dashboard_summary', { p_from: from, p_to: to }));
+      } else if (which === 'sales') {
+        const [s, r] = await Promise.all([
+          call('finance_sales_by_plan', { p_from: from, p_to: to }),
+          call('finance_receivables_worklist', { p_bucket: bucket || null, p_limit: 50 }),
+        ]);
+        setSales(s || []); setRecv(r || []);
+      } else if (which === 'ledger') {
+        setLedger(await call('finance_ledger_list', { p_from: from, p_to: to, p_limit: 100 }) || []);
+      } else if (which === 'pl') {
+        setPl(await call('finance_cash_basis_pl', { p_from: from, p_to: to, p_group: 'month' }) || []);
+      } else if (which === 'audit') {
+        setAudit(await call('finance_audit_feed', { p_limit: 50 }) || []);
+      }
+    } catch (e) {
+      console.error('[finance] load failed', { which, code: e?.code, message: e?.message });
+      setErr(appErrorMessage(e, 'Could not load this report.'));
+    } finally {
+      setBusy(false);
+    }
+  }, [allowed, call, from, to, bucket]);
+
+  // Lazy per sub-tab: nothing loads until it is opened, and the range re-loads only
+  // the tab you are looking at.
+  useEffect(() => {
+    if (!allowed || needsSetup) return;
+    const has = { overview: summary, sales: sales, ledger, pl, audit }[sub];
+    if (has === null || has === undefined) load(sub);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // ★ `bucket` belongs to the receivables QUERY, not to the date range behind
+    //   Apply. Without it here, clicking an aging chip cleared `recv` but re-ran
+    //   nothing — and the table then asserted "Nobody has an outstanding balance in
+    //   this view" from a filter that had never run.
+  }, [sub, allowed, needsSetup, bucket]);
+
+  const exportReceivables = () => {
+    const rows = (recv || []).map((r) => ({
+      student: r.full_name, email: r.student_email, plan: r.plan_name,
+      approved_on: r.approved_on, contract: r.contract_amount, collected: r.collected,
+      outstanding: r.outstanding, bucket: r.aging_bucket,
+      days_since_approval: r.days_since_approval, days_since_last_payment: r.days_since_last_payment,
+    }));
+    // toCsv is formula-injection safe; downloadFile already prepends the BOM, so we
+    // must NOT prepend another one.
+    downloadFile(toCsv(rows, Object.keys(rows[0] || { student: '' })),
+      `receivables-${todayISODate()}.csv`, 'text/csv;charset=utf-8');
+  };
+
+  if (!staffReady && !staffDegraded) {
+    return <div className="p-6"><FinanceLoading label="Checking your access…" /></div>;
+  }
+
+  if (!allowed) {
+    return (
+      <div>
+        <SectionHead eyebrow="Admin" title="Financial Management"
+          desc="The business ledger, receivables, reconciliation and the cash-basis profit & loss." gold />
+        <div className="mt-6 max-w-2xl mx-auto glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
+          <Landmark size={38} className="mx-auto mb-3" style={{ color: ROYAL }} />
+          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">Super Admin only</div>
+          <div className="text-slate-500 mt-2 text-sm max-w-md mx-auto">
+            Financial Management needs the <span style={{ fontFamily: fontMono }}>finance.manage</span> permission,
+            which only a Super Admin holds. Reviewing payment proofs does not include reading the books.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const s = summary || {};
+  const money = (v) => phpFmt(Number(v) || 0);
+
+  return (
+    <div>
+      <SectionHead eyebrow="Admin" title="Financial Management"
+        desc="Verified collections, receivables, expenses and a cash-basis profit & loss — posted as balanced double-entry journals. A management report, not a statutory financial statement." gold />
+
+      {needsSetup ? (
+        <div className="mt-6 max-w-3xl mx-auto glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
+          <Landmark size={40} className="mx-auto mb-3" style={{ color: ROYAL }} />
+          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">Finish backend setup</div>
+          <div className="text-slate-500 mt-2 text-sm max-w-md mx-auto">
+            Run <span style={{ fontFamily: fontMono }}>db/2026-09-09-financial-management.sql</span> (#58) in the
+            Supabase SQL Editor, then refresh this page. Until then nothing on this screen can load, so its
+            controls are hidden rather than left to fail.
+          </div>
+        </div>
+      ) : (
+        <div className="max-w-6xl mx-auto">
+          {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+
+          {/* Range + sub-tabs */}
+          <div className="flex flex-wrap items-end gap-3 mb-4">
+            <div role="tablist" aria-label="Financial Management sections" className="flex flex-wrap gap-1.5">
+              {FINANCE_SUBTABS.map((t) => (
+                <button key={t.key} type="button" role="tab" aria-selected={sub === t.key}
+                  onClick={() => setSub(t.key)}
+                  className="px-3 py-1.5 rounded-lg text-sm font-semibold transition"
+                  style={sub === t.key
+                    ? { background: C.primarySolid, color: 'white' }
+                    : { background: GLASS.card, color: C.textSoft, border: `1px solid ${GLASS.border}` }}>
+                  {t.label}
+                </button>
+              ))}
+            </div>
+            <div className="flex items-end gap-2 ml-auto">
+              <label className="text-xs" style={{ color: C.textMute }}>
+                From<br />
+                <input type="date" value={from} onChange={(e) => setFrom(e.target.value)}
+                  className="gh-input mt-0.5" style={{ fontSize: 13 }} />
+              </label>
+              <label className="text-xs" style={{ color: C.textMute }}>
+                To<br />
+                <input type="date" value={to} onChange={(e) => setTo(e.target.value)}
+                  className="gh-input mt-0.5" style={{ fontSize: 13 }} />
+              </label>
+              <button type="button" onClick={() => load(sub)} className="gh-btn-primary px-3 py-1.5 text-sm" disabled={busy}>
+                {busy ? 'Loading…' : 'Apply'}
+              </button>
+            </div>
+          </div>
+
+          {busy && <FinanceLoading />}
+
+          {/* ── Overview ───────────────────────────────────────────────────── */}
+          {sub === 'overview' && !busy && summary && (
+            <div className="space-y-4">
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                <FinanceStat label="Verified collections" value={money(s.verified_collections)}
+                  amount={s.verified_collections} tone={C.green} prior={s.collections_prior}
+                  note="Cash actually received and verified." />
+                <FinanceStat label="Approved contract value" value={money(s.approved_contract_value)}
+                  note="NOT revenue. What was agreed, by approval date — never added to collections." />
+                <FinanceStat label="Operational outstanding" value={money(s.operational_outstanding)}
+                  tone={C.amber}
+                  note="A management figure, not a ledger balance. Approved enrollments only." />
+                <FinanceStat label="Operating expenses" value={money(s.operating_expenses)}
+                  amount={s.operating_expenses} prior={s.expenses_prior}
+                  note="Business only. Personal spending is an owner's draw, not an expense." />
+                <FinanceStat label="Cash-basis net" value={money(s.cash_basis_net)}
+                  tone={Number(s.cash_basis_net) >= 0 ? C.green : C.red}
+                  note="Collections minus expenses. Excludes draws and transfers by construction." />
+                <FinanceStat label="Owner's draw" value={money(s.owner_draws)}
+                  note="Below the net line. Not an expense." />
+              </div>
+
+              <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+                <div className="flex items-center justify-between mb-2">
+                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Last 12 months</div>
+                  <div style={{ fontSize: 11, color: C.textMute }}>
+                    Cash basis · {s.pending_payment_proof_count ?? 0} payment proof(s) awaiting review
+                  </div>
+                </div>
+                <FinanceTrend points={s.monthly_trend} />
+              </div>
+
+              <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+                <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }} className="mb-2">Cash position</div>
+                {(s.cash_position || []).length === 0 ? (
+                  <div style={{ fontSize: 13, color: C.textMute }}>No cash or card accounts are active yet.</div>
+                ) : (
+                  <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                    {(s.cash_position || []).map((a) => (
+                      <div key={a.account_id} className="rounded-xl px-3 py-2" style={{ background: 'var(--wash)' }}>
+                        <div style={{ fontSize: 12, color: C.textMute }}>{a.code} · {a.name}</div>
+                        <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>{money(a.balance)}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className="mt-2" style={{ fontSize: 11, color: C.textMute }}>
+                  A balance, not a flow — do not add it to the figures above.
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── Sales & Receivables ────────────────────────────────────────── */}
+          {/* Each panel gates on its OWN state, as Overview does. Without it a failed
+              load leaves the state null and the empty-state copy prints beside the red
+              error banner — on a finance screen "nothing was posted" and "the query
+              failed" must never look alike. */}
+          {sub === 'sales' && !busy && sales && (
+            <div className="space-y-4">
+              <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+                <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }} className="mb-1">Sales by plan</div>
+                <div className="mb-2" style={{ fontSize: 11, color: C.textMute }}>
+                  Contract value by approval date; collections to date. Plan names are the snapshot taken at
+                  the time of sale, so retired packages keep their own names.
+                </div>
+                {(sales || []).length === 0 ? (
+                  <div style={{ fontSize: 13, color: C.textMute }}>No approved enrollments in this range.</div>
+                ) : (
+                  <table className="w-full text-sm" style={{ color: C.text }}>
+                    <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+                      <th scope="col" className="py-1">Plan</th><th scope="col">Students</th>
+                      <th scope="col">Contract</th><th scope="col">Collected</th>
+                      <th scope="col">Outstanding</th><th scope="col">Collected %</th>
+                    </tr></thead>
+                    <tbody>
+                      {(sales || []).map((r, i) => (
+                        <tr key={`${r.plan_name}-${i}`} style={{ borderTop: `1px solid ${GLASS.border}`, fontWeight: r.is_total_row ? 700 : 400 }}>
+                          <td className="py-1.5">{r.plan_name}</td>
+                          <td>{r.enrollment_count}</td>
+                          <td>{money(r.contract_value)}</td>
+                          <td>{money(r.collected)}</td>
+                          <td style={{ color: Number(r.outstanding) > 0 ? C.amber : C.textMute }}>{money(r.outstanding)}</td>
+                          <td>{r.collection_rate === null ? '—' : `${r.collection_rate}%`}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+
+              <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+                <div className="flex flex-wrap items-center gap-2 mb-2">
+                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Receivables</div>
+                  <div className="flex gap-1 ml-2">
+                    {['', ...FINANCE_AGING_BUCKETS.map((b) => b.key)].map((k) => (
+                      <button key={k || 'all'} type="button"
+                        onClick={() => { setBucket(k); setRecv(null); }}
+                        className="px-2 py-1 rounded-md text-xs font-semibold"
+                        style={bucket === k
+                          ? { background: C.primarySolid, color: 'white' }
+                          : { background: 'var(--wash)', color: C.textSoft }}>
+                        {k ? (FINANCE_AGING_BUCKETS.find((b) => b.key === k)?.label || k) : 'All'}
+                      </button>
+                    ))}
+                  </div>
+                  {(recv || []).length > 0 && (
+                    <button type="button" onClick={exportReceivables} className="gh-btn-ghost ml-auto px-3 py-1.5 text-xs">
+                      Export CSV
+                    </button>
+                  )}
+                </div>
+                {(recv || []).length === 0 ? (
+                  <div style={{ fontSize: 13, color: C.textMute }}>
+                    Nobody has an outstanding balance in this view. Only approved enrollments are counted —
+                    a lead who never converted is not a debtor.
+                  </div>
+                ) : (
+                  <>
+                    <div className="mb-2" style={{ fontSize: 12, color: C.textSoft }}>
+                      {recv[0].total_count} student(s) owe {money(recv[0].total_outstanding)}
+                    </div>
+                    <table className="w-full text-sm" style={{ color: C.text }}>
+                      <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+                        <th scope="col" className="py-1">Student</th><th scope="col">Plan</th>
+                        <th scope="col">Contract</th><th scope="col">Collected</th>
+                        <th scope="col">Outstanding</th><th scope="col">Since approval</th>
+                        <th scope="col">Since payment</th><th scope="col">Bucket</th>
+                      </tr></thead>
+                      <tbody>
+                        {recv.map((r) => (
+                          <tr key={r.enrollment_id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                            <td className="py-1.5">
+                              <div>{r.full_name}</div>
+                              <div style={{ fontSize: 11, color: C.textMute }}>{r.student_email}</div>
+                            </td>
+                            <td>{r.plan_name}</td>
+                            <td>{money(r.contract_amount)}</td>
+                            <td>{money(r.collected)}</td>
+                            <td style={{ color: C.amber, fontWeight: 700 }}>{money(r.outstanding)}</td>
+                            <td>{r.days_since_approval}d</td>
+                            <td>{r.days_since_last_payment}d</td>
+                            <td><span className="gh-pill" style={{ fontSize: 11 }}>{r.aging_bucket}</span></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    <div className="mt-2" style={{ fontSize: 11, color: C.textMute }}>
+                      Both ages are shown rather than one chosen for you: standard A/R ages from the invoice,
+                      but a payment-plan business needs the age since the last payment.
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ── Income & Expenses ──────────────────────────────────────────── */}
+          {sub === 'ledger' && !busy && ledger && (
+            <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+              <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }} className="mb-1">Journal</div>
+              <div className="mb-2" style={{ fontSize: 11, color: C.textMute }}>
+                One row per ENTRY, with its lines. Posted entries are immutable — a correction is a linked
+                reversal, and both stay on the record.
+              </div>
+              {(ledger || []).length === 0 ? (
+                <div style={{ fontSize: 13, color: C.textMute }}>No entries posted in this range.</div>
+              ) : (
+                <table className="w-full text-sm" style={{ color: C.text }}>
+                  <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+                    <th scope="col" className="py-1">#</th><th scope="col">Date</th><th scope="col">Kind</th>
+                    <th scope="col">Memo</th><th scope="col">Amount</th><th scope="col">Lines</th>
+                  </tr></thead>
+                  <tbody>
+                    {ledger.map((e) => (
+                      <tr key={e.entry_id} style={{ borderTop: `1px solid ${GLASS.border}`,
+                        textDecoration: e.reversed_by_entry_id ? 'line-through' : 'none',
+                        opacity: e.reversed_by_entry_id ? 0.6 : 1 }}>
+                        <td className="py-1.5" style={{ fontFamily: fontMono, fontSize: 12 }}>{e.entry_no}</td>
+                        <td>{e.entry_date}</td>
+                        <td><span className="gh-pill" style={{ fontSize: 11 }}>{e.entry_kind}</span></td>
+                        <td style={{ maxWidth: 260 }}>{e.memo}</td>
+                        <td style={{ fontWeight: 700 }}>{money(e.total_amount)}</td>
+                        <td style={{ fontSize: 11, color: C.textMute }}>
+                          {(e.lines || []).map((l) => `${l.account_code} ${l.debit > 0 ? 'Dr' : 'Cr'}`).join(' · ')}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
+
+          {/* ── Profit & Loss ──────────────────────────────────────────────── */}
+          {sub === 'pl' && !busy && pl && (
+            <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+              <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }} className="mb-1">
+                Cash-Basis Management P&amp;L
+              </div>
+              <div className="mb-3" style={{ fontSize: 11, color: C.textMute }}>
+                Basis: cash · generated {todayISODate()}. A management report, not a statutory financial
+                statement. There is no accrual mode and no receivable account in the chart. Owner's draws and
+                transfers cannot appear here.
+              </div>
+              {(pl || []).length === 0 ? (
+                <div style={{ fontSize: 13, color: C.textMute }}>Nothing posted in this range.</div>
+              ) : (
+                <table className="w-full text-sm" style={{ color: C.text }}>
+                  <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+                    <th scope="col" className="py-1">Period</th><th scope="col">Section</th>
+                    <th scope="col">Account</th><th scope="col">Amount</th>
+                  </tr></thead>
+                  <tbody>
+                    {pl.map((r, i) => (
+                      <tr key={`${r.period_key}-${r.account_id}-${i}`} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                        <td className="py-1.5" style={{ fontFamily: fontMono, fontSize: 12 }}>{r.period_key}</td>
+                        <td style={{ fontSize: 12, color: C.textMute }}>{String(r.section || '').replace(/_/g, ' ')}</td>
+                        <td>{r.account_code} · {r.account_name}</td>
+                        <td style={{ fontWeight: 600 }}>{money(r.amount)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
+
+          {/* ── Audit ──────────────────────────────────────────────────────── */}
+          {sub === 'audit' && !busy && audit && (
+            <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+              <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }} className="mb-1">Finance audit trail</div>
+              <div className="mb-2" style={{ fontSize: 11, color: C.textMute }}>
+                Append-only. Every post, reversal, lock, import and reconciliation is here, with the amount as
+                a typed column rather than a formatted string.
+              </div>
+              {(audit || []).length === 0 ? (
+                <div style={{ fontSize: 13, color: C.textMute }}>Nothing has been recorded yet.</div>
+              ) : (
+                <table className="w-full text-sm" style={{ color: C.text }}>
+                  <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+                    <th scope="col" className="py-1">When</th><th scope="col">Who</th><th scope="col">Action</th>
+                    <th scope="col">Target</th><th scope="col">Amount</th><th scope="col">Reason</th>
+                  </tr></thead>
+                  <tbody>
+                    {audit.map((a) => (
+                      <tr key={a.id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                        <td className="py-1.5" style={{ fontSize: 12 }}>{String(a.created_at || '').slice(0, 16).replace('T', ' ')}</td>
+                        <td style={{ fontSize: 12 }}>{a.actor_email || '—'}</td>
+                        <td><span className="gh-pill" style={{ fontSize: 11 }}>{String(a.action || '').replace(/_/g, ' ')}</span></td>
+                        <td style={{ fontSize: 12, color: C.textMute }}>{a.target_kind}</td>
+                        <td>{a.amount === null || a.amount === undefined ? '—' : money(a.amount)}</td>
+                        <td style={{ fontSize: 12, color: C.textMute, maxWidth: 220 }}>{a.reason || '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
+        </div>
       )}
     </div>
   );

@@ -33,6 +33,14 @@ const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => readFileSync(join(REPO, rel), 'utf8').replace(/\r\n/g, '\n');
 
 const MIGRATION = 'db/2026-09-05-community-staff-authority.sql';
+// ★ app_error_catalog() is a single VALUES list, so every migration that touches it
+//   restates the WHOLE thing. The "drops no existing code" invariant therefore belongs
+//   to whichever file currently OWNS the catalog — not to #56, which is frozen history
+//   and can never gain a code added after it. Pointing the check at a superseded
+//   definition is strictly weaker than pointing it at the one that runs last.
+//   Same idiom as CURRENT_SEED_MIGRATION in test/staffRolesSql.test.mjs: when a new
+//   migration restates the catalog, repoint this.
+const CURRENT_CATALOG_MIGRATION = 'db/2026-09-09-financial-management.sql';
 const BOOTSTRAP = 'db/000_full_database_bootstrap.sql';
 const CHANNELS = 'db/2026-08-18-community-channels.sql';
 const FILES = [MIGRATION, BOOTSTRAP];
@@ -548,7 +556,7 @@ test('the three new error codes are in lockstep across SQL and the client', () =
 });
 
 test('the catalog rewrite drops no existing code', () => {
-  const sql = read(MIGRATION);
+  const sql = read(CURRENT_CATALOG_MIGRATION);
   const at = sql.indexOf('create or replace function public.app_error_catalog()');
   const catalog = sql.slice(at, sql.indexOf('$cat$;', at));
   for (const code of APP_ERROR_CODES) {

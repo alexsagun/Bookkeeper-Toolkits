@@ -1077,10 +1077,10 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   staff-activation-consistency (#50) → access-request-staff-target (#51) →
   student-progress-rankings (#52) → progress-rankings-followup (#53) →
   progress-course-family-scoping (#54) → approve-rpc-grant-revoke (#55) →
-  community-staff-authority (#56) → lesson-video-quicktime (#57)** — see the Staff-authorization
+  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58)** — see the Staff-authorization
   and Progress & Rankings sections for what each does. **#57**
   ([db/2026-09-08-lesson-video-quicktime.sql](db/2026-09-08-lesson-video-quicktime.sql), fold
-  **§44**, the last one) widens `course-videos.allowed_mime_types` to
+  **§44**) widens `course-videos.allowed_mime_types` to
   `video/mp4 + video/quicktime` so an iPhone/Mac `.mov` uploads instead of being refused.
   Additive, upload-path only, no policy/function/column change — but **run it before or with the
   deploy**: the new client sends the file's real content type, so a `.mov` against an unwidened
@@ -1310,7 +1310,8 @@ That direction is the whole safety argument. **Never repair a missed check by ha
 role `is_admin = true`.**
 
 - **Tables** (`db/2026-08-25-staff-authorization.sql`, #45): `staff_roles` / `staff_permissions` /
-  `staff_role_permissions` (the 19 × 3 matrix, **28 grants** — #52 added `student_progress.read`) → `staff_memberships` (ONE row per
+  `staff_role_permissions` (the 20 × 3 matrix, **33 grants** — #52 added `student_progress.read`, #56 the
+  two community keys to both non-super roles, #58 `finance.manage` to super_admin alone) → `staff_memberships` (ONE row per
   user, mutated in place; only `status='active'` confers authority, which is what makes a suspension
   take effect on the next *request* rather than the next token refresh) → `staff_role_events`
   (append-only; FKs `on delete set null` + denormalized email snapshots, so deleting an Auth account
@@ -1542,6 +1543,81 @@ role `is_admin = true`.**
   ★ **Ship the SQL and the client together.** A pre-#56 bundle PATCHes `community_posts`
   directly, which still works for a Super Admin and 42501s for everyone else.
 - Setup + the full permission matrix: **[STAFF_ROLES_SETUP.md](STAFF_ROLES_SETUP.md)**.
+
+## Financial Management — the business ledger, Super Admin only (#58)
+
+Tab id `financialmanagement`, route `/admin/financial-management`, an admin-nav row after Team & Roles.
+Migration [db/2026-09-09-financial-management.sql](db/2026-09-09-financial-management.sql), folded
+verbatim as bootstrap **§45**. The native replacement for the Google Apps Script finance app in
+`Google Financial script/` — which had **98 server functions and exactly ONE server-side authorization
+check**, so 30 privileged mutations (reconcile, import, post to the ledger, mass email) were
+unauthenticated endpoints.
+
+**No `api/` route and no new dependency.** Like every other admin screen it calls `supabase.rpc(...)`
+directly; the three screens that use `api/admin/*` do so only because they need the service-role key.
+Charts are hand-rolled inline `<svg role="img">` modelled on `ProgressTrendChart` — never a CDN.
+
+- **`finance.manage`** — the 20th staff permission, held by **super_admin only**. Not by Operations
+  Admin, who reviews payment proofs: *causing* a finance write is not *reading the books*.
+- **12 tables**, 47 functions (counting the restated `app_error_catalog()`), **33 client-callable
+  RPCs** (14 readers + 19 writers), plus the internal `finance_request_collected()` helper.
+- ★ **ZERO CLIENT WRITE PATHS.** Every finance table has **exactly one policy** — a SELECT gated on
+  `finance.manage` — and **no** insert/update/delete policy anywhere; grants are revoked and only
+  SELECT is given back. All mutation goes through SECURITY DEFINER RPCs, so the legacy system's 30
+  unguarded mutations are structurally unreachable rather than merely gated. This is deliberately
+  stricter than the community tables, whose blanket `FOR ALL` policies are a raw PostgREST write path.
+- ★ **DEFECTS ARE UNREPRESENTABLE, NOT FILTERED.** `subtype` has no `accounts_receivable`, so no
+  receivable account can exist, so no accrual revenue entry can exist — the legacy
+  `gross = collections + outstanding` has nowhere to live. A CHECK forbids any income/expense account
+  from being anything but `reporting_class = 'business'`, so personal spending cannot be an expense
+  (it is an **owner's draw**, leaving the P&L while cash still ties). `check ((debit > 0) <> (credit > 0))`
+  makes the legacy single-entry row — 228 rows, all positive, sign carried in an `AccountType` column —
+  impossible to insert.
+- ★ **THE APPROVAL HOOK.** `after update on enrollment_requests` with
+  `when (new.status = 'approved' and old.status is distinct from 'approved')` — without the WHEN it
+  fires on every `admin_notes` edit. It posts a balanced collection **in the approver's transaction**,
+  keyed `'enrollment:' || request_id || ':collection'`. It is SECURITY DEFINER (RLS does not apply)
+  and revoked from every role, so it is reachable **only as a trigger** and has no argument surface.
+  It deliberately contains **no `has_staff_permission` check** — `auth.uid()` is unchanged inside a
+  SECURITY DEFINER chain, so one there would refuse every Operations Admin approval. Its authorization
+  is structural, and rests on **both** halves of #48: `enrollment_self_approval_guard` (you cannot
+  approve your own request) **and** `enroll_req_super_write` (a reviewer cannot forge one and approve
+  their own forgery). The preflight asserts both. `admin_finalize_enrollment` is **not retyped** —
+  the trigger is additive, avoiding the #33/#34 failure mode.
+- ★ **NEVER `alter table … force row level security`** on a finance table: it subjects the table
+  OWNER to policies and breaks that trigger. It looks like hardening; it is a breakage.
+- ★ **ONE IDEMPOTENCY NAMESPACE.** `finance_payment_events.idempotency_key` is `not null unique`, and
+  the hook, the backfill, manual entries, recurring posting and reversals all mint into
+  it — so the approval/backfill overlap is a no-op instead of the legacy daily job's re-recognition of
+  the same receivable as revenue *every day it stayed open*.
+- ★ **A LOCKED PERIOD CAN NEVER BLOCK AN APPROVAL.** `finance_lock_period` refuses unless the period
+  has fully elapsed **in the reporting timezone** (`batch_is_past()`'s reasoning applied to
+  accounting). An approval is dated today, always in the current period — so "accounting closed the
+  month and now nobody can approve a student" cannot happen, and no carve-out exists. A reversal into
+  a locked period never silently back-dates and never silently refuses: it **returns the period it
+  landed in** so the UI can say *"this will be corrected in October, not September."*
+- **Cash basis by construction** — no `p_basis` argument exists, so the basis cannot be misreported.
+  The legacy selector was echoed back and branched on nothing.
+- **Money keeps centavos** (`phpFmt`); the legacy app rounded them away everywhere, so ₱20,750.50
+  displayed as ₱20,751 in the ledger, the P&L and every export.
+- ★ **THERE IS NO LEGACY-DATA IMPORT, BY OWNER DECISION (2026-09-12).** The Apps Script workbook
+  showed the *shape* of the data only; no student was ever onboarded onto it. An earlier draft staged
+  it into four `finance_legacy_*` tables; they were removed before #58 was applied anywhere. Every
+  figure comes from Toolkit approvals and entries a Super Admin records. Do not reintroduce an
+  importer — `financeSql.test.mjs` fails on any `finance_legacy_` object in executable SQL.
+- ★ **ONE DEFINITION OF "COLLECTED".** `finance_request_collected(uuid)` is the only place the three
+  reports (dashboard outstanding, sales by plan, receivables worklist) learn what a request has paid:
+  a **reversed** collection does not count, and an outgoing event (a refund) **subtracts**. The
+  approval date is `coalesce(reviewed_at, created_at)` in the business timezone in all three.
+- **Per-plan income accounts:** `enrollment_plans.finance_income_account_id` (nullable → the settings
+  default). The hook uses it only when it is an ACTIVE income account and otherwise **falls back**
+  rather than refusing — a refusal there blocks every approval of that plan.
+- **Out of scope, deliberately:** Zoom, the to-do board, announcements, and receivable reminder
+  *sending* (the legacy path is an unauthenticated relay whose reminder counter resets whenever anyone
+  edits the subject line). The worklist still ships with aging and history.
+- Client mirror: [src/lib/financeModel.js](src/lib/financeModel.js) — **four exports, and it stays
+  four** (the `studentProgress.js` lesson). Suites: `test/financeSql.test.mjs`,
+  `test-db/financeRls.dbtest.mjs`.
 
 ## Progress & Rankings — learning analytics and privacy-safe leaderboards (#52)
 
@@ -2409,6 +2485,22 @@ docs **in the same change**:
   ★ The `created_at` bypass stays `is_super_admin()`. Backdating is forgery, not moderation.
   ★ The UPDATE-branch freeze in `community_posts_guard()` must stay gated on
   `community.moderate`: without it the RPCs silently no-op and still return success.
+- **Changing what the Financial Management dashboard may report, or who may open it** → the finance
+  half moves as one: `db/2026-09-09-financial-management.sql` ↔ **bootstrap fold §45** ↔
+  `FINANCE_ACCOUNT_TYPES` / `FINANCE_REPORTING_CLASSES` / `FINANCE_AGING_BUCKETS` in
+  [src/lib/financeModel.js](src/lib/financeModel.js) ↔ `test/financeSql.test.mjs` ↔
+  `test-db/financeRls.dbtest.mjs` ↔ the `#58` block in `scripts/audit-db.mjs`.
+  ★ **Never add an insert/update/delete policy to a `finance_` table.** The zero-client-write-path
+  rule is what makes the legacy system's 30 unguarded mutations unreachable; all mutation goes through
+  the SECURITY DEFINER RPCs, and `financeSql.test.mjs` fails if any write policy appears.
+  ★ **Never add `accounts_receivable` to the `subtype` CHECK** — a receivable account makes accrual
+  revenue representable, and every cash-basis claim in the feature stops being true by construction.
+  ★ **Assert against extracted vocabularies, never "this string appears nowhere in the file."** That
+  shape is defeated by the comments that explain an invariant *and* by the migration's own
+  `schema_migrations` notes; it produced a false failure while #58 was being written, whose tempting
+  "fix" was deleting the comment that documented the rule.
+  ★ A new error code is a **three-place** change: `app_error_catalog()` ↔ `APP_ERROR_CODES` ↔
+  `APP_ERROR_COPY`. This caught two real omissions during #58's own development.
 - **Adding, removing or re-granting a STAFF PERMISSION** → four places move together:
   the `staff_permissions` + `staff_role_permissions` seed in a dated migration ↔ the **bootstrap
   fold** ↔ `STAFF_PERMISSIONS` / `ROLE_PERMISSIONS` in [src/lib/staffRoles.js](src/lib/staffRoles.js)

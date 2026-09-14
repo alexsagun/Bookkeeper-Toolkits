@@ -25,6 +25,7 @@ import {
   STAFF_ROLE_KEYS,
   STAFF_STATUSES,
   SUPER_ADMIN_ROLE,
+  adminTabVisible,
   canManageCourseClient,
   lastSuperAdminGuard,
   normalizeStaffContext,
@@ -44,6 +45,65 @@ const ctxFor = (roleKey, extra = {}) =>
 const SUPER = ctxFor('super_admin');
 const OPS = ctxFor('operations_admin');
 const TRAINER = ctxFor('trainer');
+
+// ── Admin nav visibility (adminTabVisible) ──────────────────────────────────
+// A database where #58 has NOT run: the live permission list lacks finance.manage
+// for every role, including the Super Admin. The server list wins over the local
+// matrix when present, so this is exactly what the client receives there.
+const PRE58 = STAFF_PERMISSION_KEYS.filter((k) => k !== 'finance.manage');
+const READY = { staffReady: true, staffDegraded: false, profileIsAdmin: false };
+
+test('an active Super Admin sees Financial Management before #58 has created finance.manage', () => {
+  const superPre58 = ctxFor('super_admin', { permissions: PRE58 });
+  assert.equal(staffCan(superPre58, 'finance.manage'), false,
+    'precondition: the pre-#58 server list really lacks the key');
+  assert.equal(adminTabVisible(superPre58, READY, 'financialmanagement'), true,
+    'the row must show, so the screen can explain the missing setup instead of vanishing');
+  for (const tabId of Object.keys(ADMIN_TAB_PERMISSION)) {
+    assert.equal(adminTabVisible(SUPER, READY, tabId), true, `super_admin must see ${tabId}`);
+  }
+});
+
+test('an Operations Admin and a Trainer never see Financial Management, before or after #58', () => {
+  for (const [name, role] of [['operations_admin', 'operations_admin'], ['trainer', 'trainer']]) {
+    assert.equal(adminTabVisible(ctxFor(role), READY, 'financialmanagement'), false,
+      `${name} must not see the finance row with the full matrix`);
+    assert.equal(adminTabVisible(ctxFor(role, { permissions: PRE58 }), READY, 'financialmanagement'), false,
+      `${name} must not see the finance row on a pre-#58 database`);
+    assert.equal(adminTabVisible(ctxFor(role), { ...READY, staffDegraded: true }, 'financialmanagement'), false,
+      `${name} must not see the finance row when the staff lookup is degraded`);
+  }
+});
+
+test('the permission arm still decides for everyone who is not a Super Admin', () => {
+  assert.equal(adminTabVisible(OPS, READY, 'enrollments'), true, 'ops reviews enrollments');
+  assert.equal(adminTabVisible(OPS, READY, 'staffroles'), false, 'ops does not manage staff');
+  assert.equal(adminTabVisible(TRAINER, READY, 'enrollments'), false, 'a trainer holds no admin queue');
+});
+
+test('absent staff data means "no", and a degraded lookup falls back to the is_admin cache only', () => {
+  assert.equal(adminTabVisible(SUPER, { ...READY, staffReady: false }, 'financialmanagement'), false,
+    'not ready yet is not a yes');
+  assert.equal(adminTabVisible(EMPTY_STAFF_CONTEXT, { staffReady: false, staffDegraded: true, profileIsAdmin: true },
+    'financialmanagement'), true, 'degraded + is_admin (= active Super Admin since #45)');
+  assert.equal(adminTabVisible(EMPTY_STAFF_CONTEXT, { staffReady: false, staffDegraded: true, profileIsAdmin: false },
+    'financialmanagement'), false, 'degraded without is_admin');
+  assert.equal(adminTabVisible(EMPTY_STAFF_CONTEXT, READY, 'financialmanagement'), false, 'a student');
+});
+
+test('the Super Admin arm cannot be reached by a non-active or hand-built context', () => {
+  for (const status of ['invited', 'suspended', 'revoked']) {
+    const ctx = normalizeStaffContext({ role_key: 'super_admin', status });
+    assert.equal(adminTabVisible(ctx, READY, 'financialmanagement'), false, `a ${status} super_admin`);
+  }
+  assert.equal(adminTabVisible({ isSuperAdmin: true }, READY, 'financialmanagement'), false,
+    'a bare { isSuperAdmin: true } object is not an active staff context');
+  assert.equal(adminTabVisible(null, READY, 'financialmanagement'), false, 'no context at all');
+});
+
+test('a tab with no admin permission is left to the plan entitlement', () => {
+  assert.equal(adminTabVisible(EMPTY_STAFF_CONTEXT, { staffReady: false }, 'qbomastery'), true);
+});
 
 // ── The catalog ──────────────────────────────────────────────────────────────
 
@@ -93,8 +153,8 @@ test('the matrix covers 3 roles x 19 permissions with no unknown keys', () => {
     for (const key of STAFF_PERMISSION_KEYS) cells += 1;
   }
   assert.equal(cells, STAFF_ROLE_KEYS.length * STAFF_PERMISSION_KEYS.length,
-    'the matrix must cover 3 roles x 19 permissions');
-  assert.equal(cells, 57, 'a changed cell count means a permission or role was added without updating this sweep');
+    'the matrix must cover 3 roles x 20 permissions');
+  assert.equal(cells, 60, 'a changed cell count means a permission or role was added without updating this sweep');
 });
 
 test('super_admin holds every permission', () => {

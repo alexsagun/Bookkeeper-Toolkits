@@ -381,9 +381,9 @@ export const OBJECT_CHECKS = [
       (to_regclass('public.staff_roles')), (to_regclass('public.staff_permissions')),
       (to_regclass('public.staff_role_permissions')), (to_regclass('public.staff_memberships')),
       (to_regclass('public.staff_role_events'))) as v(t)`],
-  ['#45/#56 role x permission matrix is seeded', `select count(*) = 32 as ok
+  ['#45/#58 role x permission matrix is seeded', `select count(*) = 33 as ok
       from public.staff_role_permissions`],
-  ['#45/#52 all 19 permissions are seeded', `select count(*) = 19 as ok from public.staff_permissions`],
+  ['#45/#58 all 20 permissions are seeded', `select count(*) = 20 as ok from public.staff_permissions`],
   // The caller-scoped helpers MUST be executable by authenticated: an RLS qual is
   // evaluated AS THE QUERYING ROLE, so without the grant every gated read fails
   // with "permission denied for function" instead of a clean authorization denial.
@@ -999,6 +999,62 @@ export const OBJECT_CHECKS = [
   ['#56    community_spaces_admin_all is still the batch lifecycle', `select
       qual ilike '%batches.manage%' as ok
     from pg_policies where schemaname='public' and policyname='community_spaces_admin_all'`],
+
+  // ── #58, financial management ─────────────────────────────────────────────
+  ['#58    12 finance tables exist with RLS', `select count(*) = 12 and coalesce(bool_and(c.relrowsecurity), false) as ok
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace
+   where n.nspname = 'public' and c.relkind = 'r' and c.relname ~ '^finance_'`],
+
+  // The zero-client-write-path rule, verified against the live catalog rather than
+  // the file: all mutation must go through the SECURITY DEFINER RPCs.
+  ['#58    exactly one policy per finance table, and it is SELECT', `select coalesce(bool_and(n = 1 and cmd = 'SELECT'), false) as ok from (
+      select tablename, count(*) as n, min(cmd) as cmd
+        from pg_policies where schemaname = 'public' and tablename ~ '^finance_'
+       group by tablename) t`],
+
+  // `create or replace` cannot change an argument list; a surviving older overload
+  // would stay granted beside the current one.
+  ['#58    exactly one finance_receivables_worklist overload', `select count(*) = 1 as ok
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public' and p.proname = 'finance_receivables_worklist'`],
+
+  ['#58    only super_admin holds finance.manage', `select count(*) = 1 and min(role_key) = 'super_admin' as ok
+    from public.staff_role_permissions where permission_key = 'finance.manage'`],
+
+  ['#58    authenticated has SELECT and no write verb on finance', `select coalesce(bool_and(
+        has_table_privilege('authenticated', c.oid, 'SELECT')
+        and not has_table_privilege('authenticated', c.oid, 'INSERT')
+        and not has_table_privilege('authenticated', c.oid, 'UPDATE')
+        and not has_table_privilege('authenticated', c.oid, 'DELETE')), false) as ok
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace
+   where n.nspname = 'public' and c.relkind = 'r' and c.relname ~ '^finance_'`],
+
+  ['#58    the approval hook exists and kept its WHEN clause', `select count(*) = 1 and coalesce(bool_and(tgqual is not null), false) as ok
+    from pg_trigger where tgrelid = 'public.enrollment_requests'::regclass
+      and not tgisinternal and tgname = 'finance_enrollment_collection_trg'`],
+
+  // Non-deferred, the balance trigger fires after line 1, sees a one-sided entry and
+  // rejects EVERY multi-line entry — while reading as correct in review.
+  ['#58    both constraint triggers are DEFERRED', `select count(*) = 2 and coalesce(bool_and(tgdeferrable and tginitdeferred), false) as ok
+    from pg_trigger where tgname in ('finance_entry_balanced_trg','finance_entry_has_lines_trg')`],
+
+  // ★ The runtime proof for the plpgsql late-binding hazard. The hook resolves these at
+  //   EXECUTION time, so "the function exists" says nothing about whether it can post —
+  //   the failure would otherwise be discovered by the first admin to click Approve.
+  ['#58    settings resolve to two ACTIVE system accounts', `select count(*) = 2 and coalesce(bool_and(a.active and a.is_system), false) as ok
+    from public.finance_settings s
+    join public.finance_accounts a on a.id in (s.default_income_account_id, s.default_cash_account_id)`],
+
+  ['#58    every payment event has a unique idempotency key', `select
+      (select count(*) from public.finance_payment_events where idempotency_key is null) = 0
+      and (select count(*) from (select idempotency_key from public.finance_payment_events
+             group by idempotency_key having count(*) > 1) d) = 0 as ok`],
+
+  // ★ The line that would notice if ANY of the three balance layers were ever removed:
+  //   the per-line CHECK, the deferred constraint trigger, or the immutability guard.
+  ['#58    no posted entry is unbalanced', `select count(*) = 0 as ok from (
+      select entry_id from public.finance_journal_lines
+       group by entry_id having sum(debit) <> sum(credit)) t`],
 
 ];
 
