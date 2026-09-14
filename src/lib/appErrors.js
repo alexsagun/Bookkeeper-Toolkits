@@ -134,6 +134,14 @@ export const APP_ERROR_CODES = [
   'FINANCE_BANK_EXCLUDE_REASON_REQUIRED',
   'FINANCE_ACCOUNT_IN_USE',
   'FINANCE_RECURRING_INVALID',
+  // Finance parity (#59)
+  'FINANCE_RECLASSIFY_INVALID',
+  'FINANCE_PRESET_INVALID',
+  'FINANCE_BANK_TXN_LINKED',
+  'FINANCE_BANK_TXN_NOT_LINKED',
+  'FINANCE_BANK_MATCH_MISMATCH',
+  'FINANCE_BANK_CATEGORY_INVALID',
+  'FINANCE_ENTRY_HAS_ADJUSTMENTS',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -357,6 +365,27 @@ const COPY = {
   FINANCE_RECURRING_INVALID:
     'That recurring template isn’t complete. It needs a name, two different active accounts, an '
     + 'amount above zero, and a schedule that matches its frequency.',
+  FINANCE_RECLASSIFY_INVALID:
+    'That can’t be reclassified. Income moves to another income account, and an expense to another '
+    + 'expense or to owner’s draw — into an active account, on an entry that hasn’t been reversed, '
+    + 'with a reason.',
+  FINANCE_PRESET_INVALID:
+    'That preset isn’t valid: it needs a name no other preset uses, and an active expense or '
+    + 'owner’s draw account.',
+  FINANCE_BANK_TXN_LINKED:
+    'That statement line — or the entry you picked — is already added, matched, excluded or '
+    + 'reconciled. Refresh the feed to see where it stands.',
+  FINANCE_BANK_TXN_NOT_LINKED:
+    'That statement line isn’t added or matched, so there’s nothing to undo.',
+  FINANCE_BANK_MATCH_MISMATCH:
+    'That entry doesn’t move this account by the same amount as the statement line, so they can’t '
+    + 'be matched. Pick another entry, or add the line instead.',
+  FINANCE_BANK_CATEGORY_INVALID:
+    'Choose an active account other than the statement’s own account.',
+  FINANCE_ENTRY_HAS_ADJUSTMENTS:
+    'That entry was reclassified, and the reclassification still stands. Reverse the '
+    + 'reclassification first, then this entry — otherwise money would be moved out of an account '
+    + 'the reversal has just emptied.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };

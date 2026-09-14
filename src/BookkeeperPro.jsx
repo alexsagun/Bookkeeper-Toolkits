@@ -72,6 +72,7 @@ import {
   FULL_ENTITLEMENT, NO_ACCESS_ENTITLEMENT, filterStagesForEntitlement, extensionPrice, phpAmount,
 } from './lib/planCatalog';
 import { FINANCE_ACCOUNT_TYPES, FINANCE_AGING_BUCKETS } from './lib/financeModel';
+import { BANK_STATEMENT_PRESETS, presetColumnMap, readStatementRows } from './lib/bankStatement';
 import {
   COVER_INDUSTRIES, DEFAULT_INDUSTRY_ID, getIndustry, detectIndustry, scrubDashes,
 } from './lib/coverLetterIndustry';
@@ -12338,36 +12339,6 @@ function FinanceRecurringPanel({ call, onChanged }) {
 //   March in one bank's export and April in another's; the legacy importer kept raw
 //   strings and never resolved it. A row whose date does not fit the declared format
 //   is reported, never guessed.
-function financeStatementDate(value, format) {
-  const s = String(value || '').trim();
-  let y; let m; let d;
-  if (format === 'ISO') {
-    const hit = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s);
-    if (!hit) return null;
-    [, y, m, d] = hit;
-  } else {
-    const hit = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2}|\d{4})$/.exec(s);
-    if (!hit) return null;
-    [d, m] = format === 'DMY' ? [hit[1], hit[2]] : [hit[2], hit[1]];
-    y = hit[3].length === 2 ? `20${hit[3]}` : hit[3];
-  }
-  const iso = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-  const check = new Date(`${iso}T00:00:00Z`);
-  // Rejects 2026-02-31 instead of rolling it into March.
-  return Number.isNaN(check.getTime()) || check.toISOString().slice(0, 10) !== iso ? null : iso;
-}
-
-// "(1,234.50)" is NEGATIVE. The legacy parser stripped every non-digit and imported it
-// as +1234, landing a payment on the wrong side of the P&L.
-function financeStatementAmount(value) {
-  const s = String(value ?? '').trim();
-  if (!s) return null;
-  const negative = /^\(.*\)$/.test(s) || /^-/.test(s) || /-$/.test(s);
-  const n = Number(s.replace(/[^0-9.]/g, ''));
-  if (!Number.isFinite(n) || n === 0) return null;
-  return Math.round((negative ? -n : n) * 100) / 100;
-}
-
 function FinanceBankImportCard({ call, onChanged }) {
   const [accounts, setAccounts] = useState([]);
   const [imports, setImports] = useState(null);
@@ -12376,7 +12347,8 @@ function FinanceBankImportCard({ call, onChanged }) {
   const [busyKey, setBusyKey] = useState('');
   const [form, setForm] = useState({ accountId: '', format: 'DMY', opening: '', closing: '' });
   const [parsed, setParsed] = useState(null);      // { name, sha256, size, headers, rows }
-  const [map, setMap] = useState({ date: '', desc: '', amount: '', moneyIn: '', moneyOut: '', balance: '', mode: 'single' });
+  const [map, setMap] = useState({ date: '', desc: '', amount: '', moneyIn: '', moneyOut: '', balance: '', mode: 'single', flipSign: false });
+  const [presetKey, setPresetKey] = useState('Custom');
   const [reviewId, setReviewId] = useState(null);
   const [txns, setTxns] = useState(null);
   const [excludeFor, setExcludeFor] = useState(null);
@@ -12437,9 +12409,12 @@ function FinanceBankImportCard({ call, onChanged }) {
       if (!table.headers.length) throw new Error('No columns found. Is there a header row?');
       if (table.rows.length > 5000) throw new Error(`That file has ${table.rows.length} rows. Split it into files of 5,000 or fewer.`);
       const guess = (re) => table.headers.find((h) => re.test(h)) || '';
-      setMap({ date: guess(/date/i), desc: guess(/desc|particular|detail|narr|memo/i), amount: guess(/^amount$/i),
-        moneyIn: guess(/credit|deposit|in$/i), moneyOut: guess(/debit|withdraw|out$/i), balance: guess(/balance/i),
-        mode: guess(/^amount$/i) ? 'single' : 'split' });
+      // A named bank layout maps by column position; Custom guesses from the header names.
+      setMap(presetKey !== 'Custom'
+        ? { ...presetColumnMap(presetKey, table.headers), balance: guess(/balance/i) }
+        : { date: guess(/date/i), desc: guess(/desc|particular|detail|narr|memo/i), amount: guess(/^amount$/i),
+            moneyIn: guess(/credit|deposit|in$/i), moneyOut: guess(/debit|withdraw|out$/i), balance: guess(/balance/i),
+            mode: guess(/^amount$/i) ? 'single' : 'split', flipSign: false });
       setParsed({ name: file.name, sha256, size: file.size, ...table });
     } catch (e) {
       setErr(e?.message || 'Could not read that file.');
@@ -12447,21 +12422,8 @@ function FinanceBankImportCard({ call, onChanged }) {
   };
 
   // Rows the declared mapping can read, and the ones it cannot — both shown.
-  const preview = (() => {
-    if (!parsed) return null;
-    const good = []; const bad = [];
-    parsed.rows.forEach((r, i) => {
-      const posted = financeStatementDate(r[map.date], form.format);
-      const amt = map.mode === 'single'
-        ? financeStatementAmount(r[map.amount])
-        : (financeStatementAmount(r[map.moneyIn]) ? Math.abs(financeStatementAmount(r[map.moneyIn]))
-          : financeStatementAmount(r[map.moneyOut]) ? -Math.abs(financeStatementAmount(r[map.moneyOut])) : null);
-      if (!posted || amt === null) bad.push(i + 2);
-      else good.push({ posted_on: posted, description: String(r[map.desc] || '').trim(), amount: amt,
-        balance_after: map.balance ? financeStatementAmount(r[map.balance]) : null });
-    });
-    return { good, bad };
-  })();
+  // One reader for every screen: src/lib/bankStatement.js owns dates, signs and presets.
+  const preview = parsed ? readStatementRows(parsed.rows, map, form.format) : null;
 
   const stage = async () => {
     const id = await act('stage', 'finance_stage_bank_import', {

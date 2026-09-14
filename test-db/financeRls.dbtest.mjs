@@ -45,7 +45,12 @@ const FINANCE_TABLES = [
   'finance_payment_events', 'finance_period_locks', 'finance_audit_events',
   'finance_bank_imports', 'finance_bank_transactions', 'finance_reconciliations',
   'finance_reconciliation_items', 'finance_recurring_templates',
+  // #59 — seeded with eleven category presets, so its denial is not vacuous.
+  'finance_expense_presets',
 ];
+
+const NIL = '00000000-0000-4000-8000-000000000000';
+const NIL2 = '00000000-0000-4000-8000-000000000001';
 
 /** Every finance RPC a client may call, with arguments valid enough to reach the guard. */
 const FINANCE_RPCS = [
@@ -77,6 +82,20 @@ const FINANCE_RPCS = [
     p_contra_account_id: '00000000-0000-4000-8000-000000000001', p_amount: 1,
     p_entry_kind: 'expense', p_memo: null, p_cadence: 'monthly', p_day_of_month: 1,
     p_weekday: null, p_next_due_on: '2026-01-01', p_active: true }],
+  // #59 — the parity readers, reclassify, presets and the bank feed.
+  ['finance_pipeline_summary', {}],
+  ['finance_sales_by_plan_batch', {}],
+  ['finance_sales_report', {}],
+  ['finance_pl_account_detail', { p_account_id: NIL, p_from: '2026-01-01', p_to: '2026-12-31' }],
+  ['finance_expense_presets_list', {}],
+  ['finance_bank_account_tiles', {}],
+  ['finance_bank_match_candidates', { p_txn_id: NIL }],
+  ['finance_reclassify_entry', { p_entry_id: NIL, p_from_account_id: NIL, p_to_account_id: NIL2, p_reason: 'x', p_idempotency_key: 'x' }],
+  ['finance_save_expense_preset', { p_id: null, p_label: 'x', p_payee: null, p_account_id: NIL, p_memo: null }],
+  ['finance_delete_expense_preset', { p_id: NIL }],
+  ['finance_categorize_bank_transaction', { p_txn_id: NIL, p_account_id: NIL }],
+  ['finance_match_bank_transaction', { p_txn_id: NIL, p_entry_id: NIL }],
+  ['finance_undo_bank_transaction', { p_txn_id: NIL }],
 ];
 
 let superAdmin; let ops; let trainer; let student; let revoked;

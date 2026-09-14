@@ -39,13 +39,20 @@ const FILES = [MIGRATION, BOOTSTRAP];
 /** Executable SQL only — prose explains the invariants by NAMING what must not exist. */
 const codeOf = (sql) => sql.split('\n').filter((l) => !l.trimStart().startsWith('--')).join('\n');
 
+/** #59 re-signs #58 functions and owns the error catalog from here on. */
+const PARITY = 'db/2026-09-14-finance-parity.sql';
+
 /** The bootstrap carries every migration; scope it to the §45 fold. */
 function financeSection(rel) {
   const sql = read(rel);
   if (rel !== BOOTSTRAP) return sql;
   const at = sql.indexOf('§45) FOLDED VERBATIM');
   assert.ok(at > 0, '§45 is missing from the bootstrap — re-fold db/2026-09-09-financial-management.sql');
-  return sql.slice(at);
+  // ★ BOUNDED AT THE NEXT FOLD. Sliced to end-of-file, every later migration's text was
+  //   asserted as though it were #58's — so a #59 restatement could satisfy (or break) a
+  //   #58 assertion for a reason that has nothing to do with #58.
+  const next = sql.slice(at + 1).search(/^--\s*§\d+\) FOLDED VERBATIM/m);
+  return next < 0 ? sql.slice(at) : sql.slice(at, at + 1 + next);
 }
 
 const FINANCE_TABLES = [
@@ -439,8 +446,11 @@ test('finance.manage is the 20th permission and is Super-Admin-only', () => {
 });
 
 test('every finance error code is in the SQL catalog, the client list and the copy table', () => {
-  const sql = read(MIGRATION);
-  const catalog = sql.slice(sql.indexOf('create or replace function public.app_error_catalog()'));
+  // The catalog is one VALUES list restated whole, so the CURRENT owner is the last file
+  // that restates it (#59). Raised codes come from both finance migrations.
+  const owner = read(PARITY);
+  const catalog = owner.slice(owner.indexOf('create or replace function public.app_error_catalog()'));
+  const sql = read(MIGRATION) + '\n' + owner;
   const financeCodes = APP_ERROR_CODES.filter((c) => c.startsWith('FINANCE_'));
   assert.ok(financeCodes.length >= 27, `expected the finance codes, found ${financeCodes.length}`);
   for (const code of financeCodes) {
@@ -516,11 +526,11 @@ test('every financeModel constant the app uses is actually imported', () => {
 //   AND be granted — and an internal one (never granted) must never be called.
 test('every finance RPC the app calls exists and is granted to authenticated', () => {
   const app = read('src/BookkeeperPro.jsx');
-  const sql = codeOf(read(MIGRATION));
+  const sql = codeOf(read(MIGRATION)) + '\n' + codeOf(read(PARITY));
   const called = [...new Set([...app.matchAll(/(?:call|supabase\.rpc)\(\s*'(finance_\w+)'/g)].map((m) => m[1]))];
   assert.ok(called.length >= 6, `expected the app to call the finance RPCs, found ${called.length}`);
   for (const name of called) {
-    assert.ok(sql.includes(`create or replace function public.${name}(`), `the app calls ${name}, which #58 does not define`);
+    assert.ok(sql.includes(`create or replace function public.${name}(`), `the app calls ${name}, which neither #58 nor #59 defines`);
     assert.ok(sql.includes(`grant execute on function public.${name}(`),
       `the app calls ${name}, which is not granted — it would 403 for the Super Admin too`);
   }

@@ -1001,7 +1001,7 @@ export const OBJECT_CHECKS = [
     from pg_policies where schemaname='public' and policyname='community_spaces_admin_all'`],
 
   // ── #58, financial management ─────────────────────────────────────────────
-  ['#58    12 finance tables exist with RLS', `select count(*) = 12 and coalesce(bool_and(c.relrowsecurity), false) as ok
+  ['#58/59 13 finance tables exist with RLS', `select count(*) = 13 and coalesce(bool_and(c.relrowsecurity), false) as ok
     from pg_class c join pg_namespace n on n.oid = c.relnamespace
    where n.nspname = 'public' and c.relkind = 'r' and c.relname ~ '^finance_'`],
 
@@ -1055,6 +1055,33 @@ export const OBJECT_CHECKS = [
   ['#58    no posted entry is unbalanced', `select count(*) = 0 as ok from (
       select entry_id from public.finance_journal_lines
        group by entry_id having sum(debit) <> sum(credit)) t`],
+
+  // ── #59, finance parity ───────────────────────────────────────────────────
+  // `create or replace` cannot re-sign; a surviving old overload stays granted beside the new.
+  ['#59    exactly one overload of each re-signed finance function', `select count(*) = 5 and coalesce(bool_and(n = 1), false) as ok from (
+      select p.proname, count(*) as n
+        from pg_proc p join pg_namespace ns on ns.oid = p.pronamespace
+       where ns.nspname = 'public' and p.proname in ('finance_post_entry','finance_post_manual_entry',
+             'finance_ledger_list','finance_cash_basis_pl','finance_bank_transactions_list')
+       group by p.proname) t`],
+
+  ['#59    finance_post_entry is not client-callable', `select not has_function_privilege('authenticated',
+      'public.finance_post_entry(date,text,text,text,jsonb,text,text,uuid)', 'EXECUTE') as ok`],
+
+  ['#59    one entry clears one statement line', `select count(*) = 1 as ok from pg_indexes
+    where schemaname = 'public' and indexname = 'finance_bank_txn_entry_once' and indexdef ilike '%unique%'`],
+
+  // ★ The live versions of the invariants the feed exists to keep: no line cleared twice,
+  //   and no line left pointing at an entry that has since been reversed.
+  ['#59    no transaction is cleared by both the feed and a reconciliation item', `select count(*) = 0 as ok
+    from public.finance_bank_transactions t
+    join public.finance_reconciliation_items i on i.bank_transaction_id = t.id
+   where t.matched_entry_id is not null`],
+
+  ['#59    no statement line is linked to a reversed entry', `select count(*) = 0 as ok
+    from public.finance_bank_transactions t
+   where t.matched_entry_id is not null
+     and exists (select 1 from public.finance_journal_entries rv where rv.reverses_entry_id = t.matched_entry_id)`],
 
 ];
 
