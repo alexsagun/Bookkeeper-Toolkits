@@ -11987,6 +11987,351 @@ function FinanceOpeningBalanceCard({ accounts, today, run, saving }) {
   );
 }
 
+// Record one income or expense as a balanced two-line entry. The admin picks WHAT it was
+// and WHERE the money moved; the debit/credit sides are derived, never typed.
+function FinanceRecordEntryModal({ call, kind, onClose, onPosted }) {
+  const isIncome = kind === 'income';
+  const [accounts, setAccounts] = useState(null);
+  const [date, setDate] = useState(todayISODate());
+  const [amount, setAmount] = useState('');
+  const [categoryId, setCategoryId] = useState('');
+  const [moneyId, setMoneyId] = useState('');
+  const [memo, setMemo] = useState('');
+  const [personal, setPersonal] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  // ★ Minted when the dialog OPENS. A retry of this same dialog reuses it, so a
+  //   double-click or a timeout-then-retry cannot post the amount twice.
+  const [idemKey] = useState(() => crypto.randomUUID());
+
+  useEffect(() => {
+    let live = true;
+    call('finance_accounts_list').then((rows) => { if (live) setAccounts(rows || []); })
+      .catch((e) => { if (live) setErr(appErrorMessage(e, 'Could not load the accounts.')); });
+    return () => { live = false; };
+  }, [call]);
+
+  const list = accounts || [];
+  const categories = isIncome
+    ? list.filter((a) => a.account_type === 'income')
+    : list.filter((a) => (personal ? a.subtype === 'owner_draw' : a.account_type === 'expense'));
+  const moneyAccounts = list.filter((a) => ['cash', 'card'].includes(a.cash_flow_class)
+    && (isIncome ? a.cash_flow_class === 'cash' : true));
+  const amt = Math.round((Number(amount) || 0) * 100) / 100;
+  const ready = amt > 0 && categoryId && moneyId && categoryId !== moneyId && !!date;
+
+  const submit = async () => {
+    setBusy(true); setErr('');
+    try {
+      const lines = isIncome
+        ? [{ account_id: moneyId, debit: amt, credit: 0 }, { account_id: categoryId, debit: 0, credit: amt }]
+        : [{ account_id: categoryId, debit: amt, credit: 0 }, { account_id: moneyId, debit: 0, credit: amt }];
+      await call('finance_post_manual_entry', {
+        p_entry_date: date,
+        p_entry_kind: isIncome ? 'collection' : (personal ? 'owner_draw' : 'expense'),
+        p_memo: memo.trim() || null, p_lines: lines, p_idempotency_key: idemKey,
+      });
+      onPosted?.();
+      onClose();
+    } catch (e) {
+      console.error('[finance] manual entry failed', { code: e?.code, message: e?.message });
+      setErr(appErrorMessage(e, 'That entry was not recorded.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <AccountModal title={isIncome ? 'Record income' : 'Record an expense'} icon={isIncome ? TrendingUp : Wallet}
+      tone={isIncome ? 'ok' : 'primary'} canClose={!busy} onClose={onClose}>
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {!accounts ? <FinanceLoading label="Loading accounts…" /> : (
+        <div className="grid gap-3">
+          <div className="grid gap-3 grid-cols-2">
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Date</span>
+              <input type="date" value={date} max={todayISODate()} onChange={(e) => setDate(e.target.value)}
+                className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Amount (₱)</span>
+              <input type="number" min="0" step="0.01" inputMode="decimal" value={amount}
+                onChange={(e) => setAmount(e.target.value)} className="gh-input w-full mt-1 text-right" style={{ fontSize: 13 }} /></label>
+          </div>
+          {!isIncome && (
+            <label className="flex items-center gap-2" style={{ fontSize: 13, color: C.text }}>
+              <input type="checkbox" checked={personal} onChange={(e) => { setPersonal(e.target.checked); setCategoryId(''); }} />
+              This was personal spending
+            </label>
+          )}
+          <label className="block"><span style={FINANCE_LABEL_STYLE}>{isIncome ? 'Income type' : personal ? "Owner's draw account" : 'Expense category'}</span>
+            <select value={categoryId} onChange={(e) => setCategoryId(e.target.value)} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+              <option value="">— choose —</option>
+              {categories.map((a) => <option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
+            </select></label>
+          <label className="block"><span style={FINANCE_LABEL_STYLE}>{isIncome ? 'Received into' : 'Paid from'}</span>
+            <select value={moneyId} onChange={(e) => setMoneyId(e.target.value)} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+              <option value="">— choose —</option>
+              {moneyAccounts.map((a) => <option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
+            </select></label>
+          <label className="block"><span style={FINANCE_LABEL_STYLE}>Memo</span>
+            <input value={memo} onChange={(e) => setMemo(e.target.value)} placeholder={isIncome ? 'e.g. Collaboration fee' : 'e.g. Zoom subscription'}
+              className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+          {personal && (
+            <div style={{ fontSize: 12, color: C.textMute }}>
+              Personal spending is recorded as an owner's draw. It leaves the profit &amp; loss, while the cash side still ties.
+            </div>
+          )}
+          {isIncome && (
+            <div style={{ fontSize: 12, color: C.textMute }}>
+              A student's payment is recorded automatically when it is approved — do not record it here as well.
+            </div>
+          )}
+        </div>
+      )}
+      <div className="mt-5 flex items-center justify-end gap-2.5">
+        <button type="button" onClick={onClose} disabled={busy} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+        <button type="button" disabled={!ready || busy} onClick={submit}
+          className="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-60" style={ADMIN_BTN_OK}>
+          {busy ? 'Recording…' : `Record ${phpFmt(amt)}`}
+        </button>
+      </div>
+    </AccountModal>
+  );
+}
+
+// Reverse a posted entry. It never edits or deletes: it posts the mirror image, linked.
+function FinanceReverseModal({ call, entry, onClose, onDone }) {
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const submit = async () => {
+    setBusy(true); setErr('');
+    try {
+      const out = await call('finance_reverse_entry', { p_entry_id: entry.entry_id, p_reason: reason.trim() });
+      // ★ Say where the correction landed. Into a closed month it cannot go, so it moves
+      //   forward — and the admin must be told that, not left to find it.
+      const original = String(entry.entry_date || '').slice(0, 7);
+      onDone?.(out?.period && out.period !== original
+        ? `Entry #${entry.entry_no} is reversed. ${original} is closed, so the correction is recorded in ${out.period}.`
+        : `Entry #${entry.entry_no} is reversed in ${out?.period || original}.`);
+      onClose();
+    } catch (e) {
+      console.error('[finance] reversal failed', { code: e?.code, message: e?.message });
+      setErr(appErrorMessage(e, 'The entry was not reversed.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <AccountModal title={`Reverse entry #${entry.entry_no}?`} subtitle={`${entry.entry_date} · ${phpFmt(Number(entry.total_amount) || 0)}`}
+      icon={RotateCcw} tone="danger" canClose={!busy} onClose={onClose}>
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+        A linked entry with the debits and credits swapped is posted, so the two cancel out. Both stay on the record;
+        nothing is deleted. Post the correct entry separately if one is needed.
+      </p>
+      <label className="block mt-4 mb-1.5" style={FINANCE_LABEL_STYLE}>Reason (required)</label>
+      <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={3}
+        className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
+        style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+      <div className="mt-5 flex items-center justify-end gap-2.5">
+        <button type="button" onClick={onClose} disabled={busy} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+        <button type="button" disabled={busy || !reason.trim()} onClick={submit}
+          className="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-60" style={ADMIN_BTN_DANGER}>
+          {busy ? 'Reversing…' : 'Reverse entry'}
+        </button>
+      </div>
+    </AccountModal>
+  );
+}
+
+// Recurring costs as PROPOSALS. A template never posts by itself: "Due" is shown to a
+// human, who confirms each occurrence. The legacy app posted seven months of the future.
+const FINANCE_WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+function FinanceRecurringPanel({ call, onChanged }) {
+  const [rows, setRows] = useState(null);
+  const [accounts, setAccounts] = useState([]);
+  const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
+  const [busyKey, setBusyKey] = useState('');
+  const [editing, setEditing] = useState(null);
+  const [posting, setPosting] = useState(null);
+
+  const load = useCallback(async () => {
+    setErr('');
+    try {
+      const [r, a] = await Promise.all([
+        call('finance_recurring_list', { p_include_inactive: true }),
+        call('finance_accounts_list'),
+      ]);
+      setRows(r || []); setAccounts(a || []);
+    } catch (e) {
+      console.error('[finance] recurring load failed', { code: e?.code, message: e?.message });
+      setErr(appErrorMessage(e, 'Could not load the recurring templates.'));
+      setRows((prev) => prev || []);
+    }
+  }, [call]);
+  useEffect(() => { load(); }, [load]);
+
+  const act = async (key, fn, args, done) => {
+    setBusyKey(key); setErr(''); setNotice('');
+    try {
+      await call(fn, args);
+      setNotice(done); await load(); onChanged?.();
+      return true;
+    } catch (e) {
+      console.error('[finance] recurring write failed', { fn, code: e?.code, message: e?.message });
+      setErr(appErrorMessage(e, 'That change was not saved.'));
+      return false;
+    } finally { setBusyKey(''); }
+  };
+
+  const save = (t, patch = {}) => {
+    const acct = accounts.find((a) => a.id === t.account_id);
+    return act(`save:${t.id || 'new'}`, 'finance_save_recurring_template', {
+      p_id: t.id || null, p_name: t.name, p_account_id: t.account_id, p_contra_account_id: t.contra_account_id,
+      p_amount: Math.round((Number(t.amount) || 0) * 100) / 100,
+      p_entry_kind: acct?.subtype === 'owner_draw' ? 'owner_draw' : 'expense',
+      p_memo: t.memo || null, p_cadence: t.cadence,
+      p_day_of_month: t.cadence === 'weekly' ? null : Number(t.day_of_month) || null,
+      p_weekday: t.cadence === 'weekly' ? Number(t.weekday) : null,
+      p_next_due_on: t.next_due_on, p_active: t.active !== false, ...patch,
+    }, t.id ? `${t.name} saved.` : `${t.name} added.`);
+  };
+
+  const costAccounts = accounts.filter((a) => a.account_type === 'expense' || a.subtype === 'owner_draw');
+  const payAccounts = accounts.filter((a) => ['cash', 'card'].includes(a.cash_flow_class));
+  const schedule = (t) => (t.cadence === 'weekly'
+    ? `Weekly, ${FINANCE_WEEKDAYS[t.weekday] || '?'}`
+    : `${t.cadence[0].toUpperCase()}${t.cadence.slice(1)}, day ${t.day_of_month}`);
+
+  return (
+    <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+      <div className="flex items-center gap-2 mb-1">
+        <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Recurring costs</div>
+        <button type="button" className="gh-btn-ghost ml-auto px-3 py-1.5 text-xs"
+          onClick={() => setEditing({ name: '', amount: '', account_id: '', contra_account_id: '', cadence: 'monthly',
+            day_of_month: 1, weekday: 1, next_due_on: todayISODate(), memo: '', active: true })}>
+          <Plus size={13} className="inline -mt-0.5 mr-1" />Add template
+        </button>
+      </div>
+      <div className="mb-3" style={{ fontSize: 11.5, color: C.textMute }}>
+        A template only suggests. When one falls due it is marked here, and nothing is recorded until you post it.
+      </div>
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
+      {rows === null ? <FinanceLoading /> : rows.length === 0 ? (
+        <div style={{ fontSize: 13, color: C.textMute }}>No recurring costs yet.</div>
+      ) : (
+        <table className="w-full text-sm" style={{ color: C.text }}>
+          <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+            <th scope="col" className="py-1">Name</th><th scope="col">Amount</th><th scope="col">Schedule</th>
+            <th scope="col">Next due</th><th scope="col"><span className="sr-only">Actions</span></th>
+          </tr></thead>
+          <tbody>
+            {rows.map((t) => (
+              <tr key={t.id} style={{ borderTop: `1px solid ${GLASS.border}`, opacity: t.active ? 1 : 0.55 }}>
+                <td className="py-1.5">
+                  <div>{t.name}</div>
+                  <div style={{ fontSize: 11, color: C.textMute }}>{t.account_code} ← {t.contra_account_code}</div>
+                </td>
+                <td>{phpFmt(Number(t.amount) || 0)}</td>
+                <td style={{ fontSize: 12 }}>{schedule(t)}</td>
+                <td>
+                  {t.next_due_on}
+                  {t.is_due && <span className="gh-pill ml-2" style={{ fontSize: 10, color: C.amber }}>due</span>}
+                </td>
+                <td className="text-right whitespace-nowrap">
+                  {t.active && (
+                    <button type="button" onClick={() => setPosting(t)} disabled={!!busyKey}
+                      className="gh-btn-ghost px-2 py-1 text-xs">Post</button>
+                  )}
+                  <button type="button" onClick={() => setEditing({ ...t })} disabled={!!busyKey}
+                    className="gh-btn-ghost px-2 py-1 text-xs ml-1">Edit</button>
+                  <button type="button" onClick={() => save(t, { p_active: !t.active })} disabled={!!busyKey}
+                    className="gh-btn-ghost px-2 py-1 text-xs ml-1">{t.active ? 'Switch off' : 'Switch on'}</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {posting && (
+        <AccountModal title={`Post ${posting.name}?`} subtitle={`${phpFmt(Number(posting.amount) || 0)} dated ${posting.next_due_on}`}
+          icon={Receipt} canClose={busyKey !== 'post'} onClose={() => setPosting(null)}>
+          <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+            This records the cost for its due date and moves the template to its next occurrence. Posting the same
+            occurrence twice records it once.
+          </p>
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button type="button" onClick={() => setPosting(null)} disabled={busyKey === 'post'} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+            <button type="button" disabled={busyKey === 'post'}
+              onClick={async () => { if (await act('post', 'finance_post_recurring', { p_template_id: posting.id }, `${posting.name} posted.`)) setPosting(null); }}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-60" style={ADMIN_BTN_OK}>
+              {busyKey === 'post' ? 'Posting…' : 'Post it'}
+            </button>
+          </div>
+        </AccountModal>
+      )}
+
+      {editing && (
+        <AccountModal title={editing.id ? 'Edit recurring cost' : 'Add a recurring cost'} icon={CalendarClock} maxW="max-w-lg"
+          canClose={!busyKey.startsWith('save')} onClose={() => setEditing(null)}>
+          <div className="grid gap-3">
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Name</span>
+              <input value={editing.name} onChange={(e) => setEditing((s) => ({ ...s, name: e.target.value }))}
+                placeholder="e.g. Zoom subscription" className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+            <div className="grid gap-3 grid-cols-2">
+              <label className="block"><span style={FINANCE_LABEL_STYLE}>Amount (₱)</span>
+                <input type="number" min="0" step="0.01" value={editing.amount}
+                  onChange={(e) => setEditing((s) => ({ ...s, amount: e.target.value }))} className="gh-input w-full mt-1 text-right" style={{ fontSize: 13 }} /></label>
+              <label className="block"><span style={FINANCE_LABEL_STYLE}>Next due</span>
+                <input type="date" value={editing.next_due_on} onChange={(e) => setEditing((s) => ({ ...s, next_due_on: e.target.value }))}
+                  className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+            </div>
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Cost account</span>
+              <select value={editing.account_id} onChange={(e) => setEditing((s) => ({ ...s, account_id: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+                <option value="">— choose —</option>
+                {costAccounts.map((a) => <option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
+              </select></label>
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Paid from</span>
+              <select value={editing.contra_account_id} onChange={(e) => setEditing((s) => ({ ...s, contra_account_id: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+                <option value="">— choose —</option>
+                {payAccounts.map((a) => <option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
+              </select></label>
+            <div className="grid gap-3 grid-cols-2">
+              <label className="block"><span style={FINANCE_LABEL_STYLE}>Every</span>
+                <select value={editing.cadence} onChange={(e) => setEditing((s) => ({ ...s, cadence: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+                  <option value="weekly">Week</option><option value="monthly">Month</option>
+                  <option value="quarterly">Quarter</option><option value="yearly">Year</option>
+                </select></label>
+              {editing.cadence === 'weekly' ? (
+                <label className="block"><span style={FINANCE_LABEL_STYLE}>On</span>
+                  <select value={editing.weekday ?? 1} onChange={(e) => setEditing((s) => ({ ...s, weekday: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+                    {FINANCE_WEEKDAYS.map((d, i) => <option key={d} value={i}>{d}</option>)}
+                  </select></label>
+              ) : (
+                <label className="block"><span style={FINANCE_LABEL_STYLE}>Day of month</span>
+                  <input type="number" min="1" max="31" value={editing.day_of_month ?? 1}
+                    onChange={(e) => setEditing((s) => ({ ...s, day_of_month: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+              )}
+            </div>
+          </div>
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button type="button" onClick={() => setEditing(null)} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+            <button type="button" disabled={!!busyKey || !editing.name.trim() || !(Number(editing.amount) > 0)
+              || !editing.account_id || !editing.contra_account_id || !editing.next_due_on}
+              onClick={async () => { if (await save(editing)) setEditing(null); }}
+              className="gh-btn-primary px-4 py-2 text-sm disabled:opacity-60">
+              {busyKey.startsWith('save') ? 'Saving…' : 'Save template'}
+            </button>
+          </div>
+        </AccountModal>
+      )}
+    </div>
+  );
+}
+
 function FinancialManagement() {
   // ★ staffDegraded MUST be destructured here. A component that reads it without
   //   destructuring throws a ReferenceError at render that the build cannot see and
@@ -12013,6 +12358,9 @@ function FinancialManagement() {
   const [pl, setPl] = useState(null);
   const [audit, setAudit] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [recordKind, setRecordKind] = useState(null);   // 'income' | 'expense' | null
+  const [reversing, setReversing] = useState(null);     // a ledger row, or null
+  const [ledgerNotice, setLedgerNotice] = useState('');
 
   const call = useCallback(async (fn, args) => {
     const { data, error } = await supabase.rpc(fn, args);
@@ -12159,6 +12507,9 @@ function FinancialManagement() {
           </div>
 
           {busy && <FinanceLoading />}
+          {sub === 'ledger' && ledgerNotice && (
+            <AdminNotice kind="ok" onDismiss={() => setLedgerNotice('')}>{ledgerNotice}</AdminNotice>
+          )}
 
           {/* ── Overview ───────────────────────────────────────────────────── */}
           {sub === 'overview' && !busy && summary && (
@@ -12320,7 +12671,17 @@ function FinancialManagement() {
           {/* ── Income & Expenses ──────────────────────────────────────────── */}
           {sub === 'ledger' && !busy && ledger && (
             <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
-              <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }} className="mb-1">Journal</div>
+              <div className="flex flex-wrap items-center gap-2 mb-1">
+                <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Journal</div>
+                <div className="ml-auto flex gap-2">
+                  <button type="button" onClick={() => setRecordKind('income')} className="gh-btn-ghost px-3 py-1.5 text-xs">
+                    <Plus size={13} className="inline -mt-0.5 mr-1" />Record income
+                  </button>
+                  <button type="button" onClick={() => setRecordKind('expense')} className="gh-btn-primary px-3 py-1.5 text-xs">
+                    <Plus size={13} className="inline -mt-0.5 mr-1" />Record an expense
+                  </button>
+                </div>
+              </div>
               <div className="mb-2" style={{ fontSize: 11, color: C.textMute }}>
                 One row per ENTRY, with its lines. Posted entries are immutable — a correction is a linked
                 reversal, and both stay on the record.
@@ -12332,6 +12693,7 @@ function FinancialManagement() {
                   <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
                     <th scope="col" className="py-1">#</th><th scope="col">Date</th><th scope="col">Kind</th>
                     <th scope="col">Memo</th><th scope="col">Amount</th><th scope="col">Lines</th>
+                    <th scope="col"><span className="sr-only">Actions</span></th>
                   </tr></thead>
                   <tbody>
                     {ledger.map((e) => (
@@ -12346,12 +12708,33 @@ function FinancialManagement() {
                         <td style={{ fontSize: 11, color: C.textMute }}>
                           {(e.lines || []).map((l) => `${l.account_code} ${l.debit > 0 ? 'Dr' : 'Cr'}`).join(' · ')}
                         </td>
+                        <td className="text-right" style={{ textDecoration: 'none' }}>
+                          {!e.is_reversal && !e.reversed_by_entry_id && (
+                            <button type="button" onClick={() => setReversing(e)} className="gh-btn-ghost px-2 py-1 text-xs">
+                              <RotateCcw size={12} className="inline -mt-0.5 mr-1" />Reverse
+                            </button>
+                          )}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               )}
             </div>
+          )}
+
+          {sub === 'ledger' && !busy && ledger && (
+            <div className="mt-4">
+              <FinanceRecurringPanel call={call} onChanged={() => { invalidateReports(); load('ledger'); }} />
+            </div>
+          )}
+          {recordKind && (
+            <FinanceRecordEntryModal call={call} kind={recordKind} onClose={() => setRecordKind(null)}
+              onPosted={() => { setLedgerNotice(recordKind === 'income' ? 'Income recorded.' : 'Expense recorded.'); invalidateReports(); load('ledger'); }} />
+          )}
+          {reversing && (
+            <FinanceReverseModal call={call} entry={reversing} onClose={() => setReversing(null)}
+              onDone={(msg) => { setLedgerNotice(msg); invalidateReports(); load('ledger'); }} />
           )}
 
           {/* ── Profit & Loss ──────────────────────────────────────────────── */}
