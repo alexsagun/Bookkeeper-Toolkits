@@ -27714,12 +27714,13 @@ on conflict (filename) do nothing;
 --      select entry_id from public.finance_journal_lines
 --       group by entry_id having sum(debit) <> sum(credit)) t;             -> 0
 --
--- 8) The backfill ran DRY and recorded its own counts:
+-- 8) The backfill does NOT run as part of this migration, and cannot be run from
+--    the SQL Editor either: it is gated on finance.manage, and both of those run
+--    with no auth.uid(), so the permission check refuses them. A Super Admin starts
+--    it from Financial Management -> Setup (dry run first). Each run records its
+--    counts — no row here means it has simply not been run yet:
 --
 --    select detail from public.finance_audit_events
 --     where action = 'backfill_run' order by created_at desc limit 1;
---
---    When you are ready to post them for real, from the app (or here):
---      select public.finance_backfill_enrollment_collections(false);
 --
 -- 9) npm run db:audit -> clean, including the new #58 checks.

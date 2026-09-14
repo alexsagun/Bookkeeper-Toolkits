@@ -246,7 +246,9 @@ test('approving twice, and the backfill, create exactly one collection', async (
     select id::text from r`);
 
   await ops.db.rpc('admin_finalize_enrollment', { p_request_id: reqId, p_batch_id: null });
-  // A second approval is refused by the RPC's own status check, and must not post again.
+  // A second approval is an idempotent no-op — the RPC returns {ok, already: true} for an
+  // approved request (verified on production 2026-09-14: one term, one collection) — and
+  // must not post again.
   await ops.db.rpc('admin_finalize_enrollment', { p_request_id: reqId, p_batch_id: null });
   await superAdmin.db.rpc('finance_backfill_enrollment_collections', { p_dry_run: false });
   await superAdmin.db.rpc('finance_backfill_enrollment_collections', { p_dry_run: false });

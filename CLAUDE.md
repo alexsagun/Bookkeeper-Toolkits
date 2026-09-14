@@ -1546,7 +1546,13 @@ role `is_admin = true`.**
 
 ## Financial Management — the business ledger, Super Admin only (#58)
 
-Tab id `financialmanagement`, route `/admin/financial-management`, an admin-nav row after Team & Roles.
+Tab id `financialmanagement`, route `/admin/financial-management`, an admin-nav row directly after
+Enrollments (Access Requests · Enrollments · Financial Management · Student Imports · Batches · Team & Roles).
+**Applied to production 2026-09-14** as one transaction, after a full rehearsal on the live catalog that
+was forced to abort — the first attempt was refused whole on a STABLE function in a generated column (see
+the fingerprint comment in the migration). Verified there by rolled-back impersonation: Ops Admin, Trainer,
+student, a revoked Super Admin and anon read 0 rows from all 12 populated tables and get FORBIDDEN from all
+34 RPCs; an Ops Admin approval posts exactly one balanced collection they cannot read back.
 Migration [db/2026-09-09-financial-management.sql](db/2026-09-09-financial-management.sql), folded
 verbatim as bootstrap **§45**. The native replacement for the Google Apps Script finance app in
 `Google Financial script/` — which had **98 server functions and exactly ONE server-side authorization
