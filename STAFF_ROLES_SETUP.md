@@ -59,10 +59,10 @@ running it.
 
 ## 3. The permission matrix
 
-Three fixed roles, 20 permissions, **33 grants**. #45 seeded 18 permissions and 26 grants; #52 added
+Three fixed roles, 21 permissions, **34 grants**. #45 seeded 18 permissions and 26 grants; #52 added
 `student_progress.read` for Super Admin and Operations Admin; **#56 gave both community
-permissions to Operations Admin AND Trainer**; **#58 added `finance.manage` for Super Admin
-alone**. Mirrored in
+permissions to Operations Admin AND Trainer**; **#58 added `finance.manage` and #61
+`communications.send`, each for Super Admin alone**. Mirrored in
 [src/lib/staffRoles.js](src/lib/staffRoles.js); `test/staffRolesSql.test.mjs` fails if the two drift.
 
 | Permission | Super Admin | Operations Admin | Trainer |
@@ -87,6 +87,7 @@ alone**. Mirrored in
 | `sidebar.customize` — global navigation labels | ✅ | — | — |
 | `payment_settings.manage` — payment instructions | ✅ | — | — |
 | `finance.manage` — Financial Management (the business books) | ✅ | — | — |
+| `communications.send` — Communications (announcements, student emails, automations, the tracker) | ✅ | — | — |
 
 **Three omissions people ask about, all deliberate:**
 

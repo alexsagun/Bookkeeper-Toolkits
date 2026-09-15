@@ -148,6 +148,15 @@ export const APP_ERROR_CODES = [
   'ENROLLMENT_HOLD_INVALID',
   'ENROLLMENT_AMOUNT_INVALID',
   'ENROLLMENT_APPROVE_VIA_RPC',
+  // Communications (#61)
+  'COMM_AUDIENCE_INVALID',
+  'COMM_AUDIENCE_EMPTY',
+  'COMM_MESSAGE_INVALID',
+  'COMM_DAILY_CAP',
+  'COMM_RULE_INVALID',
+  'COMM_NOT_FOUND',
+  'COMM_CAMPAIGN_CLOSED',
+  'COMM_CAP_INVALID',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -408,6 +417,24 @@ const COPY = {
   ENROLLMENT_APPROVE_VIA_RPC:
     'Approve this request with the Approve button — that grants the membership in the same step. '
     + 'Marking it approved on its own would record the payment without giving the student access.',
+  COMM_AUDIENCE_INVALID:
+    'That audience can’t receive this kind of message. Check the batch, packages, dates or addresses '
+    + 'you chose — a pasted list holds at most 50 valid addresses.',
+  COMM_AUDIENCE_EMPTY:
+    'No one matches this audience right now, so nothing was queued.',
+  COMM_MESSAGE_INVALID:
+    'The message needs a subject (up to 200 characters) and a body (up to 20,000).',
+  COMM_DAILY_CAP:
+    'Sending this would go over today’s email limit. Send to fewer people, wait until tomorrow, or '
+    + 'raise the limit in Communications → Settings if your email plan allows more.',
+  COMM_RULE_INVALID:
+    'That automation isn’t complete: choose when it sends, who it applies to, and a valid number of days.',
+  COMM_NOT_FOUND:
+    'That campaign or automation no longer exists. Refresh the list.',
+  COMM_CAMPAIGN_CLOSED:
+    'That campaign was cancelled, so its failed emails can’t be retried. Start a new message instead.',
+  COMM_CAP_INVALID:
+    'The daily limit must be a whole number between 1 and 50,000.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };

@@ -70,7 +70,19 @@ export function displayFrom(from) {
  * @returns {{ ok: true, id?: string } | { ok: false, code: string }}
  *   `code` is always a short slug safe to store and render. Never a message.
  */
-export async function sendEmail({ to, subject, html, text, replyTo, headers, tag = 'email' }) {
+export async function sendEmail({
+  to, subject, html, text, replyTo, headers, tag = 'email', idempotencyKey: stableKey,
+  // #61: a queued sender runs under a hard time limit. `timeoutMs` bounds each request, and
+  // `retry429: false` returns a rate limit at once so the caller can re-queue the row with a
+  // backoff instead of sleeping inside a function Vercel may kill mid-batch.
+  // `maxAttempts: 1` makes one provider request: a queue that retries later with a backoff
+  // must not also retry inside a call whose worst-case time it has to budget for.
+  // ★ With no `timeoutMs` a request waits as long as fetch does — what every caller had before
+  //   #61, and what api/admin/staff.js (a 30 s function, three attempts) still needs: aborting an
+  //   invitation mid-flight and repeating it under the same key draws a 409 while the first is
+  //   still being processed, which it reports as "not sent" — and the admin invites again.
+  timeoutMs = null, retry429 = true, maxAttempts = 3,
+}) {
   const apiKey = process.env.RESEND_API_KEY;
   const from = process.env.RESEND_FROM;
   if (!apiKey) return { ok: false, code: 'email_not_configured' };
@@ -90,9 +102,16 @@ export async function sendEmail({ to, subject, html, text, replyTo, headers, tag
   //   blind retry can deliver the same invitation twice. Resend de-duplicates on
   //   this header, which turns "retry" back into "retry" rather than "resend".
   //   (CodeRabbit, PR #4.)
-  const idempotencyKey = randomUUID();
+  // A caller that can retry the SAME logical email across invocations (the #61 queue,
+  // after a released claim) passes a stable key; everyone else gets a fresh one.
+  const idempotencyKey = (typeof stableKey === 'string' && /^[A-Za-z0-9:_-]{8,128}$/.test(stableKey))
+    ? stableKey : randomUUID();
 
-  for (let attempt = 0; attempt < 3; attempt++) {
+  const ATTEMPTS = Math.max(1, Math.min(3, Math.floor(Number(maxAttempts)) || 3));
+  const limitMs = Number(timeoutMs) > 0 && Number.isFinite(Number(timeoutMs)) ? Number(timeoutMs) : null;
+  let timedOut = false;
+  for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
+    const last = attempt === ATTEMPTS - 1;
     let r;
     try {
       r = await fetch('https://api.resend.com/emails', {
@@ -103,8 +122,13 @@ export async function sendEmail({ to, subject, html, text, replyTo, headers, tag
           'Idempotency-Key': idempotencyKey,
         },
         body: JSON.stringify(payload),
+        ...(limitMs ? { signal: AbortSignal.timeout(limitMs) } : {}),
       });
-    } catch { r = null; }
+      timedOut = false;
+    } catch (e) {
+      r = null;
+      timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+    }
 
     if (r && r.ok) {
       let id;
@@ -112,6 +136,7 @@ export async function sendEmail({ to, subject, html, text, replyTo, headers, tag
       return { ok: true, id };
     }
     if (r && r.status === 429) {
+      if (!retry429 || last) return { ok: false, code: 'resend_429' };
       const retryAfter = Number(r.headers.get('retry-after')) || (2 ** attempt);
       await new Promise((res) => setTimeout(res, Math.min(retryAfter, 5) * 1000));
       continue;
@@ -121,9 +146,10 @@ export async function sendEmail({ to, subject, html, text, replyTo, headers, tag
       console.error(`[${tag}] resend ${r.status}`);
       return { ok: false, code: `resend_${r.status}` };
     }
-    await new Promise((res) => setTimeout(res, (2 ** attempt) * 500));
+    // No sleep after the final attempt: it would only spend the caller's time budget.
+    if (!last) await new Promise((res) => setTimeout(res, (2 ** attempt) * 500));
   }
-  return { ok: false, code: 'resend_failed' };
+  return { ok: false, code: timedOut ? 'resend_timeout' : 'resend_failed' };
 }
 
 /** The one font stack every email block uses. */

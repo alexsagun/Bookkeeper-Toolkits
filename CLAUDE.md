@@ -1077,7 +1077,7 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   staff-activation-consistency (#50) → access-request-staff-target (#51) →
   student-progress-rankings (#52) → progress-rankings-followup (#53) →
   progress-course-family-scoping (#54) → approve-rpc-grant-revoke (#55) →
-  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60)** — see the Staff-authorization
+  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61)** — see the Staff-authorization
   and Progress & Rankings sections for what each does. **#57**
   ([db/2026-09-08-lesson-video-quicktime.sql](db/2026-09-08-lesson-video-quicktime.sql), fold
   **§44**) widens `course-videos.allowed_mime_types` to
@@ -1310,7 +1310,7 @@ That direction is the whole safety argument. **Never repair a missed check by ha
 role `is_admin = true`.**
 
 - **Tables** (`db/2026-08-25-staff-authorization.sql`, #45): `staff_roles` / `staff_permissions` /
-  `staff_role_permissions` (the 20 × 3 matrix, **33 grants** — #52 added `student_progress.read`, #56 the
+  `staff_role_permissions` (the 21 × 3 matrix, **34 grants** — #61 added `communications.send` to super_admin alone; #52 added `student_progress.read`, #56 the
   two community keys to both non-super roles, #58 `finance.manage` to super_admin alone) → `staff_memberships` (ONE row per
   user, mutated in place; only `status='active'` confers authority, which is what makes a suspension
   take effect on the next *request* rather than the next token refresh) → `staff_role_events`
@@ -1625,9 +1625,10 @@ Charts are hand-rolled inline `<svg role="img">` modelled on `ProgressTrendChart
 - **Per-plan income accounts:** `enrollment_plans.finance_income_account_id` (nullable → the settings
   default). The hook uses it only when it is an ACTIVE income account and otherwise **falls back**
   rather than refusing — a refusal there blocks every approval of that plan.
-- **Out of scope, deliberately:** Zoom, the to-do board, announcements, and receivable reminder
+- **Out of scope for #58, deliberately:** Zoom, the to-do board, announcements, and receivable reminder
   *sending* (the legacy path is an unauthenticated relay whose reminder counter resets whenever anyone
-  edits the subject line). The worklist still ships with aging and history.
+  edits the subject line). Announcements and reminder sending arrived in **#61 Communications**, with
+  counts keyed on the request; Zoom and the to-do board are the planned #62.
 - Client mirror: [src/lib/financeModel.js](src/lib/financeModel.js) — **four exports, and it stays
   four** (the `studentProgress.js` lesson). Suites: `test/financeSql.test.mjs`,
   `test-db/financeRls.dbtest.mjs`.
@@ -1691,6 +1692,156 @@ correction; still gated on `enrollments.review`, so Operations Admins keep it. *
 - `admin_correct_enrollment_amount` works on PENDING requests only (a posted collection is corrected in
   Financial Management) and never on your own request. `admin_staff_display_names` returns names of
   STAFF only. Suite: `test/enrollmentManagementSql.test.mjs`.
+
+## Communications — announcements, student emails, payment reminders, automations (#61)
+
+Tab id `communications`, route `/admin/communications`, an admin-nav row directly after Financial
+Management. Migration [db/2026-09-16-communications.sql](db/2026-09-16-communications.sql), folded
+verbatim as bootstrap **§48**. **Not yet applied to production** at the time of writing — it was
+rehearsed and behaviour-probed on the live catalog in aborted transactions.
+
+- **`communications.send`** — the 21st staff permission, **super_admin only** (34 grants). A payment
+  reminder reads what a student owes, so it ALSO needs `finance.manage`, checked in
+  `comm_create_campaign` / `comm_preview_audience` / `comm_retry_failed` / `comm_cancel_campaign`, the
+  audience resolver's receivables branch, and again in `api/admin/communications.js`. ★ **Reading** one
+  needs it too: the SELECT policy on `comm_campaigns` / `comm_deliveries` hides `payment_reminder` rows
+  from a sender without `finance.manage`, and every reader RPC filters them. Latent while only
+  super_admin holds `communications.send`; load-bearing the day another role is given it.
+- **Four tables** (`comm_settings`, `comm_automation_rules`, `comm_campaigns`, `comm_deliveries`), each
+  with exactly one SELECT policy and **no client write path** — the finance rule.
+- ★ **THE BROWSER DESCRIBES AN AUDIENCE; THE SERVER DECIDES WHO IT IS.** The legacy Apps Script took
+  recipients, subject and body from the page and mailed them from the owner's Gmail — an open relay.
+  `comm_resolve_audience()` resolves all current members / a batch / packages / an approval date range /
+  one request / selected receivables / ≤50 pasted addresses. **Membership audiences** (all, batch,
+  packages, approval range) never include staff (`invited` + `active`, the #50/#52 rule) or a banned
+  profile; a pasted list with "active members only" off, or one enrollment request, is sent as named.
+  ★ Every address comes from `profiles`, never from `enrollment_requests.email`, which the student
+  types. A payment reminder is one row per BALANCE, so a student owing on two requests gets two, each
+  with its own amount. ★ A batch audience or batch rule counts a seat only on the member's **LIVE plan
+  segment** (the `user_entitled_batches` rule): a VIP who moved to a cheaper plan keeps `active` seats
+  until they lapse, and must not keep receiving cohort email. The send endpoint accepts no recipient or
+  content at all; it sends rows that already exist.
+- ★ **SENDING IS SERVER-ONLY AND IDEMPOTENT.** `comm_claim_deliveries` / `comm_begin_send` /
+  `comm_record_delivery` / `comm_enqueue_automations` are revoked from every client role and called by
+  [api/admin/communications.js](api/admin/communications.js) (after `requireStaff`) and
+  [api/cron/communications.js](api/cron/communications.js) (after the cron secret), through the shared
+  [api/_lib/commSend.js](api/_lib/commSend.js). Claims use `FOR UPDATE SKIP LOCKED`, and **only the
+  claiming attempt may record** (`comm_record_delivery(p_id, p_attempt, …)`), so a slow result from a
+  released claim cannot overwrite the attempt that replaced it. Three attempts is the limit, with a 1-
+  then 5-minute backoff (`next_attempt_at`). The Resend idempotency key is
+  `comm-<delivery id>-<retry_generation>`, and it lasts 24 hours at the provider.
+  ★ **AN AMBIGUOUS OUTCOME IS NEVER SENT TWICE.** A timeout, a 5xx, a CLEARED claim nobody recorded
+  (released after ten minutes as `released`) and a provider 409 (recorded as `possibly_sent`) may all have been
+  delivered. `ambiguous_since` records when the current key FIRST went out with an unclear answer, and it
+  is **sticky**: a later rate limit or local failure neither moves nor clears it. That is the fix for a
+  real double send — a timeout followed by two 429s ended as `failed:resend_429`, and judging by that
+  last code alone "Retry failed" re-sent the email under a brand-new key. A row whose first unclear
+  attempt is 20 hours old — or whose unrecorded claim was its third — becomes `failed:unknown_outcome`,
+  whether it is still `sending` or back in the queue, whatever its latest code. "Retry failed" never
+  re-sends `unknown_outcome` or `possibly_sent`; a row that was ever unclear goes again under the SAME key
+  (the provider de-duplicates it), and only a row refused outright on every attempt (a bad address,
+  missing payment details, a rate limit) under a new generation. The sender also asks an unclear answer
+  again ONCE, a moment later, under the same key, when a whole email still fits — after clearing the row
+  again, and keeping the first answer unless the repeat succeeds or is itself unclear (a 409, 429 or 401
+  on the repeat says nothing about the first request). The tracker's `may_have_sent` marks any unsent
+  row that carries the flag, and the CSV export carries it too.
+  ★ **THE SENDER FITS INSIDE THE FUNCTION'S TIME LIMIT.** Each email is ONE provider request
+  (`sendEmail({ maxAttempts: 1, timeoutMs, retry429: false })`); EVERY database call has a time limit
+  (`rpcWithin`: 3 s, 8 s for the claim, 15 s for the enqueue) and is counted, with the pace, in the
+  per-email worst case; each claim is sized to the time left; and a row the budget cannot reach is handed
+  back (`deferred`) without spending an attempt — or simply left, because an uncleared claim is safe to
+  walk away from (see below).
+  ★ `sendEmail`'s `timeoutMs` has **no default** — `api/admin/staff.js` must keep waiting on an invitation,
+  because aborting one and repeating it under the same key draws a 409 that it reports as "not sent".
+  ★ **NOTHING GOES TO THE PROVIDER UNTIL THE DATABASE CLEARS IT.** Everything that can fail on the
+  sender's side — the payment details read, rendering, the address check — happens first; then, as the
+  LAST database call before EVERY send (and before repeating an unclear answer), the service-only
+  `comm_begin_send(p_id, p_attempt)` holds the row's rule or campaign row in share mode, then locks the row, and in a
+  later statement with a fresh snapshot
+  confirms it is still this claim's, its campaign is not cancelled, and its rule is active **at the
+  version the claim recorded on the row** (`claimed_rule_version`) — so a pause, an edit, and an edit
+  followed by turning the rule back on all refuse — and stamps `send_started_at`. A refusal hands the row
+  back: `skipped:stopped` for a campaign, `skipped:rule_paused` or `skipped:rule_edited` for an
+  automation, so the next run queues the member with fresh attempts if the rule as it now reads still
+  produces that notice (claim step 3 records a row it rejects after an edit as `rule_edited` too, never as
+  `no_longer_eligible`, which would hold the key for good). An unanswered clearance gets one more try,
+  then ends the run, and so does a record the database does not take — it does not send what it could not
+  check. Counts follow what the record step decided: a stopped retry is "stopped", not "failed".
+  ★ **The stamp is what makes walking away safe.** A stale claim WITHOUT it reached nobody, so the next
+  claim releases it with its attempt refunded and nothing marked unclear; only a cleared claim is released
+  as `released` / `unknown_outcome`. Before the stamp, a slow database or a killed function turned unsent
+  emails into "outcome unknown". Cancel, pause, edit and delete count `in_flight` (rows already cleared).
+  Because the clearance holds the rule or campaign row in share mode and they write it, a clearance racing them is
+  either refused or counted, never neither, and the screen says those may still arrive. ★ Every one of them
+  takes the rule or campaign row BEFORE any delivery row of it, and so does the enqueue, which keeps
+  `FOR UPDATE` on the rule for that reason: locking the delivery row first deadlocked the clearance against
+  a delete, whose `ON DELETE SET NULL` cascade locks every delivery of the rule. (Counting under
+  delivery-row locks instead deadlocks with the claim, which locks those rows in the opposite order.)
+  ★ One deadlock class remains, and is accepted: a claim can meet a rule delete (whose cascade reaches that
+  rule's rows in every status) or another claim holding rows in the opposite order. Postgres rolls one back
+  within a second, so nothing is sent twice or lost; a rolled-back claim (`40P01`, `55P03`, `57014`) ends
+  the send run the way a claim that did not answer does, the Communications screen asks a rolled-back
+  action once more, and a failed daily enqueue still sends what was already waiting. Every call also meets
+  the database's own 8-second statement and lock limits, which bind before the sender's 15-second enqueue
+  limit. A support address that cannot be read, with no
+  `NOTIFY_ADMIN_EMAIL` fallback, also stops the run rather than mailing students with nowhere to reply.
+  ★ **EVERY ROW IS RE-CHECKED AT THE CLAIM.** A cancelled campaign or an inactive rule sends nothing
+  (the pick repeats both conditions); an automation goes out only if its RULE, run again with a week's
+  catch-up window, still produces the row's dedupe key — so a member who renewed, left, became staff,
+  was banned, left the rule's batch or packages, or ran past its timing is skipped — and its address,
+  name and tag values are refreshed to the day of sending (the re-check re-tests `status = 'queued'` on
+  the row it updates, or a claim that waited on another could skip a row that one is sending, and it runs
+  only for a claim that can pick automations); a payment reminder recomputes the balance and is skipped
+  when it has been paid. A queued row is a plan, not a promise. The rule preview counts a member as
+  already handled by the enqueue's own test, so it never promises an email the run will not queue.
+- ★ **NO PAYMENT DETAILS ARE STORED.** `{{payment_instructions}}` is filled from `payment_settings` by
+  `commSend.js` at the moment of sending, only for a body that contains the tag — never a subject, which
+  shows in inbox lists and on lock screens (`comm_create_campaign` / `comm_save_rule` refuse it, the
+  composer and rule editor block it, and the renderer blanks it). Delivery `vars` hold
+  name/plan/batch/days/expiry/week/amount_due; `db:audit` checks no row carries a payment key.
+- ★ **A RULE IS BORN PAUSED, AND AN EDIT PAUSES IT AGAIN** — and editing or pausing a rule drops the
+  emails it already queued, because the sender reads the rule's CURRENT text. A BEFORE INSERT trigger
+  forces the first half. Triggers: `expiry_exact`, `expiry_within` (once per term), `program_week` (7-day
+  anniversaries of the **first term of an unbroken run on the same plan**, `comm_program_root()`, so a
+  renewal does not restart week 1 — but a lapse or a plan change does, because `approve_subscription`
+  links every approval to the previous row whatever its age or plan; the legacy "weekly" rule fired
+  daily); all skip a term with no end date. Dedupe is a **unique key** (`rule:<rule>:<term>:ends:<date>`
+  / `rule:<rule>:<first term>:week:<n>`), not a scan of the last 600 log rows, so an extended term earns
+  a fresh notice at its new date and a second run the same day is a no-op. ★ A row a pause, an edit or
+  an inactive rule DROPPED was never sent, so it does not hold its key: the next run queues that member
+  again anywhere in the claim's week-long window — so turning a rule back on after midnight does not
+  strand it — unless an earlier try of it may have been delivered 20 or more hours ago, which the claim
+  would only write off (the rule preview uses the same test). Each run re-reads every rule under a row lock, so it never queues matches from a definition an
+  edit has just replaced. ★ A missed or capped day is **caught up** on the next run, up to seven days
+  back (`last_complete_on`); a rule that has never completed a run catches up from the day it was
+  turned on.
+- ★ **THE DAILY CAP IS CHECKED UNDER A LOCK** on the `comm_settings` row: "used today" = sent since Manila
+  midnight + everything still waiting. A message that would pass it is refused whole (`COMM_DAILY_CAP`);
+  over-cap automation matches are left unqueued so the next run picks them up. Default 100 (Resend's free
+  plan); set it in Communications → Settings. A double submit reuses the composer's `client_key` (minted
+  on Review, kept until the message or the audience changes — Back alone keeps it), so the server returns
+  the campaign it already made; after a dropped connection the composer says the outcome is uncertain
+  rather than "not queued".
+- ★ **VERCEL CRON CALLS GET.** `vercel.json` schedules `/api/cron/communications` at `0 1 * * *` (09:00
+  Manila). The handler requires `Authorization: Bearer $CRON_SECRET`, compares SHA-256 digests with
+  `timingSafeEqual`, and **fails closed when the secret is unset or shorter than 16 characters** — with the same 401 as a wrong secret,
+  so the response does not reveal whether the schedule is configured (the reason goes to the log). It
+  must never become an unauthenticated "send the queue" URL. It queues nothing while email is unconfigured (a notice would go
+  out days late and eat the cap). `GET /api/admin/communications` returns `{ ok }` only — which secrets
+  are set is read through the signed-in `status` action. Both handlers have a `commDevApi` route in
+  `vite.config.js`.
+- **Reminder counts key on the enrollment request**, not a subject prefix: `finance_receivables_worklist`
+  is dropped and re-signed with `p_plan_keys` / `p_batch_ids` and `reminder_count` / `last_reminder_at`.
+  Finance → Receivables gains package/batch filters, row selection and "Send reminder"; Enrollments gains
+  an **Email** button and an "Emailed …" line, both rendered only for `communications.send`.
+- ★ **Every preview is `<iframe sandbox="" srcDoc>`** built by `renderPreviewDocument()`; tag values are
+  escaped and only `https:` is linked by [src/lib/commTemplates.js](src/lib/commTemplates.js) — the ONE
+  renderer the preview and the sender share, so what the Super Admin reads is what the student receives.
+- Suites: `test/commTemplates.test.mjs`, `test/communicationsSql.test.mjs` (SQL contract in both files,
+  service-only grants, finance.manage read and write paths, the claim/record/backoff contract, the RPC
+  names the app calls, the empty sandbox, the cron gate, the send loop's stop conditions and the
+  composer's key and lock — every guard mutation-tested). Owner steps: set `CRON_SECRET` (at least 16 characters — the signed-in status check uses the same rule), confirm
+  `RESEND_API_KEY` / `RESEND_FROM`, set the daily cap.
 
 ## Progress & Rankings — learning analytics and privacy-safe leaderboards (#52)
 

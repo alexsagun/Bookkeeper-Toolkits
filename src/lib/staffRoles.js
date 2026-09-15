@@ -94,12 +94,14 @@ export const STAFF_PERMISSIONS = [
   { key: 'payment_settings.manage', category: 'Settings', label: 'Edit payment settings',
     description: 'Change the manual-payment instructions and the notification address.' },
 
-  // ── Finance (#58) ──────────────────────────────────────────────────────────
-  // ★ LAST, because the SQL seed lists it last and test/staffRolesSql.test.mjs
-  //   asserts deepEqual on ORDER, not set membership. Moving it moves nothing
-  //   about authorization and breaks the parity test.
+  // ── Finance (#58) + Communications (#61) ──────────────────────────────────
+  // ★ ORDER MATTERS: the SQL seed lists these last, in this order, and
+  //   test/staffRolesSql.test.mjs asserts deepEqual on ORDER, not set membership.
+  //   Moving one moves nothing about authorization and breaks the parity test.
   { key: 'finance.manage', category: 'Finance', label: 'Manage business finances',
     description: 'Open the Financial Management dashboard: the ledger, receivables, bank imports, reconciliation, the cash-basis P&L and the finance audit trail.' },
+  { key: 'communications.send', category: 'Communications', label: 'Send student communications',
+    description: 'Send announcements, student emails and payment reminders, run email automations, and read the delivery tracker.' },
 ];
 
 /** Fast membership test + the canonical ordering. */
@@ -142,7 +144,8 @@ export const STAFF_ROLE_KEYS = STAFF_ROLES.map((r) => r.key);
 export const SUPER_ADMIN_ROLE = 'super_admin';
 
 /**
- * THE matrix. 19 permissions x 3 roles.
+ * THE matrix. 21 permissions x 3 roles (#58 added finance.manage and #61
+ * communications.send, both held by super_admin alone).
  *
  * Two deliberate omissions, both of which a reader will want to challenge:
  *
@@ -543,6 +546,9 @@ export const ADMIN_TAB_PERMISSION = {
   // Super Admin only. An Operations Admin reviews payment proofs — and CAUSES a
   // finance write when they approve one — but may not read the books.
   financialmanagement: 'finance.manage',
+  // Super Admin only (#61). Mass email from the business's own sender, and the
+  // reminder tracker lists every student's address.
+  communications: 'communications.send',
 };
 
 /**

@@ -224,6 +224,44 @@ const notifyDevApi = (env, route, modulePath) => ({
   },
 });
 
+// Communications (#61): the Super Admin send endpoint and the daily cron. Both need the
+// service key (they claim and record deliveries) and the Resend pair. CRON_SECRET is
+// copied so the cron handler can be exercised locally with the same header Vercel sends;
+// without it the handler refuses, exactly as it does in production.
+const commDevApi = (env, route, modulePath) => ({
+  name: `comm-dev${route.replace(/\W+/g, '-')}`,
+  configureServer(server) {
+    server.middlewares.use(route, async (req, res) => {
+      const keys = [
+        'SUPABASE_SECRET_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'RESEND_API_KEY', 'RESEND_FROM',
+        'NOTIFY_ADMIN_EMAIL', 'CRON_SECRET',
+        'VITE_SUPABASE_URL', 'VITE_SUPABASE_ANON_KEY', 'SUPABASE_URL', 'SUPABASE_ANON_KEY',
+      ];
+      for (const k of keys) {
+        if (!process.env[k] && env[k]) process.env[k] = env[k];
+      }
+      res.status = (code) => { res.statusCode = code; return res; };
+      res.json = (obj) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(obj)); };
+      res.send = (text) => { res.end(String(text)); };
+      try {
+        if (req.method === 'POST') {
+          const raw = await new Promise((resolve) => {
+            let data = '';
+            req.on('data', (c) => { data += c; });
+            req.on('end', () => resolve(data));
+            req.on('error', () => resolve(''));
+          });
+          try { req.body = raw ? JSON.parse(raw) : {}; } catch { req.body = {}; }
+        }
+        const { default: handler } = await import(modulePath);
+        await handler(req, res);
+      } catch (err) {
+        res.status(500).json({ error: String(err) });
+      }
+    });
+  },
+});
+
 // The app's AI features call the Anthropic API. To keep the API key OUT of the
 // browser bundle, the dev server proxies `/api/anthropic/*` to the real API and
 // injects the auth headers here, server-side. (See src/main.jsx for the fetch
@@ -236,7 +274,9 @@ export default defineConfig(({ mode }) => {
     plugins: [react(), elevenlabsDevApi(env), studentImportDevApi(env), trainerDevApi(env), courseTrainerDevApi(env),
       staffDevApi(env),
       notifyDevApi(env, '/api/notify-enrollment', './api/notify-enrollment.js'),
-      notifyDevApi(env, '/api/notify-access', './api/notify-access.js')],
+      notifyDevApi(env, '/api/notify-access', './api/notify-access.js'),
+      commDevApi(env, '/api/admin/communications', './api/admin/communications.js'),
+      commDevApi(env, '/api/cron/communications', './api/cron/communications.js')],
     build: {
       rollupOptions: {
         output: {

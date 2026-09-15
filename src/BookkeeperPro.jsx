@@ -74,6 +74,10 @@ import {
 import { FINANCE_ACCOUNT_TYPES, FINANCE_AGING_BUCKETS } from './lib/financeModel';
 import { BANK_STATEMENT_PRESETS, presetColumnMap, readStatementRows } from './lib/bankStatement';
 import {
+  COMM_PREVIEW_VARS, COMM_TAGS, COMM_TAG_HELP, COMM_TEMPLATES, parseManualEmails, renderPreviewDocument,
+  templatesFor, unknownTags,
+} from './lib/commTemplates';
+import {
   COVER_INDUSTRIES, DEFAULT_INDUSTRY_ID, getIndustry, detectIndustry, scrubDashes,
 } from './lib/coverLetterIndustry';
 import { parseLooseJson } from './lib/partialJson';
@@ -161,6 +165,7 @@ const TAB_ROUTES = {
   batches: '/admin/batches',
   staffroles: '/admin/team',
   financialmanagement: '/admin/financial-management',
+  communications: '/admin/communications',
   course: '/courses/accounting-101',
   qbomastery: '/courses/quickbooks-online-mastery',
   industryacc: '/industry-accounting',
@@ -210,7 +215,7 @@ const VALID_APP_TABS = new Set(Object.keys(TAB_ROUTES));
 // admin-only screens, the member community (a space, not a tool), and the legacy
 // mockinterview alias (a redirect, not a tool). Derived so the number can never drift
 // from the actual toolkit again.
-const NON_TOOL_TAB_IDS = new Set(['dashboard', 'progress', 'community', 'accessrequests', 'enrollments', 'studentimports', 'batches', 'staffroles', 'financialmanagement', 'mockinterview']);
+const NON_TOOL_TAB_IDS = new Set(['dashboard', 'progress', 'community', 'accessrequests', 'enrollments', 'studentimports', 'batches', 'staffroles', 'financialmanagement', 'communications', 'mockinterview']);
 const TOOL_COUNT = Object.keys(TAB_ROUTES).filter((id) => !NON_TOOL_TAB_IDS.has(id)).length;
 const INTERVIEW_SUBTAB_IDS = new Set(['winstrat', 'mock', 'common', 'accounting', 'body', 'jdgen', 'salary']);
 const APP_ROUTE_CHANGE_EVENT = 'bookkeeper:route-change';
@@ -450,6 +455,8 @@ const VOICE_TAB_INFO = {
   // Navigation only. No amounts, balances, customer details or financial facts may
   // ever appear here — this literal is published to the ElevenLabs knowledge base.
   financialmanagement: { label: 'Financial Management', stage: 'Admin', desc: 'Admin screen: the business finance dashboard. Super Admin only.', adminOnly: true },
+  // Navigation only, like the finance entry above: no recipient, address or message content.
+  communications: { label: 'Communications', stage: 'Admin', desc: 'Admin screen: send announcements and student emails, manage email automations, and read the delivery tracker. Super Admin only.', adminOnly: true },
   enrollments:  { label: 'Enrollments', stage: 'Admin', desc: 'Admin screen: review payment receipts, approve subscriptions, and manage renewals.', adminOnly: true },
   studentimports: { label: 'Student Imports', stage: 'Admin', desc: 'Admin screen: migrate legacy Thinkific students — validate, map course-combos to plans, dry-run, and import accounts + memberships.', adminOnly: true },
   staffroles: { label: 'Team & Roles', stage: 'Admin', desc: 'Admin screen: invite staff and manage who they are — assign the Super Admin, Operations Admin and Trainer roles, suspend or revoke access, and read the audit trail of every role change. Super Admin only.', adminOnly: true },
@@ -7720,6 +7727,7 @@ function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImport
     case 'batches': return <AdminBatches />;
     case 'staffroles': return <AdminStaffRoles />;
     case 'financialmanagement': return <FinancialManagement />;
+    case 'communications': return <Communications />;
     case 'coa': return <CoaGenerator />;
     case 'course': return <Course />;
     case 'qbomastery': return <QBOMastery />;
@@ -8402,6 +8410,8 @@ export default function BookkeeperProToolkit() {
     // Directly after Enrollments, by owner decision: approving a payment there is what
     // posts the collection into these books.
     { id: 'financialmanagement', label: 'Financial Management', Icon: Landmark, count: 0, tone: C.primary },
+    // Right after Financial Management, by owner decision (#61). Super Admin only.
+    { id: 'communications', label: 'Communications', Icon: Megaphone, count: 0, tone: C.primary },
     { id: 'studentimports', label: 'Student Imports', Icon: UploadCloud, count: importActiveCount, tone: C.primary },
     { id: 'batches', label: 'Batches', Icon: CalendarCheck, count: 0, tone: C.primary },
     { id: 'staffroles', label: 'Team & Roles', Icon: Users, count: 0, tone: C.primary },
@@ -14265,11 +14275,1354 @@ function FinanceReconcileCard({ call, onChanged, version }) {
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Communications (#61) — announcements, student emails, payment reminders, automatic
+// notices and the delivery tracker. Super Admin only (communications.send).
+//
+// ★ THE BROWSER DESCRIBES AN AUDIENCE; IT NEVER HANDS OVER A LIST THE SERVER TRUSTS.
+//   comm_resolve_audience() decides who receives a message, comm_create_campaign()
+//   queues it, and api/admin/communications.js sends only rows that already exist. The
+//   legacy Apps Script took recipients, subject and body from the page and sent them.
+// ★ EVERY PREVIEW IS <iframe sandbox="" srcDoc>. renderMessage() already escapes every
+//   tag value; the EMPTY sandbox (no scripts, no same-origin) is what still holds if that
+//   ever regressed. Pinned by test/communicationsSql.test.mjs.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const COMM_SUBTABS = [
+  { key: 'compose', label: 'Messages' },
+  { key: 'automations', label: 'Automations' },
+  { key: 'tracker', label: 'Reminder tracker' },
+  { key: 'settings', label: 'Settings' },
+];
+const COMM_KIND_LABELS = {
+  announcement: 'Announcement', payment_reminder: 'Payment reminder', student_email: 'Student email',
+  meeting_invite: 'Meeting invite', automation: 'Automation',
+};
+const COMM_TRIGGERS = [
+  { key: 'expiry_exact', label: 'Exactly N days before access ends', needsDays: true },
+  { key: 'expiry_within', label: 'When N or fewer days of access remain (once per term)', needsDays: true },
+  { key: 'program_week', label: 'At the start of each program week', needsDays: false },
+];
+const COMM_AUDIENCE_MODES = [
+  { key: 'all', label: 'All current members' },
+  { key: 'batch', label: 'One batch' },
+  { key: 'plans', label: 'Selected packages' },
+  { key: 'approved_between', label: 'Approved in a date range' },
+  { key: 'manual', label: 'Pasted email addresses' },
+];
+const COMM_TONES = {
+  ok: ['var(--status-ok-bg)', 'var(--status-ok-fg)', 'var(--status-ok-bd)'],
+  danger: ['var(--status-danger-bg)', 'var(--status-danger-fg)', 'var(--status-danger-bd)'],
+  neutral: ['var(--status-neutral-bg)', 'var(--status-neutral-fg)', 'var(--status-neutral-bd)'],
+  info: ['var(--status-info-bg)', 'var(--status-info-fg)', 'var(--status-info-bd)'],
+  warn: ['var(--status-warn-bg)', 'var(--status-warn-fg)', 'var(--status-warn-bd)'],
+};
+const COMM_STATUS_TONE = { sent: 'ok', failed: 'danger', skipped: 'neutral', queued: 'info', sending: 'info', active: 'ok', paused: 'warn', cancelled: 'neutral' };
+
+function CommPill({ status, label }) {
+  const t = COMM_TONES[COMM_STATUS_TONE[status] || status] || COMM_TONES.neutral;
+  return (
+    <span className="px-2 py-0.5 rounded-full text-[10.5px] font-bold whitespace-nowrap"
+      style={{ background: t[0], color: t[1], border: `1px solid ${t[2]}` }}>{label || status}</span>
+  );
+}
+
+function CommStat({ label, value, note, tone }) {
+  return (
+    <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+      <div style={FINANCE_LABEL_STYLE}>{label}</div>
+      <div style={{ fontFamily: fontDisplay, fontSize: 22, fontWeight: 800, color: tone || C.text }} className="mt-1">{value}</div>
+      {note && <div style={{ fontSize: 11, color: C.textMute }} className="mt-0.5">{note}</div>}
+    </div>
+  );
+}
+
+const commWhen = (ts) => {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleString('en-PH', { timeZone: 'Asia/Manila', month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+};
+const commDaysAgoISO = (n) => new Date(Date.now() - n * 86400000).toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
+
+// For these codes the server's own sentence names the actual problem ("Choose a batch.", "A
+// pasted list can hold at most 50 addresses.") and beats the generic copy. Any other known
+// code uses the copy table; a send-endpoint error carries its own sentence; a raw PostgREST
+// error with no known code falls back to our copy.
+const COMM_SPECIFIC_CODES = /^(FORBIDDEN|COMM_AUDIENCE_INVALID|COMM_AUDIENCE_EMPTY|COMM_MESSAGE_INVALID|COMM_RULE_INVALID|COMM_CAP_INVALID|COMM_CAMPAIGN_CLOSED|COMM_DAILY_CAP)$/;
+const commErrorText = (e, fallback) => {
+  const code = appErrorCode(e);
+  const said = typeof e?.message === 'string' ? e.message.trim() : '';
+  if (code && COMM_SPECIFIC_CODES.test(code) && said && said.length <= 240) return said;
+  if (code) return appErrorMessage(e, fallback);
+  return e?.status ? (said || fallback) : fallback;
+};
+
+/** A per-message idempotency key in the shape the server accepts (^[A-Za-z0-9-]{8,64}$). */
+const commClientKey = () => (globalThis.crypto?.randomUUID
+  ? globalThis.crypto.randomUUID()
+  : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}-${Math.random().toString(36).slice(2, 12)}`);
+
+/** POST to the send endpoint with the caller's JWT. app_error codes ride in `code`, re-attached as `hint`. */
+async function commApi(payload) {
+  const { data: s } = await supabase.auth.getSession();
+  const token = s?.session?.access_token;
+  const res = await fetch('/api/admin/communications', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(payload),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    // No server sentence (a platform error page, a timeout) → an empty message, so the
+    // caller's own fallback copy is what the Super Admin reads.
+    const e = new Error(json.error || '');
+    e.hint = json.code || null;
+    e.status = res.status;
+    throw e;
+  }
+  return json;
+}
+
+/**
+ * Drive the paced send until nothing left can go out now. Each call sends for ~45 s. It
+ * stops when nothing is waiting, when everything left is waiting out a retry backoff
+ * (another call right now would send nothing), or after three calls in a row that make no
+ * progress — pausing between them, since another tab may be sending those rows. `stopped`
+ * says which, so the caller can say what happens to what is left.
+ */
+async function commSendLoop(campaignId, onProgress) {
+  const totals = { sent: 0, failed: 0, retrying: 0, stoppedRows: 0, remaining: null, retryLater: 0, stopped: null };
+  let stalls = 0;
+  let lastRemaining = null;
+  for (let i = 0; i < 60 && !totals.stopped; i += 1) {
+    const out = await commApi({ action: 'send', campaign_id: campaignId || null });
+    const moved = (out.sent || 0) + (out.failed || 0) + (out.retrying || 0) + (out.stopped || 0);
+    totals.sent += out.sent || 0;
+    totals.failed += out.failed || 0;
+    // Rows the sender stopped because their message was cancelled or their automation turned off.
+    totals.stoppedRows += out.stopped || 0;
+    totals.retrying = out.retrying || 0;
+    totals.remaining = Number.isFinite(out.remaining) ? out.remaining : null;
+    totals.retryLater = Number(out.retry_later) || 0;
+    onProgress?.({ ...totals });
+    if (totals.remaining === null) totals.stopped = 'unknown';
+    else if (totals.remaining === 0) totals.stopped = 'done';
+    // The database stopped answering mid-run: another call right now would stop the same way.
+    else if (out.halted) totals.stopped = 'halted';
+    else if (totals.remaining <= totals.retryLater) totals.stopped = 'backoff';
+    else {
+      const progressed = moved > 0 || (lastRemaining !== null && totals.remaining < lastRemaining);
+      stalls = progressed ? 0 : stalls + 1;
+      if (stalls >= 3) totals.stopped = 'stalled';
+      else if (!progressed) await new Promise((r) => setTimeout(r, 2000));
+    }
+    lastRemaining = totals.remaining;
+  }
+  if (!totals.stopped) totals.stopped = 'limit';
+  return totals;
+}
+
+/** What happens to anything a send loop left behind, as one clause. Empty when nothing is. */
+function commLeftoverText(t) {
+  if (t?.stopped === 'not_configured') {
+    return 'nothing more went out because email is not set up on the server (RESEND_API_KEY and RESEND_FROM) — the message stays queued; press Send in Communications → Messages once it is';
+  }
+  if (t?.stopped === 'cancelled') return 'the message was cancelled, so nothing more is sent';
+  if (t?.stopped === 'unknown') {
+    return 'the rest could not be confirmed — check Communications → Messages and press Send again if any are left (that never sends an email twice)';
+  }
+  if (!t || !t.remaining) return '';
+  if (t.stopped === 'halted') {
+    return `${t.remaining} still waiting — sending stopped early because the database was slow to answer; press Send again in about ten minutes`;
+  }
+  if (t.stopped === 'backoff') {
+    // ★ Not a promise that they go out: an email the provider may already have delivered is
+    //   never sent twice, and one that still cannot be confirmed 20 hours on is written off.
+    return `${t.remaining} hit a temporary error and will be tried again — press Send again in a few minutes (the next daily run also retries them). One that may already have been delivered and still cannot be confirmed 20 hours after its first try is marked “outcome unknown” instead of being sent twice`;
+  }
+  return `${t.remaining} still waiting — they go out when you press Send again, or with the next daily run`;
+}
+
+/** The composer's closing heading — never "Sent" above a message nothing delivered. */
+function commDoneHeading(p) {
+  const sent = p?.sent || 0;
+  if (p?.stopped === 'not_configured') return sent ? 'Partly sent' : 'Not sent yet';
+  if (p?.stopped === 'cancelled' || (p?.stoppedRows && !p?.remaining)) return sent ? 'Stopped part-way' : 'Stopped';
+  // The loop was cut off (a dropped connection, a server error): emails may have gone out after the
+  // last count it heard, so it claims neither "sent" nor "not sent".
+  if (p?.stopped === 'unknown') return 'Sending interrupted';
+  if (p?.remaining) return sent ? 'Partly sent' : (p?.stopped === 'backoff' ? 'Not confirmed yet' : 'Not sent yet');
+  if (p?.failed) return sent ? 'Sent, with failures' : 'Not sent';
+  // Nothing this call delivered, failed or left waiting: another sender (the daily run, another tab)
+  // may have delivered every row, or a cancel skipped them — this loop cannot tell which.
+  return sent ? 'Sent' : 'Finished';
+}
+
+/** Plain words for the tracker's delivery codes; a code not listed shows as it is. */
+const COMM_DELIVERY_ERROR_LABELS = {
+  unknown_outcome: 'Outcome unknown — may have been delivered, so never sent again',
+  possibly_sent: 'Possibly delivered — never sent again',
+  released: 'Interrupted — retried under the same message key',
+  stopped: 'Stopped — the message was cancelled',
+  cancelled: 'Cancelled before sending',
+  rule_paused: 'Automation paused before sending',
+  rule_edited: 'Automation edited before sending',
+  rule_inactive: 'Automation off before sending',
+  rule_deleted: 'Automation deleted before sending',
+  no_longer_eligible: 'No longer matched the automation',
+  nothing_due: 'Balance already paid',
+  payment_details_missing: 'No payment details set up',
+  payment_settings_unreadable: 'Payment details could not be read',
+  render_empty: 'Empty message or invalid address',
+  resend_timeout: 'The email provider did not answer in time — outcome unclear',
+  resend_429: 'The email provider’s rate limit',
+  resend_failed: 'The connection to the email provider failed — outcome unclear',
+  send_error: 'Sending failed',
+  render_failed: 'The message could not be built — nothing was sent',
+};
+
+/** A delivery's code in plain words. After a try that may have been delivered, a stop is not "before sending". */
+function commDeliveryLabel(code, mayHaveSent) {
+  const label = COMM_DELIVERY_ERROR_LABELS[code] || code;
+  return mayHaveSent ? label.replace(/ before sending$/, '') : label;
+}
+
+function CommListError({ message, onRetry }) {
+  return (
+    <div className="py-4 flex flex-wrap items-center gap-2" role="alert" style={{ fontSize: 13, color: 'var(--status-danger-fg)' }}>
+      <span>{message}</span>
+      <button type="button" onClick={onRetry} className="gh-btn-ghost px-3 py-1.5 text-xs inline-flex items-center gap-1.5">
+        <RotateCcw size={12} /> Try again
+      </button>
+    </div>
+  );
+}
+
+function CommPreviewFrame({ subject, body, vars, height = 360 }) {
+  const doc = useMemo(() => renderPreviewDocument({ subject, body, vars: vars || COMM_PREVIEW_VARS }), [subject, body, vars]);
+  // ★ sandbox="" — the EMPTY token list: no scripts, no same-origin, no forms, no navigation.
+  return (
+    <iframe title="Email preview" sandbox="" srcDoc={doc} className="w-full rounded-xl block"
+      style={{ height, border: `1px solid ${C.border}`, background: '#f4f7fb' }} />
+  );
+}
+
+/** Packages and batches for the audience pickers. RLS decides what comes back. */
+function useCommLookups(enabled) {
+  const [plans, setPlans] = useState([]);
+  const [batches, setBatches] = useState([]);
+  useEffect(() => {
+    if (!enabled) return undefined;
+    let live = true;
+    (async () => {
+      const [p, b] = await Promise.all([
+        supabase.from('enrollment_plans').select('key,name,position').order('position'),
+        supabase.from('batches').select('id,code,name,status').order('code', { ascending: false }).limit(60),
+      ]);
+      if (!live) return;
+      setPlans(!p.error && p.data?.length ? p.data : ENROLLMENT_PLANS_FALLBACK.map((x) => ({ key: x.key, name: x.name })));
+      setBatches(!b.error ? (b.data || []) : []);
+    })();
+    return () => { live = false; };
+  }, [enabled]);
+  return { plans, batches };
+}
+
+function CommTagChips({ onInsert }) {
+  return (
+    <div className="flex flex-wrap gap-1.5 mt-1.5">
+      {COMM_TAGS.map((tag) => (
+        <button key={tag} type="button" title={COMM_TAG_HELP[tag]} onClick={() => onInsert(`{{${tag}}}`)}
+          className="px-2 py-0.5 rounded-md text-[11px]"
+          style={{ fontFamily: fontMono, background: 'var(--wash)', color: C.textSoft, border: `1px solid ${C.border}` }}>
+          {`{{${tag}}}`}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function CommPlanChecks({ plans, value, onChange, disabled = false }) {
+  return (
+    <div className="flex flex-wrap gap-3 mt-1">
+      {plans.map((p) => (
+        <label key={p.key} className="inline-flex items-center gap-1.5 text-sm" style={{ color: C.text }}>
+          <input type="checkbox" checked={value.includes(p.key)} disabled={disabled}
+            onChange={(e) => onChange(e.target.checked ? [...value, p.key] : value.filter((k) => k !== p.key))} />
+          {p.name}
+        </label>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * The one composer, used from Communications (announcements), Finance → Receivables
+ * (payment reminders) and Enrollments (one student). `lockedAudience` fixes WHO for the
+ * last two; the server still resolves it.
+ */
+function CommComposer({ kind, lockedAudience = null, audienceSummary = '', onClose, onSent }) {
+  const templates = useMemo(() => templatesFor(kind), [kind]);
+  const first = templates.find((t) => t.key !== 'custom') || templates[0];
+  const [templateKey, setTemplateKey] = useState(first?.key || 'custom');
+  const [subject, setSubject] = useState(first?.subject || '');
+  const [body, setBody] = useState(first?.body || '');
+  const [mode, setMode] = useState('all');
+  const [batchId, setBatchId] = useState('');
+  const [planKeys, setPlanKeys] = useState([]);
+  const [range, setRange] = useState(() => ({ from: commDaysAgoISO(30), to: commDaysAgoISO(0) }));
+  const [manualText, setManualText] = useState('');
+  const [activeOnly, setActiveOnly] = useState(true);
+  const [preview, setPreview] = useState(null);
+  const [step, setStep] = useState('edit');      // edit | confirm | sending | done
+  const [progress, setProgress] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const { plans, batches } = useCommLookups(!lockedAudience);
+  const manual = useMemo(() => parseManualEmails(manualText), [manualText]);
+
+  const audience = useMemo(() => {
+    if (lockedAudience) return lockedAudience;
+    if (mode === 'batch') return { mode, batch_id: batchId || null };
+    if (mode === 'plans') return { mode, plan_keys: planKeys };
+    if (mode === 'approved_between') return { mode, from: range.from, to: range.to, active_only: activeOnly };
+    if (mode === 'manual') return { mode, emails: manual.emails, active_only: activeOnly };
+    return { mode: 'all' };
+  }, [lockedAudience, mode, batchId, planKeys, range, manual.emails, activeOnly]);
+  const audienceKey = JSON.stringify(audience);
+  const audienceKeyRef = useRef(audienceKey);
+  audienceKeyRef.current = audienceKey;
+  // A changed audience invalidates the count the Send button quotes, and any confirmation
+  // that quoted it. (The controls are disabled outside `edit`; this is the backstop.)
+  useEffect(() => {
+    setPreview(null);
+    setStep((s) => (s === 'confirm' ? 'edit' : s));
+  }, [audienceKey]);
+  // ★ One idempotency key per message: minted on Review and kept until the message or the
+  //   audience actually changes — Back alone keeps it. A double click, a retried request, or
+  //   Back → Review → Send after a dropped connection reuses it, and the server hands back the
+  //   campaign it already made instead of emailing everyone twice. The ref lock stops a second
+  //   click before React has re-rendered the button away.
+  const clientKeyRef = useRef(null);
+  const sendLockRef = useRef(false);
+  useEffect(() => { clientKeyRef.current = null; }, [subject, body, templateKey, audienceKey]);
+
+  const unknown = useMemo(() => unknownTags(`${subject} ${body}`), [subject, body]);
+  const pickTemplate = (key) => {
+    const t = templates.find((x) => x.key === key);
+    setTemplateKey(key);
+    if (t) { setSubject(t.subject); setBody(t.body); }
+  };
+
+  const checkAudience = async () => {
+    const key = audienceKey;
+    setBusy(true); setErr('');
+    try {
+      const { data, error } = await supabase.rpc('comm_preview_audience', { p_kind: kind, p_audience: audience, p_limit: 25 });
+      if (error) throw error;
+      // A response for an audience that has since changed would quote the wrong count.
+      if (key === audienceKeyRef.current) setPreview(data);
+    } catch (e) {
+      if (key === audienceKeyRef.current) setErr(commErrorText(e, 'Could not check the recipients.'));
+    } finally { setBusy(false); }
+  };
+  const review = () => { if (!clientKeyRef.current) clientKeyRef.current = commClientKey(); setErr(''); setStep('confirm'); };
+  const backToEdit = () => { setStep('edit'); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { if (lockedAudience) checkAudience(); }, []);
+
+  const sampleVars = useMemo(() => {
+    const s = preview?.sample?.[0];
+    if (!s) return COMM_PREVIEW_VARS;
+    return { ...(s.vars || {}), name: s.name || s.vars?.name, payment_instructions: COMM_PREVIEW_VARS.payment_instructions };
+  }, [preview]);
+
+  const overLimit = preview && preview.count > preview.remaining;
+  // Payment details may only go in the body: the server refuses them in a subject too.
+  const subjectPayment = /\{\{\s*payment_instructions\s*\}\}/.test(subject);
+  const canReview = subject.trim() && body.trim() && preview && preview.count > 0 && !overLimit && unknown.length === 0
+    && !subjectPayment;
+
+  const send = async () => {
+    if (sendLockRef.current) return;
+    sendLockRef.current = true;
+    let campaignId = null;
+    try {
+      setErr('');
+      setStep('sending');
+      setProgress({ sent: 0, failed: 0, retrying: 0, remaining: preview?.count ?? null });
+      if (!clientKeyRef.current) clientKeyRef.current = commClientKey();
+      const { data, error } = await supabase.rpc('comm_create_campaign', {
+        p_kind: kind, p_template_key: templateKey === 'custom' ? null : templateKey,
+        p_subject: subject, p_body: body, p_audience: audience, p_client_key: clientKeyRef.current,
+      });
+      if (error) throw error;
+      campaignId = data?.campaign_id;
+      const totals = await commSendLoop(campaignId, setProgress);
+      setProgress(totals); setStep('done');
+      onSent?.({ campaignId, ...totals });
+    } catch (e) {
+      // A dropped connection carries no code and no HTTP status: the campaign may or may not
+      // exist, so say exactly that — "not queued" would push toward queueing it a second time.
+      const uncertain = !campaignId && !e?.code && !e?.status && !appErrorCode(e);
+      setErr(uncertain
+        ? 'The connection dropped, so it is not certain whether this message was queued. Press Send again — it will not go out twice — or check Communications → Messages first.'
+        : commErrorText(e, campaignId
+          ? 'Sending stopped part-way. The rest are still queued — send them from Communications → Messages.'
+          : 'The message was not queued.'));
+      if (campaignId) {
+        // The loop did not finish, so how many are still waiting is not known — and "the next daily
+        // run sends them" is only true once email is set up on the server.
+        const stopped = e?.hint === 'email_not_configured' ? 'not_configured'
+          : e?.hint === 'COMM_CAMPAIGN_CLOSED' ? 'cancelled' : 'unknown';
+        setProgress((p) => ({ ...(p || {}), remaining: null, stopped }));
+      }
+      setStep(campaignId ? 'done' : 'confirm');
+      if (campaignId) onSent?.({ campaignId, error: true });
+    } finally {
+      sendLockRef.current = false;
+    }
+  };
+
+  const title = { announcement: 'New announcement', payment_reminder: 'Send payment reminder', student_email: 'Email student' }[kind] || 'New message';
+  const insertTag = (tag) => setBody((b) => `${b}${b && !/\s$/.test(b) ? ' ' : ''}${tag}`);
+
+  const footer = step === 'done' ? (
+    <div className="flex justify-end"><button type="button" onClick={onClose} className="gh-btn-primary px-4 py-2 text-sm">Close</button></div>
+  ) : step === 'sending' ? (
+    <div className="flex items-center gap-2 text-sm" style={{ color: C.textSoft }}>
+      <Loader2 size={15} className="animate-spin" /> Sending — {progress?.sent || 0} sent{progress?.remaining ? `, ${progress.remaining} to go` : ''}. Keep this panel open.
+    </div>
+  ) : step === 'confirm' ? (
+    <div className="flex flex-wrap justify-end gap-2">
+      <button type="button" onClick={backToEdit} className="gh-btn-ghost px-4 py-2 text-sm">Back</button>
+      <button type="button" onClick={send} className="gh-btn-primary px-4 py-2 text-sm inline-flex items-center gap-1.5">
+        <Send size={14} /> Send to {preview?.count} {preview?.count === 1 ? 'person' : 'people'}
+      </button>
+    </div>
+  ) : (
+    <div className="flex flex-wrap justify-end gap-2">
+      <button type="button" onClick={onClose} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+      {/* A fixed audience is checked on open; if that check failed, it can be run again here. */}
+      {(!lockedAudience || (!preview && !busy)) && (
+        <button type="button" onClick={checkAudience} disabled={busy} className="gh-btn-ghost px-4 py-2 text-sm inline-flex items-center gap-1.5 disabled:opacity-60">
+          {busy ? <Loader2 size={14} className="animate-spin" /> : <Users size={14} />} {lockedAudience ? 'Check again' : 'Check recipients'}
+        </button>
+      )}
+      <button type="button" onClick={review} disabled={!canReview}
+        className="gh-btn-primary px-4 py-2 text-sm disabled:opacity-60">Review &amp; send</button>
+    </div>
+  );
+
+  return (
+    <SidePanel title={title} subtitle={COMM_KIND_LABELS[kind]} icon={kind === 'announcement' ? Megaphone : Mail}
+      onClose={onClose} maxW="sm:max-w-2xl" canClose={step !== 'sending'} footer={footer}>
+      <div className="space-y-4">
+        {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+
+        {step === 'done' ? (
+          <div className="glass-card rounded-2xl p-5" style={{ background: GLASS.card }}>
+            <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }} className="text-lg">
+              {commDoneHeading(progress)}
+            </div>
+            <div className="mt-2 text-sm" style={{ color: C.textSoft }}>
+              {commDoneHeading(progress) === 'Finished'
+                ? 'Nothing more was waiting for this message — another send may already have delivered it'
+                : <>{progress?.stopped === 'unknown' ? 'At least ' : ''}{progress?.sent || 0} delivered to the email provider{progress?.failed ? `, ${progress.failed} failed` : ''}</>}
+              {progress?.stoppedRows ? `, ${progress.stoppedRows} stopped because the message was cancelled` : ''}
+              {commLeftoverText(progress) ? `; ${commLeftoverText(progress)}` : ''}.
+              Every delivery is listed in Communications → Reminder tracker.
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+              <div style={FINANCE_LABEL_STYLE}>Recipients</div>
+              {lockedAudience ? (
+                <>
+                  <div className="mt-1 text-sm" style={{ color: C.text }}>{audienceSummary}</div>
+                  {kind === 'student_email' && (
+                    <div className="mt-1" style={{ fontSize: 11.5, color: C.textMute }}>
+                      Sent to the sign-in email of this request’s account, whether or not that account is staff or blocked.
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="mt-2 space-y-3">
+                  <select value={mode} onChange={(e) => setMode(e.target.value)} disabled={step !== 'edit'} aria-label="Who receives this" className="gh-input w-full" style={{ fontSize: 13 }}>
+                    {COMM_AUDIENCE_MODES.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}
+                  </select>
+                  {mode === 'batch' && (
+                    <select value={batchId} onChange={(e) => setBatchId(e.target.value)} disabled={step !== 'edit'} aria-label="Batch" className="gh-input w-full" style={{ fontSize: 13 }}>
+                      <option value="">Choose a batch…</option>
+                      {batches.map((b) => <option key={b.id} value={b.id}>{b.code} — {b.name}{b.status !== 'open' ? ` (${b.status})` : ''}</option>)}
+                    </select>
+                  )}
+                  {mode === 'plans' && <CommPlanChecks plans={plans} value={planKeys} onChange={setPlanKeys} disabled={step !== 'edit'} />}
+                  {mode === 'approved_between' && (
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="block"><span style={FINANCE_LABEL_STYLE}>From</span>
+                        <input type="date" value={range.from} onChange={(e) => setRange((r) => ({ ...r, from: e.target.value }))} disabled={step !== 'edit'} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+                      <label className="block"><span style={FINANCE_LABEL_STYLE}>To</span>
+                        <input type="date" value={range.to} onChange={(e) => setRange((r) => ({ ...r, to: e.target.value }))} disabled={step !== 'edit'} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+                    </div>
+                  )}
+                  {mode === 'manual' && (
+                    <div>
+                      <textarea value={manualText} onChange={(e) => setManualText(e.target.value)} rows={4} disabled={step !== 'edit'} aria-label="Email addresses"
+                        placeholder="One address per line, or separated by commas" className="gh-input w-full" style={{ fontSize: 13 }} />
+                      <div style={{ fontSize: 11.5, color: manual.invalid.length || manual.overLimit ? 'var(--status-warn-fg)' : C.textMute }}>
+                        {manual.emails.length} valid address(es){manual.invalid.length ? ` · ${manual.invalid.length} not valid` : ''}
+                        {manual.overLimit ? ' · only the first 50 are used' : ''}
+                      </div>
+                    </div>
+                  )}
+                  {(mode === 'approved_between' || mode === 'manual') && (
+                    <label className="inline-flex items-center gap-2 text-sm" style={{ color: C.text }}>
+                      <input type="checkbox" checked={activeOnly} onChange={(e) => setActiveOnly(e.target.checked)} disabled={step !== 'edit'} />
+                      Only people whose membership is still active
+                    </label>
+                  )}
+                  {mode === 'manual' && !activeOnly && (
+                    <div style={{ fontSize: 11.5, color: 'var(--status-warn-fg)' }}>
+                      Every valid address is emailed as typed — including staff and blocked accounts.
+                    </div>
+                  )}
+                </div>
+              )}
+              {preview && (
+                <div className="mt-3 text-sm" style={{ color: C.text }}>
+                  <strong>{preview.count}</strong> {preview.count === 1 ? 'person' : 'people'} will receive this.
+                  <span style={{ color: overLimit ? 'var(--status-danger-fg)' : C.textMute }}>
+                    {' '}{preview.remaining} of today’s {preview.daily_cap} emails are left.
+                  </span>
+                  {preview.sample?.length > 0 && (
+                    <div className="mt-1" style={{ fontSize: 12, color: C.textSoft }}>
+                      {preview.sample.slice(0, 6).map((x) => x.name || x.email).join(', ')}{preview.count > 6 ? ` and ${preview.count - 6} more` : ''}
+                    </div>
+                  )}
+                </div>
+              )}
+              {!preview && !lockedAudience && (
+                <div className="mt-2" style={{ fontSize: 12, color: C.textMute }}>Check recipients to see who this reaches before sending.</div>
+              )}
+            </div>
+
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Template</span>
+              <select value={templateKey} onChange={(e) => pickTemplate(e.target.value)} disabled={step !== 'edit'} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+                {templates.map((t) => <option key={t.key} value={t.key}>{t.label}</option>)}
+              </select>
+            </label>
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Subject</span>
+              <input value={subject} onChange={(e) => setSubject(e.target.value)} maxLength={200} disabled={step !== 'edit'} className="gh-input w-full mt-1" style={{ fontSize: 13 }} />
+            </label>
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Message</span>
+              <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={9} maxLength={20000} disabled={step !== 'edit'} className="gh-input w-full mt-1" style={{ fontSize: 13 }} />
+            </label>
+            {step === 'edit' && <CommTagChips onInsert={insertTag} />}
+            {unknown.length > 0 && (
+              <AdminNotice kind="warn">
+                {unknown.map((t) => `{{${t}}}`).join(', ')} {unknown.length === 1 ? 'is not a tag' : 'are not tags'} this message can fill. Fix the spelling before sending.
+              </AdminNotice>
+            )}
+            {subjectPayment && (
+              <AdminNotice kind="warn">
+                Payment details can only go in the message body, not the subject — a subject shows in inbox lists and on lock screens.
+              </AdminNotice>
+            )}
+            {kind === 'payment_reminder' && (
+              <div style={{ fontSize: 12, color: C.textMute }}>
+                {'{{payment_instructions}}'} is filled with your payment details from Enrollments → Payment details at the moment of sending.
+                The preview shows a placeholder. Each reminder goes to the sign-in email of the account that owes the balance, whether or not that account is staff or blocked.
+              </div>
+            )}
+            <div>
+              <div style={FINANCE_LABEL_STYLE} className="mb-1">Preview{preview?.sample?.[0] ? ' — as the first recipient sees it' : ' — with sample details'}</div>
+              <CommPreviewFrame subject={subject} body={body} vars={sampleVars} />
+              <div className="mt-1" style={{ fontSize: 11, color: C.textMute }}>Replies go to your support address. No one is copied.</div>
+            </div>
+            {step === 'confirm' && (
+              <AdminNotice kind="warn">
+                This sends {preview?.count} email{preview?.count === 1 ? '' : 's'} now, from your business address. It cannot be unsent.
+              </AdminNotice>
+            )}
+          </>
+        )}
+      </div>
+    </SidePanel>
+  );
+}
+
+const commTriggerText = (r) => (r.trigger_kind === 'expiry_exact'
+  ? `${r.days} day${r.days === 1 ? '' : 's'} before access ends`
+  : r.trigger_kind === 'expiry_within'
+    ? `When ${r.days} or fewer day${r.days === 1 ? '' : 's'} remain — once per term`
+    : 'At the start of each program week');
+
+function CommRuleEditor({ rule, onClose, onSaved }) {
+  const autoTemplates = COMM_TEMPLATES.filter((t) => t.kind === 'automation');
+  const [name, setName] = useState(rule?.name || '');
+  const [trigger, setTrigger] = useState(rule?.trigger_kind || 'expiry_exact');
+  const [days, setDays] = useState(rule?.days ?? 7);
+  const [scope, setScope] = useState(rule?.scope || 'all');
+  const [batchId, setBatchId] = useState(rule?.scope_batch_id || '');
+  const [planKeys, setPlanKeys] = useState(rule?.scope_plan_keys || []);
+  const [subject, setSubject] = useState(rule?.subject ?? autoTemplates[0].subject);
+  const [body, setBody] = useState(rule?.body ?? autoTemplates[0].body);
+  const [preview, setPreview] = useState(null);
+  const [busy, setBusy] = useState('');
+  const [err, setErr] = useState('');
+  const { plans, batches } = useCommLookups(true);
+  const needsDays = COMM_TRIGGERS.find((t) => t.key === trigger)?.needsDays;
+  const daysNum = Number(days);
+  const daysOk = !needsDays || (String(days).trim() !== '' && Number.isInteger(daysNum) && daysNum >= 0 && daysNum <= 365);
+  const unknown = unknownTags(`${subject} ${body}`);
+
+  const args = {
+    p_trigger: trigger,
+    p_days: needsDays ? daysNum : null,
+    p_scope: scope,
+    p_scope_batch_id: scope === 'batch' ? (batchId || null) : null,
+    p_scope_plan_keys: scope === 'plans' ? planKeys : null,
+  };
+  const argsKey = JSON.stringify(args);
+  const argsKeyRef = useRef(argsKey);
+  argsKeyRef.current = argsKey;
+  useEffect(() => { setPreview(null); }, [argsKey]);
+
+  const runPreview = async () => {
+    const key = argsKey;
+    setBusy('preview'); setErr('');
+    try {
+      const { data, error } = await supabase.rpc('comm_rule_preview', { ...args, p_rule_id: rule?.id || null, p_on: null, p_limit: 25 });
+      if (error) throw error;
+      // A preview for settings that have since changed would name the wrong people.
+      if (key === argsKeyRef.current) setPreview(data);
+    } catch (e) { if (key === argsKeyRef.current) setErr(commErrorText(e, 'Could not preview this automation.')); }
+    finally { setBusy(''); }
+  };
+  const save = async () => {
+    setBusy('save'); setErr('');
+    try {
+      const saveArgs = { p_id: rule?.id || null, p_name: name, ...args, p_subject: subject, p_body: body };
+      let { data, error } = await supabase.rpc('comm_save_rule', saveArgs);
+      // A deadlock victim was rolled back whole, so asking once more is safe.
+      if (error?.code === '40P01') ({ data, error } = await supabase.rpc('comm_save_rule', saveArgs));
+      if (error) throw error;
+      onSaved?.(data);
+    } catch (e) { setErr(commErrorText(e, 'The automation was not saved.')); setBusy(''); }
+  };
+
+  // The payment block shows as a placeholder, exactly as in the composer: the sender fills
+  // the real details at send time, so a preview without it would not be what members get.
+  const sampleVars = preview?.sample?.[0]
+    ? { ...(preview.sample[0].vars || {}), name: preview.sample[0].name, payment_instructions: COMM_PREVIEW_VARS.payment_instructions }
+    : COMM_PREVIEW_VARS;
+  const subjectPayment = /\{\{\s*payment_instructions\s*\}\}/.test(subject);
+  const canSave = name.trim() && subject.trim() && body.trim() && daysOk && unknown.length === 0 && !subjectPayment
+    && (scope !== 'batch' || batchId) && (scope !== 'plans' || planKeys.length > 0);
+
+  return (
+    <SidePanel title={rule?.id ? 'Edit automation' : 'New automation'} subtitle="Saved automations start paused" icon={Zap}
+      onClose={onClose} maxW="sm:max-w-2xl" canClose={busy !== 'save'}
+      footer={(
+        <div className="flex flex-wrap justify-end gap-2">
+          <button type="button" onClick={onClose} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+          <button type="button" onClick={runPreview} disabled={!!busy || !daysOk} className="gh-btn-ghost px-4 py-2 text-sm inline-flex items-center gap-1.5 disabled:opacity-60">
+            {busy === 'preview' ? <Loader2 size={14} className="animate-spin" /> : <Eye size={14} />} Preview today
+          </button>
+          <button type="button" onClick={save} disabled={!canSave || !!busy} className="gh-btn-primary px-4 py-2 text-sm disabled:opacity-60">
+            {busy === 'save' ? 'Saving…' : 'Save (paused)'}
+          </button>
+        </div>
+      )}>
+      <div className="space-y-4">
+        {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+        {rule?.status === 'active' && (
+          <AdminNotice kind="warn">Saving changes pauses this automation and drops any of its emails still waiting to send. Check the preview, then turn it back on.</AdminNotice>
+        )}
+        <label className="block"><span style={FINANCE_LABEL_STYLE}>Name</span>
+          <input value={name} onChange={(e) => setName(e.target.value)} maxLength={120} className="gh-input w-full mt-1" style={{ fontSize: 13 }} placeholder="e.g. Access ends in 7 days" />
+        </label>
+        <div className="grid sm:grid-cols-[minmax(0,1fr),120px] gap-3">
+          <label className="block"><span style={FINANCE_LABEL_STYLE}>When</span>
+            <select value={trigger} onChange={(e) => setTrigger(e.target.value)} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+              {COMM_TRIGGERS.map((t) => <option key={t.key} value={t.key}>{t.label}</option>)}
+            </select>
+          </label>
+          {needsDays && (
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Days (N)</span>
+              <input type="number" min={0} max={365} value={days} onChange={(e) => setDays(e.target.value)} className="gh-input w-full mt-1" style={{ fontSize: 13 }} />
+            </label>
+          )}
+        </div>
+        <div>
+          <span style={FINANCE_LABEL_STYLE}>Who</span>
+          <select value={scope} onChange={(e) => setScope(e.target.value)} aria-label="Who receives this automation" className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+            <option value="all">All current members</option>
+            <option value="batch">One batch</option>
+            <option value="plans">Selected packages</option>
+          </select>
+          {scope === 'batch' && (
+            <select value={batchId} onChange={(e) => setBatchId(e.target.value)} aria-label="Batch" className="gh-input w-full mt-2" style={{ fontSize: 13 }}>
+              <option value="">Choose a batch…</option>
+              {batches.map((b) => <option key={b.id} value={b.id}>{b.code} — {b.name}</option>)}
+            </select>
+          )}
+          {scope === 'plans' && <CommPlanChecks plans={plans} value={planKeys} onChange={setPlanKeys} />}
+          <div className="mt-1" style={{ fontSize: 11.5, color: C.textMute }}>
+            Memberships with no end date are never matched. Staff never receive automations.
+          </div>
+        </div>
+        <label className="block"><span style={FINANCE_LABEL_STYLE}>Start from a template</span>
+          <select value="" onChange={(e) => { const t = autoTemplates.find((x) => x.key === e.target.value); if (t) { setSubject(t.subject); setBody(t.body); } }} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+            <option value="">Choose…</option>
+            {autoTemplates.map((t) => <option key={t.key} value={t.key}>{t.label}</option>)}
+          </select>
+        </label>
+        <label className="block"><span style={FINANCE_LABEL_STYLE}>Subject</span>
+          <input value={subject} onChange={(e) => setSubject(e.target.value)} maxLength={200} className="gh-input w-full mt-1" style={{ fontSize: 13 }} />
+        </label>
+        <label className="block"><span style={FINANCE_LABEL_STYLE}>Message</span>
+          <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={8} maxLength={20000} className="gh-input w-full mt-1" style={{ fontSize: 13 }} />
+        </label>
+        <CommTagChips onInsert={(tag) => setBody((b) => `${b}${b && !/\s$/.test(b) ? ' ' : ''}${tag}`)} />
+        {unknown.length > 0 && (
+          <AdminNotice kind="warn">{unknown.map((t) => `{{${t}}}`).join(', ')} cannot be filled. Fix the spelling before saving.</AdminNotice>
+        )}
+        {subjectPayment && (
+          <AdminNotice kind="warn">Payment details can only go in the message body, not the subject.</AdminNotice>
+        )}
+        {preview && (
+          <div className="glass-card rounded-2xl p-4 text-sm" style={{ background: GLASS.card, color: C.text }}>
+            If this were active, today ({preview.on}) it would email <strong>{preview.will_send}</strong> {preview.will_send === 1 ? 'person' : 'people'}
+            {preview.already_sent ? ` — ${preview.already_sent} more already have a delivery of this notice (sent, waiting, failed or stopped) and are not emailed again` : ''}.
+            {preview.sample?.length > 0 && (
+              <div className="mt-1" style={{ fontSize: 12, color: C.textSoft }}>
+                {preview.sample.slice(0, 8).map((x) => `${x.name || x.email}${x.already_sent ? ' (already)' : ''}`).join(', ')}
+              </div>
+            )}
+          </div>
+        )}
+        <div>
+          <div style={FINANCE_LABEL_STYLE} className="mb-1">Preview</div>
+          <CommPreviewFrame subject={subject} body={body} vars={sampleVars} height={320} />
+        </div>
+      </div>
+    </SidePanel>
+  );
+}
+
+function Communications() {
+  // ★ staffDegraded destructured — uiSafety.test.mjs §12.
+  const { profile, staff, staffReady, staffDegraded, can } = useAuth();
+  const allowed = adminTabVisible(staff, {
+    staffReady, staffDegraded, profileIsAdmin: !!profile?.is_admin,
+  }, 'communications');
+  const canFinance = staffDegraded ? !!profile?.is_admin : (staffReady && can('finance.manage'));
+
+  const [sub, setSub] = useState('compose');
+  const [overview, setOverview] = useState(null);
+  const [health, setHealth] = useState(null);
+  const [needsSetup, setNeedsSetup] = useState(false);
+  const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
+  const [composing, setComposing] = useState(false);
+  const [campaigns, setCampaigns] = useState(null);
+  const [rules, setRules] = useState(null);
+  const [editingRule, setEditingRule] = useState(null);   // {} = new, a row = edit
+  const [confirm, setConfirm] = useState(null);           // { kind, row }
+  const [confirmErr, setConfirmErr] = useState('');
+  const [busyKey, setBusyKey] = useState('');
+  const [sendProgress, setSendProgress] = useState(null);
+  const [log, setLog] = useState(null);
+  const [logFilter, setLogFilter] = useState({ kind: '', status: '', search: '', campaignId: '', ruleId: '' });
+  const [summaries, setSummaries] = useState(null);
+  const [capDraft, setCapDraft] = useState('');
+
+  const call = useCallback(async (fn, args) => {
+    let { data, error } = await supabase.rpc(fn, args);
+    // ★ A deadlock victim (40P01) was rolled back whole, so asking once more is the same as asking the
+    //   first time. It happens when a pause, an edit, a delete or a cancel meets a sender's claim.
+    if (error?.code === '40P01') ({ data, error } = await supabase.rpc(fn, args));
+    if (error) {
+      if (isMigrationMissing(error)) setNeedsSetup(true);
+      throw error;
+    }
+    return data;
+  }, []);
+  // Each list has its OWN error and Try again. One shared banner left the failed list on
+  // "Loading…" forever, with nothing on it to press.
+  const [listErr, setListErr] = useState({});   // overview | campaigns | rules | tracker -> message
+  const fail = useCallback((key, e, fallback) => {
+    if (isMigrationMissing(e)) return;
+    console.error('[comm] load failed', { list: key, code: e?.code });
+    setListErr((m) => ({ ...m, [key]: commErrorText(e, fallback) }));
+  }, []);
+  const clearErr = useCallback((key) => setListErr((m) => (m[key] ? { ...m, [key]: '' } : m)), []);
+
+  const loadOverview = useCallback(async () => {
+    clearErr('overview');
+    try {
+      const o = await call('comm_overview');
+      setOverview(o);
+      setCapDraft(String(o?.daily_cap ?? ''));
+    } catch (e) { fail('overview', e, 'Could not load Communications.'); }
+  }, [call, fail, clearErr]);
+  // Through the gated endpoint: which secrets are configured is not for the public GET.
+  const loadHealth = useCallback(async () => {
+    try { setHealth(await commApi({ action: 'status' })); } catch { setHealth({ unavailable: true }); }
+  }, []);
+  const loadCampaigns = useCallback(async () => {
+    try { setCampaigns(await call('comm_campaigns_list', { p_kind: null, p_limit: 50, p_offset: 0 }) || []); }
+    catch (e) { fail('campaigns', e, 'Could not load messages.'); }
+  }, [call, fail]);
+  const loadRules = useCallback(async () => {
+    try { setRules(await call('comm_rules_list') || []); }
+    catch (e) { fail('rules', e, 'Could not load automations.'); }
+  }, [call, fail]);
+  const loadTracker = useCallback(async (override) => {
+    const f = override || logFilter;
+    try {
+      const [rows, byKind, byRule, byStudent] = await Promise.all([
+        call('comm_delivery_log', {
+          p_kind: f.kind || null, p_status: f.status || null, p_campaign_id: f.campaignId || null,
+          p_rule_id: f.ruleId || null, p_search: f.search.trim() || null, p_limit: 200, p_offset: 0,
+        }),
+        call('comm_delivery_summary', { p_group: 'kind' }),
+        call('comm_delivery_summary', { p_group: 'rule' }),
+        call('comm_delivery_summary', { p_group: 'student' }),
+      ]);
+      setLog(rows || []);
+      setSummaries({ kind: byKind || [], rule: byRule || [], student: byStudent || [] });
+    } catch (e) { fail('tracker', e, 'Could not load the tracker.'); }
+  }, [call, fail, logFilter]);
+
+  useEffect(() => {
+    if (!allowed) return;
+    loadOverview();
+    loadHealth();
+  }, [allowed, loadOverview, loadHealth]);
+
+  // A list that failed waits for Try again (which clears its error) instead of re-asking
+  // on every render.
+  useEffect(() => {
+    if (!allowed || needsSetup) return;
+    if (sub === 'compose' && campaigns === null && !listErr.campaigns) loadCampaigns();
+    if (sub === 'automations' && rules === null && !listErr.rules) loadRules();
+    if (sub === 'tracker' && log === null && !listErr.tracker) loadTracker();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sub, allowed, needsSetup, campaigns, rules, log, listErr]);
+
+  const refreshAll = useCallback(() => {
+    setListErr({}); setCampaigns(null); setRules(null); setLog(null); loadOverview();
+  }, [loadOverview]);
+
+  const runSend = async (campaignId, label) => {
+    setBusyKey(`send:${campaignId || 'all'}`); setErr(''); setNotice('');
+    setSendProgress({ label, sent: 0, failed: 0, remaining: null });
+    try {
+      const t = await commSendLoop(campaignId, (p) => setSendProgress({ label, ...p }));
+      const left = commLeftoverText(t);
+      setNotice(`${label}: ${t.sent} sent${t.failed ? `, ${t.failed} failed` : ''}`
+        + `${t.stoppedRows ? `, ${t.stoppedRows} stopped because the message was cancelled or its automation turned off` : ''}${left ? `; ${left}` : ''}.`);
+    } catch (e) {
+      setErr(commErrorText(e, 'Sending stopped. Anything already sent will not be sent twice.'));
+    } finally {
+      setBusyKey(''); setSendProgress(null); refreshAll();
+    }
+  };
+  const retryFailed = async (row) => {
+    setBusyKey(`retry:${row.id}`); setErr('');
+    try {
+      const out = await call('comm_retry_failed', { p_campaign_id: row.id });
+      setBusyKey('');
+      if (out?.requeued) await runSend(row.id, `Retry of “${row.subject}”`);
+      else setNotice('Nothing was re-queued. The failed emails left may already have been delivered — the email provider never gave a clear answer — so they are not sent again. Each one is listed in the Reminder tracker.');
+    } catch (e) { setErr(commErrorText(e, 'The failed emails were not re-queued.')); setBusyKey(''); }
+  };
+  const pauseRule = async (row) => {
+    setBusyKey(`pause:${row.id}`); setErr('');
+    try {
+      const out = await call('comm_set_rule_status', { p_id: row.id, p_status: 'paused' });
+      setNotice(`“${row.name}” is paused${out?.dropped ? ` and ${out.dropped} of its waiting email(s) were dropped` : ''}. Nothing more is sent until it is turned back on`
+        + `${out?.in_flight ? ` — except that an email already being handed to the email provider at this moment may still arrive` : ''}.`
+        + ' Turning it back on queues anyone it dropped who still qualifies.');
+      refreshAll();
+    } catch (e) { setErr(commErrorText(e, 'The automation was not paused.')); }
+    finally { setBusyKey(''); }
+  };
+  const doConfirm = async () => {
+    const { kind, row } = confirm;
+    setBusyKey(`confirm:${kind}`); setConfirmErr('');
+    try {
+      if (kind === 'activate') {
+        await call('comm_set_rule_status', { p_id: row.id, p_status: 'active' });
+        setNotice(`“${row.name}” is on. It runs every day at 9:00 AM Manila time.`);
+      } else if (kind === 'delete') {
+        const out = await call('comm_delete_rule', { p_id: row.id });
+        setNotice(`“${row.name}” was deleted${out?.skipped ? ` and ${out.skipped} waiting email(s) were dropped` : ''}`
+          + `${out?.in_flight ? `; ${out.in_flight} already being handed to the email provider may still arrive` : ''}. Its history stays in the tracker.`);
+      } else if (kind === 'cancel') {
+        const out = await call('comm_cancel_campaign', { p_campaign_id: row.id });
+        setNotice(`Cancelled — ${out?.skipped || 0} waiting email(s) will not be sent`
+          + `${out?.in_flight ? `; ${out.in_flight} already being handed to the email provider may still arrive` : ''}.`);
+      } else if (kind === 'run') {
+        const out = await commApi({ action: 'run-automations' });
+        const remaining = Number.isFinite(out.remaining) ? out.remaining : null;
+        const left = commLeftoverText({
+          remaining,
+          // An unreadable count is said out loud, never folded into "nothing left".
+          stopped: remaining === null ? 'unknown' : out.halted ? 'halted'
+            : remaining && remaining <= (Number(out.retry_later) || 0) ? 'backoff' : 'limit',
+        });
+        setNotice(`Automations ran: ${out.queued} queued, ${out.sent} sent${out.failed ? `, ${out.failed} failed` : ''}`
+          + `${out.stopped ? `, ${out.stopped} stopped because the message was cancelled or its automation turned off` : ''}`
+          + `${out.capped ? `, ${out.capped} held back by today’s limit` : ''}${left ? `; ${left}` : ''}.`);
+      }
+      setConfirm(null); refreshAll();
+    } catch (e) {
+      setConfirmErr(commErrorText(e, 'That did not work.'));
+    } finally { setBusyKey(''); }
+  };
+  const saveCap = async () => {
+    setBusyKey('cap'); setErr('');
+    try {
+      await call('comm_set_daily_cap', { p_cap: Number(capDraft) });
+      setNotice(`Daily limit set to ${Number(capDraft).toLocaleString('en-PH')} emails.`);
+      loadOverview();
+    } catch (e) { setErr(commErrorText(e, 'The daily limit was not saved.')); }
+    finally { setBusyKey(''); }
+  };
+  const applyLogFilter = (next) => { setLogFilter(next); setLog(null); loadTracker(next); };
+  const exportLog = () => financeDownloadCsv(`email-deliveries-${commDaysAgoISO(0)}.csv`, [
+    { label: 'Queued at', value: (r) => r.created_at },
+    { label: 'Sent at', value: (r) => r.sent_at },
+    { label: 'Kind', value: (r) => COMM_KIND_LABELS[r.kind] || r.kind },
+    { label: 'Recipient', key: 'recipient_name' },
+    { label: 'Email', key: 'email' },
+    { label: 'Subject', value: (r) => r.subject_sent || r.campaign_subject || r.rule_name },
+    { label: 'Status', key: 'status' },
+    { label: 'Error', key: 'error_code' },
+    { label: 'May have been delivered', value: (r) => (r.may_have_sent ? 'yes' : '') },
+    { label: 'Attempts', key: 'attempts' },
+  ], log || []);
+
+  if (!staffReady && !staffDegraded) {
+    return <div className="p-6"><FinanceLoading label="Checking your access…" /></div>;
+  }
+  if (!allowed) {
+    return (
+      <div>
+        <SectionHead eyebrow="Admin" title="Communications" desc="Announcements, student emails, payment reminders and automatic notices." gold />
+        <div className="mt-6 max-w-2xl mx-auto glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
+          <Megaphone size={38} className="mx-auto mb-3" style={{ color: ROYAL }} />
+          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">Super Admin only</div>
+          <div className="text-slate-500 mt-2 text-sm max-w-md mx-auto">
+            Communications needs the <span style={{ fontFamily: fontMono }}>communications.send</span> permission,
+            which only a Super Admin holds.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const o = overview || {};
+  const dash = listErr.overview ? '—' : '…';
+  const btn = 'px-3 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 transition disabled:opacity-60';
+  const btnGhost = { background: C.white, color: C.textSoft, border: `1px solid ${C.border}` };
+
+  return (
+    <div>
+      <SectionHead eyebrow="Admin" title="Communications" gold
+        desc="Announcements, student emails, payment reminders and automatic notices — sent from your business address, with every delivery tracked." />
+
+      {needsSetup ? (
+        <div className="mt-6 max-w-2xl mx-auto glass-card rounded-2xl p-8 text-center" style={{ background: SHEEN }}>
+          <Settings size={34} className="mx-auto mb-3" style={{ color: ROYAL }} />
+          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg font-bold">Finish database setup</div>
+          <div className="text-slate-500 mt-2 text-sm">
+            Run <span style={{ fontFamily: fontMono }}>db/2026-09-16-communications.sql</span> (#61), then reload this page.
+          </div>
+        </div>
+      ) : (
+        <div className="mt-4">
+          {health && health.hasResend === false && (
+            <AdminNotice kind="warn">
+              Email sending is not configured on the server yet — set RESEND_API_KEY and RESEND_FROM in Vercel.
+              Messages can be written and checked, but nothing is sent until then.
+            </AdminNotice>
+          )}
+          {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+          {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
+          {listErr.overview && <CommListError message={listErr.overview} onRetry={loadOverview} />}
+
+          <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 mt-4">
+            <CommStat label="Sent · 7 days" value={overview ? o.sent_7d : dash} />
+            <CommStat label="Failed · 7 days" value={overview ? o.failed_7d : dash} tone={o.failed_7d ? 'var(--status-danger-fg)' : undefined} />
+            <CommStat label="Waiting to send" value={overview ? o.waiting : dash} />
+            <CommStat label="Today’s emails" value={overview ? `${o.used_today} / ${o.daily_cap}` : dash} note={overview ? `${o.remaining} left today` : ''} />
+            <CommStat label="Automations on" value={overview ? `${o.active_rules} / ${o.rules}` : dash} note="Daily at 9:00 AM Manila" />
+          </div>
+
+          {/* Plain toggle buttons (aria-pressed): a role="tablist" promises arrow-key tab behaviour this row does not have. */}
+          <div className="flex flex-wrap items-center gap-1.5 mt-5">
+            {COMM_SUBTABS.map((t) => (
+              <button key={t.key} type="button" aria-pressed={sub === t.key} onClick={() => setSub(t.key)}
+                className="px-3.5 py-2 rounded-xl text-xs font-semibold transition"
+                style={sub === t.key ? { background: C.primarySolid, color: 'white' } : btnGhost}>
+                {t.label}
+              </button>
+            ))}
+            <button type="button" onClick={() => { refreshAll(); loadHealth(); }} disabled={!!busyKey}
+              className={`${btn} ml-auto`} style={btnGhost} aria-label="Refresh Communications">
+              <RotateCcw size={12} /> Refresh
+            </button>
+          </div>
+
+          {sendProgress && (
+            <div className="mt-3 flex items-center gap-2 text-sm" style={{ color: C.textSoft }}>
+              <Loader2 size={15} className="animate-spin" /> {sendProgress.label}: {sendProgress.sent} sent
+              {sendProgress.remaining ? `, ${sendProgress.remaining} to go` : ''}. Keep this page open.
+            </div>
+          )}
+
+          {/* ── Messages ─────────────────────────────────────────────────── */}
+          {sub === 'compose' && (
+            <div className="glass-card rounded-2xl p-4 mt-4 overflow-x-auto" style={{ background: GLASS.card }}>
+              <div className="flex flex-wrap items-center gap-2 mb-3">
+                <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Messages</div>
+                <div style={{ fontSize: 12, color: C.textMute }}>
+                  Announcements, student emails and payment reminders, newest first.
+                  {health && health.hasCronSecret === false && (
+                    <span style={{ color: 'var(--status-warn-fg)' }}> The daily run is not configured yet (CRON_SECRET), so anything left waiting goes out only when you press Send.</span>
+                  )}
+                </div>
+                <div className="ml-auto flex gap-2">
+                  {o.waiting > 0 && canFinance && (
+                    <button type="button" onClick={() => runSend(null, 'Everything waiting')} disabled={!!busyKey} className={btn} style={btnGhost}>
+                      <Send size={13} /> Send waiting ({o.waiting})
+                    </button>
+                  )}
+                  <button type="button" onClick={() => setComposing(true)} className="gh-btn-primary px-3.5 py-2 text-xs inline-flex items-center gap-1.5">
+                    <Plus size={14} /> New announcement
+                  </button>
+                </div>
+              </div>
+              {campaigns === null ? (listErr.campaigns
+                ? <CommListError message={listErr.campaigns} onRetry={() => clearErr('campaigns')} />
+                : <FinanceLoading label="Loading messages…" />) : campaigns.length === 0 ? (
+                <div className="py-6 text-center" style={{ fontSize: 13, color: C.textMute }}>
+                  Nothing sent yet. Student emails are sent from Enrollments, and payment reminders from Financial Management → Receivables.
+                </div>
+              ) : (
+                <table className="w-full text-sm" style={{ color: C.text }}>
+                  <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+                    <th scope="col" className="py-1">Queued</th><th scope="col">Kind</th><th scope="col">Subject</th>
+                    <th scope="col">To</th><th scope="col">Sent</th><th scope="col">Failed</th><th scope="col">Waiting</th><th scope="col" />
+                  </tr></thead>
+                  <tbody>
+                    {campaigns.map((c) => (
+                      <tr key={c.id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                        <td className="py-1.5 whitespace-nowrap" style={{ fontSize: 12 }}>{commWhen(c.created_at)}</td>
+                        <td><CommPill status={c.cancelled_at ? 'cancelled' : 'queued'} label={c.cancelled_at ? 'Cancelled' : COMM_KIND_LABELS[c.kind]} /></td>
+                        <td className="max-w-[260px] truncate" title={c.subject}>{c.subject}</td>
+                        <td>{c.recipient_count}</td>
+                        <td>{c.sent}</td>
+                        <td style={{ color: Number(c.failed) ? 'var(--status-danger-fg)' : undefined }}>{c.failed}</td>
+                        <td>{c.waiting}</td>
+                        <td className="whitespace-nowrap text-right">
+                          <div className="inline-flex gap-1.5">
+                            {Number(c.waiting) > 0 && !c.cancelled_at && (c.kind !== 'payment_reminder' || canFinance) && (
+                              <button type="button" onClick={() => runSend(c.id, `“${c.subject}”`)} disabled={!!busyKey} className={btn} style={btnGhost}><Send size={12} /> Send</button>
+                            )}
+                            {Number(c.failed) > 0 && !c.cancelled_at && (c.kind !== 'payment_reminder' || canFinance) && (
+                              <button type="button" onClick={() => retryFailed(c)} disabled={!!busyKey} className={btn} style={btnGhost}><RotateCcw size={12} /> Retry failed</button>
+                            )}
+                            {Number(c.waiting) > 0 && !c.cancelled_at && (
+                              <button type="button" onClick={() => { setConfirmErr(''); setConfirm({ kind: 'cancel', row: c }); }} disabled={!!busyKey} className={btn} style={btnGhost}><X size={12} /> Cancel</button>
+                            )}
+                            <button type="button" onClick={() => { const next = { kind: '', status: '', search: '', ruleId: '', campaignId: c.id }; setSub('tracker'); applyLogFilter(next); }} className={btn} style={btnGhost}>
+                              <Eye size={12} /> Deliveries
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
+
+          {/* ── Automations ──────────────────────────────────────────────── */}
+          {sub === 'automations' && (
+            <div className="mt-4 space-y-3">
+              <div className="glass-card rounded-2xl p-4 flex flex-wrap items-center gap-2" style={{ background: GLASS.card }}>
+                <div className="flex-1 min-w-[220px]" style={{ fontSize: 12.5, color: C.textSoft }}>
+                  Automations email members on their own, once a day at 9:00 AM Manila time. A new or edited automation
+                  starts paused; preview it, then turn it on.
+                  {health && health.hasCronSecret === false && (
+                    <span style={{ color: 'var(--status-warn-fg)' }}> The daily schedule is not configured yet (CRON_SECRET), so they only run when you press Run now.</span>
+                  )}
+                </div>
+                {canFinance && (
+                  <button type="button" onClick={() => { setConfirmErr(''); setConfirm({ kind: 'run' }); }} disabled={!!busyKey || !o.active_rules} className={btn} style={btnGhost}>
+                    <Play size={13} /> Run now
+                  </button>
+                )}
+                <button type="button" onClick={() => setEditingRule({})} className="gh-btn-primary px-3.5 py-2 text-xs inline-flex items-center gap-1.5">
+                  <Plus size={14} /> New automation
+                </button>
+              </div>
+              {rules === null ? (listErr.rules
+                ? <CommListError message={listErr.rules} onRetry={() => clearErr('rules')} />
+                : <FinanceLoading label="Loading automations…" />) : rules.length === 0 ? (
+                <div className="glass-card rounded-2xl p-6 text-center" style={{ background: GLASS.card, fontSize: 13, color: C.textMute }}>
+                  No automations yet. A common first one: “Access ends in 7 days”.
+                </div>
+              ) : rules.map((r) => (
+                <div key={r.id} className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+                  <div className="flex flex-wrap items-start gap-3">
+                    <div className="flex-1 min-w-[220px]">
+                      <div className="flex items-center gap-2">
+                        <span style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>{r.name}</span>
+                        <CommPill status={r.status} label={r.status === 'active' ? 'On' : 'Paused'} />
+                      </div>
+                      <div className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>
+                        {commTriggerText(r)} · {r.scope === 'all' ? 'All current members' : r.scope === 'batch' ? `Batch ${r.batch_code || ''}` : `Packages: ${(r.scope_plan_keys || []).map((k) => PLAN_LABELS[k] || k).join(', ')}`}
+                      </div>
+                      <div className="mt-0.5 truncate" style={{ fontSize: 12, color: C.textMute }} title={r.subject}>Subject: {r.subject}</div>
+                      <div className="mt-0.5" style={{ fontSize: 11.5, color: C.textMute }}>
+                        {r.sent} sent · {r.failed} failed · last run {commWhen(r.last_run_at)}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      <button type="button" onClick={() => setEditingRule(r)} className={btn} style={btnGhost}><Pencil size={12} /> Edit &amp; preview</button>
+                      {r.status === 'active' ? (
+                        <button type="button" onClick={() => pauseRule(r)} disabled={!!busyKey} className={btn} style={btnGhost}><Pause size={12} /> Pause</button>
+                      ) : (
+                        <button type="button" onClick={() => { setConfirmErr(''); setConfirm({ kind: 'activate', row: r }); }} disabled={!!busyKey} className={btn} style={btnGhost}><Play size={12} /> Turn on</button>
+                      )}
+                      <button type="button" onClick={() => { const next = { kind: '', status: '', search: '', campaignId: '', ruleId: r.id }; setSub('tracker'); applyLogFilter(next); }} className={btn} style={btnGhost}><Eye size={12} /> Deliveries</button>
+                      <button type="button" onClick={() => { setConfirmErr(''); setConfirm({ kind: 'delete', row: r }); }} disabled={!!busyKey} className={btn}
+                        style={{ background: 'var(--status-danger-bg)', color: 'var(--status-danger-fg)', border: '1px solid var(--status-danger-bd)' }}><Trash2 size={12} /> Delete</button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* ── Reminder tracker ─────────────────────────────────────────── */}
+          {sub === 'tracker' && (
+            <div className="mt-4 space-y-4">
+              {summaries && (
+                <div className="flex flex-wrap gap-2">
+                  {summaries.kind.map((k) => (
+                    <div key={k.kind} className="glass-card rounded-xl px-3 py-2" style={{ background: GLASS.card, fontSize: 12, color: C.textSoft }}>
+                      <strong style={{ color: C.text }}>{COMM_KIND_LABELS[k.kind] || k.kind}</strong> · {k.sent} sent · {k.failed} failed{k.waiting ? ` · ${k.waiting} waiting` : ''}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {summaries && summaries.rule.length > 0 && (
+                <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }} className="mb-2">By automation</div>
+                  <table className="w-full text-sm" style={{ color: C.text }}>
+                    <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+                      <th scope="col" className="py-1">Automation</th><th scope="col">Status</th><th scope="col">Sent</th>
+                      <th scope="col">Failed</th><th scope="col">Skipped</th><th scope="col">Last sent</th>
+                    </tr></thead>
+                    <tbody>
+                      {summaries.rule.map((r, i) => (
+                        <tr key={r.rule_id || `deleted-${i}`} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                          <td className="py-1.5">{r.name}</td>
+                          <td>{r.deleted ? <CommPill status="skipped" label="Deleted" /> : <CommPill status={r.status} label={r.status === 'active' ? 'On' : 'Paused'} />}</td>
+                          <td>{r.sent}</td><td>{r.failed}</td><td>{r.skipped}</td>
+                          <td style={{ fontSize: 12 }}>{commWhen(r.last_sent_at)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+                <div className="flex flex-wrap items-end gap-2 mb-3">
+                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }} className="mr-2">Activity log</div>
+                  <label className="block"><span style={FINANCE_LABEL_STYLE}>Kind</span>
+                    <select value={logFilter.kind} onChange={(e) => setLogFilter((f) => ({ ...f, kind: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+                      <option value="">All</option>
+                      {Object.entries(COMM_KIND_LABELS).map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+                    </select></label>
+                  <label className="block"><span style={FINANCE_LABEL_STYLE}>Status</span>
+                    <select value={logFilter.status} onChange={(e) => setLogFilter((f) => ({ ...f, status: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+                      <option value="">All</option><option value="sent">Sent</option><option value="failed">Failed</option>
+                      <option value="waiting">Waiting</option><option value="skipped">Skipped</option>
+                    </select></label>
+                  <label className="block"><span style={FINANCE_LABEL_STYLE}>Student</span>
+                    <input value={logFilter.search} onChange={(e) => setLogFilter((f) => ({ ...f, search: e.target.value }))} placeholder="Name or email"
+                      onKeyDown={(e) => { if (e.key === 'Enter') applyLogFilter(logFilter); }} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+                  <button type="button" onClick={() => applyLogFilter(logFilter)} className={btn} style={btnGhost}><Search size={12} /> Apply</button>
+                  {(logFilter.campaignId || logFilter.ruleId) && (
+                    <button type="button" onClick={() => applyLogFilter({ ...logFilter, campaignId: '', ruleId: '' })} className={btn} style={btnGhost}>
+                      <X size={12} /> {logFilter.campaignId ? 'One message only' : 'One automation only'}
+                    </button>
+                  )}
+                  {(log || []).length > 0 && (
+                    <button type="button" onClick={exportLog} className={`${btn} ml-auto`} style={btnGhost}><Download size={12} /> Export CSV</button>
+                  )}
+                </div>
+                {log === null ? (listErr.tracker
+                  ? <CommListError message={listErr.tracker} onRetry={() => clearErr('tracker')} />
+                  : <FinanceLoading label="Loading deliveries…" />) : log.length === 0 ? (
+                  <div className="py-4" style={{ fontSize: 13, color: C.textMute }}>No deliveries match this view.</div>
+                ) : (
+                  <>
+                    {log[0].total_count > log.length && (
+                      <div className="mb-2" style={{ fontSize: 12, color: C.textMute }}>Showing the newest {log.length} of {log[0].total_count}. Narrow the filter to see older ones.</div>
+                    )}
+                    <table className="w-full text-sm" style={{ color: C.text }}>
+                      <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+                        <th scope="col" className="py-1">When</th><th scope="col">Kind</th><th scope="col">Recipient</th>
+                        <th scope="col">Subject</th><th scope="col">Status</th>
+                      </tr></thead>
+                      <tbody>
+                        {log.map((d) => (
+                          <tr key={d.id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                            <td className="py-1.5 whitespace-nowrap" style={{ fontSize: 12 }}>{commWhen(d.sent_at || d.created_at)}</td>
+                            <td style={{ fontSize: 12 }}>{d.kind === 'automation' ? (d.rule_name || 'Automation') : COMM_KIND_LABELS[d.kind]}</td>
+                            <td>
+                              <div>{d.recipient_name || '—'}</div>
+                              <div style={{ fontSize: 11, color: C.textMute }}>{d.email}</div>
+                            </td>
+                            <td className="max-w-[240px] truncate" title={d.subject_sent || d.campaign_subject || ''}>{d.subject_sent || d.campaign_subject || '—'}</td>
+                            <td>
+                              <CommPill status={d.status} label={d.status === 'queued' || d.status === 'sending' ? 'Waiting' : d.status} />
+                              {d.error_code && (
+                                <div style={{ fontSize: 11, color: C.textMute }} title={d.error_code}>{commDeliveryLabel(d.error_code, d.may_have_sent)}</div>
+                              )}
+                              {d.may_have_sent && !['unknown_outcome', 'possibly_sent'].includes(d.error_code) && (
+                                <div style={{ fontSize: 11, color: 'var(--status-warn-fg)' }}>A try may already have been delivered — it is never sent twice</div>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </>
+                )}
+              </div>
+
+              {summaries && summaries.student.length > 0 && (
+                <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }} className="mb-2">By student</div>
+                  <table className="w-full text-sm" style={{ color: C.text }}>
+                    <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+                      <th scope="col" className="py-1">Student</th><th scope="col">Sent</th><th scope="col">Payment reminders</th>
+                      <th scope="col">Automations</th><th scope="col">Failed</th><th scope="col">Last sent</th>
+                    </tr></thead>
+                    <tbody>
+                      {summaries.student.slice(0, 200).map((s) => (
+                        <tr key={s.email} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                          <td className="py-1.5"><div>{s.name || '—'}</div><div style={{ fontSize: 11, color: C.textMute }}>{s.email}</div></td>
+                          <td>{s.sent}</td><td>{s.reminders}</td><td>{s.automations}</td>
+                          <td style={{ color: s.failed ? 'var(--status-danger-fg)' : undefined }}>{s.failed}</td>
+                          <td style={{ fontSize: 12 }}>{commWhen(s.last_sent_at)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Settings ─────────────────────────────────────────────────── */}
+          {sub === 'settings' && (
+            <div className="mt-4 grid lg:grid-cols-2 gap-4">
+              <div className="glass-card rounded-2xl p-5" style={{ background: GLASS.card }}>
+                <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Daily email limit</div>
+                <div className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>
+                  The most emails that may be sent or waiting in one day (Manila time). A message that would pass it is refused
+                  before anything is queued. Match it to your email plan — Resend’s free plan allows 100 a day.
+                </div>
+                <div className="flex items-end gap-2 mt-3">
+                  <label className="block"><span style={FINANCE_LABEL_STYLE}>Emails per day</span>
+                    <input type="number" min={1} max={50000} value={capDraft} onChange={(e) => setCapDraft(e.target.value)} className="gh-input w-40 mt-1" style={{ fontSize: 13 }} /></label>
+                  <button type="button" onClick={saveCap} disabled={busyKey === 'cap' || !Number.isInteger(Number(capDraft)) || Number(capDraft) < 1}
+                    className="gh-btn-primary px-4 py-2 text-sm disabled:opacity-60">{busyKey === 'cap' ? 'Saving…' : 'Save'}</button>
+                </div>
+              </div>
+              <div className="glass-card rounded-2xl p-5" style={{ background: GLASS.card }}>
+                <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Sending</div>
+                <ul className="mt-2 space-y-1.5" style={{ fontSize: 12.5, color: C.textSoft }}>
+                  <li>Email provider: {health ? (health.unavailable ? 'could not be checked — press Refresh' : health.hasResend ? 'configured' : 'not configured (RESEND_API_KEY, RESEND_FROM)') : 'checking…'}</li>
+                  <li>Daily automation schedule: {health ? (health.unavailable ? 'could not be checked' : health.hasCronSecret ? 'configured — 9:00 AM Manila' : 'not configured (CRON_SECRET)') : 'checking…'}</li>
+                  <li>Replies go to the “Proof / support email” in Enrollments → Payment details. No one is copied.</li>
+                  <li>
+                    Last automation run: {o.last_automation_run_at ? `${commWhen(o.last_automation_run_at)} — ${o.last_automation_run?.queued ?? 0} queued`
+                      + `${o.last_automation_run?.capped ? `, ${o.last_automation_run.capped} held back by the limit` : ''}` : 'never'}
+                  </li>
+                </ul>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {composing && (
+        <CommComposer kind="announcement" onClose={() => setComposing(false)} onSent={() => refreshAll()} />
+      )}
+      {editingRule && (
+        <CommRuleEditor rule={editingRule.id ? editingRule : null} onClose={() => setEditingRule(null)}
+          onSaved={(out) => {
+            setEditingRule(null);
+            setNotice(out?.was_active
+              ? `Saved and paused${out?.dropped ? ` — ${out.dropped} of its waiting email(s) were dropped` : ''}`
+                + `${out?.in_flight ? `; ${out.in_flight} already being handed to the email provider may still arrive with the earlier text` : ''}. Turn it back on when you are ready.`
+              : 'Saved. It is paused until you turn it on.');
+            refreshAll();
+          }} />
+      )}
+      {confirm && (
+        <AccountModal title={{ activate: 'Turn on this automation?', delete: 'Delete this automation?', cancel: 'Cancel this message?', run: 'Run automations now?' }[confirm.kind]}
+          icon={confirm.kind === 'delete' ? Trash2 : confirm.kind === 'cancel' ? X : Zap}
+          tone={confirm.kind === 'delete' || confirm.kind === 'cancel' ? 'danger' : 'primary'}
+          onClose={() => setConfirm(null)} canClose={!busyKey}>
+          <div className="space-y-3 text-sm" style={{ color: C.textSoft }}>
+            {confirmErr && <AdminNotice kind="danger">{confirmErr}</AdminNotice>}
+            {confirm.kind === 'activate' && <p>“{confirm.row.name}” will send emails automatically on the daily schedule (9:00 AM Manila) to everyone it matches. Each member receives it at most once per term{confirm.row.trigger_kind === 'program_week' ? ' per week' : ''}.</p>}
+            {confirm.kind === 'delete' && <p>“{confirm.row.name}” stops for good, and any of its emails still waiting are dropped. What it already sent stays in the tracker.</p>}
+            {confirm.kind === 'cancel' && <p>The email(s) of “{confirm.row.subject}” that have not gone out yet will not be sent — any already being handed to the email provider at this moment may still arrive. Emails already sent cannot be recalled.</p>}
+            {confirm.kind === 'run' && <p>Every automation that is on sends today’s matches now. Members who already received today’s email are skipped.</p>}
+            <div className="flex justify-end gap-2 pt-1">
+              <button type="button" onClick={() => setConfirm(null)} disabled={!!busyKey} className="gh-btn-ghost px-4 py-2 text-sm">Back</button>
+              <button type="button" onClick={doConfirm} disabled={!!busyKey}
+                className="px-4 py-2 rounded-xl text-sm font-semibold text-white disabled:opacity-60"
+                style={confirm.kind === 'delete' || confirm.kind === 'cancel' ? ADMIN_BTN_DANGER : ADMIN_BTN_OK}>
+                {busyKey ? 'Working…' : { activate: 'Turn on', delete: 'Delete', cancel: 'Cancel message', run: 'Run now' }[confirm.kind]}
+              </button>
+            </div>
+          </div>
+        </AccountModal>
+      )}
+    </div>
+  );
+}
+
 function FinancialManagement() {
   // ★ staffDegraded MUST be destructured here. A component that reads it without
   //   destructuring throws a ReferenceError at render that the build cannot see and
   //   no unit test reaches — uiSafety.test.mjs §12 pins exactly this.
-  const { profile, staff, staffReady, staffDegraded } = useAuth();
+  const { profile, staff, staffReady, staffDegraded, can } = useAuth();
+  // #61: sending a payment reminder is Communications, so it needs BOTH keys. The server
+  // (comm_create_campaign + api/admin/communications.js) asks again.
+  const canRemind = !staffDegraded && staffReady && can('finance.manage') && can('communications.send');
+  const recvLookups = useCommLookups(!!staffReady);
   // The same decision as the nav row, so the row and the screen can never disagree. An
   // active Super Admin passes before #58 exists; the RPCs then return PGRST202 and the
   // "Finish backend setup" card renders instead of any data.
@@ -14287,6 +15640,11 @@ function FinancialManagement() {
   const [sales, setSales] = useState(null);
   const [recv, setRecv] = useState(null);
   const [bucket, setBucket] = useState('');
+  // #61: package/batch filters, row selection, and the reminder composer.
+  const [recvPlan, setRecvPlan] = useState('');
+  const [recvBatch, setRecvBatch] = useState('');
+  const [recvPick, setRecvPick] = useState({});      // enrollment_id -> true
+  const [reminding, setReminding] = useState(null);  // selected rows -> CommComposer
   const [ledger, setLedger] = useState(null);
   const [pl, setPl] = useState(null);
   // The P&L loads itself; the parent only records the range that Apply committed.
@@ -14323,7 +15681,10 @@ function FinancialManagement() {
       } else if (which === 'sales') {
         const [s, r] = await Promise.all([
           call('finance_sales_by_plan', { p_from: from, p_to: to }),
-          call('finance_receivables_worklist', { p_bucket: bucket || null, p_limit: 50 }),
+          call('finance_receivables_worklist', {
+            p_bucket: bucket || null, p_limit: 200,
+            p_plan_keys: recvPlan ? [recvPlan] : null, p_batch_ids: recvBatch ? [recvBatch] : null,
+          }),
         ]);
         setSales(s || []); setRecv(r || []);
       } else if (which === 'ledger') {
@@ -14353,21 +15714,23 @@ function FinancialManagement() {
     } finally {
       setBusy(false);
     }
-  }, [allowed, call, from, to, bucket, ledgerFilter, ledgerAccounts.length]);
+  }, [allowed, call, from, to, bucket, recvPlan, recvBatch, ledgerFilter, ledgerAccounts.length]);
 
   // Lazy per sub-tab: nothing loads until it is opened, and the range re-loads only
   // the tab you are looking at.
   useEffect(() => {
     // Setup loads itself: it is a form over live state, not a report over a date range.
     if (!allowed || needsSetup || sub === 'setup' || sub === 'bank') return;
-    const has = { overview: summary, sales: sales, ledger, pl, audit }[sub];
+    // ★ `recv === null` counts as unloaded: an aging chip or a package/batch filter clears
+    //   recv while `sales` is still cached, and without this nothing re-ran the worklist.
+    const has = { overview: summary, sales: recv === null ? null : sales, ledger, pl, audit }[sub];
     if (has === null || has === undefined) load(sub);
     // eslint-disable-next-line react-hooks/exhaustive-deps
     // ★ `bucket` belongs to the receivables QUERY, not to the date range behind
     //   Apply. Without it here, clicking an aging chip cleared `recv` but re-ran
     //   nothing — and the table then asserted "Nobody has an outstanding balance in
     //   this view" from a filter that had never run.
-  }, [sub, allowed, needsSetup, bucket]);
+  }, [sub, allowed, needsSetup, bucket, recvPlan, recvBatch]);
 
   // A write anywhere changes every report, so drop the cached ones and let the
   // lazy effect re-load whichever tab is opened next.
@@ -14382,7 +15745,8 @@ function FinancialManagement() {
     const rows = (recv || []).map((r) => ({
       student: r.full_name, email: r.student_email, plan: r.plan_name,
       approved_on: r.approved_on, contract: r.contract_amount, collected: r.collected,
-      outstanding: r.outstanding, bucket: r.aging_bucket,
+      outstanding: r.outstanding, bucket: r.aging_bucket, batch: r.batch_code,
+      reminders_sent: r.reminder_count, last_reminder: r.last_reminder_at,
       days_since_approval: r.days_since_approval, days_since_last_payment: r.days_since_last_payment,
     }));
     // toCsv is formula-injection safe; downloadFile already prepends the BOM, so we
@@ -14585,11 +15949,37 @@ function FinancialManagement() {
                       </button>
                     ))}
                   </div>
-                  {(recv || []).length > 0 && (
-                    <button type="button" onClick={exportReceivables} className="gh-btn-ghost ml-auto px-3 py-1.5 text-xs">
-                      Export CSV
-                    </button>
+                  {/* #61: package and batch filters, deferred from #59. */}
+                  <select value={recvPlan} aria-label="Filter receivables by package"
+                    onChange={(e) => { setRecvPlan(e.target.value); setRecv(null); setRecvPick({}); }}
+                    className="gh-input" style={{ fontSize: 12, padding: '4px 8px', width: 'auto' }}>
+                    <option value="">All packages</option>
+                    {recvLookups.plans.map((p) => <option key={p.key} value={p.key}>{p.name}</option>)}
+                  </select>
+                  {recvLookups.batches.length > 0 && (
+                    <select value={recvBatch} aria-label="Filter receivables by batch"
+                      onChange={(e) => { setRecvBatch(e.target.value); setRecv(null); setRecvPick({}); }}
+                      className="gh-input" style={{ fontSize: 12, padding: '4px 8px', width: 'auto' }}>
+                      <option value="">All batches</option>
+                      {recvLookups.batches.map((b) => <option key={b.id} value={b.id}>{b.code}</option>)}
+                    </select>
                   )}
+                  <div className="ml-auto flex flex-wrap gap-2">
+                    {canRemind && (recv || []).length > 0 && (() => {
+                      const picked = recv.filter((r) => recvPick[r.enrollment_id]);
+                      return (
+                        <button type="button" onClick={() => setReminding(picked.length ? picked : recv)}
+                          className="gh-btn-primary px-3 py-1.5 text-xs inline-flex items-center gap-1.5">
+                          <Mail size={13} /> {picked.length ? `Send reminder (${picked.length})` : `Remind all shown (${recv.length})`}
+                        </button>
+                      );
+                    })()}
+                    {(recv || []).length > 0 && (
+                      <button type="button" onClick={exportReceivables} className="gh-btn-ghost px-3 py-1.5 text-xs">
+                        Export CSV
+                      </button>
+                    )}
+                  </div>
                 </div>
                 {(recv || []).length === 0 ? (
                   <div style={{ fontSize: 13, color: C.textMute }}>
@@ -14600,28 +15990,48 @@ function FinancialManagement() {
                   <>
                     <div className="mb-2" style={{ fontSize: 12, color: C.textSoft }}>
                       {recv[0].total_count} student(s) owe {money(recv[0].total_outstanding)}
+                      {recv[0].total_count > recv.length ? ` — showing the ${recv.length} largest balances` : ''}
                     </div>
                     <table className="w-full text-sm" style={{ color: C.text }}>
                       <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+                        {canRemind && (
+                          <th scope="col" className="py-1 pr-2">
+                            <input type="checkbox" aria-label="Select every row shown"
+                              checked={recv.length > 0 && recv.every((r) => recvPick[r.enrollment_id])}
+                              onChange={(e) => setRecvPick(e.target.checked ? Object.fromEntries(recv.map((r) => [r.enrollment_id, true])) : {})} />
+                          </th>
+                        )}
                         <th scope="col" className="py-1">Student</th><th scope="col">Plan</th>
                         <th scope="col">Contract</th><th scope="col">Collected</th>
                         <th scope="col">Outstanding</th><th scope="col">Since approval</th>
                         <th scope="col">Since payment</th><th scope="col">Bucket</th>
+                        <th scope="col">Reminders</th>
                       </tr></thead>
                       <tbody>
                         {recv.map((r) => (
                           <tr key={r.enrollment_id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                            {canRemind && (
+                              <td className="py-1.5 pr-2">
+                                <input type="checkbox" aria-label={`Select ${r.full_name || r.student_email}`} checked={!!recvPick[r.enrollment_id]}
+                                  onChange={(e) => setRecvPick((m) => { const next = { ...m }; if (e.target.checked) next[r.enrollment_id] = true; else delete next[r.enrollment_id]; return next; })} />
+                              </td>
+                            )}
                             <td className="py-1.5">
                               <div>{r.full_name}</div>
                               <div style={{ fontSize: 11, color: C.textMute }}>{r.student_email}</div>
                             </td>
-                            <td>{r.plan_name}</td>
+                            <td>{r.plan_name}{r.batch_code ? <div style={{ fontSize: 11, color: C.textMute }}>{r.batch_code}</div> : null}</td>
                             <td>{money(r.contract_amount)}</td>
                             <td>{money(r.collected)}</td>
                             <td style={{ color: C.amber, fontWeight: 700 }}>{money(r.outstanding)}</td>
                             <td>{r.days_since_approval}d</td>
                             <td>{r.days_since_last_payment}d</td>
                             <td><span className="gh-pill" style={{ fontSize: 11 }}>{r.aging_bucket}</span></td>
+                            <td style={{ fontSize: 12 }}>
+                              {r.reminder_count
+                                ? <><div>{r.reminder_count} sent</div><div style={{ fontSize: 11, color: C.textMute }}>last {commWhen(r.last_reminder_at)}</div></>
+                                : <span style={{ color: C.textMute }}>—</span>}
+                            </td>
                           </tr>
                         ))}
                       </tbody>
@@ -14631,6 +16041,16 @@ function FinancialManagement() {
                       but a payment-plan business needs the age since the last payment.
                     </div>
                   </>
+                )}
+                {/* ★ Outside the non-empty branch: reloading the list empties `recv` for a moment, and a
+                    composer inside that branch would unmount mid-send. The list reloads when it closes. */}
+                {reminding && (
+                  <CommComposer kind="payment_reminder"
+                    lockedAudience={{ mode: 'receivables', request_ids: reminding.map((r) => r.enrollment_id) }}
+                    audienceSummary={reminding.length === 1
+                      ? `${reminding[0].full_name || reminding[0].student_email} — owes ${money(reminding[0].outstanding)}`
+                      : `${reminding.length} students with an outstanding balance. Each email states that student’s own balance.`}
+                    onClose={() => { setReminding(null); setRecvPick({}); load('sales'); }} />
                 )}
               </div>
             </div>
@@ -15174,6 +16594,11 @@ function AdminEnrollments({ onCountChange }) {
   // #47: a discretionary extension is Super-Admin-only. Reviewing a payment and
   // granting free time are different acts, and the matrix keeps them apart.
   const canGrantExtension = staffDegraded ? !!profile?.is_admin : (staffReady && can('students.extend_access'));
+  // #61: emailing a student is Communications — Super Admin only. An Operations Admin keeps
+  // this screen and never sees the button or calls the status RPC.
+  const canEmail = !staffDegraded && staffReady && can('communications.send');
+  const [emailFor, setEmailFor] = useState(null);       // a request row -> CommComposer
+  const [emailStatus, setEmailStatus] = useState({});  // request id -> last sent email
   const [extendFor, setExtendFor] = useState(null);   // { row, sub } → SpecialExtensionModal
 
   const [rows, setRows] = useState([]);
@@ -15262,6 +16687,7 @@ function AdminEnrollments({ onCountChange }) {
           .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
         setRows(data);
         loadHolds(data);
+        loadEmailStatus(data);
         // Second query (no FK-embed fragility): the linked profiles, for the
         // "grant incomplete" check and the Google/Email signup hint — and the
         // subscriptions map scoped to the SAME visible users (it powers the
@@ -15559,6 +16985,15 @@ function AdminEnrollments({ onCountChange }) {
   // ── #60: holds, the timeline and reviewer names ───────────────────────────
   // Additive: on a pre-#60 database the holds table is absent and every hold control
   // stays hidden, rather than breaking the queue.
+  // #61: "last email sent" per request, newest 200. A pre-#61 database shows nothing.
+  const loadEmailStatus = async (data) => {
+    if (!canEmail) return;
+    const ids = (data || rows).map((r) => r.id).filter(Boolean).slice(0, 200);
+    if (!ids.length) return;
+    const { data: st, error } = await supabase.rpc('comm_request_email_status', { p_request_ids: ids });
+    if (error) { if (!isMigrationMissing(error)) console.warn('[enroll] email status failed', error.code); return; }
+    setEmailStatus(Object.fromEntries((st || []).map((x) => [x.enrollment_request_id, x])));
+  };
   const loadHolds = async (data) => {
     try {
       const { data: h, error } = await supabase.from('enrollment_request_holds').select('*');
@@ -16240,6 +17675,11 @@ function AdminEnrollments({ onCountChange }) {
                       {r.phone && <span className="inline-flex items-center gap-1"><Phone size={11} /> {r.phone}</span>}
                       {r.city_country && <span className="inline-flex items-center gap-1"><Globe size={11} /> {r.city_country}</span>}
                       <span className="inline-flex items-center gap-1"><Clock size={11} /> {fmtEnrollDate(r.created_at)}</span>
+                      {emailStatus[r.id] && (
+                        <span className="inline-flex items-center gap-1" title={emailStatus[r.id].last_subject || ''}>
+                          <Mail size={11} /> Emailed {commWhen(emailStatus[r.id].last_sent_at)}{Number(emailStatus[r.id].sent_count) > 1 ? ` · ${emailStatus[r.id].sent_count} emails` : ''}
+                        </span>
+                      )}
                       {daysInfo(r) && (
                         <span className="inline-flex items-center gap-1 font-semibold" style={{ color: overdueRow ? 'var(--status-warn-fg)' : C.textMute }}>
                           <Hourglass size={11} /> {daysInfo(r)}
@@ -16307,6 +17747,13 @@ function AdminEnrollments({ onCountChange }) {
                         className="px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
                         style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
                         <Pause size={14} /> {holds[r.id] ? 'Edit hold' : 'Hold'}
+                      </button>
+                    )}
+                    {canEmail && r.email && (
+                      <button onClick={() => setEmailFor(r)} disabled={rowBusy}
+                        className="px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
+                        style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+                        <Mail size={14} /> Email
                       </button>
                     )}
                     {overdueRow && (
@@ -16519,6 +17966,11 @@ function AdminEnrollments({ onCountChange }) {
       {/* Approve confirmation modal — shared AccountModal shell (dialog a11y, focus trap,
           Escape/backdrop gated on busyId, dark-mode surface). */}
       {/* #60: hold, amount correction and bulk dialogs. Errors render INSIDE each dialog. */}
+      {emailFor && (
+        <CommComposer kind="student_email" lockedAudience={{ mode: 'request', request_id: emailFor.id }}
+          audienceSummary={`${emailFor.full_name || emailFor.email} — ${emailFor.plan_name || PLAN_LABELS[emailFor.plan_key] || emailFor.plan_key || 'no package'}`}
+          onClose={() => setEmailFor(null)} onSent={() => loadEmailStatus()} />
+      )}
       {holdFor && (
         <AccountModal title={holdFor.existing ? 'Edit this hold' : 'Put this request on hold?'} subtitle={holdFor.row.email}
           icon={Pause} canClose={busyId == null} onClose={() => setHoldFor(null)}>

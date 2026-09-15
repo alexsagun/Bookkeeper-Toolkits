@@ -381,9 +381,9 @@ export const OBJECT_CHECKS = [
       (to_regclass('public.staff_roles')), (to_regclass('public.staff_permissions')),
       (to_regclass('public.staff_role_permissions')), (to_regclass('public.staff_memberships')),
       (to_regclass('public.staff_role_events'))) as v(t)`],
-  ['#45/#58 role x permission matrix is seeded', `select count(*) = 33 as ok
+  ['#45/#58/#61 role x permission matrix is seeded', `select count(*) = 34 as ok
       from public.staff_role_permissions`],
-  ['#45/#58 all 20 permissions are seeded', `select count(*) = 20 as ok from public.staff_permissions`],
+  ['#45/#58/#61 all 21 permissions are seeded', `select count(*) = 21 as ok from public.staff_permissions`],
   // The caller-scoped helpers MUST be executable by authenticated: an RLS qual is
   // evaluated AS THE QUERYING ROLE, so without the grant every gated read fails
   // with "permission denied for function" instead of a clean authorization denial.
@@ -1107,6 +1107,33 @@ export const OBJECT_CHECKS = [
   ['#60    no hold remains on a request that is no longer pending', `select count(*) = 0 as ok
     from public.enrollment_request_holds h join public.enrollment_requests r on r.id = h.request_id
    where r.status <> 'pending_review'`],
+
+  // ── #61, communications ───────────────────────────────────────────────────
+  // The zero-client-write rule and the send path, against the live catalog. The
+  // service-only functions are the ones that claim and record deliveries; a client
+  // grant on any of them would let a signed-in browser mark its own email "sent".
+  ['#61    four comm tables with RLS and exactly one SELECT policy each', `select count(*) = 4
+      and coalesce(bool_and(t.rls and t.n = 1 and t.cmd = 'SELECT'), false) as ok from (
+      select c.relname, c.relrowsecurity as rls, count(p.policyname) as n, min(p.cmd) as cmd
+        from pg_class c join pg_namespace ns on ns.oid = c.relnamespace
+        left join pg_policies p on p.schemaname = 'public' and p.tablename = c.relname
+       where ns.nspname = 'public' and c.relkind = 'r'
+         and c.relname in ('comm_settings', 'comm_automation_rules', 'comm_campaigns', 'comm_deliveries')
+       group by c.relname, c.relrowsecurity) t`],
+  ['#61    only super_admin holds communications.send', `select count(*) = 1 and min(role_key) = 'super_admin' as ok
+    from public.staff_role_permissions where permission_key = 'communications.send'`],
+  ['#61    the send functions are not executable by a client role', `select count(*) = 4 and coalesce(bool_and(
+        not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+        and not has_function_privilege('anon', p.oid, 'EXECUTE')), false) as ok
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'public'
+       and p.proname in ('comm_claim_deliveries', 'comm_begin_send', 'comm_record_delivery', 'comm_enqueue_automations')`],
+  ['#61    a new automation is born paused (trigger present)', `select count(*) = 1 as ok
+    from pg_trigger where tgname = 'comm_rules_born_paused' and not tgisinternal`],
+  ['#61    no delivery row carries payment details', `select count(*) = 0 as ok from public.comm_deliveries
+   where vars ?| array['bpi', 'gcash', 'security_bank', 'account_name', 'payment_instructions']`],
+  ['#61    nothing has been stuck mid-send for over an hour', `select count(*) = 0 as ok from public.comm_deliveries
+   where status = 'sending' and claimed_at < now() - interval '1 hour'`],
 
 ];
 

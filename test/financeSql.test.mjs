@@ -432,9 +432,11 @@ for (const file of FILES) {
 
 test('finance.manage is the 20th permission and is Super-Admin-only', () => {
   assert.ok(STAFF_PERMISSION_KEYS.includes('finance.manage'), 'finance.manage is missing from the mirror');
-  assert.equal(STAFF_PERMISSION_KEYS[STAFF_PERMISSION_KEYS.length - 1], 'finance.manage',
-    'finance.manage must be LAST, matching the SQL seed order — staffRolesSql.test.mjs asserts '
-    + 'deepEqual on order, not set membership');
+  // #61 appended communications.send after it; the SQL seed order is still what
+  // staffRolesSql.test.mjs diffs, so position 20 is pinned rather than "last".
+  assert.equal(STAFF_PERMISSION_KEYS.indexOf('finance.manage'), 19,
+    'finance.manage must stay the 20th key, matching the SQL seed order — staffRolesSql.test.mjs '
+    + 'asserts deepEqual on order, not set membership');
   assert.equal(ADMIN_TAB_PERMISSION.financialmanagement, 'finance.manage',
     'the admin tab chokepoint must gate financialmanagement on finance.manage');
 
