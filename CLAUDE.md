@@ -1077,7 +1077,7 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   staff-activation-consistency (#50) → access-request-staff-target (#51) →
   student-progress-rankings (#52) → progress-rankings-followup (#53) →
   progress-course-family-scoping (#54) → approve-rpc-grant-revoke (#55) →
-  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58)** — see the Staff-authorization
+  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60)** — see the Staff-authorization
   and Progress & Rankings sections for what each does. **#57**
   ([db/2026-09-08-lesson-video-quicktime.sql](db/2026-09-08-lesson-video-quicktime.sql), fold
   **§44**) widens `course-videos.allowed_mime_types` to
@@ -1631,6 +1631,66 @@ Charts are hand-rolled inline `<svg role="img">` modelled on `ProgressTrendChart
 - Client mirror: [src/lib/financeModel.js](src/lib/financeModel.js) — **four exports, and it stays
   four** (the `studentProgress.js` lesson). Suites: `test/financeSql.test.mjs`,
   `test-db/financeRls.dbtest.mjs`.
+
+**Finance parity (#59, [db/2026-09-14-finance-parity.sql](db/2026-09-14-finance-parity.sql), fold §46)** —
+the legacy app's day-to-day surface on top of #58. **Applied to production 2026-09-15**, after a
+stage review by two independent reviewers, fixes, and behaviour probes on the live catalog in aborted
+transactions. **13 finance tables** now (`finance_expense_presets`:
+payee + account quick-picks, never an amount, seeded by category only).
+- **Screens:** Overview gains the pipeline strip, Sales by package & batch (Today/MTD/YTD, CSV, print),
+  enrollments-by-package bars and recent activity; Sales & Receivables gains the sales report (presets,
+  package/batch/payment filters, totals, daily chart, CSV, print); Income & Expenses gains payee, presets,
+  ledger filters with totals, and **Reclassify**; Profit & Loss is a pivot (month/quarter/week/total,
+  filters, hide ₱0, % of income, drill-down side panel, CSV, print, owner's draw as a memo); Bank &
+  Reconciliation gains the **bank feed** (tiles, Match / Add / Undo) and statement-layout presets.
+- ★ **MATCH BEFORE ADD.** A student's deposit was already posted by the approval hook. The feed matches the
+  statement line to that entry; adding it again would count the money twice, so `finance_categorize_bank_transaction`
+  REFUSES a deposit into any account approvals post to (`FINANCE_BANK_ENROLLMENT_INCOME`) and Add offers
+  "Match instead" whenever an entry already records the amount. A unique index on
+  `(matched_entry_id, account_id)` lets one entry clear one line **per statement account** — per ACCOUNT,
+  because a bank→card transfer is one entry that must clear on both statements.
+- ★ **A LINE IS CLEARED ONCE — BY THE FEED OR BY A RECONCILIATION ITEM, NEVER BOTH.** #58's close counts
+  every `status='matched'` transaction. #59 restates `finance_bank_txn_set_status`,
+  `finance_match_reconciliation_item`, `finance_unmatch_reconciliation_item` and
+  `finance_reconciliation_detail` to refuse or exclude feed-linked lines, and `finance_reverse_entry`
+  refuses an entry a statement line points at (undo it in the feed).
+- ★ **Add is keyed per ATTEMPT** (`'bank:'||txn||':'||n`). Keyed on the transaction alone, Add → Undo → Add
+  found the reversed entry by its key and silently re-linked it.
+- ★ **The statement sign is the ACCOUNT's**: positive = money into the account's favour, so a card payment
+  is positive and a charge negative. [src/lib/bankStatement.js](src/lib/bankStatement.js) is the one reader
+  (declared date format, DR/CR, parentheses, card sign flip, legacy bank layouts); the monolith's copies are
+  gone and `test/bankStatement.test.mjs` fails if they return.
+- ★ **Reclassify never edits history** and moves only what is LEFT: the amount is net of earlier live
+  reclassifications of the same entry, so a second move of the same cost is refused. Allowed pairs:
+  income→income, expense→expense, expense→owner's draw. Reversing an entry with a live reclassification is
+  refused (`FINANCE_ENTRY_HAS_ADJUSTMENTS`).
+- **Printing builds the page with DOM calls and `textContent`** (`financePrintTable`) — never an HTML
+  string, because the legacy app rendered statement descriptions and form answers unescaped.
+- ★ **A card reconciliation compares amounts OWED.** A card statement's balance rises with charges, which
+  are stored negative, so close and detail negate the statement movement for `cash_flow_class='card'`.
+- ★ **Only an ORIGINAL entry is reclassified**, and reverse / reclassify / match / the reconciliation matcher
+  all lock their row before checking. Add, Match and status changes refuse inside a closed reconciliation.
+- Re-signs five #58 functions (each dropped first) and restates the catalog; #60 restates it again, so
+  `test/communityStaffSql.test.mjs`'s `CURRENT_CATALOG_MIGRATION` points at #60. No permission changes.
+  Suite: `test/financeParitySql.test.mjs` (it pins every stage-review fix above).
+
+**Enrollment management (#60, [db/2026-09-15-enrollment-management.sql](db/2026-09-15-enrollment-management.sql), fold §47)** —
+Enrollments gains search, package filter, sort, CSV, bulk approve/reject/hold, holds and amount
+correction; still gated on `enrollments.review`, so Operations Admins keep it. **Applied to production
+2026-09-15**, directly after #59.
+- ★ **A hold is a staff-only SIDE TABLE** (`enrollment_request_holds`), never a column: students SELECT their
+  own request rows. `expires_at` is never touched; "overdue" stays derived (pending, past `expires_at`,
+  not held). A decided request releases its hold by trigger, and `enrollment_request_events` is the
+  append-only timeline.
+- ★ **AN APPROVAL WITHOUT ITS GRANT IS REFUSED** (`enrollment_approval_requires_grant`). #48's column
+  grant on `status` let any reviewer set another student's request to `approved` with a direct UPDATE —
+  skipping `admin_finalize_enrollment`, granting nothing, and (since #58) still booking the payment. The
+  guard requires a subscription carrying the request's id, or the grandfathered no-expiry term
+  `approve_extension` returns unchanged; Super Admin keeps break-glass. `admin_finalize_enrollment` is
+  NOT retyped.
+- `admin_correct_enrollment_amount` works on PENDING requests only (a posted collection is corrected in
+  Financial Management) and never on your own request. `admin_staff_display_names` returns names of
+  STAFF only. Suite: `test/enrollmentManagementSql.test.mjs`.
 
 ## Progress & Rankings — learning analytics and privacy-safe leaderboards (#52)
 
@@ -2502,7 +2562,10 @@ docs **in the same change**:
   half moves as one: `db/2026-09-09-financial-management.sql` ↔ **bootstrap fold §45** ↔
   `FINANCE_ACCOUNT_TYPES` / `FINANCE_REPORTING_CLASSES` / `FINANCE_AGING_BUCKETS` in
   [src/lib/financeModel.js](src/lib/financeModel.js) ↔ `test/financeSql.test.mjs` ↔
-  `test-db/financeRls.dbtest.mjs` ↔ the `#58` block in `scripts/audit-db.mjs`.
+  `test-db/financeRls.dbtest.mjs` ↔ the `#58` block in `scripts/audit-db.mjs` — and, since #59,
+  `db/2026-09-14-finance-parity.sql` ↔ fold §46 ↔ `src/lib/bankStatement.js` ↔
+  `test/financeParitySql.test.mjs` ↔ the `#59` block. A migration that restates a #59 function must copy
+  #59's body, not #58's: #59 added the feed-link refusals, and restating the #58 text silently removes them.
   ★ **Never add an insert/update/delete policy to a `finance_` table.** The zero-client-write-path
   rule is what makes the legacy system's 30 unguarded mutations unreachable; all mutation goes through
   the SECURITY DEFINER RPCs, and `financeSql.test.mjs` fails if any write policy appears.
