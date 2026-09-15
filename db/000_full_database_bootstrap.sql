@@ -27737,6 +27737,7 @@ on conflict (filename) do nothing;
 -- ★ It must stay AFTER §45 (#58): it re-signs #58 functions and restates the catalog.
 -- ★ The `do $pre$` preflight is dropped, as every fold does; the schema_migrations
 --   insert is KEPT.
+
 -- == 1) Schema ================================================================
 
 -- 1a) Payee and the adjustment link on journal entries. Both are frozen after insert
@@ -27766,10 +27767,14 @@ alter table public.finance_bank_transactions drop constraint if exists finance_b
 alter table public.finance_bank_transactions
   add constraint finance_bank_txn_link_shape check ((matched_entry_id is null) = (matched_via is null));
 
--- ★ ONE ENTRY, ONE STATEMENT LINE. Without this two deposits of ₱2,999 could both be
---   matched to the same approval, and cash would reconcile against money received once.
+-- ★ ONE ENTRY, ONE STATEMENT LINE — PER ACCOUNT. Without this two deposits of ₱2,999 could
+--   both be matched to the same approval, and cash would reconcile against money received
+--   once. Per ACCOUNT, not per entry: a transfer between two statement accounts (bank ->
+--   card) is ONE entry that appears on BOTH statements, and each side must be able to clear
+--   it. Keyed on the entry alone, the second side could never match and would be added a
+--   second time — paying the card twice in the books.
 create unique index if not exists finance_bank_txn_entry_once
-  on public.finance_bank_transactions (matched_entry_id) where matched_entry_id is not null;
+  on public.finance_bank_transactions (matched_entry_id, account_id) where matched_entry_id is not null;
 -- duplicate_of_id is a self-FK with ON DELETE SET NULL. Discarding an import deletes its
 -- rows, and each delete looks up rows pointing at it — a sequential scan per row without
 -- this index, which makes discarding a large statement quadratic.
@@ -27804,7 +27809,6 @@ create table if not exists public.finance_expense_presets (
   id               uuid primary key default gen_random_uuid(),
   label            text not null,
   constraint finance_expense_presets_label_present check (nullif(btrim(label), '') is not null),
-  constraint finance_expense_presets_label_unique unique (label),
   payee            text,
   account_id       uuid not null references public.finance_accounts(id) on delete restrict,
   memo             text,
@@ -27820,6 +27824,9 @@ create table if not exists public.finance_expense_presets (
 alter table public.finance_expense_presets enable row level security;
 revoke all on table public.finance_expense_presets from public, anon, authenticated;
 create index if not exists finance_expense_presets_account_idx on public.finance_expense_presets (account_id);
+-- Case-INSENSITIVE, matching the save RPC's own check, so two concurrent saves of "Zoom" and
+-- "zoom" collide on a real constraint instead of one of them slipping past a read-then-write test.
+create unique index if not exists finance_expense_presets_label_ci on public.finance_expense_presets (lower(label));
 
 -- The same single SELECT policy, built by the same audited loop shape as #58 §14.
 do $pol$
@@ -27863,7 +27870,7 @@ select v.label, a.id, v.sort_order
     ('Office supplies',          '5040', 110)
   ) as v(label, code, sort_order)
   join public.finance_accounts a on a.code = v.code and a.account_type = 'expense'
-on conflict (label) do nothing;
+on conflict do nothing;
 
 
 -- == 2) The entry guard and the entry writers, restated =======================
@@ -28315,7 +28322,7 @@ create or replace function public.finance_cash_basis_pl(
   account_name text, amount numeric, section_total numeric, period_total numeric, entry_count bigint
 )
 language plpgsql stable security definer set search_path = public, pg_temp as $fn$
-declare v_pattern text;
+declare v_pattern text; v_fy int;
 begin
   if not public.has_staff_permission('finance.manage') then
     perform public.app_error('FORBIDDEN',
@@ -28326,6 +28333,9 @@ begin
   end if;
   v_pattern := case when p_payee is null or length(btrim(p_payee)) < 2 then null
                     else '%' || replace(replace(replace(btrim(p_payee), '!', '!!'), '%', '!%'), '_', '!_') || '%' end;
+  -- Quarters follow the business's fiscal year (finance_settings), not the calendar.
+  select coalesce(fiscal_year_start_month, 1) into v_fy from public.finance_settings where id;
+  v_fy := coalesce(v_fy, 1);
 
   return query
   with entries as (
@@ -28337,7 +28347,16 @@ begin
   ), lines as (
     select case p_group
              when 'total'   then 'TOTAL'
-             when 'quarter' then extract(year from en.entry_date)::int::text || '-Q' || extract(quarter from en.entry_date)::int::text
+             -- Calendar quarters when the fiscal year starts in January; otherwise a fiscal
+             -- label named by the calendar year the fiscal year STARTS in (FY2026-Q1 = the
+             -- first quarter of the year that began in fiscal_year_start_month 2026).
+             when 'quarter' then
+               case when v_fy = 1
+                    then extract(year from en.entry_date)::int::text || '-Q' || extract(quarter from en.entry_date)::int::text
+                    else 'FY' || (extract(year from en.entry_date)::int
+                                  - case when extract(month from en.entry_date)::int < v_fy then 1 else 0 end)::text
+                         || '-Q' || (((extract(month from en.entry_date)::int - v_fy + 12) % 12) / 3 + 1)::text
+               end
              -- ISO week, keyed by its Monday, so a week spanning two months is one period.
              when 'week'    then (en.entry_date - (extract(isodow from en.entry_date)::int - 1))::text
              else en.month_key
@@ -28526,10 +28545,12 @@ begin
      and x.signed = v_t.amount
      and e.entry_kind <> 'reversal'
      and not exists (select 1 from public.finance_journal_entries rv where rv.reverses_entry_id = e.id)
-     and not exists (select 1 from public.finance_bank_transactions bt where bt.matched_entry_id = e.id)
+     -- Claimed on THIS account only: a transfer's other side stays matchable on its own statement.
+     and not exists (select 1 from public.finance_bank_transactions bt
+                      where bt.matched_entry_id = e.id and bt.account_id = v_t.account_id)
      and not exists (select 1 from public.finance_reconciliation_items ri
                       join public.finance_journal_lines jl on jl.id = ri.journal_line_id
-                     where jl.entry_id = e.id)
+                     where jl.entry_id = e.id and jl.account_id = v_t.account_id)
    order by abs(e.entry_date - v_t.posted_on), e.entry_no desc
    limit 20;
 end;
@@ -28577,9 +28598,20 @@ begin
       'A reclassification needs a reason.', 422, null);
   end if;
 
-  select * into v_orig from public.finance_journal_entries where id = p_entry_id;
+  -- FOR UPDATE: two tabs reclassifying the same entry with different keys would otherwise
+  -- both read the same remaining amount and both move it.
+  select * into v_orig from public.finance_journal_entries where id = p_entry_id for update;
   if not found then
     perform public.app_error('FINANCE_ENTRY_NOT_FOUND', 'That journal entry does not exist.', 404, null);
+  end if;
+  -- ★ ONLY THE ORIGINAL ENTRY IS RECLASSIFIED. The remaining amount is measured on the entry
+  --   plus the adjustments that point AT IT; an adjustment of an adjustment points elsewhere,
+  --   so allowing one let the same money be moved twice.
+  if v_orig.adjusts_entry_id is not null then
+    perform public.app_error('FINANCE_RECLASSIFY_INVALID',
+      'That entry is itself a reclassification. Reclassify the original entry instead — the amount '
+      'still on each account is worked out from there.', 409,
+      jsonb_build_object('original_entry_id', v_orig.adjusts_entry_id));
   end if;
   if v_orig.entry_kind = 'reversal'
      or exists (select 1 from public.finance_journal_entries where reverses_entry_id = p_entry_id) then
@@ -28680,7 +28712,9 @@ begin
       'A reversal needs a reason — it is the only record of why the correction was made.', 422, null);
   end if;
 
-  select * into v_orig from public.finance_journal_entries where id = p_entry_id;
+  -- FOR UPDATE: a reversal racing a reclassification or a bank match must not both pass
+  -- their checks and leave a reversed entry with a live adjustment or a live link.
+  select * into v_orig from public.finance_journal_entries where id = p_entry_id for update;
   if not found then
     perform public.app_error('FINANCE_ENTRY_NOT_FOUND', 'That journal entry does not exist.', 404, null);
   end if;
@@ -28874,6 +28908,25 @@ begin
     perform public.app_error('FINANCE_BANK_CATEGORY_INVALID',
       'Choose an active account other than the statement''s own account.', 422, null);
   end if;
+  -- ★ A STUDENT'S PAYMENT IS RECORDED BY ITS APPROVAL. Adding a deposit to an income account
+  --   the approval hook posts to — the settings default, or any plan's mapped account — counts
+  --   the same money twice the moment the enrollment is approved, and the approval's entry can
+  --   then never be matched to this line. The deposit waits in review and is MATCHED after.
+  if v_t.amount > 0 and v_cat.account_type = 'income'
+     and (exists (select 1 from public.finance_settings s where s.id and s.default_income_account_id = v_cat.id)
+          or exists (select 1 from public.enrollment_plans p where p.finance_income_account_id = v_cat.id)) then
+    perform public.app_error('FINANCE_BANK_ENROLLMENT_INCOME',
+      'That account receives student payments when enrollments are approved. Leave this deposit in '
+      'review and Match it to the approval once the enrollment is approved.', 409,
+      jsonb_build_object('account_id', v_cat.id));
+  end if;
+  -- ★ A closed reconciliation is frozen for the feed exactly as it is for Undo.
+  if exists (select 1 from public.finance_reconciliations r
+              where r.account_id = v_t.account_id and r.status = 'closed'
+                and v_t.posted_on between r.period_start and r.period_end) then
+    perform public.app_error('FINANCE_RECONCILIATION_CLOSED',
+      'A closed reconciliation covers this transaction. Reopen it with a reason first.', 409, null);
+  end if;
 
   v_amt := abs(v_t.amount);
   v_lines := case when v_t.amount > 0
@@ -28931,13 +28984,20 @@ begin
     perform public.app_error('FINANCE_BANK_IMPORT_STATE',
       'Commit the import before matching its transactions.', 409, null);
   end if;
+  if exists (select 1 from public.finance_reconciliations r
+              where r.account_id = v_t.account_id and r.status = 'closed'
+                and v_t.posted_on between r.period_start and r.period_end) then
+    perform public.app_error('FINANCE_RECONCILIATION_CLOSED',
+      'A closed reconciliation covers this transaction. Reopen it with a reason first.', 409, null);
+  end if;
   if v_t.status <> 'unmatched' or v_t.matched_entry_id is not null
      or exists (select 1 from public.finance_reconciliation_items where bank_transaction_id = p_txn_id) then
     perform public.app_error('FINANCE_BANK_TXN_LINKED',
       'That transaction is already added, matched, excluded or reconciled.', 409, null);
   end if;
 
-  select entry_kind into v_kind from public.finance_journal_entries where id = p_entry_id;
+  -- FOR UPDATE: a match racing a reversal of the same entry must not link a reversed entry.
+  select entry_kind into v_kind from public.finance_journal_entries where id = p_entry_id for update;
   if v_kind is null then
     perform public.app_error('FINANCE_ENTRY_NOT_FOUND', 'That journal entry does not exist.', 404, null);
   end if;
@@ -28948,12 +29008,14 @@ begin
   end if;
   -- ★ One entry, one statement line — checked here for a sentence, enforced by the
   --   unique index for a race.
-  if exists (select 1 from public.finance_bank_transactions where matched_entry_id = p_entry_id)
+  -- Per ACCOUNT: the other side of a transfer is a different statement and stays matchable.
+  if exists (select 1 from public.finance_bank_transactions
+              where matched_entry_id = p_entry_id and account_id = v_t.account_id)
      or exists (select 1 from public.finance_reconciliation_items ri
                  join public.finance_journal_lines jl on jl.id = ri.journal_line_id
-                where jl.entry_id = p_entry_id) then
+                where jl.entry_id = p_entry_id and jl.account_id = v_t.account_id) then
     perform public.app_error('FINANCE_BANK_TXN_LINKED',
-      'That entry is already matched to another statement line or reconciled.', 409, null);
+      'That entry is already matched to another line on this statement, or reconciled.', 409, null);
   end if;
 
   select sum(debit - credit) into v_signed
@@ -29067,6 +29129,16 @@ begin
       'That transaction is matched in a reconciliation. Unmatch it there first.', 409,
       jsonb_build_object('txn_id', p_id));
   end if;
+  -- A closed reconciliation freezes its period: moving a line in or out of `unmatched` would
+  -- change the cleared total it was closed on, with no reopen and no reason recorded.
+  if exists (select 1 from public.finance_bank_transactions t
+               join public.finance_reconciliations r
+                 on r.account_id = t.account_id and r.status = 'closed'
+                and t.posted_on between r.period_start and r.period_end
+              where t.id = p_id) then
+    perform public.app_error('FINANCE_RECONCILIATION_CLOSED',
+      'A closed reconciliation covers this transaction. Reopen it with a reason first.', 409, null);
+  end if;
   update public.finance_bank_transactions
      set status = p_status, excluded_reason = case when p_status = 'excluded' then p_reason else null end
    where id = p_id;
@@ -29098,6 +29170,9 @@ begin
     perform public.app_error('FORBIDDEN',
       'Financial Management requires the finance.manage permission.', 403, null);
   end if;
+  -- ★ LOCK THE LINE FIRST. Without it a feed Add committing between this function's checks
+  --   and its insert would leave one line cleared twice — by the feed and by this item.
+  perform 1 from public.finance_bank_transactions where id = p_bank_transaction_id for update;
   select coalesce(p_matched_amount, t.amount) into v_amount
     from public.finance_bank_transactions t
     join public.finance_reconciliations r on r.id = p_reconciliation_id
@@ -29123,7 +29198,8 @@ begin
         'That ledger line is not on this reconciliation''s account.', 422, null);
     end if;
     if exists (select 1 from public.finance_journal_lines jl
-                join public.finance_bank_transactions bt on bt.matched_entry_id = jl.entry_id
+                join public.finance_bank_transactions bt
+                  on bt.matched_entry_id = jl.entry_id and bt.account_id = jl.account_id
                where jl.id = p_journal_line_id) then
       perform public.app_error('FINANCE_BANK_TXN_LINKED',
         'That ledger line''s entry is already matched to a statement line in the bank feed.', 409, null);
@@ -29211,8 +29287,14 @@ begin
     'account', jsonb_build_object('id', v_acct.id, 'code', v_acct.code, 'name', v_acct.name,
                                   'cash_flow_class', v_acct.cash_flow_class),
     'cleared', v_cleared,
+    -- ★ A CARD STATEMENT SHOWS WHAT IS OWED, which rises with charges — but a charge is stored
+    --   NEGATIVE (the account's convention). So for a card the statement's movement is
+    --   negated before cleared is subtracted; without it every card reconciliation was off by
+    --   twice its charges and could never close. finance_close_reconciliation tests the same.
+    'balance_convention', case when v_acct.cash_flow_class = 'card' then 'owed' else 'held' end,
     'difference', case when v_rec.statement_opening is null or v_rec.statement_closing is null then null
-                       else v_rec.statement_closing - v_rec.statement_opening - v_cleared end,
+                       else (case when v_acct.cash_flow_class = 'card' then -1 else 1 end)
+                            * (v_rec.statement_closing - v_rec.statement_opening) - v_cleared end,
     'items', coalesce((
       select jsonb_agg(jsonb_build_object(
                'id', i.id, 'bank_transaction_id', i.bank_transaction_id,
@@ -29258,7 +29340,7 @@ begin
              and not exists (select 1 from public.finance_reconciliation_items x
                               where x.journal_line_id = jl.id)
              and not exists (select 1 from public.finance_bank_transactions bt
-                              where bt.matched_entry_id = e.id)
+                              where bt.matched_entry_id = e.id and bt.account_id = v_rec.account_id)
            order by e.entry_date, e.entry_no
            limit 500
         ) c), '[]'::jsonb)
@@ -29268,12 +29350,81 @@ $fn$;
 revoke all on function public.finance_reconciliation_detail(uuid) from public, anon, authenticated;
 grant execute on function public.finance_reconciliation_detail(uuid) to authenticated;
 
+-- 5d') Close, restated from #58 with the card convention the detail reader uses.
+create or replace function public.finance_close_reconciliation(p_id uuid)
+returns jsonb language plpgsql volatile security definer set search_path = public, pg_temp as $fn$
+declare
+  v_rec public.finance_reconciliations%rowtype;
+  v_cleared numeric(14,2); v_diff numeric(14,2); v_open int; v_sign int;
+  v_actor uuid := auth.uid(); v_email text;
+begin
+  if not public.has_staff_permission('finance.manage') then
+    perform public.app_error('FORBIDDEN',
+      'Financial Management requires the finance.manage permission.', 403, null);
+  end if;
+  select * into v_rec from public.finance_reconciliations where id = p_id for update;
+  if not found or v_rec.status <> 'open' then
+    perform public.app_error('FINANCE_RECONCILIATION_CLOSED',
+      'That reconciliation is not open.', 409, null);
+  end if;
+
+  select count(*) into v_open
+    from public.finance_bank_transactions t
+   where t.account_id = v_rec.account_id
+     and t.posted_on between v_rec.period_start and v_rec.period_end
+     and t.status = 'unmatched';
+  if v_open > 0 then
+    perform public.app_error('FINANCE_RECONCILIATION_UNBALANCED',
+      'There are still unreviewed transactions in this period. Match or exclude each one, then '
+      'close.', 409, jsonb_build_object('unmatched', v_open));
+  end if;
+
+  -- ★ A MISSING STATEMENT BALANCE IS NOT ZERO (#58).
+  if v_rec.statement_opening is null or v_rec.statement_closing is null then
+    perform public.app_error('FINANCE_RECONCILIATION_UNBALANCED',
+      'This reconciliation has no statement opening or closing balance, so there is nothing to '
+      'reconcile against. Enter both figures from the statement.', 409, null);
+  end if;
+
+  select coalesce(sum(t.amount), 0) into v_cleared
+    from public.finance_bank_transactions t
+   where t.account_id = v_rec.account_id
+     and t.posted_on between v_rec.period_start and v_rec.period_end
+     and t.status = 'matched';
+  -- A card statement's balances are amounts OWED; see finance_reconciliation_detail.
+  select case when cash_flow_class = 'card' then -1 else 1 end into v_sign
+    from public.finance_accounts where id = v_rec.account_id;
+  v_diff := coalesce(v_sign, 1) * (v_rec.statement_closing - v_rec.statement_opening) - v_cleared;
+
+  if v_diff <> 0 then
+    perform public.app_error('FINANCE_RECONCILIATION_UNBALANCED',
+      'This does not reconcile yet — the difference is not zero.', 409,
+      jsonb_build_object('difference', v_diff, 'cleared', v_cleared));
+  end if;
+
+  select email into v_email from public.profiles where id = v_actor;
+  update public.finance_reconciliations
+     set status = 'closed', difference = 0, closed_at = now(),
+         closed_by = v_actor, closed_by_email = v_email
+   where id = p_id;
+  insert into public.finance_audit_events
+    (actor_user_id, actor_email, action, target_kind, target_id, amount, detail)
+  values (v_actor, v_email, 'reconciliation_close', 'reconciliation', p_id, v_cleared, '{}'::jsonb);
+  return jsonb_build_object('ok', true, 'cleared', v_cleared);
+end;
+$fn$;
+revoke all on function public.finance_close_reconciliation(uuid) from public, anon, authenticated;
+grant execute on function public.finance_close_reconciliation(uuid) to authenticated;
+
 -- 5e) Statement lines, with how the feed holds each one. ★ DROP FIRST: the return type grows.
 drop function if exists public.finance_bank_transactions_list(uuid, uuid, text, date, date, integer, integer);
 create or replace function public.finance_bank_transactions_list(
   p_import_id uuid default null, p_account_id uuid default null, p_status text default null,
   p_from date default null, p_to date default null,
-  p_limit integer default 200, p_offset integer default 0
+  p_limit integer default 200, p_offset integer default 0,
+  -- ★ The feed reads COMMITTED lines only, filtered BEFORE the limit: filtered after, a large
+  --   staged file pushed every committed line past the page and the feed read "nothing to review".
+  p_committed_only boolean default false
 ) returns table (
   id uuid, import_id uuid, account_id uuid, posted_on date, description_raw text, amount numeric,
   balance_after numeric, status text, duplicate_kind text, duplicate_of_id uuid,
@@ -29314,12 +29465,13 @@ begin
      and (p_status is null or t.status = p_status)
      and (p_from is null or t.posted_on >= p_from)
      and (p_to is null or t.posted_on <= p_to)
+     and (not coalesce(p_committed_only, false) or imp.status = 'committed')
    order by t.posted_on desc, t.created_at desc
    limit v_limit offset v_offset;
 end;
 $fn$;
-revoke all on function public.finance_bank_transactions_list(uuid, uuid, text, date, date, integer, integer) from public, anon, authenticated;
-grant execute on function public.finance_bank_transactions_list(uuid, uuid, text, date, date, integer, integer) to authenticated;
+revoke all on function public.finance_bank_transactions_list(uuid, uuid, text, date, date, integer, integer, boolean) from public, anon, authenticated;
+grant execute on function public.finance_bank_transactions_list(uuid, uuid, text, date, date, integer, integer, boolean) to authenticated;
 
 
 -- == 6) app_error_catalog() — restated IN FULL ================================
@@ -29424,7 +29576,8 @@ as $cat$
     ('FINANCE_BANK_TXN_NOT_LINKED',  409, 'The statement line is not added or matched in the bank feed, so there is nothing to undo.'),
     ('FINANCE_BANK_MATCH_MISMATCH',  422, 'The entry does not move the statement''s account by the same signed amount.'),
     ('FINANCE_BANK_CATEGORY_INVALID',422, 'A statement line must be added to an active account other than its own.'),
-    ('FINANCE_ENTRY_HAS_ADJUSTMENTS',409, 'The entry has a reclassification that still stands; reverse that first.')
+    ('FINANCE_ENTRY_HAS_ADJUSTMENTS',409, 'The entry has a reclassification that still stands; reverse that first.'),
+    ('FINANCE_BANK_ENROLLMENT_INCOME',409, 'A deposit cannot be added to an account approvals post to; match it to the approval instead.')
   ) as t(code, http, summary);
 $cat$;
 
@@ -29467,3 +29620,441 @@ on conflict (filename) do nothing;
 --    it by posting a due template from Income & Expenses, not by reading the catalog.
 --
 -- 5) npm run db:audit -> clean, including the #59 checks.
+
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- §47) FOLDED VERBATIM — 2026-09-15-enrollment-management.sql   (#60)
+-- ═════════════════════════════════════════════════════════════════════════════
+-- Enrollment management: staff-only holds and an append-only timeline, amount
+-- correction while pending, queue counts, staff display names, and a guard that refuses
+-- an approval with no membership grant.
+-- ★ RE-FOLD whenever db/2026-09-15-enrollment-management.sql changes.
+-- ★ It must stay AFTER §46 (#59): it restates the error catalog #59 owned.
+-- ★ The `do $pre$` preflight is dropped, as every fold does; the schema_migrations
+--   insert is KEPT.
+
+-- == 1) Tables ================================================================
+
+create table if not exists public.enrollment_request_holds (
+  request_id     uuid primary key references public.enrollment_requests(id) on delete cascade,
+  reason         text not null,
+  constraint enrollment_request_holds_reason_present check (nullif(btrim(reason), '') is not null),
+  follow_up_on   date,
+  held_at        timestamptz not null default now(),
+  held_by        uuid references auth.users(id) on delete set null,
+  held_by_email  text,
+  updated_at     timestamptz not null default now()
+);
+alter table public.enrollment_request_holds enable row level security;
+revoke all on table public.enrollment_request_holds from public, anon, authenticated;
+create index if not exists enrollment_request_holds_follow_up_idx
+  on public.enrollment_request_holds (follow_up_on) where follow_up_on is not null;
+
+create table if not exists public.enrollment_request_events (
+  id             bigint generated always as identity primary key,
+  -- ★ NO FK, deliberately (the finance_audit_events reasoning): a request can be deleted
+  --   with its account, and the record of what was done to it must outlive it.
+  request_id     uuid not null,
+  actor_user_id  uuid references auth.users(id) on delete set null,
+  actor_email    text,
+  action         text not null check (action in ('hold_set','hold_updated','hold_cleared','amount_corrected')),
+  detail         jsonb not null default '{}'::jsonb,
+  reason         text,
+  created_at     timestamptz not null default now()
+);
+alter table public.enrollment_request_events enable row level security;
+revoke all on table public.enrollment_request_events from public, anon, authenticated;
+create index if not exists enrollment_request_events_request_idx
+  on public.enrollment_request_events (request_id, created_at desc);
+
+-- The single SELECT policy per table.
+do $pol$
+declare
+  t text;
+begin
+  foreach t in array array['enrollment_request_holds', 'enrollment_request_events'] loop
+    execute format('grant select on table public.%I to authenticated', t);
+    execute format('drop policy if exists %I on public.%I', t || '_read', t);
+    execute format(
+      'create policy %I on public.%I for select to authenticated '
+      'using ((select public.has_staff_permission(''enrollments.review'')))', t || '_read', t);
+  end loop;
+end
+$pol$;
+
+-- Append-only, with the referential SET NULL exemption every audit table here needs.
+create or replace function public.enrollment_request_events_guard()
+returns trigger language plpgsql security definer set search_path = public, pg_temp as $fn$
+begin
+  if tg_op = 'UPDATE'
+     and new.actor_user_id is null and old.actor_user_id is not null
+     and (new.id, new.request_id, new.actor_email, new.action, new.detail, new.reason, new.created_at)
+         is not distinct from
+         (old.id, old.request_id, old.actor_email, old.action, old.detail, old.reason, old.created_at) then
+    return new;
+  end if;
+  perform public.app_error('FORBIDDEN', 'The enrollment timeline is append-only.', 409, null);
+  return null;
+end;
+$fn$;
+revoke all on function public.enrollment_request_events_guard() from public, anon, authenticated;
+drop trigger if exists enrollment_request_events_guard_trg on public.enrollment_request_events;
+create trigger enrollment_request_events_guard_trg
+  before update or delete on public.enrollment_request_events
+  for each row execute function public.enrollment_request_events_guard();
+
+
+-- == 2) An approval can only happen with its grant ===========================
+create or replace function public.enrollment_approval_requires_grant()
+returns trigger language plpgsql security definer set search_path = public, pg_temp as $fn$
+begin
+  if not public.is_super_admin()
+     and not exists (select 1 from public.subscriptions s where s.request_id = new.id)
+     -- approve_extension returns a grandfathered no-expiry term unchanged, so no row
+     -- carries this request's id. That member is still granted; let it through.
+     and not exists (select 1 from public.subscriptions s
+                      where s.user_id = new.user_id and s.status = 'active' and s.ends_at is null) then
+    perform public.app_error('ENROLLMENT_APPROVE_VIA_RPC',
+      'Approve this request from the Enrollments screen — that grants the membership in the same step.', 409,
+      jsonb_build_object('request_id', new.id));
+  end if;
+  return new;
+end;
+$fn$;
+revoke all on function public.enrollment_approval_requires_grant() from public, anon, authenticated;
+drop trigger if exists enrollment_approval_requires_grant on public.enrollment_requests;
+create trigger enrollment_approval_requires_grant
+  before update on public.enrollment_requests
+  for each row
+  when (new.status = 'approved' and old.status is distinct from 'approved')
+  execute function public.enrollment_approval_requires_grant();
+
+
+-- == 3) A decided request releases its hold ==================================
+-- Approved, rejected or expired — by a reviewer, or by the student's own self-expire —
+-- a hold on a request that is no longer pending is a stale note. It is removed, and
+-- the timeline says why.
+create or replace function public.enrollment_hold_release_trg()
+returns trigger language plpgsql security definer set search_path = public, pg_temp as $fn$
+declare v_reason text; v_actor uuid := auth.uid();
+begin
+  delete from public.enrollment_request_holds where request_id = new.id returning reason into v_reason;
+  if v_reason is not null then
+    insert into public.enrollment_request_events (request_id, actor_user_id, actor_email, action, detail)
+    values (new.id, v_actor, (select email from public.profiles where id = v_actor), 'hold_cleared',
+            jsonb_build_object('previous_reason', v_reason, 'cause', 'decided', 'status', new.status));
+  end if;
+  return null;
+end;
+$fn$;
+revoke all on function public.enrollment_hold_release_trg() from public, anon, authenticated;
+drop trigger if exists enrollment_hold_release_trg on public.enrollment_requests;
+create trigger enrollment_hold_release_trg
+  after update on public.enrollment_requests
+  for each row
+  when (old.status = 'pending_review' and new.status is distinct from 'pending_review')
+  execute function public.enrollment_hold_release_trg();
+
+
+-- == 4) RPCs ==================================================================
+
+create or replace function public.admin_set_enrollment_hold(
+  p_request_id uuid, p_reason text, p_follow_up_on date default null
+) returns jsonb language plpgsql volatile security definer set search_path = public, pg_temp as $fn$
+declare
+  v_status text; v_actor uuid := auth.uid(); v_email text; v_existed boolean; v_today date;
+begin
+  if not public.has_staff_permission('enrollments.review') then
+    perform public.app_error('FORBIDDEN', 'Reviewing enrollments requires the enrollments.review permission.', 403, null);
+  end if;
+  if nullif(btrim(coalesce(p_reason, '')), '') is null then
+    perform public.app_error('ENROLLMENT_HOLD_INVALID', 'Say why the request is on hold.', 422, null);
+  end if;
+  v_today := (now() at time zone 'Asia/Manila')::date;
+  if p_follow_up_on is not null and p_follow_up_on < v_today then
+    perform public.app_error('ENROLLMENT_HOLD_INVALID', 'A follow-up date cannot be in the past.', 422, null);
+  end if;
+
+  select status into v_status from public.enrollment_requests where id = p_request_id for update;
+  if v_status is null then
+    perform public.app_error('REQUEST_NOT_FOUND', 'The enrollment request does not exist.', 404, null);
+  end if;
+  if v_status <> 'pending_review' then
+    perform public.app_error('ENROLLMENT_NOT_PENDING', 'Only a request still awaiting review can be put on hold.', 409,
+      jsonb_build_object('status', v_status));
+  end if;
+
+  select email into v_email from public.profiles where id = v_actor;
+  v_existed := exists (select 1 from public.enrollment_request_holds where request_id = p_request_id);
+  insert into public.enrollment_request_holds (request_id, reason, follow_up_on, held_by, held_by_email)
+  values (p_request_id, btrim(p_reason), p_follow_up_on, v_actor, v_email)
+  on conflict (request_id) do update
+    set reason = excluded.reason, follow_up_on = excluded.follow_up_on, updated_at = now();
+
+  insert into public.enrollment_request_events (request_id, actor_user_id, actor_email, action, detail, reason)
+  values (p_request_id, v_actor, v_email, case when v_existed then 'hold_updated' else 'hold_set' end,
+          jsonb_build_object('follow_up_on', p_follow_up_on), btrim(p_reason));
+  return jsonb_build_object('ok', true, 'updated', v_existed);
+end;
+$fn$;
+revoke all on function public.admin_set_enrollment_hold(uuid, text, date) from public, anon, authenticated;
+grant execute on function public.admin_set_enrollment_hold(uuid, text, date) to authenticated;
+
+create or replace function public.admin_clear_enrollment_hold(p_request_id uuid, p_note text default null)
+returns jsonb language plpgsql volatile security definer set search_path = public, pg_temp as $fn$
+declare v_reason text; v_actor uuid := auth.uid(); v_email text;
+begin
+  if not public.has_staff_permission('enrollments.review') then
+    perform public.app_error('FORBIDDEN', 'Reviewing enrollments requires the enrollments.review permission.', 403, null);
+  end if;
+  delete from public.enrollment_request_holds where request_id = p_request_id returning reason into v_reason;
+  if v_reason is null then
+    perform public.app_error('ENROLLMENT_HOLD_INVALID', 'That request is not on hold.', 404, null);
+  end if;
+  select email into v_email from public.profiles where id = v_actor;
+  insert into public.enrollment_request_events (request_id, actor_user_id, actor_email, action, detail, reason)
+  values (p_request_id, v_actor, v_email, 'hold_cleared',
+          jsonb_build_object('previous_reason', v_reason, 'cause', 'manual'),
+          nullif(btrim(coalesce(p_note, '')), ''));
+  return jsonb_build_object('ok', true);
+end;
+$fn$;
+revoke all on function public.admin_clear_enrollment_hold(uuid, text) from public, anon, authenticated;
+grant execute on function public.admin_clear_enrollment_hold(uuid, text) to authenticated;
+
+-- ★ PENDING ONLY. Correcting a request that is already approved would not move its
+--   posted collection — the ledger is corrected by a reversal, not by editing the
+--   request. Before approval, the approval hook posts the corrected figure.
+create or replace function public.admin_correct_enrollment_amount(
+  p_request_id uuid, p_amount_paid numeric, p_note text
+) returns jsonb language plpgsql volatile security definer set search_path = public, pg_temp as $fn$
+declare
+  v_req record; v_new numeric(14,2); v_actor uuid := auth.uid(); v_email text;
+begin
+  if not public.has_staff_permission('enrollments.review') then
+    perform public.app_error('FORBIDDEN', 'Reviewing enrollments requires the enrollments.review permission.', 403, null);
+  end if;
+  if nullif(btrim(coalesce(p_note, '')), '') is null then
+    perform public.app_error('ENROLLMENT_AMOUNT_INVALID', 'Say why the amount is being corrected.', 422, null);
+  end if;
+  if p_amount_paid is null or p_amount_paid < 0 or p_amount_paid > 1000000 then
+    perform public.app_error('ENROLLMENT_AMOUNT_INVALID', 'The amount must be between ₱0 and ₱1,000,000.', 422, null);
+  end if;
+  v_new := round(p_amount_paid, 2);
+
+  select id, user_id, status, amount_paid into v_req
+    from public.enrollment_requests where id = p_request_id for update;
+  if v_req.id is null then
+    perform public.app_error('REQUEST_NOT_FOUND', 'The enrollment request does not exist.', 404, null);
+  end if;
+  if v_req.status <> 'pending_review' then
+    perform public.app_error('ENROLLMENT_NOT_PENDING',
+      'Only a request still awaiting review can be corrected. A posted payment is corrected in Financial Management.', 409,
+      jsonb_build_object('status', v_req.status));
+  end if;
+  -- The #48 segregation rule, applied to the amount the approval will post.
+  if v_req.user_id = v_actor and not public.is_super_admin() then
+    perform public.app_error('FORBIDDEN', 'You cannot correct your own enrollment request.', 403, null);
+  end if;
+  if v_req.amount_paid is not distinct from v_new then
+    return jsonb_build_object('ok', true, 'changed', false);
+  end if;
+
+  update public.enrollment_requests set amount_paid = v_new, updated_at = now() where id = p_request_id;
+
+  select email into v_email from public.profiles where id = v_actor;
+  insert into public.enrollment_request_events (request_id, actor_user_id, actor_email, action, detail, reason)
+  values (p_request_id, v_actor, v_email, 'amount_corrected',
+          jsonb_build_object('before', v_req.amount_paid, 'after', v_new), btrim(p_note));
+  return jsonb_build_object('ok', true, 'changed', true, 'amount_paid', v_new);
+end;
+$fn$;
+revoke all on function public.admin_correct_enrollment_amount(uuid, numeric, text) from public, anon, authenticated;
+grant execute on function public.admin_correct_enrollment_amount(uuid, numeric, text) to authenticated;
+
+create or replace function public.admin_enrollment_queue_counts()
+returns jsonb language plpgsql stable security definer set search_path = public, pg_temp as $fn$
+declare v_today date;
+begin
+  if not public.has_staff_permission('enrollments.review') then
+    perform public.app_error('FORBIDDEN', 'Reviewing enrollments requires the enrollments.review permission.', 403, null);
+  end if;
+  v_today := (now() at time zone 'Asia/Manila')::date;
+  return jsonb_build_object(
+    'pending', (select count(*) from public.enrollment_requests where status = 'pending_review'),
+    'on_hold', (select count(*) from public.enrollment_request_holds h
+                  join public.enrollment_requests r on r.id = h.request_id and r.status = 'pending_review'),
+    'follow_up_due', (select count(*) from public.enrollment_request_holds h
+                        join public.enrollment_requests r on r.id = h.request_id and r.status = 'pending_review'
+                       where h.follow_up_on is not null and h.follow_up_on <= v_today),
+    -- ★ DERIVED, never stored: pending, past expires_at, and NOT on hold.
+    'overdue', (select count(*) from public.enrollment_requests r
+                 where r.status = 'pending_review' and r.expires_at < now()
+                   and not exists (select 1 from public.enrollment_request_holds h where h.request_id = r.id))
+  );
+end;
+$fn$;
+revoke all on function public.admin_enrollment_queue_counts() from public, anon, authenticated;
+grant execute on function public.admin_enrollment_queue_counts() to authenticated;
+
+-- ★ STAFF NAMES ONLY. Given any list of ids, it returns a name only for accounts that hold
+--   (or held) a staff membership — so it can never be used to look up a student.
+create or replace function public.admin_staff_display_names(p_user_ids uuid[])
+returns table (user_id uuid, display_name text)
+language plpgsql stable security definer set search_path = public, pg_temp as $fn$
+begin
+  if not public.has_staff_permission('enrollments.review') then
+    perform public.app_error('FORBIDDEN', 'Reviewing enrollments requires the enrollments.review permission.', 403, null);
+  end if;
+  if p_user_ids is null or cardinality(p_user_ids) > 200 then
+    perform public.app_error('FORBIDDEN', 'Pass at most 200 staff ids.', 422, null);
+  end if;
+  return query
+  select m.user_id, coalesce(nullif(btrim(p.full_name), ''), 'Staff member')
+    from public.staff_memberships m
+    left join public.profiles p on p.id = m.user_id
+   where m.user_id = any(p_user_ids);
+end;
+$fn$;
+revoke all on function public.admin_staff_display_names(uuid[]) from public, anon, authenticated;
+grant execute on function public.admin_staff_display_names(uuid[]) to authenticated;
+
+-- == 5) app_error_catalog() — restated IN FULL ================================
+-- ★ One VALUES list, so a delta is not expressible. Generated from #59's catalog plus
+--   #60's four codes, so no earlier code can be dropped in transcription.
+create or replace function public.app_error_catalog()
+returns table (code text, http int, summary text)
+language sql
+immutable
+parallel safe
+set search_path = public
+as $cat$
+  select * from (values
+    ('BATCH_REQUIRED',               422, 'A VIP action needs an explicit batch; none was supplied.'),
+    ('BATCH_NOT_FOUND',              404, 'The batch id or month code does not exist.'),
+    ('BATCH_CLOSED',                 409, 'The batch is closed to new assignments, or archived.'),
+    ('BATCH_FULL',                   409, 'A cohort in the run has no seats left.'),
+    ('NO_SPACE_FOR_SEGMENT',         409, 'The batch has no active community space for that plan segment.'),
+    ('INVALID_BATCH_CODE',           422, 'Not a real YYYY-MM month.'),
+    ('ENTITLEMENT_EXPIRED',          403, 'The membership term (or its grace) has ended.'),
+    ('INVALID_PLAN',                 422, 'Unknown, inactive, or non-premium plan for this action.'),
+    ('ALREADY_ENTITLED',             409, 'The member already holds an outstanding seat in that cohort.'),
+    ('RUN_LIMIT_EXCEEDED',           409, 'Outstanding seats would exceed the per-member ceiling.'),
+    ('SEGMENT_MISMATCH',             409, 'The grant would mix cohort segments in one outstanding run.'),
+    ('INVALID_MEMBERSHIP_TRANSITION',409, 'The current membership state does not allow this transition.'),
+    ('IMMUTABLE_ENTITLEMENT',        409, 'An attempt to rewrite a frozen ledger column.'),
+    ('FORBIDDEN',                    403, 'Admin-only operation called by a non-admin.'),
+    ('REQUEST_NOT_FOUND',            404, 'The enrollment request does not exist.'),
+    ('COURSE_ACCESS_DENIED',         403, 'Course hidden by plan scope, publication, or cohort entitlement.'),
+    ('LESSON_NOT_RELEASED',          403, 'The cohort drip has not unlocked this lesson yet.'),
+    ('COMMUNITY_ACCESS_DENIED',      403, 'The community write was refused.'),
+    ('COMMENT_PERMISSION_DENIED',    403, 'Replies are off in this channel.'),
+    ('ASSIGNMENT_CLOSED',            409, 'Past the due date, or the assignment is unpublished.'),
+    ('SUBMISSION_LOCKED',            409, 'The submission is handed in or graded; edits refused.'),
+    ('COURSE_HAS_SUBMISSIONS',       409, 'The course has graded assignment work and cannot be deleted.'),
+    ('BATCH_PAST',                   409, 'The batch period has elapsed in its own timezone; it is read-only.'),
+    ('BATCH_CODE_TAKEN',             409, 'Another batch already uses that month code.'),
+    ('BATCH_CODE_REORDER',           409, 'The new code would move the batch past a sibling and reorder members'' runs.'),
+    ('BATCH_PERIOD_PAST',            422, 'The requested period has already ended; a batch cannot be edited into the past.'),
+    ('BATCH_PERIOD_INVALID',         422, 'The end date falls before the start date, or a date is missing.'),
+    ('BATCH_TIMEZONE_INVALID',       422, 'Not a timezone Postgres recognises (see pg_timezone_names).'),
+    ('BATCH_CAPACITY_BELOW_OCCUPANCY',409,'The new capacity is below the seats already sold in that segment.'),
+    ('CHANNEL_NOT_FOUND',            404, 'The channel does not exist, or is not available to you.'),
+    ('CHANNEL_SLUG_TAKEN',           409, 'Another channel in this space already uses that address.'),
+    ('CHANNEL_AUDIENCE_EMPTY',       422, 'The audience needs at least one plan or batch, or nobody could see it.'),
+    ('CHANNEL_ARCHIVED',             409, 'The channel is archived and accepts no new content.'),
+    ('CATEGORY_NOT_FOUND',           404, 'The channel category does not exist.'),
+    ('CATEGORY_NOT_EMPTY',           409, 'The category still holds active channels.'),
+    ('LESSON_VIDEO_UPLOAD_ONLY',     409, 'A lesson video must be an uploaded file in the private bucket; external links are no longer accepted.'),
+    ('LESSON_VIDEO_PATH_INVALID',    422, 'An uploaded lesson video must live at lessons/<course-uuid>/<file>.'),
+    ('COURSE_PUBLISH_BLOCKED',       409, 'The course still has video lessons with no uploaded file.'),
+    ('STAFF_LAST_SUPER_ADMIN',       409, 'That change would leave no active Super Admin. Promote a replacement first.'),
+    ('STAFF_NOT_FOUND',              404, 'That account is not staff, or has no profile.'),
+    ('STAFF_ROLE_INVALID',           422, 'Unknown staff role or status, or a required reason was missing.'),
+    ('COURSE_NOT_ASSIGNED',          403, 'You can edit courses, but not this one — nobody has assigned it to you.'),
+    ('COURSE_PUBLISH_FORBIDDEN',     403, 'Publishing or withdrawing a course needs its own permission.'),
+    ('COURSE_ASSIGNMENT_INVALID',    422, 'Unknown assignment role, or the target account cannot edit courses at all.'),
+    ('SUBSCRIPTION_NOT_FOUND',       404, 'That member has no subscription to act on.'),
+    ('EXTENSION_NOT_ALLOWED',        409, 'This membership never expires, so an extension could only shorten it.'),
+    ('EXTENSION_INVALID',            422, 'The requested extension is out of range, backwards, or missing its reason.'),
+    ('STAFF_NO_INVITATION',          404, 'There is no staff membership on this account to accept.'),
+    ('STAFF_INVITATION_NOT_PENDING', 409, 'The membership is suspended, revoked or already active; an old link cannot restore it.'),
+    ('STAFF_EMAIL_NOT_VERIFIED',     403, 'The Auth identity has not confirmed the mailbox the invitation was sent to.'),
+    ('STAFF_ACCOUNT_REJECTED',       403, 'The account is blocked from the platform, so a staff invitation cannot be accepted on it.'),
+    ('ACCESS_REQUEST_SELF_REVIEW',   403, 'A reviewer cannot decide on their own access request.'),
+    ('ACCESS_REQUEST_STAFF_TARGET',  409, 'The target holds an invited or active staff membership; withdraw staff access through Team & Roles instead.'),
+    ('MODERATION_TARGET_NOT_FOUND',  404, 'The post or reply does not exist, or is not in a channel the moderator can reach.'),
+    ('MODERATION_ACTION_INVALID',    422, 'Unknown moderation action.'),
+    ('MODERATION_STATE_INVALID',     409, 'The target''s current state does not allow that action (e.g. restoring an author-withdrawn post).'),
+    -- ── Financial management (#58) ──
+    ('FINANCE_ENTRY_UNBALANCED',     409, 'A journal entry must have at least two lines and equal debits and credits.'),
+    ('FINANCE_ENTRY_IMMUTABLE',      409, 'A posted entry, line, payment event or audit row cannot be edited or deleted.'),
+    ('FINANCE_ENTRY_ALREADY_REVERSED',409,'That entry has already been reversed; one reversal per entry, ever.'),
+    ('FINANCE_ENTRY_NOT_FOUND',      404, 'That journal entry does not exist.'),
+    ('FINANCE_ENTRY_FUTURE_DATED',   422, 'An entry cannot be dated in the future; a recurring cost is a template, not a posting.'),
+    ('FINANCE_ENTRY_KIND_INVALID',   422, 'Unknown entry kind for this action.'),
+    ('FINANCE_PERIOD_LOCKED',        409, 'That accounting period is closed; post the correction in an open period.'),
+    ('FINANCE_PERIOD_NOT_ELAPSED',   409, 'Only a period that has fully ended in the business timezone can be closed.'),
+    ('FINANCE_PERIOD_INVALID',       422, 'Not a real YYYY-MM period, or the period is not locked.'),
+    ('FINANCE_PERIOD_REASON_REQUIRED',422,'Reopening a closed accounting period needs a reason.'),
+    ('FINANCE_REVERSAL_REASON_REQUIRED',422,'A reversal needs a reason.'),
+    ('FINANCE_ACCOUNTS_NOT_CONFIGURED',409,'The default income or cash account is missing or inactive.'),
+    ('FINANCE_ACCOUNT_NOT_FOUND',    404, 'That finance account does not exist.'),
+    ('FINANCE_SYSTEM_ACCOUNT',       409, 'A system account cannot be deactivated or retyped.'),
+    ('FINANCE_EVENT_AMOUNT_MISMATCH',409, 'The payment event amount does not equal its journal entry.'),
+    ('FINANCE_AUDIT_IMMUTABLE',      409, 'The finance audit trail is append-only.'),
+    ('FINANCE_IDEMPOTENCY_REQUIRED', 422, 'This action needs an idempotency key so a retry cannot post twice.'),
+    ('FINANCE_TIMEZONE_INVALID',     422, 'Not a timezone Postgres recognises (see pg_timezone_names).'),
+    ('FINANCE_BANK_TXN_IMMUTABLE',   409, 'The parsed facts of a bank transaction cannot be edited; exclude it with a reason.'),
+    ('FINANCE_BANK_IMPORT_DUPLICATE',409, 'That statement file has already been imported into this account.'),
+    ('FINANCE_RECONCILIATION_CLOSED',409, 'A closed reconciliation is frozen; reopen it with a reason first.'),
+    ('FINANCE_RECONCILIATION_UNBALANCED',409,'A reconciliation whose difference is not zero cannot be closed.'),
+    ('FINANCE_COLLECTION_RACE',      409, 'Another transaction recorded this collection first; nothing was duplicated.'),
+    ('FINANCE_BANK_IMPORT_STATE',    409, 'That import is not in a state this action allows.'),
+    ('FINANCE_BANK_TXN_NOT_FOUND',   404, 'That bank transaction does not exist.'),
+    ('FINANCE_BANK_EXCLUDE_REASON_REQUIRED',422,'Excluding a bank transaction needs a reason.'),
+    ('FINANCE_ACCOUNT_IN_USE',       409, 'The account is a settings default or a plan''s income account, so it cannot be deactivated.'),
+    ('FINANCE_RECURRING_INVALID',    422, 'A recurring template is missing a field, uses an inactive account, or has a schedule that does not match its cadence.'),
+    -- ── Finance parity (#59) ──
+    ('FINANCE_RECLASSIFY_INVALID',   422, 'Only income to income, expense to expense, or expense to owner''s draw, on an unreversed entry, with a reason.'),
+    ('FINANCE_PRESET_INVALID',       422, 'An expense preset needs a unique name and an active expense or owner''s draw account.'),
+    ('FINANCE_BANK_TXN_LINKED',      409, 'The statement line, or the entry, is already added, matched, excluded or reconciled.'),
+    ('FINANCE_BANK_TXN_NOT_LINKED',  409, 'The statement line is not added or matched in the bank feed, so there is nothing to undo.'),
+    ('FINANCE_BANK_MATCH_MISMATCH',  422, 'The entry does not move the statement''s account by the same signed amount.'),
+    ('FINANCE_BANK_CATEGORY_INVALID',422, 'A statement line must be added to an active account other than its own.'),
+    ('FINANCE_ENTRY_HAS_ADJUSTMENTS',409, 'The entry has a reclassification that still stands; reverse that first.'),
+    ('FINANCE_BANK_ENROLLMENT_INCOME',409, 'A deposit cannot be added to an account approvals post to; match it to the approval instead.'),
+    -- ── Enrollment management (#60) ──
+    ('ENROLLMENT_NOT_PENDING',       409, 'Only a request still awaiting review can be held or corrected.'),
+    ('ENROLLMENT_HOLD_INVALID',      422, 'A hold needs a reason and a follow-up date that is not in the past, or the request is not on hold.'),
+    ('ENROLLMENT_AMOUNT_INVALID',    422, 'An amount correction needs a reason and an amount between 0 and 1,000,000.'),
+    ('ENROLLMENT_APPROVE_VIA_RPC',   409, 'A request can only be approved together with its membership grant.')
+  ) as t(code, http, summary);
+$cat$;
+
+
+notify pgrst, 'reload schema';
+
+insert into public.schema_migrations (filename, checksum, notes) values
+ ('2026-09-15-enrollment-management.sql', null,
+  'enrollment management (#60): staff-only enrollment_request_holds (reason, follow-up date; never a column '
+  'a student can read, never a change to expires_at) and an append-only enrollment_request_events timeline; '
+  'admin_set/clear_enrollment_hold, admin_correct_enrollment_amount (pending requests only, not your own, '
+  'always audited, so the approval hook posts the corrected figure), admin_enrollment_queue_counts (overdue '
+  'derived: pending, past expires_at, not held) and admin_staff_display_names (staff names only). A trigger '
+  'refuses a status -> approved transition with no membership term for the request (the direct-UPDATE path '
+  'that skipped admin_finalize_enrollment and, since #58, still booked the payment); Super Admin keeps '
+  'break-glass. A decided request releases its hold. No permission changes.')
+on conflict (filename) do nothing;
+
+-- ── AFTER RUNNING ────────────────────────────────────────────────────────────
+--
+-- 1) Both tables have RLS and exactly one SELECT policy:
+--      select tablename, count(*), min(cmd) from pg_policies
+--       where tablename in ('enrollment_request_holds','enrollment_request_events') group by 1;   -> 1, SELECT
+--
+-- 2) The approval guard is present and scoped to the transition:
+--      select tgname, tgqual is not null from pg_trigger
+--       where tgname = 'enrollment_approval_requires_grant';                                    -> t
+--
+-- 3) npm run db:audit -> clean, including the #60 checks.

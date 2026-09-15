@@ -142,6 +142,12 @@ export const APP_ERROR_CODES = [
   'FINANCE_BANK_MATCH_MISMATCH',
   'FINANCE_BANK_CATEGORY_INVALID',
   'FINANCE_ENTRY_HAS_ADJUSTMENTS',
+  'FINANCE_BANK_ENROLLMENT_INCOME',
+  // Enrollment management (#60)
+  'ENROLLMENT_NOT_PENDING',
+  'ENROLLMENT_HOLD_INVALID',
+  'ENROLLMENT_AMOUNT_INVALID',
+  'ENROLLMENT_APPROVE_VIA_RPC',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -386,6 +392,22 @@ const COPY = {
     'That entry was reclassified, and the reclassification still stands. Reverse the '
     + 'reclassification first, then this entry — otherwise money would be moved out of an account '
     + 'the reversal has just emptied.',
+  FINANCE_BANK_ENROLLMENT_INCOME:
+    'That account receives student payments automatically when an enrollment is approved, so adding '
+    + 'this deposit there would count the money twice. Leave the line in review and Match it to the '
+    + 'approval once the enrollment is approved.',
+  ENROLLMENT_NOT_PENDING:
+    'That request has already been decided, so it can’t be changed here. A payment that was already '
+    + 'recorded is corrected in Financial Management.',
+  ENROLLMENT_HOLD_INVALID:
+    'That hold isn’t valid: say why the request is on hold, and pick a follow-up date that isn’t in the '
+    + 'past. If you were clearing a hold, the request may no longer be on hold — refresh the list.',
+  ENROLLMENT_AMOUNT_INVALID:
+    'That correction isn’t valid: the amount must be between ₱0 and ₱1,000,000, and the reason is '
+    + 'required — it’s the only record of why the figure changed.',
+  ENROLLMENT_APPROVE_VIA_RPC:
+    'Approve this request with the Approve button — that grants the membership in the same step. '
+    + 'Marking it approved on its own would record the payment without giving the student access.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };

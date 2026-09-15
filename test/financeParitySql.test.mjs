@@ -110,8 +110,9 @@ for (const file of FILES) {
 
   test(`${file}: one entry clears one statement line, and the link has one shape`, () => {
     const s = sql();
-    assert.ok(/create unique index if not exists finance_bank_txn_entry_once\s+on public\.finance_bank_transactions \(matched_entry_id\) where matched_entry_id is not null/.test(s),
-      'without the unique index two deposits could be matched to the same approval');
+    assert.ok(/create unique index if not exists finance_bank_txn_entry_once\s+on public\.finance_bank_transactions \(matched_entry_id, account_id\) where matched_entry_id is not null/.test(s),
+      'without the unique index two deposits could be matched to the same approval; keyed on the entry '
+      + 'ALONE, a transfer could never be cleared on its second statement');
     assert.ok(/check \(\(matched_entry_id is null\) = \(matched_via is null\)\)/.test(s), 'matched_via and matched_entry_id must agree');
   });
 
@@ -179,6 +180,69 @@ for (const file of FILES) {
     assert.ok(allowed.has('backfill_run') && allowed.has('bank_undo'), 'the CHECK must carry #58 and #59 actions');
     const written = new Set([...s.matchAll(/values \(v_actor, v_email, '([a-z_]+)'/g)].map((m) => m[1]));
     for (const a of written) assert.ok(allowed.has(a), `audit action ${a} is written but not allowed by the CHECK`);
+  });
+
+  // ── Findings of the #59 stage review, pinned so they cannot quietly return ─────
+  test(`${file}: a transfer can be cleared on both of its statements`, () => {
+    const s = sql();
+    assert.ok(/matched_entry_id = p_entry_id and account_id = v_t\.account_id/.test(fnBody(s, 'finance_match_bank_transaction')),
+      'Match must treat an entry as claimed only on THIS statement account');
+    assert.ok(/bt\.matched_entry_id = e\.id and bt\.account_id = v_t\.account_id/.test(fnBody(s, 'finance_bank_match_candidates')),
+      'the other side of a transfer must stay a candidate on its own statement');
+    assert.ok(/bt\.matched_entry_id = e\.id and bt\.account_id = v_rec\.account_id/.test(fnBody(s, 'finance_reconciliation_detail')),
+      'reconciliation candidates must exclude only lines the feed claimed on this account');
+    assert.ok(/bt\.matched_entry_id = jl\.entry_id and bt\.account_id = jl\.account_id/.test(fnBody(s, 'finance_match_reconciliation_item')),
+      'a reconciliation item may name a transfer line the feed cleared on the OTHER account');
+  });
+
+  test(`${file}: writers lock the row they check before they change it`, () => {
+    const s = sql();
+    for (const [fn, pattern] of [
+      ['finance_reclassify_entry', /from public\.finance_journal_entries where id = p_entry_id for update/],
+      ['finance_reverse_entry', /from public\.finance_journal_entries where id = p_entry_id for update/],
+      ['finance_match_bank_transaction', /from public\.finance_journal_entries where id = p_entry_id for update/],
+      ['finance_match_reconciliation_item', /from public\.finance_bank_transactions where id = p_bank_transaction_id for update/],
+      ['finance_categorize_bank_transaction', /from public\.finance_bank_transactions where id = p_txn_id for update/],
+      ['finance_undo_bank_transaction', /from public\.finance_bank_transactions where id = p_txn_id for update/],
+    ]) {
+      assert.ok(pattern.test(fnBody(s, fn)), `${fn} must lock before checking — two tabs could otherwise both pass`);
+    }
+  });
+
+  test(`${file}: only an ORIGINAL entry can be reclassified`, () => {
+    assert.ok(/if v_orig\.adjusts_entry_id is not null then/.test(fnBody(sql(), 'finance_reclassify_entry')),
+      'an adjustment of an adjustment points elsewhere, so its remaining amount is not netted and money moves twice');
+  });
+
+  test(`${file}: a closed reconciliation freezes Add, Match and status changes`, () => {
+    const s = sql();
+    for (const fn of ['finance_categorize_bank_transaction', 'finance_match_bank_transaction',
+      'finance_bank_txn_set_status', 'finance_undo_bank_transaction']) {
+      assert.ok(/r\.status = 'closed'/.test(fnBody(s, fn)) && /FINANCE_RECONCILIATION_CLOSED/.test(fnBody(s, fn)),
+        `${fn} must refuse inside a closed reconciliation — otherwise its cleared total moves with no reopen`);
+    }
+  });
+
+  test(`${file}: a card reconciliation compares amounts OWED`, () => {
+    const s = sql();
+    for (const fn of ['finance_close_reconciliation', 'finance_reconciliation_detail']) {
+      assert.ok(/cash_flow_class = 'card' then -1 else 1/.test(fnBody(s, fn)),
+        `${fn}: a card statement's balance rises with charges, which are stored negative — without the sign it can never close`);
+    }
+  });
+
+  test(`${file}: a deposit cannot be added to an account approvals post to`, () => {
+    const body = fnBody(sql(), 'finance_categorize_bank_transaction');
+    assert.ok(/FINANCE_BANK_ENROLLMENT_INCOME/.test(body), 'the refusal is missing');
+    assert.ok(/s\.default_income_account_id = v_cat\.id/.test(body) && /p\.finance_income_account_id = v_cat\.id/.test(body),
+      'both the settings default and every plan-mapped income account receive approvals');
+  });
+
+  test(`${file}: the feed filters to committed lines before the limit`, () => {
+    const body = fnBody(sql(), 'finance_bank_transactions_list');
+    assert.ok(/p_committed_only boolean default false/.test(body), 'the committed-only argument is missing');
+    assert.ok(/not coalesce\(p_committed_only, false\) or imp\.status = 'committed'/.test(body),
+      'filtered after the limit, a large staged file pushes every committed line off the page');
   });
 
   test(`${file}: no permission change, no transaction wrapper, records itself`, () => {

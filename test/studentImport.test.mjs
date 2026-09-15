@@ -87,6 +87,10 @@ test('sanitizeCsvCell neutralizes formula-trigger prefixes', () => {
   assert.equal(sanitizeCsvCell('\tTAB'), "'\tTAB");
   assert.equal(sanitizeCsvCell('safe'), 'safe');
   assert.equal(sanitizeCsvCell(null), '');
+  // A number TYPE passes untouched (it cannot be a formula); the same text as a STRING is still guarded.
+  assert.equal(sanitizeCsvCell(-1200.5), '-1200.5');
+  assert.equal(sanitizeCsvCell(Number.NaN), "NaN");
+  assert.equal(sanitizeCsvCell('-1200.5'), "'-1200.5");
 });
 
 test('toCsv quotes + sanitizes', () => {

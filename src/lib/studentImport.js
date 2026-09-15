@@ -112,6 +112,9 @@ export function parseStrictDate(raw) {
 // A cell whose value starts with = + - @ (or tab/CR) can execute as a formula when
 // the exported CSV is opened in Excel/Sheets. Prefix a single quote to neutralize.
 export function sanitizeCsvCell(v) {
+  // A real JS number cannot carry a formula, and prefixing a negative one made a refund or a
+  // loss month export as TEXT that a spreadsheet will not sum. Strings keep the full guard.
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v);
   const s = v == null ? '' : String(v);
   if (/^[=+\-@\t\r]/.test(s)) return `'${s}`;
   return s;

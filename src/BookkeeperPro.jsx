@@ -11507,6 +11507,917 @@ function FinanceLoading({ label = 'Loading…' }) {
   );
 }
 
+// ── Financial Management: shared report helpers (#59) ─────────────────────────
+
+/** Money with an explicit sign. phpFmt formats a magnitude. */
+function financeMoney(v) {
+  const n = Number(v) || 0;
+  return `${n < 0 ? '−' : ''}${phpFmt(Math.abs(n))}`;
+}
+
+const FINANCE_RANGE_PRESETS = [
+  { key: 'today', label: 'Today' }, { key: 'week', label: 'This week' }, { key: 'month', label: 'This month' },
+  { key: 'quarter', label: 'This quarter' }, { key: 'ytd', label: 'Year to date' }, { key: 'custom', label: 'Custom' },
+];
+
+/** A preset's dates, from a YYYY-MM-DD "today". Weeks start on Monday. Null for 'custom'. */
+function financeRangePreset(key, todayIso = todayISODate()) {
+  const [y, m, d] = String(todayIso).split('-').map(Number);
+  const iso = (dt) => dt.toISOString().slice(0, 10);
+  const at = (yy, mm, dd) => new Date(Date.UTC(yy, mm - 1, dd));
+  switch (key) {
+    case 'today': return { from: todayIso, to: todayIso };
+    case 'week': return { from: iso(at(y, m, d - ((at(y, m, d).getUTCDay() + 6) % 7))), to: todayIso };
+    case 'month': return { from: iso(at(y, m, 1)), to: todayIso };
+    case 'quarter': return { from: iso(at(y, Math.floor((m - 1) / 3) * 3 + 1, 1)), to: todayIso };
+    case 'ytd': return { from: iso(at(y, 1, 1)), to: todayIso };
+    default: return null;
+  }
+}
+
+/** Columns are { label, key | value(row), csv?(row), align? }. `csv` returns the raw value. */
+function financeDownloadCsv(filename, columns, rows) {
+  const data = (rows || []).map((r) => Object.fromEntries(columns.map((c) => {
+    const v = c.csv ? c.csv(r) : (c.value ? c.value(r) : r[c.key]);
+    return [c.label, v === null || v === undefined ? '' : v];
+  })));
+  // toCsv is formula-injection safe; downloadFile already prepends the BOM.
+  downloadFile(toCsv(data, columns.map((c) => c.label)), filename, 'text/csv;charset=utf-8');
+}
+
+/**
+ * Print a report WITHOUT building HTML from strings: every cell is set with textContent,
+ * so a student's name or a bank description can never become markup. The legacy app
+ * rendered form answers and statement descriptions unescaped. INK, not var() tokens —
+ * the print window has no stylesheet.
+ */
+function financePrintTable({ title, subtitle, columns, rows, footnote }) {
+  const w = window.open('', '_blank');
+  if (!w) return false;
+  try { w.opener = null; } catch (_) { /* ignore */ }
+  const d = w.document;
+  d.title = title;
+  const el = (tag, text, style) => {
+    const n = d.createElement(tag);
+    if (text !== null && text !== undefined) n.textContent = String(text);
+    if (style) Object.assign(n.style, style);
+    return n;
+  };
+  Object.assign(d.body.style, { fontFamily: 'Arial, Helvetica, sans-serif', color: INK.text, margin: '24px' });
+  d.body.appendChild(el('h1', title, { fontSize: '18px', margin: '0 0 4px' }));
+  if (subtitle) d.body.appendChild(el('div', subtitle, { fontSize: '12px', color: INK.textSoft, marginBottom: '12px' }));
+  const table = el('table', null, { borderCollapse: 'collapse', width: '100%', fontSize: '11px' });
+  const head = el('tr');
+  columns.forEach((c) => head.appendChild(el('th', c.label,
+    { textAlign: c.align || 'left', borderBottom: `1px solid ${INK.textMute}`, padding: '4px 6px' })));
+  table.appendChild(head);
+  (rows || []).forEach((r) => {
+    const tr = el('tr', null, r.__bold ? { fontWeight: '700' } : null);
+    columns.forEach((c) => tr.appendChild(el('td', c.value ? c.value(r) : r[c.key],
+      { textAlign: c.align || 'left', borderBottom: `1px solid ${INK.border}`, padding: '3px 6px' })));
+    table.appendChild(tr);
+  });
+  d.body.appendChild(table);
+  if (footnote) d.body.appendChild(el('div', footnote, { fontSize: '10px', color: INK.textMute, marginTop: '10px' }));
+  setTimeout(() => { try { w.focus(); w.print(); } catch (_) { /* ignore */ } }, 250);
+  return true;
+}
+
+/** Print, and say so when the browser blocked the window instead of doing nothing. */
+function financePrintOrWarn(setErr, opts) {
+  if (!financePrintTable(opts)) {
+    setErr('Your browser blocked the print window. Allow pop-ups for this site, then try again.');
+  }
+}
+
+/** Horizontal bars, hand-rolled SVG. */
+function FinanceBars({ items, label }) {
+  const clean = (items || []).filter((i) => Number(i.value) > 0);
+  if (!clean.length) {
+    return <div className="rounded-xl px-4 py-6 text-center" style={{ background: 'var(--wash)', color: C.textMute, fontSize: 12.5 }}>Nothing to chart in this range.</div>;
+  }
+  const max = Math.max(...clean.map((i) => Number(i.value)));
+  const W = 640; const rowH = 28; const labelW = 190; const H = clean.length * rowH + 6;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img"
+      aria-label={`${label}: ${clean.map((i) => `${i.label} ${i.value}`).join(', ')}`}>
+      {clean.map((i, k) => {
+        const y = 4 + k * rowH;
+        const bw = Math.max(2, ((W - labelW - 70) * Number(i.value)) / max);
+        return (
+          <g key={`${i.label}-${k}`}>
+            <text x={labelW - 8} y={y + 16} textAnchor="end" style={{ fontSize: 12, fill: C.textSoft }}>{String(i.label).slice(0, 26)}</text>
+            <rect x={labelW} y={y + 3} width={bw} height={18} rx={5} style={{ fill: C.primary }} />
+            <text x={labelW + bw + 6} y={y + 16} style={{ fontSize: 12, fill: C.text, fontWeight: 700 }}>{i.value}</text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+// ── Overview extras: the pipeline strip, Sales by Package & Batch, recent activity ──
+// ★ Sales here are COLLECTED money by approval date — the #58 rules — so these figures
+//   agree with "Sales by plan" and the receivables worklist by construction.
+function FinanceOverviewExtras({ call, from, to }) {
+  const [pipe, setPipe] = useState(null);
+  const [scope, setScope] = useState('month');
+  const [sales, setSales] = useState(null);
+  const [expanded, setExpanded] = useState({});
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    let live = true; setPipe(null);
+    call('finance_pipeline_summary', { p_from: from, p_to: to })
+      .then((d) => { if (live) setPipe(d || {}); })
+      .catch((e) => { if (live) { setErr(appErrorMessage(e, 'Could not load the pipeline.')); setPipe({}); } });
+    return () => { live = false; };
+  }, [call, from, to]);
+
+  useEffect(() => {
+    let live = true; setSales(null);
+    const r = financeRangePreset(scope);
+    call('finance_sales_by_plan_batch', { p_from: r.from, p_to: r.to })
+      .then((d) => { if (live) setSales(d || { plans: [] }); })
+      .catch((e) => { if (live) { setErr(appErrorMessage(e, 'Could not load sales by package.')); setSales({ plans: [] }); } });
+    return () => { live = false; };
+  }, [call, scope]);
+
+  const plans = sales?.plans || [];
+  const pct = (v) => (v === null || v === undefined ? '—' : `${v}%`);
+  const flat = () => plans.flatMap((p) => [
+    { kind: 'Package', name: p.plan_name, ...p },
+    ...(p.batches || []).map((b) => ({ kind: 'Batch', name: `${p.plan_name} — ${b.batch_code || 'No batch'}`, ...b })),
+  ]).concat(sales?.total ? [{ kind: 'Total', name: 'TOTAL', ...sales.total, __bold: true }] : []);
+  const columns = [
+    { label: 'Row', key: 'kind' }, { label: 'Package / batch', key: 'name' },
+    { label: 'Enrollments', key: 'enrollments', align: 'right' },
+    { label: 'Collected', value: (r) => financeMoney(r.collected), csv: (r) => r.collected, align: 'right' },
+    { label: '% of total', value: (r) => pct(r.pct_of_collected), csv: (r) => r.pct_of_collected, align: 'right' },
+    { label: 'Avg per enrollment', value: (r) => (r.avg_collected == null ? '—' : financeMoney(r.avg_collected)), csv: (r) => r.avg_collected, align: 'right' },
+  ];
+  const scopeLabel = { today: 'Today', month: 'Month to date', ytd: 'Year to date' }[scope];
+
+  return (
+    <div className="space-y-4">
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {pipe === null ? <FinanceLoading label="Loading the pipeline…" /> : (
+        <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
+          <FinanceStat label="Signups awaiting access" value={String(pipe.signups_awaiting_access ?? '—')} note="Accounts not yet approved." />
+          <FinanceStat label="Payment proofs pending" value={String(pipe.payment_proofs_pending ?? '—')} tone={Number(pipe.payment_proofs_pending) > 0 ? C.amber : undefined} note="Waiting in Enrollments." />
+          <FinanceStat label="Approved in range" value={String(pipe.approved_in_range ?? '—')} tone={C.green} note={`${pipe.range?.from || from} → ${pipe.range?.to || to}`} />
+          <FinanceStat label="Rejected in range" value={String(pipe.rejected_in_range ?? '—')} note="By decision date." />
+        </div>
+      )}
+
+      <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+        <div className="flex flex-wrap items-center gap-2 mb-2">
+          <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Sales by package &amp; batch</div>
+          <div className="flex gap-1 ml-2" role="tablist" aria-label="Sales period">
+            {[['today', 'Today'], ['month', 'MTD'], ['ytd', 'YTD']].map(([k, l]) => (
+              <button key={k} type="button" role="tab" aria-selected={scope === k} onClick={() => setScope(k)}
+                className="px-2 py-1 rounded-md text-xs font-semibold"
+                style={scope === k ? { background: C.primarySolid, color: 'white' } : { background: 'var(--wash)', color: C.textSoft }}>{l}</button>
+            ))}
+          </div>
+          {plans.length > 0 && (
+            <div className="ml-auto flex gap-2">
+              <button type="button" className="gh-btn-ghost px-3 py-1.5 text-xs"
+                onClick={() => financeDownloadCsv(`sales-by-package-${scope}-${todayISODate()}.csv`, columns, flat())}>
+                <Download size={12} className="inline -mt-0.5 mr-1" />CSV</button>
+              <button type="button" className="gh-btn-ghost px-3 py-1.5 text-xs"
+                onClick={() => financePrintOrWarn(setErr, { title: 'Sales by package & batch', subtitle: `${scopeLabel} · ${sales?.range?.from} → ${sales?.range?.to} · collected, by approval date`, columns: columns.slice(1), rows: flat() })}>
+                <Printer size={12} className="inline -mt-0.5 mr-1" />Print</button>
+            </div>
+          )}
+        </div>
+        {sales === null ? <FinanceLoading /> : plans.length === 0 ? (
+          <div style={{ fontSize: 13, color: C.textMute }}>No approved enrollments {scope === 'today' ? 'today' : 'in this period'}.</div>
+        ) : (
+          <table className="w-full text-sm" style={{ color: C.text }}>
+            <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+              <th scope="col" className="py-1">Package</th><th scope="col" className="text-right">Enrollments</th>
+              <th scope="col" className="text-right">Collected</th><th scope="col" className="text-right">% of total</th>
+              <th scope="col" className="text-right">Avg / enrollment</th>
+            </tr></thead>
+            <tbody>
+              {plans.map((p) => {
+                const key = `${p.plan_key}|${p.plan_name}`;
+                const hasBatches = (p.batches || []).some((b) => b.batch_id);
+                return (
+                  <React.Fragment key={key}>
+                    <tr style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                      <td className="py-1.5">
+                        {hasBatches ? (
+                          <button type="button" aria-expanded={!!expanded[key]} onClick={() => setExpanded((x) => ({ ...x, [key]: !x[key] }))}
+                            className="inline-flex items-center gap-1 font-semibold" style={{ color: C.text }}>
+                            {expanded[key] ? <ChevronDown size={13} /> : <ChevronRight size={13} />}{p.plan_name}
+                          </button>
+                        ) : <span className="font-semibold">{p.plan_name}</span>}
+                      </td>
+                      <td className="text-right">{p.enrollments}</td>
+                      <td className="text-right">{financeMoney(p.collected)}</td>
+                      <td className="text-right">{pct(p.pct_of_collected)}</td>
+                      <td className="text-right">{p.avg_collected == null ? '—' : financeMoney(p.avg_collected)}</td>
+                    </tr>
+                    {expanded[key] && (p.batches || []).map((b) => (
+                      <tr key={`${key}-${b.batch_id || 'none'}`} style={{ color: C.textSoft, fontSize: 12.5 }}>
+                        <td className="py-1 pl-6">{b.batch_code ? `${b.batch_code}${b.batch_name ? ` · ${b.batch_name}` : ''}` : 'No batch'}</td>
+                        <td className="text-right">{b.enrollments}</td>
+                        <td className="text-right">{financeMoney(b.collected)}</td>
+                        <td className="text-right">{pct(b.pct_of_collected)}</td>
+                        <td className="text-right">{b.avg_collected == null ? '—' : financeMoney(b.avg_collected)}</td>
+                      </tr>
+                    ))}
+                  </React.Fragment>
+                );
+              })}
+              {sales?.total && (
+                <tr style={{ borderTop: `1px solid ${GLASS.border}`, fontWeight: 700 }}>
+                  <td className="py-1.5">Total</td><td className="text-right">{sales.total.enrollments}</td>
+                  <td className="text-right">{financeMoney(sales.total.collected)}</td><td className="text-right">100%</td>
+                  <td className="text-right">{sales.total.avg_collected == null ? '—' : financeMoney(sales.total.avg_collected)}</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+          <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }} className="mb-2">Enrollments by package · {scopeLabel}</div>
+          {sales === null ? <FinanceLoading /> : <FinanceBars label="Enrollments by package" items={plans.map((p) => ({ label: p.plan_name, value: p.enrollments }))} />}
+        </div>
+        <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+          <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }} className="mb-2">Recent activity</div>
+          {pipe === null ? <FinanceLoading /> : (
+            <div className="grid gap-3 sm:grid-cols-2" style={{ fontSize: 12.5 }}>
+              <div>
+                <div style={FINANCE_LABEL_STYLE} className="mb-1">Collections</div>
+                {(pipe.recent_collections || []).length === 0 ? <div style={{ color: C.textMute }}>None yet.</div>
+                  : pipe.recent_collections.map((c, i) => (
+                    <div key={i} className="py-1" style={{ borderTop: i ? `1px solid ${GLASS.border}` : 'none', opacity: c.reversed ? 0.55 : 1 }}>
+                      <div className="flex justify-between gap-2"><span>{c.occurred_on}</span><strong>{financeMoney(c.amount)}</strong></div>
+                      <div style={{ color: C.textMute, fontSize: 11.5 }}>{c.plan_name || '—'}{c.reversed ? ' · reversed' : ''}</div>
+                    </div>
+                  ))}
+              </div>
+              <div>
+                <div style={FINANCE_LABEL_STYLE} className="mb-1">Approvals</div>
+                {(pipe.recent_approvals || []).length === 0 ? <div style={{ color: C.textMute }}>None yet.</div>
+                  : pipe.recent_approvals.map((a) => (
+                    <div key={a.request_id} className="py-1" style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                      <div className="flex justify-between gap-2"><span className="truncate">{a.full_name || a.email || '—'}</span><strong>{financeMoney(a.amount_paid)}</strong></div>
+                      <div style={{ color: C.textMute, fontSize: 11.5 }}>{a.plan_name || '—'} · {String(a.approved_at || '').slice(0, 10)}</div>
+                    </div>
+                  ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── The sales report: presets, filters, totals, a daily trend and the detail rows ──
+const FINANCE_PAYMENT_STATUSES = [
+  { key: '', label: 'Any payment status' }, { key: 'paid', label: 'Paid in full' },
+  { key: 'partial', label: 'Partly paid' }, { key: 'outstanding', label: 'Nothing collected yet' },
+];
+
+/** Collected per day, hand-rolled SVG bars. */
+function FinanceDailyBars({ days }) {
+  const clean = (days || []).filter((d) => d && d.day);
+  if (clean.length === 0) {
+    return <div className="rounded-xl px-4 py-6 text-center" style={{ background: 'var(--wash)', color: C.textMute, fontSize: 12.5 }}>No approvals in this range.</div>;
+  }
+  const W = 640; const H = 150; const pad = 22;
+  const max = Math.max(1, ...clean.map((d) => Number(d.collected) || 0));
+  // The step always fits the chart: a fixed minimum width ran past the edge after ~99 days
+  // and silently clipped the most recent ones.
+  const step = (W - pad * 2) / clean.length;
+  const bw = Math.max(1, step * 0.8);
+  const first = clean[0]; const last = clean[clean.length - 1];
+  return (
+    <figure aria-label="Collected per day">
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img"
+        aria-label={`Collected per day from ${first.day} to ${last.day}, peaking at ${phpFmt(max)}.`}>
+        {clean.map((d, i) => {
+          const h = ((Number(d.collected) || 0) * (H - pad * 2)) / max;
+          return <rect key={d.day} x={pad + i * step} y={H - pad - h} width={bw} height={Math.max(h, 1)} rx={Math.min(2, bw / 2)} style={{ fill: C.primary }} />;
+        })}
+      </svg>
+      <figcaption className="flex justify-between text-[10px]" style={{ color: C.textMute }}>
+        <span>{first.day}</span><span>Collected, by approval date</span><span>{last.day}</span>
+      </figcaption>
+    </figure>
+  );
+}
+
+function FinanceSalesReport({ call }) {
+  const [preset, setPreset] = useState('month');
+  const [range, setRange] = useState(() => financeRangePreset('month'));
+  const [plans, setPlans] = useState([]);
+  const [batches, setBatches] = useState([]);
+  const [planKeys, setPlanKeys] = useState([]);
+  const [batchIds, setBatchIds] = useState([]);
+  const [status, setStatus] = useState('');
+  const [report, setReport] = useState(null);
+  const [ranWith, setRanWith] = useState(null);   // the filters the shown report was RUN with
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    let live = true;
+    Promise.all([
+      call('finance_setup_state'),
+      supabase.from('batches').select('id,code,name').order('code', { ascending: false }).limit(60),
+    ]).then(([st, b]) => {
+      if (!live) return;
+      setPlans((st?.plans || []).map((p) => ({ key: p.key, name: p.name })));
+      if (!b.error) setBatches(b.data || []);
+    }).catch(() => { /* the filters are optional; the report still runs */ });
+    return () => { live = false; };
+  }, [call]);
+
+  const run = async () => {
+    if (!range?.from || !range?.to || range.to < range.from) { setErr('Choose a start date on or before the end date.'); return; }
+    setBusy(true); setErr('');
+    try {
+      const out = await call('finance_sales_report', {
+        p_from: range.from, p_to: range.to,
+        p_plan_keys: planKeys.length ? planKeys : null, p_batch_ids: batchIds.length ? batchIds : null,
+        p_payment_status: status || null, p_limit: 500,
+      });
+      setReport(out || { rows: [], daily: [], totals: {} });
+      setRanWith({ planKeys: [...planKeys], batchIds: [...batchIds], status });
+    } catch (e) {
+      console.error('[finance] sales report failed', { code: e?.code, message: e?.message });
+      setErr(appErrorMessage(e, 'Could not run the sales report.'));
+    } finally { setBusy(false); }
+  };
+  // First run with the default preset; later runs only when asked.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { run(); }, []);
+
+  const pickPreset = (key) => {
+    setPreset(key);
+    const r = financeRangePreset(key);
+    if (r) setRange(r);
+  };
+  const toggle = (list, setList, v) => setList(list.includes(v) ? list.filter((x) => x !== v) : [...list, v]);
+  const rows = report?.rows || [];
+  const t = report?.totals || {};
+  const statusLabel = { paid: 'paid', partial: 'partial', outstanding: 'outstanding' };
+  const columns = [
+    { label: 'Approved', key: 'approved_on' },
+    { label: 'Student', value: (r) => r.full_name || '—' },
+    { label: 'Email', key: 'email' },
+    { label: 'Package', key: 'plan_name' },
+    { label: 'Batch', value: (r) => r.batch_code || '—' },
+    { label: 'Contract', value: (r) => financeMoney(r.contract), csv: (r) => r.contract, align: 'right' },
+    { label: 'Collected', value: (r) => financeMoney(r.collected), csv: (r) => r.collected, align: 'right' },
+    { label: 'Outstanding', value: (r) => financeMoney(r.outstanding), csv: (r) => r.outstanding, align: 'right' },
+    { label: 'Payment', value: (r) => statusLabel[r.payment_status] || r.payment_status },
+  ];
+  const chip = (active) => (active
+    ? { background: C.primarySolid, color: 'white' }
+    : { background: 'var(--wash)', color: C.textSoft });
+  // Printed and exported reports say what they were filtered to — a single-package print must
+  // never read as whole-business sales.
+  const filterLabel = !ranWith ? '' : [
+    ranWith.planKeys.length ? `packages: ${ranWith.planKeys.map((k) => plans.find((p) => p.key === k)?.name || k).join(', ')}` : '',
+    ranWith.batchIds.length ? `batches: ${ranWith.batchIds.map((id) => batches.find((b) => b.id === id)?.code || '?').join(', ')}` : '',
+    ranWith.status ? `payment: ${FINANCE_PAYMENT_STATUSES.find((s) => s.key === ranWith.status)?.label || ranWith.status}` : '',
+  ].filter(Boolean).join(' · ');
+  const stale = !!ranWith && (String(planKeys) !== String(ranWith.planKeys)
+    || String(batchIds) !== String(ranWith.batchIds) || status !== ranWith.status);
+
+  return (
+    <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+      <div className="flex flex-wrap items-center gap-2 mb-1">
+        <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Sales report</div>
+        {rows.length > 0 && (
+          <div className="ml-auto flex gap-2">
+            <button type="button" className="gh-btn-ghost px-3 py-1.5 text-xs"
+              onClick={() => financeDownloadCsv(`sales-report-${report.range?.from}-to-${report.range?.to}.csv`, columns, rows)}>
+              <Download size={12} className="inline -mt-0.5 mr-1" />CSV</button>
+            <button type="button" className="gh-btn-ghost px-3 py-1.5 text-xs"
+              onClick={() => financePrintOrWarn(setErr, {
+                title: 'Sales report', subtitle: `${report.range?.from} → ${report.range?.to} · by approval date${filterLabel ? ` · ${filterLabel}` : ' · all packages'} · ${t.enrollments} enrollment(s), ${financeMoney(t.collected)} collected`,
+                columns: columns.filter((c) => c.label !== 'Email'),
+                rows: [...rows, { __bold: true, approved_on: 'TOTAL', full_name: '', plan_name: '', contract: t.contract, collected: t.collected, outstanding: t.outstanding, payment_status: '' }],
+                footnote: 'Cash basis. A management report, not a statutory financial statement.',
+              })}>
+              <Printer size={12} className="inline -mt-0.5 mr-1" />Print</button>
+          </div>
+        )}
+      </div>
+      <div className="mb-3" style={{ fontSize: 11.5, color: C.textMute }}>
+        Approved enrollments by approval date. Collected is money actually recorded; a reversed collection does not count.
+      </div>
+
+      <div className="flex flex-wrap gap-1 mb-2" role="group" aria-label="Date range">
+        {FINANCE_RANGE_PRESETS.map((p) => (
+          <button key={p.key} type="button" aria-pressed={preset === p.key} onClick={() => pickPreset(p.key)}
+            className="px-2 py-1 rounded-md text-xs font-semibold" style={chip(preset === p.key)}>{p.label}</button>
+        ))}
+      </div>
+      <div className="grid gap-2 sm:grid-cols-4 items-end mb-2">
+        <label className="block"><span style={FINANCE_LABEL_STYLE}>From</span>
+          <input type="date" value={range?.from || ''} onChange={(e) => { setPreset('custom'); setRange((r) => ({ ...r, from: e.target.value })); }}
+            className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+        <label className="block"><span style={FINANCE_LABEL_STYLE}>To</span>
+          <input type="date" value={range?.to || ''} onChange={(e) => { setPreset('custom'); setRange((r) => ({ ...r, to: e.target.value })); }}
+            className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+        <label className="block"><span style={FINANCE_LABEL_STYLE}>Payment</span>
+          <select value={status} onChange={(e) => setStatus(e.target.value)} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+            {FINANCE_PAYMENT_STATUSES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+          </select></label>
+        <button type="button" onClick={run} disabled={busy} className="gh-btn-primary px-3 py-2 text-sm disabled:opacity-60">
+          {busy ? 'Running…' : 'Run report'}</button>
+      </div>
+      {plans.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1 mb-1" role="group" aria-label="Packages">
+          <span style={FINANCE_LABEL_STYLE} className="mr-1">Packages</span>
+          {plans.map((p) => (
+            <button key={p.key} type="button" aria-pressed={planKeys.includes(p.key)} onClick={() => toggle(planKeys, setPlanKeys, p.key)}
+              className="px-2 py-1 rounded-md text-xs font-semibold" style={chip(planKeys.includes(p.key))}>{p.name}</button>
+          ))}
+        </div>
+      )}
+      {batches.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1 mb-3" role="group" aria-label="Batches">
+          <span style={FINANCE_LABEL_STYLE} className="mr-1">Batches</span>
+          {batches.slice(0, 18).map((b) => (
+            <button key={b.id} type="button" aria-pressed={batchIds.includes(b.id)} onClick={() => toggle(batchIds, setBatchIds, b.id)}
+              className="px-2 py-1 rounded-md text-xs font-semibold" style={chip(batchIds.includes(b.id))}>{b.code}</button>
+          ))}
+        </div>
+      )}
+
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {report && !busy && (
+        <div className="mb-2" style={{ fontSize: 12, color: stale ? C.amber : C.textMute }}>
+          Showing {filterLabel || 'all packages, batches and payment statuses'}.{stale ? ' The filters above have changed — run the report again to apply them.' : ''}
+        </div>
+      )}
+      {/* A failed FIRST run must not spin forever under its own error. */}
+      {busy || (report === null && !err) ? <FinanceLoading label="Running the report…" /> : report === null ? null : (
+        <div className="space-y-3">
+          <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
+            <FinanceStat label="Enrollments" value={String(t.enrollments ?? 0)} />
+            <FinanceStat label="Contract value" value={financeMoney(t.contract)} note="Agreed, not revenue." />
+            <FinanceStat label="Collected" value={financeMoney(t.collected)} tone={C.green} />
+            <FinanceStat label="Outstanding" value={financeMoney(t.outstanding)} tone={Number(t.outstanding) > 0 ? C.amber : undefined} />
+          </div>
+          <FinanceDailyBars days={report.daily} />
+          {rows.length === 0 ? (
+            <div style={{ fontSize: 13, color: C.textMute }}>No approved enrollments match these filters.</div>
+          ) : (
+            <>
+              {Number(report.total_count) > rows.length && (
+                <div style={{ fontSize: 12, color: C.amber }}>Showing the first {rows.length} of {report.total_count}. Narrow the range to see the rest; the totals above cover all of them.</div>
+              )}
+              <table className="w-full text-sm" style={{ color: C.text }}>
+                <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+                  <th scope="col" className="py-1">Approved</th><th scope="col">Student</th><th scope="col">Package</th>
+                  <th scope="col">Batch</th><th scope="col" className="text-right">Contract</th>
+                  <th scope="col" className="text-right">Collected</th><th scope="col" className="text-right">Outstanding</th>
+                  <th scope="col">Payment</th>
+                </tr></thead>
+                <tbody>
+                  {rows.map((r) => (
+                    <tr key={r.request_id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                      <td className="py-1.5" style={{ fontSize: 12 }}>{r.approved_on}</td>
+                      <td><div>{r.full_name || '—'}</div><div style={{ fontSize: 11, color: C.textMute }}>{r.email}</div></td>
+                      <td style={{ fontSize: 12.5 }}>{r.plan_name}</td>
+                      <td style={{ fontSize: 12 }}>{r.batch_code || '—'}</td>
+                      <td className="text-right">{financeMoney(r.contract)}</td>
+                      <td className="text-right">{financeMoney(r.collected)}</td>
+                      <td className="text-right" style={{ color: Number(r.outstanding) > 0 ? C.amber : C.textMute }}>{financeMoney(r.outstanding)}</td>
+                      <td><span className="gh-pill" style={{ fontSize: 11 }}>{statusLabel[r.payment_status] || r.payment_status}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Profit & Loss: a pivot of the cash-basis P&L, with drill-down ─────────────
+const FINANCE_PL_SECTIONS = [
+  ['income', 'Income'], ['other_income', 'Other income'], ['cost_of_sales', 'Cost of sales'],
+  ['operating_expense', 'Operating expenses'], ['other_expense', 'Other expenses'],
+];
+const FINANCE_PL_INCOME_SECTIONS = ['income', 'other_income'];
+
+function financePeriodLabel(key, group) {
+  if (key === 'TOTAL') return 'Total';
+  if (group === 'week') return `Week of ${key}`;
+  return key;
+}
+
+function FinanceProfitLoss({ call, from, to, version }) {
+  const [group, setGroup] = useState('month');
+  const [filters, setFilters] = useState({ accountId: '', payee: '', min: '', max: '' });
+  const [applied, setApplied] = useState({ accountId: '', payee: '', min: '', max: '' });
+  const [accounts, setAccounts] = useState([]);
+  const [rows, setRows] = useState(null);
+  const [hideZero, setHideZero] = useState(true);
+  const [showPct, setShowPct] = useState(false);
+  const [err, setErr] = useState('');
+  const [drill, setDrill] = useState(null);
+  const [detail, setDetail] = useState(null);
+
+  useEffect(() => {
+    let live = true;
+    call('finance_accounts_list', { p_include_inactive: true })
+      .then((a) => { if (live) setAccounts((a || []).filter((x) => ['income', 'expense'].includes(x.account_type) || x.subtype === 'owner_draw')); })
+      .catch(() => {});
+    return () => { live = false; };
+  }, [call]);
+
+  useEffect(() => {
+    let live = true; setRows(null); setErr('');
+    call('finance_cash_basis_pl', {
+      p_from: from, p_to: to, p_group: group,
+      p_account_ids: applied.accountId ? [applied.accountId] : null,
+      p_payee: applied.payee.trim() || null,
+      p_min: applied.min === '' ? null : Number(applied.min),
+      p_max: applied.max === '' ? null : Number(applied.max),
+    }).then((r) => { if (live) setRows(r || []); })
+      .catch((e) => {
+        console.error('[finance] P&L failed', { code: e?.code, message: e?.message });
+        if (live) { setErr(appErrorMessage(e, 'Could not load the profit & loss.')); setRows([]); }
+      });
+    return () => { live = false; };
+  }, [call, from, to, group, applied, version]);
+
+  useEffect(() => {
+    if (!drill) { setDetail(null); return undefined; }
+    let live = true; setDetail(null);
+    call('finance_pl_account_detail', { p_account_id: drill.account_id, p_from: from, p_to: to })
+      .then((d) => { if (live) setDetail(d || {}); })
+      .catch((e) => { if (live) setDetail({ error: appErrorMessage(e, 'Could not load that account.') }); });
+    return () => { live = false; };
+  }, [call, drill, from, to]);
+
+  // ── Pivot: one row per account, one column per period. Every number is read off the
+  //    server rows; the only client arithmetic is summing cells the server already signed.
+  const data = rows || [];
+  const periods = [...new Set(data.map((r) => r.period_key))].sort();
+  const accountRows = {};
+  data.forEach((r) => {
+    const k = `${r.section}|${r.account_id}`;
+    accountRows[k] = accountRows[k] || { section: r.section, account_id: r.account_id, code: r.account_code, name: r.account_name, cells: {}, total: 0 };
+    accountRows[k].cells[r.period_key] = Number(r.amount) || 0;
+    accountRows[k].total += Number(r.amount) || 0;
+  });
+  const netByPeriod = {};
+  data.forEach((r) => { netByPeriod[r.period_key] = Number(r.period_total) || 0; });
+  const netTotal = periods.reduce((a, p) => a + (netByPeriod[p] || 0), 0);
+  const incomeByPeriod = {};
+  Object.values(accountRows).filter((a) => FINANCE_PL_INCOME_SECTIONS.includes(a.section)).forEach((a) => {
+    periods.forEach((p) => { incomeByPeriod[p] = (incomeByPeriod[p] || 0) + (a.cells[p] || 0); });
+  });
+  const incomeTotal = periods.reduce((a, p) => a + (incomeByPeriod[p] || 0), 0);
+  const visible = (a) => !hideZero || a.total !== 0 || periods.some((p) => (a.cells[p] || 0) !== 0);
+  const sectionAccounts = (sect) => Object.values(accountRows).filter((a) => a.section === sect && visible(a))
+    .sort((x, y) => String(x.code).localeCompare(String(y.code)));
+  const sectionSum = (sect, p) => Object.values(accountRows).filter((a) => a.section === sect)
+    .reduce((s, a) => s + (p ? (a.cells[p] || 0) : a.total), 0);
+  const pctOf = (v, p) => {
+    const base = p ? incomeByPeriod[p] : incomeTotal;
+    return base ? `${((v / base) * 100).toFixed(1)}%` : '—';
+  };
+
+  // Flattened for CSV and print.
+  const flat = () => {
+    const out = [];
+    const line = (label, cells, total, bold) => {
+      const r = { label, __bold: bold, total };
+      periods.forEach((p) => { r[p] = cells[p] || 0; });
+      out.push(r);
+    };
+    FINANCE_PL_SECTIONS.forEach(([sect, title]) => {
+      const accts = sectionAccounts(sect);
+      if (!accts.length) return;
+      accts.forEach((a) => line(`${title} — ${a.code} ${a.name}`, a.cells, a.total, false));
+      const cells = {}; periods.forEach((p) => { cells[p] = sectionSum(sect, p); });
+      line(`Total ${title.toLowerCase()}`, cells, sectionSum(sect), true);
+    });
+    line('Net profit', netByPeriod, netTotal, true);
+    sectionAccounts('memo_owner_draw').forEach((a) => line(`Memo: owner's draw — ${a.code} ${a.name}`, a.cells, a.total, false));
+    return out;
+  };
+  const exportColumns = [
+    { label: 'Line', key: 'label' },
+    ...periods.map((p) => ({ label: financePeriodLabel(p, group), value: (r) => financeMoney(r[p]), csv: (r) => r[p], align: 'right' })),
+    ...(periods.length > 1 ? [{ label: 'Total', value: (r) => financeMoney(r.total), csv: (r) => r.total, align: 'right' }] : []),
+  ];
+
+  const cell = (v, p) => (
+    <td className="text-right whitespace-nowrap px-2">
+      {financeMoney(v)}
+      {showPct && <div style={{ fontSize: 10.5, color: C.textMute }}>{pctOf(v, p)}</div>}
+    </td>
+  );
+
+  return (
+    <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+      <div className="flex flex-wrap items-center gap-2 mb-1">
+        <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Cash-Basis Management P&amp;L</div>
+        {data.length > 0 && (
+          <div className="ml-auto flex gap-2">
+            <button type="button" className="gh-btn-ghost px-3 py-1.5 text-xs"
+              onClick={() => financeDownloadCsv(`profit-and-loss-${from}-to-${to}-${group}.csv`, exportColumns, flat())}>
+              <Download size={12} className="inline -mt-0.5 mr-1" />CSV</button>
+            <button type="button" className="gh-btn-ghost px-3 py-1.5 text-xs"
+              onClick={() => financePrintOrWarn(setErr, {
+                title: 'Cash-Basis Management P&L', subtitle: `${from} → ${to} · by ${group}`,
+                columns: exportColumns, rows: flat(),
+                footnote: 'Cash basis. A management report, not a statutory financial statement. Owner\'s draws are a memo below net profit and are not part of it.',
+              })}>
+              <Printer size={12} className="inline -mt-0.5 mr-1" />Print</button>
+          </div>
+        )}
+      </div>
+      <div className="mb-3" style={{ fontSize: 11, color: C.textMute }}>
+        Basis: cash · {from} → {to}. A management report, not a statutory financial statement. There is no accrual mode and
+        no receivable account in the chart. Owner's draws appear only as a memo below net profit.
+      </div>
+
+      <div className="grid gap-2 sm:grid-cols-6 items-end mb-2">
+        <label className="block"><span style={FINANCE_LABEL_STYLE}>Group by</span>
+          <select value={group} onChange={(e) => setGroup(e.target.value)} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+            <option value="month">Month</option><option value="quarter">Quarter</option>
+            <option value="week">Week</option><option value="total">Whole range</option>
+          </select></label>
+        <label className="block sm:col-span-2"><span style={FINANCE_LABEL_STYLE}>Account</span>
+          <select value={filters.accountId} onChange={(e) => setFilters((f) => ({ ...f, accountId: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+            <option value="">All accounts</option>
+            {accounts.map((a) => <option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
+          </select></label>
+        <label className="block"><span style={FINANCE_LABEL_STYLE}>Payee</span>
+          <input value={filters.payee} onChange={(e) => setFilters((f) => ({ ...f, payee: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+        <div className="flex gap-1">
+          <label className="block flex-1"><span style={FINANCE_LABEL_STYLE}>Min ₱</span>
+            <input type="number" min="0" step="0.01" value={filters.min} onChange={(e) => setFilters((f) => ({ ...f, min: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+          <label className="block flex-1"><span style={FINANCE_LABEL_STYLE}>Max ₱</span>
+            <input type="number" min="0" step="0.01" value={filters.max} onChange={(e) => setFilters((f) => ({ ...f, max: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+        </div>
+        <button type="button" onClick={() => setApplied({ ...filters })} className="gh-btn-primary px-3 py-2 text-sm">Apply filters</button>
+      </div>
+      <div className="flex flex-wrap gap-4 mb-3" style={{ fontSize: 12.5, color: C.text }}>
+        <label className="flex items-center gap-1.5"><input type="checkbox" checked={hideZero} onChange={(e) => setHideZero(e.target.checked)} />Hide ₱0 accounts</label>
+        <label className="flex items-center gap-1.5"><input type="checkbox" checked={showPct} onChange={(e) => setShowPct(e.target.checked)} />Show % of income</label>
+      </div>
+
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {rows === null ? <FinanceLoading label="Loading the profit & loss…" /> : data.length === 0 ? (
+        <div style={{ fontSize: 13, color: C.textMute }}>Nothing posted in this range{applied.accountId || applied.payee || applied.min || applied.max ? ' with these filters' : ''}.</div>
+      ) : (
+        <table className="w-full text-sm" style={{ color: C.text }}>
+          <thead><tr style={{ color: C.textMute, fontSize: 11.5 }}>
+            <th scope="col" className="py-1 text-left">Account</th>
+            {periods.map((p) => <th key={p} scope="col" className="text-right px-2 whitespace-nowrap">{financePeriodLabel(p, group)}</th>)}
+            {periods.length > 1 && <th scope="col" className="text-right px-2">Total</th>}
+          </tr></thead>
+          <tbody>
+            {FINANCE_PL_SECTIONS.map(([sect, title]) => {
+              const accts = sectionAccounts(sect);
+              if (!accts.length) return null;
+              return (
+                <React.Fragment key={sect}>
+                  <tr><td colSpan={periods.length + 2} className="pt-3 pb-1" style={FINANCE_LABEL_STYLE}>{title}</td></tr>
+                  {accts.map((a) => (
+                    <tr key={a.account_id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                      <td className="py-1.5">
+                        <button type="button" onClick={() => setDrill(a)} className="text-left hover:underline" style={{ color: C.text }}>
+                          {a.code} · {a.name}</button>
+                      </td>
+                      {periods.map((p) => <React.Fragment key={p}>{cell(a.cells[p] || 0, p)}</React.Fragment>)}
+                      {periods.length > 1 && cell(a.total, null)}
+                    </tr>
+                  ))}
+                  <tr style={{ borderTop: `1px solid ${GLASS.border}`, fontWeight: 700 }}>
+                    <td className="py-1.5">Total {title.toLowerCase()}</td>
+                    {periods.map((p) => <React.Fragment key={p}>{cell(sectionSum(sect, p), p)}</React.Fragment>)}
+                    {periods.length > 1 && cell(sectionSum(sect), null)}
+                  </tr>
+                </React.Fragment>
+              );
+            })}
+            <tr style={{ borderTop: `2px solid ${GLASS.border}`, fontWeight: 800 }}>
+              <td className="py-2">Net profit</td>
+              {periods.map((p) => (
+                <td key={p} className="text-right px-2 whitespace-nowrap" style={{ color: (netByPeriod[p] || 0) >= 0 ? C.green : C.red }}>{financeMoney(netByPeriod[p])}</td>
+              ))}
+              {periods.length > 1 && <td className="text-right px-2" style={{ color: netTotal >= 0 ? C.green : C.red }}>{financeMoney(netTotal)}</td>}
+            </tr>
+            {sectionAccounts('memo_owner_draw').length > 0 && (
+              <>
+                <tr><td colSpan={periods.length + 2} className="pt-4 pb-1" style={FINANCE_LABEL_STYLE}>Memo — not part of profit</td></tr>
+                {sectionAccounts('memo_owner_draw').map((a) => (
+                  <tr key={a.account_id} style={{ borderTop: `1px solid ${GLASS.border}`, color: C.textSoft }}>
+                    <td className="py-1.5">
+                      <button type="button" onClick={() => setDrill(a)} className="text-left hover:underline" style={{ color: C.textSoft }}>
+                        {a.code} · {a.name} (owner's draw)</button>
+                    </td>
+                    {periods.map((p) => <td key={p} className="text-right px-2 whitespace-nowrap">{financeMoney(a.cells[p] || 0)}</td>)}
+                    {periods.length > 1 && <td className="text-right px-2">{financeMoney(a.total)}</td>}
+                  </tr>
+                ))}
+              </>
+            )}
+          </tbody>
+        </table>
+      )}
+
+      {drill && (
+        <SidePanel title={`${drill.code} · ${drill.name}`}
+          subtitle={`${from} → ${to}${applied.payee || applied.min || applied.max ? ' · every payee and amount (the table above is filtered)' : ''}`}
+          icon={FileSpreadsheet}
+          maxW="sm:max-w-lg" onClose={() => setDrill(null)}>
+          {detail === null ? <FinanceLoading /> : detail.error ? (
+            <AdminNotice kind="danger">{detail.error}</AdminNotice>
+          ) : (
+            <div className="space-y-4" style={{ color: C.text }}>
+              <div className="rounded-xl px-3 py-2" style={{ background: 'var(--wash)' }}>
+                <div style={{ fontSize: 11, color: C.textMute }}>Total in range · {detail.entry_count} entr{Number(detail.entry_count) === 1 ? 'y' : 'ies'}</div>
+                <div style={{ fontFamily: fontDisplay, fontWeight: 800, fontSize: 20 }}>{financeMoney(detail.total)}</div>
+              </div>
+              <div>
+                <div style={FINANCE_LABEL_STYLE} className="mb-1">By payee</div>
+                <table className="w-full text-sm"><tbody>
+                  {(detail.by_payee || []).map((p, i) => (
+                    <tr key={i} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                      <td className="py-1">{p.payee || <span style={{ color: C.textMute }}>(no payee)</span>}</td>
+                      <td style={{ fontSize: 12, color: C.textMute }}>{p.entries} entr{Number(p.entries) === 1 ? 'y' : 'ies'}</td>
+                      <td className="text-right font-semibold">{financeMoney(p.amount)}</td>
+                    </tr>
+                  ))}
+                </tbody></table>
+              </div>
+              <div>
+                <div style={FINANCE_LABEL_STYLE} className="mb-1">Entries</div>
+                <table className="w-full text-sm"><tbody>
+                  {(detail.entries || []).map((e) => (
+                    <tr key={e.entry_id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                      <td className="py-1" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>#{e.entry_no} · {e.entry_date}</td>
+                      <td style={{ fontSize: 12.5 }}>{e.payee ? <strong>{e.payee} </strong> : null}{e.memo}</td>
+                      <td className="text-right">{financeMoney(e.amount)}</td>
+                    </tr>
+                  ))}
+                </tbody></table>
+              </div>
+            </div>
+          )}
+        </SidePanel>
+      )}
+    </div>
+  );
+}
+
+// Expense presets: named quick-picks for Record an expense. Payee + account, never an amount.
+function FinancePresetsCard({ call }) {
+  const [rows, setRows] = useState(null);
+  const [accounts, setAccounts] = useState([]);
+  const [form, setForm] = useState(null);
+  const [deleting, setDeleting] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [formErr, setFormErr] = useState('');
+
+  const load = useCallback(async () => {
+    try {
+      const [p, a] = await Promise.all([
+        call('finance_expense_presets_list', { p_include_inactive: true }),
+        call('finance_accounts_list'),
+      ]);
+      setRows(p || []);
+      setAccounts((a || []).filter((x) => x.account_type === 'expense' || x.subtype === 'owner_draw'));
+    } catch (e) {
+      setErr(appErrorMessage(e, 'Could not load the expense presets.')); setRows((r) => r || []);
+    }
+  }, [call]);
+  useEffect(() => { load(); }, [load]);
+
+  const save = async () => {
+    setBusy(true); setFormErr('');
+    try {
+      await call('finance_save_expense_preset', {
+        p_id: form.id || null, p_label: form.label.trim(), p_payee: form.payee?.trim() || null,
+        p_account_id: form.account_id, p_memo: form.memo?.trim() || null,
+        p_sort_order: Number(form.sort_order) || 0, p_active: form.active !== false,
+      });
+      setForm(null); await load();
+    } catch (e) {
+      setFormErr(appErrorMessage(e, 'That preset was not saved.'));
+    } finally { setBusy(false); }
+  };
+  const remove = async () => {
+    setBusy(true); setFormErr('');
+    try { await call('finance_delete_expense_preset', { p_id: deleting.id }); setDeleting(null); await load(); }
+    catch (e) { setFormErr(appErrorMessage(e, 'That preset was not deleted.')); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+      <div className="flex items-center gap-2 mb-1">
+        <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Expense presets</div>
+        <button type="button" className="gh-btn-ghost ml-auto px-3 py-1.5 text-xs"
+          onClick={() => { setFormErr(''); setForm({ label: '', payee: '', account_id: '', memo: '', sort_order: 0, active: true }); }}>
+          <Plus size={12} className="inline -mt-0.5 mr-1" />New preset</button>
+      </div>
+      <div className="mb-2" style={{ fontSize: 11.5, color: C.textMute }}>
+        One-click choices in Record an expense. A preset fills in the payee and account — never an amount, so it can
+        never post anything by itself.
+      </div>
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {rows === null ? <FinanceLoading /> : rows.length === 0 ? (
+        <div style={{ fontSize: 13, color: C.textMute }}>No presets yet.</div>
+      ) : (
+        <table className="w-full text-sm" style={{ color: C.text }}>
+          <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+            <th scope="col" className="py-1">Name</th><th scope="col">Payee</th><th scope="col">Account</th>
+            <th scope="col">Status</th><th scope="col"><span className="sr-only">Actions</span></th>
+          </tr></thead>
+          <tbody>
+            {rows.map((p) => (
+              <tr key={p.id} style={{ borderTop: `1px solid ${GLASS.border}`, opacity: p.active ? 1 : 0.6 }}>
+                <td className="py-1.5">{p.label}</td>
+                <td style={{ fontSize: 12.5 }}>{p.payee || '—'}</td>
+                <td style={{ fontSize: 12.5 }}>{p.account_code} · {p.account_name}</td>
+                <td><span className="gh-pill" style={{ fontSize: 11 }}>{p.active ? 'active' : 'off'}</span></td>
+                <td className="text-right whitespace-nowrap">
+                  <button type="button" className="gh-btn-ghost px-2 py-1 text-xs"
+                    onClick={() => { setFormErr(''); setForm({ ...p, payee: p.payee || '', memo: p.memo || '' }); }}>Edit</button>
+                  <button type="button" className="gh-btn-ghost px-2 py-1 text-xs ml-1"
+                    onClick={() => { setFormErr(''); setDeleting(p); }}>Delete</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {form && (
+        <AccountModal title={form.id ? 'Edit preset' : 'New expense preset'} icon={Pencil} canClose={!busy} onClose={() => setForm(null)}>
+          {formErr && <AdminNotice kind="danger" onDismiss={() => setFormErr('')}>{formErr}</AdminNotice>}
+          <div className="grid gap-3">
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Name</span>
+              <input value={form.label} onChange={(e) => setForm((f) => ({ ...f, label: e.target.value }))}
+                className="gh-input w-full mt-1" style={{ fontSize: 13 }} placeholder="e.g. Zoom subscription" /></label>
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Payee (optional)</span>
+              <input value={form.payee} onChange={(e) => setForm((f) => ({ ...f, payee: e.target.value }))}
+                className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Account</span>
+              <select value={form.account_id} onChange={(e) => setForm((f) => ({ ...f, account_id: e.target.value }))}
+                className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+                <option value="">— choose —</option>
+                {accounts.filter((a) => a.active || a.id === form.account_id).map((a) => <option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
+              </select></label>
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Memo (optional)</span>
+              <input value={form.memo} onChange={(e) => setForm((f) => ({ ...f, memo: e.target.value }))}
+                className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+            <label className="flex items-center gap-2" style={{ fontSize: 13, color: C.text }}>
+              <input type="checkbox" checked={form.active !== false} onChange={(e) => setForm((f) => ({ ...f, active: e.target.checked }))} />
+              Offer this preset
+            </label>
+          </div>
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button type="button" onClick={() => setForm(null)} disabled={busy} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+            <button type="button" disabled={busy || !form.label.trim() || !form.account_id} onClick={save}
+              className="gh-btn-primary px-4 py-2 text-sm disabled:opacity-60">{busy ? 'Saving…' : 'Save preset'}</button>
+          </div>
+        </AccountModal>
+      )}
+      {deleting && (
+        <AccountModal title={`Delete “${deleting.label}”?`} icon={Trash2} tone="danger" canClose={!busy} onClose={() => setDeleting(null)}>
+          {formErr && <AdminNotice kind="danger" onDismiss={() => setFormErr('')}>{formErr}</AdminNotice>}
+          <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+            Only the quick-pick is removed. Nothing already recorded changes, and the audit trail keeps its name.
+          </p>
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button type="button" onClick={() => setDeleting(null)} disabled={busy} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+            <button type="button" disabled={busy} onClick={remove} style={ADMIN_BTN_DANGER}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-60">{busy ? 'Deleting…' : 'Delete preset'}</button>
+          </div>
+        </AccountModal>
+      )}
+    </div>
+  );
+}
+
 // ── Financial Management: Setup ───────────────────────────────────────────────
 // Everything a Super Admin needs to take the books live and keep approvals posting.
 // ★ This panel is the in-app recovery for FINANCE_ACCOUNTS_NOT_CONFIGURED. Without it a
@@ -11761,6 +12672,8 @@ function FinanceSetupPanel({ call, onChanged }) {
 
       <FinanceAccountsCard accounts={accounts || []} saving={saving} run={run} />
 
+      <FinancePresetsCard call={call} />
+
       {state.ledger_empty && !state.opening_balance_posted && (
         <FinanceOpeningBalanceCard accounts={accounts || []} today={state.today} run={run} saving={saving} />
       )}
@@ -11999,6 +12912,8 @@ function FinanceRecordEntryModal({ call, kind, onClose, onPosted }) {
   const [categoryId, setCategoryId] = useState('');
   const [moneyId, setMoneyId] = useState('');
   const [memo, setMemo] = useState('');
+  const [payee, setPayee] = useState('');
+  const [presets, setPresets] = useState([]);
   const [personal, setPersonal] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
@@ -12010,8 +12925,21 @@ function FinanceRecordEntryModal({ call, kind, onClose, onPosted }) {
     let live = true;
     call('finance_accounts_list').then((rows) => { if (live) setAccounts(rows || []); })
       .catch((e) => { if (live) setErr(appErrorMessage(e, 'Could not load the accounts.')); });
+    // Presets are a convenience: a failure to load them must not block recording.
+    if (!isIncome) {
+      call('finance_expense_presets_list').then((rows) => { if (live) setPresets(rows || []); }).catch(() => {});
+    }
     return () => { live = false; };
-  }, [call]);
+  }, [call, isIncome]);
+
+  const applyPreset = (p) => {
+    const draw = p.account_id && (accounts || []).some((a) => a.id === p.account_id && a.subtype === 'owner_draw');
+    setPersonal(!!draw);
+    setCategoryId(p.account_id);
+    setPayee(p.payee || '');
+    // Always replace: switching presets must not carry the previous preset's memo into this one.
+    setMemo(p.memo || '');
+  };
 
   const list = accounts || [];
   const categories = isIncome
@@ -12032,6 +12960,7 @@ function FinanceRecordEntryModal({ call, kind, onClose, onPosted }) {
         p_entry_date: date,
         p_entry_kind: isIncome ? 'collection' : (personal ? 'owner_draw' : 'expense'),
         p_memo: memo.trim() || null, p_lines: lines, p_idempotency_key: idemKey,
+        p_payee: payee.trim() || null,
       });
       onPosted?.();
       onClose();
@@ -12049,6 +12978,21 @@ function FinanceRecordEntryModal({ call, kind, onClose, onPosted }) {
       {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
       {!accounts ? <FinanceLoading label="Loading accounts…" /> : (
         <div className="grid gap-3">
+          {!isIncome && presets.length > 0 && (
+            <div>
+              <div style={FINANCE_LABEL_STYLE} className="mb-1">Quick pick</div>
+              <div className="flex flex-wrap gap-1" role="group" aria-label="Expense presets">
+                {presets.map((p) => (
+                  <button key={p.id} type="button" onClick={() => applyPreset(p)}
+                    aria-pressed={categoryId === p.account_id && (payee || '') === (p.payee || '')}
+                    className="px-2 py-1 rounded-md text-xs font-semibold"
+                    style={categoryId === p.account_id && (payee || '') === (p.payee || '')
+                      ? { background: C.primarySolid, color: 'white' }
+                      : { background: 'var(--wash)', color: C.textSoft }}>{p.label}</button>
+                ))}
+              </div>
+            </div>
+          )}
           <div className="grid gap-3 grid-cols-2">
             <label className="block"><span style={FINANCE_LABEL_STYLE}>Date</span>
               <input type="date" value={date} max={todayISODate()} onChange={(e) => setDate(e.target.value)}
@@ -12073,6 +13017,9 @@ function FinanceRecordEntryModal({ call, kind, onClose, onPosted }) {
               <option value="">— choose —</option>
               {moneyAccounts.map((a) => <option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
             </select></label>
+          <label className="block"><span style={FINANCE_LABEL_STYLE}>{isIncome ? 'Received from (optional)' : 'Paid to (optional)'}</span>
+            <input value={payee} onChange={(e) => setPayee(e.target.value)} placeholder={isIncome ? 'e.g. Partner company' : 'e.g. Zoom'}
+              className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
           <label className="block"><span style={FINANCE_LABEL_STYLE}>Memo</span>
             <input value={memo} onChange={(e) => setMemo(e.target.value)} placeholder={isIncome ? 'e.g. Collaboration fee' : 'e.g. Zoom subscription'}
               className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
@@ -12144,6 +13091,84 @@ function FinanceReverseModal({ call, entry, onClose, onDone }) {
     </AccountModal>
   );
 }
+
+// Reclassify: move an amount from one P&L account to another with a linked adjustment.
+// History is never edited. The account lists offer ONLY the pairs the server accepts:
+// income -> income, expense -> expense, expense -> owner's draw.
+function FinanceReclassifyModal({ call, entry, accounts, onClose, onDone }) {
+  const fromOptions = [];
+  (entry.lines || []).forEach((l) => {
+    if (['income', 'expense'].includes(l.account_type) && !fromOptions.some((o) => o.id === l.account_id)) {
+      fromOptions.push({ id: l.account_id, code: l.account_code, name: l.account_name, type: l.account_type });
+    }
+  });
+  const [fromId, setFromId] = useState(fromOptions[0]?.id || '');
+  const [toId, setToId] = useState('');
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  // ★ Minted when the dialog opens, so a retry of THIS click can never move the amount twice.
+  const [idemKey] = useState(() => crypto.randomUUID());
+  const from = fromOptions.find((o) => o.id === fromId);
+  const toOptions = (accounts || []).filter((a) => a.active && a.id !== fromId && from && (
+    a.account_type === from.type || (from.type === 'expense' && a.subtype === 'owner_draw')));
+
+  const submit = async () => {
+    setBusy(true); setErr('');
+    try {
+      const out = await call('finance_reclassify_entry', {
+        p_entry_id: entry.entry_id, p_from_account_id: fromId, p_to_account_id: toId,
+        p_reason: reason.trim(), p_idempotency_key: idemKey,
+      });
+      const original = String(entry.entry_date || '').slice(0, 7);
+      onDone?.(out?.period && out.period !== original
+        ? `Entry #${entry.entry_no} is reclassified. ${original} is closed, so the adjustment is recorded in ${out.period}.`
+        : `Entry #${entry.entry_no} is reclassified.`);
+      onClose();
+    } catch (e) {
+      console.error('[finance] reclassify failed', { code: e?.code, message: e?.message });
+      setErr(appErrorMessage(e, 'The entry was not reclassified.'));
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <AccountModal title={`Reclassify entry #${entry.entry_no}`} subtitle={`${entry.entry_date} · ${financeMoney(entry.total_amount)}`}
+      icon={Pencil} canClose={!busy} onClose={onClose}>
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+        A linked adjustment moves the amount to the right account; the original entry stays exactly as it was.
+        Moving a cost to owner's draw takes it out of the profit &amp; loss.
+      </p>
+      {fromOptions.length === 0 ? (
+        <div className="mt-3" style={{ fontSize: 13, color: C.textMute }}>This entry has no income or expense line to reclassify.</div>
+      ) : (
+        <div className="grid gap-3 mt-3">
+          <label className="block"><span style={FINANCE_LABEL_STYLE}>Move from</span>
+            <select value={fromId} onChange={(e) => { setFromId(e.target.value); setToId(''); }} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+              {fromOptions.map((o) => <option key={o.id} value={o.id}>{o.code} · {o.name}</option>)}
+            </select></label>
+          <label className="block"><span style={FINANCE_LABEL_STYLE}>To</span>
+            <select value={toId} onChange={(e) => setToId(e.target.value)} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+              <option value="">— choose —</option>
+              {toOptions.map((a) => <option key={a.id} value={a.id}>{a.code} · {a.name}{a.subtype === 'owner_draw' ? " (owner's draw)" : ''}</option>)}
+            </select></label>
+          <label className="block"><span style={FINANCE_LABEL_STYLE}>Reason (required)</span>
+            <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={2}
+              className="w-full mt-1 px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
+              style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} /></label>
+        </div>
+      )}
+      <div className="mt-5 flex items-center justify-end gap-2.5">
+        <button type="button" onClick={onClose} disabled={busy} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+        <button type="button" disabled={busy || !fromId || !toId || !reason.trim()} onClick={submit}
+          className="gh-btn-primary px-4 py-2 text-sm disabled:opacity-60">{busy ? 'Reclassifying…' : 'Reclassify'}</button>
+      </div>
+    </AccountModal>
+  );
+}
+
+const FINANCE_ENTRY_KINDS = ['collection', 'expense', 'owner_draw', 'owner_contribution', 'transfer',
+  'refund', 'opening_balance', 'adjustment', 'reversal'];
 
 // Recurring costs as PROPOSALS. A template never posts by itself: "Due" is shown to a
 // human, who confirms each occurrence. The legacy app posted seven months of the future.
@@ -12339,7 +13364,318 @@ function FinanceRecurringPanel({ call, onChanged }) {
 //   March in one bank's export and April in another's; the legacy importer kept raw
 //   strings and never resolved it. A row whose date does not fit the declared format
 //   is reported, never guessed.
-function FinanceBankImportCard({ call, onChanged }) {
+// ── The bank feed (#59): each committed statement line is MATCHED to an entry that already
+//    exists, ADDED as a new entry, or UNDONE. ★ Match comes first on purpose: a student's
+//    deposit was already recorded when the enrollment was approved, and adding it again
+//    would count the same money twice.
+function FinanceBankFeed({ call, onChanged, version }) {
+  const [kind, setKind] = useState('cash');
+  const [tiles, setTiles] = useState(null);
+  const [accounts, setAccounts] = useState([]);
+  const [accountId, setAccountId] = useState('');
+  const [review, setReview] = useState(null);
+  const [cleared, setCleared] = useState(null);
+  const [addFor, setAddFor] = useState(null);
+  const [addForm, setAddForm] = useState({ accountId: '', payee: '', memo: '' });
+  const [matchFor, setMatchFor] = useState(null);
+  const [candidates, setCandidates] = useState(null);
+  const [undoFor, setUndoFor] = useState(null);
+  const [undoReason, setUndoReason] = useState('');
+  const [busy, setBusy] = useState('');
+  const [err, setErr] = useState('');
+  const [dialogErr, setDialogErr] = useState('');
+  const [notice, setNotice] = useState('');
+
+  const loadTiles = useCallback(async () => {
+    try {
+      const [t, a] = await Promise.all([call('finance_bank_account_tiles'), call('finance_accounts_list')]);
+      setTiles(t || []); setAccounts(a || []);
+    } catch (e) {
+      setErr(appErrorMessage(e, 'Could not load the bank accounts.')); setTiles((x) => x || []);
+    }
+  }, [call]);
+  const loadRows = useCallback(async (id) => {
+    if (!id) { setReview(null); setCleared(null); return; }
+    try {
+      // Committed lines only, filtered on the SERVER before the limit — filtered here, a large
+      // staged file pushed every committed line off the page.
+      const [u, m] = await Promise.all([
+        call('finance_bank_transactions_list', { p_account_id: id, p_status: 'unmatched', p_limit: 500, p_committed_only: true }),
+        call('finance_bank_transactions_list', { p_account_id: id, p_status: 'matched', p_limit: 500, p_committed_only: true }),
+      ]);
+      setReview(u || []);
+      setCleared((m || []).filter((t) => t.matched_entry_id));
+    } catch (e) {
+      setErr(appErrorMessage(e, 'Could not load the statement lines.')); setReview([]); setCleared([]);
+    }
+  }, [call]);
+  // `version` moves whenever another bank card changes something, so all three stay in step.
+  useEffect(() => { loadTiles(); }, [loadTiles, version]);
+  useEffect(() => { loadRows(accountId); }, [accountId, loadRows, version]);
+  const shown = (tiles || []).filter((t) => t.cash_flow_class === kind);
+
+  // ★ MATCH BEFORE ADD, for every kind of line: when Add opens, look for an entry that already
+  //   records this money (an approval, a recorded expense, a posted recurring cost).
+  const [addCandidates, setAddCandidates] = useState(null);
+  useEffect(() => {
+    if (!addFor) { setAddCandidates(null); return undefined; }
+    let live = true; setAddCandidates(null);
+    call('finance_bank_match_candidates', { p_txn_id: addFor.id })
+      .then((c) => { if (live) setAddCandidates(c || []); })
+      .catch(() => { if (live) setAddCandidates([]); });
+    return () => { live = false; };
+  }, [call, addFor]);
+  useEffect(() => {
+    if (tiles && !shown.some((t) => t.account_id === accountId)) setAccountId(shown[0]?.account_id || '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tiles, kind]);
+
+  useEffect(() => {
+    if (!matchFor) { setCandidates(null); return undefined; }
+    let live = true; setCandidates(null);
+    call('finance_bank_match_candidates', { p_txn_id: matchFor.id })
+      .then((c) => { if (live) setCandidates(c || []); })
+      .catch((e) => { if (live) { setDialogErr(appErrorMessage(e, 'Could not find matching entries.')); setCandidates([]); } });
+    return () => { live = false; };
+  }, [call, matchFor]);
+
+  const act = async (key, fn, args, done, inDialog) => {
+    setBusy(key); setErr(''); setDialogErr(''); setNotice('');
+    try {
+      const out = await call(fn, args);
+      setNotice(typeof done === 'function' ? done(out) : done);
+      await Promise.all([loadTiles(), loadRows(accountId)]);
+      onChanged?.();
+      return out ?? true;
+    } catch (e) {
+      console.error('[finance] bank feed write failed', { fn, code: e?.code, message: e?.message });
+      (inDialog ? setDialogErr : setErr)(appErrorMessage(e, 'That change was not saved.'));
+      return null;
+    } finally { setBusy(''); }
+  };
+
+  const tile = (shown || []).find((t) => t.account_id === accountId);
+  const own = accounts.find((a) => a.id === accountId);
+  const categoryChoices = accounts.filter((a) => a.active && a.id !== accountId);
+  const chosen = accounts.find((a) => a.id === addForm.accountId);
+  const posting = addFor && chosen && own
+    ? (Number(addFor.amount) > 0 ? `Dr ${own.code} ${own.name} / Cr ${chosen.code} ${chosen.name}` : `Dr ${chosen.code} ${chosen.name} / Cr ${own.code} ${own.name}`)
+    : '';
+
+  return (
+    <div className="space-y-4">
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
+
+      <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+        <div className="flex flex-wrap items-center gap-2 mb-3">
+          <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Bank feed</div>
+          <div className="flex gap-1 ml-2" role="tablist" aria-label="Account type">
+            {[['cash', 'Bank accounts'], ['card', 'Credit cards']].map(([k, l]) => (
+              <button key={k} type="button" role="tab" aria-selected={kind === k} onClick={() => setKind(k)}
+                className="px-2 py-1 rounded-md text-xs font-semibold"
+                style={kind === k ? { background: C.primarySolid, color: 'white' } : { background: 'var(--wash)', color: C.textSoft }}>{l}</button>
+            ))}
+          </div>
+        </div>
+        {tiles === null ? <FinanceLoading /> : shown.length === 0 ? (
+          <div style={{ fontSize: 13, color: C.textMute }}>No active {kind === 'card' ? 'credit card' : 'bank'} accounts.</div>
+        ) : (
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {shown.map((t) => (
+              <button key={t.account_id} type="button" onClick={() => setAccountId(t.account_id)} aria-pressed={accountId === t.account_id}
+                className="text-left rounded-xl px-3 py-2 transition"
+                style={{ background: 'var(--wash)', border: `2px solid ${accountId === t.account_id ? C.primary : 'transparent'}` }}>
+                <div style={{ fontSize: 12, color: C.textMute }}>{t.code} · {t.name}</div>
+                <div style={{ fontFamily: fontDisplay, fontWeight: 800, color: C.text }}>
+                  {/* ★ A card's balance is OWED. It arrives negative, as cash_position reports it. */}
+                  {t.cash_flow_class === 'card' ? `Owed ${financeMoney(-Number(t.balance))}` : financeMoney(t.balance)}
+                </div>
+                <div style={{ fontSize: 11.5, color: Number(t.to_review) > 0 ? C.amber : C.textMute }}>
+                  {t.to_review} to review{Number(t.possible_duplicates) > 0 ? ` · ${t.possible_duplicates} possible duplicate(s)` : ''}
+                  {t.last_import_at ? ` · last import ${String(t.last_import_at).slice(0, 10)}` : ' · no imports yet'}
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {tile && (
+        <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
+          <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>For review · {tile.code} {tile.name}</div>
+          <div className="mb-2" style={{ fontSize: 11.5, color: C.textMute }}>
+            Match a line to an entry that already exists — a student's approved payment is already recorded. Add only
+            money the books do not have yet. {kind === 'card' ? 'On a card, a charge is negative and a payment positive.' : ''}
+          </div>
+          {review === null ? <FinanceLoading /> : review.length === 0 ? (
+            <div style={{ fontSize: 13, color: C.textMute }}>Nothing to review. Import and commit a statement to fill the feed.</div>
+          ) : (
+            <table className="w-full text-sm" style={{ color: C.text }}>
+              <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
+                <th scope="col" className="py-1">Date</th><th scope="col">Description</th>
+                <th scope="col" className="text-right">Amount</th><th scope="col"><span className="sr-only">Actions</span></th>
+              </tr></thead>
+              <tbody>
+                {review.map((t) => (
+                  <tr key={t.id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                    <td className="py-1.5" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>{t.posted_on}</td>
+                    <td style={{ maxWidth: 300, fontSize: 12.5 }}>{t.description_raw}
+                      {t.duplicate_kind === 'likely' && <span className="gh-pill ml-1" style={{ fontSize: 10, color: C.amber }}>possible duplicate</span>}</td>
+                    <td className="text-right" style={{ fontWeight: 600, color: Number(t.amount) < 0 ? C.red : C.green }}>{financeMoney(t.amount)}</td>
+                    <td className="text-right whitespace-nowrap">
+                      <button type="button" disabled={!!busy} className="gh-btn-primary px-2 py-1 text-xs"
+                        onClick={() => { setDialogErr(''); setMatchFor(t); }}>Match</button>
+                      <button type="button" disabled={!!busy} className="gh-btn-ghost px-2 py-1 text-xs ml-1"
+                        onClick={() => { setDialogErr(''); setAddForm({ accountId: '', payee: '', memo: '' }); setAddFor(t); }}>Add</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          <div style={{ fontWeight: 600, fontSize: 13, color: C.text }} className="mt-4 mb-1">Cleared in the feed</div>
+          {cleared === null ? <FinanceLoading /> : cleared.length === 0 ? (
+            <div style={{ fontSize: 12.5, color: C.textMute }}>Nothing added or matched yet.</div>
+          ) : (
+            <table className="w-full text-sm" style={{ color: C.text }}>
+              <tbody>
+                {cleared.map((t) => (
+                  <tr key={t.id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                    <td className="py-1.5" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>{t.posted_on}</td>
+                    <td style={{ maxWidth: 260, fontSize: 12.5 }}>{t.description_raw}</td>
+                    <td className="text-right" style={{ fontWeight: 600 }}>{financeMoney(t.amount)}</td>
+                    <td style={{ fontSize: 12, color: C.textMute }}>
+                      <span className="gh-pill" style={{ fontSize: 10.5 }}>{t.matched_via === 'add' ? 'added' : 'matched'}</span>
+                      {t.matched_entry_no ? ` #${t.matched_entry_no}` : ''}
+                    </td>
+                    <td className="text-right">
+                      <button type="button" disabled={!!busy} className="gh-btn-ghost px-2 py-1 text-xs"
+                        onClick={() => { setDialogErr(''); setUndoReason(''); setUndoFor(t); }}>Undo</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {matchFor && (
+        <SidePanel title="Match to an existing entry" subtitle={`${matchFor.posted_on} · ${financeMoney(matchFor.amount)}`} icon={Link2}
+          maxW="sm:max-w-lg" canClose={!busy} onClose={() => setMatchFor(null)}>
+          {dialogErr && <AdminNotice kind="danger" onDismiss={() => setDialogErr('')}>{dialogErr}</AdminNotice>}
+          <div className="mb-3" style={{ fontSize: 12.5, color: C.textSoft }}>{matchFor.description_raw}</div>
+          {candidates === null ? <FinanceLoading label="Looking for entries of the same amount…" /> : candidates.length === 0 ? (
+            <div style={{ fontSize: 13, color: C.textMute }}>
+              No entry moves this account by exactly {financeMoney(matchFor.amount)} within two weeks of this date. If this is money the books do
+              not have yet, close this and use Add.
+            </div>
+          ) : (
+            <table className="w-full text-sm" style={{ color: C.text }}>
+              <tbody>
+                {candidates.map((c) => (
+                  <tr key={c.entry_id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                    <td className="py-1.5" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>#{c.entry_no} · {c.entry_date}
+                      <div style={{ fontSize: 11, color: C.textMute }}>{c.day_gap === 0 ? 'same day' : `${c.day_gap} day(s) apart`}</div></td>
+                    <td style={{ fontSize: 12.5 }}>{c.payee ? <strong>{c.payee} </strong> : null}{c.memo}
+                      <div style={{ fontSize: 11, color: C.textMute }}>{String(c.entry_kind).replace(/_/g, ' ')} · {c.source}</div></td>
+                    <td className="text-right">
+                      <button type="button" disabled={!!busy} className="gh-btn-primary px-2 py-1 text-xs"
+                        onClick={async () => {
+                          if (await act('match', 'finance_match_bank_transaction', { p_txn_id: matchFor.id, p_entry_id: c.entry_id },
+                            `Matched to entry #${c.entry_no}. Nothing new was posted.`, true)) setMatchFor(null);
+                        }}>Match</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </SidePanel>
+      )}
+
+      {addFor && (
+        <AccountModal title="Add to the books" subtitle={`${addFor.posted_on} · ${financeMoney(addFor.amount)}`} icon={Plus}
+          canClose={!busy} onClose={() => setAddFor(null)}>
+          {dialogErr && <AdminNotice kind="danger" onDismiss={() => setDialogErr('')}>{dialogErr}</AdminNotice>}
+          <div className="mb-3" style={{ fontSize: 12.5, color: C.textSoft }}>{addFor.description_raw}</div>
+          {addCandidates && addCandidates.length > 0 && (
+            <AdminNotice kind="warn">
+              {addCandidates.length === 1
+                ? `Entry #${addCandidates[0].entry_no} (${addCandidates[0].entry_date}) already records this amount on this account.`
+                : `${addCandidates.length} existing entries already record this amount on this account.`}
+              {' '}Adding the line would count it twice.
+              <button type="button" className="gh-btn-primary px-2 py-1 text-xs ml-2"
+                onClick={() => { const t = addFor; setAddFor(null); setDialogErr(''); setMatchFor(t); }}>Match instead</button>
+            </AdminNotice>
+          )}
+          <div className="grid gap-3">
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Account</span>
+              <select value={addForm.accountId} onChange={(e) => setAddForm((f) => ({ ...f, accountId: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+                <option value="">— choose —</option>
+                {['income', 'expense', 'equity', 'asset', 'liability'].map((type) => {
+                  const opts = categoryChoices.filter((a) => a.account_type === type);
+                  return opts.length ? (
+                    <optgroup key={type} label={type === 'asset' || type === 'liability' ? `${type} (a transfer)` : type}>
+                      {opts.map((a) => <option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
+                    </optgroup>
+                  ) : null;
+                })}
+              </select></label>
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>{Number(addFor.amount) > 0 ? 'Received from' : 'Paid to'} (optional)</span>
+              <input value={addForm.payee} onChange={(e) => setAddForm((f) => ({ ...f, payee: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Memo (defaults to the statement description)</span>
+              <input value={addForm.memo} onChange={(e) => setAddForm((f) => ({ ...f, memo: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+            {posting && <div style={{ fontSize: 12, color: C.textMute, fontFamily: fontMono }}>Posts: {posting} · {financeMoney(Math.abs(Number(addFor.amount)))}</div>}
+            {chosen?.account_type === 'income' && Number(addFor.amount) > 0 && (
+              <AdminNotice kind="warn">If this is a student's payment, it was recorded when their enrollment was approved. Use Match instead, or it will be counted twice.</AdminNotice>
+            )}
+          </div>
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button type="button" onClick={() => setAddFor(null)} disabled={!!busy} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+            <button type="button" disabled={!!busy || !addForm.accountId} className="gh-btn-primary px-4 py-2 text-sm disabled:opacity-60"
+              onClick={async () => {
+                if (await act('add', 'finance_categorize_bank_transaction', {
+                  p_txn_id: addFor.id, p_account_id: addForm.accountId,
+                  p_payee: addForm.payee.trim() || null, p_memo: addForm.memo.trim() || null,
+                }, 'Added to the books.', true)) setAddFor(null);
+              }}>{busy === 'add' ? 'Adding…' : 'Add'}</button>
+          </div>
+        </AccountModal>
+      )}
+
+      {undoFor && (
+        <AccountModal title={undoFor.matched_via === 'add' ? 'Undo this addition?' : 'Undo this match?'}
+          subtitle={`${undoFor.posted_on} · ${financeMoney(undoFor.amount)}`} icon={RotateCcw} tone="danger"
+          canClose={!busy} onClose={() => setUndoFor(null)}>
+          {dialogErr && <AdminNotice kind="danger" onDismiss={() => setDialogErr('')}>{dialogErr}</AdminNotice>}
+          <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+            {undoFor.matched_via === 'add'
+              ? `Entry #${undoFor.matched_entry_no} is reversed — both stay on the record — and the line returns to review.`
+              : `The link to entry #${undoFor.matched_entry_no} is removed. That entry stays exactly as it is; the line returns to review.`}
+          </p>
+          <label className="block mt-4 mb-1.5" style={FINANCE_LABEL_STYLE}>Reason{undoFor.matched_via === 'add' ? ' (required)' : ' (optional)'}</label>
+          <textarea value={undoReason} onChange={(e) => setUndoReason(e.target.value)} rows={2}
+            className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
+            style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button type="button" onClick={() => setUndoFor(null)} disabled={!!busy} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+            <button type="button" disabled={!!busy || (undoFor.matched_via === 'add' && !undoReason.trim())} style={ADMIN_BTN_DANGER}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-60"
+              onClick={async () => {
+                if (await act('undo', 'finance_undo_bank_transaction', { p_txn_id: undoFor.id, p_reason: undoReason.trim() || null },
+                  (o) => (o?.reversed ? `Undone. The entry is reversed${o.reversal_period ? ` in ${o.reversal_period}` : ''}.` : 'Match undone.'), true)) setUndoFor(null);
+              }}>{busy === 'undo' ? 'Undoing…' : 'Undo'}</button>
+          </div>
+        </AccountModal>
+      )}
+    </div>
+  );
+}
+
+function FinanceBankImportCard({ call, onChanged, version }) {
   const [accounts, setAccounts] = useState([]);
   const [imports, setImports] = useState(null);
   const [err, setErr] = useState('');
@@ -12370,8 +13706,8 @@ function FinanceBankImportCard({ call, onChanged }) {
     try { setTxns(await call('finance_bank_transactions_list', { p_import_id: id, p_limit: 500 }) || []); }
     catch (e) { setErr(appErrorMessage(e, 'Could not load the transactions.')); setTxns([]); }
   }, [call]);
-  useEffect(() => { loadImports(); }, [loadImports]);
-  useEffect(() => { if (reviewId) loadTxns(reviewId); }, [reviewId, loadTxns]);
+  useEffect(() => { loadImports(); }, [loadImports, version]);
+  useEffect(() => { if (reviewId) loadTxns(reviewId); }, [reviewId, loadTxns, version]);
 
   const act = async (key, fn, args, done) => {
     setBusyKey(key); setErr(''); setNotice('');
@@ -12400,11 +13736,25 @@ function FinanceBankImportCard({ call, onChanged }) {
         const XLSX = await import('xlsx');
         const wb = XLSX.read(buf, { type: 'array' });
         const arr = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, raw: false, defval: '' });
-        const hdr = (arr[0] || []).map((h) => String(h).trim());
+        // Rows are read by HEADER NAME, so a blank or repeated heading would silently read the
+        // wrong column. Give each a unique, visible name.
+        const seen = {};
+        const hdr = (arr[0] || []).map((h, i) => {
+          const base = String(h ?? '').trim() || `Column ${i + 1}`;
+          seen[base] = (seen[base] || 0) + 1;
+          return seen[base] > 1 ? `${base} (${seen[base]})` : base;
+        });
         table = { headers: hdr, rows: arr.slice(1).filter((r) => r.some((c) => String(c).trim() !== ''))
           .map((r) => Object.fromEntries(hdr.map((h, i) => [h, r[i] != null ? String(r[i]) : '']))) };
       } else {
         table = parseCsv(new TextDecoder('utf-8').decode(buf));
+        // The CSV reader keys rows by heading, so a repeat has ALREADY overwritten a column.
+        // Refuse rather than stage amounts from the wrong one.
+        const bad = table.headers.filter((h, i) => !String(h).trim() || table.headers.indexOf(h) !== i);
+        if (bad.length) {
+          throw new Error('This CSV has a blank or repeated column heading, so its columns cannot be told apart. '
+            + 'Give every column a unique heading and export it again (or upload it as Excel).');
+        }
       }
       if (!table.headers.length) throw new Error('No columns found. Is there a header row?');
       if (table.rows.length > 5000) throw new Error(`That file has ${table.rows.length} rows. Split it into files of 5,000 or fewer.`);
@@ -12461,6 +13811,15 @@ function FinanceBankImportCard({ call, onChanged }) {
               <option value="">— choose —</option>
               {accounts.map((a) => <option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
             </select></label>
+          <label className="block sm:col-span-2"><span style={FINANCE_LABEL_STYLE}>Statement layout</span>
+            <select value={presetKey} onChange={(e) => {
+              const key = e.target.value;
+              setPresetKey(key);
+              // Re-map an already-read file by column position; Custom keeps the current choices.
+              if (parsed && key !== 'Custom') setMap((m) => ({ ...presetColumnMap(key, parsed.headers), balance: m.balance }));
+            }} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+              {BANK_STATEMENT_PRESETS.map((p) => <option key={p.key} value={p.key}>{p.label} — {p.hint}</option>)}
+            </select></label>
           <label className="block sm:col-span-2"><span style={FINANCE_LABEL_STYLE}>Dates in this file look like</span>
             <select value={form.format} onChange={(e) => setForm((f) => ({ ...f, format: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
               <option value="DMY">31/12/2026 — day first</option>
@@ -12488,6 +13847,10 @@ function FinanceBankImportCard({ call, onChanged }) {
                 </select></label>
               {map.mode === 'single' ? colSelect('amount', 'Amount column') : (<>{colSelect('moneyIn', 'Money in column')}{colSelect('moneyOut', 'Money out column')}</>)}
               {colSelect('balance', 'Running balance column', true)}
+              <label className="flex items-center gap-2 sm:col-span-3" style={{ fontSize: 12.5, color: C.text }}>
+                <input type="checkbox" checked={!!map.flipSign} onChange={(e) => setMap((m) => ({ ...m, flipSign: e.target.checked }))} />
+                Flip every sign — for a card statement that shows charges as positive numbers
+              </label>
             </div>
             <div className="mt-3" style={{ fontSize: 12.5, color: preview.bad.length ? C.amber : C.textSoft }}>
               {preview.good.length} row(s) read.
@@ -12631,7 +13994,7 @@ function FinanceBankImportCard({ call, onChanged }) {
 // Reconcile an account against its statement. A reconciliation that does not reconcile
 // cannot close — every open transaction is matched or excluded with a reason first, so
 // a zero difference is always explained rather than merely zero.
-function FinanceReconcileCard({ call, onChanged }) {
+function FinanceReconcileCard({ call, onChanged, version }) {
   const [accounts, setAccounts] = useState([]);
   const [list, setList] = useState(null);
   const [detail, setDetail] = useState(null);
@@ -12656,8 +14019,11 @@ function FinanceReconcileCard({ call, onChanged }) {
     try { setDetail(await call('finance_reconciliation_detail', { p_id: id })); }
     catch (e) { setErr(appErrorMessage(e, 'Could not load that reconciliation.')); }
   }, [call]);
-  useEffect(() => { loadList(); }, [loadList]);
+  useEffect(() => { loadList(); }, [loadList, version]);
   useEffect(() => { setChoice({}); loadDetail(openId); }, [openId, loadDetail]);
+  // Another bank card changed something: refresh the open reconciliation without losing the picks.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { if (version && openId) loadDetail(openId); }, [version]);
 
   const act = async (key, fn, args, done) => {
     setBusyKey(key); setErr(''); setNotice('');
@@ -12690,7 +14056,8 @@ function FinanceReconcileCard({ call, onChanged }) {
       <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
         <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Reconciliations</div>
         <div className="mb-3" style={{ fontSize: 11.5, color: C.textMute }}>
-          One open reconciliation per account. Enter the opening and closing balances exactly as the statement shows them.
+          One open reconciliation per account. Enter the opening and closing balances exactly as the statement shows them —
+          for a credit card, that is the amount owed.
         </div>
         <div className="grid gap-2 sm:grid-cols-6 items-end mb-3">
           <label className="block sm:col-span-2"><span style={FINANCE_LABEL_STYLE}>Account</span>
@@ -12812,6 +14179,26 @@ function FinanceReconcileCard({ call, onChanged }) {
             </table>
           )}
 
+          {(detail.feed_cleared || []).length > 0 && (
+            <>
+              <div style={{ fontWeight: 600, fontSize: 13, color: C.text }} className="mb-1">Cleared in the bank feed ({detail.feed_cleared.length})</div>
+              <div className="mb-1" style={{ fontSize: 11.5, color: C.textMute }}>
+                Counted in Cleared above. They are undone in the bank feed, not here.
+              </div>
+              <table className="w-full text-sm mb-4" style={{ color: C.text }}>
+                <tbody>
+                  {detail.feed_cleared.map((t) => (
+                    <tr key={t.id} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                      <td className="py-1.5" style={{ fontSize: 12 }}>{t.posted_on}</td>
+                      <td style={{ fontSize: 12.5, maxWidth: 240 }}>{t.description}</td>
+                      <td style={{ fontWeight: 600 }}>{financeMoney(t.amount)}</td>
+                      <td style={{ fontSize: 12, color: C.textMute }}>{t.matched_via === 'add' ? 'added' : 'matched'}{t.entry_no ? ` · #${t.entry_no}` : ''}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          )}
           <div style={{ fontWeight: 600, fontSize: 13, color: C.text }} className="mb-1">Matched ({(detail.items || []).length})</div>
           {(detail.items || []).length === 0 ? (
             <div style={{ fontSize: 12.5, color: C.textMute }}>Nothing matched yet.</div>
@@ -12902,23 +14289,32 @@ function FinancialManagement() {
   const [bucket, setBucket] = useState('');
   const [ledger, setLedger] = useState(null);
   const [pl, setPl] = useState(null);
+  // The P&L loads itself; the parent only records the range that Apply committed.
+  const [plRange, setPlRange] = useState(null);
+  // Bumped by any bank write, so the feed, the import card and reconciliation reload together.
+  const [bankVersion, setBankVersion] = useState(0);
   const [audit, setAudit] = useState(null);
   const [busy, setBusy] = useState(false);
   const [recordKind, setRecordKind] = useState(null);   // 'income' | 'expense' | null
   const [reversing, setReversing] = useState(null);     // a ledger row, or null
   const [ledgerNotice, setLedgerNotice] = useState('');
+  const [ledgerFilter, setLedgerFilter] = useState({ search: '', accountId: '', kind: '', min: '', max: '' });
+  const [ledgerAccounts, setLedgerAccounts] = useState([]);
+  const [reclassifying, setReclassifying] = useState(null);
 
   const call = useCallback(async (fn, args) => {
     const { data, error } = await supabase.rpc(fn, args);
     if (error) {
       // A missing migration is guidance, never a red error — the AdminBatches idiom.
-      if (isMigrationMissing(error)) { setNeedsSetup(true); return null; }
+      // ★ It still THROWS. Returning null let a writer read "no error" as success: a Record
+      //   expense against an unapplied #59 closed its dialog saying "Expense recorded."
+      if (isMigrationMissing(error)) setNeedsSetup(true);
       throw error;
     }
     return data;
   }, []);
 
-  const load = useCallback(async (which) => {
+  const load = useCallback(async (which, overrides = {}) => {
     if (!allowed) return;
     setBusy(true); setErr('');
     try {
@@ -12931,9 +14327,23 @@ function FinancialManagement() {
         ]);
         setSales(s || []); setRecv(r || []);
       } else if (which === 'ledger') {
-        setLedger(await call('finance_ledger_list', { p_from: from, p_to: to, p_limit: 100 }) || []);
+        // An override lets Clear re-run with the EMPTY filter; state set in the same click is
+        // not visible to this closure yet.
+        const f = overrides.ledgerFilter || ledgerFilter;
+        const [rows, accts] = await Promise.all([
+          call('finance_ledger_list', {
+            p_from: from, p_to: to, p_limit: 200,
+            p_search: f.search.trim() || null, p_account_id: f.accountId || null, p_entry_kind: f.kind || null,
+            p_min: f.min === '' ? null : Number(f.min), p_max: f.max === '' ? null : Number(f.max),
+          }),
+          ledgerAccounts.length ? Promise.resolve(null) : call('finance_accounts_list', { p_include_inactive: true }),
+        ]);
+        if (accts) setLedgerAccounts(accts);
+        setLedger(rows || []);
       } else if (which === 'pl') {
-        setPl(await call('finance_cash_basis_pl', { p_from: from, p_to: to, p_group: 'month' }) || []);
+        // `n` moves on every Apply and is passed as `version`, so FinanceProfitLoss refetches even
+        // for an unchanged range (its effect compares the strings, not this object).
+        setPlRange((p) => ({ from, to, n: (p?.n || 0) + 1 })); setPl([]);
       } else if (which === 'audit') {
         setAudit(await call('finance_audit_feed', { p_limit: 50 }) || []);
       }
@@ -12943,7 +14353,7 @@ function FinancialManagement() {
     } finally {
       setBusy(false);
     }
-  }, [allowed, call, from, to, bucket]);
+  }, [allowed, call, from, to, bucket, ledgerFilter, ledgerAccounts.length]);
 
   // Lazy per sub-tab: nothing loads until it is opened, and the range re-loads only
   // the tab you are looking at.
@@ -12963,7 +14373,10 @@ function FinancialManagement() {
   // lazy effect re-load whichever tab is opened next.
   const invalidateReports = useCallback(() => {
     setSummary(null); setSales(null); setRecv(null); setLedger(null); setPl(null); setAudit(null);
+    // Accounts can change in Setup; the ledger and Reclassify must not offer a stale list.
+    setLedgerAccounts([]);
   }, []);
+  const bankChanged = useCallback(() => { invalidateReports(); setBankVersion((v) => v + 1); }, [invalidateReports]);
 
   const exportReceivables = () => {
     const rows = (recv || []).map((r) => ({
@@ -13012,8 +14425,8 @@ function FinancialManagement() {
           <Landmark size={40} className="mx-auto mb-3" style={{ color: ROYAL }} />
           <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">Finish backend setup</div>
           <div className="text-slate-500 mt-2 text-sm max-w-md mx-auto">
-            Run <span style={{ fontFamily: fontMono }}>db/2026-09-09-financial-management.sql</span> (#58) in the
-            Supabase SQL Editor, then refresh this page. Until then nothing on this screen can load, so its
+            A Financial Management migration has not been applied: <span style={{ fontFamily: fontMono }}>db/2026-09-09-financial-management.sql</span> (#58)
+            and <span style={{ fontFamily: fontMono }}>db/2026-09-14-finance-parity.sql</span> (#59), in that order. Apply them, then refresh this page. Until then nothing on this screen can load, so its
             controls are hidden rather than left to fail.
           </div>
         </div>
@@ -13058,6 +14471,13 @@ function FinancialManagement() {
           )}
 
           {/* ── Overview ───────────────────────────────────────────────────── */}
+          {/* OUTSIDE the busy guard, keyed to the range the summary was LOADED with: Apply must
+              not unmount it (resetting Today/MTD/YTD), and typing a date must not refetch. */}
+          {sub === 'overview' && summary?.range && (
+            <div className="mb-4">
+              <FinanceOverviewExtras call={call} from={summary.range.from} to={summary.range.to} />
+            </div>
+          )}
           {sub === 'overview' && !busy && summary && (
             <div className="space-y-4">
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -13115,6 +14535,8 @@ function FinancialManagement() {
               load leaves the state null and the empty-state copy prints beside the red
               error banner — on a finance screen "nothing was posted" and "the query
               failed" must never look alike. */}
+          {/* Self-loading, and OUTSIDE the parent's busy/sales guard: its filters survive a parent reload. */}
+          {sub === 'sales' && <div className="mb-4"><FinanceSalesReport call={call} /></div>}
           {sub === 'sales' && !busy && sales && (
             <div className="space-y-4">
               <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
@@ -13232,6 +14654,50 @@ function FinancialManagement() {
                 One row per ENTRY, with its lines. Posted entries are immutable — a correction is a linked
                 reversal, and both stay on the record.
               </div>
+              <form className="grid gap-2 sm:grid-cols-6 items-end mb-3"
+                onSubmit={(ev) => { ev.preventDefault(); load('ledger'); }}>
+                <label className="block sm:col-span-2"><span style={FINANCE_LABEL_STYLE}>Payee or memo</span>
+                  <input value={ledgerFilter.search} onChange={(e) => setLedgerFilter((x) => ({ ...x, search: e.target.value }))}
+                    className="gh-input w-full mt-1" style={{ fontSize: 13 }} placeholder="At least 2 characters" /></label>
+                <label className="block"><span style={FINANCE_LABEL_STYLE}>Account</span>
+                  <select value={ledgerFilter.accountId} onChange={(e) => setLedgerFilter((x) => ({ ...x, accountId: e.target.value }))}
+                    className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+                    <option value="">Any</option>
+                    {ledgerAccounts.map((a) => <option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
+                  </select></label>
+                <label className="block"><span style={FINANCE_LABEL_STYLE}>Kind</span>
+                  <select value={ledgerFilter.kind} onChange={(e) => setLedgerFilter((x) => ({ ...x, kind: e.target.value }))}
+                    className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+                    <option value="">Any</option>
+                    {FINANCE_ENTRY_KINDS.map((k) => <option key={k} value={k}>{k.replace(/_/g, ' ')}</option>)}
+                  </select></label>
+                <div className="flex gap-1">
+                  <label className="block flex-1"><span style={FINANCE_LABEL_STYLE}>Min ₱</span>
+                    <input type="number" min="0" step="0.01" value={ledgerFilter.min} onChange={(e) => setLedgerFilter((x) => ({ ...x, min: e.target.value }))}
+                      className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+                  <label className="block flex-1"><span style={FINANCE_LABEL_STYLE}>Max ₱</span>
+                    <input type="number" min="0" step="0.01" value={ledgerFilter.max} onChange={(e) => setLedgerFilter((x) => ({ ...x, max: e.target.value }))}
+                      className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+                </div>
+                <div className="flex gap-1">
+                  <button type="submit" className="gh-btn-primary px-3 py-2 text-sm flex-1">Filter</button>
+                  <button type="button" className="gh-btn-ghost px-3 py-2 text-sm"
+                    onClick={() => {
+                      const empty = { search: '', accountId: '', kind: '', min: '', max: '' };
+                      setLedgerFilter(empty);
+                      load('ledger', { ledgerFilter: empty });
+                    }}>Clear</button>
+                </div>
+              </form>
+              {(ledger || []).length > 0 && (
+                <div className="grid gap-3 grid-cols-3 mb-3">
+                  <FinanceStat label="Income in this view" value={financeMoney(ledger[0].filter_income)} tone={C.green} />
+                  <FinanceStat label="Expenses in this view" value={financeMoney(ledger[0].filter_expense)} />
+                  <FinanceStat label="Net" value={financeMoney(Number(ledger[0].filter_income) - Number(ledger[0].filter_expense))}
+                    tone={Number(ledger[0].filter_income) - Number(ledger[0].filter_expense) >= 0 ? C.green : C.red}
+                    note={`${ledger[0].total_count} entr${Number(ledger[0].total_count) === 1 ? 'y' : 'ies'} match${Number(ledger[0].total_count) > ledger.length ? `; showing ${ledger.length}` : ''}.`} />
+                </div>
+              )}
               {(ledger || []).length === 0 ? (
                 <div style={{ fontSize: 13, color: C.textMute }}>No entries posted in this range.</div>
               ) : (
@@ -13249,12 +14715,22 @@ function FinancialManagement() {
                         <td className="py-1.5" style={{ fontFamily: fontMono, fontSize: 12 }}>{e.entry_no}</td>
                         <td>{e.entry_date}</td>
                         <td><span className="gh-pill" style={{ fontSize: 11 }}>{e.entry_kind}</span></td>
-                        <td style={{ maxWidth: 260 }}>{e.memo}</td>
+                        <td style={{ maxWidth: 260 }}>
+                          {e.payee && <div style={{ fontWeight: 600 }}>{e.payee}</div>}
+                          <div style={e.payee ? { fontSize: 12, color: C.textMute } : undefined}>{e.memo}</div>
+                          {e.adjusts_entry_id && <span className="gh-pill mt-0.5 inline-block" style={{ fontSize: 10, textDecoration: 'none' }}>reclassification</span>}
+                        </td>
                         <td style={{ fontWeight: 700 }}>{money(e.total_amount)}</td>
                         <td style={{ fontSize: 11, color: C.textMute }}>
                           {(e.lines || []).map((l) => `${l.account_code} ${l.debit > 0 ? 'Dr' : 'Cr'}`).join(' · ')}
                         </td>
                         <td className="text-right" style={{ textDecoration: 'none' }}>
+                          {!e.is_reversal && !e.reversed_by_entry_id
+                            && (e.lines || []).some((l) => ['income', 'expense'].includes(l.account_type)) && (
+                            <button type="button" onClick={() => setReclassifying(e)} className="gh-btn-ghost px-2 py-1 text-xs mr-1">
+                              <Pencil size={12} className="inline -mt-0.5 mr-1" />Reclassify
+                            </button>
+                          )}
                           {!e.is_reversal && !e.reversed_by_entry_id && (
                             <button type="button" onClick={() => setReversing(e)} className="gh-btn-ghost px-2 py-1 text-xs">
                               <RotateCcw size={12} className="inline -mt-0.5 mr-1" />Reverse
@@ -13278,43 +14754,20 @@ function FinancialManagement() {
             <FinanceRecordEntryModal call={call} kind={recordKind} onClose={() => setRecordKind(null)}
               onPosted={() => { setLedgerNotice(recordKind === 'income' ? 'Income recorded.' : 'Expense recorded.'); invalidateReports(); load('ledger'); }} />
           )}
+          {reclassifying && (
+            <FinanceReclassifyModal call={call} entry={reclassifying} accounts={ledgerAccounts}
+              onClose={() => setReclassifying(null)}
+              onDone={(msg) => { setLedgerNotice(msg); invalidateReports(); load('ledger'); }} />
+          )}
           {reversing && (
             <FinanceReverseModal call={call} entry={reversing} onClose={() => setReversing(null)}
               onDone={(msg) => { setLedgerNotice(msg); invalidateReports(); load('ledger'); }} />
           )}
 
           {/* ── Profit & Loss ──────────────────────────────────────────────── */}
-          {sub === 'pl' && !busy && pl && (
-            <div className="glass-card rounded-2xl p-4 overflow-x-auto" style={{ background: GLASS.card }}>
-              <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }} className="mb-1">
-                Cash-Basis Management P&amp;L
-              </div>
-              <div className="mb-3" style={{ fontSize: 11, color: C.textMute }}>
-                Basis: cash · generated {todayISODate()}. A management report, not a statutory financial
-                statement. There is no accrual mode and no receivable account in the chart. Owner's draws and
-                transfers cannot appear here.
-              </div>
-              {(pl || []).length === 0 ? (
-                <div style={{ fontSize: 13, color: C.textMute }}>Nothing posted in this range.</div>
-              ) : (
-                <table className="w-full text-sm" style={{ color: C.text }}>
-                  <thead><tr style={{ color: C.textMute, fontSize: 11.5, textAlign: 'left' }}>
-                    <th scope="col" className="py-1">Period</th><th scope="col">Section</th>
-                    <th scope="col">Account</th><th scope="col">Amount</th>
-                  </tr></thead>
-                  <tbody>
-                    {pl.map((r, i) => (
-                      <tr key={`${r.period_key}-${r.account_id}-${i}`} style={{ borderTop: `1px solid ${GLASS.border}` }}>
-                        <td className="py-1.5" style={{ fontFamily: fontMono, fontSize: 12 }}>{r.period_key}</td>
-                        <td style={{ fontSize: 12, color: C.textMute }}>{String(r.section || '').replace(/_/g, ' ')}</td>
-                        <td>{r.account_code} · {r.account_name}</td>
-                        <td style={{ fontWeight: 600 }}>{money(r.amount)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-            </div>
+          {/* No !busy guard: Apply toggles busy, and unmounting would reset grouping and filters. */}
+          {sub === 'pl' && plRange && (
+            <FinanceProfitLoss call={call} from={plRange.from} to={plRange.to} version={plRange.n} />
           )}
 
           {/* ── Setup ──────────────────────────────────────────────────────── */}
@@ -13323,8 +14776,9 @@ function FinancialManagement() {
           {/* ── Bank & Reconciliation ─────────────────────────────────────── */}
           {sub === 'bank' && (
             <div className="space-y-6">
-              <FinanceBankImportCard call={call} onChanged={invalidateReports} />
-              <FinanceReconcileCard call={call} onChanged={invalidateReports} />
+              <FinanceBankFeed call={call} onChanged={bankChanged} version={bankVersion} />
+              <FinanceBankImportCard call={call} onChanged={bankChanged} version={bankVersion} />
+              <FinanceReconcileCard call={call} onChanged={bankChanged} version={bankVersion} />
             </div>
           )}
 
@@ -13752,6 +15206,19 @@ function AdminEnrollments({ onCountChange }) {
   const [rejectReason, setRejectReason] = useState('');
   const [receiptView, setReceiptView] = useState(null); // { url, name } image preview modal
   const [expandedId, setExpandedId] = useState(null);
+  // #60: holds, the timeline, reviewer names, search/sort, and bulk selection.
+  const [holds, setHolds] = useState({});             // request_id -> hold row
+  const [holdsAvailable, setHoldsAvailable] = useState(false);
+  const [eventsByReq, setEventsByReq] = useState({});
+  const [staffNames, setStaffNames] = useState({});
+  const [query, setQuery] = useState('');
+  const [planFilter, setPlanFilter] = useState('');
+  const [sortKey, setSortKey] = useState('newest');
+  const [selected, setSelected] = useState({});       // request_id -> true
+  const [holdFor, setHoldFor] = useState(null);       // { row, reason, followUp, existing }
+  const [amountFor, setAmountFor] = useState(null);   // { row, amount, note }
+  const [bulk, setBulk] = useState(null);             // { kind, reason, followUp, batchId, running, done, results }
+  const [dialogErr, setDialogErr] = useState('');
   const [notesDraft, setNotesDraft] = useState({});
   // Admin-editable payment instructions (shown on the student paywall).
   const [payOpen, setPayOpen] = useState(false);
@@ -13794,6 +15261,7 @@ function AdminEnrollments({ onCountChange }) {
         const data = [...(pendRes.data || []), ...(histRes.data || [])]
           .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
         setRows(data);
+        loadHolds(data);
         // Second query (no FK-embed fragility): the linked profiles, for the
         // "grant incomplete" check and the Google/Email signup hint — and the
         // subscriptions map scoped to the SAME visible users (it powers the
@@ -14088,6 +15556,154 @@ function AdminEnrollments({ onCountChange }) {
     // eslint-disable-next-line
   }, [approveFor?.id]);
 
+  // ── #60: holds, the timeline and reviewer names ───────────────────────────
+  // Additive: on a pre-#60 database the holds table is absent and every hold control
+  // stays hidden, rather than breaking the queue.
+  const loadHolds = async (data) => {
+    try {
+      const { data: h, error } = await supabase.from('enrollment_request_holds').select('*');
+      if (error) {
+        if (['42P01', 'PGRST205'].includes(String(error.code))) { setHoldsAvailable(false); setHolds({}); }
+        else console.warn('[enroll] holds fetch failed', error.code, error.message);
+        return;
+      }
+      setHoldsAvailable(true);
+      setHolds(Object.fromEntries((h || []).map((x) => [x.request_id, x])));
+      const ids = [...new Set([...(data || rows).map((r) => r.reviewed_by), ...(h || []).map((x) => x.held_by)].filter(Boolean))];
+      if (ids.length) {
+        const { data: names, error: nErr } = await supabase.rpc('admin_staff_display_names', { p_user_ids: ids.slice(0, 200) });
+        if (!nErr && Array.isArray(names)) setStaffNames(Object.fromEntries(names.map((n) => [n.user_id, n.display_name])));
+      }
+    } catch (e) {
+      console.warn('[enroll] holds fetch failed', e?.message);
+    }
+  };
+  const loadEvents = async (id) => {
+    const { data, error } = await supabase.from('enrollment_request_events')
+      .select('id, action, detail, reason, actor_email, created_at')
+      .eq('request_id', id).order('created_at', { ascending: false }).limit(50);
+    if (!error) setEventsByReq((m) => ({ ...m, [id]: data || [] }));
+  };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { if (expandedId && holdsAvailable) loadEvents(expandedId); }, [expandedId, holdsAvailable]);
+
+  const saveHold = async () => {
+    const r = holdFor.row;
+    setBusyId(r.id); setDialogErr('');
+    try {
+      const { error } = await supabase.rpc('admin_set_enrollment_hold', {
+        p_request_id: r.id, p_reason: holdFor.reason.trim(), p_follow_up_on: holdFor.followUp || null,
+      });
+      if (error) throw error;
+      setHoldFor(null);
+      setNotice(`${r.email} is on hold${holdFor.followUp ? ` — follow up by ${holdFor.followUp}` : ''}. The student is not notified.`);
+      await loadHolds();
+      if (expandedId === r.id) loadEvents(r.id);
+    } catch (e) {
+      console.error('[enroll] hold failed', { id: r.id, code: e?.code, message: e?.message });
+      setDialogErr(appErrorMessage(e, 'The hold was not saved.'));
+    } finally { setBusyId(null); }
+  };
+  const clearHold = async () => {
+    const r = holdFor.row;
+    setBusyId(r.id); setDialogErr('');
+    try {
+      const { error } = await supabase.rpc('admin_clear_enrollment_hold', { p_request_id: r.id, p_note: null });
+      if (error) throw error;
+      setHoldFor(null); setNotice(`Hold removed for ${r.email}.`);
+      await loadHolds();
+      if (expandedId === r.id) loadEvents(r.id);
+    } catch (e) {
+      setDialogErr(appErrorMessage(e, 'The hold was not removed.'));
+    } finally { setBusyId(null); }
+  };
+  const saveAmount = async () => {
+    const r = amountFor.row;
+    setBusyId(r.id); setDialogErr('');
+    try {
+      const { data, error } = await supabase.rpc('admin_correct_enrollment_amount', {
+        p_request_id: r.id, p_amount_paid: Number(amountFor.amount), p_note: amountFor.note.trim(),
+      });
+      if (error) throw error;
+      if (data?.changed) {
+        setRows((prev) => prev.map((x) => (x.id === r.id ? { ...x, amount_paid: data.amount_paid } : x)));
+        setNotice(`Amount corrected for ${r.email}. Approving it will record ${phpFmt(data.amount_paid)}.`);
+      } else {
+        setNotice('That amount was already recorded — nothing changed.');
+      }
+      setAmountFor(null);
+      if (expandedId === r.id) loadEvents(r.id);
+    } catch (e) {
+      console.error('[enroll] amount correction failed', { id: r.id, code: e?.code, message: e?.message });
+      setDialogErr(appErrorMessage(e, 'The amount was not corrected.'));
+    } finally { setBusyId(null); }
+  };
+
+  // Bulk actions run ONE AT A TIME through the same server paths as a single click, and
+  // report every row: a batch that fails halfway must say which students it reached.
+  const runBulk = async () => {
+    const kind = bulk.kind;
+    const targets = kind === 'clearhold' ? selectedRows.filter((r) => holds[r.id]) : selectedRows;
+    setBulk((b) => ({ ...b, running: true, results: [] }));
+    const results = [];
+    for (const r of targets) {
+      try {
+        if (kind === 'approve') {
+          const { data, error } = await supabase.rpc('admin_finalize_enrollment', {
+            p_request_id: r.id, p_batch_id: bulk.batchId || null,
+          });
+          if (error) throw error;
+          if (!data?.already) await notifyDecision({ email: r.email, fullName: r.full_name, status: 'approved', planName: r.plan_name });
+          results.push({ id: r.id, email: r.email, ok: true, note: data?.already ? 'already approved' : 'approved' });
+        } else if (kind === 'reject') {
+          const nowIso = new Date().toISOString();
+          const { data, error } = await supabase.from('enrollment_requests')
+            .update({ status: 'rejected', rejection_reason: bulk.reason.trim(), reviewed_at: nowIso, reviewed_by: user?.id || null, updated_at: nowIso })
+            .eq('id', r.id).eq('status', 'pending_review').select('id');
+          if (error) throw error;
+          if (!data?.[0]) throw new Error('Not changed — it may already have been decided.');
+          await notifyDecision({ email: r.email, fullName: r.full_name, status: 'rejected', reason: bulk.reason.trim(), planName: r.plan_name });
+          results.push({ id: r.id, email: r.email, ok: true, note: 'rejected' });
+        } else if (kind === 'hold') {
+          const { error } = await supabase.rpc('admin_set_enrollment_hold', {
+            p_request_id: r.id, p_reason: bulk.reason.trim(), p_follow_up_on: bulk.followUp || null,
+          });
+          if (error) throw error;
+          results.push({ id: r.id, email: r.email, ok: true, note: 'on hold' });
+        } else if (kind === 'clearhold') {
+          const { error } = await supabase.rpc('admin_clear_enrollment_hold', { p_request_id: r.id, p_note: null });
+          if (error) throw error;
+          results.push({ id: r.id, email: r.email, ok: true, note: 'hold removed' });
+        }
+      } catch (e) {
+        console.error('[enroll] bulk action failed', { kind, id: r.id, code: e?.code, message: e?.message });
+        results.push({ id: r.id, email: r.email, ok: false, note: appErrorMessage(e, e?.message || 'Failed.') });
+      }
+      setBulk((b) => ({ ...b, results: [...results] }));
+    }
+    setBulk((b) => ({ ...b, running: false, done: true }));
+    setSelected({});
+    onCountChange?.();
+    load(true);
+  };
+
+  const exportCsv = () => {
+    const cols = [
+      { label: 'Submitted', value: (r) => String(r.created_at || '').slice(0, 10) },
+      { label: 'Name', key: 'full_name' }, { label: 'Email', key: 'email' }, { label: 'Phone', key: 'phone' },
+      { label: 'Package', value: (r) => r.plan_name || r.plan_key }, { label: 'Kind', value: (r) => kindOf(r) },
+      { label: 'Amount paid', key: 'amount_paid' }, { label: 'Expected', key: 'amount_expected' },
+      { label: 'Status', value: (r) => (holdOf(r) ? 'on hold' : r.status) },
+      { label: 'Hold reason', value: (r) => holdOf(r)?.reason || '' },
+      { label: 'Follow up by', value: (r) => holdOf(r)?.follow_up_on || '' },
+      { label: 'Reviewed', value: (r) => String(r.reviewed_at || '').slice(0, 10) },
+      { label: 'Reviewed by', value: (r) => staffNames[r.reviewed_by] || '' },
+      { label: 'Current access ends', value: (r) => { const s = subOf(r); return s ? (s.ends_at ? String(s.ends_at).slice(0, 10) : 'no expiry') : ''; } },
+      { label: 'Access days left', value: (r) => accessDaysLeft(r) ?? '' },
+    ];
+    financeDownloadCsv(`enrollments-${filter}-${todayISODate()}.csv`, cols, visible);
+  };
+
   // Reject (with reason) or Mark expired — the student stays blocked and can resubmit.
   const doDecline = async (r, status, reason = null) => {
     setBusyId(r.id); setErr(''); setNotice('');
@@ -14194,7 +15810,8 @@ function AdminEnrollments({ onCountChange }) {
     }
   };
 
-  const isOverdue = (r) => r.status === 'pending_review' && r.expires_at && new Date(r.expires_at) < new Date();
+  // #60: a request ON HOLD is not overdue — someone is deliberately waiting on it.
+  const isOverdue = (r) => r.status === 'pending_review' && r.expires_at && new Date(r.expires_at) < new Date() && !holds[r.id];
   const daysInfo = (r) => {
     if (r.status !== 'pending_review' || !r.expires_at) return null;
     const ms = new Date(r.expires_at) - Date.now();
@@ -14246,8 +15863,32 @@ function AdminEnrollments({ onCountChange }) {
     return new Date(base + days * 86400000);
   };
 
+  // ── #60: holds, search, sort ──────────────────────────────────────────────
+  const holdOf = (r) => (r.status === 'pending_review' ? holds[r.id] || null : null);
+  const isFollowUpDue = (r) => { const h = holdOf(r); return !!(h && h.follow_up_on && h.follow_up_on <= todayISODate()); };
+  const searchQ = query.trim().toLowerCase();
+  const matchesSearch = (r) => (!searchQ || [r.full_name, r.email, r.phone, r.plan_name, r.plan_key, r.payment_reference]
+    .some((v) => String(v || '').toLowerCase().includes(searchQ)))
+    && (!planFilter || r.plan_key === planFilter);
+  const accessDaysLeft = (r) => {
+    const a = subAccess(subOf(r));
+    return a.has && !a.legacy && a.daysLeft != null ? a.daysLeft : null;
+  };
+  const SORTS = {
+    newest: (a, b) => new Date(b.created_at) - new Date(a.created_at),
+    oldest: (a, b) => new Date(a.created_at) - new Date(b.created_at),
+    name: (a, b) => String(a.full_name || a.email || '').localeCompare(String(b.full_name || b.email || '')),
+    plan: (a, b) => String(a.plan_name || a.plan_key || '').localeCompare(String(b.plan_name || b.plan_key || '')),
+    amount: (a, b) => (Number(b.amount_paid) || 0) - (Number(a.amount_paid) || 0),
+    status: (a, b) => String(a.status).localeCompare(String(b.status)),
+    // Members with no dated term sort last, not first.
+    daysleft: (a, b) => (accessDaysLeft(a) ?? Number.POSITIVE_INFINITY) - (accessDaysLeft(b) ?? Number.POSITIVE_INFINITY),
+  };
+
   const counts = {
     pending: rows.filter(r => r.status === 'pending_review').length,
+    onhold: rows.filter((r) => !!holdOf(r)).length,
+    followup: rows.filter(isFollowUpDue).length,
     overdue: rows.filter(isOverdue).length,
     renewals: rows.filter(isRenewalReq).length,
     upgrades: rows.filter(r => r.status === 'pending_review' && kindOf(r) === 'upgrade').length,
@@ -14260,8 +15901,10 @@ function AdminEnrollments({ onCountChange }) {
     grace: rows.filter(memberInGrace).length,
     ended: rows.filter(memberEnded).length,
   };
-  const visible = rows.filter(r =>
-    filter === 'pending' ? r.status === 'pending_review'
+  const filtered = rows.filter(r =>
+    filter === 'onhold' ? !!holdOf(r)
+    : filter === 'followup' ? isFollowUpDue(r)
+    : filter === 'pending' ? r.status === 'pending_review'
     : filter === 'overdue' ? isOverdue(r)
     : filter === 'renewals' ? isRenewalReq(r)
     : filter === 'upgrades' ? (r.status === 'pending_review' && kindOf(r) === 'upgrade')
@@ -14271,6 +15914,8 @@ function AdminEnrollments({ onCountChange }) {
     : filter === 'grace' ? memberInGrace(r)
     : filter === 'ended' ? memberEnded(r)
     : r.status === filter);
+  const visible = filtered.filter(matchesSearch).sort(SORTS[sortKey] || SORTS.newest);
+  const selectedRows = rows.filter((r) => selected[r.id] && r.status === 'pending_review');
 
   const STATUS_STYLE = {
     pending_review: { label: 'Pending',  bg: 'var(--status-warn-bg)',        bd: 'var(--status-warn-bd)',        fg: 'var(--status-warn-fg)' },
@@ -14285,9 +15930,11 @@ function AdminEnrollments({ onCountChange }) {
     expiring:       { label: 'Expiring', bg: 'var(--status-warn-bg)',        bd: 'var(--status-warn-bd)',        fg: 'var(--status-warn-fg)' },
     grace:          { label: 'In grace', bg: 'var(--status-warn-strong-bg)', bd: 'var(--status-warn-strong-bd)', fg: 'var(--status-warn-strong-fg)' },
     ended:          { label: 'Ended',    bg: 'var(--status-danger-bg)',      bd: 'var(--status-danger-bd)',      fg: 'var(--status-danger-fg)' },
+    onhold:         { label: 'On hold',  bg: 'var(--status-info-bg)',        bd: 'var(--status-info-bd)',        fg: 'var(--status-info-fg)' },
+    followup:       { label: 'Follow-up due', bg: 'var(--status-warn-strong-bg)', bd: 'var(--status-warn-strong-bd)', fg: 'var(--status-warn-strong-fg)' },
   };
   const StatusPill = ({ request }) => {
-    const s = STATUS_STYLE[isOverdue(request) ? 'overdue' : request.status] || STATUS_STYLE.pending_review;
+    const s = STATUS_STYLE[holdOf(request) ? 'onhold' : isOverdue(request) ? 'overdue' : request.status] || STATUS_STYLE.pending_review;
     return (
       <span className="px-2.5 py-1 rounded-full text-[11px] font-bold" style={{ background: s.bg, color: s.fg, border: `1px solid ${s.bd}` }}>
         {s.label}
@@ -14354,7 +16001,7 @@ function AdminEnrollments({ onCountChange }) {
           on the first line, MEMBERSHIP lifecycle + utilities on the second. */}
       <div className="mt-6 flex flex-wrap items-center gap-2">
         <AdminFilterCaption>Requests</AdminFilterCaption>
-        {[['pending', 'Pending'], ['overdue', 'Overdue'], ['renewals', 'Renewals'], ['upgrades', 'Upgrades'], ['extensions', 'Extensions'], ['approved', 'Approved'], ['rejected', 'Rejected'], ['expired', 'Expired']].map(([key, label]) => {
+        {[['pending', 'Pending'], ...(holdsAvailable ? [['onhold', 'On hold'], ['followup', 'Follow-up due']] : []), ['overdue', 'Overdue'], ['renewals', 'Renewals'], ['upgrades', 'Upgrades'], ['extensions', 'Extensions'], ['approved', 'Approved'], ['rejected', 'Rejected'], ['expired', 'Expired']].map(([key, label]) => {
           const s = STATUS_STYLE[key === 'pending' ? 'pending_review' : key];
           return (
             <AdminFilterChip key={key} active={filter === key} label={label} count={counts[key]}
@@ -14400,6 +16047,69 @@ function AdminEnrollments({ onCountChange }) {
           {loading ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />} Refresh
         </button>
       </div>
+
+      {/* #60: find, sort, export, and act on several requests at once. */}
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <div className="relative flex-1" style={{ minWidth: 200 }}>
+          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+          <input value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Search enrollment requests"
+            placeholder="Search name, email, phone, package or reference"
+            className="gh-input w-full" style={{ fontSize: 13, paddingLeft: 32 }} />
+        </div>
+        <select value={planFilter} onChange={(e) => setPlanFilter(e.target.value)} aria-label="Filter by package"
+          className="gh-input" style={{ fontSize: 13 }}>
+          <option value="">All packages</option>
+          {Object.values(plansByKey).map((p) => <option key={p.key} value={p.key}>{p.name || p.key}</option>)}
+        </select>
+        <select value={sortKey} onChange={(e) => setSortKey(e.target.value)} aria-label="Sort requests"
+          className="gh-input" style={{ fontSize: 13 }}>
+          <option value="newest">Newest first</option>
+          <option value="oldest">Oldest first</option>
+          <option value="name">Name</option>
+          <option value="plan">Package</option>
+          <option value="amount">Amount, highest first</option>
+          <option value="status">Status</option>
+          <option value="daysleft">Access days left</option>
+        </select>
+        <button onClick={exportCsv} disabled={visible.length === 0}
+          className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition disabled:opacity-60"
+          style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+          <Download size={14} /> CSV ({visible.length})
+        </button>
+      </div>
+      {(() => {
+        const pendingVisible = visible.filter((r) => r.status === 'pending_review');
+        if (!pendingVisible.length && !selectedRows.length) return null;
+        const allOn = pendingVisible.length > 0 && pendingVisible.every((r) => selected[r.id]);
+        const btn = { background: C.white, color: C.textSoft, border: `1px solid ${C.border}` };
+        const open = (kind) => { setDialogErr(''); setBulk({ kind, reason: '', followUp: '', batchId: '', running: false, done: false, results: [] }); };
+        return (
+          <div className="mt-2 flex flex-wrap items-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'var(--wash)', fontSize: 12.5, color: C.text }}>
+            <label className="inline-flex items-center gap-1.5">
+              <input type="checkbox" checked={allOn}
+                onChange={(e) => setSelected((s) => {
+                  const next = { ...s };
+                  pendingVisible.forEach((r) => { if (e.target.checked) next[r.id] = true; else delete next[r.id]; });
+                  return next;
+                })} />
+              Select all {pendingVisible.length} pending in this view
+            </label>
+            {selectedRows.length > 0 && (
+              <>
+                <span className="font-semibold ml-1">{selectedRows.length} selected</span>
+                <button onClick={() => open('approve')} className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white" style={ADMIN_BTN_OK}>Approve</button>
+                <button onClick={() => open('reject')} className="px-3 py-1.5 rounded-lg text-xs font-semibold"
+                  style={{ background: 'var(--status-danger-bg)', color: 'var(--status-danger-fg)', border: '1px solid var(--status-danger-bd)' }}>Reject</button>
+                {holdsAvailable && <button onClick={() => open('hold')} className="px-3 py-1.5 rounded-lg text-xs font-semibold" style={btn}>Put on hold</button>}
+                {holdsAvailable && selectedRows.some((r) => holds[r.id]) && (
+                  <button onClick={() => open('clearhold')} className="px-3 py-1.5 rounded-lg text-xs font-semibold" style={btn}>Remove holds</button>
+                )}
+                <button onClick={() => setSelected({})} className="px-3 py-1.5 rounded-lg text-xs font-semibold" style={btn}>Clear selection</button>
+              </>
+            )}
+          </div>
+        );
+      })()}
 
       {/* Payment details editor (what students see on the paywall) */}
       <div className="mt-4 glass-card overflow-hidden">
@@ -14456,7 +16166,8 @@ function AdminEnrollments({ onCountChange }) {
         <div className="mt-6 rounded-2xl border-2 border-dashed p-12 text-center" style={{ borderColor: C.border, color: C.textMute }}>
           <Receipt size={26} className="mx-auto" style={{ color: C.textMute }} />
           <div className="mt-3 text-sm font-medium">
-            {({ pending: 'No pending enrollment requests.', overdue: 'No overdue enrollment requests.',
+            {(searchQ || planFilter) ? 'No requests in this view match your search.' : ({ pending: 'No pending enrollment requests.', overdue: 'No overdue enrollment requests.',
+                onhold: 'No requests are on hold.', followup: 'No follow-ups are due.',
                 renewals: 'No renewal requests waiting for review.', approved: 'No approved enrollment requests.',
                 rejected: 'No rejected enrollment requests.', expired: 'No expired enrollment requests.',
                 active: 'No active memberships.', expiring: 'No memberships expiring in the next 14 days.',
@@ -14515,6 +16226,15 @@ function AdminEnrollments({ onCountChange }) {
                         return null;
                       })()}
                       <NotifyBadge request={r} />
+                      {holdOf(r) && (
+                        <span title={`${holdOf(r).reason}${holdOf(r).held_by && staffNames[holdOf(r).held_by] ? ` — ${staffNames[holdOf(r).held_by]}` : ''}`}
+                          className="px-2 py-0.5 rounded-full text-[10px] font-bold inline-flex items-center gap-1"
+                          style={isFollowUpDue(r)
+                            ? { background: 'var(--status-warn-strong-bg)', color: 'var(--status-warn-strong-fg)', border: '1px solid var(--status-warn-strong-bd)' }
+                            : { background: 'var(--status-info-bg)', color: 'var(--status-info-fg)', border: '1px solid var(--status-info-bd)' }}>
+                          <Pause size={9} /> On hold{holdOf(r).follow_up_on ? ` · follow up ${holdOf(r).follow_up_on}` : ''}
+                        </span>
+                      )}
                     </>}
                     meta={<>
                       {r.phone && <span className="inline-flex items-center gap-1"><Phone size={11} /> {r.phone}</span>}
@@ -14534,6 +16254,12 @@ function AdminEnrollments({ onCountChange }) {
                       </div>
                     )}
                     <div style={{ fontFamily: fontMono, fontSize: 13, fontWeight: 700, color: C.text }}>{phpFmt(r.amount_paid)}</div>
+                    {r.status === 'pending_review' && holdsAvailable && (
+                      <button type="button" onClick={() => { setDialogErr(''); setAmountFor({ row: r, amount: String(r.amount_paid ?? ''), note: '' }); }}
+                        className="hover:underline" style={{ fontSize: 10.5, fontWeight: 600, color: C.primary }}>
+                        Correct amount
+                      </button>
+                    )}
                     {amountMismatch && (
                       <div style={{ fontSize: 10.5, fontWeight: 600, color: 'var(--status-warn-fg)' }}>expected {phpFmt(r.amount_expected)}</div>
                     )}
@@ -14547,6 +16273,13 @@ function AdminEnrollments({ onCountChange }) {
                     <StatusPill request={r} />
                   </div>
                   <div className="col-start-2 lg:col-start-5 flex items-center gap-2 flex-wrap">
+                    {r.status === 'pending_review' && (
+                      <label className="inline-flex items-center gap-1 text-xs" style={{ color: C.textSoft }}>
+                        <input type="checkbox" checked={!!selected[r.id]} aria-label={`Select ${r.email}`}
+                          onChange={(e) => setSelected((s) => { const next = { ...s }; if (e.target.checked) next[r.id] = true; else delete next[r.id]; return next; })} />
+                        Select
+                      </label>
+                    )}
                     {r.receipt_path && (
                       <button onClick={() => viewReceipt(r)} disabled={rowBusy}
                         className="px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
@@ -14566,6 +16299,14 @@ function AdminEnrollments({ onCountChange }) {
                         className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
                         style={{ background: 'var(--status-danger-bg)', color: 'var(--status-danger-fg)', border: '1px solid var(--status-danger-bd)' }}>
                         <UserX size={14} /> Reject
+                      </button>
+                    )}
+                    {r.status === 'pending_review' && holdsAvailable && (
+                      <button onClick={() => { setDialogErr(''); setHoldFor({ row: r, reason: holds[r.id]?.reason || '', followUp: holds[r.id]?.follow_up_on || '', existing: !!holds[r.id] }); }}
+                        disabled={rowBusy}
+                        className="px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
+                        style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+                        <Pause size={14} /> {holds[r.id] ? 'Edit hold' : 'Hold'}
                       </button>
                     )}
                     {overdueRow && (
@@ -14719,7 +16460,7 @@ function AdminEnrollments({ onCountChange }) {
                       )}
                       <div className="mt-3 flex items-center gap-3 flex-wrap" style={{ fontSize: 11, color: C.textMute }}>
                         <span>Review window ends: <span style={{ fontWeight: 600, color: C.textSoft }}>{fmtEnrollDate(r.expires_at)}</span></span>
-                        {r.reviewed_at && <span>Reviewed: <span style={{ fontWeight: 600, color: C.textSoft }}>{fmtEnrollDate(r.reviewed_at)}</span></span>}
+                        {r.reviewed_at && <span>Reviewed: <span style={{ fontWeight: 600, color: C.textSoft }}>{fmtEnrollDate(r.reviewed_at)}{staffNames[r.reviewed_by] ? ` by ${staffNames[r.reviewed_by]}` : ''}</span></span>}
                       </div>
                     </div>
                     <div>
@@ -14735,6 +16476,37 @@ function AdminEnrollments({ onCountChange }) {
                           <Save size={13} /> Save note
                         </button>
                       </div>
+                      {holdOf(r) && (
+                        <div className="mt-3 px-3 py-2.5 rounded-xl" style={{ background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)', fontSize: 12, color: C.text }}>
+                          <span style={{ fontWeight: 600 }}>On hold: </span>{holdOf(r).reason}
+                          <div style={{ fontSize: 11, color: C.textMute }}>
+                            Since {fmtEnrollDate(holdOf(r).held_at)}{holdOf(r).held_by && staffNames[holdOf(r).held_by] ? ` · ${staffNames[holdOf(r).held_by]}` : ''}
+                            {holdOf(r).follow_up_on ? ` · follow up by ${holdOf(r).follow_up_on}` : ''}
+                          </div>
+                        </div>
+                      )}
+                      {holdsAvailable && (
+                        <div className="mt-3">
+                          <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: C.textMute }}>Timeline (staff only)</div>
+                          {eventsByReq[r.id] === undefined ? (
+                            <div className="mt-1.5" style={{ fontSize: 12, color: C.textMute }}>Loading…</div>
+                          ) : eventsByReq[r.id].length === 0 ? (
+                            <div className="mt-1.5" style={{ fontSize: 12, color: C.textMute }}>No holds or corrections on this request.</div>
+                          ) : (
+                            <ul className="mt-1.5 space-y-1.5">
+                              {eventsByReq[r.id].map((ev) => (
+                                <li key={ev.id} style={{ fontSize: 12, color: C.textSoft }}>
+                                  <span style={{ fontWeight: 600, color: C.text }}>
+                                    {({ hold_set: 'Put on hold', hold_updated: 'Hold updated', hold_cleared: ev.detail?.cause === 'decided' ? 'Hold released — request decided' : 'Hold removed', amount_corrected: `Amount corrected ${phpFmt(ev.detail?.before)} → ${phpFmt(ev.detail?.after)}` })[ev.action] || ev.action}
+                                  </span>
+                                  {ev.reason ? ` — ${ev.reason}` : ''}
+                                  <div style={{ fontSize: 10.5, color: C.textMute }}>{new Date(ev.created_at).toLocaleString()}{ev.actor_email ? ` · ${ev.actor_email}` : ''}</div>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
                 )}
@@ -14746,6 +16518,141 @@ function AdminEnrollments({ onCountChange }) {
 
       {/* Approve confirmation modal — shared AccountModal shell (dialog a11y, focus trap,
           Escape/backdrop gated on busyId, dark-mode surface). */}
+      {/* #60: hold, amount correction and bulk dialogs. Errors render INSIDE each dialog. */}
+      {holdFor && (
+        <AccountModal title={holdFor.existing ? 'Edit this hold' : 'Put this request on hold?'} subtitle={holdFor.row.email}
+          icon={Pause} canClose={busyId == null} onClose={() => setHoldFor(null)}>
+          {dialogErr && <AdminNotice kind="danger" onDismiss={() => setDialogErr('')}>{dialogErr}</AdminNotice>}
+          <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+            A hold is a note for staff — the student is not told. The request stays pending, stops counting as overdue, and
+            the hold is released automatically when the request is approved, rejected or expires.
+          </p>
+          <label className="block mt-4 mb-1.5" style={FINANCE_LABEL_STYLE}>Why is it on hold? (required)</label>
+          <textarea value={holdFor.reason} onChange={(e) => setHoldFor((h) => ({ ...h, reason: e.target.value }))} rows={3}
+            placeholder="e.g. Waiting for the next VIP batch to open"
+            className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
+            style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+          <label className="block mt-3 mb-1.5" style={FINANCE_LABEL_STYLE}>Follow up by (optional)</label>
+          <input type="date" min={todayISODate()} value={holdFor.followUp || ''} onChange={(e) => setHoldFor((h) => ({ ...h, followUp: e.target.value }))}
+            className="gh-input" style={{ fontSize: 13 }} />
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            {holdFor.existing && (
+              <button type="button" onClick={clearHold} disabled={busyId != null} className="gh-btn-ghost px-4 py-2 text-sm mr-auto">Remove hold</button>
+            )}
+            <button type="button" onClick={() => setHoldFor(null)} disabled={busyId != null} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+            <button type="button" onClick={saveHold} disabled={busyId != null || !holdFor.reason.trim()}
+              className="gh-btn-primary px-4 py-2 text-sm disabled:opacity-60">{busyId != null ? 'Saving…' : 'Save hold'}</button>
+          </div>
+        </AccountModal>
+      )}
+
+      {amountFor && (
+        <AccountModal title="Correct the amount paid" subtitle={amountFor.row.email} icon={Pencil}
+          canClose={busyId == null} onClose={() => setAmountFor(null)}>
+          {dialogErr && <AdminNotice kind="danger" onDismiss={() => setDialogErr('')}>{dialogErr}</AdminNotice>}
+          <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+            Use this when the amount on the request doesn't match the receipt. Approving the request records the corrected
+            figure as the payment. Both amounts and your reason stay on the request's timeline.
+          </p>
+          <div className="grid gap-3 grid-cols-2 mt-4">
+            <div>
+              <div style={FINANCE_LABEL_STYLE}>Recorded now</div>
+              <div className="mt-1" style={{ fontFamily: fontMono, fontWeight: 700, color: C.text }}>{phpFmt(amountFor.row.amount_paid)}</div>
+            </div>
+            <label className="block"><span style={FINANCE_LABEL_STYLE}>Correct amount (₱)</span>
+              <input type="number" min="0" step="0.01" inputMode="decimal" value={amountFor.amount}
+                onChange={(e) => setAmountFor((a) => ({ ...a, amount: e.target.value }))}
+                className="gh-input w-full mt-1 text-right" style={{ fontSize: 13 }} /></label>
+          </div>
+          <label className="block mt-3 mb-1.5" style={FINANCE_LABEL_STYLE}>Reason (required)</label>
+          <textarea value={amountFor.note} onChange={(e) => setAmountFor((a) => ({ ...a, note: e.target.value }))} rows={2}
+            placeholder="e.g. Receipt shows ₱2,999, the form said ₱2,990"
+            className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
+            style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+          <div className="mt-5 flex items-center justify-end gap-2.5">
+            <button type="button" onClick={() => setAmountFor(null)} disabled={busyId != null} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+            <button type="button" onClick={saveAmount}
+              disabled={busyId != null || amountFor.amount === '' || !Number.isFinite(Number(amountFor.amount)) || Number(amountFor.amount) < 0 || !amountFor.note.trim()}
+              className="gh-btn-primary px-4 py-2 text-sm disabled:opacity-60">{busyId != null ? 'Saving…' : 'Correct amount'}</button>
+          </div>
+        </AccountModal>
+      )}
+
+      {bulk && (() => {
+        const targets = bulk.kind === 'clearhold' ? selectedRows.filter((r) => holds[r.id]) : selectedRows;
+        const title = { approve: 'Approve these requests?', reject: 'Reject these requests?', hold: 'Put these requests on hold?', clearhold: 'Remove these holds?' }[bulk.kind];
+        const needsReason = bulk.kind === 'reject' || bulk.kind === 'hold';
+        const vipCount = targets.filter((r) => isPremiumSegment(planSegment(r.plan_key, plansByKey))).length;
+        return (
+          <AccountModal title={title} subtitle={`${bulk.done ? bulk.results.length : targets.length} request(s)`}
+            icon={bulk.kind === 'approve' ? UserCheck : bulk.kind === 'reject' ? UserX : Pause}
+            tone={bulk.kind === 'approve' ? 'ok' : bulk.kind === 'reject' ? 'danger' : 'primary'}
+            canClose={!bulk.running} onClose={() => setBulk(null)}>
+            {!bulk.done && !bulk.running && (
+              <>
+                <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+                  {bulk.kind === 'approve' && 'Each request is approved on its own, exactly as the Approve button does, and the student is emailed. A request that cannot be approved — your own, or a VIP request with no batch — is skipped and listed.'}
+                  {bulk.kind === 'reject' && 'Each student is emailed this reason and can resubmit.'}
+                  {bulk.kind === 'hold' && 'The students are not told. Each request stays pending and stops counting as overdue.'}
+                  {bulk.kind === 'clearhold' && 'The holds are removed; the requests stay pending.'}
+                </p>
+                {bulk.kind === 'approve' && vipCount > 0 && (
+                  <label className="block mt-3"><span style={FINANCE_LABEL_STYLE}>Batch for the {vipCount} VIP request(s) (optional)</span>
+                    <select value={bulk.batchId} onChange={(e) => setBulk((b) => ({ ...b, batchId: e.target.value }))} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+                      <option value="">Use each request's own batch</option>
+                      {(batches || []).filter((b) => b.status === 'open').map((b) => <option key={b.id} value={b.id}>{b.name || b.code}</option>)}
+                    </select></label>
+                )}
+                {needsReason && (
+                  <>
+                    <label className="block mt-3 mb-1.5" style={FINANCE_LABEL_STYLE}>{bulk.kind === 'reject' ? 'Reason sent to the students (required)' : 'Why are they on hold? (required)'}</label>
+                    <textarea value={bulk.reason} onChange={(e) => setBulk((b) => ({ ...b, reason: e.target.value }))} rows={3}
+                      className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
+                      style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
+                  </>
+                )}
+                {bulk.kind === 'hold' && (
+                  <>
+                    <label className="block mt-3 mb-1.5" style={FINANCE_LABEL_STYLE}>Follow up by (optional)</label>
+                    <input type="date" min={todayISODate()} value={bulk.followUp} onChange={(e) => setBulk((b) => ({ ...b, followUp: e.target.value }))} className="gh-input" style={{ fontSize: 13 }} />
+                  </>
+                )}
+              </>
+            )}
+            {(bulk.running || bulk.done) && (
+              <div className="mt-2" style={{ fontSize: 12.5 }}>
+                <div className="mb-2" style={{ color: C.textSoft }}>
+                  {bulk.running ? `Working… ${bulk.results.length} of ${targets.length}` : `${bulk.results.filter((x) => x.ok).length} done, ${bulk.results.filter((x) => !x.ok).length} not done.`}
+                </div>
+                <ul className="space-y-1" style={{ maxHeight: 260, overflowY: 'auto' }}>
+                  {bulk.results.map((x) => (
+                    <li key={x.id} className="flex gap-2">
+                      <span style={{ color: x.ok ? C.green : C.red, fontWeight: 700 }}>{x.ok ? '✓' : '✕'}</span>
+                      <span className="truncate" style={{ color: C.text }}>{x.email}</span>
+                      <span style={{ color: C.textMute }}>{x.note}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <div className="mt-5 flex items-center justify-end gap-2.5">
+              {bulk.done ? (
+                <button type="button" onClick={() => setBulk(null)} className="gh-btn-primary px-4 py-2 text-sm">Close</button>
+              ) : (
+                <>
+                  <button type="button" onClick={() => setBulk(null)} disabled={bulk.running} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+                  <button type="button" onClick={runBulk} disabled={bulk.running || targets.length === 0 || (needsReason && !bulk.reason.trim())}
+                    className="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-60"
+                    style={bulk.kind === 'reject' ? ADMIN_BTN_DANGER : ADMIN_BTN_OK}>
+                    {bulk.running ? 'Working…' : `${{ approve: 'Approve', reject: 'Reject', hold: 'Hold', clearhold: 'Remove' }[bulk.kind]} ${targets.length}`}
+                  </button>
+                </>
+              )}
+            </div>
+          </AccountModal>
+        );
+      })()}
+
       {/* #47: the discretionary extension. Reloads the list on success so the
           membership strip shows the new expiry immediately. */}
       {extendFor && (

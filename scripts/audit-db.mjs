@@ -1083,6 +1083,31 @@ export const OBJECT_CHECKS = [
    where t.matched_entry_id is not null
      and exists (select 1 from public.finance_journal_entries rv where rv.reverses_entry_id = t.matched_entry_id)`],
 
+  // ── #60, enrollment management ────────────────────────────────────────────
+  ['#60    hold and timeline tables exist with RLS and exactly one SELECT policy each', `select count(*) = 2 and coalesce(bool_and(t.rls and t.n = 1 and t.cmd = 'SELECT'), false) as ok from (
+      select c.relname, c.relrowsecurity as rls,
+             (select count(*) from pg_policies p where p.schemaname = 'public' and p.tablename = c.relname) as n,
+             (select min(cmd) from pg_policies p where p.schemaname = 'public' and p.tablename = c.relname) as cmd
+        from pg_class c join pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = 'public' and c.relname in ('enrollment_request_holds','enrollment_request_events')) t`],
+
+  ['#60    an approval requires its grant (guard present, scoped to the transition)', `select count(*) = 1 and coalesce(bool_and(tgqual is not null and tgenabled = 'O'), false) as ok
+    from pg_trigger where tgrelid = 'public.enrollment_requests'::regclass
+      and not tgisinternal and tgname = 'enrollment_approval_requires_grant'`],
+
+  // ★ The live proof: no request approved after #60 is missing its membership term.
+  ['#60    no request approved since #60 lacks a membership term', `select count(*) = 0 as ok
+    from public.enrollment_requests r
+   where r.status = 'approved'
+     and r.reviewed_at > coalesce((select applied_at from public.schema_migrations
+                                    where filename = '2026-09-15-enrollment-management.sql'), 'infinity'::timestamptz)
+     and not exists (select 1 from public.subscriptions s where s.request_id = r.id)
+     and not exists (select 1 from public.subscriptions s where s.user_id = r.user_id and s.status = 'active' and s.ends_at is null)`],
+
+  ['#60    no hold remains on a request that is no longer pending', `select count(*) = 0 as ok
+    from public.enrollment_request_holds h join public.enrollment_requests r on r.id = h.request_id
+   where r.status <> 'pending_review'`],
+
 ];
 
 async function main() {
