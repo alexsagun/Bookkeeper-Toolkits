@@ -1697,8 +1697,13 @@ correction; still gated on `enrollments.review`, so Operations Admins keep it. *
 
 Tab id `communications`, route `/admin/communications`, an admin-nav row directly after Financial
 Management. Migration [db/2026-09-16-communications.sql](db/2026-09-16-communications.sql), folded
-verbatim as bootstrap **§48**. **Not yet applied to production** at the time of writing — it was
-rehearsed and behaviour-probed on the live catalog in aborted transactions.
+verbatim as bootstrap **§48**. **Applied to production 2026-09-16 (Manila time)** as one transaction, right
+after a fresh forced-abort rehearsal on the live catalog. Verified there by the post-apply catalog checks
+(21 permissions / 34 grants; four tables with exactly one SELECT policy each; the four sending functions
+executable by `service_role` alone; no anon-executable function; no client write grant; the 104-code
+catalog), by the full behaviour probe re-run against the applied schema in a rolled-back transaction —
+identical to the pre-apply run — and by an advisors comparison with the pre-#61 baseline, whose only
+security change is the 15 new client RPCs on the authenticated SECURITY DEFINER list.
 
 - **`communications.send`** — the 21st staff permission, **super_admin only** (34 grants). A payment
   reminder reads what a student owes, so it ALSO needs `finance.manage`, checked in
