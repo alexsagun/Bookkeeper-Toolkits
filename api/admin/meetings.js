@@ -352,11 +352,20 @@ export default async function handler(req, res) {
             invite = await inviteAndSend(u, recorded.id, audience, String(body.client_key), started);
           } catch (e) {
             // Only meeting_send_invites itself can fail here now, and a lost response may still have
-            // committed — so this is "not certain", never "not queued", and the request key rides back
-            // so the same invitation can be retried without emailing anyone twice.
+            // committed — so that case is "not certain", never "not queued", and the request key rides
+            // back so the same invitation can be retried without emailing anyone twice.
+            // ★ BUT A REFUSAL IS NOT AN UNCERTAINTY. callerRpc reports a timeout, a network fault and
+            //   every 5xx as 502; those, and only those, may have committed. A 4xx the database
+            //   answered with, or 501 for a missing migration, means the call was refused and nothing
+            //   was created — telling the admin it "may have gone out" would stop them fixing the
+            //   input and pressing Schedule again, which is exactly what that case needs.
+            const uncertain = !(e instanceof HttpError) || e.status === 502;
+            // An uncertain outcome gets a neutral sentence: the screen puts it after "It is not certain
+            // whether the invitations were queued", and neither "could not be queued" nor callerRpc's
+            // "Try again." may follow that.
             invite = {
-              error: e instanceof HttpError ? e.message : 'The invitations could not be queued.',
-              code: e.code, uncertain: true, client_key: String(body.client_key),
+              error: uncertain ? 'The database did not confirm the invitations in time.' : e.message,
+              code: e.code, uncertain, client_key: String(body.client_key),
             };
           }
         }

@@ -306,7 +306,9 @@ async function sendResend(apiKey, from, to, subject, html) {
   });
   const text = await r.text();
   if (!r.ok) {
-    console.error(`[notify-enrollment] resend ${r.status}: ${text.slice(0, 500)}`);
+    // Status only: the body carries the addresses this handler exists to keep private, and a
+    // deployment log is not the place for them. Read the detail from the admin 'test' action.
+    console.error(`[notify-enrollment] resend ${r.status}`);
     return { ok: false, status: r.status, detail: text.slice(0, 300) };
   }
   let data = {};
@@ -476,7 +478,13 @@ export default async function handler(req, res) {
         await sendStudentCopy();
         return res.status(200).json(out);
       }
-      await recordNotify(requestId, u.token, 'provider_error', out.detail || `status ${out.status}`);
+      // ★ A CODE, NEVER THE PROVIDER'S SENTENCE. notify_detail is stored on the STUDENT's own
+      //   request row, which enroll_req_own_select lets them read — and a Resend rejection body
+      //   names the from-address, the admin recipient it could not reach, or the unverified
+      //   domain. The column has said "short, non-secret provider detail slice" since #16; this
+      //   is the line that made that untrue. The full body still reaches the admin through the
+      //   'test' action, which is gated on enrollments.review.
+      await recordNotify(requestId, u.token, 'provider_error', `resend_${out.status}`);
       return res.status(502).json({ ok: false, error: 'Email provider rejected the request.' });
     } catch (err) {
       console.error('[notify-enrollment] send failed:', String(err));

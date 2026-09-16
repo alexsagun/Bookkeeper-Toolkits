@@ -219,7 +219,12 @@ test('a failure after the invitations are queued is reported as a send failure, 
   assert.ok(!/catch \(e\) \{[\s\S]*\berror:/.test(fn),
     'and never as error — the screen reads that as "not queued" and would invite everyone a second time');
   const create = src.slice(src.indexOf("if (action === 'create')"), src.indexOf("if (action === 'invite')"));
-  assert.ok(create.includes('uncertain: true') && create.includes('client_key: String(body.client_key)'),
+  // ★ #63 narrowed this from a flat `uncertain: true`. A lost answer is still uncertain and its
+  //   request key still rides back — but a 4xx the database ANSWERED with, and 501 for a missing
+  //   migration, refused before anything was created, and saying "this may have gone out" about
+  //   those stops the admin fixing the input and pressing Schedule again.
+  assert.ok(create.includes('const uncertain = !(e instanceof HttpError) || e.status === 502;')
+    && create.includes('code: e.code, uncertain, client_key: String(body.client_key)'),
     'a lost answer from meeting_send_invites is uncertain, and its request key rides back');
 });
 

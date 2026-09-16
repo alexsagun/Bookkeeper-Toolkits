@@ -39,8 +39,18 @@ const FILES = [MIGRATION, BOOTSTRAP];
 /** Executable SQL only — prose explains the invariants by NAMING what must not exist. */
 const codeOf = (sql) => sql.split('\n').filter((l) => !l.trimStart().startsWith('--')).join('\n');
 
-/** #59 re-signs #58 functions and owns the error catalog from here on. */
+/** #59 re-signs #58 functions. */
 const PARITY = 'db/2026-09-14-finance-parity.sql';
+
+/**
+ * ★ THE CATALOG OWNER IS WHICHEVER FILE RESTATES IT LAST, AND IT IS NO LONGER #59.
+ * app_error_catalog() is one VALUES list restated whole, so #60, #61, #62 and #63 each own it in
+ * turn. This pointer sat on #59 from #59 until #63 and kept passing only because none of those
+ * migrations added a FINANCE_ code — the check was reading a superseded definition, which is
+ * strictly weaker than reading the one that runs last. Repoint it whenever a migration restates
+ * the catalog, exactly as CURRENT_CATALOG_MIGRATION is repointed in communityStaffSql.test.mjs.
+ */
+const CATALOG_OWNER = 'db/2026-09-18-management-hardening.sql';
 
 /** The bootstrap carries every migration; scope it to the §45 fold. */
 function financeSection(rel) {
@@ -448,11 +458,11 @@ test('finance.manage is the 20th permission and is Super-Admin-only', () => {
 });
 
 test('every finance error code is in the SQL catalog, the client list and the copy table', () => {
-  // The catalog is one VALUES list restated whole, so the CURRENT owner is the last file
-  // that restates it (#59). Raised codes come from both finance migrations.
-  const owner = read(PARITY);
+  // The catalog is one VALUES list restated whole, so the CURRENT owner is the last file that
+  // restates it — see CATALOG_OWNER. Raised codes come from every migration that raises one.
+  const owner = read(CATALOG_OWNER);
   const catalog = owner.slice(owner.indexOf('create or replace function public.app_error_catalog()'));
-  const sql = read(MIGRATION) + '\n' + owner;
+  const sql = read(MIGRATION) + '\n' + read(PARITY) + '\n' + owner;
   const financeCodes = APP_ERROR_CODES.filter((c) => c.startsWith('FINANCE_'));
   assert.ok(financeCodes.length >= 27, `expected the finance codes, found ${financeCodes.length}`);
   for (const code of financeCodes) {

@@ -103,7 +103,7 @@ import {
 import { planFaststartRemux } from './lib/mp4Faststart';
 import {
   INTAKE_FIELDS, INTAKE_SECTIONS,
-  validateIntake, parseAmountPaid, normalizePhone,
+  validateIntake, parseAmountPaid, normalizePhone, MAX_INTAKE_AMOUNT,
   blankIntake, intakeField, fileTypeAllowed, contentTypeFor, intakeValuesFromRequest, intakePayload, ENROLLMENT_PROCESSING_NOTE,
 } from './lib/enrollmentIntake';
 import { AGREEMENT_VERSION, agreementModel, agreementSnapshot } from './lib/trainingAgreement';
@@ -6622,6 +6622,13 @@ function ExtendAccessModal({ user, profile, sub, latestReq, onClose, onSubmitted
     if (!file) { setErr('Please upload a screenshot or PDF of your payment.'); return; }
     const amt = Number(amountPaid);
     if (!amt || amt <= 0) { setErr('Please enter the amount you sent.'); return; }
+    // The same ceiling the intake form and the approval hook use — this path writes the same
+    // student-typed amount_paid into the same ledger. See MAX_INTAKE_AMOUNT.
+    if (amt > MAX_INTAKE_AMOUNT) {
+      setErr('That is larger than any extension costs — check the figure. If this really is the '
+        + 'amount, email support and we will record it.');
+      return;
+    }
     if (!agree) { setErr('Please confirm the checkbox before submitting.'); return; }
 
     setBusy(true);
@@ -16340,6 +16347,17 @@ function meetingAudienceOf(a) {
 }
 
 /** What happens to invitations a send left behind, as one clause (#61's words). */
+/**
+ * True when an invitation result needs the admin's attention: refused, uncertain, not configured,
+ * cut off, anything failed or still waiting. The SAME classification the Invite panel's heading uses
+ * (commDoneHeading), so a banner can never be green while its own text says the emails did not go.
+ */
+function meetingInviteNeedsAttention(invite) {
+  if (!invite) return false;
+  if (invite.error || invite.send_error) return true;
+  return !['Sent', 'Finished'].includes(commDoneHeading(invite));
+}
+
 function meetingInviteLeftover(invite) {
   if (!invite || invite.error) return '';
   const remaining = Number.isFinite(invite.remaining) ? invite.remaining : null;
@@ -16484,6 +16502,10 @@ function MeetingInvitePanel({ meeting, onClose, onDone }) {
   const [progress, setProgress] = useState(null);
   const [result, setResult] = useState(null);
   const [err, setErr] = useState('');
+  // ★ An unclear answer FREEZES who is invited. The request key is what makes pressing Send again
+  //   safe, and it is replaced the moment the audience changes — so an edit after an unclear answer
+  //   would queue a second campaign for the same people. Only a success releases it.
+  const [unclear, setUnclear] = useState(false);
   const { plans, batches } = useCommLookups(true);
   const audience = useMemo(() => meetingAudienceOf(aud), [aud]);
   const audienceKey = JSON.stringify(audience);
@@ -16513,12 +16535,22 @@ function MeetingInvitePanel({ meeting, onClose, onDone }) {
     try {
       const out = await meetingsApi({ action: 'invite', meeting_id: meeting.id, audience, client_key: keyRef.current });
       setResult(await meetingFinishInvite(out.invite, setProgress));
+      setUnclear(false);
       setStep('done');
       onDone?.();
     } catch (e) {
-      setErr(!e?.status
-        ? 'The connection dropped, so it is not certain whether the invitations were queued. Press Send again — nobody is emailed twice.'
-        : meetingErrorText(e, 'The invitations were not sent.'));
+      // A dropped connection, or a gateway 5xx with no sentence of ours: the invitations may already
+      // be queued and sending. Same rule as the Schedule button.
+      const noAnswer = !e?.status || (e.status >= 500 && !String(e?.message || '').trim());
+      if (noAnswer) {
+        setUnclear(true);
+        setErr('No clear answer came back, so it is not certain whether the invitations were queued. Press Send '
+          + 'again without changing who is invited — the same request is never emailed twice — or close this '
+          + 'panel and check the meeting’s invitation count before inviting again.');
+        onDone?.();
+      } else {
+        setErr(meetingErrorText(e, 'The invitations were not sent.'));
+      }
       setStep('edit');
     } finally { lockRef.current = false; }
   };
@@ -16566,7 +16598,7 @@ function MeetingInvitePanel({ meeting, onClose, onDone }) {
             <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
               <div style={FINANCE_LABEL_STYLE}>Who is invited</div>
               <div className="mt-2">
-                <MeetingAudienceFields value={aud} onChange={setAud} disabled={step !== 'edit'} plans={plans} batches={batches} />
+                <MeetingAudienceFields value={aud} onChange={setAud} disabled={step !== 'edit' || unclear} plans={plans} batches={batches} />
               </div>
               {preview && (
                 <div className="mt-3 text-sm" style={{ color: C.text }}>
@@ -16848,8 +16880,13 @@ function MeetingsTasks() {
       setInviteNow(false);
       loadCalendar();
     } catch (e) {
-      setFormErr(!e?.status
-        ? 'The connection dropped, so it is not certain whether Zoom created the meeting. Check the calendar before scheduling it again — Zoom does not recognise a repeated request.'
+      // ★ A 5xx WITH NO SENTENCE IS NOT A REFUSAL. Every 502 this handler raises itself — an
+      //   unclear Zoom answer, MEETING_LOG_FAILED — carries its own, more specific sentence, and
+      //   meetingErrorText prefers it. What is left is a gateway 502/504: the function was cut off,
+      //   possibly after Zoom had already created the meeting. "The meeting was not scheduled" is a
+      //   claim nobody here can make, and acting on it means a second Zoom meeting.
+      setFormErr(!e?.status || (e.status >= 500 && !String(e?.message || '').trim())
+        ? 'No clear answer came back, so it is not certain whether Zoom created the meeting. Check the calendar before scheduling it again — Zoom does not recognise a repeated request.'
         : meetingErrorText(e, 'The meeting was not scheduled.'));
       if (e?.hint === 'MEETING_LOG_FAILED') loadCalendar();
     } finally {
@@ -17178,14 +17215,21 @@ function MeetingsTasks() {
                     {inviteProgress.remaining ? `, ${inviteProgress.remaining} to go` : ''}. Keep this page open.
                   </div>
                 )}
+                {/* ★ The meeting was scheduled, but a banner that stays green while its own text
+                    says the invitations did not go is read as a success and dismissed — so the
+                    colour follows the same classification as the Invite panel's heading. */}
                 {scheduleResult && (
-                  <AdminNotice kind="ok" onDismiss={() => setScheduleResult(null)}>
+                  <AdminNotice kind={meetingInviteNeedsAttention(inv) ? 'warn' : 'ok'} onDismiss={() => setScheduleResult(null)}>
                     Scheduled in Zoom — {scheduleResult.sessions} session{scheduleResult.sessions === 1 ? '' : 's'}.
                     {!inv && ' Invite students from the calendar when you are ready.'}
                     {/* ★ Queued and sent are different facts. Anything that fails AFTER the invitations
                         are queued must never read as "not queued": the answer to that is to invite
-                        again, which emails the whole audience a second time. */}
-                    {inv?.error && ` It is not certain whether the invitations were queued: ${inv.error} Open the calendar — this meeting shows how many are waiting — and invite again only if it shows none.`}
+                        again, which emails the whole audience a second time. And a refusal is not an
+                        uncertainty either — the server says which this was, and being told to go and
+                        check a calendar that will show nothing is how a refusal goes unfixed. */}
+                    {inv?.error && (inv.uncertain
+                      ? ` It is not certain whether the invitations were queued: ${inv.error} Open the calendar — this meeting shows how many are waiting — and invite again only if it shows none.`
+                      : ` No invitations were queued: ${inv.error} Nothing has been emailed — invite from the calendar once that is sorted.`)}
                     {inv?.send_error && ` All ${inv.queued} invitation${inv.queued === 1 ? ' is' : 's are'} queued and go out on the next run — do not invite again (${inv.send_error}).`}
                     {inv && !inv.error && !inv.send_error && ` ${inv.sent || 0} invitation${inv.sent === 1 ? '' : 's'} delivered to the email provider${inv.failed ? `, ${inv.failed} failed` : ''}${meetingInviteLeftover(inv) ? `; ${meetingInviteLeftover(inv)}` : ''}.`}
                   </AdminNotice>

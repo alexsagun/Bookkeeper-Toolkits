@@ -1077,7 +1077,7 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   staff-activation-consistency (#50) → access-request-staff-target (#51) →
   student-progress-rankings (#52) → progress-rankings-followup (#53) →
   progress-course-family-scoping (#54) → approve-rpc-grant-revoke (#55) →
-  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61) → meetings-tasks (#62)** — see the Staff-authorization
+  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61) → meetings-tasks (#62) → management-hardening (#63)** — see the Staff-authorization
   and Progress & Rankings sections for what each does. **#57**
   ([db/2026-09-08-lesson-video-quicktime.sql](db/2026-09-08-lesson-video-quicktime.sql), fold
   **§44**) widens `course-videos.allowed_mime_types` to
@@ -1673,7 +1673,8 @@ payee + account quick-picks, never an amount, seeded by category only).
 - ★ **Only an ORIGINAL entry is reclassified**, and reverse / reclassify / match / the reconciliation matcher
   all lock their row before checking. Add, Match and status changes refuse inside a closed reconciliation.
 - Re-signs five #58 functions (each dropped first) and restates the catalog; #60 restates it again, so
-  `test/communityStaffSql.test.mjs`'s `CURRENT_CATALOG_MIGRATION` points at #60. No permission changes.
+  the catalog has been restated again since, so `CURRENT_CATALOG_MIGRATION` (communityStaffSql) and
+  `CATALOG_OWNER` (financeSql) both point at **#63** — repoint them with every restatement. No permission changes.
   Suite: `test/financeParitySql.test.mjs` (it pins every stage-review fix above).
 
 **Enrollment management (#60, [db/2026-09-15-enrollment-management.sql](db/2026-09-15-enrollment-management.sql), fold §47)** —
@@ -1905,6 +1906,69 @@ its to-do board in ONE browser's localStorage.
   `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID` and `ZOOM_CLIENT_SECRET` in Vercel. Until then the tab says Zoom
   is not connected, and templates and the to-do board still work. **Zoom itself is stub-tested only**
   — nothing in this feature has talked to the real Zoom API yet.
+
+## Management hardening — what the final #58–#62 security review found (#63)
+
+Migration [db/2026-09-18-management-hardening.sql](db/2026-09-18-management-hardening.sql), folded verbatim
+as bootstrap **§50**. **Applied to production 2026-09-16 (Manila time)** as one transaction after a
+forced-abort rehearsal. It adds no table, no permission and **no RPC** — the advisors comparison shows no
+security change at all — and it changes nine function bodies plus one constraint.
+
+★ **EVERY BODY HERE WAS COPIED, NOT RETYPED, AND EACH WAS CHECKED AGAINST PRODUCTION FIRST.** The file is
+assembled by a script that lifts the current body out of #58/#59/#60/#62 and applies anchored edits, and the
+md5 of every source body was compared with the live `prosrc` before copying. That is the #33/#34 rule made
+mechanical: #59 added the feed-link refusals, and a #63 that retyped those bodies from #58's text would have
+deleted them silently.
+
+- ★ **AN APPROVAL EXEMPTION BELONGED TO A MEMBER; NOW IT BELONGS TO A PATH.** #60's
+  `enrollment_approval_requires_grant` exempted anyone holding a legacy no-expiry term, on every request
+  kind and for ever — so an Operations Admin could PATCH such a member's *renewal* straight to `approved`
+  through PostgREST, granting nothing while #58's hook still booked the payment. **Verified live** on the
+  pre-#63 schema in a rolled-back transaction: it worked. The exemption now also requires
+  `request_kind = 'extension'`, which is the only case that needs it (`approve_extension` returns a
+  grandfathered term unchanged, so no subscription carries the request's id). A reviewer cannot relabel a
+  request to reach it: #48 grants UPDATE on `status` and five other columns, never on `request_kind`.
+- ★ **A STAGED BANK FILE IS NOT A STATEMENT.** #59 made "committed" load-bearing for the feed, but
+  reconciliation still read every row, so a file still under review counted as real — close was refused over
+  rows the feed says do not exist. `finance_reconciliation_detail`, `finance_close_reconciliation` and
+  `finance_reconciliations_list` now join the committed imports, and `finance_match_reconciliation_item`
+  refuses an uncommitted line outright. Because "committed" became the ONLY way in, three follow-on defects
+  had to close with it: commit and discard now **lock the import row** (two tabs both passed the status check,
+  and the second zeroed `duplicate_row_count`); commit **refuses to drop unreviewed lines into a CLOSED
+  reconciliation**; and the likely-duplicate pass compares only against committed files or the same file, so
+  a flag can no longer point at a line that a discard deleted.
+- ★ **THE STUDENT TYPES THE AMOUNT, AND IT REACHES THE LEDGER.** `amount_paid` had no ceiling, and
+  `parseAmountPaid` keeps digits — so a pasted phone number books as ₱9,171,234,567 (**verified live**: the
+  approval succeeded and granted a term), and past 1e12 it overflows `numeric(14,2)` and aborts the approval
+  with a bare 22003. Bounded at 1,000,000, the ceiling `admin_correct_enrollment_amount` has enforced since
+  #60. ★ The constraint is added **NOT VALID and then validated**, never skipped: #30's idiom dropped the whole
+  constraint when a legacy row failed it and said so only in a NOTICE, which the Management API discards — the
+  bound would have vanished for every future write while the log claimed it existed. `db:audit` checks
+  `convalidated`. The hook names `FINANCE_COLLECTION_AMOUNT_INVALID` instead of overflowing, and the
+  comped-approval test and the backfill filter read the amount **rounded to centavos**, which is what the
+  ledger lines hold (₱0.004 used to pass `> 0` and then abort on `finance_line_one_side`).
+- **Two client fixes ride with it.** `api/notify-enrollment.js` stored the provider's rejection body in
+  `notify_detail` — a column on the student's OWN request row, which `enroll_req_own_select` lets them read,
+  and which names the from-address and the admin recipient. It stores `resend_<status>` now and logs the
+  status only, the rule `api/_lib/email.js` has followed since #49; the full detail still reaches an admin
+  through the gated `test` action. And a **refused** Zoom invitation was reported as "the outcome is
+  uncertain": `api/admin/meetings.js` now marks uncertain only for callerRpc's 502 (timeout, network fault,
+  5xx), the schedule banner takes its colour from `meetingInviteNeedsAttention()` (the Invite panel's own
+  `commDoneHeading` classification, so the two surfaces cannot disagree), and an unclear answer in the Invite
+  panel **freezes the audience** — the request key is replaced whenever the audience changes, so an edit after
+  an unclear answer would have queued a second campaign to the same people.
+- **Lockstep:** `MAX_INTAKE_AMOUNT` in [src/lib/enrollmentIntake.js](src/lib/enrollmentIntake.js) ↔ the
+  `enrollment_requests_amounts_bounded` CHECK ↔ `finance_enrollment_collection_trg` ↔
+  `finance_backfill_enrollment_collections` ↔ `admin_correct_enrollment_amount` (#60) ↔
+  `ExtendAccessModal.submit`. `test/managementHardeningSql.test.mjs` builds its patterns FROM the constant, so
+  a drift fails rather than passing on a stale literal.
+- ★ **`CATALOG_OWNER` in `test/financeSql.test.mjs` had been stale since #60.** The finance-code check read
+  #59's catalog, which is a superseded definition — it kept passing only because no migration since added a
+  `FINANCE_` code. Repoint it, and `CURRENT_CATALOG_MIGRATION` in `test/communityStaffSql.test.mjs`, whenever
+  a migration restates `app_error_catalog()`. Both now name #63 (112 codes).
+- Suite: `test/managementHardeningSql.test.mjs` — every assertion runs against the dated file AND the §50
+  fold, and all 40 guards are mutation-tested. ★ The mutation runner counts a run that did not finish as an
+  ERROR, never as a passing guard: it once read a timeout as "SURVIVED".
 
 ## Progress & Rankings — learning analytics and privacy-safe leaderboards (#52)
 

@@ -220,6 +220,23 @@ export function parseAmountPaid(raw) {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * The most a student may declare as paid, in pesos.
+ *
+ * ★ THE STUDENT TYPES THIS FIGURE AND IT REACHES THE LEDGER. Since #58 an approval posts
+ *   `amount_paid` as a balanced collection into an append-only ledger, so a pasted phone number —
+ *   `parseAmountPaid` keeps digits, so `09171234567` reads as ₱9,171,234,567 — books as pesos, and
+ *   past 1e12 it overflows the journal line's own numeric(14,2) and aborts the approval with a bare
+ *   22003 that names nothing. The ceiling is the one `admin_correct_enrollment_amount` has enforced
+ *   since #60, and #63 puts it on the column and in the approval hook; this is the same number said
+ *   early, where the person who can fix it is still looking at the field.
+ *
+ * Moving together: this constant ↔ `ExtendAccessModal.submit` ↔ the
+ * `enrollment_requests_amounts_bounded` CHECK and `finance_enrollment_collection_trg` in
+ * db/2026-09-18-management-hardening.sql ↔ `admin_correct_enrollment_amount` (#60).
+ */
+export const MAX_INTAKE_AMOUNT = 1000000;
+
 /** Bump when the shape of the `intake` jsonb changes. Stored as `_v`. */
 export const INTAKE_JSON_VERSION = 1;
 
@@ -365,6 +382,9 @@ export function validateIntake(values = {}, ctx = {}) {
       errors.amountPaid = 'Enter the amount as a number, for example 16,999.';
     } else if (amount <= 0) {
       errors.amountPaid = 'Enter the amount you actually sent.';
+    } else if (amount > MAX_INTAKE_AMOUNT) {
+      errors.amountPaid = 'That is larger than any package costs — check the figure. If this really '
+        + 'is the amount, email support and we will record it.';
     }
   }
 

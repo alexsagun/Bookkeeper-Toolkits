@@ -1151,6 +1151,30 @@ export const OBJECT_CHECKS = [
     from unnest(array['public.meeting_templates', 'public.meetings', 'public.staff_tasks']) t`],
   ['#62    an invitation needs a request key', `select to_regprocedure('public.meeting_send_invites(uuid,jsonb,text)') is not null as ok`],
 
+  // ── #63, management hardening ─────────────────────────────────────────────
+  // ★ A later migration that restates one of these functions from #58/#59/#60's text silently undoes
+  //   #63 — db:shadow:verify compares signatures, never prosrc, so these are the live tripwire.
+  ['#63    an approval without its grant is exempt only on the extension path', `select count(*) = 1 as ok
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public' and p.proname = 'enrollment_approval_requires_grant'
+     and p.prosrc like '%new.request_kind = ''extension''%'`],
+  ['#63    reconciliation reads only committed bank imports (4 functions)', `select count(*) = 4 as ok
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public'
+     and p.proname in ('finance_reconciliation_detail', 'finance_close_reconciliation',
+                       'finance_reconciliations_list', 'finance_match_reconciliation_item')
+     and p.prosrc like '%finance_bank_imports bi%' and p.prosrc like '%''committed''%'`],
+  // convalidated, not merely present: #63 adds the bound NOT VALID so new writes are bounded even when a
+  // legacy row fails it, and then validates. A false here means such a row exists and was never corrected.
+  ['#63    enrollment amounts are bounded at 1,000,000, and validated', `select count(*) = 1 as ok from pg_constraint
+   where conname = 'enrollment_requests_amounts_bounded' and conrelid = 'public.enrollment_requests'::regclass
+     and convalidated`],
+  ['#63    the approval hook names an out-of-range amount', `select count(*) = 1 as ok
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public' and p.proname = 'finance_enrollment_collection_trg'
+     and p.prosrc like '%FINANCE_COLLECTION_AMOUNT_INVALID%'
+     and exists (select 1 from public.app_error_catalog() c where c.code = 'FINANCE_COLLECTION_AMOUNT_INVALID')`],
+
 ];
 
 async function main() {

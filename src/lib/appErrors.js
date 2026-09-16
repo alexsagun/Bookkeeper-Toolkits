@@ -165,6 +165,8 @@ export const APP_ERROR_CODES = [
   'ZOOM_NOT_CONNECTED',
   'ZOOM_REQUEST_FAILED',
   'MEETING_LOG_FAILED',
+  // Management hardening (#63)
+  'FINANCE_COLLECTION_AMOUNT_INVALID',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -460,6 +462,10 @@ const COPY = {
   MEETING_LOG_FAILED:
     'The meeting was created in Zoom but couldn’t be saved here, so any invitations you asked for were '
     + 'not sent. It still shows in the calendar from Zoom — don’t create it again.',
+  FINANCE_COLLECTION_AMOUNT_INVALID:
+    'This enrollment records an amount the books can’t post — it’s outside the range a collection may '
+    + 'hold. Use “Correct amount” on the request to set the figure the student actually paid, then '
+    + 'approve it.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };
