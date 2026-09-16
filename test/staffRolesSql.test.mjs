@@ -35,7 +35,7 @@ const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => readFileSync(join(REPO, rel), 'utf8').replace(/\r\n/g, '\n');
 
 const MIGRATION = 'db/2026-08-25-staff-authorization.sql';
-const CURRENT_SEED_MIGRATION = 'db/2026-09-16-communications.sql';
+const CURRENT_SEED_MIGRATION = 'db/2026-09-17-meetings-tasks.sql';
 const BOOTSTRAP = 'db/000_full_database_bootstrap.sql';
 const SQL_FILES = [MIGRATION, BOOTSTRAP];
 const SEED_SQL_FILES = [CURRENT_SEED_MIGRATION, BOOTSTRAP];
@@ -202,10 +202,10 @@ for (const file of SEED_SQL_FILES) {
   });
 }
 
-test('the matrix is pinned in both current seed definitions, all 34 grants', () => {
-  assert.equal(JS_PAIRS.length, 34,
-    '21 super_admin + 8 operations_admin + 5 trainer; a change here must be deliberate. '
-    + '#58 added finance.manage and #61 communications.send, both to super_admin alone. '
+test('the matrix is pinned in both current seed definitions, all 35 grants', () => {
+  assert.equal(JS_PAIRS.length, 35,
+    '22 super_admin + 8 operations_admin + 5 trainer; a change here must be deliberate. '
+    + '#58 added finance.manage, #61 communications.send and #62 meetings.manage, each to super_admin alone. '
     + '#56 added community.manage + community.moderate to BOTH non-super roles, which is '
     + 'what made its server-side re-gate mandatory rather than optional.');
   assert.equal(permissionComparisons, SEED_SQL_FILES.length, 'permissions unchecked in one file');

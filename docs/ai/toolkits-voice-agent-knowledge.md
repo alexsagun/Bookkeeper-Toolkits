@@ -1,5 +1,5 @@
 <!-- GENERATED FILE — do not hand-edit. Regenerate with `npm run ai:knowledge`
-     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-09-15 -->
+     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-09-16 -->
 
 # Toolkits by Alex — Voice Assistant Knowledge
 
@@ -12,7 +12,7 @@ paths never change.
 
 ## 1. App overview
 
-- The toolkit bundles **37 tools** across three career stages: **01 Training &
+- The toolkit bundles **38 tools** across three career stages: **01 Training &
   Skills** (build your foundation), **02 Job Application** (land US clients), and
   **03 Client Management & Delivery** (onboard, operate, close the year), plus a Home
   dashboard.
@@ -99,6 +99,7 @@ paths never change.
 | Access Requests | `accessrequests` | `/admin/access-requests` | Admin screen: approve or reject new signups. |
 | Financial Management | `financialmanagement` | `/admin/financial-management` | Admin screen: the business finance dashboard. Super Admin only. |
 | Communications | `communications` | `/admin/communications` | Admin screen: send announcements and student emails, manage email automations, and read the delivery tracker. Super Admin only. |
+| Meetings & Tasks | `meetings` | `/admin/meetings` | Admin screen: schedule Zoom meetings, invite students, keep meeting templates, and use the shared staff to-do board. Super Admin only. |
 | Enrollments | `enrollments` | `/admin/enrollments` | Admin screen: review payment receipts, approve subscriptions, and manage renewals. |
 | Student Imports | `studentimports` | `/admin/student-imports` | Admin screen: migrate legacy Thinkific students — validate, map course-combos to plans, dry-run, and import accounts + memberships. |
 | Team & Roles | `staffroles` | `/admin/team` | Admin screen: invite staff and manage who they are — assign the Super Admin, Operations Admin and Trainer roles, suspend or revoke access, and read the audit trail of every role change. Super Admin only. |

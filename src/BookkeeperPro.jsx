@@ -73,6 +73,7 @@ import {
 } from './lib/planCatalog';
 import { FINANCE_ACCOUNT_TYPES, FINANCE_AGING_BUCKETS } from './lib/financeModel';
 import { BANK_STATEMENT_PRESETS, presetColumnMap, readStatementRows } from './lib/bankStatement';
+import * as MTG from './lib/meetingSchedule';
 import {
   COMM_PREVIEW_VARS, COMM_TAGS, COMM_TAG_HELP, COMM_TEMPLATES, parseManualEmails, renderPreviewDocument,
   templatesFor, unknownTags,
@@ -166,6 +167,7 @@ const TAB_ROUTES = {
   staffroles: '/admin/team',
   financialmanagement: '/admin/financial-management',
   communications: '/admin/communications',
+  meetings: '/admin/meetings',
   course: '/courses/accounting-101',
   qbomastery: '/courses/quickbooks-online-mastery',
   industryacc: '/industry-accounting',
@@ -215,7 +217,7 @@ const VALID_APP_TABS = new Set(Object.keys(TAB_ROUTES));
 // admin-only screens, the member community (a space, not a tool), and the legacy
 // mockinterview alias (a redirect, not a tool). Derived so the number can never drift
 // from the actual toolkit again.
-const NON_TOOL_TAB_IDS = new Set(['dashboard', 'progress', 'community', 'accessrequests', 'enrollments', 'studentimports', 'batches', 'staffroles', 'financialmanagement', 'communications', 'mockinterview']);
+const NON_TOOL_TAB_IDS = new Set(['dashboard', 'progress', 'community', 'accessrequests', 'enrollments', 'studentimports', 'batches', 'staffroles', 'meetings', 'financialmanagement', 'communications', 'mockinterview']);
 const TOOL_COUNT = Object.keys(TAB_ROUTES).filter((id) => !NON_TOOL_TAB_IDS.has(id)).length;
 const INTERVIEW_SUBTAB_IDS = new Set(['winstrat', 'mock', 'common', 'accounting', 'body', 'jdgen', 'salary']);
 const APP_ROUTE_CHANGE_EVENT = 'bookkeeper:route-change';
@@ -457,6 +459,7 @@ const VOICE_TAB_INFO = {
   financialmanagement: { label: 'Financial Management', stage: 'Admin', desc: 'Admin screen: the business finance dashboard. Super Admin only.', adminOnly: true },
   // Navigation only, like the finance entry above: no recipient, address or message content.
   communications: { label: 'Communications', stage: 'Admin', desc: 'Admin screen: send announcements and student emails, manage email automations, and read the delivery tracker. Super Admin only.', adminOnly: true },
+  meetings: { label: 'Meetings & Tasks', stage: 'Admin', desc: 'Admin screen: schedule Zoom meetings, invite students, keep meeting templates, and use the shared staff to-do board. Super Admin only.', adminOnly: true },
   enrollments:  { label: 'Enrollments', stage: 'Admin', desc: 'Admin screen: review payment receipts, approve subscriptions, and manage renewals.', adminOnly: true },
   studentimports: { label: 'Student Imports', stage: 'Admin', desc: 'Admin screen: migrate legacy Thinkific students — validate, map course-combos to plans, dry-run, and import accounts + memberships.', adminOnly: true },
   staffroles: { label: 'Team & Roles', stage: 'Admin', desc: 'Admin screen: invite staff and manage who they are — assign the Super Admin, Operations Admin and Trainer roles, suspend or revoke access, and read the audit trail of every role change. Super Admin only.', adminOnly: true },
@@ -7728,6 +7731,7 @@ function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImport
     case 'staffroles': return <AdminStaffRoles />;
     case 'financialmanagement': return <FinancialManagement />;
     case 'communications': return <Communications />;
+    case 'meetings': return <MeetingsTasks />;
     case 'coa': return <CoaGenerator />;
     case 'course': return <Course />;
     case 'qbomastery': return <QBOMastery />;
@@ -8412,6 +8416,8 @@ export default function BookkeeperProToolkit() {
     { id: 'financialmanagement', label: 'Financial Management', Icon: Landmark, count: 0, tone: C.primary },
     // Right after Financial Management, by owner decision (#61). Super Admin only.
     { id: 'communications', label: 'Communications', Icon: Megaphone, count: 0, tone: C.primary },
+    // Right after Communications, by owner decision (#62). Super Admin only.
+    { id: 'meetings', label: 'Meetings & Tasks', Icon: CalendarClock, count: 0, tone: C.primary },
     { id: 'studentimports', label: 'Student Imports', Icon: UploadCloud, count: importActiveCount, tone: C.primary },
     { id: 'batches', label: 'Batches', Icon: CalendarCheck, count: 0, tone: C.primary },
     { id: 'staffroles', label: 'Team & Roles', Icon: Users, count: 0, tone: C.primary },
@@ -16235,6 +16241,1093 @@ function FinancialManagement() {
             </div>
           )}
         </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Meetings & Tasks (#62) — Zoom meetings, invitations, meeting templates and the shared staff
+// to-do board. Super Admin only (meetings.manage).
+//
+// ★ ZOOM IS CALLED ONLY BY api/admin/meetings.js, which holds the Zoom credentials. The browser
+//   sends the FORM; the handler validates it with the same src/lib/meetingSchedule.js functions
+//   this screen previews with, creates the meeting in Zoom, then records it with the caller's JWT.
+// ★ AN INVITATION IS A #61 CAMPAIGN built on the server from the stored meeting. The browser
+//   chooses WHO, never what the email says, and every request carries a request key minted once
+//   per invitation, so a retried request never emails anyone twice.
+// ★ CREATING IS NOT IDEMPOTENT AT ZOOM, so Schedule is held by a ref lock (a state flag re-renders
+//   too late to stop a double click), and an unclear failure says to check the calendar first.
+// Pinned by test/meetingsSql.test.mjs.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MEETING_SUBTABS = [
+  { key: 'calendar', label: 'Calendar' },
+  { key: 'schedule', label: 'Schedule a meeting' },
+  { key: 'templates', label: 'Templates' },
+  { key: 'tasks', label: 'To-do board' },
+];
+const MEETING_VIEWS = [{ key: 'list', label: 'List' }, { key: 'week', label: 'Week' }, { key: 'month', label: 'Month' }];
+// A template suggests an audience it can store: never a date range or a pasted list.
+const MEETING_TEMPLATE_AUDIENCES = COMM_AUDIENCE_MODES.filter((m) => ['all', 'batch', 'plans'].includes(m.key));
+const MEETING_TASK_SCOPES = [
+  { key: 'day', label: 'Today' },
+  { key: 'week', label: 'This week' },
+  { key: 'month', label: 'This month' },
+];
+
+/** POST to the Meetings endpoint with the caller's JWT. app_error codes ride in `code`, re-attached as `hint`. */
+async function meetingsApi(payload) {
+  const { data: s } = await supabase.auth.getSession();
+  const token = s?.session?.access_token;
+  const res = await fetch('/api/admin/meetings', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(payload),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const e = new Error(json.error || '');
+    e.hint = json.code || null;
+    e.status = res.status;
+    throw e;
+  }
+  return json;
+}
+
+/** The endpoint's own sentence names the actual problem; a database error uses the copy table. */
+const meetingErrorText = (e, fallback) => {
+  const said = typeof e?.message === 'string' ? e.message.trim() : '';
+  if (e?.status && said && said.length <= 240) return said;
+  return commErrorText(e, fallback);
+};
+
+/** A Manila calendar date as words. The date is already Manila's, so it is formatted as UTC. */
+const meetingDateLabel = (iso, opts = { weekday: 'short', month: 'short', day: 'numeric' }) =>
+  new Date(`${iso}T00:00:00Z`).toLocaleDateString('en-US', { ...opts, timeZone: 'UTC' });
+const meetingDaysLabel = (days) => (days || []).map((d) => MTG.MEETING_WEEKDAYS[d]?.short).filter(Boolean).join(', ');
+const meetingShiftMonth = (iso, n) => {
+  const [y, m] = iso.split('-').map(Number);
+  const d = new Date(Date.UTC(y, m - 1 + n, 1));
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-01`;
+};
+// ★ Only an https link ever becomes an href — the same rule the server applies before storing one.
+const meetingSafeLink = (url) => (typeof url === 'string' && /^https:\/\//.test(url) ? url : null);
+const meetingAudienceLabel = (a) => (a?.mode === 'plans' ? 'selected packages' : a?.mode === 'batch' ? 'one batch' : 'all current members');
+
+const blankMeetingForm = () => ({
+  topic: '', date: MTG.manilaToday(), time: '09:00', duration: 60,
+  recurrence: 'none', days: [], endMode: 'count', count: 4, endDate: '',
+  joinBeforeHost: true, waitingRoom: false, templateKey: '',
+});
+const blankMeetingAudience = (patch = {}) => ({
+  mode: 'all', batchId: '', planKeys: [], from: commDaysAgoISO(30), to: commDaysAgoISO(0),
+  manualText: '', activeOnly: true, ...patch,
+});
+/** A stored audience ({ mode, batch_id, plan_keys }) as form state. */
+const meetingAudienceState = (a, modes = COMM_AUDIENCE_MODES) => blankMeetingAudience({
+  mode: modes.some((m) => m.key === a?.mode) ? a.mode : 'all',
+  batchId: a?.batch_id || '',
+  planKeys: Array.isArray(a?.plan_keys) ? a.plan_keys : [],
+});
+/** The audience as the server reads it — the same shapes the #61 composer sends. */
+function meetingAudienceOf(a) {
+  if (a.mode === 'batch') return { mode: 'batch', batch_id: a.batchId || null };
+  if (a.mode === 'plans') return { mode: 'plans', plan_keys: a.planKeys };
+  if (a.mode === 'approved_between') return { mode: 'approved_between', from: a.from, to: a.to, active_only: a.activeOnly };
+  if (a.mode === 'manual') return { mode: 'manual', emails: parseManualEmails(a.manualText).emails, active_only: a.activeOnly };
+  return { mode: 'all' };
+}
+
+/** What happens to invitations a send left behind, as one clause (#61's words). */
+function meetingInviteLeftover(invite) {
+  if (!invite || invite.error) return '';
+  const remaining = Number.isFinite(invite.remaining) ? invite.remaining : null;
+  return commLeftoverText({
+    remaining,
+    stopped: remaining === null ? 'unknown' : invite.halted ? 'halted'
+      : remaining && remaining <= (Number(invite.retry_later) || 0) ? 'backoff' : (invite.stopped || 'limit'),
+  });
+}
+
+/** The endpoint sends for ~45 s; anything still waiting goes out through #61's send loop. */
+async function meetingFinishInvite(invite, onProgress) {
+  if (!invite || invite.error || !invite.campaign_id || invite.halted) return invite;
+  if (!(Number(invite.remaining) > (Number(invite.retry_later) || 0))) return invite;
+  try {
+    const more = await commSendLoop(invite.campaign_id, onProgress);
+    // The endpoint's own send may have failed where this one succeeded: the rows went out, so that
+    // earlier failure is no longer part of the story.
+    const { send_error: finished, ...rest } = invite;
+    void finished;
+    return {
+      ...rest, sent: (invite.sent || 0) + more.sent, failed: (invite.failed || 0) + more.failed,
+      remaining: more.remaining, retry_later: more.retryLater, halted: more.stopped === 'halted', stopped: more.stopped,
+    };
+  } catch {
+    // The meeting and the queued invitations exist; only how many went out is unknown.
+    return { ...invite, remaining: null, stopped: 'unknown' };
+  }
+}
+
+function MeetingAudienceFields({ value, onChange, disabled, plans, batches, modes = COMM_AUDIENCE_MODES }) {
+  const set = (patch) => onChange({ ...value, ...patch });
+  const manual = useMemo(() => parseManualEmails(value.manualText), [value.manualText]);
+  return (
+    <div className="space-y-3">
+      <select value={value.mode} onChange={(e) => set({ mode: e.target.value })} disabled={disabled} aria-label="Who is invited"
+        className="gh-input w-full" style={{ fontSize: 13 }}>
+        {modes.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}
+      </select>
+      {value.mode === 'batch' && (
+        <select value={value.batchId} onChange={(e) => set({ batchId: e.target.value })} disabled={disabled} aria-label="Batch"
+          className="gh-input w-full" style={{ fontSize: 13 }}>
+          <option value="">Choose a batch…</option>
+          {batches.map((b) => <option key={b.id} value={b.id}>{b.code} — {b.name}{b.status !== 'open' ? ` (${b.status})` : ''}</option>)}
+        </select>
+      )}
+      {value.mode === 'plans' && (
+        <CommPlanChecks plans={plans} value={value.planKeys} onChange={(planKeys) => set({ planKeys })} disabled={disabled} />
+      )}
+      {value.mode === 'approved_between' && (
+        <div className="grid grid-cols-2 gap-2">
+          <label className="block"><span style={FINANCE_LABEL_STYLE}>From</span>
+            <input type="date" value={value.from} onChange={(e) => set({ from: e.target.value })} disabled={disabled} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+          <label className="block"><span style={FINANCE_LABEL_STYLE}>To</span>
+            <input type="date" value={value.to} onChange={(e) => set({ to: e.target.value })} disabled={disabled} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+        </div>
+      )}
+      {value.mode === 'manual' && (
+        <div>
+          <textarea value={value.manualText} onChange={(e) => set({ manualText: e.target.value })} rows={4} disabled={disabled}
+            aria-label="Email addresses" placeholder="One address per line, or separated by commas" className="gh-input w-full" style={{ fontSize: 13 }} />
+          <div style={{ fontSize: 11.5, color: manual.invalid.length || manual.overLimit ? 'var(--status-warn-fg)' : C.textMute }}>
+            {manual.emails.length} valid address(es){manual.invalid.length ? ` · ${manual.invalid.length} not valid` : ''}
+            {manual.overLimit ? ' · only the first 50 are used' : ''}
+          </div>
+        </div>
+      )}
+      {(value.mode === 'approved_between' || value.mode === 'manual') && (
+        <label className="inline-flex items-center gap-2 text-sm" style={{ color: C.text }}>
+          <input type="checkbox" checked={value.activeOnly} onChange={(e) => set({ activeOnly: e.target.checked })} disabled={disabled} />
+          Only people whose membership is still active
+        </label>
+      )}
+    </div>
+  );
+}
+
+function MeetingDayChecks({ value, onChange, disabled }) {
+  return (
+    <div className="flex flex-wrap gap-1.5 mt-1">
+      {MTG.MEETING_WEEKDAYS.map((d) => {
+        const on = value.includes(d.day);
+        return (
+          <button key={d.day} type="button" aria-pressed={on} aria-label={d.label} disabled={disabled}
+            onClick={() => onChange(on ? value.filter((x) => x !== d.day) : [...value, d.day].sort((a, b) => a - b))}
+            className="px-2.5 py-1 rounded-lg text-xs font-semibold disabled:opacity-60"
+            style={on ? { background: C.primarySolid, color: 'white' } : { background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+            {d.short}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function MeetingItemRow({ item, log, onInvite, onCancel }) {
+  const link = meetingSafeLink(item.joinUrl);
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(link); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* clipboard blocked */ }
+  };
+  const btn = 'px-2.5 py-1 rounded-lg text-xs font-semibold inline-flex items-center gap-1';
+  const ghost = { background: C.white, color: C.textSoft, border: `1px solid ${C.border}` };
+  return (
+    <div className="rounded-xl px-3 py-2.5 flex flex-wrap items-center gap-x-3 gap-y-1.5"
+      style={{ background: C.white, border: `1px solid ${C.border}`, opacity: item.cancelled ? 0.6 : 1 }}>
+      <div style={{ fontFamily: fontMono, fontSize: 12.5, color: C.text, minWidth: 64 }}>{MTG.formatClock(item.time)}</div>
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-semibold truncate" style={{ color: C.text, textDecoration: item.cancelled ? 'line-through' : 'none' }}>{item.topic}</div>
+        <div style={{ fontSize: 11.5, color: C.textMute }}>
+          {item.duration ? `${item.duration} min` : ''}
+          {item.source === 'zoom' ? ' · created in Zoom, not scheduled here' : ''}
+          {item.cancelled ? ' · cancelled' : ''}
+          {log && log.invited ? ` · ${log.sent} of ${log.invited} invitations sent${log.waiting ? `, ${log.waiting} waiting` : ''}` : ''}
+        </div>
+      </div>
+      {link && !item.cancelled && (
+        <>
+          <a href={link} target="_blank" rel="noopener noreferrer" className="text-xs font-semibold inline-flex items-center gap-1" style={{ color: C.primary }}>
+            <Video size={13} /> Join link
+          </a>
+          <button type="button" onClick={copy} className="text-xs inline-flex items-center gap-1" style={{ color: C.textSoft }} aria-label="Copy the join link">
+            <Copy size={12} /> {copied ? 'Copied' : 'Copy'}
+          </button>
+        </>
+      )}
+      {!item.cancelled && (onInvite || onCancel) && (
+        <div className="flex gap-1.5 ml-auto">
+          {onInvite && <button type="button" onClick={onInvite} className={btn} style={ghost}><Send size={12} /> Invite</button>}
+          {onCancel && <button type="button" onClick={onCancel} className={btn} style={ghost}><Trash2 size={12} /> Cancel</button>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MeetingInvitePanel({ meeting, onClose, onDone }) {
+  const [aud, setAud] = useState(() => meetingAudienceState(meeting?.audience));
+  const [preview, setPreview] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [step, setStep] = useState('edit');      // edit | sending | done
+  const [progress, setProgress] = useState(null);
+  const [result, setResult] = useState(null);
+  const [err, setErr] = useState('');
+  const { plans, batches } = useCommLookups(true);
+  const audience = useMemo(() => meetingAudienceOf(aud), [aud]);
+  const audienceKey = JSON.stringify(audience);
+  const audienceKeyRef = useRef(audienceKey);
+  audienceKeyRef.current = audienceKey;
+  // ★ One request key per invitation: kept across a retry, replaced only when WHO changes.
+  const keyRef = useRef(null);
+  const lockRef = useRef(false);
+  useEffect(() => { keyRef.current = null; setPreview(null); }, [audienceKey]);
+
+  const check = async () => {
+    const key = audienceKey;
+    setBusy(true); setErr('');
+    try {
+      const { data, error } = await supabase.rpc('comm_preview_audience', { p_kind: 'meeting_invite', p_audience: audience, p_limit: 10 });
+      if (error) throw error;
+      if (key === audienceKeyRef.current) setPreview(data);
+    } catch (e) {
+      if (key === audienceKeyRef.current) setErr(meetingErrorText(e, 'Could not check who is invited.'));
+    } finally { setBusy(false); }
+  };
+  const send = async () => {
+    if (lockRef.current) return;
+    lockRef.current = true;
+    if (!keyRef.current) keyRef.current = commClientKey();
+    setErr(''); setStep('sending'); setProgress(null);
+    try {
+      const out = await meetingsApi({ action: 'invite', meeting_id: meeting.id, audience, client_key: keyRef.current });
+      setResult(await meetingFinishInvite(out.invite, setProgress));
+      setStep('done');
+      onDone?.();
+    } catch (e) {
+      setErr(!e?.status
+        ? 'The connection dropped, so it is not certain whether the invitations were queued. Press Send again — nobody is emailed twice.'
+        : meetingErrorText(e, 'The invitations were not sent.'));
+      setStep('edit');
+    } finally { lockRef.current = false; }
+  };
+
+  const overLimit = preview && preview.count > preview.remaining;
+  const footer = step === 'done' ? (
+    <div className="flex justify-end"><button type="button" onClick={onClose} className="gh-btn-primary px-4 py-2 text-sm">Close</button></div>
+  ) : step === 'sending' ? (
+    <div className="flex items-center gap-2 text-sm" style={{ color: C.textSoft }}>
+      <Loader2 size={15} className="animate-spin" /> Sending — {progress?.sent || 0} sent{progress?.remaining ? `, ${progress.remaining} to go` : ''}. Keep this panel open.
+    </div>
+  ) : (
+    <div className="flex flex-wrap justify-end gap-2">
+      <button type="button" onClick={onClose} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+      <button type="button" onClick={check} disabled={busy} className="gh-btn-ghost px-4 py-2 text-sm inline-flex items-center gap-1.5 disabled:opacity-60">
+        {busy ? <Loader2 size={14} className="animate-spin" /> : <Users size={14} />} Check recipients
+      </button>
+      <button type="button" onClick={send} disabled={!preview || !preview.count || overLimit}
+        className="gh-btn-primary px-4 py-2 text-sm inline-flex items-center gap-1.5 disabled:opacity-60">
+        <Send size={14} /> {preview?.count ? `Send to ${preview.count} ${preview.count === 1 ? 'person' : 'people'}` : 'Send'}
+      </button>
+    </div>
+  );
+
+  return (
+    <SidePanel title="Invite to this meeting" subtitle={meeting?.topic} icon={Send} onClose={onClose}
+      maxW="sm:max-w-xl" canClose={step !== 'sending'} footer={footer}>
+      <div className="space-y-4">
+        {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+        {step === 'done' ? (
+          <div className="glass-card rounded-2xl p-5" style={{ background: GLASS.card }}>
+            <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }} className="text-lg">
+              {result?.duplicate ? 'Already queued' : commDoneHeading(result)}
+            </div>
+            <div className="mt-2 text-sm" style={{ color: C.textSoft }}>
+              {result?.duplicate ? 'This invitation had already been queued, so nobody was emailed twice. ' : ''}
+              {result?.send_error ? `All ${result.queued} are queued and go out on the next run — do not invite again. ` : ''}
+              {result?.sent || 0} delivered to the email provider{result?.failed ? `, ${result.failed} failed` : ''}
+              {meetingInviteLeftover(result) ? `; ${meetingInviteLeftover(result)}` : ''}.
+              Every delivery is listed in Communications → Reminder tracker.
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+              <div style={FINANCE_LABEL_STYLE}>Who is invited</div>
+              <div className="mt-2">
+                <MeetingAudienceFields value={aud} onChange={setAud} disabled={step !== 'edit'} plans={plans} batches={batches} />
+              </div>
+              {preview && (
+                <div className="mt-3 text-sm" style={{ color: C.text }}>
+                  <strong>{preview.count}</strong> {preview.count === 1 ? 'person' : 'people'} will be invited.
+                  <span style={{ color: overLimit ? 'var(--status-danger-fg)' : C.textMute }}>
+                    {' '}{preview.remaining} of today’s {preview.daily_cap} emails are left.
+                  </span>
+                </div>
+              )}
+            </div>
+            <div style={{ fontSize: 12, color: C.textMute }}>
+              The email is written from the meeting itself: the topic, the date and time in Manila, how often it
+              repeats, the duration and the Zoom join link. Replies go to your support address.
+            </div>
+          </>
+        )}
+      </div>
+    </SidePanel>
+  );
+}
+
+function MeetingTemplateEditor({ template, onClose, onSaved }) {
+  const { plans, batches } = useCommLookups(true);
+  const [f, setF] = useState(() => ({
+    name: template?.name || '', description: template?.description || '', topic: template?.topic || '',
+    duration: template?.duration_min || 60, startTime: template?.start_time || '09:00',
+    days: Array.isArray(template?.weekly_days) ? template.weekly_days : [], count: template?.session_count || 12,
+  }));
+  const [aud, setAud] = useState(() => meetingAudienceState(template?.audience, MEETING_TEMPLATE_AUDIENCES));
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const set = (patch) => setF((x) => ({ ...x, ...patch }));
+  const weekly = f.days.length > 0;
+  const ready = f.name.trim() && f.topic.trim() && Number(f.duration) >= 15 && Number(f.duration) <= 480
+    && MTG.isHHMM(f.startTime) && (!weekly || (Number(f.count) >= 1 && Number(f.count) <= 50));
+
+  const save = async () => {
+    setBusy(true); setErr('');
+    try {
+      const { data, error } = await supabase.rpc('meeting_template_save', {
+        p_id: template?.id || null, p_name: f.name, p_description: f.description, p_topic: f.topic,
+        p_duration: Number(f.duration), p_start_time: f.startTime, p_weekly_days: f.days,
+        p_session_count: weekly ? Number(f.count) : null, p_audience: meetingAudienceOf(aud),
+      });
+      if (error) throw error;
+      onSaved?.(data);
+    } catch (e) {
+      setErr(meetingErrorText(e, 'The template was not saved.'));
+      setBusy(false);
+    }
+  };
+
+  const footer = (
+    <div className="flex justify-end gap-2">
+      <button type="button" onClick={onClose} disabled={busy} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
+      <button type="button" onClick={save} disabled={!ready || busy} className="gh-btn-primary px-4 py-2 text-sm disabled:opacity-60">
+        {busy ? 'Saving…' : 'Save template'}
+      </button>
+    </div>
+  );
+  return (
+    <SidePanel title={template ? 'Edit template' : 'New template'} subtitle="Meetings & Tasks" icon={CalendarClock}
+      onClose={onClose} maxW="sm:max-w-xl" canClose={!busy} footer={footer}>
+      <div className="space-y-3">
+        {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+        <label className="block"><span style={FINANCE_LABEL_STYLE}>Name</span>
+          <input value={f.name} onChange={(e) => set({ name: e.target.value })} maxLength={120} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+        <label className="block"><span style={FINANCE_LABEL_STYLE}>Description (optional)</span>
+          <input value={f.description} onChange={(e) => set({ description: e.target.value })} maxLength={300} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+        <label className="block"><span style={FINANCE_LABEL_STYLE}>Meeting topic</span>
+          <input value={f.topic} onChange={(e) => set({ topic: e.target.value })} maxLength={200} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+        <div className="grid grid-cols-2 gap-2">
+          <label className="block"><span style={FINANCE_LABEL_STYLE}>Start time (Manila)</span>
+            <input type="time" value={f.startTime} onChange={(e) => set({ startTime: e.target.value })} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+          <label className="block"><span style={FINANCE_LABEL_STYLE}>Minutes</span>
+            <input type="number" min={15} max={480} step={15} value={f.duration}
+              onChange={(e) => set({ duration: e.target.value === '' ? '' : Number(e.target.value) })} className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+        </div>
+        <div>
+          <span style={FINANCE_LABEL_STYLE}>Repeats on (none selected = one time)</span>
+          <MeetingDayChecks value={f.days} onChange={(days) => set({ days })} disabled={busy} />
+        </div>
+        {weekly && (
+          <label className="block"><span style={FINANCE_LABEL_STYLE}>Sessions</span>
+            <input type="number" min={1} max={50} value={f.count}
+              onChange={(e) => set({ count: e.target.value === '' ? '' : Number(e.target.value) })} className="gh-input w-28 mt-1" style={{ fontSize: 13 }} /></label>
+        )}
+        <div>
+          <span style={FINANCE_LABEL_STYLE}>Suggested invitation audience</span>
+          <div className="mt-1">
+            <MeetingAudienceFields value={aud} onChange={setAud} disabled={busy} plans={plans} batches={batches} modes={MEETING_TEMPLATE_AUDIENCES} />
+          </div>
+        </div>
+      </div>
+    </SidePanel>
+  );
+}
+
+function MeetingsTasks() {
+  // ★ staffDegraded destructured — uiSafety.test.mjs §12.
+  const { profile, staff, staffReady, staffDegraded, can } = useAuth();
+  const allowed = adminTabVisible(staff, {
+    staffReady, staffDegraded, profileIsAdmin: !!profile?.is_admin,
+  }, 'meetings');
+  const canInvite = staffDegraded ? !!profile?.is_admin : (staffReady && can('communications.send'));
+
+  const [sub, setSub] = useState('calendar');
+  const [health, setHealth] = useState(null);
+  const [needsSetup, setNeedsSetup] = useState(false);
+  const [notice, setNotice] = useState('');
+
+  // Calendar
+  const [view, setView] = useState('list');
+  const [anchor, setAnchor] = useState(() => MTG.manilaToday());
+  const [logRows, setLogRows] = useState(null);
+  const [zoomRows, setZoomRows] = useState([]);
+  const [zoomNote, setZoomNote] = useState('');
+  const [calErr, setCalErr] = useState('');
+  const [calLoading, setCalLoading] = useState(false);
+  const [inviting, setInviting] = useState(null);      // a meetings_list row
+  const [cancelling, setCancelling] = useState(null);  // a calendar item
+  const [cancelErr, setCancelErr] = useState('');
+  const [cancelBusy, setCancelBusy] = useState(false);
+
+  // Schedule
+  const [form, setForm] = useState(blankMeetingForm);
+  const [inviteNow, setInviteNow] = useState(false);
+  const [aud, setAud] = useState(() => blankMeetingAudience());
+  const [audPreview, setAudPreview] = useState(null);
+  const [audBusy, setAudBusy] = useState(false);
+  const [formErr, setFormErr] = useState('');
+  const [scheduling, setScheduling] = useState(false);
+  const [inviteProgress, setInviteProgress] = useState(null);
+  const [scheduleResult, setScheduleResult] = useState(null);
+  const createLockRef = useRef(false);
+  const createKeyRef = useRef(null);
+
+  // Templates
+  const [templates, setTemplates] = useState(null);
+  const [tplErr, setTplErr] = useState('');
+  const [editingTpl, setEditingTpl] = useState(null);  // {} = new, a row = edit
+
+  // Tasks
+  const [tasks, setTasks] = useState(null);
+  const [taskErr, setTaskErr] = useState('');
+  const [drafts, setDrafts] = useState({ day: '', week: '', month: '' });
+  const [taskBusy, setTaskBusy] = useState('');
+  const [confirmDelete, setConfirmDelete] = useState('');
+
+  const { plans, batches } = useCommLookups(allowed && sub === 'schedule');
+
+  const call = useCallback(async (fn, args) => {
+    const { data, error } = await supabase.rpc(fn, args);
+    if (error) {
+      if (isMigrationMissing(error)) setNeedsSetup(true);
+      throw error;
+    }
+    return data;
+  }, []);
+
+  // Through the gated endpoint: whether Zoom is configured is not for the public GET.
+  const loadHealth = useCallback(async () => {
+    try { setHealth(await meetingsApi({ action: 'status' })); } catch { setHealth({ unavailable: true }); }
+  }, []);
+
+  const range = useMemo(() => {
+    if (view === 'week') {
+      const d = MTG.weekDates(anchor);
+      return { from: d[0], to: d[6] };
+    }
+    if (view === 'month') {
+      const [y, m] = anchor.split('-').map(Number);
+      const g = MTG.monthGrid(y, m);
+      return { from: g[0].date, to: g[41].date };
+    }
+    return { from: anchor, to: MTG.addDaysISO(anchor, 59) };
+  }, [view, anchor]);
+  const zoomReady = health?.zoomConfigured === true;
+
+  const loadCalendar = useCallback(async () => {
+    setCalErr('');
+    setCalLoading(true);
+    try {
+      const [rows, zoom] = await Promise.all([
+        call('meetings_list', { p_from: range.from, p_to: range.to }),
+        zoomReady ? meetingsApi({ action: 'upcoming' }).catch((e) => ({ failed: e })) : Promise.resolve(null),
+      ]);
+      setLogRows(rows || []);
+      setZoomRows(zoom && !zoom.failed ? (zoom.meetings || []) : []);
+      setZoomNote(zoom?.failed
+        ? `${meetingErrorText(zoom.failed, 'Zoom’s own list could not be loaded.')} Meetings created directly in Zoom are not shown.`
+        : zoom && zoom.expanded_all === false ? 'Some recurring meetings created in Zoom show only their next session.' : '');
+    } catch (e) {
+      if (!isMigrationMissing(e)) setCalErr(meetingErrorText(e, 'Could not load the calendar.'));
+    } finally { setCalLoading(false); }
+  }, [call, range.from, range.to, zoomReady]);
+  const loadTemplates = useCallback(async () => {
+    setTplErr('');
+    try { setTemplates(await call('meeting_templates_list', { p_include_inactive: true }) || []); }
+    catch (e) { if (!isMigrationMissing(e)) setTplErr(meetingErrorText(e, 'Could not load the templates.')); }
+  }, [call]);
+  const loadTasks = useCallback(async () => {
+    setTaskErr('');
+    try { setTasks(await call('staff_tasks_list', { p_done_days: 30 }) || []); }
+    catch (e) { if (!isMigrationMissing(e)) setTaskErr(meetingErrorText(e, 'Could not load the to-do board.')); }
+  }, [call]);
+
+  useEffect(() => {
+    if (!allowed) return;
+    loadHealth(); loadTemplates(); loadTasks();
+  }, [allowed, loadHealth, loadTemplates, loadTasks]);
+  useEffect(() => { if (allowed) loadCalendar(); }, [allowed, loadCalendar]);
+
+  const audience = useMemo(() => meetingAudienceOf(aud), [aud]);
+  const audienceKey = JSON.stringify(audience);
+  const audienceKeyRef = useRef(audienceKey);
+  audienceKeyRef.current = audienceKey;
+  useEffect(() => { setAudPreview(null); }, [audienceKey]);
+  // ★ A new meeting or a new audience is a new invitation, so its request key goes with the change.
+  useEffect(() => { createKeyRef.current = null; }, [form, audienceKey, inviteNow]);
+
+  const check = useMemo(() => MTG.validateMeetingForm(form, { todayISO: MTG.manilaToday() }), [form]);
+  const sessions = useMemo(() => (check.ok ? MTG.expandOccurrences(form) : []), [check.ok, form]);
+  const items = useMemo(() => MTG.mergeCalendarItems(logRows, zoomRows).filter((it) => {
+    const d = MTG.utcToManila(it.startUtc)?.date;
+    return d && d >= range.from && d <= range.to;
+  }), [logRows, zoomRows, range.from, range.to]);
+  const byDate = useMemo(() => MTG.groupByManilaDate(items), [items]);
+  const logById = useMemo(() => new Map((logRows || []).map((m) => [m.id, m])), [logRows]);
+  const tasksByScope = useMemo(() => {
+    const out = { day: [], week: [], month: [] };
+    for (const t of tasks || []) (out[t.scope] || out.day).push(t);
+    return out;
+  }, [tasks]);
+
+  const setField = (patch) => setForm((f) => ({ ...f, ...patch }));
+  const pickTemplate = (key) => {
+    const t = (templates || []).find((x) => x.key === key);
+    if (!t) { setField({ templateKey: '' }); return; }
+    const weekly = (t.weekly_days || []).length > 0;
+    setForm((f) => ({
+      ...f, templateKey: t.key, topic: t.topic, time: t.start_time, duration: t.duration_min,
+      recurrence: weekly ? 'weekly' : 'none', days: t.weekly_days || [], endMode: 'count', count: t.session_count || 1,
+    }));
+    setAud(meetingAudienceState(t.audience));
+  };
+
+  const checkAudience = async () => {
+    const key = audienceKey;
+    setAudBusy(true); setFormErr('');
+    try {
+      const { data, error } = await supabase.rpc('comm_preview_audience', { p_kind: 'meeting_invite', p_audience: audience, p_limit: 10 });
+      if (error) throw error;
+      if (key === audienceKeyRef.current) setAudPreview(data);
+    } catch (e) {
+      if (key === audienceKeyRef.current) setFormErr(meetingErrorText(e, 'Could not check who is invited.'));
+    } finally { setAudBusy(false); }
+  };
+
+  const canSchedule = zoomReady && check.ok && !scheduling
+    && (!inviteNow || (canInvite && audPreview && audPreview.count > 0 && audPreview.count <= audPreview.remaining));
+
+  const schedule = async () => {
+    if (createLockRef.current) return;
+    const verdict = MTG.validateMeetingForm(form, { todayISO: MTG.manilaToday() });
+    if (!verdict.ok) { setFormErr(Object.values(verdict.errors)[0]); return; }
+    createLockRef.current = true;
+    setScheduling(true); setFormErr(''); setScheduleResult(null);
+    if (inviteNow && !createKeyRef.current) createKeyRef.current = commClientKey();
+    try {
+      const out = await meetingsApi({
+        action: 'create', form,
+        audience: inviteNow ? audience : null,
+        client_key: inviteNow ? createKeyRef.current : undefined,
+      });
+      const invite = await meetingFinishInvite(out.invite, setInviteProgress);
+      setScheduleResult({ ...out, invite });
+      setForm(blankMeetingForm());
+      setInviteNow(false);
+      loadCalendar();
+    } catch (e) {
+      setFormErr(!e?.status
+        ? 'The connection dropped, so it is not certain whether Zoom created the meeting. Check the calendar before scheduling it again — Zoom does not recognise a repeated request.'
+        : meetingErrorText(e, 'The meeting was not scheduled.'));
+      if (e?.hint === 'MEETING_LOG_FAILED') loadCalendar();
+    } finally {
+      createLockRef.current = false;
+      setScheduling(false);
+      setInviteProgress(null);
+    }
+  };
+
+  const doCancel = async () => {
+    const it = cancelling;
+    setCancelBusy(true); setCancelErr('');
+    try {
+      const out = await meetingsApi({ action: 'cancel', zoom_meeting_id: it.zoomMeetingId, meeting_id: it.meetingId || null });
+      const log = out.log || {};
+      setNotice(`Cancelled in Zoom${out.zoom_status === 404 ? ' (it was already gone there)' : ''}.`
+        + `${log.skipped ? ` ${log.skipped} invitation(s) still waiting were stopped.` : ''}`
+        + `${log.in_flight ? ` ${log.in_flight} already being handed to the email provider may still arrive.` : ''}`
+        + ' Anyone already invited is not told automatically.');
+      setCancelling(null);
+      loadCalendar();
+    } catch (e) {
+      setCancelErr(!e?.status
+        ? 'The connection dropped, so it is not certain whether the meeting was cancelled. Refresh the calendar to check.'
+        : meetingErrorText(e, 'The meeting was not cancelled.'));
+    } finally { setCancelBusy(false); }
+  };
+
+  const toggleTemplate = async (t) => {
+    try { await call('meeting_template_set_active', { p_id: t.id, p_active: !t.active }); loadTemplates(); }
+    catch (e) { setTplErr(meetingErrorText(e, 'The template was not updated.')); }
+  };
+  const addTask = async (scope) => {
+    const title = drafts[scope].trim();
+    if (!title) return;
+    setTaskBusy(`add:${scope}`); setTaskErr('');
+    try {
+      await call('staff_task_save', { p_id: null, p_title: title, p_scope: scope, p_due_on: null });
+      setDrafts((d) => ({ ...d, [scope]: '' }));
+      loadTasks();
+    } catch (e) { setTaskErr(meetingErrorText(e, 'The task was not added.')); }
+    finally { setTaskBusy(''); }
+  };
+  const toggleTask = async (t) => {
+    setTaskBusy(`done:${t.id}`);
+    try { await call('staff_task_set_done', { p_id: t.id, p_done: !t.done }); loadTasks(); }
+    catch (e) { setTaskErr(meetingErrorText(e, 'The task was not updated.')); }
+    finally { setTaskBusy(''); }
+  };
+  const deleteTask = async (t) => {
+    if (confirmDelete !== t.id) { setConfirmDelete(t.id); return; }
+    setConfirmDelete(''); setTaskBusy(`del:${t.id}`);
+    try { await call('staff_task_delete', { p_id: t.id }); loadTasks(); }
+    catch (e) { setTaskErr(meetingErrorText(e, 'The task was not deleted.')); }
+    finally { setTaskBusy(''); }
+  };
+
+  if (!staffReady && !staffDegraded) {
+    return <div className="p-6"><FinanceLoading label="Checking your access…" /></div>;
+  }
+  if (!allowed) {
+    return (
+      <div>
+        <SectionHead eyebrow="Admin" title="Meetings & Tasks" desc="Zoom meetings, invitations, templates and the team to-do board." gold />
+        <div className="mt-6 max-w-2xl mx-auto glass-card rounded-2xl p-10 text-center" style={{ background: SHEEN }}>
+          <CalendarClock size={38} className="mx-auto mb-3" style={{ color: ROYAL }} />
+          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">Super Admin only</div>
+          <div className="text-slate-500 mt-2 text-sm max-w-md mx-auto">
+            Meetings & Tasks needs the <span style={{ fontFamily: fontMono }}>meetings.manage</span> permission,
+            which only a Super Admin holds.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const btn = 'px-3 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 transition disabled:opacity-60';
+  const btnGhost = { background: C.white, color: C.textSoft, border: `1px solid ${C.border}` };
+  const today = MTG.manilaToday();
+  const inv = scheduleResult?.invite;
+
+  return (
+    <div>
+      <SectionHead eyebrow="Admin" title="Meetings & Tasks" gold
+        desc="Zoom meetings and invitations, reusable meeting templates, and one to-do board the whole team shares." />
+
+      {needsSetup ? (
+        <div className="mt-6 max-w-2xl mx-auto glass-card rounded-2xl p-8 text-center" style={{ background: SHEEN }}>
+          <Settings size={34} className="mx-auto mb-3" style={{ color: ROYAL }} />
+          <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg font-bold">Finish database setup</div>
+          <div className="text-slate-500 mt-2 text-sm">
+            Run <span style={{ fontFamily: fontMono }}>db/2026-09-17-meetings-tasks.sql</span> (#62), then reload this page.
+          </div>
+        </div>
+      ) : (
+        <div className="mt-4">
+          {health && health.zoomConfigured === false && (
+            <AdminNotice kind="warn">
+              Zoom is not connected yet — set ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET in Vercel. Templates
+              and the to-do board work now; scheduling and Zoom’s own calendar start once Zoom is connected.
+            </AdminNotice>
+          )}
+          {health?.unavailable && (
+            <AdminNotice kind="warn">The Meetings server could not be reached, so whether Zoom is connected is not known. Press Refresh.</AdminNotice>
+          )}
+          {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
+
+          {/* Plain toggle buttons (aria-pressed): a role="tablist" promises arrow-key behaviour this row does not have. */}
+          <div className="flex flex-wrap items-center gap-1.5 mt-4">
+            {MEETING_SUBTABS.map((t) => (
+              <button key={t.key} type="button" aria-pressed={sub === t.key} onClick={() => setSub(t.key)}
+                className="px-3.5 py-2 rounded-xl text-xs font-semibold transition"
+                style={sub === t.key ? { background: C.primarySolid, color: 'white' } : btnGhost}>
+                {t.label}
+              </button>
+            ))}
+            <button type="button" onClick={() => { loadHealth(); loadCalendar(); loadTemplates(); loadTasks(); }}
+              className={`${btn} ml-auto`} style={btnGhost} aria-label="Refresh Meetings & Tasks">
+              <RotateCcw size={12} /> Refresh
+            </button>
+          </div>
+
+          {/* ── Calendar ───────────────────────────────────────────────────── */}
+          {sub === 'calendar' && (
+            <div className="glass-card rounded-2xl p-4 mt-4" style={{ background: GLASS.card }}>
+              <div className="flex flex-wrap items-center gap-2 mb-3">
+                <div className="flex gap-1.5">
+                  {MEETING_VIEWS.map((v) => (
+                    <button key={v.key} type="button" aria-pressed={view === v.key} onClick={() => setView(v.key)}
+                      className={btn} style={view === v.key ? { background: C.primarySolid, color: 'white' } : btnGhost}>{v.label}</button>
+                  ))}
+                </div>
+                {view !== 'list' && (
+                  <div className="flex items-center gap-1.5">
+                    <button type="button" className={btn} style={btnGhost} aria-label={view === 'week' ? 'Previous week' : 'Previous month'}
+                      onClick={() => setAnchor((a) => (view === 'week' ? MTG.addDaysISO(a, -7) : meetingShiftMonth(a, -1)))}><ChevronLeft size={13} /></button>
+                    <button type="button" className={btn} style={btnGhost} onClick={() => setAnchor(MTG.manilaToday())}>Today</button>
+                    <button type="button" className={btn} style={btnGhost} aria-label={view === 'week' ? 'Next week' : 'Next month'}
+                      onClick={() => setAnchor((a) => (view === 'week' ? MTG.addDaysISO(a, 7) : meetingShiftMonth(a, 1)))}><ChevronRight size={13} /></button>
+                  </div>
+                )}
+                <div style={{ fontSize: 12.5, color: C.textSoft, fontWeight: 600 }}>
+                  {view === 'month'
+                    ? new Date(`${anchor.slice(0, 7)}-01T00:00:00Z`).toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })
+                    : `${meetingDateLabel(range.from)} – ${meetingDateLabel(range.to)}`}
+                  <span style={{ color: C.textMute, fontWeight: 500 }}> · Manila time</span>
+                </div>
+                {calLoading && <Loader2 size={14} className="animate-spin" style={{ color: C.textMute }} />}
+              </div>
+              {zoomNote && <div className="mb-2" style={{ fontSize: 12, color: 'var(--status-warn-fg)' }}>{zoomNote}</div>}
+              {calErr ? <CommListError message={calErr} onRetry={loadCalendar} /> : logRows === null ? <FinanceLoading label="Loading meetings…" /> : (
+                <>
+                  {view === 'list' && (byDate.size === 0 ? (
+                    <div className="py-6 text-sm text-center" style={{ color: C.textMute }}>No meetings in these 60 days.</div>
+                  ) : (
+                    <div className="space-y-4">
+                      {[...byDate.entries()].map(([date, dayItems]) => (
+                        <div key={date}>
+                          <div style={FINANCE_LABEL_STYLE}>{meetingDateLabel(date, { weekday: 'long', month: 'long', day: 'numeric' })}{date === today ? ' · today' : ''}</div>
+                          <div className="mt-1.5 space-y-2">
+                            {dayItems.map((it) => (
+                              <MeetingItemRow key={it.key} item={it} log={it.meetingId ? logById.get(it.meetingId) : null}
+                                onInvite={it.meetingId && canInvite ? () => setInviting(logById.get(it.meetingId)) : null}
+                                onCancel={zoomReady ? () => { setCancelErr(''); setCancelling(it); } : null} />
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                  {view === 'week' && (
+                    <div className="overflow-x-auto">
+                      <div className="grid grid-cols-7 gap-2 min-w-[720px]">
+                        {MTG.weekDates(anchor).map((d) => (
+                          <div key={d} className="rounded-xl p-2" style={{ background: d === today ? 'var(--primary-tint)' : 'var(--wash)', minHeight: 120 }}>
+                            <div style={{ fontSize: 11, fontWeight: 700, color: C.textSoft }}>{meetingDateLabel(d)}</div>
+                            <div className="mt-1.5 space-y-1.5">
+                              {(byDate.get(d) || []).map((it) => (
+                                <button key={it.key} type="button" onClick={() => { setAnchor(d); setView('list'); }}
+                                  className="block w-full text-left rounded-lg px-1.5 py-1"
+                                  style={{ background: C.white, border: `1px solid ${C.border}`, opacity: it.cancelled ? 0.55 : 1 }}>
+                                  <div style={{ fontFamily: fontMono, fontSize: 10.5, color: C.textMute }}>{MTG.formatClock(it.time)}</div>
+                                  <div className="truncate" style={{ fontSize: 11.5, fontWeight: 600, color: C.text, textDecoration: it.cancelled ? 'line-through' : 'none' }}>{it.topic}</div>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {view === 'month' && (
+                    <div className="overflow-x-auto">
+                      <div className="grid grid-cols-7 gap-1 min-w-[640px]">
+                        {MTG.MEETING_WEEKDAYS.map((w) => <div key={w.day} style={{ ...FINANCE_LABEL_STYLE, textAlign: 'center' }}>{w.short}</div>)}
+                        {MTG.monthGrid(...anchor.split('-').slice(0, 2).map(Number)).map((cell) => {
+                          const dayItems = byDate.get(cell.date) || [];
+                          return (
+                            <button key={cell.date} type="button" onClick={() => { setAnchor(cell.date); setView('list'); }}
+                              aria-label={`${meetingDateLabel(cell.date, { weekday: 'long', month: 'long', day: 'numeric' })}: ${dayItems.length} meeting(s)`}
+                              className="rounded-lg p-1.5 text-left"
+                              style={{ minHeight: 76, background: cell.inMonth ? C.white : 'var(--wash)', border: `1px solid ${C.border}`, opacity: cell.inMonth ? 1 : 0.6 }}>
+                              <div style={{ fontSize: 11, fontWeight: 700, color: cell.date === today ? C.primary : C.textSoft }}>{Number(cell.date.slice(8))}</div>
+                              {dayItems.slice(0, 3).map((it) => (
+                                <div key={it.key} className="truncate" style={{ fontSize: 10.5, color: it.cancelled ? C.textMute : C.text, textDecoration: it.cancelled ? 'line-through' : 'none' }}>
+                                  {MTG.formatClock(it.time)} {it.topic}
+                                </div>
+                              ))}
+                              {dayItems.length > 3 && <div style={{ fontSize: 10.5, color: C.textMute }}>+{dayItems.length - 3} more</div>}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {/* ── Schedule a meeting ─────────────────────────────────────────── */}
+          {sub === 'schedule' && (
+            <div className="grid lg:grid-cols-5 gap-4 mt-4">
+              <div className="lg:col-span-3 glass-card rounded-2xl p-4 space-y-4" style={{ background: GLASS.card }}>
+                {health && !zoomReady && (
+                  <div style={{ fontSize: 12.5, color: 'var(--status-warn-fg)' }}>Zoom is not connected, so a meeting cannot be scheduled yet.</div>
+                )}
+                {formErr && <AdminNotice kind="danger" onDismiss={() => setFormErr('')}>{formErr}</AdminNotice>}
+                <label className="block"><span style={FINANCE_LABEL_STYLE}>Start from a template</span>
+                  <select value={form.templateKey} onChange={(e) => pickTemplate(e.target.value)} disabled={scheduling} className="gh-input w-full mt-1" style={{ fontSize: 13 }}>
+                    <option value="">No template</option>
+                    {(templates || []).filter((t) => t.active).map((t) => <option key={t.id} value={t.key}>{t.name}</option>)}
+                  </select>
+                </label>
+                <label className="block"><span style={FINANCE_LABEL_STYLE}>Topic</span>
+                  <input value={form.topic} onChange={(e) => setField({ topic: e.target.value })} maxLength={200} disabled={scheduling}
+                    className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <label className="block"><span style={FINANCE_LABEL_STYLE}>Date (Manila)</span>
+                    <input type="date" value={form.date} min={today} onChange={(e) => setField({ date: e.target.value })} disabled={scheduling}
+                      className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+                  <label className="block"><span style={FINANCE_LABEL_STYLE}>Start time</span>
+                    <input type="time" value={form.time} step={300} onChange={(e) => setField({ time: e.target.value })} disabled={scheduling}
+                      className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+                  <label className="block"><span style={FINANCE_LABEL_STYLE}>Minutes</span>
+                    <input type="number" min={15} max={480} step={15} value={form.duration} disabled={scheduling}
+                      onChange={(e) => setField({ duration: e.target.value === '' ? '' : Number(e.target.value) })}
+                      className="gh-input w-full mt-1" style={{ fontSize: 13 }} /></label>
+                </div>
+                <div>
+                  <span style={FINANCE_LABEL_STYLE}>Repeats</span>
+                  <div className="flex gap-1.5 mt-1">
+                    {[['none', 'One time'], ['weekly', 'Weekly']].map(([k, label]) => (
+                      <button key={k} type="button" aria-pressed={form.recurrence === k} onClick={() => setField({ recurrence: k })} disabled={scheduling}
+                        className={btn} style={form.recurrence === k ? { background: C.primarySolid, color: 'white' } : btnGhost}>{label}</button>
+                    ))}
+                  </div>
+                </div>
+                {form.recurrence === 'weekly' && (
+                  <div className="space-y-2">
+                    <MeetingDayChecks value={form.days} onChange={(days) => setField({ days })} disabled={scheduling} />
+                    <div className="flex flex-wrap items-center gap-2 text-sm" style={{ color: C.text }}>
+                      <label className="inline-flex items-center gap-1.5">
+                        <input type="radio" name="meeting-end" checked={form.endMode !== 'date'} onChange={() => setField({ endMode: 'count' })} disabled={scheduling} /> After
+                      </label>
+                      <input type="number" min={1} max={MTG.MEETING_LIMITS.occurrencesMax} value={form.count} aria-label="Number of sessions"
+                        onChange={(e) => setField({ count: e.target.value === '' ? '' : Number(e.target.value) })}
+                        disabled={form.endMode === 'date' || scheduling} className="gh-input w-20" style={{ fontSize: 13 }} /> sessions
+                      <label className="inline-flex items-center gap-1.5 sm:ml-3">
+                        <input type="radio" name="meeting-end" checked={form.endMode === 'date'} onChange={() => setField({ endMode: 'date' })} disabled={scheduling} /> Until
+                      </label>
+                      <input type="date" value={form.endDate} min={form.date} aria-label="Last day of the series"
+                        onChange={(e) => setField({ endDate: e.target.value })} disabled={form.endMode !== 'date' || scheduling}
+                        className="gh-input" style={{ fontSize: 13 }} />
+                    </div>
+                  </div>
+                )}
+                <div className="flex flex-wrap gap-4 text-sm" style={{ color: C.text }}>
+                  <label className="inline-flex items-center gap-2">
+                    <input type="checkbox" checked={form.joinBeforeHost} onChange={(e) => setField({ joinBeforeHost: e.target.checked })} disabled={scheduling} />
+                    Participants can join before the host
+                  </label>
+                  <label className="inline-flex items-center gap-2">
+                    <input type="checkbox" checked={form.waitingRoom} onChange={(e) => setField({ waitingRoom: e.target.checked })} disabled={scheduling} />
+                    Waiting room
+                  </label>
+                </div>
+                <div className="rounded-xl p-3" style={{ background: 'var(--wash)' }}>
+                  <label className="inline-flex items-center gap-2 text-sm font-semibold" style={{ color: C.text }}>
+                    <input type="checkbox" checked={inviteNow} onChange={(e) => setInviteNow(e.target.checked)} disabled={!canInvite || scheduling} />
+                    Invite students by email as soon as it is created
+                  </label>
+                  {!canInvite && (
+                    <div style={{ fontSize: 11.5, color: C.textMute }}>Inviting students also needs the communications.send permission.</div>
+                  )}
+                  {inviteNow && (
+                    <div className="mt-3 space-y-2">
+                      <MeetingAudienceFields value={aud} onChange={setAud} disabled={scheduling} plans={plans} batches={batches} />
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button type="button" onClick={checkAudience} disabled={audBusy || scheduling} className={btn} style={btnGhost}>
+                          {audBusy ? <Loader2 size={12} className="animate-spin" /> : <Users size={12} />} Check recipients
+                        </button>
+                        {audPreview && (
+                          <span className="text-sm" style={{ color: audPreview.count > audPreview.remaining ? 'var(--status-danger-fg)' : C.text }}>
+                            <strong>{audPreview.count}</strong> {audPreview.count === 1 ? 'person' : 'people'} · {audPreview.remaining} of today’s {audPreview.daily_cap} emails left
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 11.5, color: C.textMute }}>
+                        The email is written from the meeting Zoom creates: the topic, the date and time in Manila, how often it
+                        repeats, the duration and the join link. Replies go to your support address.
+                      </div>
+                    </div>
+                  )}
+                </div>
+                <div className="flex justify-end">
+                  <button type="button" onClick={schedule} disabled={!canSchedule}
+                    className="gh-btn-primary px-4 py-2 text-sm inline-flex items-center gap-1.5 disabled:opacity-60">
+                    {scheduling ? <Loader2 size={14} className="animate-spin" /> : <CalendarPlus size={14} />}
+                    {scheduling ? 'Scheduling…' : inviteNow ? 'Schedule and invite' : 'Schedule in Zoom'}
+                  </button>
+                </div>
+                {inviteProgress && (
+                  <div className="text-sm flex items-center gap-2" style={{ color: C.textSoft }}>
+                    <Loader2 size={14} className="animate-spin" /> Sending invitations — {inviteProgress.sent || 0} sent
+                    {inviteProgress.remaining ? `, ${inviteProgress.remaining} to go` : ''}. Keep this page open.
+                  </div>
+                )}
+                {scheduleResult && (
+                  <AdminNotice kind="ok" onDismiss={() => setScheduleResult(null)}>
+                    Scheduled in Zoom — {scheduleResult.sessions} session{scheduleResult.sessions === 1 ? '' : 's'}.
+                    {!inv && ' Invite students from the calendar when you are ready.'}
+                    {/* ★ Queued and sent are different facts. Anything that fails AFTER the invitations
+                        are queued must never read as "not queued": the answer to that is to invite
+                        again, which emails the whole audience a second time. */}
+                    {inv?.error && ` It is not certain whether the invitations were queued: ${inv.error} Open the calendar — this meeting shows how many are waiting — and invite again only if it shows none.`}
+                    {inv?.send_error && ` All ${inv.queued} invitation${inv.queued === 1 ? ' is' : 's are'} queued and go out on the next run — do not invite again (${inv.send_error}).`}
+                    {inv && !inv.error && !inv.send_error && ` ${inv.sent || 0} invitation${inv.sent === 1 ? '' : 's'} delivered to the email provider${inv.failed ? `, ${inv.failed} failed` : ''}${meetingInviteLeftover(inv) ? `; ${meetingInviteLeftover(inv)}` : ''}.`}
+                  </AdminNotice>
+                )}
+              </div>
+              <div className="lg:col-span-2 glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+                <div style={FINANCE_LABEL_STYLE}>Sessions Zoom will create</div>
+                {check.ok ? (
+                  <>
+                    <ul className="mt-2 space-y-1 max-h-96 overflow-y-auto">
+                      {sessions.map((s) => (
+                        <li key={s.startUtc} className="text-sm flex justify-between gap-3" style={{ color: C.text }}>
+                          <span>{meetingDateLabel(s.date, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                          <span style={{ fontFamily: fontMono, color: C.textSoft }}>{MTG.formatClock(s.time)}</span>
+                        </li>
+                      ))}
+                    </ul>
+                    <div className="mt-2" style={{ fontSize: 11.5, color: C.textMute }}>
+                      {sessions.length} session{sessions.length === 1 ? '' : 's'}, in Manila time.
+                      {form.recurrence === 'weekly' && form.endMode === 'date' ? ' The series includes every session on its last day.' : ''}
+                    </div>
+                  </>
+                ) : (
+                  <ul className="mt-2 space-y-1">
+                    {Object.entries(check.errors).map(([k, msg]) => (
+                      <li key={k} className="text-sm" style={{ color: 'var(--status-warn-fg)' }}>{msg}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ── Templates ──────────────────────────────────────────────────── */}
+          {sub === 'templates' && (
+            <div className="glass-card rounded-2xl p-4 mt-4" style={{ background: GLASS.card }}>
+              <div className="flex flex-wrap items-center gap-2 mb-3">
+                <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Templates</div>
+                <div style={{ fontSize: 12, color: C.textMute }}>Starting points for a new meeting. Editing one never changes a meeting already scheduled.</div>
+                <button type="button" onClick={() => setEditingTpl({})} className={`${btn} ml-auto`} style={btnGhost}><Plus size={12} /> New template</button>
+              </div>
+              {tplErr ? <CommListError message={tplErr} onRetry={loadTemplates} /> : templates === null ? <FinanceLoading label="Loading templates…" /> : templates.length === 0 ? (
+                <div className="py-6 text-sm text-center" style={{ color: C.textMute }}>No templates yet.</div>
+              ) : (
+                <div className="space-y-2">
+                  {templates.map((t) => (
+                    <div key={t.id} className="rounded-xl px-3 py-2.5 flex flex-wrap items-center gap-x-3 gap-y-1.5"
+                      style={{ background: C.white, border: `1px solid ${C.border}`, opacity: t.active ? 1 : 0.6 }}>
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm font-semibold" style={{ color: C.text }}>
+                          {t.name}{!t.active && <span style={{ color: C.textMute, fontWeight: 500 }}> · off</span>}
+                        </div>
+                        <div style={{ fontSize: 11.5, color: C.textMute }}>
+                          {(t.weekly_days || []).length ? `Weekly · ${meetingDaysLabel(t.weekly_days)} · ${t.session_count} sessions` : 'One time'}
+                          {` · ${MTG.formatClock(t.start_time)} · ${t.duration_min} min · ${meetingAudienceLabel(t.audience)}`}
+                        </div>
+                      </div>
+                      <div className="flex gap-1.5">
+                        <button type="button" onClick={() => { setSub('schedule'); pickTemplate(t.key); }} disabled={!t.active} className={btn} style={btnGhost}>
+                          <CalendarPlus size={12} /> Use
+                        </button>
+                        <button type="button" onClick={() => setEditingTpl(t)} className={btn} style={btnGhost}><Pencil size={12} /> Edit</button>
+                        <button type="button" onClick={() => toggleTemplate(t)} className={btn} style={btnGhost}>{t.active ? 'Turn off' : 'Turn on'}</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── To-do board ────────────────────────────────────────────────── */}
+          {sub === 'tasks' && (
+            <div className="mt-4">
+              {taskErr && <CommListError message={taskErr} onRetry={loadTasks} />}
+              {tasks === null && !taskErr ? <FinanceLoading label="Loading the board…" /> : (
+                <div className="grid md:grid-cols-3 gap-3">
+                  {MEETING_TASK_SCOPES.map((s) => {
+                    const list = tasksByScope[s.key];
+                    const open = list.filter((t) => !t.done);
+                    const done = list.filter((t) => t.done);
+                    return (
+                      <div key={s.key} className="glass-card rounded-2xl p-3" style={{ background: GLASS.card }}>
+                        <div className="flex items-center justify-between">
+                          <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>{s.label}</div>
+                          <div style={{ fontSize: 11.5, color: C.textMute }}>{open.length} open</div>
+                        </div>
+                        <form className="flex gap-1.5 mt-2" onSubmit={(e) => { e.preventDefault(); addTask(s.key); }}>
+                          <input value={drafts[s.key]} onChange={(e) => setDrafts((d) => ({ ...d, [s.key]: e.target.value }))} maxLength={300}
+                            placeholder="Add a task" aria-label={`Add a task for ${s.label.toLowerCase()}`} className="gh-input flex-1 min-w-0" style={{ fontSize: 13 }} />
+                          <button type="submit" disabled={!drafts[s.key].trim() || taskBusy === `add:${s.key}`} className={btn} style={btnGhost} aria-label="Add the task">
+                            <Plus size={13} />
+                          </button>
+                        </form>
+                        <ul className="mt-2 space-y-1.5">
+                          {[...open, ...done].map((t) => (
+                            <li key={t.id} className="flex items-start gap-2 rounded-lg px-2 py-1.5" style={{ background: C.white, border: `1px solid ${C.border}` }}>
+                              <input type="checkbox" checked={t.done} onChange={() => toggleTask(t)} disabled={taskBusy === `done:${t.id}`}
+                                aria-label={t.done ? 'Mark as not done' : 'Mark as done'} className="mt-1" />
+                              <span className="flex-1 text-sm break-words" style={{ color: t.done ? C.textMute : C.text, textDecoration: t.done ? 'line-through' : 'none' }}>{t.title}</span>
+                              <button type="button" onClick={() => deleteTask(t)} disabled={taskBusy === `del:${t.id}`}
+                                className="text-xs inline-flex items-center gap-1"
+                                style={{ color: confirmDelete === t.id ? 'var(--status-danger-fg)' : C.textMute }}
+                                aria-label={confirmDelete === t.id ? 'Confirm deleting the task' : 'Delete the task'}>
+                                <Trash2 size={12} />{confirmDelete === t.id ? ' Delete?' : ''}
+                              </button>
+                            </li>
+                          ))}
+                          {!list.length && <li className="py-2" style={{ fontSize: 12, color: C.textMute }}>Nothing here yet.</li>}
+                        </ul>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              <div className="mt-2" style={{ fontSize: 11.5, color: C.textMute }}>One board for the whole team. Finished tasks stay listed for 30 days.</div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {inviting && <MeetingInvitePanel meeting={inviting} onClose={() => setInviting(null)} onDone={loadCalendar} />}
+      {editingTpl && (
+        <MeetingTemplateEditor template={editingTpl.id ? editingTpl : null} onClose={() => setEditingTpl(null)}
+          onSaved={() => { setEditingTpl(null); setNotice('Template saved.'); loadTemplates(); }} />
+      )}
+      {cancelling && (
+        <AccountModal title="Cancel this meeting?" subtitle={cancelling.topic} icon={Trash2} tone="danger" maxW="max-w-md"
+          canClose={!cancelBusy} onClose={() => { setCancelling(null); setCancelErr(''); }}>
+          <div className="space-y-3 text-sm" style={{ color: C.text }}>
+            {cancelErr && <AdminNotice kind="danger">{cancelErr}</AdminNotice>}
+            <p>This deletes the meeting in Zoom — for a weekly series, every session — and stops any invitations still waiting to be sent.</p>
+            <p style={{ color: C.textSoft }}>Anyone already invited is not told automatically. Send them a note from Communications if they need one.</p>
+            <div className="flex justify-end gap-2 pt-1">
+              <button type="button" onClick={() => { setCancelling(null); setCancelErr(''); }} disabled={cancelBusy} className="gh-btn-ghost px-4 py-2 text-sm">Keep it</button>
+              <button type="button" onClick={doCancel} disabled={cancelBusy}
+                className="px-4 py-2 rounded-xl text-sm font-semibold text-white disabled:opacity-60" style={ADMIN_BTN_DANGER}>
+                {cancelBusy ? 'Cancelling…' : 'Cancel meeting'}
+              </button>
+            </div>
+          </div>
+        </AccountModal>
       )}
     </div>
   );

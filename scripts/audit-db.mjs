@@ -381,9 +381,9 @@ export const OBJECT_CHECKS = [
       (to_regclass('public.staff_roles')), (to_regclass('public.staff_permissions')),
       (to_regclass('public.staff_role_permissions')), (to_regclass('public.staff_memberships')),
       (to_regclass('public.staff_role_events'))) as v(t)`],
-  ['#45/#58/#61 role x permission matrix is seeded', `select count(*) = 34 as ok
+  ['#45/#58/#61/#62 role x permission matrix is seeded', `select count(*) = 35 as ok
       from public.staff_role_permissions`],
-  ['#45/#58/#61 all 21 permissions are seeded', `select count(*) = 21 as ok from public.staff_permissions`],
+  ['#45/#58/#61/#62 all 22 permissions are seeded', `select count(*) = 22 as ok from public.staff_permissions`],
   // The caller-scoped helpers MUST be executable by authenticated: an RLS qual is
   // evaluated AS THE QUERYING ROLE, so without the grant every gated read fails
   // with "permission denied for function" instead of a clean authorization denial.
@@ -1134,6 +1134,22 @@ export const OBJECT_CHECKS = [
    where vars ?| array['bpi', 'gcash', 'security_bank', 'account_name', 'payment_instructions']`],
   ['#61    nothing has been stuck mid-send for over an hour', `select count(*) = 0 as ok from public.comm_deliveries
    where status = 'sending' and claimed_at < now() - interval '1 hour'`],
+
+  // ── #62, meetings & tasks ─────────────────────────────────────────────────
+  ['#62    three meeting tables with RLS and exactly one SELECT policy each', `select count(*) = 3
+         and coalesce(bool_and(c.relrowsecurity
+           and (select count(*) from pg_policies p where p.schemaname = 'public' and p.tablename = c.relname) = 1
+           and (select count(*) from pg_policies p where p.schemaname = 'public' and p.tablename = c.relname and p.cmd = 'SELECT') = 1), false) as ok
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace
+   where n.nspname = 'public' and c.relkind = 'r'
+     and c.relname in ('meeting_templates', 'meetings', 'staff_tasks')`],
+  ['#62    only super_admin holds meetings.manage', `select count(*) = 1 and min(role_key) = 'super_admin' as ok
+    from public.staff_role_permissions where permission_key = 'meetings.manage'`],
+  ['#62    no client role can write a meeting table, and anon cannot read one', `select coalesce(bool_and(
+           not has_table_privilege('authenticated', t, 'insert') and not has_table_privilege('authenticated', t, 'update')
+           and not has_table_privilege('authenticated', t, 'delete') and not has_table_privilege('anon', t, 'select')), false) as ok
+    from unnest(array['public.meeting_templates', 'public.meetings', 'public.staff_tasks']) t`],
+  ['#62    an invitation needs a request key', `select to_regprocedure('public.meeting_send_invites(uuid,jsonb,text)') is not null as ok`],
 
 ];
 

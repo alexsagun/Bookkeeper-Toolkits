@@ -432,7 +432,7 @@ for (const file of FILES) {
 
 test('finance.manage is the 20th permission and is Super-Admin-only', () => {
   assert.ok(STAFF_PERMISSION_KEYS.includes('finance.manage'), 'finance.manage is missing from the mirror');
-  // #61 appended communications.send after it; the SQL seed order is still what
+  // #61 appended communications.send and #62 meetings.manage after it; the SQL seed order is still what
   // staffRolesSql.test.mjs diffs, so position 20 is pinned rather than "last".
   assert.equal(STAFF_PERMISSION_KEYS.indexOf('finance.manage'), 19,
     'finance.manage must stay the 20th key, matching the SQL seed order — staffRolesSql.test.mjs '

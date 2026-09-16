@@ -157,6 +157,14 @@ export const APP_ERROR_CODES = [
   'COMM_NOT_FOUND',
   'COMM_CAMPAIGN_CLOSED',
   'COMM_CAP_INVALID',
+  // Meetings & Tasks (#62)
+  'MEETING_INVALID',
+  'MEETING_NOT_FOUND',
+  'TASK_INVALID',
+  'TASK_NOT_FOUND',
+  'ZOOM_NOT_CONNECTED',
+  'ZOOM_REQUEST_FAILED',
+  'MEETING_LOG_FAILED',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -435,6 +443,23 @@ const COPY = {
     'That campaign was cancelled, so its failed emails can’t be retried. Start a new message instead.',
   COMM_CAP_INVALID:
     'The daily limit must be a whole number between 1 and 50,000.',
+  MEETING_INVALID:
+    'Some meeting details are missing or don’t fit together. Check the topic, date, time, duration, '
+    + 'repeat settings and who is invited.',
+  MEETING_NOT_FOUND:
+    'That meeting or template no longer exists. Refresh the list.',
+  TASK_INVALID:
+    'A task needs a title (up to 300 characters) and whether it is for the day, the week or the month.',
+  TASK_NOT_FOUND:
+    'That task no longer exists. Refresh the board.',
+  ZOOM_NOT_CONNECTED:
+    'Zoom isn’t connected yet. Add the Zoom app credentials (ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID and '
+    + 'ZOOM_CLIENT_SECRET) in Vercel, then try again.',
+  ZOOM_REQUEST_FAILED:
+    'Zoom didn’t complete the request, so nothing was changed here. Try again in a moment.',
+  MEETING_LOG_FAILED:
+    'The meeting was created in Zoom but couldn’t be saved here, so any invitations you asked for were '
+    + 'not sent. It still shows in the calendar from Zoom — don’t create it again.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };

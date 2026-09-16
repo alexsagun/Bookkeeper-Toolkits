@@ -224,7 +224,8 @@ const notifyDevApi = (env, route, modulePath) => ({
   },
 });
 
-// Communications (#61): the Super Admin send endpoint and the daily cron. Both need the
+// Communications (#61): the Super Admin send endpoint and the daily cron — and Meetings (#62),
+// which also needs the ZOOM_* trio. All of them need the
 // service key (they claim and record deliveries) and the Resend pair. CRON_SECRET is
 // copied so the cron handler can be exercised locally with the same header Vercel sends;
 // without it the handler refuses, exactly as it does in production.
@@ -234,7 +235,7 @@ const commDevApi = (env, route, modulePath) => ({
     server.middlewares.use(route, async (req, res) => {
       const keys = [
         'SUPABASE_SECRET_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'RESEND_API_KEY', 'RESEND_FROM',
-        'NOTIFY_ADMIN_EMAIL', 'CRON_SECRET',
+        'NOTIFY_ADMIN_EMAIL', 'CRON_SECRET', 'ZOOM_ACCOUNT_ID', 'ZOOM_CLIENT_ID', 'ZOOM_CLIENT_SECRET',
         'VITE_SUPABASE_URL', 'VITE_SUPABASE_ANON_KEY', 'SUPABASE_URL', 'SUPABASE_ANON_KEY',
       ];
       for (const k of keys) {
@@ -276,7 +277,8 @@ export default defineConfig(({ mode }) => {
       notifyDevApi(env, '/api/notify-enrollment', './api/notify-enrollment.js'),
       notifyDevApi(env, '/api/notify-access', './api/notify-access.js'),
       commDevApi(env, '/api/admin/communications', './api/admin/communications.js'),
-      commDevApi(env, '/api/cron/communications', './api/cron/communications.js')],
+      commDevApi(env, '/api/cron/communications', './api/cron/communications.js'),
+      commDevApi(env, '/api/admin/meetings', './api/admin/meetings.js')],
     build: {
       rollupOptions: {
         output: {

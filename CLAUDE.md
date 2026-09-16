@@ -1077,7 +1077,7 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   staff-activation-consistency (#50) → access-request-staff-target (#51) →
   student-progress-rankings (#52) → progress-rankings-followup (#53) →
   progress-course-family-scoping (#54) → approve-rpc-grant-revoke (#55) →
-  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61)** — see the Staff-authorization
+  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61) → meetings-tasks (#62)** — see the Staff-authorization
   and Progress & Rankings sections for what each does. **#57**
   ([db/2026-09-08-lesson-video-quicktime.sql](db/2026-09-08-lesson-video-quicktime.sql), fold
   **§44**) widens `course-videos.allowed_mime_types` to
@@ -1310,7 +1310,7 @@ That direction is the whole safety argument. **Never repair a missed check by ha
 role `is_admin = true`.**
 
 - **Tables** (`db/2026-08-25-staff-authorization.sql`, #45): `staff_roles` / `staff_permissions` /
-  `staff_role_permissions` (the 21 × 3 matrix, **34 grants** — #61 added `communications.send` to super_admin alone; #52 added `student_progress.read`, #56 the
+  `staff_role_permissions` (the 22 × 3 matrix, **35 grants** — #61 added `communications.send` and #62 `meetings.manage`, each to super_admin alone; #52 added `student_progress.read`, #56 the
   two community keys to both non-super roles, #58 `finance.manage` to super_admin alone) → `staff_memberships` (ONE row per
   user, mutated in place; only `status='active'` confers authority, which is what makes a suspension
   take effect on the next *request* rather than the next token refresh) → `staff_role_events`
@@ -1547,7 +1547,8 @@ role `is_admin = true`.**
 ## Financial Management — the business ledger, Super Admin only (#58)
 
 Tab id `financialmanagement`, route `/admin/financial-management`, an admin-nav row directly after
-Enrollments (Access Requests · Enrollments · Financial Management · Student Imports · Batches · Team & Roles).
+Enrollments (Access Requests · Enrollments · Financial Management · Communications · Meetings & Tasks ·
+Student Imports · Batches · Team & Roles).
 **Applied to production 2026-09-14** as one transaction, after a full rehearsal on the live catalog that
 was forced to abort — the first attempt was refused whole on a STABLE function in a generated column (see
 the fingerprint comment in the migration). Verified there by rolled-back impersonation: Ops Admin, Trainer,
@@ -1847,6 +1848,63 @@ security change is the 15 new client RPCs on the authenticated SECURITY DEFINER 
   names the app calls, the empty sandbox, the cron gate, the send loop's stop conditions and the
   composer's key and lock — every guard mutation-tested). Owner steps: set `CRON_SECRET` (at least 16 characters — the signed-in status check uses the same rule), confirm
   `RESEND_API_KEY` / `RESEND_FROM`, set the daily cap.
+
+## Meetings & Tasks — Zoom meetings, invitations and the shared to-do board (#62)
+
+Tab id `meetings`, route `/admin/meetings`, an admin-nav row directly after Communications. Migration
+[db/2026-09-17-meetings-tasks.sql](db/2026-09-17-meetings-tasks.sql), folded verbatim as bootstrap
+**§49**. **Applied to production 2026-09-16 (Manila time)** as one transaction, right after a fresh
+forced-abort rehearsal. Verified there by the post-apply catalog checks (22 permissions / 35 grants;
+three tables with exactly one SELECT policy each; 11 client RPCs and no anon-executable function; no
+client write grant; the audience CHECK; no stored audience holding an address; the 111-code catalog),
+by the behaviour probe re-run against the applied schema in a rolled-back transaction — identical to
+the pre-apply run — and by an advisors comparison whose only security change is the 11 new client RPCs
+on the authenticated SECURITY DEFINER list. The native replacement for the legacy
+Apps Script "Meetings" module, which created Zoom meetings from an endpoint that checked nothing,
+emailed the join link to whatever recipients the browser named (with a CC list), sent a series' end
+date as midnight UTC — 08:00 in Manila, so an evening session on the last day was dropped — and kept
+its to-do board in ONE browser's localStorage.
+
+- **`meetings.manage`** — the 22nd staff permission, **super_admin only** (35 grants). Inviting
+  students ALSO needs `communications.send`, checked in `meeting_send_invites` and again in
+  `api/admin/meetings.js`, so a future role could schedule meetings without gaining a mailing list.
+- **Three tables** (`meeting_templates`, `meetings`, `staff_tasks`), each with exactly one SELECT
+  policy and **no client write path** — the finance rule — plus `comm_campaigns.meeting_id`.
+- ★ **ZOOM FIRST, THEN THE LOG.** Zoom and Postgres cannot share a transaction.
+  [api/admin/meetings.js](api/admin/meetings.js) holds the Zoom Server-to-Server credentials, creates
+  the meeting in Zoom, then records it with the CALLER's JWT through `meeting_record`, which is
+  idempotent on the Zoom id. A meeting in Zoom with no log row still appears in the calendar (the
+  Zoom list is merged in by `mergeCalendarItems`); a log row for a meeting Zoom never created would
+  be a lie. A failed log write returns `MEETING_LOG_FAILED` and says not to create it again.
+- ★ **`start_url` IS NEVER READ INTO ANYTHING.** Whoever holds Zoom's start link is the host, so
+  `safeMeeting()` keeps `join_url` only, the column takes `https://` only, and both the suite and the
+  migration scan assert the string appears in no executable line.
+- ★ **CREATING IS NOT IDEMPOTENT AT ZOOM**, which takes no request key: the Schedule button is held
+  by a **ref lock** (a state flag re-renders too late), the handler refuses a second concurrent create
+  from the same account, and a dropped connection says to check the calendar before trying again.
+- ★ **AN INVITATION IS A #61 CAMPAIGN, BUILT IN SQL.** `meeting_send_invites(meeting, audience, key)`
+  composes the subject and body from the stored meeting — topic, Manila date and time, repeat pattern,
+  duration, join link — so the browser chooses WHO and never what the email says. Braces are stripped
+  from the topic and the link, so a topic cannot smuggle in `{{payment_instructions}}`. **The request
+  key is required**: a replay returns the campaign the first request made, and a key that belongs to
+  another message is refused rather than relinked. Invitations then ride #61's audience resolver,
+  daily cap, queue, clearance and idempotency, with replies to support and no CC.
+- ★ **CANCELLING A MEETING STOPS ITS INVITATIONS**, in #61's lock order: the meeting row, then every
+  campaign row of that meeting (in id order), then their delivery rows. It drops what is still
+  waiting and RETURNS `in_flight` for anything already cleared to send, which the screen reports as
+  "may still arrive". Anyone already invited is not told automatically, and the dialog says so.
+- **Templates** are starting points only (the five legacy ones, remapped to today's plans); editing
+  one never changes a meeting already scheduled. **The to-do board** is one shared table, three
+  scopes, with finished tasks listed for 30 days.
+- Pure mirror: [src/lib/meetingSchedule.js](src/lib/meetingSchedule.js) — the SAME functions the tab
+  previews with and the handler validates with, so the sessions a Super Admin sees are the sessions
+  Zoom creates. Asia/Manila is a fixed +08:00 (no DST since 1978), and a series ends at 23:59 on its
+  last Manila day. Suites: `test/meetingSchedule.test.mjs`, `test/meetingsSql.test.mjs` (both SQL
+  files, the handler's gate and bounds, the tab's wiring and RPC names — every guard mutation-tested).
+- Owner steps: create a Zoom **Server-to-Server OAuth** app with meeting read and write scopes and set
+  `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID` and `ZOOM_CLIENT_SECRET` in Vercel. Until then the tab says Zoom
+  is not connected, and templates and the to-do board still work. **Zoom itself is stub-tested only**
+  — nothing in this feature has talked to the real Zoom API yet.
 
 ## Progress & Rankings — learning analytics and privacy-safe leaderboards (#52)
 
