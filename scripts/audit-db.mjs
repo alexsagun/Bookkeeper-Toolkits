@@ -1175,6 +1175,28 @@ export const OBJECT_CHECKS = [
      and p.prosrc like '%FINANCE_COLLECTION_AMOUNT_INVALID%'
      and exists (select 1 from public.app_error_catalog() c where c.code = 'FINANCE_COLLECTION_AMOUNT_INVALID')`],
 
+  // ── #64, finance daily income ─────────────────────────────────────────────
+  // ★ One reader. SECURITY DEFINER in public is callable by authenticated, so the in-body
+  //   finance.manage check — not the grant — is the boundary, and anon must not hold EXECUTE.
+  ['#64    one daily-income reader: stable, security definer, search_path pinned', `select count(*) = 1
+         and bool_and(p.provolatile = 's' and p.prosecdef
+           and coalesce(array_to_string(p.proconfig, ','), '') like '%search_path=public, pg_temp%') as ok
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public' and p.proname = 'finance_daily_income_report'`],
+  ['#64    the daily-income reader is authenticated-only', `select case when to_regprocedure('public.finance_daily_income_report(date)') is null then false
+    else has_function_privilege('authenticated', 'public.finance_daily_income_report(date)', 'execute')
+     and not has_function_privilege('anon', 'public.finance_daily_income_report(date)', 'execute') end as ok`],
+  // A restatement that read a catalog price or a request amount would rewrite history when a price
+  // changes; one that dropped the check would hand the books to anyone signed in.
+  ['#64    the daily-income reader checks finance.manage and reads only the ledger', `select count(*) = 1 as ok
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public' and p.proname = 'finance_daily_income_report'
+     and p.prosrc like '%has_staff_permission(''finance.manage'')%'
+     and p.prosrc not like '%amount_paid%' and p.prosrc not like '%price_php%'
+     and p.prosrc not like '%amount_expected%' and p.prosrc not like '%finance_request_collected%'
+     and p.prosrc like '%reverses_entry_id%'
+     and p.prosrc like '%''reconciled'', v_ledger = %'`],
+
 ];
 
 async function main() {

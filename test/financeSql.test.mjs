@@ -536,13 +536,19 @@ test('every financeModel constant the app uses is actually imported', () => {
 //   call('finance_…') builds, passes every other test, and fails only when a Super
 //   Admin clicks the button. Every finance function the app names must exist in #58
 //   AND be granted — and an internal one (never granted) must never be called.
+// ★ run(key, 'finance_…') and act(key, 'finance_…') — the Setup and Bank panels' helpers — name
+//   the RPC in their SECOND argument, and some keys are template literals. Matching only
+//   call(…)/supabase.rpc(…) left 21 writers unchecked, including locking a period and committing
+//   a bank import.
+const FINANCE_RPC_OWNERS = [MIGRATION, PARITY, 'db/2026-09-19-finance-daily-income.sql'];
 test('every finance RPC the app calls exists and is granted to authenticated', () => {
   const app = read('src/BookkeeperPro.jsx');
-  const sql = codeOf(read(MIGRATION)) + '\n' + codeOf(read(PARITY));
-  const called = [...new Set([...app.matchAll(/(?:call|supabase\.rpc)\(\s*'(finance_\w+)'/g)].map((m) => m[1]))];
-  assert.ok(called.length >= 6, `expected the app to call the finance RPCs, found ${called.length}`);
+  const sql = FINANCE_RPC_OWNERS.map((f) => codeOf(read(f))).join('\n');
+  const callSite = /(?:\b(?:call|supabase\.rpc)\(\s*|\b(?:run|act)\(\s*(?:'[^']*'|`[^`]*`)\s*,\s*)'(finance_\w+)'/g;
+  const called = [...new Set([...app.matchAll(callSite)].map((m) => m[1]))];
+  assert.ok(called.length >= 40, `expected the app to call the finance RPCs, found ${called.length}`);
   for (const name of called) {
-    assert.ok(sql.includes(`create or replace function public.${name}(`), `the app calls ${name}, which neither #58 nor #59 defines`);
+    assert.ok(sql.includes(`create or replace function public.${name}(`), `the app calls ${name}, which no finance migration (#58, #59, #64) defines`);
     assert.ok(sql.includes(`grant execute on function public.${name}(`),
       `the app calls ${name}, which is not granted — it would 403 for the Super Admin too`);
   }

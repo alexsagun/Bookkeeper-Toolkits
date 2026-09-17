@@ -122,7 +122,8 @@ See the **add-bookkeeper-tool** skill for the full copy-paste snippet, and `Bank
 
   Guard with `if (typeof window !== 'undefined' && window.storage)` as existing code does (~L940).
   Sidebar layout persists under `sidebar:*` keys (`sidebar:stages` / `sidebar:collapsed` /
-  `sidebar:expandedGroups`, ~L940–988).
+  `sidebar:expandedGroups` / `sidebar:railCollapsed` / `sidebar:adminExpanded` — the last is the
+  Administration group's open state, added with the scrolling-admin-nav change; all in `LEGACY_KEYS`).
 
 - **Per-user namespacing is automatic.** `window.storage` keys are transparently scoped to the
   signed-in user (`u:<uid>:<key>`) by the shim in `main.jsx`. Keep calling `window.storage` with

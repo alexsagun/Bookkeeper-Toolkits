@@ -37,7 +37,7 @@ import assert from 'node:assert/strict';
 
 import {
   makePersona, seedStaff, seedMember, clearStaff, expectAppError,
-  resetShadow, runSql, serviceClient, anonClient, lit, sqlScalar,
+  resetShadow, resetFinance, runSql, serviceClient, anonClient, lit, sqlScalar,
 } from './_harness.mjs';
 
 const FINANCE_TABLES = [
@@ -96,6 +96,8 @@ const FINANCE_RPCS = [
   ['finance_categorize_bank_transaction', { p_txn_id: NIL, p_account_id: NIL }],
   ['finance_match_bank_transaction', { p_txn_id: NIL, p_entry_id: NIL }],
   ['finance_undo_bank_transaction', { p_txn_id: NIL }],
+  // #64 — the Daily Income report. No argument: the guard must refuse before the month is read.
+  ['finance_daily_income_report', {}],
 ];
 
 let superAdmin; let ops; let trainer; let student; let revoked;
@@ -103,6 +105,7 @@ let cashId; let incomeId; let entryId;
 
 before(async () => {
   await resetShadow();
+  await resetFinance();
 
   superAdmin = await makePersona('fin-super', { fullName: 'Fin Super' });
   ops = await makePersona('fin-ops', { fullName: 'Fin Ops' });

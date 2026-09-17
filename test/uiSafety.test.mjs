@@ -811,3 +811,208 @@ test('an abandoned upload is swept when the drawer closes', () => {
     + 'is the one just written to the row');
   assert.match(src, /onPendingPath=\{notePendingVideoPath\}/, 'the drawer must be told the path');
 });
+
+// ── 20. The admin nav scrolls with the rest of the sidebar ──────────────────
+//
+// Eight capability-filtered admin links and the Customize controls lived in the
+// sidebar's NON-scrolling header. Every admin screen added (#58 Finance, #61
+// Communications, #62 Meetings) made that header taller and the scrolling product
+// nav below it shorter, until on a 1280×720 laptop the courses were a sliver. The
+// header now holds only brand + identity; the admin links are a collapsible group
+// INSIDE the scroll region, and Customize sits in a small non-scrolling footer.
+const sidebarOf = (src) => {
+  const start = src.indexOf('{/* SIDEBAR — static column');
+  const end = src.indexOf('{/* MAIN */}');
+  assert.ok(start > 0 && end > start, 'the sidebar <aside> could not be found');
+  return src.slice(start, end);
+};
+
+test('the sidebar header holds no admin links and no Customize controls', () => {
+  const aside = sidebarOf(app());
+  const header = aside.slice(0, aside.indexOf('{/* Rail header'));
+  assert.ok(header.length > 0, 'the rail header marker moved');
+  assert.ok(!header.includes('adminNavItems.map('),
+    'admin links in the fixed header squeeze the scrolling nav on every short screen');
+  assert.ok(!header.includes('enterCustomize'), 'Customize belongs in the footer, not the fixed header');
+  assert.match(header, /className=\{`flex-shrink-0 px-5/, 'the header must not be squeezed either');
+});
+
+test('the expanded nav is the scroller, and it starts with the Administration group', () => {
+  const aside = sidebarOf(app());
+  // BOTH <nav>s carry the same accessible name, and that is correct: only one is ever
+  // rendered-and-visible at a time (the rail is `railCollapsed &&` plus `hidden lg:flex`; the
+  // expanded one goes `lg:hidden` when collapsed), so neither breakpoint is handed an unnamed
+  // navigation. It does mean the LABEL is no longer a unique anchor — pin the expanded nav by its
+  // own class shape instead: a template literal starting `flex-1`, where the rail's is a plain
+  // string starting "hidden lg:flex".
+  assert.equal((aside.match(/<nav aria-label="Main navigation"/g) || []).length, 2,
+    'both the expanded nav and the collapsed rail must be named for assistive tech');
+  const EXPANDED = '<nav aria-label="Main navigation" className={`flex-1';
+  assert.equal(aside.split(EXPANDED).length - 1, 1,
+    'the expanded nav lost its label or its class shape — this anchor must stay unambiguous');
+  const navAt = aside.indexOf(EXPANDED);
+  const navTag = aside.slice(navAt, aside.indexOf('>', navAt));
+  assert.match(navTag, /min-h-0/, 'a flex child without min-h-0 refuses to shrink and stops scrolling');
+  assert.match(navTag, /overflow-y-auto/);
+  const group = aside.indexOf('aria-controls="sidebar-admin-list"');
+  const stages = aside.indexOf('visibleStages.map(', navAt);
+  assert.ok(group > navAt && group < stages, 'the admin group must be inside the scroll region, before the stages');
+  assert.match(aside, /aria-expanded=\{adminNavOpen\}/);
+  // Attribute ORDER must not matter. Asserting that id and hidden were ADJACENT is exactly what
+  // broke when the list gained its own accessible name, so slice the tag and test it by parts.
+  const ulAt = aside.indexOf('<ul id="sidebar-admin-list"');
+  assert.ok(ulAt > 0, 'the list stays rendered so aria-controls always points at a real element');
+  const ulTag = aside.slice(ulAt, aside.indexOf('>', ulAt));
+  assert.match(ulTag, /hidden=\{!adminNavOpen\}/, 'the group collapses via the hidden attribute');
+  assert.match(ulTag, /aria-labelledby="sidebar-admin-toggle"/,
+    'an unnamed list of admin links is announced as just "list"');
+  // The collapse rests ENTIRELY on preflight's [hidden]{display:none}. ANY display utility here
+  // out-cascades it and Administration becomes permanently open — the precise hazard
+  // src/index.css already documents, after it shipped once one layer down.
+  const ulClass = (ulTag.match(/className="([^"]*)"/) || ['', ''])[1];
+  assert.ok(!/\b(flex|grid|block|inline|inline-flex|inline-block|table|contents)\b/.test(ulClass),
+    'a display utility on the admin list would silently defeat hidden={!adminNavOpen}');
+});
+
+test('the collapsed rail is not second class for assistive tech', () => {
+  const aside = sidebarOf(app());
+  const railAt = aside.indexOf('<nav aria-label="Main navigation" className="hidden lg:flex');
+  assert.ok(railAt > 0, 'the collapsed rail nav must be named too, not just the expanded one');
+  // Active state in the rail used to be an inline gradient and nothing else — it LOOKED current
+  // and announced nothing. Scope the search to the rail so the group's own copy cannot satisfy it.
+  const rail = aside.slice(railAt, aside.indexOf('{visibleStages.map(', railAt));
+  assert.ok(rail.includes('adminNavItems.map('), 'the rail slice no longer contains the admin rows');
+  assert.match(rail, /aria-current=\{tab === item\.id \? 'page' : undefined\}/,
+    'a rail admin row must announce that it is the current page, not merely look like it');
+});
+
+test('the collapsed Administration badge counts every admin queue', () => {
+  const aside = sidebarOf(app());
+  // The summary badge exists so a CLOSED group can still pull you in. Filtering it to
+  // accessrequests+enrollments made a running or failed student import invisible the moment the
+  // group was collapsed — the one job the badge has. Whichever admin queue is added next must
+  // be counted without anyone remembering to extend a list.
+  const at = aside.indexOf('const waiting = adminNavItems');
+  assert.ok(at > 0, 'the Administration summary badge lost its count');
+  const stmt = aside.slice(at, aside.indexOf(';', at));
+  assert.match(stmt, /adminNavItems\.reduce\(/, 'the badge must reduce over the whole list');
+  assert.ok(!stmt.includes('.filter('),
+    'an id allow-list here silently drops whichever admin queue was added last');
+});
+
+test('admin links stay real links, from ONE list, in exactly two renderings', () => {
+  const aside = sidebarOf(app());
+  assert.equal((aside.match(/adminNavItems\.map\(/g) || []).length, 2,
+    'one expanded group and one icon rail — a third copy is how the two drift apart');
+  assert.equal((aside.match(/href=\{tabHref\(item\.id\)\}/g) || []).length, 2,
+    'an admin row must stay an <a href> so Ctrl/middle-click opens a new tab');
+  assert.match(aside, /aria-current=\{tab === item\.id \? 'page' : undefined\}/);
+  assert.match(aside, /className=\{`relative nav-hover \$\{tab === item\.id \? 'nav-item-active'/,
+    'nav-item-active draws its bar with an absolutely positioned ::before — without relative it lands on the aside edge');
+});
+
+test('Customize lives in a non-scrolling footer and is still capability-gated', () => {
+  const aside = sidebarOf(app());
+  const footerAt = aside.indexOf('{/* Sidebar footer');
+  assert.ok(footerAt > aside.lastIndexOf('</nav>'), 'the footer must come after the scrolling nav');
+  const footer = aside.slice(footerAt);
+  assert.match(footer, /className=\{`flex-shrink-0/);
+  assert.match(footer, /canCustomizeSidebar && !editMode/, 'Customize is shown only to those who may rename labels');
+  assert.match(footer, /onClick=\{enterCustomize\}/);
+  assert.match(footer, /role="alert"/, 'a failed save must be announced, not just coloured red');
+});
+
+test('the Administration group state persists per user and opens for an active admin tab', () => {
+  const src = app();
+  assert.match(src, /window\.storage\.get\('sidebar:adminExpanded'\)/);
+  assert.match(src, /window\.storage\.set\('sidebar:adminExpanded', String\(adminNavOpen\)\)/);
+  assert.match(src, /if \(storageReady && adminNavIds\.split\(','\)\.includes\(tab\)\) setAdminNavOpen\(true\)/,
+    'an admin tab reached by deep link must not sit inside a collapsed group');
+  const auth = readFileSync(join(REPO, 'src/auth/AuthProvider.jsx'), 'utf8');
+  assert.match(auth, /'sidebar:adminExpanded'/, 'every persisted key belongs in LEGACY_KEYS');
+});
+
+// ── 21. Daily Income is wired to the ledger, not to a cache ─────────────────
+test('the ledger-change event is declared once at module scope and never re-fired by invalidateReports', () => {
+  const src = app();
+  assert.match(src, /^const FINANCE_LEDGER_CHANGE_EVENT = 'bookkeeper:finance-ledger-change';$/m);
+  const inv = src.slice(src.indexOf('const invalidateReports = useCallback('), src.indexOf('const bankChanged = useCallback('));
+  assert.ok(inv.length > 0 && !/dispatchEvent/.test(inv),
+    'invalidateReports is what the listener calls — dispatching from it would recurse');
+  assert.match(src, /window\.addEventListener\(FINANCE_LEDGER_CHANGE_EVENT, onLedgerChange\)/);
+  assert.match(src, /window\.removeEventListener\(FINANCE_LEDGER_CHANGE_EVENT, onLedgerChange\)/);
+});
+
+test('both approval paths announce the ledger change', () => {
+  const src = app();
+  const single = src.slice(src.indexOf('const doApprove = async (r, pickedBatchId = null) => {'), src.indexOf('const grantedEndsAt'));
+  assert.match(single, /if \(out\.already\)[\s\S]*return;[\s\S]*dispatchEvent\(new Event\(FINANCE_LEDGER_CHANGE_EVENT\)\)/,
+    'after the already-approved early return — an idempotent re-approval posted nothing');
+  const bulk = src.slice(src.indexOf('const runBulk = async () => {'), src.indexOf('const exportCsv = () => {'));
+  assert.match(bulk, /kind === 'approve' && results\.some\(\(x\) => x\.ok && x\.note === 'approved'\)/);
+  assert.equal((bulk.match(/FINANCE_LEDGER_CHANGE_EVENT/g) || []).length, 1, 'once per bulk run, not once per row');
+});
+
+test('Daily Income loads itself, shows its own setup card, and a failure is never an empty month', () => {
+  const src = app();
+  const body = src.slice(src.indexOf('function FinanceDailyIncomeReport('), src.indexOf('// ── Profit & Loss'));
+  assert.match(body, /supabase\.rpc\('finance_daily_income_report', \{ p_month: month \? `\$\{month\}-01` : null \}\)/);
+  assert.ok(!/\bcall\(/.test(body), "the parent's call() would replace the whole finance screen for a missing #64");
+  assert.match(body, /db\/2026-09-19-finance-daily-income\.sql/);
+  assert.match(body, /catch \(e\) \{[\s\S]{0,80}setReport\(null\)/, 'a failed load must clear the previous month');
+  assert.ok(!/'(sampler|silver_self_paced|vip|gold|core|gold_live|essentials)'/.test(body),
+    'no plan key in the component — the columns are the server\'s plan list');
+  assert.match(src, /\{ key: 'overview',\s+label: 'Overview' \},[\s\S]{0,140}\{ key: 'daily',\s+label: 'Daily Income' \}/);
+});
+
+test('a reversal is dated today in the business timezone unless the admin chooses the original date', () => {
+  const src = app();
+  const body = src.slice(src.indexOf('function FinanceReverseModal('), src.indexOf('\nfunction ', src.indexOf('function FinanceReverseModal(') + 10));
+  assert.match(body, /const \[when, setWhen\] = useState\('today'\)/, 'the owner decision: corrections default to today');
+  assert.match(body, /const today = serverToday \|\| businessToday\(timeZone\);/,
+    "the server's business date first; the device clock is only a visible fallback");
+  assert.match(body, /when === 'original' && landed !== original/,
+    '"closed" is only true on the original-date path — a today-dated correction never moved');
+  assert.match(body, /correctionDate\(entry\.entry_date, today\)/);
+  assert.match(body, /p_reversal_date: when === 'today' \? onDate : null/);
+  assert.ok(!/todayISODate\(/.test(body), "the browser's date is not the business date");
+});
+
+const dailyBody = (src) => src.slice(src.indexOf('function FinanceDailyIncomeReport('), src.indexOf('// ── Profit & Loss'));
+
+test('one visible choice drives the table, the print view and the CSV', () => {
+  const body = dailyBody(app());
+  // `rows` is the zero-day filter applied; `days` is every calendar day. Exporting `days` while
+  // printing `rows` let a hidden-zero-days view download a file that disagreed with both the
+  // screen and the printout, row for row.
+  assert.match(body, /const rows = showZero \? days : activeDays;/);
+  assert.match(body, /financeDownloadCsv\(`daily-income-\$\{report\.month\}\.csv`, exportCols, \[\.\.\.rows, totalsRow\]\)/,
+    'the CSV must honour the zero-activity toggle, like the table and the print view already do');
+  assert.ok(!/exportCols, \[\.\.\.days,/.test(body),
+    'exporting every calendar day contradicts the screen the admin is looking at');
+});
+
+test('the month picker keeps its rails when a load fails', () => {
+  const body = dailyBody(app());
+  // A failure clears `report` on purpose, so a failure can never read as a zero month. Deriving
+  // the bounds from `report` therefore dropped min/max in the error state: prev/next stepped
+  // outside 2020-01 … max_month, the next call answered 22023, and the same error card rendered
+  // again with no way forward.
+  assert.match(body, /const bounds = report \? \{[^}]*\} : lastBoundsRef\.current;/,
+    'the error state must fall back to the last known bounds');
+  assert.match(body, /lastBoundsRef\.current = \{ min: data\.min_month \|\| null, max: data\.max_month \|\| null \}/,
+    'and the rails must be captured on a SUCCESSFUL load, not derived from the cleared report');
+});
+
+test('the finance loading card and the daily chart respect the reader', () => {
+  const src = app();
+  const loadAt = src.indexOf('function FinanceLoading(');
+  assert.ok(loadAt > 0, 'FinanceLoading moved');
+  assert.match(src.slice(loadAt, loadAt + 400), /animate-spin motion-reduce:animate-none/,
+    'a spinner with no reduced-motion opt-out is the one animation a reader cannot turn off');
+  const chart = src.slice(src.indexOf('function FinanceDailyNetBars('), src.indexOf('function FinanceDailyIncomeReport('));
+  assert.ok(!/<figure aria-label=/.test(chart),
+    'an aria-label on the <figure> overrides its <figcaption>, so the legend stops being part of the name');
+  assert.match(chart, /<figcaption/, 'the chart is named by its caption');
+  assert.match(chart, /<svg[^>]*role="img"/, 'and the svg carries the full spoken description');
+});

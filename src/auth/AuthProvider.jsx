@@ -49,6 +49,9 @@ export const useAuth = () => useContext(AuthContext);
 const LEGACY_KEYS = [
   'currency:pref', 'currency:rate',
   'sidebar:stages', 'sidebar:collapsed', 'sidebar:expandedGroups', 'sidebar:version', 'sidebar:railCollapsed',
+  // The Administration group's open/closed state. Listed for the "every persisted key" rule —
+  // it post-dates auth, so no signed-out copy of it can exist to migrate.
+  'sidebar:adminExpanded',
   'certs:completed', 'certs:inProgress',
   'health:clients',
   'monthend:checked', 'yearend:checked',

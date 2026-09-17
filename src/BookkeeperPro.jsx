@@ -73,6 +73,9 @@ import {
 } from './lib/planCatalog';
 import { FINANCE_ACCOUNT_TYPES, FINANCE_AGING_BUCKETS } from './lib/financeModel';
 import { BANK_STATEMENT_PRESETS, presetColumnMap, readStatementRows } from './lib/bankStatement';
+import {
+  shiftMonth, isZeroActivityDay, dailyIncomeColumns, businessToday, correctionDate,
+} from './lib/financeDailyIncome';
 import * as MTG from './lib/meetingSchedule';
 import {
   COMM_PREVIEW_VARS, COMM_TAGS, COMM_TAG_HELP, COMM_TEMPLATES, parseManualEmails, renderPreviewDocument,
@@ -222,6 +225,10 @@ const TOOL_COUNT = Object.keys(TAB_ROUTES).filter((id) => !NON_TOOL_TAB_IDS.has(
 const INTERVIEW_SUBTAB_IDS = new Set(['winstrat', 'mock', 'common', 'accounting', 'body', 'jdgen', 'salary']);
 const APP_ROUTE_CHANGE_EVENT = 'bookkeeper:route-change';
 const STUDENT_PROGRESS_CHANGE_EVENT = 'bookkeeper:student-progress-change';
+// #64: something posted to the ledger from OUTSIDE Financial Management (an enrollment approval
+// runs the collection hook). The finance screen stays mounted while hidden, so without this its
+// cached reports — Daily Income included — would keep showing the books as they were.
+const FINANCE_LEDGER_CHANGE_EVENT = 'bookkeeper:finance-ledger-change';
 const ACCOUNT_PANEL_ALIASES = {
   settings: 'settings',
   profile: 'settings',
@@ -8317,6 +8324,12 @@ export default function BookkeeperProToolkit() {
   // so the look is unchanged until the user collapses it; the saved preference takes over after load.
   const [railCollapsed, setRailCollapsed] = useState(false);
   const toggleRail = () => setRailCollapsed(v => !v);
+  // The Administration group in the scrolling nav (per user, `sidebar:adminExpanded`). Default
+  // open, so moving the links out of the fixed header costs nobody a click.
+  const [adminNavOpen, setAdminNavOpen] = useState(true);
+  const customizeBtnRef = useRef(null);
+  const doneBtnRef = useRef(null);
+  const wasEditingRef = useRef(false);
 
   // Global label overrides: { item_key: custom_label } loaded from Supabase (every user reads
   // them, so the whole app shows the admin's labels). `draftLabels` holds an admin's in-progress
@@ -8485,6 +8498,10 @@ export default function BookkeeperProToolkit() {
           if (!cancelled && railRes && railRes.value != null) {
             setRailCollapsed(railRes.value === 'true');
           }
+          const adminRes = await window.storage.get('sidebar:adminExpanded').catch(() => null);
+          if (!cancelled && adminRes && adminRes.value != null) {
+            setAdminNavOpen(adminRes.value !== 'false');
+          }
         }
       } catch (e) {/* ignore */}
       if (!cancelled) setStorageReady(true);
@@ -8533,6 +8550,14 @@ export default function BookkeeperProToolkit() {
     }
   }, [railCollapsed, storageReady]);
 
+  // Persist the Administration group's open/closed state
+  useEffect(() => {
+    if (!storageReady) return;
+    if (typeof window !== 'undefined' && window.storage) {
+      window.storage.set('sidebar:adminExpanded', String(adminNavOpen)).catch(() => {});
+    }
+  }, [adminNavOpen, storageReady]);
+
   // Customizing labels requires the full sidebar (you can't rename what the rail hides), so entering
   // edit mode force-expands. Keeps the admin label-customization workflow fully intact.
   useEffect(() => {
@@ -8580,6 +8605,44 @@ export default function BookkeeperProToolkit() {
       }
     }
   }, [tab, stages]);
+
+  // An admin tab reached any way (deep link, Back, a queue badge) opens its group. Waits for
+  // storageReady, or the async read of the saved state would collapse it again right after.
+  // Keyed on the id STRING, not adminNavItems: its counts change, and re-opening the group on
+  // every badge update would fight someone who closed it on purpose.
+  const adminNavIds = adminNavItems.map((i) => i.id).join(',');
+  useEffect(() => {
+    if (storageReady && adminNavIds.split(',').includes(tab)) setAdminNavOpen(true);
+  }, [tab, storageReady, adminNavIds]);
+
+  // Customize and Done replace each other in the footer; move focus with them so a keyboard
+  // user is not dropped on <body> when the button they pressed disappears.
+  useEffect(() => {
+    if (editMode) doneBtnRef.current?.focus();
+    else if (wasEditingRef.current) {
+      // Only take focus back if it has not gone somewhere else (a Done button disabled mid-save
+      // drops focus to <body>, which still counts as "nowhere").
+      const a = typeof document !== 'undefined' ? document.activeElement : null;
+      if (!a || a === document.body || a === doneBtnRef.current || customizeBtnRef.current?.closest('aside')?.contains(a)) {
+        customizeBtnRef.current?.focus();
+      }
+    }
+    wasEditingRef.current = editMode;
+  }, [editMode]);
+
+  // A different account must not inherit someone else's half-finished label edits: the footer
+  // shows Done/Cancel/Reset whenever editMode is on, independent of canCustomizeSidebar.
+  useEffect(() => {
+    setEditMode(false); setDraftLabels({}); setLabelsErr(''); setLabelsNotice('');
+    setEditingTabId(null); setEditingStageId(null); setEditingGroupKey(null);
+  }, [user?.id]);
+
+  // The footer does not scroll, so a success note there must not sit on top of the tagline forever.
+  useEffect(() => {
+    if (!labelsNotice) return undefined;
+    const t = setTimeout(() => setLabelsNotice(''), 4000);
+    return () => clearTimeout(t);
+  }, [labelsNotice]);
 
   // ── Global, admin-controlled sidebar labels (Supabase `sidebar_settings`) ──
   // Renames are staged locally in `draftLabels` (Enter/blur confirms a field) and only persisted
@@ -8920,7 +8983,7 @@ export default function BookkeeperProToolkit() {
         backdropFilter: 'blur(40px) saturate(180%)',
         WebkitBackdropFilter: 'blur(40px) saturate(180%)',
         borderRight: '1px solid var(--sidebar-border)',
-      }} className={`w-72 ${railCollapsed ? 'lg:w-[76px]' : 'lg:w-72'} flex-shrink-0 flex flex-col h-screen z-50 fixed inset-y-0 left-0 transform transition-transform duration-300 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:relative lg:inset-auto lg:translate-x-0 lg:transition-[width] lg:duration-300 lg:ease-in-out`}>
+      }} className={`w-72 ${railCollapsed ? 'lg:w-[76px]' : 'lg:w-72'} flex-shrink-0 flex flex-col h-screen h-dvh z-50 fixed inset-y-0 left-0 transform transition-transform duration-300 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:relative lg:inset-auto lg:translate-x-0 lg:transition-[width] lg:duration-300 lg:ease-in-out`}>
         {/* Subtle right-edge highlight */}
         <div className="absolute top-0 right-0 bottom-0 w-px" style={{ background: 'var(--sidebar-edge)' }} />
 
@@ -8934,7 +8997,7 @@ export default function BookkeeperProToolkit() {
           <X size={18} style={{ color: C.textMute }} />
         </button>
 
-        <div className={`px-5 py-5 ${railCollapsed ? 'lg:hidden' : ''}`} style={{ borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+        <div className={`flex-shrink-0 px-5 pt-5 pb-4 ${railCollapsed ? 'lg:hidden' : ''}`} style={{ borderBottom: `1px solid ${GLASS.borderSoft}` }}>
           <div className="flex items-center gap-3">
             <img
               src={LOGO_DATA_URI}
@@ -9014,85 +9077,6 @@ export default function BookkeeperProToolkit() {
               </div>
             );
           })()}
-
-          {/* Admin nav (#45) — ONE capability-gated list, rendered here and again in
-              the mobile drawer below. An Operations Admin sees the student-operations
-              links; a Trainer sees none of them. See adminNavItems for the source. */}
-          {adminNavItems.map((item, i) => (
-            <a
-              key={item.id}
-              href={tabHref(item.id)}
-              onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab(item.id); } }}
-              className={`${i === 0 ? 'mt-4' : 'mt-2'} w-full px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5`}
-              style={tab === item.id
-                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white', boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)` }
-                : { background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
-              <item.Icon size={11} />
-              {item.label}
-              {item.count > 0 && (
-                <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[9px] font-bold"
-                  style={{ background: tab === item.id ? 'rgba(255,255,255,0.25)' : item.tone, color: 'white' }}>
-                  {item.count}
-                </span>
-              )}
-            </a>
-          ))}
-
-          {/* Customize sidebar — renames persist GLOBALLY (Supabase) on "Done", so this is
-              gated on sidebar.customize, a key only super_admin holds today. #45 left
-              sidebar_settings_admin_write on is_admin() precisely because the two are
-              equivalent while that stays true — if the key is ever given to another role,
-              that policy has to move with it. */}
-          {canCustomizeSidebar && (
-            <div className="mt-4">
-              {!editMode ? (
-                <button onClick={enterCustomize}
-                  className="w-full px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5"
-                  style={{ background: 'var(--wash)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}` }}>
-                  <Edit3 size={11} />
-                  Customize
-                </button>
-              ) : (
-                <>
-                  <div className="flex items-center gap-2">
-                    <button onClick={saveSidebarLabels} disabled={savingLabels}
-                      className="flex-1 px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5 text-white"
-                      style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)`, opacity: savingLabels ? 0.65 : 1, cursor: savingLabels ? 'default' : 'pointer' }}>
-                      {savingLabels ? <Loader2 size={11} className="animate-spin" /> : <Check size={11} />}
-                      {savingLabels ? 'Saving…' : 'Done'}
-                    </button>
-                    <button onClick={cancelSidebarEdit} disabled={savingLabels}
-                      title="Discard unsaved changes"
-                      className="px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition"
-                      style={{ background: 'var(--wash)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}`, opacity: savingLabels ? 0.65 : 1 }}>
-                      Cancel
-                    </button>
-                    <button onClick={resetSidebarLabels} disabled={savingLabels}
-                      title="Reset all labels to defaults (everyone)"
-                      className="px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition"
-                      style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: `1px solid rgba(208,35,35,0.15)`, opacity: savingLabels ? 0.65 : 1 }}>
-                      Reset
-                    </button>
-                  </div>
-                  <div className="mt-2 text-[10px] leading-relaxed" style={{ color: C.textMute }}>
-                    Click any label to rename · Press Enter to confirm a field · Done saves for everyone
-                  </div>
-                </>
-              )}
-              {labelsErr && (
-                <div className="mt-2 text-[10px] leading-relaxed flex items-start gap-1.5" style={{ color: C.red }}>
-                  <AlertCircle size={11} className="flex-shrink-0 mt-px" />
-                  <span>{labelsErr}</span>
-                </div>
-              )}
-              {labelsNotice && !labelsErr && (
-                <div className="mt-2 text-[10px] leading-relaxed flex items-start gap-1.5" style={{ color: C.primary }}>
-                  <CheckCircle2 size={11} className="flex-shrink-0 mt-px" />
-                  <span>{labelsNotice}</span>
-                </div>
-              )}
-            </div>
-          )}
         </div>
 
         {/* Rail header — desktop only, shown when collapsed (logo + expand toggle + compact identity) */}
@@ -9126,7 +9110,7 @@ export default function BookkeeperProToolkit() {
 
         {/* Rail nav — desktop only, flat icon list (every tool reachable in one click, with tooltips) */}
         {railCollapsed && (
-          <nav className="hidden lg:flex flex-col flex-1 py-3 overflow-y-auto items-center gap-1">
+          <nav aria-label="Main navigation" className="hidden lg:flex flex-col flex-1 min-h-0 py-3 overflow-y-auto items-center gap-1">
             {/* Same adminNavItems list as the expanded sidebar — icon-only here.
                 Rendering both rails from one source is what stops the two drifting
                 apart when a permission changes (#45). */}
@@ -9137,6 +9121,7 @@ export default function BookkeeperProToolkit() {
                 onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab(item.id); } }}
                 title={`${item.label}${item.count ? ` (${item.count} pending)` : ''}`}
                 aria-label={item.label}
+                aria-current={tab === item.id ? 'page' : undefined}
                 className="relative flex items-center justify-center rounded-xl transition mb-1"
                 style={tab === item.id
                   ? { width: 40, height: 40, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: 'white' }
@@ -9144,12 +9129,16 @@ export default function BookkeeperProToolkit() {
                 <item.Icon size={18} />
                 {item.count > 0 && (
                   <span className="absolute -top-1 -right-1 px-1 rounded-full text-[9px] font-bold flex items-center justify-center"
-                    style={{ minWidth: 16, height: 16, background: item.tone, color: 'white', border: `2px solid ${C.white}` }}>
+                    style={{ minWidth: 16, height: 16, background: item.tone, color: item.tone === C.amber ? INK.text : 'white', border: `2px solid ${C.white}` }}>
                     {item.count}
                   </span>
                 )}
               </a>
             ))}
+            {/* Admin icons and tool icons are two different kinds of place; say so. */}
+            {adminNavItems.length > 0 && (
+              <div aria-hidden="true" className="h-px w-7 my-1.5 flex-shrink-0" style={{ background: GLASS.borderSoft }} />
+            )}
             {visibleStages.map((stage, sIdx) => {
               const hasNumber = !!stage.number;
               const containsActive = stage.tabs.some(t => t.id === tab);
@@ -9202,7 +9191,58 @@ export default function BookkeeperProToolkit() {
           </nav>
         )}
 
-        <nav className={`flex-1 py-2 overflow-y-auto ${railCollapsed ? 'lg:hidden' : ''}`}>
+        <nav aria-label="Main navigation" className={`flex-1 min-h-0 py-2 overflow-y-auto ${railCollapsed ? 'lg:hidden' : ''}`}>
+          {/* Administration — the SAME capability-filtered adminNavItems as the icon rail (#45), now
+              INSIDE the scroll region. These links used to sit in the fixed header above, and every
+              admin screen added (#58, #61, #62) made the scrolling nav below shorter, until a 1280×720
+              laptop showed a sliver of the courses. An Operations Admin sees the student-operations
+              links; a Trainer and a student see no group at all. */}
+          {adminNavItems.length > 0 && (() => {
+            // EVERY admin badge, not an allow-list of two: a queue badge exists so a closed group can
+            // still pull you in, and student imports carries a live count too. Filtering to
+            // accessrequests+enrollments made a running or failed import invisible once collapsed.
+            const waiting = adminNavItems.reduce((n, i) => n + (Number(i.count) || 0), 0);
+            const holdsActive = adminNavItems.some((i) => i.id === tab);
+            return (
+              <div className="px-3 pb-2 mb-1" style={{ borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+                <button type="button" id="sidebar-admin-toggle" onClick={() => setAdminNavOpen((v) => !v)}
+                  aria-expanded={adminNavOpen} aria-controls="sidebar-admin-list"
+                  className="nav-hover w-full min-h-[40px] flex items-center gap-2 rounded-lg px-3 text-left">
+                  <ChevronDown size={12} className={`flex-shrink-0 transition-transform motion-reduce:transition-none ${adminNavOpen ? '' : '-rotate-90'}`} style={{ color: C.textMute }} />
+                  <span className="flex-1 text-[10px] font-bold uppercase tracking-[0.12em]" style={{ color: holdsActive ? C.primary : C.textMute }}>
+                    Administration
+                  </span>
+                  {!adminNavOpen && waiting > 0 && (
+                    <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold" style={{ background: C.amber, color: INK.text }}
+                      aria-label={`${waiting} waiting for review`}>{waiting}</span>
+                  )}
+                </button>
+                {/* No display utility on this ul: the collapse rests entirely on preflight's
+                    [hidden]{display:none}, which ANY display class would out-cascade (see the note
+                    in src/index.css). Pinned by test/uiSafety.test.mjs §20. */}
+                <ul id="sidebar-admin-list" aria-labelledby="sidebar-admin-toggle" hidden={!adminNavOpen} className="mt-0.5 space-y-0.5">
+                  {adminNavItems.map((item) => (
+                    <li key={item.id}>
+                      <a
+                        href={tabHref(item.id)}
+                        onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab(item.id); } }}
+                        aria-current={tab === item.id ? 'page' : undefined}
+                        className={`relative nav-hover ${tab === item.id ? 'nav-item-active' : ''} flex items-center gap-3 pl-3 pr-2 py-2 min-h-[40px] rounded-lg text-[13px]`}
+                        style={{ color: tab === item.id ? C.primary : C.textSoft, fontWeight: tab === item.id ? 600 : 500 }}>
+                        <item.Icon size={15} style={{ color: tab === item.id ? C.primary : C.textMute, flexShrink: 0 }} />
+                        <span className="flex-1 truncate">{item.label}</span>
+                        {item.count > 0 && (
+                          <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold flex-shrink-0"
+                            style={{ background: item.tone === C.amber ? C.amber : C.primarySolid, color: item.tone === C.amber ? INK.text : 'white' }}
+                            aria-label={`${item.count} pending`}>{item.count}</span>
+                        )}
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            );
+          })()}
           {visibleStages.map((stage, sIdx) => {
             const containsActive = stage.tabs.some(t => t.id === tab);
             const isCollapsed = collapsedStages.has(stage.id);
@@ -9433,12 +9473,70 @@ export default function BookkeeperProToolkit() {
           })}
         </nav>
 
-        <div className={`px-6 py-4 text-[11px] ${railCollapsed ? 'lg:hidden' : ''}`} style={{ borderTop: `1px solid ${GLASS.borderSoft}`, color: C.textMute }}>
-          <div className="flex items-center gap-2 mb-1">
-            <Award size={12} style={{ color: C.primary }} />
-            <span style={{ color: C.textSoft, fontWeight: 500, lineHeight: 1.35 }}>Making Success Easier</span>
-          </div>
-          <div style={{ lineHeight: 1.4 }}>For US Remote Bookkeepers / Accountants</div>
+        {/* Sidebar footer — NON-scrolling and small. Customize moved here from the fixed header,
+            where its edit-mode controls added four more rows above the navigation. Renames persist
+            GLOBALLY (Supabase) on "Done", so this is gated on sidebar.customize, a key only
+            super_admin holds today. #45 left sidebar_settings_admin_write on is_admin() precisely
+            because the two are equivalent while that stays true — if the key is ever given to
+            another role, that policy has to move with it. */}
+        <div className={`flex-shrink-0 px-4 py-3 text-[11px] ${railCollapsed ? 'lg:hidden' : ''}`} style={{ borderTop: `1px solid ${GLASS.borderSoft}`, color: C.textMute }}>
+          {!editMode && (
+            <div className="flex items-center gap-2">
+              <Award size={12} style={{ color: C.primary, flexShrink: 0 }} />
+              <div className="flex-1 min-w-0">
+                <div className="truncate" style={{ color: C.textSoft, fontWeight: 500, lineHeight: 1.35 }}>Making Success Easier</div>
+                <div className="truncate" style={{ lineHeight: 1.4 }}>For US Remote Bookkeepers / Accountants</div>
+              </div>
+              {canCustomizeSidebar && !editMode && (
+                <button ref={customizeBtnRef} type="button" onClick={enterCustomize}
+                  aria-label="Customize navigation labels" title="Customize navigation labels"
+                  className="flex-shrink-0 min-h-[32px] px-2.5 rounded-lg text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center gap-1.5"
+                  style={{ background: 'var(--wash)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}` }}>
+                  <Edit3 size={11} />
+                  Customize
+                </button>
+              )}
+            </div>
+          )}
+          {editMode && (
+            <>
+              <div className="flex items-center gap-2">
+                <button ref={doneBtnRef} onClick={saveSidebarLabels} disabled={savingLabels}
+                  className="flex-1 px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition flex items-center justify-center gap-1.5 text-white"
+                  style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 4px 12px -2px var(--primary-glow-soft)`, opacity: savingLabels ? 0.65 : 1, cursor: savingLabels ? 'default' : 'pointer' }}>
+                  {savingLabels ? <Loader2 size={11} className="animate-spin" /> : <Check size={11} />}
+                  {savingLabels ? 'Saving…' : 'Done'}
+                </button>
+                <button onClick={cancelSidebarEdit} disabled={savingLabels}
+                  title="Discard unsaved changes"
+                  className="px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition"
+                  style={{ background: 'var(--wash)', color: C.textSoft, border: `1px solid ${GLASS.borderSoft}`, opacity: savingLabels ? 0.65 : 1 }}>
+                  Cancel
+                </button>
+                <button onClick={resetSidebarLabels} disabled={savingLabels}
+                  title="Reset all labels to defaults (everyone)"
+                  className="px-3 py-2 rounded-xl text-[10px] font-semibold uppercase tracking-[0.12em] transition"
+                  style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: `1px solid rgba(208,35,35,0.15)`, opacity: savingLabels ? 0.65 : 1 }}>
+                  Reset
+                </button>
+              </div>
+              <div className="mt-2 text-[10px] leading-relaxed" style={{ color: C.textMute }}>
+                Click any label to rename · Press Enter to confirm a field · Done saves for everyone
+              </div>
+            </>
+          )}
+          {labelsErr && (
+            <div role="alert" className="mt-2 text-[10px] leading-relaxed flex items-start gap-1.5" style={{ color: C.red }}>
+              <AlertCircle size={11} className="flex-shrink-0 mt-px" />
+              <span>{labelsErr}</span>
+            </div>
+          )}
+          {labelsNotice && !labelsErr && (
+            <div role="status" className="mt-2 text-[10px] leading-relaxed flex items-start gap-1.5" style={{ color: C.primary }}>
+              <CheckCircle2 size={11} className="flex-shrink-0 mt-px" />
+              <span>{labelsNotice}</span>
+            </div>
+          )}
         </div>
       </aside>
 
@@ -11435,6 +11533,8 @@ function AdminBatches() {
 //   ₱20,751 in the ledger, the P&L and every export.
 const FINANCE_SUBTABS = [
   { key: 'overview',   label: 'Overview' },
+  // #64: cash actually posted, day by day. Loads itself — it is a month view, not the range below.
+  { key: 'daily',      label: 'Daily Income' },
   { key: 'sales',      label: 'Sales & Receivables' },
   { key: 'ledger',     label: 'Income & Expenses' },
   { key: 'pl',         label: 'Profit & Loss' },
@@ -11525,7 +11625,7 @@ function FinanceLoading({ label = 'Loading…' }) {
   return (
     <div className="rounded-2xl p-8 flex items-center justify-center gap-2 text-sm"
       style={{ background: 'var(--wash)', color: C.textMute }} role="status">
-      <Loader2 size={17} className="animate-spin" /> {label}
+      <Loader2 size={17} className="animate-spin motion-reduce:animate-none" /> {label}
     </div>
   );
 }
@@ -12029,6 +12129,372 @@ function FinanceSalesReport({ call }) {
             </>
           )}
         </div>
+      )}
+    </div>
+  );
+}
+
+// ── Daily Income (#64): cash actually posted, day by day ──────────────────────
+// ★ EVERY FIGURE COMES FROM finance_daily_income_report. The client formats and filters rows;
+//   it adds no amounts together, so a total on this screen is always the server's total.
+// ★ THE PACKAGE COLUMNS ARE THE SERVER'S `plans`, IN ITS ORDER. Nothing here names a plan: the
+//   Apps Script this replaces hard-coded five packages, two of them retired, and a tagline.
+// ★ A FAILED LOAD CLEARS THE REPORT. On a finance screen, "no income this month" and "the query
+//   failed" must never look alike.
+const FINANCE_MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
+  'August', 'September', 'October', 'November', 'December'];
+const FINANCE_ISO_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+/** 'YYYY-MM' → 'September 2026', with no Date object (a Date would apply the browser's zone). */
+function financeMonthLabel(month) {
+  const [y, m] = String(month || '').split('-').map(Number);
+  return y && m >= 1 && m <= 12 ? `${FINANCE_MONTH_NAMES[m - 1]} ${y}` : String(month || '');
+}
+
+/** Net cash income per day: bars above a zero line, days where corrections won below it. */
+function FinanceDailyNetBars({ days, best }) {
+  const clean = (days || []).filter((d) => d && d.day);
+  if (clean.length === 0) return null;
+  const W = 640; const H = 170; const pad = 22;
+  const vals = clean.map((d) => Number(d.net_cash_income) || 0);
+  const hi = Math.max(0, ...vals);
+  const lo = Math.max(0, ...vals.map((v) => -v));
+  const span = Math.max(1, hi + lo);
+  const inner = H - pad * 2;
+  const zeroY = pad + (hi / span) * inner;
+  // The step always fits the chart — the FinanceDailyBars lesson about a fixed minimum width.
+  const step = (W - pad * 2) / clean.length;
+  const bw = Math.max(1, step * 0.72);
+  const first = clean[0]; const last = clean[clean.length - 1];
+  return (
+    <figure>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ minHeight: 140 }} role="img"
+        aria-label={`Net cash income per day from ${first.day} to ${last.day}.${best ? ` The strongest day was ${best.day}, at ${financeMoney(best.net_cash_income)}.` : ' No day had positive income.'} Bars below the line are days where corrections exceeded income.`}>
+        <line x1={pad} x2={W - pad} y1={zeroY} y2={zeroY} stroke="var(--glass-border-soft)" strokeWidth="1.5" />
+        {clean.map((d, i) => {
+          const v = Number(d.net_cash_income) || 0;
+          if (v === 0) return null;
+          const h = Math.max(1, (Math.abs(v) / span) * inner);
+          return (
+            <rect key={d.day} x={pad + i * step + (step - bw) / 2} y={v > 0 ? zeroY - h : zeroY} width={bw} height={h}
+              rx={Math.min(2, bw / 2)} style={{ fill: v > 0 ? C.primary : C.red }}>
+              <title>{`${d.day}: ${financeMoney(v)}`}</title>
+            </rect>
+          );
+        })}
+      </svg>
+      <figcaption className="flex justify-between gap-3 text-[10px]" style={{ color: C.textMute }}>
+        <span>{first.day}</span>
+        <span><span style={{ color: C.primary }}>■</span> Income <span className="ml-2" style={{ color: C.red }}>■</span> Net correction</span>
+        <span>{last.day}</span>
+      </figcaption>
+    </figure>
+  );
+}
+
+function FinanceDailyIncomeReport({ version = 0 }) {
+  const [month, setMonth] = useState(null);          // 'YYYY-MM'; null = the server's current month
+  const [report, setReport] = useState(null);
+  const [state, setState] = useState('loading');     // loading | ready | refreshing | error | setup
+  const [err, setErr] = useState('');
+  const [showZero, setShowZero] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  // What the admin is TYPING in the month field. A half-typed year ('0002-09') must never be
+  // committed, clamped or written back into the input while they are still typing it.
+  const [draftMonth, setDraftMonth] = useState(null);
+  // The picker rails must OUTLIVE a failed load. A failure clears `report` deliberately, so that a
+  // failure can never read as a zero month — but the bounds describe the BOOKS, not this request.
+  // Without remembering them the error card loses min/max, prev/next step outside 2020-01 … max_month,
+  // the next call answers 22023, and the same card renders again with no way forward.
+  const lastBoundsRef = useRef({ min: null, max: null });
+
+  useEffect(() => {
+    let live = true;
+    setState((s) => (s === 'ready' || s === 'refreshing' ? 'refreshing' : 'loading'));
+    setErr('');
+    (async () => {
+      try {
+        const { data, error } = await supabase.rpc('finance_daily_income_report', { p_month: month ? `${month}-01` : null });
+        if (!live) return;
+        if (error) throw error;
+        setReport(data || null);
+        if (data && (data.min_month || data.max_month)) {
+          lastBoundsRef.current = { min: data.min_month || null, max: data.max_month || null };
+        }
+        setState('ready');
+      } catch (e) {
+        if (!live) return;
+        setReport(null);
+        if (isMigrationMissing(e)) { setState('setup'); return; }
+        console.error('[finance] daily income failed', { code: e?.code, message: e?.message });
+        setErr(appErrorMessage(e, 'Could not load the daily income report.'));
+        setState('error');
+      }
+    })();
+    return () => { live = false; };
+  }, [month, version, attempt]);
+
+  const current = month || report?.month || null;
+  const bounds = report ? { min: report.min_month || null, max: report.max_month || null } : lastBoundsRef.current;
+  const prevMonth = current ? shiftMonth(current, -1, bounds) : null;
+  const nextMonth = current ? shiftMonth(current, 1, bounds) : null;
+  const go = (m) => { if (m && m !== current) setMonth(m); };
+
+  if (state === 'setup') {
+    return (
+      <div className="glass-card rounded-2xl p-8 text-center" style={{ background: SHEEN }}>
+        <Landmark size={34} className="mx-auto mb-2" style={{ color: ROYAL }} />
+        <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-lg font-bold">Daily Income needs one more migration</div>
+        <div className="text-slate-500 mt-2 text-sm max-w-md mx-auto">
+          Apply <span style={{ fontFamily: fontMono }}>db/2026-09-19-finance-daily-income.sql</span> (#64), then refresh this page.
+          The rest of Financial Management is unaffected.
+        </div>
+      </div>
+    );
+  }
+
+  const cols = report ? dailyIncomeColumns(report) : [];
+  const days = report?.days || [];
+  const t = report?.totals || {};
+  const activeDays = days.filter((d) => !isZeroActivityDay(d));
+  const rows = showZero ? days : activeDays;
+  const money = (v) => financeMoney(v);
+  const cell = (c, r) => {
+    const v = c.get(r);
+    if (c.kind === 'money') return Number(v) === 0 ? '—' : money(v);
+    if (c.kind === 'count') return Number(v) === 0 ? '—' : String(v);
+    return String(v);
+  };
+  // In the table a package's collection count sits under its amount; the CSV and print keep both columns.
+  const tableCols = cols.filter((c) => c.kind !== 'count' || !(c.plan || c.key.startsWith('legacy')));
+  const countFor = (c) => cols.find((x) => x.key === `${c.key}:collections`);
+  const totalsRow = { ...t, day: 'TOTAL' };
+  // Named after the report ON SCREEN, not the month just requested: while the next month loads,
+  // the previous month's figures must not be printed or captioned under the new month's name.
+  const label = financeMonthLabel(report?.month || current);
+  const refreshing = state === 'refreshing';
+  const exportCols = cols.map((c) => ({
+    label: c.label,
+    align: c.kind === 'date' ? 'left' : 'right',
+    value: (r) => (r.day === 'TOTAL' || c.kind !== 'date' ? cell(c, r) : `${r.day} ${FINANCE_ISO_DAYS[(r.isodow || 1) - 1] || ''}`),
+    csv: (r) => {
+      const v = c.get(r);
+      return c.kind === 'money' ? Math.round(Number(v) * 100) / 100 : v;
+    },
+  }));
+  const planName = (p) => p.plan_name || 'Unspecified package';
+
+  return (
+    <div className="space-y-4">
+      <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+        <div className="flex flex-wrap items-center gap-2">
+          <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Daily income</div>
+          <div className="flex items-center gap-1 ml-auto" role="group" aria-label="Month">
+            <button type="button" className="gh-btn-ghost px-2 py-1.5 text-xs disabled:opacity-40"
+              aria-label="Previous month" disabled={!prevMonth || prevMonth === current} onClick={() => go(prevMonth)}>
+              <ChevronLeft size={14} /></button>
+            <input type="month" aria-label="Report month" className="gh-input" style={{ fontSize: 13 }}
+              value={draftMonth ?? current ?? ''} min={bounds.min || undefined} max={bounds.max || undefined}
+              onChange={(e) => {
+                const v = e.target.value;
+                setDraftMonth(v);
+                // Commit only a complete month already inside the bounds; shiftMonth(v, 0) === v says both.
+                if (v && shiftMonth(v, 0, bounds) === v) { go(v); setDraftMonth(null); }
+              }}
+              onBlur={() => setDraftMonth(null)} />
+            <button type="button" className="gh-btn-ghost px-2 py-1.5 text-xs disabled:opacity-40"
+              aria-label="Next month" disabled={!nextMonth || nextMonth === current} onClick={() => go(nextMonth)}>
+              <ChevronRight size={14} /></button>
+            <button type="button" className="gh-btn-ghost px-2.5 py-1.5 text-xs" onClick={() => setMonth(null)}
+              disabled={month === null}>This month</button>
+          </div>
+          {report && (
+            <div className="flex gap-2">
+              {/* CSV, print and the table all export `rows`, so the zero-day toggle means ONE thing.
+                  Exporting `days` here instead let a hidden-zero-days view download a file that
+                  disagreed with both the screen and the printout, row for row. */}
+              <button type="button" className="gh-btn-ghost px-3 py-1.5 text-xs disabled:opacity-50" disabled={refreshing}
+                onClick={() => financeDownloadCsv(`daily-income-${report.month}.csv`, exportCols, [...rows, totalsRow])}>
+                <Download size={12} className="inline -mt-0.5 mr-1" />CSV</button>
+              <button type="button" className="gh-btn-ghost px-3 py-1.5 text-xs disabled:opacity-50" disabled={refreshing}
+                onClick={() => financePrintOrWarn(setErr, {
+                  title: `Daily income — ${label}`,
+                  subtitle: `${report.from} → ${report.to} · ${report.timezone} · cash basis · net cash income ${money(t.net_cash_income)}${showZero ? '' : ' · days with activity only'}`,
+                  columns: exportCols,
+                  rows: [...rows, { ...totalsRow, __bold: true }],
+                  footnote: report.scope,
+                })}>
+                <Printer size={12} className="inline -mt-0.5 mr-1" />Print</button>
+            </div>
+          )}
+        </div>
+        <div className="mt-1" style={{ fontSize: 11.5, color: C.textMute, lineHeight: 1.5 }}>
+          {report ? `${label} · ${report.timezone} · cash basis · ${report.currency}. ` : ''}
+          Money actually posted to the books, on the day it was posted. Never a price multiplied by a count.
+        </div>
+        {state === 'refreshing' && (
+          <div role="status" aria-live="polite" className="mt-1 flex items-center gap-1.5" style={{ fontSize: 11.5, color: C.textMute }}>
+            <Loader2 size={12} className="animate-spin motion-reduce:animate-none" /> Updating…
+          </div>
+        )}
+      </div>
+
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {/* From STATE, not from the message: dismissing the notice must not remove the only way back. */}
+      {state === 'error' && (
+        <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+          <div style={{ fontSize: 13, color: C.textSoft }}>The daily income report did not load. Nothing here is a zero month.</div>
+          <button type="button" className="gh-btn-ghost mt-2 px-3 py-1.5 text-xs" onClick={() => setAttempt((n) => n + 1)}>
+            <RotateCcw size={12} className="inline -mt-0.5 mr-1" />Try again</button>
+        </div>
+      )}
+      {state === 'loading' && <FinanceLoading label="Loading daily income…" />}
+
+      {report && (
+        <>
+          {report.reconciliation?.reconciled === false && (
+            <AdminNotice kind="danger">
+              This month does not reconcile to the ledger: the report classifies {money(report.reconciliation.classified_total)} but the
+              income accounts hold {money(report.reconciliation.ledger_income_total)} (difference {money(report.reconciliation.difference)}).
+              Do not rely on these figures; report it.
+            </AdminNotice>
+          )}
+          {Number(report.reconciliation?.unlinked_collection_entries) > 0 && (
+            <AdminNotice kind="warn">
+              {report.reconciliation.unlinked_collection_entries} approval collection(s) this month have no payment record, so they
+              are counted as Other income rather than under a package.
+            </AdminNotice>
+          )}
+
+          <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
+            <FinanceStat label="Gross collections" value={money(t.gross_collections)} tone={C.green}
+              note="Enrollment payments posted, before corrections." />
+            <FinanceStat label="Enrollment reversals" value={money(t.enrollment_reversals)}
+              tone={Number(t.enrollment_reversals) < 0 ? C.red : undefined}
+              note="Shown on the day each correction was posted." />
+            <FinanceStat label="Refunds" value={money(t.refunds)} tone={Number(t.refunds) < 0 ? C.red : undefined}
+              note="Not linked to an enrollment, so not under a package." />
+            <FinanceStat label="Other income" value={money(t.other_income)}
+              note={Number(t.adjustments) !== 0 ? `Plus ${money(t.adjustments)} in adjustments.` : 'Recorded by hand, from the bank feed or a recurring template.'} />
+            <FinanceStat label="Net cash income" value={money(t.net_cash_income)}
+              tone={Number(t.net_cash_income) >= 0 ? C.green : C.red}
+              note="Everything above. Income received, before expenses." />
+            <FinanceStat label="Collections" value={String(t.collections ?? 0)}
+              note="Approved enrollment payments, not students. A later payment recorded by hand is Other income." />
+            <FinanceStat label="Distinct enrollments" value={String(t.distinct_enrollments ?? 0)}
+              note="Each enrollment counts once, however many collections it has." />
+            <FinanceStat label="Strongest day" value={t.best_day ? money(t.best_day.net_cash_income) : '—'}
+              note={t.best_day ? `${t.best_day.day} · by net cash income` : 'No day had positive income.'} />
+          </div>
+
+          <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+            <div className="mb-2" style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>By package</div>
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+              {(report.plans || []).map((p) => {
+                const pt = t.plans?.[p.key] || {};
+                return (
+                  <div key={p.key} className="rounded-xl px-3 py-2" style={{ background: 'var(--wash)' }}>
+                    <div style={{ fontSize: 12, color: C.textMute }}>{p.name}{p.tagline ? ` · ${p.tagline}` : ''}{p.active ? '' : ' · not sold today'}</div>
+                    <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>{money(pt.net)}</div>
+                    <div style={{ fontSize: 11, color: C.textMute }}>
+                      {pt.collections || 0} collection(s) · gross {money(pt.gross)}{Number(pt.reversals) !== 0 ? ` · reversals ${money(pt.reversals)}` : ''}
+                    </div>
+                  </div>
+                );
+              })}
+              {report.has_legacy && (
+                <div className="rounded-xl px-3 py-2" style={{ background: 'var(--wash)' }}>
+                  <div style={{ fontSize: 12, color: C.textMute }}>Legacy / other packages · historical records only</div>
+                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>{money(t.legacy_other?.net)}</div>
+                  <ul className="mt-0.5" style={{ fontSize: 11, color: C.textMute }}>
+                    {(report.legacy_plans || []).map((lp) => (
+                      <li key={`${lp.plan_key}-${lp.plan_name}`}>{planName(lp)}: {money(lp.net)} · {lp.collections} collection(s)</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+            <div className="mt-2" style={{ fontSize: 11, color: C.textMute }}>
+              Each collection counts under the package recorded when its payment was approved, net of its own reversals. Refunds
+              show under Refunds, not under a package. Reverse a collection only to void one that should never have been recorded:
+              a reversed collection no longer counts as paid, so its full price shows as outstanding again in Receivables.
+            </div>
+          </div>
+
+          <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+            <FinanceDailyNetBars days={days} best={t.best_day} />
+          </div>
+
+          <div className="glass-card rounded-2xl p-4" style={{ background: GLASS.card }}>
+            <div className="flex flex-wrap items-center gap-2 mb-2">
+              <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Day by day</div>
+              <label className="ml-auto flex items-center gap-2 text-xs" style={{ color: C.textSoft }}>
+                <input type="checkbox" checked={showZero} onChange={(e) => setShowZero(e.target.checked)} />
+                Show zero-activity days
+              </label>
+            </div>
+            {rows.length === 0 ? (
+              <div style={{ fontSize: 13, color: C.textMute }}>No income was posted to the books in {label}.</div>
+            ) : (
+              <div className="overflow-x-auto rounded-xl" tabIndex={0} role="region" aria-label={`Daily income for ${label}, scrollable table`}>
+                <table className="w-full text-sm" style={{ color: C.text, minWidth: 720 }}>
+                  <caption className="sr-only">Daily income for {label}. Amounts in {report.currency}; a dash means nothing was posted.</caption>
+                  <thead>
+                    <tr style={{ color: C.textMute, fontSize: 11.5 }}>
+                      {tableCols.map((c) => (
+                        <th key={c.key} scope="col" className={`py-1.5 px-2 ${c.kind === 'date' ? 'sticky left-0 text-left' : 'text-right'}`}
+                          style={c.kind === 'date' ? { background: 'var(--table-sticky-bg)' } : undefined}>{c.label}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((r) => (
+                      <tr key={r.day} style={{ borderTop: `1px solid ${GLASS.border}` }}>
+                        {tableCols.map((c) => {
+                          if (c.kind === 'date') {
+                            return (
+                              <th key={c.key} scope="row" className="sticky left-0 py-1.5 px-2 text-left whitespace-nowrap"
+                                style={{ background: 'var(--table-sticky-bg)', fontSize: 12, fontWeight: 500 }}>
+                                {r.day} <span style={{ color: C.textMute }}>{FINANCE_ISO_DAYS[(r.isodow || 1) - 1]}</span>
+                              </th>
+                            );
+                          }
+                          const v = Number(c.get(r));
+                          const n = countFor(c);
+                          return (
+                            <td key={c.key} className="py-1.5 px-2 text-right whitespace-nowrap"
+                              style={{ color: v === 0 ? C.textMute : v < 0 ? C.red : C.text, fontWeight: c.key === 'net_cash_income' ? 700 : 400 }}>
+                              {cell(c, r)}
+                              {n && Number(n.get(r)) > 0 && <div style={{ fontSize: 10.5, color: C.textMute }}>{n.get(r)} collection(s)</div>}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot>
+                    <tr style={{ borderTop: `2px solid ${GLASS.border}`, fontWeight: 700 }}>
+                      {tableCols.map((c) => (c.kind === 'date' ? (
+                        <th key={c.key} scope="row" className="sticky left-0 py-2 px-2 text-left" style={{ background: 'var(--table-sticky-bg)' }}>
+                          {label}
+                        </th>
+                      ) : (
+                        <td key={c.key} className="py-2 px-2 text-right whitespace-nowrap">
+                          {cell(c, totalsRow)}
+                          {countFor(c) && Number(countFor(c).get(totalsRow)) > 0
+                            && <div style={{ fontSize: 10.5, color: C.textMute, fontWeight: 400 }}>{countFor(c).get(totalsRow)} collection(s)</div>}
+                        </td>
+                      )))}
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            )}
+            <div className="mt-3" style={{ fontSize: 11, color: C.textMute, lineHeight: 1.5 }}>
+              {report.scope} {report.reconciliation?.reconciled ? `Reconciled: equals the income accounts in the ledger for ${label} (difference ${money(report.reconciliation.difference)}).` : ''}
+            </div>
+          </div>
+        </>
       )}
     </div>
   );
@@ -13074,16 +13540,44 @@ function FinanceReverseModal({ call, entry, onClose, onDone }) {
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  // #64 owner decision (2026-09-17): a correction is dated the day it is MADE, so Daily Income
+  // shows it on that day and the original collection keeps its own. "Original date" remains for
+  // voiding a mistake. Today is the BUSINESS timezone's date, never the browser's.
+  const [when, setWhen] = useState('today');
+  const [timeZone, setTimeZone] = useState(null);
+  // ★ The SERVER's date first (finance_setup_state.today, computed in the reporting timezone): a
+  //   device clock that is wrong would otherwise date the correction wrongly. The device's clock,
+  //   read in the business timezone, is only a fallback — and a visible one.
+  const [serverToday, setServerToday] = useState(null);
+  const [clock, setClock] = useState('loading');     // loading | ready | failed
+  useEffect(() => {
+    let live = true;
+    call('finance_setup_state')
+      .then((st) => {
+        if (!live) return;
+        setTimeZone(st?.settings?.reporting_timezone || null);
+        setServerToday(st?.today || null);
+        setClock('ready');
+      })
+      .catch(() => { if (live) setClock('failed'); });
+    return () => { live = false; };
+  }, [call]);
+  const today = serverToday || businessToday(timeZone);
+  const onDate = correctionDate(entry.entry_date, today);
   const submit = async () => {
     setBusy(true); setErr('');
     try {
-      const out = await call('finance_reverse_entry', { p_entry_id: entry.entry_id, p_reason: reason.trim() });
-      // ★ Say where the correction landed. Into a closed month it cannot go, so it moves
-      //   forward — and the admin must be told that, not left to find it.
+      const out = await call('finance_reverse_entry', {
+        p_entry_id: entry.entry_id, p_reason: reason.trim(),
+        p_reversal_date: when === 'today' ? onDate : null,
+      });
+      // ★ Say where the correction landed. "Closed" is only ever true on the original-date path:
+      //   the server moves a reversal forward only when it was asked for a date in a locked month.
       const original = String(entry.entry_date || '').slice(0, 7);
-      onDone?.(out?.period && out.period !== original
-        ? `Entry #${entry.entry_no} is reversed. ${original} is closed, so the correction is recorded in ${out.period}.`
-        : `Entry #${entry.entry_no} is reversed in ${out?.period || original}.`);
+      const landed = out?.period || original;
+      onDone?.(when === 'original' && landed !== original
+        ? `Entry #${entry.entry_no} is reversed. ${original} is closed, so the correction is recorded in ${landed}.`
+        : `Entry #${entry.entry_no} is reversed, dated ${out?.entry_date || (when === 'today' ? onDate : entry.entry_date)}. The original stays on ${entry.entry_date}.`);
       onClose();
     } catch (e) {
       console.error('[finance] reversal failed', { code: e?.code, message: e?.message });
@@ -13100,13 +13594,35 @@ function FinanceReverseModal({ call, entry, onClose, onDone }) {
         A linked entry with the debits and credits swapped is posted, so the two cancel out. Both stay on the record;
         nothing is deleted. Post the correct entry separately if one is needed.
       </p>
+      <fieldset className="mt-4">
+        <legend className="mb-1.5" style={FINANCE_LABEL_STYLE}>Date the correction</legend>
+        <label className="flex items-start gap-2 py-1 text-sm" style={{ color: C.text }}>
+          <input type="radio" name="reversal-date" className="mt-1" checked={when === 'today'} onChange={() => setWhen('today')} />
+          <span>
+            {clock === 'loading' ? 'Today' : onDate === today ? `Today, ${onDate}` : `On ${onDate}`}{' '}
+            <span style={{ color: C.textMute }}>
+              — {onDate === today ? 'the day you make the correction' : 'the entry’s own date, which is after today'}. The original stays on {entry.entry_date}.
+            </span>
+          </span>
+        </label>
+        <label className="flex items-start gap-2 py-1 text-sm" style={{ color: C.text }}>
+          <input type="radio" name="reversal-date" className="mt-1" checked={when === 'original'} onChange={() => setWhen('original')} />
+          <span>The original date, {entry.entry_date} <span style={{ color: C.textMute }}>— to void a mistake. If that month is closed, the correction is dated today instead.</span></span>
+        </label>
+        {clock === 'failed' && when === 'today' && (
+          <div className="mt-1" style={{ fontSize: 12, color: C.amber }}>
+            Could not read the business date from the server, so this uses this device’s clock in {timeZone || 'Asia/Manila'}: {onDate}.
+            Check it before reversing.
+          </div>
+        )}
+      </fieldset>
       <label className="block mt-4 mb-1.5" style={FINANCE_LABEL_STYLE}>Reason (required)</label>
       <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={3}
         className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none"
         style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }} />
       <div className="mt-5 flex items-center justify-end gap-2.5">
         <button type="button" onClick={onClose} disabled={busy} className="gh-btn-ghost px-4 py-2 text-sm">Cancel</button>
-        <button type="button" disabled={busy || !reason.trim()} onClick={submit}
+        <button type="button" disabled={busy || !reason.trim() || (when === 'today' && clock === 'loading')} onClick={submit}
           className="px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-60" style={ADMIN_BTN_DANGER}>
           {busy ? 'Reversing…' : 'Reverse entry'}
         </button>
@@ -15664,6 +16180,11 @@ function FinancialManagement() {
   const [plRange, setPlRange] = useState(null);
   // Bumped by any bank write, so the feed, the import card and reconciliation reload together.
   const [bankVersion, setBankVersion] = useState(0);
+  // #64: Daily Income loads itself; this moves on every ledger write so it refetches in place.
+  const [dailyVersion, setDailyVersion] = useState(0);
+  // #64: moves when the ledger changed OUTSIDE this screen (an approval), so the open sub-tab
+  // re-loads instead of sitting on a report invalidateReports() just blanked.
+  const [ledgerTick, setLedgerTick] = useState(0);
   const [audit, setAudit] = useState(null);
   const [busy, setBusy] = useState(false);
   const [recordKind, setRecordKind] = useState(null);   // 'income' | 'expense' | null
@@ -15733,7 +16254,8 @@ function FinancialManagement() {
   // the tab you are looking at.
   useEffect(() => {
     // Setup loads itself: it is a form over live state, not a report over a date range.
-    if (!allowed || needsSetup || sub === 'setup' || sub === 'bank') return;
+    // Daily Income loads itself too: it is a month view, and load('daily') has nothing to run.
+    if (!allowed || needsSetup || sub === 'setup' || sub === 'bank' || sub === 'daily') return;
     // ★ `recv === null` counts as unloaded: an aging chip or a package/batch filter clears
     //   recv while `sales` is still cached, and without this nothing re-ran the worklist.
     const has = { overview: summary, sales: recv === null ? null : sales, ledger, pl, audit }[sub];
@@ -15743,16 +16265,40 @@ function FinancialManagement() {
     //   Apply. Without it here, clicking an aging chip cleared `recv` but re-ran
     //   nothing — and the table then asserted "Nobody has an outstanding balance in
     //   this view" from a filter that had never run.
-  }, [sub, allowed, needsSetup, bucket, recvPlan, recvBatch]);
+  }, [sub, allowed, needsSetup, bucket, recvPlan, recvBatch, ledgerTick]);
 
   // A write anywhere changes every report, so drop the cached ones and let the
   // lazy effect re-load whichever tab is opened next.
+  // ★ NEVER dispatch FINANCE_LEDGER_CHANGE_EVENT from here: the listener below calls this, and
+  //   dispatchEvent runs listeners synchronously — it would recurse until the stack overflows.
   const invalidateReports = useCallback(() => {
     setSummary(null); setSales(null); setRecv(null); setLedger(null); setPl(null); setAudit(null);
     // Accounts can change in Setup; the ledger and Reclassify must not offer a stale list.
     setLedgerAccounts([]);
+    setDailyVersion((v) => v + 1);
   }, []);
   const bankChanged = useCallback(() => { invalidateReports(); setBankVersion((v) => v + 1); }, [invalidateReports]);
+
+  // #64: an approval elsewhere posted a collection. This screen stays mounted while hidden, so
+  // drop its cached reports and re-load the open one. Coalesced: a bulk approval fires once, but a
+  // burst of single approvals must not refetch every report once per click.
+  const ledgerTimerRef = useRef(null);
+  useEffect(() => {
+    if (!allowed) return undefined;
+    const onLedgerChange = () => {
+      clearTimeout(ledgerTimerRef.current);
+      ledgerTimerRef.current = setTimeout(() => {
+        invalidateReports();
+        setBankVersion((v) => v + 1);
+        setLedgerTick((n) => n + 1);
+      }, 250);
+    };
+    window.addEventListener(FINANCE_LEDGER_CHANGE_EVENT, onLedgerChange);
+    return () => {
+      window.removeEventListener(FINANCE_LEDGER_CHANGE_EVENT, onLedgerChange);
+      clearTimeout(ledgerTimerRef.current);
+    };
+  }, [allowed, invalidateReports]);
 
   const exportReceivables = () => {
     const rows = (recv || []).map((r) => ({
@@ -15825,7 +16371,8 @@ function FinancialManagement() {
                 </button>
               ))}
             </div>
-            <div className="flex items-end gap-2 ml-auto">
+            {/* Daily Income is a month view with its own picker; this range would do nothing there. */}
+            {sub !== 'daily' && <div className="flex items-end gap-2 ml-auto">
               <label className="text-xs" style={{ color: C.textMute }}>
                 From<br />
                 <input type="date" value={from} onChange={(e) => setFrom(e.target.value)}
@@ -15839,7 +16386,7 @@ function FinancialManagement() {
               <button type="button" onClick={() => load(sub)} className="gh-btn-primary px-3 py-1.5 text-sm" disabled={busy}>
                 {busy ? 'Loading…' : 'Apply'}
               </button>
-            </div>
+            </div>}
           </div>
 
           {busy && <FinanceLoading />}
@@ -15906,6 +16453,10 @@ function FinancialManagement() {
               </div>
             </div>
           )}
+
+          {/* ── Daily Income (#64) ─────────────────────────────────────────── */}
+          {/* Self-loading and outside the busy guard, so its month survives a parent reload. */}
+          {sub === 'daily' && <FinanceDailyIncomeReport version={dailyVersion} />}
 
           {/* ── Sales & Receivables ────────────────────────────────────────── */}
           {/* Each panel gates on its OWN state, as Overview does. Without it a failed
@@ -18079,6 +18630,9 @@ function AdminEnrollments({ onCountChange }) {
         setNotice(`${r.email} was already approved — nothing changed.`);
         return;
       }
+      // #64: the approval hook just posted a collection; a mounted Financial Management must not
+      // keep showing the books as they were.
+      window.dispatchEvent(new Event(FINANCE_LEDGER_CHANGE_EVENT));
       const grantedEndsAt = out.ends_at ?? null;
       let subNote = grantedEndsAt ? ` · access until ${fmtEnrollDate(grantedEndsAt)}` : ' · no expiry';
       if (out.batch_code) subNote += ` · batch ${out.batch_code}`;
@@ -18255,6 +18809,10 @@ function AdminEnrollments({ onCountChange }) {
     }
     setBulk((b) => ({ ...b, running: false, done: true }));
     setSelected({});
+    // #64: once for the whole run, and only if something was actually approved (and so posted).
+    if (kind === 'approve' && results.some((x) => x.ok && x.note === 'approved')) {
+      window.dispatchEvent(new Event(FINANCE_LEDGER_CHANGE_EVENT));
+    }
     onCountChange?.();
     load(true);
   };

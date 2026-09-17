@@ -52,7 +52,7 @@ npm run ai:knowledge:check # rebuild the knowledge doc in memory + diff vs disk;
 npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge base
 npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
 npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, bootstrapFolds, courseVideo, courseVideoSql, courseVideoContent, mp4Faststart, studentProgress, studentProgressSql, uiSafety, coaIntegrity, portfolioGenerator,
-                           approveGrantSql, …)
+                           approveGrantSql, financeDailyIncome, financeDailyIncomeSql, …)
 npm run storage:config     # read the PROJECT-WIDE Supabase Storage upload limit and the effective
                            # limit of every bucket; --apply raises it to LESSON_VIDEO_MAX_BYTES.
                            # The bucket limit alone is a ceiling, not a grant — Supabase enforces
@@ -149,6 +149,12 @@ The sanctioned exceptions to the single-file rule (same spirit as the `main.jsx`
   for the scheme-less input everybody actually types. **No `Date`, no `toLocaleString`** — the year
   and the filename date are parameters, so the same draft is byte-identical everywhere. See
   "Changing what the Portfolio Generator may emit".
+- `src/lib/financeDailyIncome.js` — the client half of Financial Management → Daily Income (#64)
+  (pure, no imports, five exports). The SERVER computes every figure; this decides only which columns
+  exist (from the response's `plans`, in its order — nothing here names a plan key), how a month is
+  stepped and clamped, which days count as empty (net zero is NOT empty: a correction that cancels a
+  collection stays visible), and what "today" is in the **business** timezone — `todayISODate()` is
+  the browser's. One column list drives the table, the CSV and the print view, so they cannot disagree.
 - `src/index.css` — the **global theme-token layer** (all CSS custom properties for light + dark,
   the shared `.gh-app-bg`/glass/button/input classes, and the Tailwind dark compat layer). See
   Styling conventions.
@@ -777,6 +783,23 @@ keep-alive** (see below). Four pieces must stay in sync when adding/removing a t
 - **Order + collapse/expanded-groups stay per-user** in `window.storage` under `sidebar:*` keys
   (unchanged). `expandedGroups` keys off the group `key`, not its label, so collapse-state survives
   a rename. Do **not** add a label key to `LEGACY_KEYS` — labels now live in Supabase.
+- ★ **The admin links scroll; only brand + identity are fixed.** (Shipped alongside #64, but it is a
+  UI-only change with no SQL — it is *not* a member of the numbered migration chain, where `#64` means
+  `finance-daily-income` and nothing else.) The expanded `<aside>` is three
+  flex rows: a `flex-shrink-0` header (logo, collapse, identity card with bell/theme/account menu, the
+  "Access until" line), the `<nav aria-label="Main navigation">` scroller (`flex-1 min-h-0
+  overflow-y-auto`), and a `flex-shrink-0` footer (tagline + **Customize**, which becomes
+  Done/Cancel/Reset in edit mode). The capability-filtered `adminNavItems` render as a collapsible
+  **Administration** group at the top of the scroller — `aria-expanded`/`aria-controls` toggle, rows
+  still `<a href={tabHref(id)}>`, open/closed persisted per user as `sidebar:adminExpanded` (in
+  `LEGACY_KEYS`), auto-opened when the active tab is an admin tab. They used to sit in the fixed header,
+  and every admin screen added (#58, #61, #62) shortened the scrolling nav until a 1280×720 laptop showed
+  a sliver of the courses. The collapsed rail and the mobile drawer are the same `<aside>`, and
+  `adminNavItems.map(` appears exactly twice **inside the `<aside>`** (group + rail) — file-wide there
+  is a third, non-rendering use that builds the auto-open key. Both `<nav>`s carry
+  `aria-label="Main navigation"` and both sets of rows carry `aria-current`: only one is ever
+  rendered-and-visible per breakpoint, so neither is left unnamed. Pinned by `test/uiSafety.test.mjs` §20;
+  do not edit the `adminNavItems` literal's row spacing — two SQL-suite regexes read its order.
 
 ## Authentication (Supabase — Phase 1)
 
@@ -1077,7 +1100,7 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   staff-activation-consistency (#50) → access-request-staff-target (#51) →
   student-progress-rankings (#52) → progress-rankings-followup (#53) →
   progress-course-family-scoping (#54) → approve-rpc-grant-revoke (#55) →
-  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61) → meetings-tasks (#62) → management-hardening (#63)** — see the Staff-authorization
+  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61) → meetings-tasks (#62) → management-hardening (#63) → finance-daily-income (#64)** — see the Staff-authorization
   and Progress & Rankings sections for what each does. **#57**
   ([db/2026-09-08-lesson-video-quicktime.sql](db/2026-09-08-lesson-video-quicktime.sql), fold
   **§44**) widens `course-videos.allowed_mime_types` to
@@ -1568,7 +1591,7 @@ Charts are hand-rolled inline `<svg role="img">` modelled on `ProgressTrendChart
   Admin, who reviews payment proofs: *causing* a finance write is not *reading the books*.
 - **12 tables**, 48 functions (counting the restated `app_error_catalog()`), **34 client-callable
   RPCs** (14 readers + 20 writers), plus the internal `finance_request_collected()` helper.
-- **Seven sub-tabs**, all one component tree: Overview · Sales & Receivables · Income & Expenses (record
+- **Eight sub-tabs**, all one component tree: Overview · **Daily Income** (#64, below) · Sales & Receivables · Income & Expenses (record
   income/expense, reverse, recurring proposals) · Profit & Loss · Audit trail · **Bank & Reconciliation**
   (client-side CSV/XLSX parse with a human-declared date format, stage → commit, exclude-with-reason,
   match/unmatch, correct statement balances, close/reopen) · **Setup** (whether approvals can post,
@@ -1676,6 +1699,61 @@ payee + account quick-picks, never an amount, seeded by category only).
   the catalog has been restated again since, so `CURRENT_CATALOG_MIGRATION` (communityStaffSql) and
   `CATALOG_OWNER` (financeSql) both point at **#63** — repoint them with every restatement. No permission changes.
   Suite: `test/financeParitySql.test.mjs` (it pins every stage-review fix above).
+
+**Daily Income (#64, [db/2026-09-19-finance-daily-income.sql](db/2026-09-19-finance-daily-income.sql), fold §51)** —
+cash actually posted, day by day, for one month. ONE reader, `finance_daily_income_report(p_month)`,
+Super Admin only; no table, policy, permission or error code (the catalog stays with #63). The legacy
+Apps Script's version is audited in [docs/audits/2026-09-17-legacy-finance-script-audit.md](docs/audits/2026-09-17-legacy-finance-script-audit.md).
+- ★ **IT READS THE LEDGER AND NOTHING ELSE.** Income is `sum(credit − debit)` over income-account lines
+  by `entry_date` — the same definition as `finance_cash_basis_pl` and `verified_collections` — so a month
+  equals the P&L's income + other income BY THAT SHARED DEFINITION (only `test-db` compares the two).
+  Every response also carries an **independent** `reconciliation.ledger_income_total`, which proves
+  something narrower: every income entry landed in exactly one bucket (difference must be 0). Never a catalog price, never the
+  student-typed `amount_paid`, never `finance_request_collected` (which is lifetime, not by day).
+  `test/financeDailyIncomeSql.test.mjs` fails if the body names any of them.
+- ★ **EVERY ENTRY IS BUCKETED BY THE ROOT OF ITS REVERSAL CHAIN** (`reverses_entry_id`, depth-bounded,
+  falling back to itself so no row is ever lost): an enrollment collection (the root carries an
+  `enrollment_collection` payment event — the package is that event's **plan snapshot**, never the
+  student's plan today), refunds (root kind `refund`; the ledger has no refund→enrollment link, so a
+  refund is **not** attributed to a package. ★ Reversing the collection is NOT a substitute for a
+  refund: `finance_request_collected` ignores a reversed collection, so the student's full price shows
+  as owed again in Receivables and can be targeted by payment reminders), other
+  income (a collection with no enrollment event: manual, bank feed, recurring) and adjustments (income
+  lines on any other kind of entry). An income→income reclassification nets to zero and drops out.
+- ★ **A CORRECTION NEVER REMOVES THE ORIGINAL FROM ITS DAY.** A reversal is a signed amount on the
+  reversal's OWN `entry_date`, attributed to the original's package. The old `not exists (… rv.reverses_entry_id …)`
+  idiom used by the sales reports would delete a September collection from September because it was
+  reversed in October — never use it here. And since #64, **Reverse defaults to today** in the business
+  timezone (owner decision 2026-09-17), with "original date" kept for voiding a mistake; before that, a
+  reversal in an open month silently took the original date.
+- **Package columns are `enrollment_plans`** (active plans, plus an inactive one only in a month it has
+  money), in `position` order. A snapshot key with **no** catalog row — Gold, Core, a null key — is one
+  Legacy/Other bucket with a per-name detail list, and never a column. There are no plan-key literals in
+  the SQL or the component; "Essentials" is the Sampler **tagline**, not a plan.
+- **Counts:** `collections` = payment events; `distinct_enrollments` = distinct requests. They coincide
+  today — no writer creates a second collection event for a request, so a later instalment recorded by
+  hand is Other income — but the schema allows one, the report handles it, and no label says "students".
+- Dates: `entry_date` is already a business-timezone date stamped at posting; the only `at time zone` in
+  the function computes "today". The calendar is `generate_series(0, v_to - v_from)` over integers (a
+  date/interval series resolves to timestamptz and follows the session TimeZone). A month outside
+  `2020-01 … greatest(month-of(today+1), month-of(max(entry_date)))` raises `22023`, **after** the
+  permission check. Those two bounds coincide today — the entry guard caps `entry_date` at `today+1` —
+  but the `greatest()` is deliberate: it fails SAFE, so a far-future or imported entry stays viewable
+  instead of being refused by a picker that cannot reach the month its own data sits in.
+- **Client:** `FinanceDailyIncomeReport` loads itself with `supabase.rpc(...)` directly — the parent's
+  `call()` would replace the whole finance screen with the #58/#59 setup card for a missing #64 — and a
+  failed load clears the report, so a failure never reads as an empty month. Figures are never summed
+  in React. `FINANCE_LEDGER_CHANGE_EVENT` is dispatched after a single approval and once after a bulk
+  approval run; `FinancialManagement` listens (coalesced) and invalidates its caches plus bumps
+  `dailyVersion`/`ledgerTick`. ★ `invalidateReports` must never dispatch that event — the listener
+  calls it, and `dispatchEvent` is synchronous.
+- **Deliberately not recreated:** the legacy nightly "Daily Sales" posting. Approvals already post each
+  collection; a daily summary row would count every sale twice.
+- Suites: `test/financeDailyIncomeSql.test.mjs` (dated file + §51), `test/financeDailyIncome.test.mjs`
+  (the lib), `test/uiSafety.test.mjs` §21 (wiring), `test-db/financeDailyIncome.dbtest.mjs` (a month of
+  books built through the real writers, reconciled against the P&L and the dashboard), and the `#64`
+  block in `scripts/audit-db.mjs`. The RPC wiring test in `financeSql.test.mjs` now reads #58 + #59 +
+  #64 and also checks the `run(key, 'finance_…')` / `act(key, 'finance_…')` call sites it used to miss.
 
 **Enrollment management (#60, [db/2026-09-15-enrollment-management.sql](db/2026-09-15-enrollment-management.sql), fold §47)** —
 Enrollments gains search, package filter, sort, CSV, bulk approve/reject/hold, holds and amount
@@ -2844,6 +2922,15 @@ docs **in the same change**:
   `db/2026-09-14-finance-parity.sql` ↔ fold §46 ↔ `src/lib/bankStatement.js` ↔
   `test/financeParitySql.test.mjs` ↔ the `#59` block. A migration that restates a #59 function must copy
   #59's body, not #58's: #59 added the feed-link refusals, and restating the #58 text silently removes them.
+  Since #64, **Daily Income** moves as its own set: `db/2026-09-19-finance-daily-income.sql` ↔ fold §51 ↔
+  `src/lib/financeDailyIncome.js` ↔ `FinanceDailyIncomeReport` ↔ `test/financeDailyIncomeSql.test.mjs` +
+  `test/financeDailyIncome.test.mjs` + `test-db/financeDailyIncome.dbtest.mjs` ↔ the `#64` audit block.
+  ★ **Its definition of income must stay the P&L's.** The `reconciliation` block does NOT check this — it
+  only proves the classification is complete against the report's own income-account total — so if
+  `finance_cash_basis_pl` changes what counts as income, `reconciled` stays true while the two reports
+  quietly disagree. Change both in the same migration and run `test-db/financeDailyIncome.dbtest.mjs`
+  ("June reconciles to the cash-basis P&L"), the only check that compares them. ★ A new finance RPC called from the app
+  must be added to `FINANCE_RPC_OWNERS` in `financeSql.test.mjs`, or the wiring test reports it as undefined.
   ★ **Never add an insert/update/delete policy to a `finance_` table.** The zero-client-write-path
   rule is what makes the legacy system's 30 unguarded mutations unreachable; all mutation goes through
   the SECURITY DEFINER RPCs, and `financeSql.test.mjs` fails if any write policy appears.

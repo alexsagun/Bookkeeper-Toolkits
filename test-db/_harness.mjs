@@ -359,7 +359,21 @@ export async function resetShadow() {
     restart identity cascade`);
   // Objects the course-video tests file under the private bucket. Deleted rather than
   // truncated: storage.objects is shared with the community-media and receipts suites.
-  await runSql(`delete from storage.objects where bucket_id = 'course-videos'`);
+  // ★ Supabase added a platform trigger, storage.protect_delete(), that raises 42501 on ANY
+  //   direct DELETE from a storage table — which broke this line, and with it the `before()`
+  //   of every suite in this directory, so `npm run test:db` failed 100% at setup with an error
+  //   that named storage and looked nothing like the feature under test. The trigger has one
+  //   sanctioned escape: it returns early when `storage.allow_delete_query` is 'true'. It must
+  //   be set with is_local = true, which needs a transaction — and the Management API commits
+  //   each request on its own — so the setting and the delete have to travel in ONE statement.
+  //   A `do` block is that statement: its implicit transaction scopes the setting to exactly
+  //   this delete, so nothing else in the run inherits permission to bypass the guard.
+  await runSql(`do $storage$
+    begin
+      perform set_config('storage.allow_delete_query', 'true', true);
+      delete from storage.objects where bucket_id = 'course-videos';
+    end
+  $storage$`);
   // Cohorts and their spaces: delete the batches, let the FK cascade take the
   // spaces (and, since #40, their categories and channels). General is seeded
   // by #32 and its channels by #40 — both must survive.
@@ -405,6 +419,40 @@ export async function resetShadow() {
     update public.profiles
        set is_paid = false, plan = 'free', approval_status = 'approved',
            rejected_at = null, rejection_reason = null`);
+}
+
+/**
+ * Wipe the finance LEDGER back to the #58 seed, keeping the chart, settings and presets.
+ *
+ * ★ resetShadow() alone leaves the ledger inconsistent. Its `truncate enrollment_requests …
+ *   cascade` also empties finance_payment_events (the FK reaches it), while the journal entries
+ *   those events belonged to survive — so every surviving enrollment collection reads as income
+ *   with no package, and a report asserting exact figures fails for a reason unrelated to it.
+ *   The #58 suite also inserts a 2020-01 period lock with no ON CONFLICT, so without this a
+ *   second run against the same shadow project failed in its own before().
+ *
+ * TRUNCATE bypasses the append-only ROW triggers (it fires no DELETE trigger) and needs table
+ * ownership: the Management API runs as postgres, and every client role lost TRUNCATE when #58
+ * revoked all on these tables — which is the reason this is safe to have at all.
+ */
+export async function resetFinance() {
+  shadowEnv(); // re-asserts we are not pointed at production
+  await runSql(`
+    truncate table
+      public.finance_reconciliation_items,
+      public.finance_reconciliations,
+      public.finance_bank_transactions,
+      public.finance_bank_imports,
+      public.finance_payment_events,
+      public.finance_journal_lines,
+      public.finance_journal_entries,
+      public.finance_recurring_templates,
+      public.finance_period_locks,
+      public.finance_audit_events
+    restart identity`);
+  await runSql(`update public.finance_accounts set active = true
+                 where code in ('1010', '4000', '4010', '4040', '4900')`);
+  await runSql(`update public.enrollment_plans set finance_income_account_id = null`);
 }
 
 /** Convenience for tests that need the General space id. */
