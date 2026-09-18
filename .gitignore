@@ -49,3 +49,6 @@ api/*.png
 # credential sheet, so it must never be staged. The sanitized findings live in
 # docs/audits/2026-09-17-legacy-finance-script-audit.md.
 Google Financial script/
+
+# Vercel CLI project link (created by `vercel link`): account and project ids, machine-local.
+.vercel/

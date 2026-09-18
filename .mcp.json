@@ -1,12 +1,15 @@
 {
   "mcpServers": {
-    "supabase": {
-      "type": "http",
-      "url": "https://mcp.supabase.com/mcp?project_ref=ifxcobxsjdjzlozagmls&features=docs%2Cdatabase%2Cdebugging%2Cdevelopment%2Cfunctions"
-    },
     "elevenlabs": {
       "type": "http",
-      "url": "https://api.elevenlabs.io/v1/mcp"
+      "url": "https://api.us.elevenlabs.io/v1/mcp"
+    },
+    "supabase": {
+      "type": "http",
+      "url": "https://mcp.supabase.com/mcp?project_ref=ifxcobxsjdjzlozagmls&features=docs%2Cdatabase%2Cdebugging%2Cdevelopment%2Cfunctions",
+      "headers": {
+        "Authorization": "Bearer ${SUPABASE_ACCESS_TOKEN}"
+      }
     }
   }
 }
