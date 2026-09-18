@@ -1,10 +1,18 @@
 # AI Course Trainer — setup guide
 
-The voice assistant ("Toolkits Guide") can **teach, explain, quiz, practice, and recap**
-your Supabase-hosted courses with enrolled learners. This guide is every backend/dashboard
-step to turn it on. The voice widget itself is set up in
-[docs/ai/voice-agent-setup.md](docs/ai/voice-agent-setup.md) — do that first if you
+The voice assistant — **Toolkits Siri — AI Voice Guide & Course Trainer** — can **teach,
+explain, quiz, practice, and recap** your Supabase-hosted courses with enrolled learners.
+This guide is every backend/dashboard step to turn it on. The voice widget itself is set up
+in [docs/ai/voice-agent-setup.md](docs/ai/voice-agent-setup.md) — do that first if you
 haven't.
+
+> ★ **Provisioning refuses to attach the trainer until the DEPLOYED app is ready.**
+> `npm run ai:provision` will not create or attach the four webhook tools unless
+> `TRAINER_TOKEN_SECRET` is set locally **and** the deployed
+> `GET ${APP_URL}/api/elevenlabs/trainer` reports `configured:true`. A local `.env` value
+> alone never satisfies it: attaching the tools to a live agent while the deployment lacks
+> the secret would answer "not configured" to a learner mid-lesson. Follow the ship order in
+> [Step 4](#step-4--provision-the-elevenlabs-side).
 
 ## What you get
 
@@ -47,10 +55,12 @@ transcript** (Scribe or manual paste — YouTube/Vimeo are never scraped).
 
 1. Run migration **#27** (`db/2026-07-24-course-ai-trainer.sql`).
 2. Set `TRAINER_TOKEN_SECRET` (+ confirm `SUPABASE_SECRET_KEY`, `ELEVENLABS_API_KEY`,
-   `APP_URL`) in `.env` and Vercel.
+   `APP_URL`) in `.env` **and** Vercel Production + Preview, then **redeploy**.
 3. Deploy the **`trainer-embed`** Edge Function (dashboard editor — recommended, enables
    semantic search; skipping it leaves the trainer on keyword search).
-4. `npm run ai:provision` (creates/updates the 4 webhook tools + the trainer prompt).
+4. Confirm the deployed trainer reports `configured:true`, then `npm run ai:provision`
+   (Step 4 — the ship order). ★ Check `configured:true` yourself: the provisioner does not yet
+   enforce it, and its read-only `--verify-only` check is not built (the script refuses the flag).
 5. In the app: open a course → **Edit course** → **AI Trainer** → Enable → **Sync index**.
 6. Transcripts for video lessons (Transcribe button or manual paste) → **Approve & index**.
 
@@ -73,10 +83,17 @@ Preview), then redeploy:
 
 | Var | What |
 |---|---|
-| `TRAINER_TOKEN_SECRET` | **New.** ≥32 random characters (e.g. `openssl rand -hex 32` or any password generator). Signs the short-lived trainer session tokens. Unset = trainer tools off; the rest of the voice widget is unaffected. |
-| `SUPABASE_SECRET_KEY` | Already set for Student Imports. The service-role key the trainer endpoints use AFTER verifying the caller. |
+| `TRAINER_TOKEN_SECRET` | **Required to provision the trainer.** ≥32 random characters (e.g. `openssl rand -hex 32` or any password generator). Signs the short-lived trainer session tokens. Set it in Vercel **Production AND Preview with the same value** — the webhook tools always call the production `APP_URL`, so a token minted by a Preview deployment is verified by Production — then **redeploy**. Unset in the deployment = the trainer health check reports `configured:false`, provisioning refuses the webhook tools, and the rest of the voice widget is unaffected. |
+| `SUPABASE_SECRET_KEY` | Already set for Student Imports. The service-role key the trainer endpoints use AFTER verifying the caller. The trainer also reports `configured:false` without it. |
 | `ELEVENLABS_API_KEY` | Already set for the voice widget. Also powers Scribe transcription. |
-| `APP_URL` | Your deployed origin, e.g. `https://toolkits.alexsagun.com`. The ElevenLabs webhook tools call `${APP_URL}/api/elevenlabs/trainer`. |
+| `APP_URL` | Your deployed origin, e.g. `https://toolkits.alexsagun.com`. The ElevenLabs webhook tools call `${APP_URL}/api/elevenlabs/trainer`. Required to provision them; on a dev machine it can be passed inline for one run (Step 4). |
+
+Check the deployment, not your `.env`:
+
+```powershell
+curl https://toolkits.alexsagun.com/api/elevenlabs/trainer
+# → {"ok":true,"configured":true}
+```
 
 ## Step 3 — Deploy the `trainer-embed` Edge Function (semantic search)
 
@@ -139,15 +156,51 @@ builder's AI Trainer panel shows which mode is live (green "Semantic search on" 
 
 ## Step 4 — Provision the ElevenLabs side
 
-```powershell
-npm run ai:provision
-```
+`npm run ai:provision` creates/updates the **4 webhook tools** (URL =
+`${APP_URL}/api/elevenlabs/trainer?action=…`, header
+`Authorization: Bearer {{secret__trainer_token}}`), the 7 client tools, the Toolkits Siri
+system prompt and the knowledge document — and it refuses to start until every check
+passes. It stops at PREFLIGHT, before a single write, on:
 
-With `APP_URL` + `ELEVENLABS_API_KEY` (+ `ELEVENLABS_AGENT_ID`) set, this creates/updates
-the **4 webhook tools** (URL = `${APP_URL}/api/elevenlabs/trainer?action=…`, header
-`Authorization: Bearer {{secret__trainer_token}}`), the 7 client tools, and the extended
-trainer system prompt. `APP_URL` unset → the webhook tools are skipped with a loud
-warning. Details + manual fallback: voice-agent-setup.md §4b.
+- `NO_APP_URL` — **fatal**. `APP_URL` unset no longer "skips" the webhook tools: a run
+  without it would **detach** working trainer tools from the agent.
+- `NO_TRAINER_SECRET` — `TRAINER_TOKEN_SECRET` is not set locally.
+- `TRAINER_NOT_CONFIGURED` — checked against the **deployed** app: the trainer GET does not
+  report `configured:true`. Setting the secret in `.env` does not clear this; setting it in
+  Vercel and redeploying does.
+- `TRAINER_HEALTH_UNREACHABLE` — that GET could not be read at all.
+
+**Ship order (load-bearing):**
+
+1. Deploy the frontend.
+2. Set `TRAINER_TOKEN_SECRET` in Vercel **Production AND Preview** (same value).
+3. **Redeploy.**
+4. Confirm `GET https://toolkits.alexsagun.com/api/elevenlabs/trainer` →
+   `{"ok":true,"configured":true}`.
+5. Provision, passing `APP_URL` inline from a dev machine:
+   ```bash
+   APP_URL=https://toolkits.alexsagun.com npm run ai:provision
+   ```
+   PowerShell:
+   ```powershell
+   $env:APP_URL = 'https://toolkits.alexsagun.com'; npm run ai:provision
+   ```
+6. Verify the live agent. ★ There is no automated read-only check yet: `--verify-only` is
+   planned but **not implemented**, and the script refuses it rather than run. Until it lands,
+   open the agent in the ElevenLabs dashboard and confirm its tools, system prompt and attached
+   knowledge document match `docs/ai/voice-agent-setup.md` §3–§4.
+
+Preview first with `npm run ai:provision -- --dry-run`: it runs the same checks, prints the
+plan, and never writes. The escape hatch `--client-only` provisions the client tools alone
+and is refused while the agent already has webhook tools attached. The full state machine,
+every blocker and the rollback behaviour: voice-agent-setup.md §3a. Manual fallback:
+voice-agent-setup.md §4b.
+
+★ **`scripts/provision-voice-agent.mjs` has not caught up with this section yet** — it takes
+`--dry-run` only, and its prompt sentinel is still the assistant's previous name, so today every
+run aborts with a misleading *"the extracted system prompt looks wrong"* before any of the
+blockers above can be reached. See the ★ note at the top of voice-agent-setup.md §3a for what
+must change and, in particular, what must **not** (do not put the old name back in the prompt).
 
 ## Step 5 — Enable + index a course
 
@@ -191,8 +244,11 @@ Course-level **Trainer notes** (optional) work the same way — extra approved c
 | Symptom | Cause / fix |
 |---|---|
 | Builder shows "Finish backend setup" | Migration #27 not run — Step 1. |
+| `ai:provision` stops with `TRAINER_NOT_CONFIGURED` | The deployed trainer GET reports `configured:false` — `TRAINER_TOKEN_SECRET` (or `SUPABASE_SECRET_KEY`) missing in Vercel. Set it in Production + Preview, **redeploy**, confirm the GET, re-run. A local `.env` value does not clear this. |
+| `ai:provision` stops with `NO_TRAINER_SECRET` | `TRAINER_TOKEN_SECRET` is not in your local `.env` / shell. |
+| `ai:provision` stops with `NO_APP_URL` | Pass `APP_URL=https://toolkits.alexsagun.com` inline (or `--app-url`). Fatal on purpose — continuing would detach the trainer tools. |
 | Trainer says "not set up yet" | `TRAINER_TOKEN_SECRET` or `SUPABASE_SECRET_KEY` missing on the server (Step 2), or #27 not run. |
-| Trainer says "session expired" immediately | The signed-url endpoint isn't minting tokens — `TRAINER_TOKEN_SECRET` unset, or the 15-minute token elapsed (restart the voice session). |
+| Trainer says "session expired" immediately | The signed-url endpoint isn't minting tokens — `TRAINER_TOKEN_SECRET` unset, a Preview deployment whose secret differs from Production's, or the 15-minute token elapsed (restart the voice session). |
 | Amber "Keyword fallback" pill | `trainer-embed` not deployed/unreachable (Step 3). The trainer still works — with keyword search. |
 | "The trainer is temporarily unavailable" | The entitlement check failed — this is the **fail-closed** path (Supabase down/misconfigured). Check Vercel logs for `[trainer]` lines (codes only, never content). |
 | Transcribe fails / times out | Very long videos can exceed the serverless window (300s). Retry, or paste the transcript manually — the manual path always works. Check `ELEVENLABS_API_KEY`. |

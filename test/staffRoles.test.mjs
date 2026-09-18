@@ -438,8 +438,9 @@ test('a student gets 403', () => {
 test('an unavailable check denies — it never fails open', () => {
   const v = staffAuthVerdict({ rpc: rpcBroken(), permission: 'students.import' });
   assert.equal(v.allow, false,
-    'the anthropic/elevenlabs gates fail OPEN on an indeterminate is_enrolled(); a STAFF '
-    + 'check must not, because what it guards is the service-role key');
+    'the anthropic proxy fails OPEN on an indeterminate is_enrolled() (signed-url now fails '
+    + 'closed — see voiceSessionVerdict); a STAFF check must not, because what it guards is '
+    + 'the service-role key');
   assert.equal(v.status, 403);
   assert.equal(v.degraded, true);
 });

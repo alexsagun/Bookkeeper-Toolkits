@@ -157,6 +157,16 @@ The sanctioned exceptions to the single-file rule (same spirit as the `main.jsx`
   stepped and clamped, which days count as empty (net zero is NOT empty: a correction that cancels a
   collection stays visible), and what "today" is in the **business** timezone — `todayISODate()` is
   the browser's. One column list drives the table, the CSV and the print view, so they cannot disagree.
+- `src/lib/voiceAccess.js` — who may open a voice session (pure). `voiceSessionVerdict()` is the
+  ONE decision table behind `api/elevenlabs/signed-url.js`, which imports it: it fails CLOSED
+  (`unavailable` → 503) and admits active staff without a subscription. Also the single source of
+  the assistant's name (`VOICE_ASSISTANT_NAME` / `_SHORT_NAME`). ★ `voiceEligibility()` — the
+  client-side mic-FAB rule — is defined and tested here but **not yet called by the app**.
+- `src/lib/voiceKnowledge.js` / `src/lib/voiceProvisioning.js` — the knowledge-doc fingerprint and
+  invariants, and the provisioning PREFLIGHT/plan (`--verify-only`, `--client-only`, the
+  `TRAINER_NOT_CONFIGURED` / `NO_APP_URL` blockers). ★ **Built and tested, but NOT wired in yet:**
+  imported only by their tests — neither `ai:knowledge` nor `scripts/provision-voice-agent.mjs` uses
+  them. The provision script refuses the unbuilt flags by name; see docs/ai/voice-agent-setup.md §3a.
 - `src/index.css` — the **global theme-token layer** (all CSS custom properties for light + dark,
   the shared `.gh-app-bg`/glass/button/input classes, and the Tailwind dark compat layer). See
   Styling conventions.
@@ -1384,8 +1394,9 @@ role `is_admin = true`.**
   queries**. `adminTabAllowed()` now refuses first, gated on `staffReady`.
 - **Server**: [api/_lib/staffAuth.js](api/_lib/staffAuth.js) is the ONE gate for `api/admin/*` —
   verify JWT → ask the database with the CALLER's JWT → only then may `service()` be constructed.
-  It **fails CLOSED**, deliberately unlike the fail-open `is_enrolled()` gates in `api/anthropic` and
-  `api/elevenlabs`, because what it protects is the service-role key. Its one legacy fallback applies
+  It **fails CLOSED**, deliberately unlike the fail-open `is_enrolled()` gate in `api/anthropic`
+  (`api/elevenlabs` now fails closed too — see the Voice assistant section), because what it
+  protects is the service-role key. Its one legacy fallback applies
   to a **missing** function only — answering a timeout by consulting a weaker check would convert an
   outage into a privilege escalation.
 - **Break-glass**: `npm run staff:bootstrap -- --email you@… [--apply]`. It writes
@@ -2193,7 +2204,14 @@ const { text, data } = await callClaude({ system, messages }, { returnData: true
 - Under the hood `callClaude` is still a `fetch('https://api.anthropic.com/v1/messages', …)` with only
   `Content-Type: application/json` — that's what the `main.jsx` fetch shim rewrites to `/api/anthropic`.
 
-## Voice assistant (ElevenLabs) — "Toolkits Guide"
+## Voice assistant (ElevenLabs) — "Toolkits Siri"
+
+The assistant's name has ONE source: `VOICE_ASSISTANT_NAME` / `VOICE_ASSISTANT_SHORT_NAME` in
+[src/lib/voiceAccess.js](src/lib/voiceAccess.js) ("Toolkits Siri"). ★ Its previous name was
+"Toolkits Guide", and the ElevenLabs agent **record** is still called `Toolkits Guide by Alex`
+(`AGENT_NAME` in `scripts/provision-voice-agent.mjs`). That is deliberate, not stale: provisioning
+finds the agent BY NAME, so renaming the record without `ELEVENLABS_AGENT_ID` set would create a
+second agent instead of updating the live one.
 
 A floating mic FAB (bottom-right) that lets **enrolled members + admins** talk to the app: ask
 about tools/plans/membership and have the agent navigate tabs or open account panels. Full
@@ -2208,9 +2226,17 @@ setup/ops guide: [docs/ai/voice-agent-setup.md](docs/ai/voice-agent-setup.md).
   vars are a soft off switch. The **`@elevenlabs/client` SDK is lazy-loaded via dynamic
   `import()`** (own chunk, XLSX idiom — do not add it to `manualChunks`).
 - **Server** — [api/elevenlabs/signed-url.js](api/elevenlabs/signed-url.js): GET = unauthenticated
-  health check `{ ok, configured }`; POST mints an ElevenLabs signed URL after the same gate as
-  the Anthropic proxy (valid Supabase JWT → 401, `is_enrolled()` admin-or-member → 403,
-  fail-open on RPC-indeterminate with a `[elevenlabs]` warning, 8 mints/min/user burst limit).
+  health check `{ ok, configured }`; POST mints an ElevenLabs signed URL after: a valid Supabase
+  JWT (else 401) → an 8-mints/min/user rate limit (429, checked BEFORE any RPC) → `is_enrolled()`
+  and `my_staff_context()` asked **in parallel**, each attempt bounded and retried once → the
+  verdict from `voiceSessionVerdict()` in [src/lib/voiceAccess.js](src/lib/voiceAccess.js):
+  `allow` mints, `deny` → 403, `unavailable` → **503 + Retry-After**.
+  ★ **It FAILS CLOSED.** It used to fail OPEN on an indeterminate RPC (log a warning, mint anyway),
+  which converted a Supabase outage into free metered voice sessions. The stated trade, written in
+  the handler: an outage now takes the widget down instead. An **active** staff member (Super
+  Admin, Operations Admin, Trainer) is admitted without a subscription — previously the gate
+  hid the assistant from staff. Suspended, revoked and invited-but-unaccepted staff are refused.
+  This gate is now STRICTER than `api/anthropic`, which still fails open by design.
   Env: `ELEVENLABS_API_KEY` + `ELEVENLABS_AGENT_ID` (server-only), optional
   `ELEVENLABS_SERVER_LOCATION`. **Unlike the notify fns, this DOES run under `npm run dev`** —
   the `elevenlabsDevApi` plugin in vite.config.js imports the real handler, so dev exercises
@@ -2279,8 +2305,9 @@ explain/quiz/practice/recap the Supabase-hosted courses. Full setup:
   [api/elevenlabs/trainer.js](api/elevenlabs/trainer.js) (`get_my_training_catalog`,
   `get_authorized_training_context`, `get_my_training_checkpoint`, `save_training_checkpoint`).
   Never attach course content to the KB doc.
-- **Authorization is server-side and FAIL-CLOSED** (unlike the fail-open signed-url/anthropic
-  gates, which are deliberately unchanged): every trainer request verifies a short-lived HMAC
+- **Authorization is server-side and FAIL-CLOSED** (like the signed-url gate, which now fails
+  closed too; unlike the `api/anthropic` proxy, which still fails open by design): every trainer
+  request verifies a short-lived HMAC
   **trainer token** (minted by signed-url.js when `TRAINER_TOKEN_SECRET` is set; identity-only
   claims; codec in [src/lib/trainerToken.js](src/lib/trainerToken.js)), then re-queries
   `trainer_visible_courses(p_user)` under the service role — a SECURITY DEFINER function that

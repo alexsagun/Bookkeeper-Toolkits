@@ -409,12 +409,13 @@ export function staffCan(ctx, key) {
  * api/_lib/staffAuth.js is a thin I/O shell around this: it fetches, this
  * decides. Returns `{ allow, status, code, degraded, legacy, context }`.
  *
- * ★ THIS GATE FAILS CLOSED, and that is a deliberate departure from its
- *   neighbours. api/anthropic and api/elevenlabs/signed-url both fail OPEN when
- *   is_enrolled() is indeterminate, because refusing there would take the product
- *   down over a transient blip and the worst case is some spent tokens. What this
- *   gate protects is the SERVICE-ROLE KEY. An authorization check that could not
- *   run is not a permission granted.
+ * ★ THIS GATE FAILS CLOSED. Of its neighbours, only api/anthropic still fails
+ *   OPEN when is_enrolled() is indeterminate, because refusing there would take
+ *   the product down over a transient blip and the worst case is some spent
+ *   tokens. api/elevenlabs/signed-url now fails CLOSED too, because every mint is
+ *   a metered voice session AND a trainer token (see voiceSessionVerdict in
+ *   src/lib/voiceAccess.js). What this gate protects is the SERVICE-ROLE KEY. An
+ *   authorization check that could not run is not a permission granted.
  *
  * ★ The legacy fallback exists only for deploy skew. Vercel ships the code the
  *   moment it is pushed; a human runs the migration afterwards. In that window

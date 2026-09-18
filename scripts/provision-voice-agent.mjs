@@ -35,6 +35,10 @@ import { readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadDotEnv, makeApi, attachKnowledgeDoc, extractLiteral, fencedBlockAfter } from './_elevenlabs.mjs';
+// The assistant's name has ONE source. This check used to hard-code the old name
+// ("Toolkits Guide"), so renaming the assistant in the setup doc silently broke every
+// `ai:provision` run — including --dry-run — until someone found this line.
+import { VOICE_ASSISTANT_SHORT_NAME } from '../src/lib/voiceAccess.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SOURCE = join(ROOT, 'src', 'BookkeeperPro.jsx');
@@ -54,6 +58,31 @@ const warn = (m) => console.warn(`[ai:provision] WARN: ${m}`);
 function fail(msg) {
   console.error(`\n[ai:provision] FAILED: ${msg}\n`);
   process.exit(1);
+}
+
+// ── Flags: fail CLOSED on anything this script does not implement ──────────────
+// ★ An unrecognised flag used to be silently IGNORED, and the only one read is --dry-run.
+//   So `--verify-only` — which docs/ai/voice-agent-setup.md describes as READ-ONLY and
+//   tells people to run when the live agent looks stale — fell straight through to a full,
+//   WRITING provision: tools re-created, system prompt overwritten, knowledge re-attached.
+//   `--client-only` did the same while claiming to leave webhook tools alone, and
+//   `--app-url` had its value discarded. Those three are designed in
+//   src/lib/voiceProvisioning.js but not wired in here yet, so refuse them by name.
+//   This check runs before .env is loaded and before any request is made.
+const KNOWN_FLAGS = new Set(['--dry-run']);
+const NOT_YET_IMPLEMENTED = {
+  '--verify-only': 'the read-only live-agent check',
+  '--client-only': 'client-tools-only provisioning',
+  '--app-url': 'a per-run origin override — set APP_URL in the environment instead',
+};
+for (const arg of process.argv.slice(2)) {
+  if (!arg.startsWith('--')) continue;
+  const flag = arg.split('=')[0];
+  if (KNOWN_FLAGS.has(flag)) continue;
+  if (NOT_YET_IMPLEMENTED[flag]) {
+    fail(`${flag} is not implemented yet (${NOT_YET_IMPLEMENTED[flag]}). Nothing was changed.`);
+  }
+  fail(`Unknown flag ${flag}. The only supported flag is --dry-run. Nothing was changed.`);
 }
 
 // ── Inputs ───────────────────────────────────────────────────────────────────
@@ -105,7 +134,7 @@ try {
 } catch (err) {
   fail(`Could not read the system prompt / first message from docs/ai/voice-agent-setup.md (${err.message}). Keep §3's fenced blocks intact.`);
 }
-if (!/Toolkits Guide/i.test(SYSTEM_PROMPT)) fail('The extracted system prompt looks wrong (no "Toolkits Guide" sentinel) — check §3 of the setup doc.');
+if (!SYSTEM_PROMPT.includes(VOICE_ASSISTANT_SHORT_NAME)) fail(`The extracted system prompt looks wrong (no "${VOICE_ASSISTANT_SHORT_NAME}" sentinel) — check §3 of the setup doc.`);
 if (!/\{\{\s*user_name\s*\}\}/.test(FIRST_MESSAGE)) warn('First message has no {{user_name}} variable — double-check §3 of the setup doc.');
 
 const api = makeApi({ apiKey: process.env.ELEVENLABS_API_KEY, dryRun: DRY_RUN, log });

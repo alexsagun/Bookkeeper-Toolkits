@@ -73,6 +73,11 @@
   --topbar-bg: rgba(255,255,255,0.85);
   --section-head-bg: linear-gradient(180deg, rgba(247,250,255,0.92) 0%, rgba(247,250,255,0.78) 70%, rgba(247,250,255,0.50) 100%);
   --table-sticky-bg: rgba(247,250,255,0.95);
+  /* Voice assistant (Toolkits Siri) header band. ★ Deep in BOTH themes on purpose: the band
+     carries text-white and text-blue-100/200, which the dark compat layer deliberately does
+     not remap — a light endpoint here would make that text unreadable. */
+  --voice-header-from: #0057B8;
+  --voice-header-to: #0F2A5A;
 
   /* Text */
   --c-text: #0F1217;
@@ -149,6 +154,10 @@
   --topbar-bg: rgba(16,27,48,0.85);
   --section-head-bg: linear-gradient(180deg, rgba(11,19,34,0.92) 0%, rgba(11,19,34,0.78) 70%, rgba(11,19,34,0.50) 100%);
   --table-sticky-bg: rgba(18,26,41,0.96);
+  /* Voice assistant header band — identical to light, deliberately: it carries text-white and
+     text-blue-100/200, which the dark compat layer does not remap, so both endpoints stay deep. */
+  --voice-header-from: #0057B8;
+  --voice-header-to: #0F2A5A;
 
   --c-text: #E8ECF2;
   --c-text-soft: #A9B2C0;
