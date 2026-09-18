@@ -171,8 +171,18 @@ don't need to add auth checks inside a tool. See the "Authentication" section in
 
 ## File import / export
 
-- **Download/export:** use the `downloadFile(content, filename, mimeType)` helper (~L679) — e.g.
-  `downloadFile(csv, 'chart-of-accounts.csv', 'text/csv')`.
+- **Download/export:** use the `downloadFile(content, filename, mimeType, opts)` helper (~L1516) — e.g.
+  `downloadFile(csv, 'chart-of-accounts.csv', 'text/csv')`. It accepts a string or a `Blob`, returns
+  `true`/`false`, and `alert()`s on failure unless you pass `{ quiet: true }` — do that when the caller
+  already renders its own error in context (a dialog), or the alert stacks on top of it.
+- **PDF from a DOM subtree:** lazy-load both libraries together
+  (`await Promise.all([import('jspdf'), import('html2canvas')])`) and use JPEG, never PNG. Known
+  html2canvas 1.4.1 limits measured in this repo: no `backdrop-filter`/`filter` paint, no `outline`,
+  blurred `box-shadow` becomes a solid frame, flex text-centering and flex `gap` are unreliable (grid
+  gaps are fine). ★ Text drawn LOW is not a layout bug: html2canvas measures font baselines in the global
+  `document`, where Tailwind's preflight makes its probe `<img>` `display:block` — install
+  `PF_H2C_METRICS_FIX_CSS` for the duration of the capture. Race every capture against a timeout — it waits on a child iframe's onload with none
+  of its own. See `renderPortfolioPdf` and `renderAgreementPdf`.
 - **Spreadsheets:** the `xlsx` library (`XLSX`) parses/builds Excel; see `StatementConverter` /
   `CoaGenerator`. Import it lazily — `const XLSX = await import('xlsx')` — so it stays out of the main bundle.
 - **Word docs (`.docx`):** not currently wired into the app. If you add `.docx` parsing, lazy-load a

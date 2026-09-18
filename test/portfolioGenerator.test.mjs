@@ -32,7 +32,15 @@ import {
   PF_TWO_PANE_MIN,
   PF_LOGICAL_WIDTHS,
   PF_PHOTO_MAX_BASE64,
+  PF_PDF_MARGIN_PT,
+  PF_PDF_MAX_PAGES,
+  PF_PDF_PAGE_HEIGHT_PT,
+  PF_PDF_PAGE_PX,
+  PF_PDF_PAGE_WIDTH_PT,
+  PF_PDF_WIDTH_PX,
   FALLBACK_THEME,
+  PDF_CSS,
+  PORTFOLIO_EXPORT_REQUIREMENTS,
   PORTFOLIO_SECTIONS,
   buildPortfolioHtml,
   contrastRatio,
@@ -41,6 +49,7 @@ import {
   emptyDraft,
   escapeHtml,
   financialSampleRows,
+  formatMetricValue,
   isSafePhotoDataUrl,
   isTheme,
   mailtoHref,
@@ -50,6 +59,10 @@ import {
   onPanelGlow,
   parseResumeLines,
   parseStoredDraft,
+  pdfPageChrome,
+  planPdfPages,
+  planPortfolioExport,
+  portfolioExportReadiness,
   portfolioFileName,
   resolveTheme,
   safeLinkHref,
@@ -67,6 +80,15 @@ import {
 
 const B64 = 'QUJDRA==';
 const PNG = `data:image/png;base64,${B64}`;
+/** The smallest draft the export gate accepts: the five requirements, nothing optional. */
+const MINIMAL = () => ({
+  ...emptyDraft(),
+  fullName: 'Ana Cruz',
+  title: 'Remote Bookkeeper',
+  heroHeadline: 'Clean books, closed by the 10th of every month.',
+  services: [{ name: 'Monthly bookkeeping', desc: 'Reconciled and closed every month.' }],
+  email: 'ana@cruzbooks.co',
+});
 const download = (draft, extra) => buildPortfolioHtml(draft, { mode: 'download', year: 2026, ...extra });
 const preview = (draft, extra) => buildPortfolioHtml(draft, { mode: 'preview', year: 2026, ...extra });
 const navBlock = (html) => (/<div class="links">([\s\S]*?)<\/div>/.exec(html) || [, ''])[1];
@@ -1261,15 +1283,24 @@ test('draftHasContent notices any authored field, including a changed default', 
   assert.equal(draftHasContent(SAMPLE_DRAFT), true, 'the loaded example is content to be warned about');
 });
 
-test('validateDraft blocks only on a missing name', () => {
+test('validateDraft blocks on the five export requirements, and nothing else', () => {
+  // ★ IT USED TO BLOCK ONLY ON THE NAME, and the name is PREFILLED from the student's
+  //   profile — so an untouched draft had zero blockers and downloaded an empty portfolio
+  //   with no dialog at all. The gate is still deliberately small: five things a client
+  //   needs, every other section optional.
   const empty = validateDraft(emptyDraft());
-  assert.deepEqual(empty.blocking, ['fullName'],
-    'a tool that refuses the download until everything is perfect is one nobody finishes');
+  assert.deepEqual(empty.blocking, PORTFOLIO_EXPORT_REQUIREMENTS.map((r) => r.key),
+    'blocking must come back in registry order, so the review list reads top to bottom');
   assert.equal(empty.ok, false);
   const named = validateDraft({ ...emptyDraft(), fullName: 'Jordan Reyes' });
-  assert.equal(named.ok, true, 'a half-finished portfolio is still worth downloading');
-  assert.ok(named.fields.services, 'it should still warn about what is missing');
-  assert.equal(named.fields.services.level, 'warn');
+  assert.equal(named.ok, false, 'a prefilled name alone is not a portfolio');
+  assert.deepEqual(named.blocking, ['title', 'heroHeadline', 'services', 'contact']);
+  for (const key of named.blocking) assert.equal(named.fields[key].level, 'error');
+  assert.equal(named.fields.services.code, 'empty');
+  assert.equal(named.fields.summary.level, 'warn', 'the About section stays optional');
+  const minimal = validateDraft(MINIMAL());
+  assert.equal(minimal.ok, true);
+  assert.deepEqual(minimal.blocking, []);
 });
 
 test('an invalid link is a warning that names the reason, not a block', () => {
@@ -1283,6 +1314,11 @@ test('an invalid link is a warning that names the reason, not a block', () => {
 test('a portfolio with no way to reach the author is flagged', () => {
   const v = validateDraft({ ...emptyDraft(), fullName: 'A' });
   assert.ok(v.fields.contact, 'a portfolio nobody can reply to cannot convert');
+  assert.equal(v.fields.contact.level, 'error');
+  assert.equal(v.fields.contact.code, 'unreachable', 'nothing was entered at all');
+  const unusable = validateDraft({ ...emptyDraft(), fullName: 'A', email: 'not-an-email' });
+  assert.equal(unusable.fields.contact.code, 'unusable',
+    'something was entered, and none of it can be used — a different fix for the student');
   const reachable = validateDraft({ ...emptyDraft(), fullName: 'A', email: 'a@example.com' });
   assert.ok(!reachable.fields.contact);
 });
@@ -2078,6 +2114,680 @@ test('the example draft is never the initial draft', () => {
     + 'is saved when it was dropped');
   assert.match(writeArm, /const trimmed = \{ \.\.\.draft, photo: '' \};/,
     'the trimmed payload must be named so the same value is both written and stamped');
-  assert.match(body, /sampleFieldsStillPresent/,
+  // ★ The component no longer calls sampleFieldsStillPresent itself: the export gate does,
+  //   and a pure test in section 12 pins that the readiness object carries its result.
+  assert.match(body, /lib\.portfolioExportReadiness\(draft, \{ sample: SAMPLE_DRAFT \}\)/,
     'the download step must name the fields still holding example content');
+});
+
+// ── 13. The export flow in the component (source scans) ─────────────────────
+//
+// There is no jsdom in this repo, so the component half of the gate is pinned by
+// reading its source. Each scan names the regression it exists to stop.
+
+// ★ Every helper below normalizes CRLF first. A Windows checkout can hand these scans
+//   `\r\n`, and a search for `) {\n` or `\n  }\n` then silently finds NOTHING — which made
+//   one slice come back empty (a loud failure) and another run to the end of the file (a
+//   silent pass that proved nothing). An anchor that can miss must fail, never widen.
+const lf = (text) => text.replace(/\r\n/g, '\n');
+
+/** A top-level function's full source, by signature, with brace matching. */
+const fnSource = (rawSrc, signature) => {
+  const src = lf(rawSrc);
+  const at = src.indexOf(signature);
+  assert.ok(at >= 0, `${signature} was not found`);
+  const bodyOpen = src.indexOf(') {\n', at);
+  assert.ok(bodyOpen > at, `${signature} has no body`);
+  const open = bodyOpen + 2;
+  let depth = 0;
+  for (let i = open; i < src.length; i += 1) {
+    if (src[i] === '{') depth += 1;
+    else if (src[i] === '}') { depth -= 1; if (depth === 0) return src.slice(at, i + 1); }
+  }
+  throw new Error(`${signature} is unterminated`);
+};
+const stripComments = (code) => lf(code)
+  .replace(/\/\*[\s\S]*?\*\//g, ' ')
+  .split('\n')
+  .filter((l) => !l.trim().startsWith('//'))
+  .join('\n');
+const pdfHelper = () => stripComments(fnSource(app(), 'async function renderPortfolioPdf('));
+/** An indented function inside the component, up to its closing brace at two spaces. */
+const innerFn = (rawCode, signature) => {
+  const code = lf(rawCode);
+  const at = code.indexOf(signature);
+  assert.ok(at > 0, `${signature} was not found in the component`);
+  const end = code.indexOf('\n  }\n', at);
+  assert.ok(end > at, `${signature} has no closing brace at two spaces — refusing to scan the rest of the file`);
+  return code.slice(at, end);
+};
+
+test('the PDF capture helper lives at module scope, outside the component', () => {
+  const src = app();
+  const helperAt = src.indexOf('async function renderPortfolioPdf(');
+  assert.ok(helperAt > 0, 'renderPortfolioPdf was not found');
+  assert.ok(helperAt < src.indexOf('function PfField('),
+    'above PfField, so componentBody (which ends at the next top-level function) can never swallow it');
+  assert.equal(componentBody(src).includes('renderPortfolioPdf({'), true, 'the component calls it');
+  assert.equal(componentBody(src).includes('async function renderPortfolioPdf('), false);
+});
+
+test('the capture frame is sandboxed WITHOUT scripts, and never touches the live preview', () => {
+  // ★ allow-same-origin WITHOUT allow-scripts. html2canvas must read the capture
+  //   document's DOM, which needs the same origin; the document is escaped, carries a
+  //   script-src 'none' policy, and has nothing to run. The dangerous combination is both
+  //   flags together — a same-origin document that can also execute.
+  const code = pdfHelper();
+  const sb = /setAttribute\('sandbox', '([^']*)'\)/.exec(code);
+  assert.ok(sb, 'the capture frame must carry an explicit sandbox');
+  assert.deepEqual(sb[1].split(/\s+/).filter(Boolean), ['allow-same-origin']);
+  assert.equal(/allow-scripts|allow-top-navigation|allow-popups|allow-forms|allow-modals/.test(code), false);
+  assert.equal(/previewHtml|frameRef/.test(code), false, 'the PDF is never captured from the preview');
+  assert.equal(/display:\s*none/.test(code), false, 'a display:none frame lays out nothing to capture');
+  assert.match(code, /finally \{[\s\S]*\.remove\(\)/, 'the frame is removed however the export ends');
+  // The live preview is untouched — the section 11 sandbox test still pins it exactly.
+  assert.match(componentCode(app()), /sandbox="allow-scripts"/);
+});
+
+test('every html2canvas call and the frame load are bounded by a timeout', () => {
+  // ★ html2canvas clones into a child iframe and waits on its onload with NO timeout. A
+  //   browser that never fires it would leave the dialog on "Rendering…" forever, with
+  //   closing disabled — so every await that crosses into it is raced against a clock.
+  const code = pdfHelper();
+  const calls = code.split('html2canvas(').length - 1;
+  assert.ok(calls >= 1, 'the helper must capture with html2canvas');
+  assert.equal((code.match(/withPdfTimeout\(\s*html2canvas\(/g) || []).length, calls,
+    'an unbounded capture can hang the export with no way out');
+  assert.match(code, /withPdfTimeout\(\s*loaded/, 'the frame load is bounded too');
+  // ★ Found in review: the library download was the one unbounded await. The dialog cannot
+  //   be closed while an export runs, so on a stalled connection Cancel must end that wait.
+  assert.match(code, /withPdfTimeout\(\s*Promise\.all\(\[\s*import\('jspdf'\)/,
+    'the jspdf + html2canvas download is bounded and cancellable too');
+});
+
+test('the capture neutralises the app stylesheet html2canvas measures fonts against, and only while capturing', () => {
+  // ★ MEASURED, 2026-09-15. html2canvas 1.4.1 builds FontMetrics on the GLOBAL `document`
+  //   (html2canvas.js: `new FontMetrics(document)`), not on the document it is capturing.
+  //   That document is this app, whose Tailwind preflight makes every <img> display:block —
+  //   so the 1x1 probe image it aligns to the text baseline drops a whole line, and every
+  //   glyph in the PDF was drawn low: baseline 25px instead of 18px at 16px, 76 instead of
+  //   57 at 52px. Pain-card text and tool labels were clipped by their own boxes. No CSS in
+  //   the PDF document can reach it, because the measurement never happens there.
+  const src = app();
+  const fix = /const PF_H2C_METRICS_FIX_CSS = '([^']*)';/.exec(src);
+  assert.ok(fix, 'the fix must be a named module-scope constant');
+  assert.match(fix[1], /span \+ img\s*\{\s*display:\s*inline\s*!important/,
+    'the probe image sits right after the probe span — the selector must be that narrow');
+  assert.match(fix[1], /^body > div\[style\*="visibility: hidden"\]/,
+    'scoped to html2canvas\'s hidden measurement container, never to app images');
+  const code = pdfHelper();
+  const inject = code.indexOf('PF_H2C_METRICS_FIX_CSS');
+  assert.ok(inject > 0, 'renderPortfolioPdf must install the fix');
+  assert.ok(inject < code.indexOf('html2canvas(doc.documentElement'), 'before the first capture');
+  assert.match(code.slice(code.lastIndexOf('finally {')), /metricsFix\.remove\(\)/,
+    'removed however the export ends, so the app never keeps a global img override');
+});
+
+test('jspdf and html2canvas load only when a PDF is actually requested', () => {
+  const src = app();
+  assert.equal(/^import .*['"](jspdf|html2canvas)['"]/m.test(src), false,
+    'a static import would put both libraries in front of every user of every tool');
+  assert.match(pdfHelper(), /Promise\.all\(\[\s*import\('jspdf'\),\s*import\('html2canvas'\)\s*\]\)/);
+  const vite = readFileSync(join(REPO, 'vite.config.js'), 'utf8');
+  const at = vite.indexOf('manualChunks:');
+  assert.ok(at > 0, 'manualChunks was not found');
+  assert.equal(/jspdf|html2canvas/.test(vite.slice(at, vite.indexOf('}', at))), false,
+    'listing a dynamically-imported lib in manualChunks forces it back into a static chunk');
+});
+
+test('the PDF helper sends nothing anywhere and logs no draft content', () => {
+  const code = pdfHelper();
+  for (const token of ['fetch(', 'supabase', '/api/', 'callClaude', 'localStorage', 'alert(', 'XMLHttpRequest']) {
+    assert.equal(code.includes(token), false, `${token} has no place in a local-only export`);
+  }
+  assert.equal(/console\.(log|info|debug|warn|error)\(/.test(code), false,
+    'the helper throws; the component decides what (not) to log');
+  assert.match(code, /\^\(https:\|mailto:\|tel:\)/, 'link annotations re-check the scheme');
+});
+
+test('both formats reach a download only through planPortfolioExport', () => {
+  const code = componentCode(app());
+  assert.equal((code.match(/lib\.buildPortfolioHtml\(/g) || []).length, 1,
+    'only the live preview may build a document directly; exports must go through the gate');
+  const body = innerFn(code, 'async function startExport(');
+  const plan = body.indexOf('lib.planPortfolioExport(');
+  assert.ok(plan > 0, 'startExport must ask the gate');
+  assert.ok(plan < body.indexOf('downloadFile('), 'the gate runs before any HTML download');
+  assert.ok(plan < body.indexOf('renderPortfolioPdf('), 'the gate runs before any PDF work');
+  assert.match(body, /if \(!plan\.ok\)/, 'a refused plan must stop the export');
+  const lock = body.indexOf('if (exportLockRef.current) return;');
+  assert.ok(lock >= 0 && lock < body.indexOf('await '),
+    'the single-flight lock is a ref checked before the first await — setState is not a lock');
+  const downloads = (code.match(/downloadFile\(/g) || []).length;
+  assert.ok(downloads >= 2);
+  assert.equal((code.match(/downloadFile\([^;]*\{ quiet: true \}\)/g) || []).length, downloads,
+    'downloadFile alerts on failure unless told not to; the export shows its own error');
+  assert.equal(/Download anyway/.test(componentBody(app())), false,
+    'no dialog may offer to download past a blocker');
+});
+
+test('a PDF export checks for cancellation before it downloads, and unmount cancels it', () => {
+  const code = componentCode(app());
+  const body = innerFn(code, 'async function startExport(');
+  const render = body.indexOf('renderPortfolioPdf(');
+  const pdfDownload = body.lastIndexOf('downloadFile(');
+  const guard = body.lastIndexOf('exportCancelRef.current', pdfDownload);
+  // A hidden keep-alive tab keeps rendering on purpose (the student asked for the file);
+  // what must never download is a CANCELLED or UNMOUNTED export.
+  assert.ok(guard > render && guard < pdfDownload,
+    'a cancelled export must never start a download');
+  assert.match(code, /useEffect\(\(\) => \(\) => \{\s*exportCancelRef\.current = true;/,
+    'an unmounted tool must stop its capture');
+  assert.equal(/startExport\('(html|pdf)'\)/.test(code), false,
+    'every call must pass the acknowledgement, or Try again would re-open the review dialog');
+});
+
+test('the blocked dialog offers no download, and review focuses a visible control', () => {
+  const src = componentBody(app());
+  const at = src.indexOf("dialog.kind === 'export-blocked'");
+  assert.ok(at > 0, 'the blocked dialog was not found');
+  const blocked = src.slice(at, src.indexOf('{dialog && dialog.kind ===', at + 10));
+  assert.match(blocked, /Your portfolio isn.t ready to download/);
+  assert.match(blocked, /Review missing fields/);
+  assert.match(blocked, /Keep editing/);
+  assert.equal(/startExport\(|downloadFile\(/.test(blocked), false, 'a blocker is not a warning');
+  const code = componentCode(app());
+  const review = innerFn(code, 'function reviewMissing(');
+  for (const step of ['pendingFocusRef.current', 'setDialog(null)', "setPane('edit')", 'setOpen(']) {
+    assert.ok(review.includes(step), `reviewMissing must ${step}`);
+  }
+  assert.match(code, /requestAnimationFrame\(\(\) => \{[\s\S]{0,80}requestAnimationFrame\(/,
+    'focus must land AFTER AccountModal returns focus to its opener on unmount');
+  assert.match(code, /closest\('\[hidden\]'\)/, 'never focus a control inside a closed section');
+  assert.match(code, /prefers-reduced-motion: reduce/);
+  assert.match(code, /focus\(\{ preventScroll: true \}\)/);
+});
+
+test('keyboard focus stays inside the export dialog while it works and when it fails', () => {
+  // ★ Found in review. Disabling the format card that holds focus drops focus to <body>,
+  //   and AccountModal's trap only acts on its own first/last element — so Tab during a
+  //   render, or after an error, landed in the page behind an aria-modal dialog.
+  const code = componentCode(app());
+  assert.match(code, /ref=\{exportCancelBtnRef\}/, 'Cancel must be focusable by ref');
+  assert.match(code, /ref=\{exportErrorBtnRef\}|ref=\{exportJob\.error [!=]== 'too-long' \? exportErrorBtnRef : undefined\}/,
+    'the first error action must be focusable by ref');
+  assert.match(code, /if \(exportBusy && exportCancelBtnRef\.current\) exportCancelBtnRef\.current\.focus\(\);/);
+  assert.match(code, /exportJob\.phase === 'error' && exportErrorBtnRef\.current\) exportErrorBtnRef\.current\.focus\(\);/);
+  // ★ The third way out of "busy". Cancel unmounts the focused Cancel button as the dialog returns
+  //   to idle, and without this arm focus fell to <body> — the same escape, found after the fix.
+  assert.match(code, /ref=\{\(el\) => \{ exportCardRefs\.current\[o\.format\] = el; \}\}/,
+    'each format card must be reachable by ref');
+  assert.match(code, /wasExportBusyRef\.current && exportJob\.phase === 'idle'/,
+    'the effect must notice busy → idle, which only a cancel produces with the dialog still open');
+  assert.match(code, /exportCardRefs\.current\[lastExportFormatRef\.current\]/,
+    'focus returns to the card the student chose');
+  assert.match(code, /wasExportBusyRef\.current = exportBusy;/, 'the previous busy state must be recorded');
+});
+
+test('the export error copy and the PDF card say true things', () => {
+  const code = componentCode(app());
+  // A finished PDF that fails to SAVE was not a render failure, and re-rendering it wastes a minute.
+  assert.match(code, /exportJob\.error === 'download'/, 'a save failure needs its own copy');
+  // With sample reports switched off, no statements are printed at all.
+  assert.match(code, /draft\.showSamples\s*\?[^:]*all three sample statements/,
+    'the PDF card may only promise the statements when the draft includes them');
+});
+
+test('review never interrupts the blocked dialog, and reaches a bad booking link', () => {
+  const code = componentCode(app());
+  // ★ Marking fields touched in the same update that OPENS the dialog inserts role="alert"
+  //   errors behind the modal, and they interrupt the dialog's own title being read.
+  assert.equal(innerFn(code, 'function openExportGate(').includes('setTouched'), false,
+    'fields are marked when the student returns to the form, not while the dialog opens');
+  assert.ok(innerFn(code, 'function reviewMissing(').includes('setTouched'));
+  assert.ok(innerFn(code, 'function keepEditingAfterBlocked(').includes('setTouched'),
+    'Keep editing must still show the errors once the dialog is gone');
+  // ★ Caught in the browser, not by the line above: the function existed and was wired to
+  //   onClose, while the Keep editing BUTTON still called setDialog(null) — so its errors
+  //   never appeared. Both ways out of the blocked dialog must use it.
+  const at = code.indexOf("dialog.kind === 'export-blocked'");
+  const blocked = code.slice(at, code.indexOf('{dialog && dialog.kind ===', at + 10));
+  assert.match(blocked, /onClose=\{keepEditingAfterBlocked\}/);
+  assert.match(blocked, /onClick=\{keepEditingAfterBlocked\}>Keep editing<\/button>/);
+  // ★ A javascript: or http: booking link is the only "contact" some drafts have. Review used
+  //   to open section 2 and focus an empty Email field while the bad link sat in section 3.
+  const target = innerFn(code, 'function reviewTarget(');
+  assert.ok(target.includes("fid('ctaLink')"), 'the booking link is a contact detail to send the student to');
+  assert.match(target, /section: 3/, 'and it lives in section 3');
+});
+
+test('every export requirement has an editor target, and its error is rendered', () => {
+  const src = app();
+  const targets = literalOf(src, 'PF_EXPORT_FIELD_TARGETS');
+  for (const { key } of PORTFOLIO_EXPORT_REQUIREMENTS) {
+    assert.match(targets, new RegExp(`\\b${key}: \\{ section: \\d+`), `${key} has nowhere to send the student`);
+  }
+  const code = componentCode(src);
+  for (const key of ['services', 'contact']) {
+    assert.ok(code.includes(`fieldErr('${key}')`), `the ${key} error was computed but never shown`);
+    assert.ok(code.includes(`fid('${key}-err')`), `the ${key} error needs an id to be described by`);
+  }
+  assert.ok(code.includes("fid('svc-add')"), 'an empty services list focuses the Add button');
+});
+
+test('downloadFile can be quiet, and still alerts every other tool by default', () => {
+  const fn = fnSource(app(), 'function downloadFile(');
+  assert.match(fn, /^function downloadFile\(content, filename, mimeType, opts\)/);
+  assert.match(fn, /if \(!\(opts && opts\.quiet\)\) alert\(/);
+});
+
+// ── 12. The export gate, the PDF document and its pagination ────────────────
+//
+// ★ ONE GATE, TWO FORMATS. HTML and PDF are both produced by planPortfolioExport, which
+//   refuses before it builds anything. A draft that cannot export therefore has no
+//   artifact to download in either format — a fact about a pure function, not a habit
+//   in a click handler.
+
+const keysOf = (items) => items.map((i) => i.key);
+const readiness = (draft, opts) => portfolioExportReadiness(draft, opts);
+const contactRow = (draft) => draftCompletion(draft).sections.find((s) => s.key === 'contact');
+
+test('an untouched draft is EMPTY and cannot export', () => {
+  const r = readiness(emptyDraft());
+  assert.equal(r.state, 'empty');
+  assert.equal(r.ok, false);
+  assert.equal(r.hasSubstantiveContent, false);
+  assert.deepEqual(keysOf(r.blocking), PORTFOLIO_EXPORT_REQUIREMENTS.map((q) => q.key));
+  assert.equal(r.firstBlocking.key, 'fullName');
+  for (const b of r.blocking) {
+    assert.ok(b.label && b.message, `${b.key} needs a label and a message for the review list`);
+  }
+});
+
+test('a profile-prefilled name alone is still EMPTY', () => {
+  // ★ The exact shape of the bug: the mount effect seeds fullName from profile.full_name,
+  //   so this is what every new student sees before typing anything.
+  const r = readiness({ ...emptyDraft(), fullName: 'Ana Cruz' });
+  assert.equal(r.state, 'empty');
+  assert.equal(r.ok, false);
+  assert.deepEqual(keysOf(r.blocking), ['title', 'heroHeadline', 'services', 'contact']);
+  assert.equal(r.firstBlocking.key, 'title');
+});
+
+test('defaults, a theme change and sample-report settings are not substance', () => {
+  const base = { ...emptyDraft(), fullName: 'Ana Cruz' };
+  for (const [what, patch] of [
+    ['a theme change', { theme: 'coral' }],
+    ['the default CTA text', { ctaText: emptyDraft().ctaText }],
+    ['sample reports on', { showSamples: true }],
+    ['sample reports off', { showSamples: false }],
+    ['a sample company', { sampleCompany: 'Acme Plumbing' }],
+    ['a sample period', { samplePeriod: 'FY 2024' }],
+    ['a rewritten CTA label', { ctaText: 'Talk to me' }],
+  ]) {
+    const r = readiness({ ...base, ...patch });
+    assert.equal(r.state, 'empty', `${what} must not make a portfolio exportable`);
+    assert.equal(r.hasSubstantiveContent, false, `${what} is not authored substance`);
+  }
+});
+
+test('a blank service row satisfies nothing', () => {
+  const blank = readiness({ ...emptyDraft(), fullName: 'Ana Cruz', services: [{ name: '', desc: '' }] });
+  assert.equal(blank.state, 'empty', 'an empty repeater row is a click, not content');
+  assert.equal(blank.fields.services.code, 'unnamed');
+  const descOnly = readiness({ ...MINIMAL(), services: [{ name: '', desc: 'I close the books.' }] });
+  assert.equal(descOnly.ok, false, 'a service needs a NAME to count');
+  assert.deepEqual(keysOf(descOnly.blocking), ['services']);
+  assert.equal(descOnly.state, 'blocked', 'a description is authored, so this is blocked, not empty');
+  for (const row of [[{ name: '', desc: '' }], [{ name: '', desc: '' }, { name: '', desc: '' }]]) {
+    assert.equal(draftHasContent({ ...emptyDraft(), services: row }), true,
+      'draftHasContent keeps its own meaning — the résumé prompt and autosave depend on it');
+  }
+});
+
+test('each export requirement blocks on its own', () => {
+  for (const [key, patch] of [
+    ['fullName', { fullName: '' }],
+    ['title', { title: '' }],
+    ['heroHeadline', { heroHeadline: '' }],
+    ['services', { services: [] }],
+    ['contact', { email: '' }],
+  ]) {
+    const r = readiness({ ...MINIMAL(), ...patch });
+    assert.deepEqual(keysOf(r.blocking), [key], `removing ${key} must block on ${key} alone`);
+    assert.equal(r.state, 'blocked');
+    assert.equal(r.firstBlocking.key, key);
+  }
+  assert.ok(Object.isFrozen(PORTFOLIO_EXPORT_REQUIREMENTS), 'the registry is not a runtime knob');
+});
+
+test('invalid contact details do not satisfy the contact requirement', () => {
+  const noContact = { ...MINIMAL(), email: '' };
+  for (const [what, patch] of [
+    ['an invalid email', { email: 'ana at cruzbooks' }],
+    ['a phone with an extension', { phone: '555-0104 ext. 2' }],
+    ['an http website', { website: 'http://cruzbooks.co' }],
+    ['a javascript CTA', { ctaLink: 'javascript:alert(1)' }],
+    ['a fragment CTA', { ctaLink: '#contact' }],
+  ]) {
+    const r = readiness({ ...noContact, ...patch });
+    assert.ok(keysOf(r.blocking).includes('contact'), `${what} is not a way to reach the author`);
+    assert.equal(contactRow({ ...noContact, ...patch }).done, false,
+      `the completion meter must agree with the gate for ${what}`);
+  }
+});
+
+test('any ONE valid contact method is enough — and the meter agrees', () => {
+  const noContact = { ...MINIMAL(), email: '' };
+  for (const [what, patch] of [
+    ['email', { email: 'ana@cruzbooks.co' }],
+    ['phone', { phone: '(213) 555-0147' }],
+    ['website', { website: 'linkedin.com/in/ana-cruz' }],
+    ['booking link', { ctaLink: 'https://calendly.com/ana-cruz/intro' }],
+  ]) {
+    const d = { ...noContact, ...patch };
+    const r = readiness(d);
+    assert.equal(r.ok, true, `${what} alone must satisfy contact`);
+    assert.equal(contactRow(d).done, true, `the completion meter must count ${what} as contact`);
+  }
+});
+
+test('a minimum valid portfolio is READY, and every optional gap is only a note', () => {
+  const r = readiness(MINIMAL(), { sample: SAMPLE_DRAFT });
+  assert.equal(r.ok, true);
+  assert.equal(r.state, 'ready');
+  assert.deepEqual(r.blocking, []);
+  assert.equal(r.firstBlocking, null);
+  assert.deepEqual(r.warnings, []);
+  const notes = keysOf(r.notes);
+  for (const k of ['about', 'photo', 'packages', 'metrics', 'testimonials']) {
+    assert.ok(notes.includes(k), `${k} is optional and must be a note, never a blocker`);
+  }
+  assert.ok(!notes.includes('serviceDescriptions'), 'the minimal service has a description');
+  const noDesc = readiness({ ...MINIMAL(), services: [{ name: 'Payroll', desc: '' }] });
+  assert.equal(noDesc.ok, true);
+  assert.ok(keysOf(noDesc.notes).includes('serviceDescriptions'));
+});
+
+test('stale example content is a WARNING, never confused with an empty draft', () => {
+  const r = readiness(SAMPLE_DRAFT, { sample: SAMPLE_DRAFT });
+  assert.equal(r.state, 'warning');
+  assert.equal(r.ok, true, 'the example satisfies every requirement — it needs acknowledgement, not a block');
+  assert.equal(r.hasSubstantiveContent, true);
+  const sample = r.warnings.find((w) => w.key === 'sample');
+  assert.ok(sample, 'the example fields must be named at export time');
+  assert.ok(sample.items.includes('Testimonials'));
+  assert.deepEqual(r.staleSampleFields, sampleFieldsStillPresent(SAMPLE_DRAFT, SAMPLE_DRAFT),
+    'the readiness object reuses the existing guard rather than a second copy of it');
+  assert.equal(readiness(SAMPLE_DRAFT).warnings.some((w) => w.key === 'sample'), false,
+    'with no sample to compare against there is nothing to report');
+});
+
+test('a filled-but-invalid link is flagged as omitted, per field, only when contact is satisfied', () => {
+  const messages = [];
+  for (const [field, patch] of [
+    ['email', { email: 'ana at cruzbooks', phone: '(213) 555-0147' }],
+    ['phone', { phone: '555-0104 ext. 2' }],
+    ['website', { website: 'http://cruzbooks.co' }],
+    ['ctaLink', { ctaLink: 'javascript:alert(1)' }],
+  ]) {
+    const r = readiness({ ...MINIMAL(), ...patch });
+    assert.equal(r.ok, true, `an invalid ${field} beside a valid contact must not block`);
+    assert.equal(r.state, 'warning', `an invalid ${field} needs acknowledgement`);
+    const w = r.warnings.find((x) => x.key === 'omittedLink' && x.field === field);
+    assert.ok(w, `the invalid ${field} must be named`);
+    messages.push(w.message);
+  }
+  assert.equal(new Set(messages).size, 4,
+    'an invalid phone still prints and an invalid CTA still scrolls — one copy cannot describe all four');
+  const unsatisfied = readiness({ ...MINIMAL(), email: 'ana at cruzbooks' });
+  assert.equal(unsatisfied.warnings.some((w) => w.key === 'omittedLink'), false,
+    'when nothing reaches the author it is a blocker, not an omission');
+});
+
+const PLAN_OPTS = { year: 2026, isoDate: '2026-09-15' };
+
+test('a blocked draft produces NO artifact in either format', () => {
+  for (const draft of [emptyDraft(), { ...emptyDraft(), fullName: 'Ana Cruz' }, { ...MINIMAL(), email: '' }]) {
+    for (const format of ['html', 'pdf']) {
+      const plan = planPortfolioExport(draft, { ...PLAN_OPTS, format });
+      assert.equal(plan.ok, false);
+      assert.equal(plan.reason, 'blocked');
+      for (const k of ['html', 'fileName', 'mimeType']) {
+        assert.equal(k in plan, false, `a refused ${format} plan must not carry ${k}`);
+      }
+    }
+  }
+});
+
+test('a warning needs acknowledgement, and then it exports', () => {
+  const opts = { ...PLAN_OPTS, format: 'html', sample: SAMPLE_DRAFT };
+  const refused = planPortfolioExport(SAMPLE_DRAFT, opts);
+  assert.equal(refused.ok, false);
+  assert.equal(refused.reason, 'needs-acknowledgement');
+  assert.equal('html' in refused, false);
+  const accepted = planPortfolioExport(SAMPLE_DRAFT, { ...opts, acknowledged: true });
+  assert.equal(accepted.ok, true);
+  assert.equal(typeof accepted.html, 'string');
+});
+
+test('HTML and PDF are judged by the same readiness', () => {
+  for (const draft of [emptyDraft(), MINIMAL(), SAMPLE_DRAFT, { ...MINIMAL(), phone: 'call me' }]) {
+    const html = planPortfolioExport(draft, { ...PLAN_OPTS, format: 'html', sample: SAMPLE_DRAFT });
+    const pdf = planPortfolioExport(draft, { ...PLAN_OPTS, format: 'pdf', sample: SAMPLE_DRAFT });
+    assert.deepEqual(html.readiness, pdf.readiness);
+    assert.equal(html.ok, pdf.ok);
+  }
+});
+
+test('the HTML plan builds the download document and the PDF plan builds the pdf document', () => {
+  const theme = resolveTheme('royal', PORTFOLIO_THEMES);
+  const html = planPortfolioExport(MINIMAL(), { ...PLAN_OPTS, format: 'html', theme });
+  assert.equal(html.ok, true);
+  assert.equal(html.fileName, 'ana-cruz-bookkeeper-portfolio-2026-09-15.html');
+  assert.equal(html.mimeType, 'text/html');
+  assert.equal(html.html, buildPortfolioHtml(MINIMAL(), { mode: 'download', theme, year: 2026 }));
+  const pdf = planPortfolioExport(MINIMAL(), { ...PLAN_OPTS, format: 'pdf', theme });
+  assert.equal(pdf.ok, true);
+  assert.equal(pdf.fileName, 'ana-cruz-bookkeeper-portfolio-2026-09-15.pdf');
+  assert.equal(pdf.mimeType, 'application/pdf');
+  assert.equal(pdf.html, buildPortfolioHtml(MINIMAL(), { mode: 'pdf', theme, year: 2026 }));
+});
+
+test('an unknown export format is refused', () => {
+  for (const format of ['docx', '', undefined, 'HTML']) {
+    const plan = planPortfolioExport(MINIMAL(), { ...PLAN_OPTS, format });
+    assert.equal(plan.ok, false);
+    assert.equal(plan.reason, 'unknown-format');
+    assert.equal('html' in plan, false);
+  }
+});
+
+test('portfolioFileName takes an explicit, allowlisted extension', () => {
+  assert.equal(portfolioFileName({ fullName: 'Jordan Reyes' }, '2026-09-15', 'pdf'),
+    'jordan-reyes-bookkeeper-portfolio-2026-09-15.pdf');
+  assert.equal(portfolioFileName({ fullName: 'Jordan Reyes' }, '2026-09-15'),
+    'jordan-reyes-bookkeeper-portfolio-2026-09-15.html', 'the default is unchanged');
+  for (const bad of ['exe', '../x', 'pdf/../../x', 'PDF ', null, 42]) {
+    assert.ok(portfolioFileName({ fullName: 'A' }, '2026-09-15', bad).endsWith('.html'),
+      `an extension of ${JSON.stringify(bad)} must never reach the filename`);
+  }
+  assert.ok(!/[^a-z0-9.-]/.test(portfolioFileName({ fullName: 'A/B\\C:D' }, '2026-09-15', 'pdf')));
+});
+
+const pdfDoc = (draft, extra) => buildPortfolioHtml(draft, { mode: 'pdf', year: 2026, ...extra });
+
+test('the PDF document ships no script and a script-free CSP, first in the head', () => {
+  const html = pdfDoc(SAMPLE_DRAFT);
+  assert.equal(/<script/i.test(html), false, 'the capture frame must have nothing to execute');
+  const csp = /<meta http-equiv="Content-Security-Policy" content="([^"]*)">/.exec(html);
+  assert.ok(csp, 'the PDF document needs its own policy');
+  assert.match(csp[1], /script-src 'none'/);
+  assert.match(csp[1], /default-src 'none'/);
+  assert.ok(html.indexOf('Content-Security-Policy') < html.indexOf('<style>'),
+    'the policy must be parsed before anything it governs');
+  assert.ok(html.indexOf('<meta charset="UTF-8">') < html.indexOf('Content-Security-Policy'));
+  for (const t of ['pf-linknote', 'data-pf-scroll', 'class="bgwrap"', '<nav', 'class="stab']) {
+    assert.equal(html.includes(t), false, `${t} has no meaning on paper`);
+  }
+});
+
+test('the PDF document renders its interactive content statically', () => {
+  const html = pdfDoc(SAMPLE_DRAFT);
+  assert.ok(html.includes(PDF_CSS), 'the static-state stylesheet must be present');
+  assert.match(PDF_CSS, /\.reveal\{opacity:1/, 'reveal sections must be visible without a script');
+  assert.match(PDF_CSS, /\.bar i\{width:var\(--w\)/, 'proficiency bars must be drawn without a script');
+  assert.equal((html.match(/class="stmtcard"/g) || []).length, 3, 'all three statements, not one tab');
+  for (const title of ['Profit &amp; Loss', 'Balance Sheet', 'Cash Flow Statement']) {
+    assert.ok(html.includes(title), `${title} must be printed`);
+  }
+  assert.equal(html.includes('style="display:none"'), false, 'no statement may be hidden on paper');
+  assert.equal(html.includes('data-count'), false, 'counters must print their final value');
+  for (const m of normalizeDraft(SAMPLE_DRAFT).metrics) {
+    assert.ok(html.includes(escapeHtml(formatMetricValue(m.value, m.suffix))),
+      `metric ${m.label} must print its final value`);
+  }
+  assert.ok(html.includes('Illustrative sample only'), 'the samples are still labelled illustrative');
+  assert.ok(html.includes(escapeHtml(SAMPLE_DRAFT.fullName)), 'the static header names the author');
+});
+
+test('PDF_CSS is a frozen, interpolation-free constant that stills everything', () => {
+  assert.equal(typeof PDF_CSS, 'string');
+  assert.equal(PDF_CSS.includes('${'), false);
+  // ★ box-shadow is on the list because the spike measured it: html2canvas 1.4.1 paints a
+  //   blurred shadow as a solid, notch-cornered frame around every glass card.
+  for (const hazard of [/animation:none!important/, /transition:none!important/,
+    /backdrop-filter:none!important/, /box-shadow:none!important/,
+    /\.orb,\.bgwrap,\.hero:after\{display:none\}/, /overflow:hidden/, /min-height:0!important/]) {
+    assert.match(PDF_CSS, hazard, `${hazard} — html2canvas cannot paint it, or it moves the layout`);
+  }
+});
+
+test('the PDF document escapes a hostile draft and is deterministic', () => {
+  const x = '<script>alert(1)</script>"\'<img src=x onerror=alert(1)>';
+  const hostile = {
+    ...SAMPLE_DRAFT, fullName: x, title: x, heroHeadline: x, heroSub: x, location: x, summary: x,
+    services: [{ name: x, desc: x }], testimonials: [{ quote: x, name: x, role: x }],
+    metrics: [{ value: 5, suffix: x, label: x }], sampleCompany: x, samplePeriod: x,
+    ctaLink: 'javascript:alert(1)', website: 'javascript:alert(1)',
+  };
+  const html = pdfDoc(hostile);
+  assert.equal(/<script/i.test(html), false);
+  assert.equal(/<img src=x/i.test(html), false);
+  assert.ok(html.includes('&lt;script&gt;'));
+  assert.equal(html.includes('javascript:'), false);
+  assert.equal(pdfDoc(SAMPLE_DRAFT), pdfDoc(SAMPLE_DRAFT), 'no Date, no randomness');
+});
+
+test('data-pdf markers exist only in the PDF document, and links are only safe schemes', () => {
+  for (const html of [download(SAMPLE_DRAFT), preview(SAMPLE_DRAFT)]) {
+    assert.equal(html.includes('data-pdf-'), false, 'the website and preview must be unchanged');
+    assert.equal(html.includes('class="pdfhead"'), false);
+  }
+  const html = pdfDoc({ ...SAMPLE_DRAFT, ctaLink: 'https://calendly.com/ana/intro' });
+  for (const marker of ['data-pdf-block', 'data-pdf-keep', 'data-pdf-link']) {
+    assert.ok(html.includes(marker), `${marker} drives pagination or link annotations`);
+  }
+  const links = [...html.matchAll(/<a [^>]*data-pdf-link[^>]*>/g)].map((m) => m[0]);
+  assert.ok(links.length >= 2, 'the CTA and the contact links become clickable in the PDF');
+  for (const tag of links) {
+    const href = /href="([^"]*)"/.exec(tag);
+    assert.ok(href && /^(https:|mailto:|tel:)/.test(href[1]), `unsafe annotation target: ${tag}`);
+  }
+});
+
+test('the PDF prints where a link goes, because paper cannot be hovered', () => {
+  const d = { ...MINIMAL(), ctaLink: 'https://calendly.com/ana-cruz/intro', website: 'https://linkedin.com/in/ana-cruz' };
+  const html = pdfDoc(d);
+  assert.ok(html.includes('calendly.com/ana-cruz/intro'), 'the booking destination is printed');
+  assert.ok(html.includes('linkedin.com/in/ana-cruz'), 'the website path is printed, not just the host');
+  assert.equal(download(d).includes('class="pdfdest"'), false);
+});
+
+test('formatMetricValue groups digits exactly as the runtime counter does', () => {
+  assert.equal(formatMetricValue(1000, '+'), '1,000+');
+  assert.equal(formatMetricValue(1250000, ''), '1,250,000');
+  assert.equal(formatMetricValue(-4500, '%'), '-4,500%');
+  assert.equal(formatMetricValue(12, 'yrs'), '12 yrs', 'a word suffix is spaced, like metricSuffix');
+  assert.equal(formatMetricValue(0, '%'), '0%');
+});
+
+test('PDF page geometry is derived, never typed', () => {
+  assert.equal(PF_PDF_WIDTH_PX, 794, 'A4 at 96 CSS px per inch');
+  assert.equal(PF_PDF_PAGE_WIDTH_PT, 595.28);
+  assert.equal(PF_PDF_PAGE_HEIGHT_PT, 841.89);
+  assert.equal(PF_PDF_PAGE_PX,
+    Math.floor(((PF_PDF_PAGE_HEIGHT_PT - 2 * PF_PDF_MARGIN_PT) * PF_PDF_WIDTH_PX) / PF_PDF_PAGE_WIDTH_PT));
+  assert.ok(PF_PDF_MAX_PAGES >= 10 && PF_PDF_MAX_PAGES <= 40);
+});
+
+/** Pages must cover [0, H] with no gap, no overlap and whole-pixel bounds. */
+const assertTiles = (pages, H) => {
+  assert.ok(pages.length > 0);
+  assert.equal(pages[0].start, 0);
+  assert.equal(pages[pages.length - 1].end, H);
+  pages.forEach((p, i) => {
+    assert.ok(Number.isInteger(p.start) && Number.isInteger(p.end), 'whole pixels only');
+    assert.ok(p.end > p.start, 'no empty page');
+    if (i > 0) assert.equal(p.start, pages[i - 1].end, 'no gap and no overlap');
+  });
+};
+
+test('planPdfPages tiles a document exactly, in whole pixels', () => {
+  for (const [H, P] of [[5000, 1048], [5000, 1048.24], [1048, 1048], [333, 1048], [10479, 1048]]) {
+    const { pages, truncated } = planPdfPages({ contentHeight: H, pageHeight: P, keep: [], maxPages: 50 });
+    assert.equal(truncated, false);
+    assertTiles(pages, H);
+    for (const p of pages.slice(0, -1)) assert.ok(p.end - p.start <= Math.floor(P));
+  }
+});
+
+test('planPdfPages never cuts a block that fits on a page', () => {
+  const { pages } = planPdfPages({ contentHeight: 3000, pageHeight: 1048, keep: [{ top: 1000, bottom: 1200 }], maxPages: 10 });
+  assertTiles(pages, 3000);
+  assert.equal(pages[0].end, 1000, 'the cut moves up to the top of the block');
+  for (const p of pages) {
+    assert.ok(!(p.end > 1000 && p.end < 1200), 'no page may end inside the block');
+  }
+});
+
+test('planPdfPages hard-cuts a block taller than a page, and respects minFill', () => {
+  const tall = planPdfPages({ contentHeight: 4000, pageHeight: 1048, keep: [{ top: 100, bottom: 2500 }], maxPages: 10 });
+  assertTiles(tall.pages, 4000);
+  assert.equal(tall.pages[0].end, 1048, 'an unfittable block is cut rather than looping forever');
+  const nearTop = planPdfPages({ contentHeight: 4000, pageHeight: 1048, keep: [{ top: 150, bottom: 1100 }], minFill: 0.2, maxPages: 10 });
+  assert.equal(nearTop.pages[0].end, 1048, 'moving the cut to 150px would print a nearly empty page');
+});
+
+test('planPdfPages settles when moving a cut lands inside another block', () => {
+  const { pages } = planPdfPages({
+    contentHeight: 3000, pageHeight: 1048, maxPages: 10,
+    keep: [{ top: 900, bottom: 1100 }, { top: 850, bottom: 950 }],
+  });
+  assert.equal(pages[0].end, 850, 'the heading group above the card must move with it');
+  assertTiles(pages, 3000);
+});
+
+test('planPdfPages never emits a blank trailing page, and reports truncation', () => {
+  assert.deepEqual(planPdfPages({ contentHeight: 1049, pageHeight: 1048, keep: [], maxPages: 10 }).pages,
+    [{ start: 0, end: 1049 }], 'a one-pixel remainder is merged, never a page of its own');
+  assert.equal(planPdfPages({ contentHeight: 1060, pageHeight: 1048, keep: [], maxPages: 10 }).pages.length, 2);
+  const long = planPdfPages({ contentHeight: 30000, pageHeight: 1048, keep: [], maxPages: 25 });
+  assert.equal(long.truncated, true, 'the caller must refuse rather than silently cut the portfolio off');
+  assert.equal(long.pages.length, 25);
+  for (const bad of [{ contentHeight: 0, pageHeight: 1048 }, { contentHeight: 500, pageHeight: 0 },
+    { contentHeight: NaN, pageHeight: 1048 }, {}]) {
+    assert.deepEqual(planPdfPages({ keep: [], maxPages: 10, ...bad }).pages, [], 'degenerate input plans nothing');
+  }
+});
+
+test('the PDF margin bands and page numbers are legible in every theme', () => {
+  for (const key of PORTFOLIO_THEME_ORDER) {
+    const theme = PORTFOLIO_THEMES[key];
+    const chrome = pdfPageChrome(theme);
+    assert.equal(chrome.background, theme.pg2, 'the band matches the flat page background');
+    assert.ok(contrastRatio(chrome.text, chrome.background) >= 4.5,
+      `${key}: page numbers at ${contrastRatio(chrome.text, chrome.background).toFixed(2)}:1`);
+  }
+  assert.equal(pdfPageChrome(null).background, FALLBACK_THEME.pg2, 'an unknown theme falls back');
 });

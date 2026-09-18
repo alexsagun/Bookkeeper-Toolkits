@@ -140,8 +140,10 @@ The sanctioned exceptions to the single-file rule (same spirit as the `main.jsx`
   stable code rather than guessing. **No SQL half**, which is why it is not part of the
   SQL-mirrored `courseVideo.js`. See "Changing what a course lesson video may be".
 - `src/lib/portfolioGenerator.js` — the Portfolio Generator engine (pure). Owns the draft shape,
-  link/photo validation, the ordered section table, and the builder that emits the downloadable
-  one-file portfolio. It exists because the standalone artifact it was ported from escaped
+  link/photo validation, the ordered section table, the builder that emits the downloadable
+  one-file portfolio **and its static `mode: 'pdf'` capture document**, the **export gate**
+  (`PORTFOLIO_EXPORT_REQUIREMENTS` → `validateDraft` / `portfolioExportReadiness` /
+  `planPortfolioExport`) and the PDF paginator (`planPdfPages`). It exists because the standalone artifact it was ported from escaped
   `& < > "` and **not `:`**, so a CTA of `javascript:alert(1)` reached FOUR hrefs in a page the
   student then hosts — stored XSS against their own prospects. `safeLinkHref()` follows the
   `lessonReplay.js` rule (the parsed `protocol` is the only scheme authority; no base argument;
@@ -684,15 +686,17 @@ detector) and `src/lib/partialJson.js` (tolerant JSON + truncated-prefix recover
 `npm test`), `BookkeeperPortfolioGenerator` ~20000 (tab id `portfoliogenerator`, route
 `/profile-optimization/portfolio-generator`, sidebar Job Application → Profile Optimization between
 Resume Winning Strategy and Book 1-on-1 — a **two-pane authoring workspace**: 13 editor sections on
-the left, a live sandboxed preview on the right, one self-contained downloadable HTML file out the
-other end. 9 themes, 10 industry presets, optional PDF résumé import, optional photo. **Fully
-offline — no Supabase, no `callClaude`, no `api/` route, nothing uploaded**, which is deliberate:
-the inputs are a CV and a headshot. Presets live in `src/data/portfolio-generator.js` and the whole
-engine in `src/lib/portfolioGenerator.js`; **both are lazy-loaded together** by
-`loadPortfolioGeneratorModules`, and `pdfjs-dist` is a third dynamic import that only fetches when
-somebody picks a file. Layout is the `.pf-tool` **container query** in `src/index.css`, not a media
-query. Pinned by `test/portfolioGenerator.test.mjs``test/portfolioGenerator.test.mjs` (151 tests, incl. source scans of all seven
-wiring sites and of the iframe sandbox)), `EngagementLetter` 15168, `EmailTemplates` 15717,
+the left, a live sandboxed preview on the right, and a download in **two formats** — one
+self-contained HTML website or a static A4 PDF — behind **one export gate** that refuses an empty or
+incomplete portfolio. 9 themes, 10 industry presets, optional PDF résumé import, optional photo.
+**Fully offline — no Supabase, no `callClaude`, no `api/` route, nothing uploaded**, which is
+deliberate: the inputs are a CV and a headshot. Presets live in `src/data/portfolio-generator.js` and
+the whole engine in `src/lib/portfolioGenerator.js`; **both are lazy-loaded together** by
+`loadPortfolioGeneratorModules`, `pdfjs-dist` is a third dynamic import that only fetches when
+somebody picks a résumé, and `jspdf` + `html2canvas` load only when somebody chooses PDF. Layout is
+the `.pf-tool` **container query** in `src/index.css`, not a media query. Pinned by
+`test/portfolioGenerator.test.mjs` (197 tests, incl. source scans of all seven wiring sites, both
+iframe sandboxes and the export flow)), `EngagementLetter` 15168, `EmailTemplates` 15717,
 `PainPointsGenerator` 15970, `IndustryAccounting` 16330, `USTax101` 16466,
 `MonthlyWorkflow` 16560, `MonthEndChecklist` 16650, `InvoiceCreator` 16881, `CoachAlexChat` 17369,
 `CPAAIChat` 17399, `AccountingCalculators` 18201,
@@ -2734,6 +2738,47 @@ docs **in the same change**:
   and sails through `/^javascript:/`. Never pass a base to `new URL()`. `mailtoHref`/`telHref`
   **synthesise** and never accept a raw value — the mailto threat is mail-header injection
   (`?bcc=`), which escaping cannot see.
+  ★ **ONE EXPORT GATE, TWO FORMATS, AND IT REFUSES BEFORE IT BUILDS.** `validateDraft` used to
+  block on `fullName` alone — and `fullName` is PREFILLED from the profile, so an untouched draft
+  downloaded an empty portfolio with no dialog at all. The five requirements (name, professional
+  title, headline, ≥1 service with a NAME, ≥1 WORKING contact method — a valid email, a dialable
+  phone, an https website or an https booking link) live in ONE registry,
+  `PORTFOLIO_EXPORT_REQUIREMENTS`, which `validateDraft`, `portfolioExportReadiness` and
+  `draftCompletion`'s contact row all read, so the editor, the dialog and the meter cannot disagree.
+  `portfolioExportReadiness` returns `empty | blocked | warning | ready`: `empty` means nothing
+  authored beyond defaults and the prefilled name (NOT `draftHasContent`, which still answers "was
+  the form touched?" for the résumé prompt and the autosave); `warning` is stale example content or a
+  filled-in link that will be dropped and needs an explicit acknowledgement; optional gaps are
+  `notes` and never block. Both formats call `planPortfolioExport`, which returns no `html`,
+  `fileName` or `mimeType` at all when refused — so "a blocked draft cannot produce a file" is a
+  fact about a pure function. The component re-plans at the moment a format is chosen, and the
+  blocked dialog has **no download action**. Never reintroduce "Download anyway".
+  ★ **THE PDF IS A SEPARATE `mode: 'pdf'` DOCUMENT CAPTURED IN ITS OWN FRAME — NEVER THE PREVIEW.**
+  `renderPortfolioPdf` (module scope, above `PfField`, so `componentBody` cannot swallow it) builds
+  an off-screen iframe with `sandbox="allow-same-origin"` and **never** `allow-scripts`:
+  html2canvas must read its DOM, and the document is escaped, carries `script-src 'none'` and emits
+  no `<script>`. The preview is the inverse (`allow-scripts`, never `allow-same-origin`). **The
+  dangerous combination is both flags on one frame; neither frame may ever have it.** The PDF
+  document forces every `.reveal` visible, prints metrics at their final value
+  (`formatMetricValue`), prints all three sample statements instead of tabs, prints link
+  destinations, and marks `data-pdf-block` / `data-pdf-keep` / `data-pdf-link` — all PDF-only, so
+  preview and download bytes are unchanged. `PDF_CSS` answers html2canvas 1.4.1 limits that were
+  MEASURED in a browser spike, not assumed: no `backdrop-filter`/`filter`, blurred `box-shadow`
+  painted as a solid notch-cornered frame, flex text-centering and flex `gap` unreliable; and it
+  zeroes `min-height`, without which `body{min-height:100vh}` reports the capture frame's own height
+  as the content height. Every html2canvas call, the frame load and the jspdf/html2canvas download
+  race `withPdfTimeout`, because html2canvas waits on a child iframe's onload with no timeout of its
+  own and the dialog cannot be closed while an export runs. ★ **html2canvas measures font baselines
+  in the GLOBAL `document`, not the one it captures** (`new FontMetrics(document)`), and this app's
+  Tailwind preflight makes that probe `<img>` `display:block` — so every glyph was drawn low (25px
+  instead of 18px at 16px, 76 instead of 57 at 52px), clipping pain-card text and tool labels.
+  `PF_H2C_METRICS_FIX_CSS` restores the probe to `inline` for one export and is removed in
+  `finally`. The Training Agreement and certificate PDFs capture in this document too and have the
+  same offset; their "flex text-centering" comments are most likely this bug. `planPdfPages` cuts on
+  forbidden intervals (blocks, heading groups kept with the next block, every text line box), sees
+  the REAL height, and a portfolio over `PF_PDF_MAX_PAGES` is refused — never silently cut off. Page
+  geometry is derived (`PF_PDF_PAGE_PX` = the A4 content band after 2 × 28pt, i.e. 1048px, not
+  1123). One canvas per page, released before the next.
   ★ **THE PREVIEW IFRAME IS `sandbox="allow-scripts"` AND NOTHING ELSE.** A `srcdoc` document
   normally INHERITS its embedder's origin, which is exactly how the artifact's preview could read
   the app's `localStorage` — where the Supabase session lives. `allow-same-origin` is the only

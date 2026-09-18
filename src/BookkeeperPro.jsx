@@ -437,7 +437,7 @@ const VOICE_TAB_INFO = {
   chat:         { label: 'ProAdvisor Chat', stage: 'Training & Skills', desc: 'AI mentor chat for QuickBooks cleanups and day-to-day bookkeeping questions.' },
   brand:        { label: 'Authentic Branding', stage: 'Job Application', desc: 'Guided questionnaire that builds your authentic personal brand story for applications.' },
   resumestrategy: { label: 'Resume Winning Strategy', stage: 'Job Application', desc: 'Resume video-course catalog with completion certificates.' },
-  portfoliogenerator: { label: 'Portfolio Generator', stage: 'Job Application', desc: 'Build a client-ready bookkeeping portfolio website and download it as one self-contained file. Nine designs, ten industry presets, optional resume import — everything stays in the browser.' },
+  portfoliogenerator: { label: 'Portfolio Generator', stage: 'Job Application', desc: 'Build a client-ready bookkeeping portfolio website and download it as a self-contained HTML website or an A4 PDF. Nine designs, ten industry presets, optional resume import — everything stays in the browser.' },
   linkedinopt:  { label: 'Book 1-on-1 with Alex', stage: 'Job Application', desc: 'Booking page for a 1-on-1 profile-optimization session with Alex.' },
   coachalex:    { label: 'Personalized Coaching With Alex', stage: 'Job Application', desc: 'Booking page for personalized coaching sessions with Coach Alex.' },
   interview:    { label: 'Job Interview Mastery', stage: 'Job Application', desc: 'Interview prep hub: winning-strategy courses, mock interview simulator, common and accounting questions, body language, JD question generator, and salary negotiation.' },
@@ -1530,7 +1530,9 @@ const fontMono    = `'JetBrains Mono', ui-monospace, 'SF Mono', 'Menlo', monospa
 const LOGO_DATA_URI = '/logo-alex.png';
 
 // ── Download helper (browser-safe file download via anchor) ──
-function downloadFile(content, filename, mimeType) {
+// `opts.quiet` suppresses the alert() below for a caller that renders its own error in
+// context (the Portfolio Generator's export dialog) — an alert would stack on top of it.
+function downloadFile(content, filename, mimeType, opts) {
   try {
     const isString = typeof content === 'string';
     // Prepend UTF-8 BOM for CSV/text so Excel opens it correctly
@@ -1551,7 +1553,7 @@ function downloadFile(content, filename, mimeType) {
     return true;
   } catch (err) {
     console.error('downloadFile error:', err);
-    alert('Download failed: ' + (err.message || 'unknown error'));
+    if (!(opts && opts.quiet)) alert('Download failed: ' + (err.message || 'unknown error'));
     return false;
   }
 }
@@ -27096,6 +27098,198 @@ const PF_DEVICES = [
 // opened in a later year is still correct; this is only the value baked at build.
 const PF_YEAR = new Date().getFullYear();
 
+// ── Export: where review sends the student, and the PDF capture ─────────────
+
+// "Review missing fields" opens this accordion for each export requirement. `field` is
+// the default control to focus; `services` and `contact` refine it from the draft at
+// click time (the first unnamed service, the first invalid contact detail).
+const PF_EXPORT_FIELD_TARGETS = Object.freeze({
+  fullName: { section: 2, field: 'fullName' },
+  title: { section: 2, field: 'title' },
+  heroHeadline: { section: 3, field: 'heroHeadline' },
+  services: { section: 6, field: 'svc-add' },
+  contact: { section: 2, field: 'email' },
+});
+
+// A failure with a stable `code` the dialog can branch on: 'cancelled' | 'timeout' |
+// 'too-long' | 'capture'. The message is never shown to the student.
+class PortfolioPdfError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = 'PortfolioPdfError';
+    this.code = code;
+  }
+}
+
+// ★ EVERY AWAIT THAT CROSSES INTO THE CAPTURE IS RACED AGAINST A CLOCK. html2canvas
+//   builds its clone inside a child iframe and waits on that frame's onload with no
+//   timeout of its own (html2canvas.js iframeLoader). If a browser never fires it, the
+//   export dialog would sit on "Rendering…" forever with closing disabled. Cancel is
+//   polled here too, so a Cancel click does not have to wait out a slow page.
+// ★ html2canvas 1.4.1 measures every font's baseline against the GLOBAL `document`
+//   (`new FontMetrics(document)` in its CanvasRenderer), not against the document it is
+//   capturing. Here that is this app, whose Tailwind preflight sets `img { display: block }`,
+//   so the 1x1 probe image it lines up with the text baseline drops a whole line and every
+//   glyph is drawn low — measured 25px instead of 18px at 16px and 76 instead of 57 at 52px,
+//   enough to clip pain-card text and tool labels inside their own boxes. No CSS in the
+//   capture document can reach it. This restores the probe to `inline` for the duration of
+//   one export only, and matches nothing but html2canvas's hidden measurement container.
+//   The Training Agreement and certificate PDFs capture in this document too.
+const PF_H2C_METRICS_FIX_CSS = 'body > div[style*="visibility: hidden"] > span + img { display: inline !important; }';
+
+function withPdfTimeout(promise, ms, isCancelled) {
+  let timer = 0;
+  let poll = 0;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new PortfolioPdfError('timeout', 'The PDF renderer stopped responding.')), ms);
+    if (isCancelled) {
+      poll = setInterval(() => {
+        if (isCancelled()) reject(new PortfolioPdfError('cancelled', 'Cancelled.'));
+      }, 150);
+    }
+  });
+  return Promise.race([promise, guard]).finally(() => {
+    clearTimeout(timer);
+    clearInterval(poll);
+  });
+}
+
+// Render the PDF-mode portfolio document to an A4 PDF Blob, entirely in this browser.
+//
+// ★ A DEDICATED CAPTURE FRAME, NEVER THE LIVE PREVIEW. The preview is
+//   sandbox="allow-scripts" precisely so it can never reach this origin; the parent page
+//   cannot read its DOM, and that is the point. This frame is the inverse:
+//   `allow-same-origin` WITHOUT `allow-scripts`, so html2canvas can read its DOM while the
+//   document — escaped by the engine, carrying a script-src 'none' policy, and emitting
+//   no <script> — can execute nothing. The dangerous combination is both flags at once,
+//   and neither frame ever has it.
+// ★ RENDERED OFF-SCREEN, NOT display:none: a hidden frame lays out nothing to capture. It
+//   starts 20000px tall so no line wraps while it is measured, then is sized to fit.
+// ★ ONE CANVAS PER PAGE. A single full-length capture of a long portfolio at 2x is a
+//   canvas past what a mid-range phone will allocate; a page is ~13 MB and is released
+//   before the next one is drawn.
+// ★ Break points come from lib.planPdfPages over the document's `data-pdf-block` and
+//   `data-pdf-keep` markers plus every text line box, so even a forced cut falls between
+//   lines. A portfolio longer than PF_PDF_MAX_PAGES is refused, never silently cut off.
+// ★ Link annotations re-check the scheme here even though only mailtoHref/telHref/
+//   safeLinkHref produce these hrefs — a PDF link is the one href that leaves the app.
+async function renderPortfolioPdf({ lib, html, title, author, theme, onProgress, isCancelled }) {
+  const cancelled = typeof isCancelled === 'function' ? isCancelled : () => false;
+  const check = () => {
+    if (cancelled()) throw new PortfolioPdfError('cancelled', 'Cancelled.');
+  };
+  // Bounded like every other wait: the dialog cannot be closed while an export runs, so on a
+  // stalled connection Cancel has to be able to end the library download itself.
+  const [{ jsPDF }, h2c] = await withPdfTimeout(Promise.all([import('jspdf'), import('html2canvas')]), 30000, cancelled);
+  const html2canvas = h2c.default;
+  check();
+
+  const widthPx = lib.PF_PDF_WIDTH_PX;
+  const frame = document.createElement('iframe');
+  frame.setAttribute('sandbox', 'allow-same-origin');
+  frame.setAttribute('aria-hidden', 'true');
+  frame.setAttribute('title', 'PDF capture');
+  frame.tabIndex = -1;
+  frame.style.cssText = `position:fixed;left:-100000px;top:0;width:${widthPx}px;height:20000px;border:0;pointer-events:none`;
+  const loaded = new Promise((resolve) => frame.addEventListener('load', resolve, { once: true }));
+  frame.srcdoc = html;
+  const metricsFix = document.createElement('style');
+  metricsFix.setAttribute('data-portfolio-pdf', '');
+  metricsFix.textContent = PF_H2C_METRICS_FIX_CSS;
+  document.head.appendChild(metricsFix);
+  document.body.appendChild(frame);
+  try {
+    await withPdfTimeout(loaded, 15000, cancelled);
+    const doc = frame.contentDocument;
+    if (!doc || !doc.body) throw new PortfolioPdfError('capture', 'The capture document could not be read.');
+    if (doc.fonts && doc.fonts.ready) await withPdfTimeout(doc.fonts.ready, 10000, cancelled);
+    await withPdfTimeout(
+      Promise.all(Array.from(doc.images).map((img) => img.decode().catch(() => {}))),
+      10000,
+      cancelled,
+    );
+
+    // Measure, resize to fit, re-measure until two reads agree (PDF_CSS zeroes min-height,
+    // so the body reports its content, not the frame).
+    const measure = () => Math.ceil(doc.body.getBoundingClientRect().height);
+    let height = measure();
+    for (let i = 0; i < 3; i += 1) {
+      frame.style.height = `${height}px`;
+      const next = measure();
+      if (next === height) break;
+      height = next;
+    }
+
+    const pageHeight = lib.PF_PDF_PAGE_PX;
+    const blocks = Array.from(doc.querySelectorAll('[data-pdf-block]')).map((el) => el.getBoundingClientRect());
+    const keep = blocks.map((r) => ({ top: r.top, bottom: r.bottom }));
+    doc.querySelectorAll('[data-pdf-keep]').forEach((el) => {
+      const r = el.getBoundingClientRect();
+      const next = blocks.filter((b) => b.top >= r.bottom - 1).sort((a, b) => a.top - b.top)[0];
+      const bottom = next ? Math.min(next.bottom, r.top + pageHeight * 0.9) : r.bottom;
+      keep.push({ top: r.top, bottom: Math.max(bottom, r.bottom) });
+    });
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+    const range = doc.createRange();
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (!node.nodeValue.trim()) continue;
+      range.selectNodeContents(node);
+      Array.from(range.getClientRects()).forEach((r) => {
+        if (r.height > 0) keep.push({ top: r.top, bottom: r.bottom });
+      });
+    }
+    const plan = lib.planPdfPages({ contentHeight: height, pageHeight, keep, maxPages: lib.PF_PDF_MAX_PAGES });
+    if (plan.truncated) throw new PortfolioPdfError('too-long', `Longer than ${lib.PF_PDF_MAX_PAGES} pages.`);
+    if (!plan.pages.length) throw new PortfolioPdfError('capture', 'There was nothing to capture.');
+
+    const links = Array.from(doc.querySelectorAll('a[data-pdf-link]'))
+      .map((a) => ({ url: a.getAttribute('href') || '', rect: a.getBoundingClientRect() }))
+      .filter((l) => /^(https:|mailto:|tel:)/.test(l.url));
+
+    const chrome = lib.pdfPageChrome(theme);
+    const pageW = lib.PF_PDF_PAGE_WIDTH_PT;
+    const pageH = lib.PF_PDF_PAGE_HEIGHT_PT;
+    const margin = lib.PF_PDF_MARGIN_PT;
+    const k = pageW / widthPx;
+    const pdf = new jsPDF({ unit: 'pt', format: 'a4', orientation: 'portrait', compress: true });
+    const total = plan.pages.length;
+    for (let i = 0; i < total; i += 1) {
+      check();
+      if (onProgress) onProgress(i + 1, total);
+      const { start, end } = plan.pages[i];
+      const canvas = await withPdfTimeout(html2canvas(doc.documentElement, {
+        x: 0, y: start, width: widthPx, height: end - start,
+        windowWidth: widthPx, windowHeight: height, scrollX: 0, scrollY: 0,
+        scale: 2, backgroundColor: chrome.background, logging: false, useCORS: false,
+      }), 20000, cancelled);
+      const image = canvas.toDataURL('image/jpeg', 0.9);
+      canvas.width = 0;
+      canvas.height = 0;
+      if (i > 0) pdf.addPage();
+      pdf.setFillColor(chrome.background);
+      pdf.rect(0, 0, pageW, pageH, 'F');
+      pdf.addImage(image, 'JPEG', 0, margin, pageW, (end - start) * k);
+      links.forEach(({ url, rect }) => {
+        if (rect.width > 0 && rect.top >= start && rect.bottom <= end) {
+          pdf.link(rect.left * k, (rect.top - start) * k + margin, rect.width * k, rect.height * k, { url });
+        }
+      });
+    }
+    for (let n = 1; n <= total; n += 1) {
+      pdf.setPage(n);
+      pdf.setFontSize(8);
+      pdf.setTextColor(chrome.text);
+      pdf.text(`Page ${n} of ${total}`, pageW / 2, pageH - margin / 2 + 3, { align: 'center' });
+    }
+    pdf.setProperties({ title, author, subject: 'Bookkeeping portfolio', creator: 'Bookkeeper Portfolio Generator' });
+    check();
+    return pdf.output('blob');
+  } finally {
+    frame.remove();
+    metricsFix.remove();
+  }
+}
+
 // ── Editor primitives ───────────────────────────────────────────────────────
 // Declared at module scope, never inside a render: a component type created during
 // render is a new type on every keystroke, so React unmounts and remounts the
@@ -27189,9 +27383,9 @@ function PfRow({ removeLabel, onRemove, children }) {
   );
 }
 
-function PfAdd({ onClick, children }) {
+function PfAdd({ onClick, children, id, describedBy }) {
   return (
-    <button type="button" onClick={onClick}
+    <button type="button" id={id} aria-describedby={describedBy} onClick={onClick}
       className="gh-btn-ghost mt-3 px-3 py-1.5 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5">
       <Plus size={13} aria-hidden="true" /> {children}
     </button>
@@ -27248,6 +27442,8 @@ function PortfolioGeneratorInner({ data, lib }) {
   const [dialog, setDialog] = useState(null);
   const [touched, setTouched] = useState({});
   const [industryPick, setIndustryPick] = useState('');
+  // The download job. phase: idle | preparing | rendering | downloading | success | error.
+  const [exportJob, setExportJob] = useState({ phase: 'idle', format: null, page: 0, pages: 0, error: null });
 
   const toolRef = useRef(null);
   const paneRef = useRef(null);
@@ -27260,6 +27456,21 @@ function PortfolioGeneratorInner({ data, lib }) {
   // one plus the prefilled name. The autosave compares against it, so merely opening the
   // tab never writes a storage row. Re-stamped by Clear.
   const seedRef = useRef(null);
+  // The draft as of the last render, so an export judges what is on screen when the format
+  // is CHOSEN rather than what was on screen when the dialog opened.
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
+  // ★ A REF, NOT STATE, is the single-flight lock: setState is asynchronous, so two quick
+  //   clicks would both read "not busy" and start two captures of the same document.
+  const exportLockRef = useRef(false);
+  const exportCancelRef = useRef(false);
+  // The export requirement whose control should receive focus once review has opened it.
+  const pendingFocusRef = useRef(null);
+  const exportCancelBtnRef = useRef(null);
+  const exportErrorBtnRef = useRef(null);
+  const exportCardRefs = useRef({});
+  const wasExportBusyRef = useRef(false);
+  const lastExportFormatRef = useRef(null);
 
   const patch = useCallback((fields) => setDraft((d) => ({ ...d, ...fields })), []);
   const setList = useCallback((key, next) => setDraft((d) => ({ ...d, [key]: next })), []);
@@ -27443,8 +27654,16 @@ function PortfolioGeneratorInner({ data, lib }) {
   );
   const completion = useMemo(() => lib.draftCompletion(draft), [draft, lib]);
   const validation = useMemo(() => lib.validateDraft(draft), [draft, lib]);
+  // The export gate's verdict on the draft as it stands. Both download formats read the
+  // same function (lib.planPortfolioExport), so this is only for the dialogs to render.
+  const readiness = useMemo(
+    () => lib.portfolioExportReadiness(draft, { sample: SAMPLE_DRAFT }),
+    [draft, SAMPLE_DRAFT, lib],
+  );
   const fieldErr = (name) => (touched[name] && validation.fields[name] ? validation.fields[name].message : '');
   const blur = (name) => setTouched((t) => ({ ...t, [name]: true }));
+  // The ids that describe a control, or undefined so React omits the attribute entirely.
+  const describe = (...ids) => ids.filter(Boolean).join(' ') || undefined;
 
   // ── Résumé import ────────────────────────────────────────────────────────
   async function extractResumeLines(file) {
@@ -27667,31 +27886,205 @@ function PortfolioGeneratorInner({ data, lib }) {
     setOpen((o) => ({ ...o, 3: true, 4: true }));
   }
 
-  // ── Download ─────────────────────────────────────────────────────────────
-  const staleSampleFields = useMemo(
-    () => lib.sampleFieldsStillPresent(draft, SAMPLE_DRAFT),
-    [draft, SAMPLE_DRAFT, lib],
-  );
+  // ── Download: one gate, two formats ──────────────────────────────────────
+  // ★ EVERY PATH TO A FILE GOES THROUGH startExport → lib.planPortfolioExport, which refuses
+  //   BEFORE it builds anything. This used to download straight from the click whenever
+  //   the name was filled — and the name is prefilled from the profile — so an untouched
+  //   draft produced an empty portfolio with no dialog at all. The button stays enabled on
+  //   purpose: a disabled button explains nothing, a dialog naming the missing items does.
+  const exportBusy = exportJob.phase === 'preparing' || exportJob.phase === 'rendering'
+    || exportJob.phase === 'downloading';
 
-  function runDownload() {
-    const html = lib.buildPortfolioHtml(draft, {
-      theme: lib.resolveTheme(draft.theme, PORTFOLIO_THEMES),
-      mode: 'download',
-      year: PF_YEAR,
-    });
-    const ok = downloadFile(html, lib.portfolioFileName(draft, todayISODate()), 'text/html');
-    setDialog(null);
-    if (ok) setNotice('Downloaded. Open the file in any browser — it works offline, with no other files needed.');
+  // An unmounted tool (sign-out) must not start a download. A hidden keep-alive tab is NOT
+  // unmounted and keeps rendering on purpose — the student asked for that file.
+  useEffect(() => () => {
+    exportCancelRef.current = true;
+  }, []);
+
+  // ★ Keyboard focus stays in the dialog. Disabling the format card that holds focus drops it
+  //   to <body>, outside AccountModal's trap, so it is handed to Cancel while the export runs,
+  //   to the first recovery action when it fails, and back to the chosen card after a Cancel —
+  //   whose own button unmounts in the same commit that returns the dialog to idle.
+  useEffect(() => {
+    if (exportBusy && exportCancelBtnRef.current) exportCancelBtnRef.current.focus();
+    else if (exportJob.phase === 'error' && exportErrorBtnRef.current) exportErrorBtnRef.current.focus();
+    else if (wasExportBusyRef.current && exportJob.phase === 'idle') {
+      const card = exportCardRefs.current[lastExportFormatRef.current] || exportCardRefs.current.html;
+      if (card && card.isConnected) card.focus();
+    }
+    wasExportBusyRef.current = exportBusy;
+  }, [exportBusy, exportJob.phase]);
+
+  function openExportGate(r, acknowledged) {
+    if (!r.ok) {
+      // Fields are NOT marked touched here — see keepEditingAfterBlocked.
+      setDialog({ kind: 'export-blocked' });
+      return;
+    }
+    if (r.state === 'warning' && !acknowledged) {
+      setDialog({ kind: 'export-review' });
+      return;
+    }
+    setDialog({ kind: 'export-format', acknowledged: !!acknowledged });
   }
 
   function requestDownload() {
-    if (!validation.ok || staleSampleFields.length) {
-      setTouched((t) => ({ ...t, ...Object.fromEntries(validation.blocking.map((k) => [k, true])) }));
-      setDialog({ kind: 'download' });
+    setExportJob({ phase: 'idle', format: null, page: 0, pages: 0, error: null });
+    openExportGate(readiness, false);
+  }
+
+  async function startExport(format, acknowledged) {
+    if (exportLockRef.current) return;
+    const current = draftRef.current;
+    const theme = lib.resolveTheme(current.theme, PORTFOLIO_THEMES);
+    // ★ Re-judged at the moment a format is chosen, from the draft on screen now.
+    const plan = lib.planPortfolioExport(current, {
+      format,
+      sample: SAMPLE_DRAFT,
+      theme,
+      year: PF_YEAR,
+      isoDate: todayISODate(),
+      acknowledged: acknowledged === true,
+    });
+    if (!plan.ok) {
+      openExportGate(plan.readiness, acknowledged === true);
       return;
     }
-    runDownload();
+    exportLockRef.current = true;
+    exportCancelRef.current = false;
+    lastExportFormatRef.current = plan.format;
+    try {
+      if (plan.format === 'html') {
+        const ok = downloadFile(plan.html, plan.fileName, plan.mimeType, { quiet: true });
+        if (!ok) {
+          setExportJob({ phase: 'error', format: 'html', page: 0, pages: 0, error: 'download' });
+          return;
+        }
+        setExportJob({ phase: 'success', format: 'html', page: 0, pages: 0, error: null });
+        setDialog(null);
+        setNotice('HTML portfolio downloaded. Open it in any browser—it works offline with no additional files.');
+        return;
+      }
+      setExportJob({ phase: 'preparing', format: 'pdf', page: 0, pages: 0, error: null });
+      const author = lib.normalizeDraft(current).fullName;
+      const blob = await renderPortfolioPdf({
+        lib,
+        html: plan.html,
+        title: `${author} — Bookkeeping portfolio`,
+        author,
+        theme,
+        isCancelled: () => exportCancelRef.current,
+        onProgress: (page, pages) => {
+          if (!exportCancelRef.current) setExportJob({ phase: 'rendering', format: 'pdf', page, pages, error: null });
+        },
+      });
+      if (exportCancelRef.current) return;
+      setExportJob({ phase: 'downloading', format: 'pdf', page: 0, pages: 0, error: null });
+      const ok = downloadFile(blob, plan.fileName, plan.mimeType, { quiet: true });
+      if (!ok) {
+        setExportJob({ phase: 'error', format: 'pdf', page: 0, pages: 0, error: 'download' });
+        return;
+      }
+      setExportJob({ phase: 'success', format: 'pdf', page: 0, pages: 0, error: null });
+      setDialog(null);
+      setNotice('PDF portfolio downloaded and ready to share or print.');
+    } catch (e) {
+      const code = e && e.code ? e.code : 'capture';
+      if (code === 'cancelled' || exportCancelRef.current) {
+        setExportJob({ phase: 'idle', format: null, page: 0, pages: 0, error: null });
+        return;
+      }
+      // ★ The code and the error's name only — the draft is somebody's CV.
+      console.error('[portfolio] export failed:', code, e && e.name);
+      setExportJob({ phase: 'error', format: plan.format, page: 0, pages: 0, error: code });
+    } finally {
+      exportLockRef.current = false;
+    }
   }
+
+  function cancelExport() {
+    exportCancelRef.current = true;
+  }
+
+  // Where "Review missing fields" sends the student, resolved from the live draft: the
+  // accordion to open, the control to focus, and any field whose own error should show too.
+  function reviewTarget(key) {
+    const base = PF_EXPORT_FIELD_TARGETS[key];
+    if (!base) return null;
+    const d = draftRef.current;
+    if (key === 'services') {
+      const i = d.services.findIndex((s) => !String((s && s.name) || '').trim());
+      return { section: base.section, id: i >= 0 ? fid(`svc-n-${i}`) : fid('svc-add'), touch: [] };
+    }
+    if (key === 'contact') {
+      if (d.email && lib.mailtoHref(d.email).kind === 'invalid') return { section: 2, id: fid('email'), touch: ['email'] };
+      if (d.phone && lib.telHref(d.phone).kind === 'invalid') return { section: 2, id: fid('phone'), touch: ['phone'] };
+      if (d.website && lib.safeLinkHref(d.website).kind === 'invalid') return { section: 2, id: fid('website'), touch: ['website'] };
+      // ★ A javascript: or http: booking link can be the ONLY contact detail entered, and it
+      //   lives in section 3 — not beside the empty email field review used to focus.
+      if (d.ctaLink && lib.safeLinkHref(d.ctaLink).kind === 'invalid') return { section: 3, id: fid('ctaLink'), touch: ['ctaLink'] };
+      return { section: base.section, id: fid('email'), touch: [] };
+    }
+    return { section: base.section, id: fid(base.field), touch: [] };
+  }
+
+  // ★ Errors appear once the dialog has gone. Marking fields touched in the same update that
+  //   opened it inserted role="alert" messages behind the modal, interrupting its own title.
+  function keepEditingAfterBlocked() {
+    setTouched((t) => ({ ...t, ...Object.fromEntries(readiness.blocking.map((b) => [b.key, true])) }));
+    setDialog(null);
+  }
+
+  function reviewMissing(key) {
+    const target = reviewTarget(key);
+    if (!target) return;
+    pendingFocusRef.current = key;
+    setTouched((t) => ({
+      ...t,
+      ...Object.fromEntries(readiness.blocking.map((b) => [b.key, true])),
+      ...Object.fromEntries(target.touch.map((k) => [k, true])),
+    }));
+    setDialog(null);
+    setPane('edit');
+    setOpen((o) => ({ ...o, [target.section]: true }));
+  }
+
+  // ★ FOCUS LANDS AFTER THE DIALOG HAS LET GO OF IT. AccountModal returns focus to its opener
+  //   (the Download button) in its unmount cleanup, and the accordion panel only stops being
+  //   `hidden` in this same commit — so the move waits two frames, and refuses a control that
+  //   is still inside a hidden panel rather than focusing something invisible.
+  useEffect(() => {
+    const key = pendingFocusRef.current;
+    if (!key || dialog) return undefined;
+    let inner = 0;
+    const outer = requestAnimationFrame(() => {
+      inner = requestAnimationFrame(() => {
+        pendingFocusRef.current = null;
+        const target = reviewTarget(key);
+        const id = target ? target.id : null;
+        const el = id ? document.getElementById(id) : null;
+        if (!el || el.closest('[hidden]') || el.getClientRects().length === 0) return;
+        const reduce = typeof window.matchMedia === 'function'
+          && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        el.scrollIntoView({ block: 'center', behavior: reduce ? 'auto' : 'smooth' });
+        el.focus({ preventScroll: true });
+      });
+    });
+    return () => {
+      cancelAnimationFrame(outer);
+      cancelAnimationFrame(inner);
+    };
+  }, [dialog, open, pane]);
+
+  const exportErrorCopy = exportJob.error === 'too-long'
+    ? `Your portfolio is longer than ${lib.PF_PDF_MAX_PAGES} PDF pages, so we didn’t create a cut-off copy. Download the HTML version, or shorten a few sections and try again.`
+    : exportJob.error === 'timeout'
+      ? 'Creating the PDF took too long on this device. Your draft is safe—try again, or download the HTML version.'
+      : exportJob.error === 'download'
+        ? (exportJob.format === 'pdf'
+          ? 'Your PDF was created, but this browser didn’t start the download. Your draft is safe—try again, or download the HTML version.'
+          : 'This browser didn’t start the download. Your draft is safe—try again.')
+        : 'We couldn’t create the PDF on this device. Your draft is safe—try again, or download the HTML version.';
 
   const themeList = PORTFOLIO_THEME_ORDER.map((k) => PORTFOLIO_THEMES[k]).filter(Boolean);
   const showEditor = twoPane || pane === 'edit';
@@ -27707,7 +28100,7 @@ function PortfolioGeneratorInner({ data, lib }) {
       <SectionHead
         eyebrow="Job Application · Tool"
         title="Bookkeeper Portfolio Generator"
-        desc="Build a client-ready portfolio website and download it as one self-contained file. Pick a design and an industry, fill in the thirteen sections, and everything stays in your browser until you download it."
+        desc="Build a client-ready portfolio and download it as a self-contained HTML website or an A4 PDF. Pick a design and an industry, fill in the thirteen sections, and everything stays in your browser until you download it."
       />
 
       {/* ★ SAY THAT THE DRAFT DOES NOT FOLLOW THEM. Every other tool in this toolkit
@@ -27919,9 +28312,22 @@ function PortfolioGeneratorInner({ data, lib }) {
               <PfInput id={fid('location')} value={draft.location}
                 onChange={(v) => patch({ location: v })} />
             </PfField>
+            {/* The export gate's contact requirement: at least one email, phone, website or
+                booking link that actually works. It describes all three controls below. */}
+            {fieldErr('contact') && (
+              <p id={fid('contact-err')} role="alert" className="mt-3 text-[11px] font-medium"
+                style={{ color: 'var(--status-danger-fg)' }}>
+                {fieldErr('contact')}
+              </p>
+            )}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               <PfField id={fid('email')} label="Email" error={fieldErr('email')}>
+                {/* ★ The aria props are set HERE because this PfField wraps a fragment (the
+                    input plus the account-email button), so its cloneElement never reaches
+                    the input — the email field was the one control left undescribed. */}
                 <PfInput id={fid('email')} type="email" inputMode="email" autoComplete="email"
+                  aria-invalid={fieldErr('email') || fieldErr('contact') ? true : undefined}
+                  aria-describedby={describe(fieldErr('email') && fid('email-err'), fieldErr('contact') && fid('contact-err'))}
                   value={draft.email} onChange={(v) => patch({ email: v })} onBlur={() => blur('email')} />
                 {/* ★ The account email is OFFERED, not prefilled. It ends up printed on
                     a page the student publishes, so it should be a decision. */}
@@ -27935,6 +28341,8 @@ function PortfolioGeneratorInner({ data, lib }) {
               <PfField id={fid('phone')} label="Phone" error={fieldErr('phone')}
                 hint="Digits and a country code only — an extension or a note stops it being tappable.">
                 <PfInput id={fid('phone')} type="tel" inputMode="tel" autoComplete="tel"
+                  aria-invalid={fieldErr('contact') ? true : undefined}
+                  aria-describedby={describe(fieldErr('phone') && fid('phone-err'), fieldErr('contact') && fid('contact-err'), fid('phone-hint'))}
                   value={draft.phone} onChange={(v) => patch({ phone: v })} onBlur={() => blur('phone')} />
               </PfField>
             </div>
@@ -27946,6 +28354,8 @@ function PortfolioGeneratorInner({ data, lib }) {
                   : 'https:// links only.';
               })()}>
               <PfInput id={fid('website')} type="url" inputMode="url" value={draft.website}
+                aria-invalid={fieldErr('contact') ? true : undefined}
+                aria-describedby={describe(fieldErr('website') && fid('website-err'), fieldErr('contact') && fid('contact-err'), fid('website-hint'))}
                 onChange={(v) => patch({ website: v })} onBlur={() => blur('website')} />
             </PfField>
             <div className="flex items-center gap-3 mt-3">
@@ -28053,10 +28463,18 @@ function PortfolioGeneratorInner({ data, lib }) {
             <p className="mt-2 text-[11px]" style={{ color: C.textMute }}>
               What you do, written as the outcome the owner gets — not as a task list.
             </p>
+            {fieldErr('services') && (
+              <p id={fid('services-err')} role="alert" className="mt-2 text-[11px] font-medium"
+                style={{ color: 'var(--status-danger-fg)' }}>
+                {fieldErr('services')}
+              </p>
+            )}
             {draft.services.map((s, i) => (
               <PfRow key={i} removeLabel={`Remove service ${i + 1}`} onRemove={() => removeItem('services', i)}>
                 <PfField id={fid(`svc-n-${i}`)} label={`Service ${i + 1} name`}>
                   <PfInput id={fid(`svc-n-${i}`)} value={s.name}
+                    aria-invalid={fieldErr('services') && !String(s.name).trim() ? true : undefined}
+                    aria-describedby={fieldErr('services') && !String(s.name).trim() ? fid('services-err') : undefined}
                     onChange={(v) => setItem('services', i, { name: v })} />
                 </PfField>
                 <PfField id={fid(`svc-d-${i}`)} label={`Service ${i + 1} description`}>
@@ -28065,7 +28483,8 @@ function PortfolioGeneratorInner({ data, lib }) {
                 </PfField>
               </PfRow>
             ))}
-            <PfAdd onClick={() => addItem('services', { name: '', desc: '' })}>Add service</PfAdd>
+            <PfAdd id={fid('svc-add')} describedBy={fieldErr('services') ? fid('services-err') : undefined}
+              onClick={() => addItem('services', { name: '', desc: '' })}>Add service</PfAdd>
           </PfSection>
 
           {/* 7 — Sample reports */}
@@ -28405,41 +28824,184 @@ function PortfolioGeneratorInner({ data, lib }) {
         </AccountModal>
       )}
 
-      {dialog && dialog.kind === 'download' && (
-        <AccountModal title="Before you download" icon={AlertTriangle} tone="danger"
+      {/* ★ A BLOCKER IS NOT A WARNING. This dialog has no download action of any kind —
+          the only ways out are back to the form. */}
+      {dialog && dialog.kind === 'export-blocked' && (
+        <AccountModal title="Your portfolio isn’t ready to download" icon={ClipboardList}
+          onClose={keepEditingAfterBlocked}>
+          <p className="text-sm" style={{ color: C.textSoft }}>
+            Add the essential details clients need to understand who you are, what you offer,
+            and how to contact you. Complete the items below, then try again.
+          </p>
+          <ul className="mt-4 space-y-2" aria-label="Still needed">
+            {readiness.blocking.map((b) => (
+              <li key={b.key}>
+                <button type="button" onClick={() => reviewMissing(b.key)}
+                  className="w-full text-left rounded-xl px-3 py-2.5 flex items-start gap-2.5 transition hover:brightness-[0.98]"
+                  style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)' }}>
+                  <AlertCircle size={15} aria-hidden="true" className="mt-0.5 flex-shrink-0"
+                    style={{ color: 'var(--status-warn-fg)' }} />
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-semibold" style={{ color: C.text }}>{b.label}</span>
+                    <span className="block text-[12px] mt-0.5" style={{ color: C.textSoft }}>{b.message}</span>
+                  </span>
+                  <ChevronRight size={15} aria-hidden="true" className="mt-0.5 flex-shrink-0"
+                    style={{ color: C.textMute }} />
+                </button>
+              </li>
+            ))}
+          </ul>
+          <div className="flex flex-wrap justify-end gap-2 mt-5">
+            <button type="button" className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold"
+              onClick={keepEditingAfterBlocked}>Keep editing</button>
+            <button type="button" className="sheen-btn px-4 py-2 text-sm font-semibold"
+              onClick={() => reviewMissing(readiness.firstBlocking ? readiness.firstBlocking.key : 'fullName')}>
+              Review missing fields
+            </button>
+          </div>
+        </AccountModal>
+      )}
+
+      {dialog && dialog.kind === 'export-review' && (
+        <AccountModal title="Before you choose a format" icon={AlertTriangle}
           onClose={() => setDialog(null)}>
-          {validation.blocking.length > 0 && (
-            <div className="mb-4">
-              <div className="text-sm font-semibold mb-1.5" style={{ color: C.text }}>Still needed</div>
-              <ul className="text-sm list-disc pl-5" style={{ color: 'var(--status-danger-fg)' }}>
-                {validation.blocking.map((k) => <li key={k}>{validation.fields[k].message}</li>)}
-              </ul>
-            </div>
-          )}
           {/* ★ THE FIELDS ARE NAMED, not gestured at. A student who loads the example,
               edits three fields and downloads has published invented client
               testimonials under their own name. A banner at the top of the form is
               not read at download time; this list is. */}
-          {staleSampleFields.length > 0 && (
-            <div>
+          {readiness.warnings.filter((w) => w.key === 'sample').map((w) => (
+            <div key="sample" className="mb-4">
               <div className="text-sm font-semibold mb-1.5" style={{ color: C.text }}>
                 These still hold the example content
               </div>
               <ul className="text-sm list-disc pl-5" style={{ color: 'var(--status-warn-fg)' }}>
-                {staleSampleFields.map((f) => <li key={f}>{f}</li>)}
+                {w.items.map((f) => <li key={f}>{f}</li>)}
               </ul>
-              <p className="text-[12.5px] mt-2.5" style={{ color: C.textSoft }}>
-                Publishing invented testimonials, results or credentials as your own is
-                misrepresentation, and the first prospect who checks is the one you most wanted.
-              </p>
+              <p className="text-[12.5px] mt-2.5" style={{ color: C.textSoft }}>{w.message}</p>
+            </div>
+          ))}
+          {readiness.warnings.some((w) => w.key === 'omittedLink') && (
+            <div>
+              <div className="text-sm font-semibold mb-1.5" style={{ color: C.text }}>
+                Details that won’t work as written
+              </div>
+              <ul className="text-[13px] space-y-1.5">
+                {readiness.warnings.filter((w) => w.key === 'omittedLink').map((w) => (
+                  <li key={w.field}>
+                    <strong style={{ color: C.text }}>{w.label}:</strong>{' '}
+                    <span style={{ color: C.textSoft }}>{w.message}</span>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
           <div className="flex flex-wrap justify-end gap-2 mt-5">
             <button type="button" className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold"
-              onClick={() => setDialog(null)}>Back to editing</button>
-            {validation.blocking.length === 0 && (
-              <button type="button" className="sheen-btn px-4 py-2 text-sm font-semibold"
-                onClick={runDownload}>Download anyway</button>
+              onClick={() => setDialog(null)}>Keep editing</button>
+            <button type="button" className="sheen-btn px-4 py-2 text-sm font-semibold"
+              onClick={() => openExportGate(readiness, true)}>I understand — choose a format</button>
+          </div>
+        </AccountModal>
+      )}
+
+      {dialog && dialog.kind === 'export-format' && (
+        <AccountModal title="Download your portfolio" icon={Download} maxW="max-w-lg"
+          subtitle="Pick the format that suits where it is going. You can download both."
+          canClose={!exportBusy} onClose={() => { if (!exportBusy) setDialog(null); }}>
+          <div role="group" aria-label="Choose a download format" className="grid gap-3">
+            {[
+              {
+                format: 'html', Icon: Globe, title: 'Interactive HTML website',
+                body: 'One self-contained .html file that opens offline in any browser. Keeps the navigation, links, animations, mobile layout and the interactive sample-report tabs.',
+                best: 'Best for hosting or sharing as a website',
+              },
+              {
+                format: 'pdf', Icon: FileText, title: 'PDF document',
+                body: `Fixed A4 portrait pages that are easy to email, upload or print.${draft.showSamples
+                  ? ' Animations and interactive tabs don’t exist on paper, so all three sample statements are printed in full.'
+                  : ' Animations don’t exist on paper, so every section is printed as a static page.'}`,
+                best: 'Best for emailing, applications and printing',
+              },
+            ].map((o) => (
+              <button key={o.format} type="button" disabled={exportBusy}
+                ref={(el) => { exportCardRefs.current[o.format] = el; }}
+                onClick={() => startExport(o.format, dialog.acknowledged)}
+                className="w-full text-left rounded-2xl p-4 flex items-start gap-3 transition hover:shadow-md disabled:opacity-60 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                // ★ A real border on a washed surface. On the dialog's own white the glass border
+                //   was invisible, so both options read as body copy rather than as two buttons.
+                style={{ background: 'var(--wash)', border: `1px solid ${C.border}` }}>
+                <span className="flex items-center justify-center rounded-xl flex-shrink-0"
+                  style={{ width: 40, height: 40, ...MODAL_TONE_TILE.primary }}>
+                  {exportBusy && exportJob.format === o.format
+                    ? <Loader2 size={18} className="animate-spin" aria-hidden="true" />
+                    : <o.Icon size={18} aria-hidden="true" />}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-bold" style={{ color: C.text }}>{o.title}</span>
+                  <span className="block text-[12.5px] mt-1 leading-relaxed" style={{ color: C.textSoft }}>{o.body}</span>
+                  <span className="block text-[11.5px] mt-1.5 font-semibold" style={{ color: C.text }}>{o.best}</span>
+                </span>
+              </button>
+            ))}
+          </div>
+
+          {/* Always mounted: a live region created in the same commit as its text is not announced. */}
+          <div role="status" aria-live="polite" className="mt-3 min-h-[1.25rem]">
+            {exportBusy && (
+              <div className="flex items-center gap-2 text-[13px]" style={{ color: C.textSoft }}>
+                <Loader2 size={14} className="animate-spin" aria-hidden="true" />
+                <span>
+                  {exportJob.phase === 'rendering' && exportJob.pages
+                    ? `Rendering page ${exportJob.page} of ${exportJob.pages}…`
+                    : exportJob.phase === 'downloading' ? 'Saving your PDF…' : 'Preparing PDF…'}
+                </span>
+              </div>
+            )}
+          </div>
+          <div role="alert">
+            {exportJob.phase === 'error' && (
+              <div className="mt-1 rounded-xl px-3.5 py-3"
+                style={{ background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)' }}>
+                <div className="text-[13px] font-semibold" style={{ color: 'var(--status-danger-fg)' }}>{exportErrorCopy}</div>
+                <div className="flex flex-wrap gap-2 mt-3">
+                  {exportJob.error !== 'too-long' && (
+                    <button type="button" ref={exportErrorBtnRef} className="gh-btn-ghost px-3.5 py-1.5 rounded-xl text-xs font-semibold"
+                      onClick={() => startExport(exportJob.format === 'html' ? 'html' : 'pdf', dialog.acknowledged)}>
+                      Try again
+                    </button>
+                  )}
+                  {exportJob.format === 'pdf' && (
+                    <button type="button" className="sheen-btn px-3.5 py-1.5 text-xs font-semibold"
+                      ref={exportJob.error === 'too-long' ? exportErrorBtnRef : undefined}
+                      onClick={() => startExport('html', dialog.acknowledged)}>
+                      Download HTML instead
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {readiness.notes.length > 0 && !exportBusy && (
+            <details className="mt-3">
+              <summary className="text-[12.5px] font-semibold cursor-pointer" style={{ color: C.textSoft }}>
+                Optional sections you could still add ({readiness.notes.length})
+              </summary>
+              <ul className="mt-2 text-[12.5px] list-disc pl-5 space-y-1" style={{ color: C.textSoft }}>
+                {readiness.notes.map((n) => (
+                  <li key={n.key}><strong style={{ color: C.text }}>{n.label}</strong> — {n.message}</li>
+                ))}
+              </ul>
+            </details>
+          )}
+
+          <div className="flex flex-wrap justify-end gap-2 mt-5">
+            {exportBusy ? (
+              <button type="button" ref={exportCancelBtnRef} className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold"
+                onClick={cancelExport}>Cancel</button>
+            ) : (
+              <button type="button" className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold"
+                onClick={() => setDialog(null)}>Keep editing</button>
             )}
           </div>
         </AccountModal>

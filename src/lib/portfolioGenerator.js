@@ -706,12 +706,108 @@ export function parseStoredDraft(raw) {
   return { draft: normalize(payload, dropped), recovered: true, dropped };
 }
 
+// ── The export requirements ─────────────────────────────────────────────────
+
+/** Services a client can actually read — a blank repeater row is a click, not a service. */
+function namedServices(d) {
+  return d.services.filter((s) => s.name);
+}
+
 /**
- * Field-level warnings for the editor and the pre-download check.
+ * Every way a visitor could reach the author, judged by the SAME validators that decide
+ * whether the document renders a link at all.
  *
- * ★ ONLY `fullName` BLOCKS. A half-finished portfolio is still worth
- *   downloading, and a tool that refuses the download until everything is
- *   perfect is a tool nobody finishes.
+ * ★ ONE DEFINITION, TWO CONSUMERS. The export gate and draftCompletion's "Contact details"
+ *   row both read this. They used to disagree: the warning checked raw presence (an
+ *   invalid email "counted") while the meter checked validity and ignored the website,
+ *   so a website-only draft read as unreachable on the meter and reachable in the dialog.
+ * ★ AN INVALID PHONE DOES NOT COUNT, even though it still prints as plain text. The
+ *   requirement is a way to reach you, and a number with "ext. 2" glued on is the exact
+ *   shape telHref refuses because a visitor dials it wrong.
+ * ★ A `#fragment` CTA DOES NOT COUNT. It scrolls to the contact section — which is only a
+ *   way to reach you if something in that section is.
+ */
+function contactMethods(d) {
+  return {
+    email: mailtoHref(d.email).kind === 'mailto',
+    phone: telHref(d.phone).kind === 'tel',
+    website: safeLinkHref(d.website).kind === 'external',
+    ctaLink: safeLinkHref(d.ctaLink).kind === 'external',
+  };
+}
+
+function contactSatisfied(d) {
+  const m = contactMethods(d);
+  return m.email || m.phone || m.website || m.ctaLink;
+}
+
+/**
+ * THE export requirements, in the order a student should fix them.
+ *
+ * ★ FIVE THINGS, AND ONLY FIVE. A client needs to know who you are, what you call
+ *   yourself, the promise, what you do, and how to reach you. Every other section stays
+ *   optional, because a tool that refuses the download until all thirteen are perfect is
+ *   a tool nobody finishes.
+ * ★ `check` returns `null` when met, else `[code, message]`. Codes are stable and are
+ *   what the suite asserts; messages are copy and may be reworded.
+ */
+const EXPORT_REQUIREMENTS = [
+  {
+    key: 'fullName',
+    label: 'Your name',
+    check: (d) => (d.fullName ? null
+      : ['required', 'Add your name — it headlines the portfolio and names the file.']),
+  },
+  {
+    key: 'title',
+    label: 'Professional title',
+    check: (d) => (d.title ? null
+      : ['empty', 'Add a professional title — it tells a client what you do in three words.']),
+  },
+  {
+    key: 'heroHeadline',
+    label: 'Headline',
+    check: (d) => (d.heroHeadline ? null
+      : ['empty', 'Add a headline — it is the first line a prospect reads.']),
+  },
+  {
+    key: 'services',
+    label: 'At least one service',
+    check: (d) => {
+      if (namedServices(d).length) return null;
+      return d.services.length
+        ? ['unnamed', 'Give at least one service a name — a service with no name never tells a client what you do.']
+        : ['empty', 'Add at least one service so the portfolio says what you actually do.'];
+    },
+  },
+  {
+    key: 'contact',
+    label: 'A way for clients to reach you',
+    check: (d) => {
+      if (contactSatisfied(d)) return null;
+      const entered = d.email || d.phone || d.website || safeLinkHref(d.ctaLink).kind === 'invalid';
+      return entered
+        ? ['unusable', 'None of your contact details can be used yet — fix the email, phone or link, or add another way to reach you.']
+        : ['unreachable', 'Add at least one way to reach you — a valid email, phone number, website or LinkedIn, or a booking link.'];
+    },
+  },
+];
+
+/** The requirement keys and their labels, frozen — the component's review list reads this. */
+export const PORTFOLIO_EXPORT_REQUIREMENTS = Object.freeze(
+  EXPORT_REQUIREMENTS.map(({ key, label }) => Object.freeze({ key, label })),
+);
+
+/**
+ * Field-level errors and warnings for the editor and the export gate.
+ *
+ * ★ THE FIVE EXPORT REQUIREMENTS BLOCK; NOTHING ELSE DOES. This used to block on
+ *   `fullName` alone — and `fullName` is PREFILLED from the student's profile, so an
+ *   untouched draft had zero blockers and downloaded an empty portfolio without so much
+ *   as a dialog. The requirement set lives in EXPORT_REQUIREMENTS, and this function and
+ *   portfolioExportReadiness both read it, so the editor and the gate cannot disagree.
+ * ★ Link problems stay WARNINGS. An invalid CTA degrades to #contact and an invalid
+ *   phone still prints as text, so neither is a reason to refuse the file on its own.
  *
  * @param {object} draft
  * @returns {{ ok: boolean, fields: Record<string, {level:'error'|'warn', code:string, message:string}>, blocking: string[] }}
@@ -721,11 +817,11 @@ export function validateDraft(draft) {
   const fields = {};
   const add = (field, level, code, message) => { fields[field] = { level, code, message }; };
 
-  if (!d.fullName) add('fullName', 'error', 'required', 'Add your name — it headlines the portfolio and names the file.');
-  if (!d.title) add('title', 'warn', 'empty', 'A professional title tells a visitor what you do in three words.');
-  if (!d.heroHeadline) add('heroHeadline', 'warn', 'empty', 'The headline is the first line a prospect reads.');
+  for (const req of EXPORT_REQUIREMENTS) {
+    const miss = req.check(d);
+    if (miss) add(req.key, 'error', miss[0], miss[1]);
+  }
   if (!d.summary && d.education.length === 0) add('summary', 'warn', 'empty', 'Without a summary or any credentials the About section is skipped entirely.');
-  if (d.services.length === 0) add('services', 'warn', 'empty', 'With no services the portfolio never says what you actually do.');
 
   const emailCheck = mailtoHref(d.email);
   if (emailCheck.kind === 'invalid') add('email', 'warn', 'invalid', 'That email address is not valid, so no email link will appear.');
@@ -735,11 +831,10 @@ export function validateDraft(draft) {
   if (ctaCheck.kind === 'invalid') add('ctaLink', 'warn', ctaCheck.reason, `${ctaCheck.message} Until then the button scrolls to your contact section.`);
   const siteCheck = safeLinkHref(d.website);
   if (siteCheck.kind === 'invalid') add('website', 'warn', siteCheck.reason, siteCheck.message);
-  if (!d.email && !d.phone && siteCheck.kind !== 'external') {
-    add('contact', 'warn', 'unreachable', 'Add at least one way to reach you — a portfolio with no contact details cannot convert.');
-  }
 
-  const blocking = Object.keys(fields).filter((k) => fields[k].level === 'error');
+  // Registry order, not insertion order, so the review list always reads top to bottom.
+  const blocking = EXPORT_REQUIREMENTS.map((r) => r.key)
+    .filter((k) => fields[k] && fields[k].level === 'error');
   return { ok: blocking.length === 0, fields, blocking };
 }
 
@@ -987,6 +1082,22 @@ export function metricSuffix(suffix) {
 }
 
 /**
+ * A metric's FINAL display value — what the runtime counter lands on.
+ *
+ * ★ THE PDF HAS NO SCRIPT, so it cannot count up from zero; without this every metric
+ *   would print as "0+". The grouping regex is the runtime's own (PORTFOLIO_RUNTIME_JS),
+ *   so the paper and the website show the same digits.
+ *
+ * @param {unknown} value
+ * @param {unknown} suffix the raw suffix; spaced exactly as metricSuffix spaces it
+ * @returns {string}
+ */
+export function formatMetricValue(value, suffix) {
+  const n = Math.round(num(value, 0));
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',') + metricSuffix(suffix);
+}
+
+/**
  * One row of a financial statement.
  *
  * ★ THE LABEL IS A ROW HEADER, NOT A CELL. These are three tables of bare numbers, and
@@ -1027,28 +1138,47 @@ function eyebrow(text, centered) {
   return `<p class="eyebrow${centered ? ' center' : ''}">${esc(text)}</p>`;
 }
 
-function sectionPain(d) {
+// ── PDF-only markers ────────────────────────────────────────────────────────
+// ★ EVERY ONE RETURNS ITS INPUT UNCHANGED OUTSIDE PDF MODE, so the preview and the
+//   downloaded website are byte-identical to what they were before the PDF existed.
+//   `data-pdf-block` is a unit a page must not cut through; `data-pdf-keep` is a heading
+//   group the paginator keeps with the block after it.
+
+function pdfBlock(ctx) {
+  return ctx && ctx.pdf ? ' data-pdf-block' : '';
+}
+
+function heading(ctx, inner) {
+  return ctx && ctx.pdf ? `<div data-pdf-keep>${inner}</div>` : inner;
+}
+
+/** What to PRINT for a validated https href — paper cannot be hovered to see a URL. */
+function linkDisplay(href) {
+  return String(href || '').replace(/^https:\/\//, '').replace(/\/$/, '');
+}
+
+function sectionPain(d, ctx) {
   return `
     <section class="pain reveal">
       <div class="container">
-        ${eyebrow('Does this sound familiar?')}
-        <h2>If any of these keep you up at night, you’re exactly who I help.</h2>
+        ${heading(ctx, `${eyebrow('Does this sound familiar?')}
+        <h2>If any of these keep you up at night, you’re exactly who I help.</h2>`)}
         <div class="paingrid">
-          ${d.painPoints.map((p) => `<div class="paincard"><span class="x" aria-hidden="true">✕</span><p>${esc(p)}</p></div>`).join('')}
+          ${d.painPoints.map((p) => `<div class="paincard"${pdfBlock(ctx)}><span class="x" aria-hidden="true">✕</span><p>${esc(p)}</p></div>`).join('')}
         </div>
         <p class="painfoot">Good news: every one of these is fixable — and that’s the work I do every day.</p>
       </div>
     </section>`;
 }
 
-function sectionTransformations(d) {
+function sectionTransformations(d, ctx) {
   return `
     <section class="transform reveal">
       <div class="container">
-        ${eyebrow('The transformation', true)}
-        <h2 class="center">From messy books to money clarity</h2>
+        ${heading(ctx, `${eyebrow('The transformation', true)}
+        <h2 class="center">From messy books to money clarity</h2>`)}
         <div class="tfgrid">
-          ${d.transformations.map((tf) => `<div class="tfcard">
+          ${d.transformations.map((tf) => `<div class="tfcard"${pdfBlock(ctx)}>
             <div class="tside before"><span class="tlab">Before</span><p>${esc(tf.before)}</p></div>
             <div class="tarrow" aria-hidden="true">→</div>
             <div class="tside after"><span class="tlab">After</span><p>${esc(tf.after)}</p></div>
@@ -1058,33 +1188,60 @@ function sectionTransformations(d) {
     </section>`;
 }
 
-function sectionMetrics(d) {
+function sectionMetrics(d, ctx) {
+  const pdf = !!(ctx && ctx.pdf);
   return `
     <section class="metrics reveal">
-      <div class="container"><div class="mpanel"><div class="mgrid">
+      <div class="container"><div class="mpanel"${pdfBlock(ctx)}><div class="mgrid">
         ${d.metrics.map((m) => {
     const suffix = metricSuffix(m.suffix);
+    if (pdf) {
+      return `<div class="metric"><div class="num">${esc(formatMetricValue(m.value, m.suffix))}</div><div class="mlabel">${esc(m.label)}</div></div>`;
+    }
     return `<div class="metric"><div class="num" data-count="${esc(String(m.value))}" data-suffix="${esc(suffix)}">0${esc(suffix)}</div><div class="mlabel">${esc(m.label)}</div></div>`;
   }).join('')}
       </div></div></div>
     </section>`;
 }
 
-function sectionServices(d) {
+function sectionServices(d, ctx) {
   return `
     <section id="services" class="services reveal">
       <div class="container">
-        ${eyebrow('What I do for you', true)}
-        <h2 class="center">Services built around your peace of mind</h2>
+        ${heading(ctx, `${eyebrow('What I do for you', true)}
+        <h2 class="center">Services built around your peace of mind</h2>`)}
         <div class="svcgrid">
-          ${d.services.map((s, i) => `<div class="svc"><div class="svcnum">${String(i + 1).padStart(2, '0')}</div><h3>${esc(s.name)}</h3><p>${esc(s.desc)}</p></div>`).join('')}
+          ${d.services.map((s, i) => `<div class="svc"${pdfBlock(ctx)}><div class="svcnum">${String(i + 1).padStart(2, '0')}</div><h3>${esc(s.name)}</h3><p>${esc(s.desc)}</p></div>`).join('')}
         </div>
       </div>
     </section>`;
 }
 
-function sectionSamples(d) {
+function sectionSamples(d, ctx) {
   const fs = financialSampleRows();
+  if (ctx && ctx.pdf) {
+    // ★ PAPER HAS NO TABS. The website hides two of the three statements behind buttons;
+    //   a static document that did the same would silently drop the Balance Sheet and the
+    //   Cash Flow Statement. Each is printed as its own card with its own heading.
+    const statements = [
+      ['Profit &amp; Loss', fs.pl, 'Profit & Loss'],
+      ['Balance Sheet', fs.bs, 'Balance Sheet'],
+      ['Cash Flow Statement', fs.cf, 'Cash Flow Statement'],
+    ];
+    return `
+    <section id="samples" class="samples reveal">
+      <div class="container">
+        ${heading(ctx, `${eyebrow('Work samples', true)}
+        <h2 class="center">The reports you’ll get in your inbox every month</h2>
+        <p class="samplesub center">Clean, accurate, decision-ready financials — here’s the quality you can expect.</p>`)}
+        ${statements.map(([title, rows, name], i) => `<div class="stmtcard" data-pdf-block>
+          <div class="stmthead"><strong>${esc(d.sampleCompany)}</strong><span class="stmttitle">${title}</span><span>${esc(d.samplePeriod)}</span></div>
+          ${renderStatementTable(rows, name)}${i === statements.length - 1 ? `
+          <p class="stmtnote">Illustrative sample only — these are demonstration figures for a fictional company, not a real client’s results.</p>` : ''}
+        </div>`).join('\n        ')}
+      </div>
+    </section>`;
+  }
   return `
     <section id="samples" class="samples reveal">
       <div class="container">
@@ -1107,59 +1264,59 @@ function sectionSamples(d) {
     </section>`;
 }
 
-function renderEducation(d) {
+function renderEducation(d, ctx) {
   if (d.education.length === 0) return '';
   return `
-    <div class="edu">
+    <div class="edu"${pdfBlock(ctx)}>
       <h3>Education &amp; certifications</h3>
       <ul>${d.education.map((e) => `<li><strong>${esc(e.credential)}</strong>${e.detail ? ` — ${esc(e.detail)}` : ''}</li>`).join('')}</ul>
     </div>`;
 }
 
-function renderPhoto(d) {
+function renderPhoto(d, ctx) {
   if (d.photo && isSafePhotoDataUrl(d.photo)) {
-    return `<div class="abphoto"><img src="${esc(d.photo)}" alt="${esc(d.fullName || 'Portrait')}"></div>`;
+    return `<div class="abphoto"${pdfBlock(ctx)}><img src="${esc(d.photo)}" alt="${esc(d.fullName || 'Portrait')}"></div>`;
   }
-  return `<div class="abphoto ph"><span aria-hidden="true">${esc(initials(d.fullName))}</span></div>`;
+  return `<div class="abphoto ph"${pdfBlock(ctx)}><span aria-hidden="true">${esc(initials(d.fullName))}</span></div>`;
 }
 
-function sectionAbout(d) {
+function sectionAbout(d, ctx) {
   return `
     <section id="about" class="about reveal">
       <div class="container abgrid">
         <div class="abtext">
-          ${eyebrow(`About ${firstName(d)}`)}
-          <h2>More than a bookkeeper — a partner who keeps your numbers honest.</h2>
+          ${heading(ctx, `${eyebrow(`About ${firstName(d)}`)}
+          <h2>More than a bookkeeper — a partner who keeps your numbers honest.</h2>`)}
           ${d.summary ? `<p>${esc(d.summary)}</p>` : ''}
-          ${renderEducation(d)}
+          ${renderEducation(d, ctx)}
         </div>
-        ${renderPhoto(d)}
+        ${renderPhoto(d, ctx)}
       </div>
     </section>`;
 }
 
-function sectionTools(d) {
+function sectionTools(d, ctx) {
   return `
     <section id="tools" class="tools reveal">
       <div class="container">
         ${/* A LITERAL ampersand: eyebrow() escapes its argument, so an &amp; here
               would be escaped a second time and the client would read the entity. */ ''}
-        ${eyebrow('Tools & proficiency', true)}
-        <h2 class="center">The stack I work in</h2>
+        ${heading(ctx, `${eyebrow('Tools & proficiency', true)}
+        <h2 class="center">The stack I work in</h2>`)}
         <div class="toolgrid">
-          ${d.tools.map((t) => `<div class="tool"><div class="tlabel"><span>${esc(t.name)}</span><span>${esc(String(t.level))}%</span></div><div class="bar"><i style="--w:${esc(String(t.level))}%"></i></div></div>`).join('')}
+          ${d.tools.map((t) => `<div class="tool"${pdfBlock(ctx)}><div class="tlabel"><span>${esc(t.name)}</span><span>${esc(String(t.level))}%</span></div><div class="bar"><i style="--w:${esc(String(t.level))}%"></i></div></div>`).join('')}
         </div>
       </div>
     </section>`;
 }
 
-function sectionIndustries(d) {
+function sectionIndustries(d, ctx) {
   return `
     <section class="industries reveal">
       <div class="container center">
-        ${eyebrow('Industries I know', true)}
-        <h2 class="center">Experience across the businesses you run</h2>
-        <div class="indwrap">${d.industries.map((i) => `<span class="indchip">${esc(i)}</span>`).join('')}</div>
+        ${heading(ctx, `${eyebrow('Industries I know', true)}
+        <h2 class="center">Experience across the businesses you run</h2>`)}
+        <div class="indwrap"${pdfBlock(ctx)}>${d.industries.map((i) => `<span class="indchip">${esc(i)}</span>`).join('')}</div>
       </div>
     </section>`;
 }
@@ -1168,28 +1325,28 @@ function sectionPackages(d, ctx) {
   return `
     <section id="packages" class="packages reveal">
       <div class="container">
-        ${eyebrow('Packages', true)}
-        <h2 class="center">Simple, transparent pricing</h2>
+        ${heading(ctx, `${eyebrow('Packages', true)}
+        <h2 class="center">Simple, transparent pricing</h2>`)}
         <div class="pkggrid">
-          ${d.packages.map((p) => `<div class="pkg${p.featured ? ' feat' : ''}">${p.featured ? '<span class="badge">Most popular</span>' : ''}
+          ${d.packages.map((p) => `<div class="pkg${p.featured ? ' feat' : ''}"${pdfBlock(ctx)}>${p.featured ? '<span class="badge">Most popular</span>' : ''}
             <h3>${esc(p.name)}</h3>
             <div class="price">${esc(p.price)}<small>${esc(p.period)}</small></div>
             <ul>${p.features.filter((f) => f.trim()).map((f) => `<li>${esc(f)}</li>`).join('')}</ul>
-            <a href="${esc(ctx.cta)}"${ctx.ctaRel} class="pkgcta">Get started</a>
+            <a href="${esc(ctx.cta)}"${ctx.ctaRel}${ctx.ctaLinkMark} class="pkgcta">Get started</a>
           </div>`).join('')}
         </div>
       </div>
     </section>`;
 }
 
-function sectionTestimonials(d) {
+function sectionTestimonials(d, ctx) {
   return `
     <section class="testi reveal">
       <div class="container">
-        ${eyebrow('In their words', true)}
-        <h2 class="center">Owners who stopped worrying about their books</h2>
+        ${heading(ctx, `${eyebrow('In their words', true)}
+        <h2 class="center">Owners who stopped worrying about their books</h2>`)}
         <div class="tgrid">
-          ${d.testimonials.map((t) => `<figure class="quote"><div class="qm" aria-hidden="true">&ldquo;</div><blockquote>${esc(t.quote)}</blockquote><figcaption><strong>${esc(t.name)}</strong><span>${esc(t.role)}</span></figcaption></figure>`).join('')}
+          ${d.testimonials.map((t) => `<figure class="quote"${pdfBlock(ctx)}><div class="qm" aria-hidden="true">&ldquo;</div><blockquote>${esc(t.quote)}</blockquote><figcaption><strong>${esc(t.name)}</strong><span>${esc(t.role)}</span></figcaption></figure>`).join('')}
         </div>
       </div>
     </section>`;
@@ -1224,16 +1381,20 @@ function navLinks(live, ctx) {
   return items.join('');
 }
 
-function contactLinks(d) {
+function contactLinks(d, ctx) {
+  const pdf = !!(ctx && ctx.pdf);
+  // ★ Only hrefs synthesised by mailtoHref / telHref / safeLinkHref are ever marked, so
+  //   the PDF link annotations can only point where the website's links already point.
+  const mark = pdf ? ' data-pdf-link' : '';
   const out = [];
   const mail = mailtoHref(d.email);
-  if (mail.kind === 'mailto') out.push(`<a href="${esc(mail.href)}">${esc(mail.label)}</a>`);
+  if (mail.kind === 'mailto') out.push(`<a href="${esc(mail.href)}"${mark}>${esc(mail.label)}</a>`);
   const tel = telHref(d.phone);
-  if (tel.kind === 'tel') out.push(`<a href="${esc(tel.href)}">${esc(tel.label)}</a>`);
+  if (tel.kind === 'tel') out.push(`<a href="${esc(tel.href)}"${mark}>${esc(tel.label)}</a>`);
   else if (tel.kind === 'invalid') out.push(`<span>${esc(tel.label)}</span>`);
   const site = safeLinkHref(d.website);
   if (site.kind === 'external') {
-    out.push(`<a href="${esc(site.href)}" target="_blank" rel="noopener noreferrer">${esc(site.host)}</a>`);
+    out.push(`<a href="${esc(site.href)}" target="_blank" rel="noopener noreferrer"${mark}>${esc(pdf ? linkDisplay(site.href) : site.host)}</a>`);
   }
   return out.join('');
 }
@@ -1246,28 +1407,35 @@ function sectionNav(d, ctx, links) {
 </div></nav>`;
 }
 
+/** The PDF's static identity band. A sticky nav of in-page links means nothing on paper. */
+function sectionPdfHeader(d) {
+  return `<header class="pdfhead" data-pdf-block><div class="container">
+  <span class="logo"><i aria-hidden="true"></i>${esc(displayName(d) || 'Your Name')}</span>${d.title ? `<span class="pdfrole">${esc(d.title)}</span>` : ''}
+</div></header>`;
+}
+
 function sectionHero(d, ctx) {
-  return `<header class="hero">
+  return `<header class="hero"${pdfBlock(ctx)}>
   <div class="container">
     <div class="avail"><span class="pulse" aria-hidden="true"></span> Available for new clients${d.location ? ` · ${esc(d.location)}` : ''}</div>
     <h1>${esc(d.heroHeadline || 'Clean books. Clear numbers. Zero stress.')}</h1>
     ${d.heroSub ? `<p class="sub">${esc(d.heroSub)}</p>` : ''}
     <div class="actions">
-      <a class="btn-primary" href="${esc(ctx.cta)}"${ctx.ctaRel}>${esc(ctx.ctaText)}</a>
-      ${d.services.length ? '<a class="btn-outline" href="#services">See how I help →</a>' : ''}
-    </div>
+      <a class="btn-primary" href="${esc(ctx.cta)}"${ctx.ctaRel}${ctx.ctaLinkMark}>${esc(ctx.ctaText)}</a>
+      ${d.services.length && !ctx.pdf ? '<a class="btn-outline" href="#services">See how I help →</a>' : ''}
+    </div>${ctx.pdf && ctx.ctaDisplay ? `\n    <p class="pdfdest">${esc(ctx.ctaDisplay)}</p>` : ''}
   </div>
 </header>`;
 }
 
 function sectionContact(d, ctx) {
-  const links = contactLinks(d);
+  const links = contactLinks(d, ctx);
   return `<section id="contact" class="contact reveal">
-  <div class="container"><div class="cpanel"><div class="cinner">
+  <div class="container"><div class="cpanel"${pdfBlock(ctx)}><div class="cinner">
     <p class="eyebrow center glowtext">Let’s talk</p>
     <h2>Ready to stop worrying about your books?</h2>
     <p class="lead">Book a quick, no-pressure call and let’s see if we’re a fit.</p>
-    <a class="btn-primary inline" href="${esc(ctx.cta)}"${ctx.ctaRel}>${esc(ctx.ctaText)}</a>
+    <a class="btn-primary inline" href="${esc(ctx.cta)}"${ctx.ctaRel}${ctx.ctaLinkMark}>${esc(ctx.ctaText)}</a>${ctx.pdf && ctx.ctaDisplay ? `\n    <p class="pdfdest">${esc(ctx.ctaDisplay)}</p>` : ''}
     ${links ? `<div class="contactlinks">${links}</div>` : ''}
   </div></div></div>
 </section>`;
@@ -1275,7 +1443,7 @@ function sectionContact(d, ctx) {
 
 function sectionFooter(d, ctx) {
   const who = displayName(d) || 'Your Name';
-  return `<footer>© <span id="yr">${esc(String(ctx.year))}</span> ${esc(who)} · ${esc(d.title || 'Bookkeeping & Accounting')}</footer>`;
+  return `<footer${pdfBlock(ctx)}>© <span id="yr">${esc(String(ctx.year))}</span> ${esc(who)} · ${esc(d.title || 'Bookkeeping & Accounting')}</footer>`;
 }
 
 function backdrop() {
@@ -1530,6 +1698,67 @@ export const PREVIEW_CSS = `
 `;
 
 /**
+ * The static-state stylesheet for the PDF capture document. Appended AFTER
+ * PORTFOLIO_CSS in pdf mode only; a frozen constant with no interpolation.
+ *
+ * Every line answers something html2canvas 1.4.1 cannot do, or something a script would
+ * normally do and the PDF document has no script to do:
+ *
+ * ★ `min-height:0` IS LOAD-BEARING. PORTFOLIO_CSS gives `body` `min-height:100vh`, and the
+ *   capture frame starts very tall so nothing wraps while it is measured — so without
+ *   this the body would report the FRAME's height as the content height and the PDF
+ *   would be twenty pages of empty background.
+ * ★ `overflow:hidden` stops a classic scrollbar stealing layout width during measurement,
+ *   which would re-wrap every line once the frame is resized to fit.
+ * ★ backdrop-filter and filter:blur are not painted by html2canvas at all, so the orbs
+ *   would print as hard-edged discs; they are removed, and glass is flattened explicitly
+ *   so the screen and the capture agree.
+ * ★ box-shadow is removed because the spike MEASURED it, not because it was assumed:
+ *   html2canvas 1.4.1 painted every blurred card shadow as a solid, notch-cornered frame
+ *   around the glass cards, the metrics band and the contact panel.
+ * ★ `.reveal` and `.bar i` are the two states the runtime normally flips.
+ * ★ The flex + `gap` restatements follow the Training Agreement's measured experience
+ *   (src/BookkeeperPro.jsx AgreementDocInner): html2canvas positions text from the
+ *   element box rather than the flex line, and carries no handling for flex gap. Grid
+ *   gaps DO come out right, so the grids are left alone.
+ */
+export const PDF_CSS = `
+    html,body{background:var(--pg2);overflow:hidden;min-height:0!important;height:auto}
+    html{scroll-behavior:auto}
+    *,*:before,*:after{animation:none!important;transition:none!important;-webkit-backdrop-filter:none!important;backdrop-filter:none!important;box-shadow:none!important}
+    .orb,.bgwrap,.hero:after{display:none}
+    .reveal{opacity:1;transform:none}
+    .bar i{width:var(--w)}
+    section{padding:44px 0}
+    .pdfhead{background:linear-gradient(150deg,var(--d1),var(--d2));border-bottom:1px solid var(--glassBrd)}
+    .pdfhead .container{padding:16px 24px}
+    .pdfhead .logo{display:inline-block;vertical-align:middle;font-weight:800;font-size:16px;color:#fff}
+    .pdfhead .logo i{display:inline-block;vertical-align:middle;width:11px;height:11px;margin:0 9px 2px 0;background:var(--accent);border-radius:3px}
+    .pdfhead .pdfrole{display:inline-block;vertical-align:middle;margin-left:14px;font-size:13px;font-weight:600;color:rgba(255,255,255,.82)}
+    .hero{padding:64px 0 72px}
+    .hero .avail{display:inline-block}
+    .hero .avail .pulse{display:inline-block;vertical-align:middle;margin:0 8px 2px 0}
+    .hero .actions{display:block}
+    .hero .actions .btn-primary{display:inline-block}
+    .pdfdest{margin-top:12px;font-size:13px;color:rgba(255,255,255,.85);overflow-wrap:anywhere}
+    .contact .pdfdest{color:var(--glow-on-panel)}
+    .paincard{display:block}
+    .paincard .x{float:left;margin-right:12px}
+    .paincard p{overflow:hidden}
+    .tlabel{display:block;overflow:hidden}
+    .tlabel span:first-child{float:left}
+    .tlabel span:last-child{float:right}
+    .indwrap{display:block}
+    .indchip{display:inline-block;margin:5px}
+    .pkg{display:block}
+    .pkg ul{flex:none}
+    .contactlinks{display:block}
+    .contactlinks a,.contactlinks span{display:inline-block;margin:0 13px 8px}
+    .stmtcard + .stmtcard{margin-top:22px}
+    .svc:hover,.btn-primary:hover{transform:none}
+`;
+
+/**
  * The runtime the generated document ships with.
  *
  * ★ A FROZEN CONSTANT WITH NO INTERPOLATION. No user value reaches the inline
@@ -1662,6 +1891,16 @@ const CSP_DOWNLOAD = "default-src 'none'; img-src data: https:; style-src 'unsaf
   + "script-src 'unsafe-inline'; font-src https: data:; object-src 'none'; connect-src 'none'; "
   + "base-uri 'none'; form-action 'none'";
 
+/**
+ * ★ THE PDF CAPTURE DOCUMENT MAY EXECUTE NOTHING. It is rendered inside the app's own
+ *   origin (html2canvas must read its DOM), so `script-src 'none'` is the non-script
+ *   contract that makes that safe — belt and braces beside the frame's sandbox, and the
+ *   whole contract if a browser ever forces the sandbox off. It needs no network either:
+ *   the only image is the re-encoded data: photo, and fonts are system fonts.
+ */
+const CSP_PDF = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; "
+  + "script-src 'none'; object-src 'none'; connect-src 'none'; base-uri 'none'; form-action 'none'";
+
 function clampScroll(y) {
   return clamp(Math.round(num(y, 0)), 0, 200000);
 }
@@ -1672,7 +1911,7 @@ function documentHead(d, ctx) {
     || (d.fullName ? `Professional bookkeeping services by ${d.fullName}` : 'Professional bookkeeping services');
   return `<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="${ctx.mode === 'preview' ? CSP_PREVIEW : CSP_DOWNLOAD}">
+<meta http-equiv="Content-Security-Policy" content="${ctx.mode === 'preview' ? CSP_PREVIEW : ctx.mode === 'pdf' ? CSP_PDF : CSP_DOWNLOAD}">
 <title>${esc(title)} — ${esc(d.title || 'Bookkeeper')}</title>
 <meta name="description" content="${esc(description)}">
 <meta name="robots" content="index,follow">
@@ -1682,11 +1921,15 @@ function documentHead(d, ctx) {
 function buildContext(d, options) {
   const opts = options || {};
   const theme = resolveTheme(opts.theme);
-  const mode = opts.mode === 'preview' ? 'preview' : 'download';
+  const mode = opts.mode === 'preview' || opts.mode === 'pdf' ? opts.mode : 'download';
   const cta = safeLinkHref(d.ctaLink);
   return {
     theme,
     mode,
+    pdf: mode === 'pdf',
+    // Empty outside pdf mode, so the website's CTA markup is byte-identical.
+    ctaLinkMark: mode === 'pdf' && cta.kind === 'external' ? ' data-pdf-link' : '',
+    ctaDisplay: cta.kind === 'external' ? linkDisplay(cta.href) : '',
     year: clamp(Math.round(num(opts.year, 2026)), 1970, 9999),
     scrollY: clampScroll(opts.scrollY),
     // ★ ONE resolved CTA for all four places the artifact interpolated ctaLink
@@ -1703,10 +1946,13 @@ function buildContext(d, options) {
  * Render the complete standalone portfolio document.
  *
  * @param {object} draft
- * @param {{ theme?: unknown, mode?: 'preview'|'download', year?: number, scrollY?: number }} [options]
+ * @param {{ theme?: unknown, mode?: 'preview'|'download'|'pdf', year?: number, scrollY?: number }} [options]
  *   `theme` is a resolved theme object or a key already looked up by the caller —
  *   this module cannot see PORTFOLIO_THEMES, so an unrecognised value becomes
  *   FALLBACK_THEME rather than broken CSS. `year` is a PARAMETER: see the header.
+ *   `pdf` is the static capture document for the PDF export: no script, a
+ *   `script-src 'none'` policy, every section visible, all three statements printed,
+ *   and `data-pdf-*` markers for the paginator. It is never shipped as a file itself.
  * @returns {string} a complete `<!DOCTYPE html>` document
  */
 export function buildPortfolioHtml(draft, options) {
@@ -1714,22 +1960,26 @@ export function buildPortfolioHtml(draft, options) {
   const ctx = buildContext(d, options);
   const live = PORTFOLIO_SECTIONS.filter((s) => s.has(d));
   const preview = ctx.mode === 'preview';
+  const pdf = ctx.pdf;
+  const styles = pdf
+    ? `${themeCssVars(ctx.theme)}${PORTFOLIO_CSS}${PDF_CSS}`
+    : `${themeCssVars(ctx.theme)}${PORTFOLIO_CSS}${REDUCED_MOTION_CSS}${preview ? PREVIEW_CSS : ''}`;
   return [
     '<!DOCTYPE html>',
     '<html lang="en">',
     '<head>',
     documentHead(d, ctx),
-    `<style>${themeCssVars(ctx.theme)}${PORTFOLIO_CSS}${REDUCED_MOTION_CSS}${preview ? PREVIEW_CSS : ''}</style>`,
+    `<style>${styles}</style>`,
     '</head>',
     `<body${preview ? ` data-pf-scroll="${ctx.scrollY}"` : ''}>`,
-    backdrop(),
-    sectionNav(d, ctx, navLinks(live, ctx)),
+    pdf ? '' : backdrop(),
+    pdf ? sectionPdfHeader(d) : sectionNav(d, ctx, navLinks(live, ctx)),
     sectionHero(d, ctx),
     ...live.map((s) => s.render(d, ctx)),
     sectionContact(d, ctx),
     sectionFooter(d, ctx),
     preview ? '<p class="pf-linknote">Preview — links open normally in the downloaded file.</p>' : '',
-    `<script>${PORTFOLIO_RUNTIME_JS}${preview ? PREVIEW_RUNTIME_JS : ''}<\/script>`,
+    pdf ? '' : `<script>${PORTFOLIO_RUNTIME_JS}${preview ? PREVIEW_RUNTIME_JS : ''}<\/script>`,
     '</body>',
     '</html>',
   ].filter((part) => part !== '').join('\n');
@@ -1751,7 +2001,8 @@ export function draftCompletion(draft) {
   const identity = [
     { key: 'identity', label: 'Name and title', done: !!d.fullName && !!d.title },
     { key: 'hero', label: 'Headline', done: !!d.heroHeadline },
-    { key: 'contact', label: 'Contact details', done: mailtoHref(d.email).kind === 'mailto' || telHref(d.phone).kind === 'tel' },
+    // ★ The export gate's own definition, so the meter and the dialog cannot disagree.
+    { key: 'contact', label: 'Contact details', done: contactSatisfied(d) },
   ];
   const sections = identity.concat(
     PORTFOLIO_SECTIONS.map((s) => ({ key: s.key, label: s.label, done: !!s.has(d) })),
@@ -1768,11 +2019,15 @@ export function draftCompletion(draft) {
  * ★ The artifact hardcoded "index.html", so every download collided in the
  *   browser's downloads folder and none of them said whose portfolio it was.
  *
+ * ★ The extension is an ALLOWLIST, never interpolated: anything but 'pdf' is 'html', so no
+ *   caller value can put a path separator or a second extension into a download name.
+ *
  * @param {object} draft
  * @param {string} isoDate `YYYY-MM-DD`
+ * @param {'html'|'pdf'} [extension] defaults to 'html'
  * @returns {string}
  */
-export function portfolioFileName(draft, isoDate) {
+export function portfolioFileName(draft, isoDate, extension) {
   const d = normalizeDraft(draft);
   // NFKD folds "José" to "Jose" rather than dropping the letter. Guarded because
   // String.prototype.normalize is absent on a few very old engines.
@@ -1787,7 +2042,289 @@ export function portfolioFileName(draft, isoDate) {
     .slice(0, 60)
     .replace(/-+$/, '');
   const date = /^\d{4}-\d{2}-\d{2}$/.test(String(isoDate || '')) ? `-${isoDate}` : '';
-  return `${name || 'portfolio'}-bookkeeper-portfolio${date}.html`;
+  const ext = extension === 'pdf' ? 'pdf' : 'html';
+  return `${name || 'portfolio'}-bookkeeper-portfolio${date}.${ext}`;
+}
+
+// ── The export gate ─────────────────────────────────────────────────────────
+
+/**
+ * True when the draft holds something the student actually wrote for a client to read.
+ *
+ * ★ NOT draftHasContent, AND THE DIFFERENCE IS THE POINT. draftHasContent answers "has
+ *   this person touched the form?" for the résumé prompt and the autosave, so a changed
+ *   theme, a rewritten CTA label, a blank repeater row and the PREFILLED profile name all
+ *   count there. None of them is a portfolio. This excludes exactly those: the name
+ *   (which may be the prefill), every default-carrying setting, and rows with no text.
+ */
+function authoredSubstance(d) {
+  for (const key of ['industry', 'credentials', 'title', 'location', 'email', 'phone',
+    'website', 'photo', 'heroHeadline', 'heroSub', 'summary', 'ctaLink']) {
+    if (d[key]) return true;
+  }
+  // normalize already drops empty pain points and industries.
+  if (d.painPoints.length || d.industries.length) return true;
+  const rowHasText = (row) => Object.values(row).some((v) => (
+    typeof v === 'string' ? v !== '' : Array.isArray(v) ? v.some((x) => x !== '') : false
+  ));
+  for (const key of ['transformations', 'services', 'packages', 'testimonials', 'education']) {
+    if (d[key].some(rowHasText)) return true;
+  }
+  if (d.tools.some((t) => t.name)) return true;
+  return d.metrics.some((m) => m.label);
+}
+
+const OMITTED_LINK_COPY = Object.freeze([
+  {
+    field: 'email',
+    label: 'Contact email',
+    invalid: (d) => mailtoHref(d.email).kind === 'invalid',
+    message: 'This email address isn’t valid, so it won’t appear in your portfolio.',
+  },
+  {
+    field: 'phone',
+    label: 'Contact phone',
+    invalid: (d) => telHref(d.phone).kind === 'invalid',
+    message: 'This phone number will show as plain text, but visitors won’t be able to tap it to call.',
+  },
+  {
+    field: 'website',
+    label: 'Website / LinkedIn',
+    invalid: (d) => safeLinkHref(d.website).kind === 'invalid',
+    message: 'This website or LinkedIn link can’t be used, so it won’t appear.',
+  },
+  {
+    field: 'ctaLink',
+    label: 'Button link',
+    invalid: (d) => safeLinkHref(d.ctaLink).kind === 'invalid',
+    message: 'Your button link can’t be used, so the button will scroll to your contact section instead.',
+  },
+]);
+
+/**
+ * Whether a draft may be exported, and what to tell the student when it may not.
+ *
+ * ★ FOUR STATES, CHECKED IN THIS ORDER:
+ *   - `empty`   nothing authored beyond defaults and the prefilled name — also blocked;
+ *   - `blocked` at least one EXPORT_REQUIREMENT is unmet — no download action exists;
+ *   - `warning` exportable, but something needs an explicit acknowledgement: fields that
+ *               still hold the shipped example, or a filled-in link that will be dropped;
+ *   - `ready`   exportable; `notes` lists optional sections still missing, which never
+ *               block and never need acknowledging.
+ * ★ `staleSampleFields` REUSES sampleFieldsStillPresent rather than restating it, so the
+ *   per-item comparison that guards against a partially edited testimonial list is the
+ *   same guard here as everywhere else.
+ *
+ * @param {object} draft
+ * @param {{ sample?: object }} [options] the SAMPLE_DRAFT, when the caller has it
+ * @returns {{
+ *   ok: boolean, state: 'empty'|'blocked'|'warning'|'ready',
+ *   fields: object,
+ *   blocking: {key:string,label:string,code:string,message:string}[],
+ *   firstBlocking: {key:string,label:string,code:string,message:string}|null,
+ *   warnings: object[], notes: {key:string,label:string,message:string}[],
+ *   hasSubstantiveContent: boolean, staleSampleFields: string[],
+ * }}
+ */
+export function portfolioExportReadiness(draft, options) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const d = normalizeDraft(draft);
+  const v = validateDraft(d);
+  const labels = Object.fromEntries(EXPORT_REQUIREMENTS.map((r) => [r.key, r.label]));
+  const blocking = v.blocking.map((key) => ({
+    key, label: labels[key], code: v.fields[key].code, message: v.fields[key].message,
+  }));
+  const hasSubstantiveContent = authoredSubstance(d);
+
+  const staleSampleFields = opts.sample ? sampleFieldsStillPresent(d, opts.sample) : [];
+  const warnings = [];
+  if (staleSampleFields.length) {
+    warnings.push({
+      key: 'sample',
+      label: 'Example content',
+      items: staleSampleFields,
+      message: 'Publishing invented testimonials, results or credentials as your own is misrepresentation, and the first prospect who checks is the one you most wanted.',
+    });
+  }
+  // ★ Only when contact is otherwise met. When nothing reaches the author the invalid
+  //   value is the reason for a BLOCKER, and listing it twice would read as two problems.
+  if (contactSatisfied(d)) {
+    for (const link of OMITTED_LINK_COPY) {
+      if (link.invalid(d)) {
+        warnings.push({ key: 'omittedLink', field: link.field, label: link.label, message: link.message });
+      }
+    }
+  }
+
+  const notes = [];
+  const note = (key, label, message) => notes.push({ key, label, message });
+  if (!d.summary && d.education.length === 0) note('about', 'About you', 'No summary or credentials yet, so the About section is left out.');
+  const named = namedServices(d);
+  if (named.length && named.some((s) => !s.desc)) note('serviceDescriptions', 'Service descriptions', 'Some services have no description yet.');
+  if (!d.photo) note('photo', 'Photo', 'No photo, so your initials are shown instead.');
+  if (d.packages.length === 0) note('packages', 'Packages & rates', 'No packages, so the pricing section is left out.');
+  if (d.metrics.length === 0) note('metrics', 'Results & key numbers', 'No results yet, so the numbers band is left out.');
+  if (d.testimonials.length === 0) note('testimonials', 'Testimonials', 'No testimonials yet, so that section is left out.');
+
+  const ok = blocking.length === 0;
+  const state = !hasSubstantiveContent ? 'empty'
+    : !ok ? 'blocked'
+      : warnings.length ? 'warning' : 'ready';
+  return {
+    ok,
+    state,
+    fields: v.fields,
+    blocking,
+    firstBlocking: blocking[0] || null,
+    warnings,
+    notes,
+    hasSubstantiveContent,
+    staleSampleFields,
+  };
+}
+
+const EXPORT_FORMATS = Object.freeze({
+  html: Object.freeze({ mode: 'download', ext: 'html', mimeType: 'text/html' }),
+  pdf: Object.freeze({ mode: 'pdf', ext: 'pdf', mimeType: 'application/pdf' }),
+});
+
+/**
+ * THE one gate both download formats go through.
+ *
+ * ★ IT REFUSES BEFORE IT BUILDS. A refused plan carries no `html`, no `fileName` and no
+ *   `mimeType`, so a blocked draft has nothing a click handler could download even if the
+ *   component forgot to check — the guarantee is structural, not a habit.
+ * ★ `acknowledged` must be exactly `true`. A warning (example content, an omitted link)
+ *   is only exportable after the student has seen and accepted it.
+ *
+ * @param {object} draft
+ * @param {{ format: 'html'|'pdf', sample?: object, theme?: unknown, year?: number,
+ *           isoDate?: string, acknowledged?: boolean }} options
+ * @returns {{ ok: false, reason: 'unknown-format'|'blocked'|'needs-acknowledgement', readiness: object }
+ *         | { ok: true, readiness: object, format: 'html'|'pdf', fileName: string, mimeType: string, html: string }}
+ */
+export function planPortfolioExport(draft, options) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const readiness = portfolioExportReadiness(draft, { sample: opts.sample });
+  const format = typeof opts.format === 'string'
+    && Object.prototype.hasOwnProperty.call(EXPORT_FORMATS, opts.format) ? opts.format : null;
+  if (!format) return { ok: false, reason: 'unknown-format', readiness };
+  if (!readiness.ok) return { ok: false, reason: 'blocked', readiness };
+  if (readiness.state === 'warning' && opts.acknowledged !== true) {
+    return { ok: false, reason: 'needs-acknowledgement', readiness };
+  }
+  const spec = EXPORT_FORMATS[format];
+  const d = normalizeDraft(draft);
+  return {
+    ok: true,
+    readiness,
+    format,
+    fileName: portfolioFileName(d, opts.isoDate, spec.ext),
+    mimeType: spec.mimeType,
+    html: buildPortfolioHtml(d, { theme: opts.theme, mode: spec.mode, year: opts.year }),
+  };
+}
+
+// ── PDF geometry and pagination ─────────────────────────────────────────────
+
+/** A4 portrait at 96 CSS px per inch — the width the capture document is laid out at. */
+export const PF_PDF_WIDTH_PX = 794;
+export const PF_PDF_PAGE_WIDTH_PT = 595.28;
+export const PF_PDF_PAGE_HEIGHT_PT = 841.89;
+/** Top and bottom band, in points; it carries the page number. */
+export const PF_PDF_MARGIN_PT = 28;
+/**
+ * Content height of one page in CSS px.
+ *
+ * ★ DERIVED, NEVER TYPED, and NOT the 1123px an A4 page is at 96dpi. The bands take
+ *   2 × 28pt, so a slice planned at 1123px would be squashed or run into the page number.
+ */
+export const PF_PDF_PAGE_PX = Math.floor(
+  ((PF_PDF_PAGE_HEIGHT_PT - 2 * PF_PDF_MARGIN_PT) * PF_PDF_WIDTH_PX) / PF_PDF_PAGE_WIDTH_PT,
+);
+/** A portfolio longer than this is refused with a message, never silently cut off. */
+export const PF_PDF_MAX_PAGES = 25;
+
+/** A remainder this small is merged into the page above rather than printed alone. */
+const PDF_MERGE_PX = 2;
+
+/**
+ * Where each PDF page starts and ends, in CSS px of the capture document.
+ *
+ * ★ `keep` ARE FORBIDDEN INTERVALS, NOT SAFE STOPS. A cut may not land strictly inside
+ *   one. Intervals — rather than the Training Agreement's list of safe break points —
+ *   are what make a two-column grid work: two cards side by side are two intervals with
+ *   the same top, and a cut between rows is outside both without anyone registering it.
+ * ★ A MOVED CUT IS RE-CHECKED. Moving the cut to the top of a card can land it inside the
+ *   heading group above that card, so the scan repeats until nothing straddles the cut.
+ *   Every move strictly decreases the cut, and a cut never moves to or above the page
+ *   start, so it terminates.
+ * ★ `minFill` STOPS A NEARLY EMPTY PAGE. A tall block just below the page top would
+ *   otherwise move the cut to 40px and print a page holding one line.
+ * ★ THE REAL HEIGHT, ALWAYS. Truncation is reported, never applied silently — the caller
+ *   refuses the export with a message instead of shipping half a portfolio.
+ *
+ * @param {{ contentHeight: number, pageHeight: number, keep?: {top:number,bottom:number}[],
+ *           minFill?: number, maxPages?: number }} input
+ * @returns {{ pages: {start:number,end:number}[], truncated: boolean }}
+ */
+export function planPdfPages(input) {
+  const o = input && typeof input === 'object' ? input : {};
+  const H = Math.round(num(o.contentHeight, 0));
+  const P = Math.floor(num(o.pageHeight, 0));
+  if (!(H > 0) || !(P > 0)) return { pages: [], truncated: false };
+  const maxPages = clamp(Math.round(num(o.maxPages, PF_PDF_MAX_PAGES)), 1, 1000);
+  const minFill = clamp(num(o.minFill, 0.2), 0, 0.9);
+  const keep = (Array.isArray(o.keep) ? o.keep : [])
+    .map((k) => ({
+      top: Math.floor(num(k && k.top, NaN)),
+      bottom: Math.ceil(num(k && k.bottom, NaN)),
+    }))
+    .filter((k) => Number.isFinite(k.top) && Number.isFinite(k.bottom) && k.bottom > k.top);
+
+  const pages = [];
+  let start = 0;
+  while (start < H) {
+    if (pages.length >= maxPages) return { pages, truncated: true };
+    let end = start + P;
+    if (end >= H - PDF_MERGE_PX) {
+      pages.push({ start, end: H });
+      break;
+    }
+    const floor = start + minFill * P;
+    let moved = true;
+    while (moved) {
+      moved = false;
+      for (const k of keep) {
+        if (k.top < end && k.bottom > end && k.bottom - k.top <= P && k.top > start && k.top >= floor) {
+          end = k.top;
+          moved = true;
+          break;
+        }
+      }
+    }
+    pages.push({ start, end });
+    start = end;
+  }
+  return { pages, truncated: false };
+}
+
+/**
+ * The PDF page's margin bands and page-number colour for a theme.
+ *
+ * ★ The band is the theme's flat `pg2`, which PDF_CSS also makes the document
+ *   background, so a band never reads as a seam. The number colour is chosen by
+ *   contrast rather than per theme, like every other derived colour in this file.
+ *
+ * @param {unknown} theme
+ * @returns {{ background: string, text: string }}
+ */
+export function pdfPageChrome(theme) {
+  const t = isTheme(theme) ? theme : FALLBACK_THEME;
+  const dark = t.mode === 'dark';
+  const soft = dark ? '#9db0c6' : '#5f7488';
+  const head = dark ? '#ffffff' : '#12213b';
+  return { background: t.pg2, text: pickReadable([soft, head], t.pg2, 4.5) };
 }
 
 // ── Résumé parsing ──────────────────────────────────────────────────────────
