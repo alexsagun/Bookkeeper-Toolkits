@@ -195,9 +195,18 @@ for (const [label, sqlOf] of SOURCES) {
     const catalog = s.slice(at, s.indexOf('$cat$;', at));
     assert.equal((catalog.match(/^ {4}\('[A-Z0-9_]+',/gm) || []).length, 112,
       'the catalog is not 112 codes');
-    for (const code of APP_ERROR_CODES) {
-      if (code === 'MIGRATION_MISSING') continue;   // client-synthesised, never raised by SQL
-      assert.ok(catalog.includes(`('${code}'`), `${code} fell out of the restated catalog`);
+    // ★ THIS ITERATES #63'S OWN CATALOG, NOT APP_ERROR_CODES, AND THAT DIRECTION IS THE
+    //   POINT. It used to walk the client registry and require every code to appear here —
+    //   which silently asserted that #63 is the LAST migration ever to restate the catalog.
+    //   #65 restated it again (119 codes), and this test failed for a change that was
+    //   entirely correct. What it actually means to check is that #63's restatement is
+    //   whole and invents nothing: the count above proves nothing fell out, and the loop
+    //   below proves every code it does carry is one the client knows.
+    const codes = (catalog.match(/^ {4}\('([A-Z0-9_]+)',/gm) || [])
+      .map((l) => l.replace(/^ {4}\('/, '').replace(/',$/, ''));
+    for (const code of codes) {
+      assert.ok(APP_ERROR_CODES.includes(code),
+        `${code} is in the SQL catalog but not in APP_ERROR_CODES — clients branch on hint`);
     }
   });
 

@@ -52,7 +52,7 @@ npm run ai:knowledge:check # rebuild the knowledge doc in memory + diff vs disk;
 npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge base
 npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
 npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, bootstrapFolds, courseVideo, courseVideoSql, courseVideoContent, mp4Faststart, studentProgress, studentProgressSql, uiSafety, coaIntegrity, portfolioGenerator,
-                           approveGrantSql, financeDailyIncome, financeDailyIncomeSql, …)
+                           approveGrantSql, financeDailyIncome, financeDailyIncomeSql, lessonContent, lessonContentSql, sidebarLayout, …)
 npm run storage:config     # read the PROJECT-WIDE Supabase Storage upload limit and the effective
                            # limit of every bucket; --apply raises it to LESSON_VIDEO_MAX_BYTES.
                            # The bucket limit alone is a ceiling, not a grant — Supabase enforces
@@ -128,7 +128,20 @@ The sanctioned exceptions to the single-file rule (same spirit as the `main.jsx`
 - `src/lib/sidebarLayout.js` — the per-user sidebar layout reconciler (pure; extracted from the
   monolith by #56 so it could be tested). `mergeStoredWithDefaults()` is what DROPS a retired
   tab id out of a saved layout, which is why retiring a tool needs no storage migration —
-  pinned by `test/sidebarLayout.test.mjs` instead of being an unverified comment.
+  pinned by `test/sidebarLayout.test.mjs` instead of being an unverified comment. Since v5 it
+  also owns GROUPED order (`groups[].tabIds`) and the two move functions — `moveTabByStep()` and
+  `reorderVerdict()`, the single place that decides a drop is illegal. The UI never splices an
+  array itself, so "a tab cannot leave its group" and "a tab cannot be lost" are properties of one
+  tested module rather than of two event handlers that have to agree.
+- `src/lib/lessonContent.js` — what a course lesson's instructions may contain (pure). Owns the
+  closed markdown subset (paragraphs, bold, lists, https links, `![alt](lesson-asset://<uuid>)`
+  images), `safeLessonHref()` (the `lessonReplay.js` rule: parsed `protocol` is the only scheme
+  authority, no base argument, `hostname` not `host`, an invalid result carries no href), the
+  asset-token parser the SQL trigger mirrors, the editor's caret-preserving insert helpers, and
+  `lessonContentToPlainText()` — the projection that keeps markup and asset ids out of the AI
+  trainer. **No markdown library**: it emits a closed token set and the renderer builds React
+  elements from it, so unsafe markup is unrepresentable rather than filtered. See "Changing what a
+  lesson's INSTRUCTIONS may contain".
 - `src/lib/coursePlayerLayout.js` — the lesson-page track arithmetic (pure): rail bounds,
   the derived two-pane threshold, the drag clamp, and the persisted layout shape. See
   "Course lesson workspace" below.
@@ -343,12 +356,15 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
   would refuse to delete it, but relying on that is a safety net standing in for a design.
   `LessonVideoOrphans` remains the backstop for the cases no client code can reach (a crashed
   tab, a closed laptop). Pinned by `test/uiSafety.test.mjs` §19.
-- **Storage (two buckets):** PAID lesson **videos** live in the **private** `course-videos` bucket
+- **Storage (three buckets):** PAID lesson **videos** live in the **private** `course-videos` bucket
   (`lessons/{course.id}/…`), served via short-lived **signed URLs** gated by `is_enrolled()` RLS —
   because a *public* Supabase bucket serves every object publicly and bypasses RLS on read, so a
-  public bucket can't protect paid content. Course **covers** (`covers/{course.id}/…`) and
-  feature-guide videos stay in the **public** `course-media` bucket (they're meant to be visible
-  while browsing). Write/delete on both buckets is admin-only. Cover images are guarded at ≤ 5 MB.
+  public bucket can't protect paid content. Lesson **instruction images** (#65) live in their own
+  **private** `course-lesson-assets` bucket (`lessons/{course.id}/{lesson.id}/…`, 10 MiB,
+  png/jpeg/webp), batch-signed once per lesson and authorized **by REFERENCE** rather than by path.
+  Course **covers** (`covers/{course.id}/…`) and feature-guide videos stay in the **public**
+  `course-media` bucket (they're meant to be visible while browsing). Write/delete on all three is
+  course-staff-only. Cover images are guarded at ≤ 5 MB.
 - **Lesson video is UPLOAD-ONLY (#44, `db/2026-08-24-course-video-upload-only.sql`).** A lesson's
   primary content can no longer be a pasted YouTube/Vimeo/MP4 URL — not in the editor, and not
   through a direct PostgREST call (`course_lessons_video_guard` refuses the transition INTO
@@ -797,6 +813,58 @@ keep-alive** (see below). Four pieces must stay in sync when adding/removing a t
 - **Order + collapse/expanded-groups stay per-user** in `window.storage` under `sidebar:*` keys
   (unchanged). `expandedGroups` keys off the group `key`, not its label, so collapse-state survives
   a rename. Do **not** add a label key to `LEGACY_KEYS` — labels now live in Supabase.
+- ★ **GROUPED STAGES PERSIST THEIR OWN ORDER SINCE v5, AND UNTIL THEN THEY SILENTLY COULD NOT.**
+  A grouped stage renders from `groups[].tabIds` — `stage.tabs` is collapsed to an id→object
+  dictionary first, so its array order is discarded — and `mergeStoredWithDefaults` re-stamped
+  `groups` from the code defaults on every load. So a drag inside Job Application or Client
+  Management mutated `stage.tabs`, persisted faithfully, and changed **nothing on screen**, while
+  the same drag in flat Training worked. The owner reported it as "rearranging only works under
+  Training". The old suite pinned the behaviour as intended, in two tests.
+  `stagesToStorable` now writes `groups: [{ key, tabIds }]` — **stable keys and ids only**, never
+  labels (global in `sidebar_settings`; a per-browser copy would shadow an admin rename) and never
+  icons. **Group ORDER and MEMBERSHIP still come from the defaults**; only the order of tabs WITHIN
+  a group is user data, which keeps the reconciliation total — a stored id is accepted only into the
+  group `DEFAULT_STAGES` assigns it to, so a corrupt layout can reorder a group but can never move a
+  tab between groups or strand one. For a grouped stage `tabs` is then **derived** from `groups`,
+  which also fixes the collapsed icon rail (it renders `stage.tabs` flat for every stage) silently
+  disagreeing with the expanded nav.
+- ★ **REORDERING IS NOT MOUSE-ONLY, AND CANCEL NOW CANCELS.** HTML5 drag-and-drop cannot be operated
+  from a keyboard and is unusable on touch, so the ⋮⋮ grip is a convenience and the per-row
+  **Move up / Move down** buttons are the real control; every move is announced through an
+  `aria-live` region, and so is every refusal. A cross-group or cross-stage drop is REFUSED by
+  `reorderVerdict()` rather than applied — the old handler spliced the tab into another stage's
+  `tabs`, where no group's `tabIds` named it and `.filter(Boolean)` dropped it, so the tab vanished
+  with no error and only a Reset brought it back. And the layout is no longer persisted while
+  Customize is open: the write used to fire on every drag, so Cancel was a lie. Snapshot on entry,
+  commit on Done, restore on Cancel.
+  ★ **THE EDGE BUTTONS ARE `aria-disabled`, NEVER `disabled`, AND THEY ARE 24×24.** A browser blurs
+  a focused element the instant it becomes disabled, so pressing Move up until a tab reached
+  position 1 threw a keyboard user out to `<body>` mid-reorder. Left focusable, the press falls
+  through to `moveTabByStep()`, which already refuses with `at-edge` and already announces it — the
+  refusal wording is direction-aware ("… is already first in Interview"), built by
+  `announceTabEdge()`, which is its own function **beside** `announceMove()` so `moveTab` stays free
+  of `effLabel` and uiSafety can keep asserting that ordering logic never reads a visible label.
+  The targets were `p-0.5` around a 13px icon — about 17×17, under WCAG 2.2 SC 2.5.8's 24×24 floor,
+  on the one device that cannot drag at all: below `lg` the sidebar IS the off-canvas drawer.
+  ★ **A CROSS-GROUP DRAG IS NOW REFUSED WHILE IT IS STILL A DRAG.** `onTabDragOver` set
+  `dropEffect = 'move'` over every row, so an illegal drag showed a legal-looking cursor the whole
+  way and explained itself only after the drop had failed. It asks the same grouping the drop does
+  and sets `'none'` plus a dashed invalid outline.
+  ★ **WHOLE STAGES REORDER THE SAME WAY (`moveStageByStep` / `stageReorderVerdict`).** `onStageDrop`
+  was the last hand-rolled splice in the sidebar — no arbiter, no refusal, no announcement and
+  drag-only, i.e. exactly the shape the tab path was rescued from.
+  ★ **RESET IS STAGED LIKE EVERY OTHER EDIT, SO CANCEL STILL CANCELS.** Reset used to null the
+  snapshot, which made `cancelSidebarEdit`'s `if (layoutSnapshotRef.current)` false — so Cancel left
+  `DEFAULT_STAGES` in place and the persist effect wrote it. A button labelled Cancel committed the
+  change it appears to undo. (The LABEL half of Reset is a Supabase delete and is genuinely
+  immediate; the confirm text says which half is which.) And the `beforeunload` guard now counts a
+  pure reorder as an unsaved edit — it keyed on `draftLabels` alone, written when only labels were
+  staged, so reordering ten tabs and closing the tab lost all of it with no prompt.
+  ★ **FOOTER COPY: TWO REACHES, NOT THREE.** It said tab order "saves for you on this account" beside
+  collapse state that "stays on this device", drawing a distinction the app does not implement —
+  `window.storage` is localStorage namespaced per user (`src/main.jsx`), so both are per-user AND
+  per-browser and only labels are global. "On this account" reads as a sync promise that was never
+  built; the copy and the success toast now both say "in this browser". Pinned by `uiSafety` §22.
 - ★ **The admin links scroll; only brand + identity are fixed.** (Shipped alongside #64, but it is a
   UI-only change with no SQL — it is *not* a member of the numbered migration chain, where `#64` means
   `finance-daily-income` and nothing else.) The expanded `<aside>` is three
@@ -1114,7 +1182,7 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   staff-activation-consistency (#50) → access-request-staff-target (#51) →
   student-progress-rankings (#52) → progress-rankings-followup (#53) →
   progress-course-family-scoping (#54) → approve-rpc-grant-revoke (#55) →
-  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61) → meetings-tasks (#62) → management-hardening (#63) → finance-daily-income (#64)** — see the Staff-authorization
+  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61) → meetings-tasks (#62) → management-hardening (#63) → finance-daily-income (#64) → course-lesson-assets (#65)** — see the Staff-authorization
   and Progress & Rankings sections for what each does. **#57**
   ([db/2026-09-08-lesson-video-quicktime.sql](db/2026-09-08-lesson-video-quicktime.sql), fold
   **§44**) widens `course-videos.allowed_mime_types` to
@@ -2863,7 +2931,125 @@ docs **in the same change**:
 - **Adding a column to the lesson model** → it must be added to **all** of: `COURSE_LESSON_SELECT`,
   `lessonComparable()` (or the dirty check silently ignores it), `saveLesson()`'s `payload`, the lesson
   editor UI, and `CourseCatalog.duplicateCourse()`'s lesson `.map()`. Each is an explicit allow-list;
-  missing one fails silently rather than loudly.
+  missing one fails silently rather than loudly. ★ And it needs **its own select tier**, never a line
+  added to `COURSE_LESSON_SELECT_LEGACY` — that constant is a frozen pre-#37b snapshot, and making
+  the two lists identical means the narrow-and-retry re-fails and the whole fallback silently stops
+  working. The chain is now three deep: full → `COURSE_LESSON_SELECT_PRE_RICH` (#65) → legacy.
+- **Changing what a lesson's INSTRUCTIONS may contain** → the rules live in ONE pure module and are
+  mirrored in SQL. Move together: [src/lib/lessonContent.js](src/lib/lessonContent.js) ↔
+  `course_lesson_sync_assets()` / `course_lesson_asset_readable()` / `course_lesson_asset_course_id()`
+  in `db/2026-09-20-course-lesson-assets.sql` **and its bootstrap fold §52** ↔ the
+  `course-lesson-assets` bucket's `file_size_limit` / `allowed_mime_types` ↔ `LessonRichText` +
+  `renderLessonComposer` in BookkeeperPro.jsx ↔ `test/lessonContent.test.mjs` +
+  `test/lessonContentSql.test.mjs` + `test-db/courseLessonAssets.dbtest.mjs` ↔ the `#65` block in
+  `scripts/audit-db.mjs`.
+  ★ **NO FUNCTION IN THAT MODULE MAY DEFAULT ITS `format` PARAMETER, and the scar is recent.**
+  Five exports were written `format = 'markdown'`. A JS default fires on `undefined`, which is
+  exactly what a row carries when the column is absent — on a database without #65, and on a lesson
+  `addLesson` just seeded from the frozen `COURSE_LESSON_SELECT_LEGACY`. So the two places that
+  decide whether a lesson may be SAVED and what the AI trainer INDEXES read a plain note as
+  markdown: a legacy `[see here](http://old-site.com)` became an `UNSAFE_LINK` that **blocked the
+  save** on a database where the feature does not exist, and every lesson on a pre-#65 database
+  re-hashed and re-embedded for nothing. Passing no format now means `plain` — the format that
+  predates the feature and can refuse nothing — because all five already route through
+  `normalizeFormat()`. `api/admin/course-trainer.js` additionally **stamps** `content_format:
+  'plain'` onto the rows its narrowed select returns, so the assumption is written where it is true
+  rather than inherited from a default. Pinned by `test/lessonContent.test.mjs`.
+  ★ **AN ASSET SCHEME THAT IS NOT A READABLE TOKEN MUST BLOCK THE SAVE.** Everything
+  `validateLessonContent` knows about images comes from the token pattern, so a
+  `lesson-asset://<uuid>` that pattern cannot read was invisible to it — and one `]` in the alt
+  text is enough (`![Screenshot [1]](lesson-asset://…)`), as is half a hand-deleted token. The
+  document then saved clean and **three** things happened at once, none of them visible: the raw
+  markdown was published verbatim to every student; the post-save sweep saw the asset as uncited
+  and deleted its row **and its bytes**, because `course_lesson_asset_delete` cannot answer
+  `LESSON_ASSET_IN_USE` when the trigger derived no reference from an unreadable token; and
+  `lessonContentToPlainText` passed the string through untouched, putting the scheme and the uuid
+  into the AI trainer's index — the one thing this module promises never to do. The guard is a
+  count: every readable token carries the scheme exactly once, so more scheme occurrences than
+  `lessonAssetRefs()` entries means at least one is stranded (`BROKEN_IMAGE_REFERENCE`).
+  ★ **THE ORPHAN SWEEP MEASURES "CITED" AGAINST THE TEXT THAT SURVIVES.** `closeLessonEditor`
+  passes the **saved** row's text, not the draft it is discarding. Reading the draft meant an
+  image the creator had placed counted as cited and was skipped — while the draft citing it was
+  thrown away and the lesson was never saved, so no reference row existed either, leaving the
+  bytes in the private bucket until some later save in that course ran the 1-day pass.
+  ★ **A CAPTION IS A SEPARATE LINE, AND THAT IS WHY IT NEEDED NO MIGRATION.** `^ text` directly
+  under an image token renders as the figure's `<figcaption>`; the Postgres trigger only matches
+  `![alt](lesson-asset://<uuid>)`, so it never sees the caption and the token keeps exactly one
+  possible reading. Putting the caption INSIDE the token would mean editing a regex in SQL that is
+  already applied to production, and would leave the two parsers one wording change away from
+  disagreeing about where a token ends. Alt text stays REQUIRED and separate — it is what a screen
+  reader announces and what shows when the image will not load; a caption is visible prose, and
+  using one as the other makes a screen reader read the same sentence twice. A caption attaches only
+  to an image, only one per image, and may not contain an image token; anything else stays the
+  literal text the creator typed. `test/lessonContentSql.test.mjs` runs the DATABASE'S OWN pattern
+  over a captioned document and asserts it still finds exactly one token.
+  ★ **A caption belongs to the image ABOVE it, and one line of prose breaks that pairing.**
+  A paragraph that mixes ordinary sentences with image rows renders the images inline and the
+  `^` lines as the literal text the creator typed, rather than as figures. That is the direct
+  cost of the line-based design, and it is the right trade: the alternative — a caption inside
+  the token — buys tidier mixed paragraphs by putting the SQL regex and the JS parser one
+  wording change away from disagreeing about where a token ends, which is silent in both
+  directions. The fallback is visible on the page and undone by moving the prose to its own
+  paragraph, so nobody loses work; a wrong token boundary is an image that renders but cannot
+  load, or one that is readable and invisible.
+  ★ **A BARE URL PROJECTS AS ITS HOST IN THE TRAINER INDEX, AND THAT IS DELIBERATE.**
+  `lessonContentToPlainText` emits a labelled link's LABEL and a bare link's HOST, because the
+  agent is speaking, not clicking, and reading ninety characters of query string aloud is noise.
+  Turning formatting on therefore does shorten a bare URL in what the trainer indexes — the URL
+  itself is untouched in `text_content`, still rendered and still clickable for the student. Do
+  not "fix" this by projecting the full URL; if a specific address must be speakable, write it as
+  a labelled link whose label says it.
+  ★ **CLOSING A COMPOSER CONTROL WITHOUT EDITING MUST HAND FOCUS BACK** (`returnFocusToLessonBody`).
+  Escape, the link bar's Cancel, and an image card's Remove each unmount the element that HAS
+  focus, and a browser then moves focus to `<body>` — a keyboard user is dropped at the top of
+  the document with the drawer still open (WCAG 2.4.3). The EDIT paths never needed this: Update
+  and Unlink end in `applyLessonEdit`, which already focuses the textarea. The restore is on a
+  `requestAnimationFrame` because the unmount happens in the same commit, so focusing before it
+  lands is undone by React. Pinned by `uiSafety`, mutation-tested.
+  ★ **A REMOTE IMAGE IS REFUSED; THE PROSE AROUND IT IS NOT.** Copying a paragraph out of a web
+  page brings any inline image with it, and `preventDefault()` alone discarded the WHOLE paste —
+  which reads as "pasting is broken", and was reported that way. `onLessonPaste` now inserts the
+  `text/plain` flavour at the caret and says which of the two things happened. This introduces
+  nothing new to validate: it is what the browser would have done for a text-only paste, and the
+  save-time check still runs over the finished document.
+  ★ **THERE IS NO MARKDOWN LIBRARY, AND THAT IS THE SECURITY ARGUMENT, NOT A PREFERENCE.** A general
+  parser is safe only while it stays correctly configured — raw HTML off, a URL transform installed,
+  a component map that never falls through to `innerHTML`. This module has no HTML to enable: it
+  emits a CLOSED set of typed tokens and the renderer turns those into React elements, so unsafe
+  markup is unrepresentable rather than filtered. Adding a library would move the guarantee from
+  "cannot" to "is configured not to".
+  ★ **TWO PARSERS READ THE SAME TOKEN AND MUST AGREE.** `LESSON_ASSET_TOKEN_SRC` decides what a
+  student SEES; the Postgres regex in `course_lesson_sync_assets()` decides which images are
+  AUTHORIZED. A disagreement about where a token ends is silent in both directions — an image that
+  renders but cannot load, or one that is readable and invisible. `sanitizeAltText` strips `]` for
+  exactly this reason, and `test/lessonContentSql.test.mjs` pins the two patterns against each other.
+  ★ **REFERENCES ARE DERIVED BY A TRIGGER, NEVER SENT BY THE CLIENT.** Staff can write
+  `course_lessons` directly through PostgREST (`lessons_staff_write`), so a client-supplied image
+  list would be a client-chosen authorization list. The trigger re-extracts the tokens from the
+  SAVED text in the same transaction — which is also why course duplication needs no special case:
+  it inserts lesson rows carrying the copied text and the trigger re-derives the copy's references
+  from them. `courses.source_course_id` must therefore be written BEFORE the lessons are inserted,
+  which `duplicateCourse` step 3 already does, two inserts ahead.
+  ★ **READS ARE REFERENCE-BASED; WRITES ARE PATH-PARSED. That inversion is deliberate.** #44 deleted
+  `course_object_allowed()` because it parsed a READ out of an object name and failed OPEN three
+  ways. A WRITE names an object that does not exist yet, so there is no reference to consult —
+  `course_lesson_asset_course_id()` is a NEW parser that returns NULL for anything but
+  `lessons/<uuid>/<uuid>/<file>`, and `can_manage_course(NULL)` is false, so a malformed path
+  DENIES. Do not loosen `course_object_course_id()`, which owns the three-segment video shape.
+  ★ **AN ASSET OUTLIVES ITS ORIGIN COURSE** (`course_id ON DELETE SET NULL`). Cascading would delete
+  the row out from under a DUPLICATE that legitimately shows the same image: its pictures would
+  vanish and its next save would be refused as citing an image that does not exist. This is the
+  same promise `removeMediaIfUnreferenced` makes for video, kept by a different mechanism.
+  ★ **A REMOTE IMAGE IS REFUSED, NEVER HOT-LINKED.** Pasting from a web page puts both a file and an
+  HTML fragment on the clipboard; taking the HTML would load a third party's server from every
+  student's lesson page, handing it each student's IP and reading time.
+  ★ **`lessonContentToPlainText()` IS THE ONLY THING KEEPING MARKUP OUT OF THE VOICE AGENT.**
+  `api/admin/course-trainer.js` used to index `text_content` with nothing but a `trim()`, and the
+  retrieval path copies chunk content byte-for-byte into the agent's envelope. Flatten at that one
+  ingest point or the agent narrates punctuation. A `plain` lesson is returned unchanged, so its
+  hash does not move and it is not needlessly re-indexed — and `course_ai_mark_lesson_stale()` was
+  patched in place (the #56 instrument) to watch `content_format`, because otherwise a lesson
+  converted to markdown without editing its words would sit `ready` for ever.
 - **Adding an error code** → `app_error_catalog()` ↔ `APP_ERROR_CODES` **and `APP_ERROR_COPY`** in
   `src/lib/appErrors.js`. Clients branch on `error.hint`, never on the HTTP status.
 - **Changing when a batch locks, or what an admin may edit on it** → four places move together:

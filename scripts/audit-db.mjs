@@ -34,6 +34,9 @@ import { dirname, join } from 'node:path';
 //   raising LESSON_VIDEO_MAX_BYTES moves this check with it. Precedent for a script
 //   importing from src/lib: scripts/generate-voice-agent-knowledge.mjs.
 import { LESSON_VIDEO_MAX_BYTES, LESSON_VIDEO_UPLOAD_MIMES } from '../src/lib/courseVideo.js';
+// Same rule for lesson IMAGES (#65): the bucket's ceiling and type list are the client's
+// own, imported so raising one moves the check with it.
+import { LESSON_ASSET_BUCKET, LESSON_IMAGE_MAX_BYTES, LESSON_IMAGE_MIMES } from '../src/lib/lessonContent.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..');
@@ -1196,6 +1199,71 @@ export const OBJECT_CHECKS = [
      and p.prosrc not like '%amount_expected%' and p.prosrc not like '%finance_request_collected%'
      and p.prosrc like '%reverses_entry_id%'
      and p.prosrc like '%''reconciled'', v_ledger = %'`],
+
+  // ── #65, course lesson instructions and their private images ──────────────
+  // ★ Storage policies are invisible to db:shadow:verify — it filters pg_policies to
+  //   schemaname='public', and even there compares only tablename/policyname/cmd, never
+  //   the qual. These checks are the only automated guard on the read/write split.
+  ['#65    the lesson-image bucket is private, 10 MiB, images only', `select coalesce(bool_and(
+        not public and file_size_limit = ${LESSON_IMAGE_MAX_BYTES}
+        and allowed_mime_types = array[${LESSON_IMAGE_MIMES.map((m) => `'${m}'`).join(', ')}]), false) as ok
+      from storage.buckets where id='${LESSON_ASSET_BUCKET}'`],
+  // The #44 lesson, in both directions: reads resolve a REFERENCE, writes parse the PATH.
+  // A read that parsed the path is the failure mode #44 removed; a write that waited for a
+  // reference could never authorize the first upload of a new object.
+  ['#65    lesson-image READS are reference-based, WRITES are path-parsed', `select coalesce(bool_and(ok), false) as ok from (
+      select (qual ilike '%course_lesson_asset_object_readable%'
+              and qual not ilike '%course_lesson_asset_course_id%') as ok
+        from pg_policies where schemaname='storage' and policyname='course_lesson_assets_object_read'
+      union all
+      select (coalesce(with_check, qual) ilike '%course_lesson_asset_course_id%'
+              and coalesce(with_check, qual) ilike '%can_manage_course%')
+        from pg_policies where schemaname='storage'
+         and policyname in ('course_lesson_assets_object_write','course_lesson_assets_object_update','course_lesson_assets_object_delete')
+    ) t`],
+  ['#65    the four lesson-image storage policies exist', `select count(*) = 4 as ok
+      from pg_policies where schemaname='storage' and policyname like 'course_lesson_assets_object_%'`],
+  // Neither table may ever gain a write policy: the trigger is what enforces alt text, the
+  // image limit and the duplication-family rule, and a direct PostgREST write would skip it.
+  ['#65    neither asset table has a client write path', `select coalesce(bool_and(ok), false) as ok from (
+      select bool_and(cmd = 'SELECT') as ok from pg_policies
+       where schemaname='public' and tablename in ('course_lesson_assets','course_lesson_asset_refs')
+      union all
+      select not (has_table_privilege('authenticated','public.course_lesson_assets','insert')
+               or has_table_privilege('authenticated','public.course_lesson_assets','update')
+               or has_table_privilege('authenticated','public.course_lesson_assets','delete')
+               or has_table_privilege('authenticated','public.course_lesson_asset_refs','insert')
+               or has_table_privilege('authenticated','public.course_lesson_asset_refs','update')
+               or has_table_privilege('authenticated','public.course_lesson_asset_refs','delete'))
+    ) t`],
+  // ★ ON DELETE SET NULL, not CASCADE. Cascading deletes the asset row out from under a
+  //   DUPLICATE course that legitimately shows the same image — its pictures vanish and its
+  //   next save is refused as citing an image that does not exist.
+  ['#65    an asset outlives its origin course', `select count(*) = 1 as ok
+      from pg_constraint where conname='course_lesson_assets_course_id_fkey'
+        and conrelid='public.course_lesson_assets'::regclass and confdeltype = 'n'`],
+  ['#65    the read predicate still mirrors courses_read', `select count(*) = 1 as ok
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname='public' and p.proname='course_lesson_asset_readable'
+       and p.prosrc like '%is_approved()%' and p.prosrc like '%is_enrolled()%'
+       and p.prosrc like '%plan_is_sampler()%' and p.prosrc like '%essentials%'
+       and p.prosrc like '%published%'`],
+  ['#65    the sync trigger is armed and reachable only as a trigger', `select coalesce(bool_and(ok), false) as ok from (
+      select count(*) = 1 as ok from pg_trigger
+       where tgname='course_lesson_assets_sync' and tgrelid='public.course_lessons'::regclass and not tgisinternal
+      union all
+      select not has_function_privilege('authenticated','public.course_lesson_sync_assets()','execute')
+    ) t`],
+  ['#65    the trainer re-indexes a lesson whose FORMAT changed', `select count(*) = 1 as ok
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname='public' and p.proname='course_ai_mark_lesson_stale'
+       and p.prosrc like '%new.content_format%'`],
+  ['#65    every lesson-asset function pins search_path and is anon-proof', `select count(*) = 9
+        and bool_and(coalesce(array_to_string(p.proconfig, ','), '') like '%search_path=public, pg_temp%'
+                     and not has_function_privilege('anon', p.oid, 'execute')) as ok
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname='public' and (p.proname like 'course_lesson_asset%'
+        or p.proname in ('course_family_root','course_lesson_sync_assets'))`],
 
 ];
 

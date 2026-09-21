@@ -79,7 +79,8 @@ by Row Level Security, not just the UI).
 Do these in order — the app keeps showing **"Finish backend setup"** until they're done:
 
 1. **Run the main SQL** (Step 1) — creates the tables, RLS, admin helper, and the course row.
-2. **Create the public `course-media` bucket** + its policies (Step 2).
+2. **Create the three media buckets** + their policies (Step 2) — public `course-media`, private
+   `course-videos`, private `course-lesson-assets`.
 3. *(Optional)* **Seed a starter module** so the course isn't blank (Step 3).
 4. **Make yourself an admin** (Step 4), then **sign out and back in**.
 5. Refresh the app → the course loads; admins see the **Edit course** builder.
@@ -249,21 +250,23 @@ on conflict (slug) do nothing;
 
 ---
 
-## Step 2 — Create the two media buckets
+## Step 2 — Create the three media buckets
 
-Course media lives in **two** buckets, and which one a file goes in is a paywall decision, not a
+Course media lives in **three** buckets, and which one a file goes in is a paywall decision, not a
 filing preference:
 
 | Bucket | Public? | Holds | Served as |
 |---|---|---|---|
 | `course-videos` | **OFF — private** | lesson videos (`lessons/<course-id>/…`) | short-lived **signed URLs**, authorized per request by RLS |
+| `course-lesson-assets` | **OFF — private** | lesson instruction images (`lessons/<course-id>/<lesson-id>/…`) | short-lived **signed URLs**, authorized by REFERENCE |
 | `course-media` | ON — public | course covers (`covers/<course-id>/…`) and feature-guide videos | plain public URLs |
 
 > **Why the split.** A *public* Supabase bucket serves every object to anyone with the URL and
 > **bypasses RLS on read entirely**, so a public bucket cannot protect paid content — the paywall
 > would end at the first copied link. Lesson videos were moved to the private bucket by
-> `db/2026-07-08-course-videos-private.sql` (#15). Covers are meant to be visible while browsing,
-> so they stay public.
+> `db/2026-07-08-course-videos-private.sql` (#15), and lesson instruction images went straight into
+> one by `db/2026-09-20-course-lesson-assets.sql` (#65). Covers are meant to be visible while
+> browsing, so they stay public.
 
 ### 2a. `course-videos` (private — the paid lesson videos)
 
@@ -323,6 +326,40 @@ create policy course_media_admin_delete on storage.objects for delete to authent
 > Lesson videos need it raised to **2 GB** (`npm run storage:config -- --apply`). There is no
 > longer a link fallback for a lesson that is too large — see *Lesson video format and limits*
 > below.
+
+### 2c. `course-lesson-assets` (private — the images inside lesson instructions)
+
+Created for you by `db/2026-09-20-course-lesson-assets.sql` (#65), together with its size limit and
+format restriction. If your SQL role could not write `storage.buckets` the migration prints a NOTICE
+and you create it by hand:
+
+1. **Supabase Dashboard → Storage → New bucket.**
+2. Name **`course-lesson-assets`**. **Public bucket = OFF.**
+3. **Settings →** file size limit **10 MB**, allowed MIME types
+   **`image/png`, `image/jpeg`, `image/webp`**.
+
+> **Why these images are private.** They are the screenshots that make a paid lesson followable —
+> which menu to click, what the finished screen looks like. That is instructional material, so it
+> gets the same treatment as the video it sits under.
+>
+> ★ **Access is decided by REFERENCE, not by the folder a file sits in.** An image is readable only
+> while a *published* lesson the viewer's plan can open actually cites it. That is what makes course
+> duplication work: a duplicate shows the original's image without copying a byte, so the file lives
+> in the **source** course's folder — and a check based on the folder would get it exactly backwards.
+> It also means an image nobody's lesson mentions is readable by nobody at all, including the admin
+> who uploaded it. See #44 for why the folder-based version of this was removed.
+
+### Lesson image format and limits
+
+| | |
+|---|---|
+| **Format** | **PNG, JPEG or WebP.** SVG is refused — it can carry script, and it is the one image format that is really a document. |
+| **Maximum size** | **10 MB** per image, **10 images** per lesson |
+| **Description** | **Required.** Every image needs a short description before it can be placed. It is read aloud to students using a screen reader, and shown if the image cannot load. Up to 300 characters. |
+| **Caption** | **Optional**, up to 300 characters, printed under the picture for everyone to read. A different thing from the description: writing the same words in both makes a screen reader read the sentence twice. In the saved text it is a `^ ` line directly under the image — the database never sees it, which is why captions needed no migration. |
+| **Where it goes** | `course-lesson-assets/lessons/<course-id>/<lesson-id>/<random>.<ext>` — private. The original filename is never reused. |
+| **How students get it** | A signed URL minted per lesson view and refreshed before it expires. One signing request per lesson, not one per image. |
+| **Pasting** | Paste a screenshot straight into the instructions box. An image copied from a **web page** is refused rather than linked — a linked image breaks when that site changes it, and tells that site who is reading your lesson. |
 
 ### Lesson video format and limits
 
@@ -433,15 +470,37 @@ In the app, open **Training & Skills → QuickBooks Online Mastering**, click **
 2. Add **lessons** to it — give each a title, pick **Video** or **Text**, and for video **upload the
    MP4 file**. The uploader shows progress and can be paused, resumed or cancelled; the lesson can
    only be saved once the upload has finished *and* been verified as playable. The duration label
-   fills itself in from the file. Optionally add notes.
-3. Optionally paste a **Zoom Live Replay link** — the recording of that lesson's live session. It must
+   fills itself in from the file.
+3. Optionally write **lesson instructions** under the video. Select a word and press the **Link**
+   button (or `Ctrl`/`Cmd`+`K`) to turn it into a link — a Google Form, a template, anything on
+   `https://`. Paste a screenshot straight into the box, or use **Image**; give each one a short
+   description, then press **Add to lesson**. **Bold**, bullets and numbered steps are on the same
+   toolbar, and **Preview** shows exactly what a student will see. Students read this directly below
+   the video and above the Zoom replay link.
+   - **To change or remove a link**, put the cursor anywhere inside it and press the **Link** button
+     again (or `Ctrl`/`Cmd`+`K`). The bar opens with that link's address and words already filled in:
+     **Update link** changes it, **Unlink** keeps the words and drops the address.
+   - Each image takes two pieces of text, and they are not the same thing. **Describe this image** is
+     required — it is what a student using a screen reader hears, and what appears if the picture
+     cannot load. **Caption (optional)** is printed under the picture for everyone to read
+     ("Figure 1 — the three-dot button"). Don't repeat one as the other, or a screen reader says the
+     same sentence twice.
+   - An existing plain-text note is left exactly as it reads until you press **Turn on formatting**,
+     which never changes how the words look.
+   - An image is uploaded as soon as you choose it, so it can be shown to you straight away.
+     Anything you upload and then remove — or leave out of the lesson, or abandon by pressing
+     Cancel — is deleted for you. Removing an image also takes it out of the text, so the lesson
+     never refers to a picture that no longer exists.
+   - The toolbar is greyed out while **Preview** is on — there is nothing to type into there. If a
+     save is refused, the editor comes back by itself and lands on the field that needs fixing.
+4. Optionally paste a **Zoom Live Replay link** — the recording of that lesson's live session. It must
    be a complete `https://` URL (paste the whole share link, including any `?pwd=` passcode). Students
    see it as a card **below the lesson and above "Mark complete"**, and it opens in a **new tab** —
    Zoom recording pages can't be embedded, and Zoom's own privacy/passcode settings still apply. It is
    **supplementary**: it never replaces the lesson video, never counts as lesson content on its own,
    and watching it does **not** mark the lesson complete. Clear the field and save to remove it. An
    invalid link blocks the save with a message under the field; the rest of your edits are kept.
-4. Reorder with the up/down arrows. Toggle the course **Published** when ready.
+5. Reorder with the up/down arrows. Toggle the course **Published** when ready.
 
 Students see published content immediately, complete lessons, and earn the certificate at 100%.
 

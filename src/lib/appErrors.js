@@ -167,6 +167,14 @@ export const APP_ERROR_CODES = [
   'MEETING_LOG_FAILED',
   // Management hardening (#63)
   'FINANCE_COLLECTION_AMOUNT_INVALID',
+  // Course lesson instructions and their private images (#65)
+  'LESSON_ASSET_FORBIDDEN',
+  'LESSON_ASSET_NOT_FOUND',
+  'LESSON_ASSET_IN_USE',
+  'LESSON_ASSET_LIMIT',
+  'LESSON_ASSET_ALT_REQUIRED',
+  'LESSON_ASSET_BAD_PATH',
+  'LESSON_ASSET_UNKNOWN_REF',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -466,6 +474,24 @@ const COPY = {
     'This enrollment records an amount the books can’t post — it’s outside the range a collection may '
     + 'hold. Use “Correct amount” on the request to set the figure the student actually paid, then '
     + 'approve it.',
+  LESSON_ASSET_FORBIDDEN:
+    'You can’t manage images for that course. Ask a Super Admin, or someone assigned to it, to make '
+    + 'the change.',
+  LESSON_ASSET_NOT_FOUND:
+    'That image no longer exists. Remove it from the lesson text and add it again.',
+  LESSON_ASSET_IN_USE:
+    'That image is still shown by a lesson, so it wasn’t deleted. Remove it from the lesson text '
+    + 'first, save, then delete it.',
+  LESSON_ASSET_LIMIT:
+    'A lesson can show up to 10 images. Remove one, or split the instructions across two lessons.',
+  LESSON_ASSET_ALT_REQUIRED:
+    'Every image needs a short description — students using a screen reader rely on it, and it is '
+    + 'what shows if the image can’t load. Add one to each image and save again.',
+  LESSON_ASSET_BAD_PATH:
+    'That image couldn’t be attached to this lesson. Try uploading it again.',
+  LESSON_ASSET_UNKNOWN_REF:
+    'This lesson refers to an image that doesn’t exist, or that belongs to an unrelated course. '
+    + 'Images can only be reused within the course they were uploaded to, or a copy of it.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };

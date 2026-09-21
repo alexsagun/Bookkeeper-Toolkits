@@ -9,7 +9,7 @@ import {
   MessageSquare, Mic, MicOff, Eye, HelpCircle, User, Target,
   Building2, Landmark, CalendarClock, CalendarCheck, ExternalLink,
   Heart, HeartHandshake, DollarSign, Phone, AlertCircle, Activity, Clock, Wallet,
-  ArrowUp, ArrowDown, X, Copy, Check,
+  ArrowUp, ArrowDown, ArrowUpDown, X, Copy, Check, ImageOff, ImagePlus, Bold, List, ListOrdered,
   TrendingUp as Growth, BookMarked, Globe, Coins, GraduationCap,
   LogOut, Lock, Mail, KeyRound, Menu,
   Plus, Trash2, Save, Play, Video, ArrowRight, ArrowLeft, ChevronUp, MoreVertical,
@@ -60,7 +60,18 @@ import {
   normalizeTabOrder as normalizeTabOrderLib,
   reconcileRenamedLabels as reconcileRenamedLabelsLib,
   SIDEBAR_VERSION, RENAMED_TAB_LABELS,
+  groupKeyOfTab, orderedSiblingIds, moveTabByStep, reorderVerdict, REORDER_REFUSALS,
+  moveStageByStep, stageReorderVerdict, STAGE_REORDER_REFUSALS,
 } from './lib/sidebarLayout';
+import {
+  LESSON_ASSET_BUCKET, LESSON_ASSET_SIGN_TTL_SECONDS, LESSON_ASSET_RESIGN_MARGIN_MS,
+  LESSON_IMAGE_ACCEPT, LESSON_IMAGE_MAX_PER_LESSON, LESSON_IMAGE_ALT_MAX,
+  LESSON_IMAGE_CAPTION_MAX,
+  applyBold, applyImage, applyLink, applyList, applyUnlink,
+  lessonAssetIds, lessonAssetObjectName, lessonAssetPath, linkAtSelection,
+  normalizeFormat, parseLessonContent, plainToMarkdown, removeAssetToken,
+  validateLessonContent, validateLessonImageFile,
+} from './lib/lessonContent';
 import {
   INVITE_STATES, EMPTY_INVITATION_STATE, normalizeInvitationState, resolveInviteState,
   invitationNeedsPassword, classifyExchangeError, exchangeErrorIsRetryable,
@@ -8233,7 +8244,10 @@ export default function BookkeeperProToolkit() {
       groups: [
         { key: 'self-discovery', label: 'Self Discovery',          tabIds: ['brand'] },
         { key: 'profile-opt',    label: 'Profile Optimization',    tabIds: ['resumestrategy', 'portfoliogenerator', 'linkedinopt'] },
-        { key: 'interview',      label: 'Interview',               tabIds: ['coachalex', 'interview', 'qbdiag'] },
+        // Owner decision 2026-09-20: HR and Client Positioning (id `interview`) leads this
+        // group. Ordered by stable id — the visible labels here are sidebar_settings
+        // overrides and are not what any ordering logic may read.
+        { key: 'interview',      label: 'Interview',               tabIds: ['interview', 'coachalex', 'qbdiag'] },
         { key: 'proposal',       label: 'Proposal / Cover Letters', tabIds: ['painpoints', 'proposal', 'discovery'] },
       ],
       tabs: [
@@ -8243,9 +8257,11 @@ export default function BookkeeperProToolkit() {
         { id: 'resumestrategy', label: 'Resume Winning Strategy',  icon: GraduationCap },
         { id: 'portfoliogenerator', label: 'Portfolio Generator',  icon: Briefcase },
         { id: 'linkedinopt',   label: 'Book 1-on-1 with Alex',     icon: CalendarCheck },
-        // Interview
-        { id: 'coachalex',     label: 'Personalized Coaching With Alex', icon: HeartHandshake },
+        // Interview — kept in the same order as the group above. For a grouped stage the
+        // rendered order comes from groups[].tabIds, so this array is a registry, not an
+        // order; letting the two drift just makes the source misleading to read.
         { id: 'interview',     label: 'Job Interview Mastery',     icon: Mic },
+        { id: 'coachalex',     label: 'Personalized Coaching With Alex', icon: HeartHandshake },
         { id: 'qbdiag',        label: 'Free QB Diagnostic',       icon: Shield },
         // Proposal / Cover Letters
         { id: 'painpoints',    label: 'Painpoints & Solutions',   icon: Target },
@@ -8511,13 +8527,21 @@ export default function BookkeeperProToolkit() {
     return () => { cancelled = true; };
   }, [user?.id]);
 
-  // Persist stages on change (after initial load)
+  // Persist stages on change (after initial load).
+  // ★ NOT WHILE CUSTOMIZE IS OPEN, so that Cancel can mean Cancel. This effect used to
+  //   fire on every drag, which made the footer's Cancel button a lie: the new layout
+  //   had already been written to storage before anyone clicked it, and Reset only ever
+  //   cleared LABELS, so there was no way back at all. Holding the write until edit mode
+  //   closes — with editMode in the dependency list, so leaving edit mode is itself what
+  //   triggers it — makes Done commit what is on screen and Cancel restore the snapshot
+  //   taken on entry.
   useEffect(() => {
     if (!storageReady) return;
+    if (editMode) return;
     if (typeof window !== 'undefined' && window.storage) {
       window.storage.set('sidebar:stages', JSON.stringify(stagesToStorable(stages))).catch(() => {});
     }
-  }, [stages, storageReady]);
+  }, [stages, storageReady, editMode]);
 
   // Stamp the current sidebar layout version once after load, so the one-time reconciliation above
   // runs at most once per user (the read in the load effect happens before this write).
@@ -8710,7 +8734,10 @@ export default function BookkeeperProToolkit() {
       if (label === defaultLabelByKey[key]) deletes.push(key);
       else upserts.push({ item_key: key, custom_label: label, updated_by: user?.id || null, updated_at: new Date().toISOString() });
     });
-    if (upserts.length === 0 && deletes.length === 0) {     // nothing changed — just exit
+    if (upserts.length === 0 && deletes.length === 0) {     // no LABEL changed — just exit
+      // Leaving edit mode is what commits the layout (see the persist effect), so a
+      // Done with only reordering behind it still saves the order.
+      layoutSnapshotRef.current = null;
       setDraftLabels({}); setEditMode(false); setEditingTabId(null); setEditingStageId(null); setEditingGroupKey(null);
       return;
     }
@@ -8725,10 +8752,11 @@ export default function BookkeeperProToolkit() {
         if (error) throw error;
       }
       await fetchSidebarLabels();                           // re-read the saved source of truth
+      layoutSnapshotRef.current = null;
       setDraftLabels({});
       setEditingTabId(null); setEditingStageId(null); setEditingGroupKey(null);
       setEditMode(false);
-      setLabelsNotice('Sidebar labels saved.');
+      setLabelsNotice('Sidebar labels saved for everyone. Tab order saved for you in this browser.');
     } catch (e) {
       logDbError('[sidebar] save labels', e, { userId: user?.id, isAdmin, keys: [...upserts.map(u => u.item_key), ...deletes] });
       const permission = e?.code === '42501' || /row-level security|permission/i.test(e?.message || '');
@@ -8742,24 +8770,46 @@ export default function BookkeeperProToolkit() {
     }
   };
 
+  // The layout as it stood when Customize was opened, so Cancel has something to restore.
+  // Held in a ref, not state: nothing renders from it, and it must not cause a re-render
+  // of the sidebar halfway through an edit.
+  const layoutSnapshotRef = useRef(null);
+
   // Enter customize mode (admin only): clear any stale drafts/messages.
   const enterCustomize = () => {
-    setDraftLabels({}); setLabelsErr(''); setLabelsNotice('');
+    setDraftLabels({}); setLabelsErr(''); setLabelsNotice(''); setReorderNote('');
     setEditingTabId(null); setEditingStageId(null); setEditingGroupKey(null);
+    layoutSnapshotRef.current = stages;
     setEditMode(true);
   };
 
-  // "Cancel": discard unsaved edits and leave edit mode (last-saved labels restored).
+  // "Cancel": discard unsaved edits and leave edit mode (last-saved labels restored,
+  // and the layout put back the way it was when Customize opened).
   const cancelSidebarEdit = () => {
-    setDraftLabels({}); setLabelsErr('');
+    setDraftLabels({}); setLabelsErr(''); setReorderNote('');
     setEditingTabId(null); setEditingStageId(null); setEditingGroupKey(null);
+    if (layoutSnapshotRef.current) setStages(layoutSnapshotRef.current);
+    layoutSnapshotRef.current = null;
     setEditMode(false);
   };
 
-  // "Reset to default": remove ALL overrides globally (labels revert to code defaults for everyone).
+  // "Reset to default": remove ALL label overrides globally, and put THIS browser's tab
+  // order back to the code defaults. The two halves have different reach and the confirm
+  // text says so — labels are global in sidebar_settings, order is per-user in
+  // window.storage, and a Reset that quietly left a scrambled order behind was the other
+  // half of having no way back.
   const resetSidebarLabels = async () => {
     if (typeof window !== 'undefined' && window.confirm &&
-        !window.confirm('Reset all sidebar labels to their defaults for everyone? This cannot be undone.')) return;
+        !window.confirm('Reset sidebar labels to their defaults for everyone, and your own tab order back to the default? The labels cannot be undone; the tab order can still be put back with Cancel.')) return;
+    // ★ THE SNAPSHOT SURVIVES A RESET, SO CANCEL STILL CANCELS. Clearing it here meant
+    //   `if (layoutSnapshotRef.current)` in cancelSidebarEdit was false, so Cancel left
+    //   DEFAULT_STAGES in place and the persist effect wrote it — a button labelled
+    //   Cancel committing the very change it appears to undo. Reset is now staged like
+    //   every other layout edit: it shows immediately, and Done or Cancel decides.
+    //   (The LABEL half is a Supabase delete and is genuinely immediate; the confirm text
+    //   says which half is which.)
+    setStages(DEFAULT_STAGES);
+    setReorderNote('Tab order reset to the default. Cancel still puts it back.');
     setLabelsErr(''); setLabelsNotice(''); setSavingLabels(true);
     try {
       const { error } = await supabase.from('sidebar_settings').delete().neq('item_key', '');
@@ -8779,50 +8829,154 @@ export default function BookkeeperProToolkit() {
     }
   };
 
+  // ★ THE LAYOUT COUNTS AS AN UNSAVED EDIT TOO. This guard was written when only LABELS
+  //   were staged; the layout was persisted on every drag, so there was nothing to lose.
+  //   Since the layout became staged (which is what makes Cancel honest), an admin who
+  //   reordered ten tabs and then closed the tab lost all of it with no prompt, because
+  //   draftLabels was still empty. Identity compare: setStages always returns a new array
+  //   when something moved, and the snapshot is the array Customize opened with.
+  const layoutDirty = editMode && !!layoutSnapshotRef.current && layoutSnapshotRef.current !== stages;
   useEffect(() => {
-    if (!editMode || Object.keys(draftLabels).length === 0) return;
+    if (!editMode || (Object.keys(draftLabels).length === 0 && !layoutDirty)) return;
     const onBeforeUnload = (e) => {
       e.preventDefault();
       e.returnValue = '';
     };
     window.addEventListener('beforeunload', onBeforeUnload);
     return () => window.removeEventListener('beforeunload', onBeforeUnload);
-  }, [editMode, draftLabels]);
+  }, [editMode, draftLabels, layoutDirty]);
 
   // ─── Drag and drop handlers (tab within a stage, or stage reorder) ──
   const dragRef = useRef({ kind: null, stageId: null, tabId: null });
+  /** The row a drag is hovering that would be REFUSED — drawn as an invalid target. */
+  const [dropTarget, setDropTarget] = useState(null);
 
   const onTabDragStart = (e, stageId, tabId) => {
     dragRef.current = { kind: 'tab', stageId, tabId };
+    setDropTarget(null);
     e.dataTransfer.effectAllowed = 'move';
     try { e.dataTransfer.setData('text/plain', tabId); } catch (err) {}
   };
 
-  const onTabDragOver = (e) => {
+  // ★ REFUSE DURING THE DRAG, NOT ONLY AFTER IT. This used to set dropEffect 'move' over
+  //   every tab row, so dragging Free QB Diagnostic across Authentic Branding showed a
+  //   "move" cursor the whole way and explained itself only once the drop had failed.
+  //   reorderVerdict is the arbiter either way; asking it here just means the cursor tells
+  //   the truth on the way. Cross-stage is caught by the stage id alone, without a lookup.
+  const onTabDragOver = (e, targetStageId, targetTabId) => {
     if (dragRef.current.kind !== 'tab') return;
     e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
+    const src = dragRef.current;
+    const stage = stages.find(s => s.id === targetStageId);
+    const allowed = src.stageId === targetStageId
+      && groupKeyOfTab(stage, src.tabId) === groupKeyOfTab(stage, targetTabId);
+    e.dataTransfer.dropEffect = allowed ? 'move' : 'none';
+    setDropTarget(allowed ? null : `${targetStageId}:${targetTabId}`);
   };
 
+  const onTabDragLeave = () => setDropTarget(null);
+  // ★ A CANCELLED DRAG FIRES dragend, NOT dragleave. Pressing Escape mid-drag over a row
+  //   the drop would refuse otherwise left its red outline painted until the next drag.
+  const onTabDragEnd = () => { dragRef.current = { kind: null, stageId: null, tabId: null }; setDropTarget(null); };
+
+  // What the last reorder did, announced to assistive tech and shown as a refusal
+  // message. One string for both outcomes: a move that succeeds and a move that is
+  // refused are equally worth saying out loud, and a silent refusal is what made the
+  // original bug feel like "the sidebar ignores me".
+  const [reorderNote, setReorderNote] = useState('');
+
+  /**
+   * Describe a completed move the way the owner reads the sidebar: by EFFECTIVE label
+   * (which may be an admin override from sidebar_settings), positioned within its group.
+   * Ordering logic never touches these strings — only this sentence does.
+   */
+  const announceMove = (stage, tabId, result) => {
+    const tLabel = effLabel(tabItemKey(tabId), (stage.tabs.find(t => t.id === tabId) || {}).label || tabId);
+    const group = (stage.groups || []).find(g => g.key === result.groupKey);
+    const where = group
+      ? ` in ${effLabel(groupItemKey(stage.id, group.key), group.label)}`
+      : ` in ${effLabel(stageItemKey(stage.id), stage.label)}`;
+    setReorderNote(`Moved ${tLabel} to position ${result.to + 1} of ${result.total}${where}.`);
+  };
+
+  /**
+   * "X is already first in Y" — the refusal a move at a boundary earns.
+   *
+   * ★ ITS OWN FUNCTION, BESIDE announceMove, FOR THE SAME REASON announceMove IS.
+   *   Ordering logic must never read a visible label: they are sidebar_settings overrides,
+   *   so anything that compared them would rearrange itself the moment an admin renamed a
+   *   tab. Announcements are the one place a label belongs, and keeping them out of
+   *   moveTab is what lets uiSafety assert that rule as a flat "no effLabel in here".
+   *   Reachable now in ordinary use: the edge buttons stay focusable rather than disabled.
+   */
+  const announceTabEdge = (stage, tabId, delta) => {
+    const tLabel = effLabel(tabItemKey(tabId), (stage.tabs.find(t => t.id === tabId) || {}).label || tabId);
+    const gKey = groupKeyOfTab(stage, tabId);
+    const group = (stage.groups || []).find(g => g.key === gKey);
+    const where = group
+      ? effLabel(groupItemKey(stage.id, group.key), group.label)
+      : effLabel(stageItemKey(stage.id), stage.label);
+    setReorderNote(`${tLabel} is already ${delta < 0 ? 'first' : 'last'} in ${where}.`);
+  };
+
+  /**
+   * Move a tab one place within its own group. Shared by the buttons and the keyboard.
+   *
+   * ★ Computed inside the updater, not from the render closure. Two moves that land before
+   *   a commit — a double click, or a move whose click follows a rename's onBlur in the
+   *   same gesture — would otherwise both read the same stale array and the second write
+   *   would discard the first. React 18 flushes discrete events synchronously so today's
+   *   paths happen to be safe, but that is incidental, not a guarantee.
+   */
+  const moveTab = (stageId, tabId, delta) => {
+    let outcome = null;
+    setStages(prev => {
+      const result = moveTabByStep(prev, stageId, tabId, delta);
+      outcome = { result, stage: prev.find(s => s.id === stageId) };
+      return result.ok ? result.stages : prev;
+    });
+    // setState updaters must stay pure, so the announcement is made out here.
+    queueMicrotask(() => {
+      if (!outcome) return;
+      const { result, stage } = outcome;
+      if (!result.ok || !stage) {
+        if (result.reason === 'at-edge' && stage) { announceTabEdge(stage, tabId, delta); return; }
+        setReorderNote(REORDER_REFUSALS[result.reason] || 'That move could not be applied.');
+        return;
+      }
+      announceMove(stage, tabId, result);
+    });
+  };
+
+  // ★ A DROP IS RESOLVED BY reorderVerdict, WHICH CAN REFUSE.
+  //   The previous version spliced the tab out of one stage.tabs and into another. In a
+  //   GROUPED stage that left it named by no group's tabIds, and the render is
+  //   `g.tabIds.map(id => tabById[id]).filter(Boolean)` — so the tab silently vanished
+  //   from the sidebar with no error, recoverable only by Reset.
   const onTabDrop = (e, targetStageId, targetTabId) => {
     if (dragRef.current.kind !== 'tab') return;
     e.preventDefault();
     e.stopPropagation();
     const { stageId: srcStageId, tabId: srcTabId } = dragRef.current;
-    if (!srcTabId || srcTabId === targetTabId) return;
-    setStages(prev => {
-      const next = prev.map(s => ({ ...s, tabs: [...s.tabs] }));
-      const srcStage = next.find(s => s.id === srcStageId);
-      const tgtStage = next.find(s => s.id === targetStageId);
-      if (!srcStage || !tgtStage) return prev;
-      const srcIdx = srcStage.tabs.findIndex(t => t.id === srcTabId);
-      if (srcIdx === -1) return prev;
-      const [moved] = srcStage.tabs.splice(srcIdx, 1);
-      const tgtIdx = targetTabId ? tgtStage.tabs.findIndex(t => t.id === targetTabId) : tgtStage.tabs.length;
-      tgtStage.tabs.splice(tgtIdx === -1 ? tgtStage.tabs.length : tgtIdx, 0, moved);
-      return next;
-    });
     dragRef.current = { kind: null, stageId: null, tabId: null };
+    setDropTarget(null);
+    // Same functional-update reasoning as moveTab above: a drop that lands between a
+    // previous move and its commit must not compute from the pre-move array.
+    let outcome = null;
+    setStages(prev => {
+      const result = reorderVerdict(prev, srcStageId, srcTabId, targetStageId, targetTabId);
+      outcome = { result, stage: prev.find(s => s.id === srcStageId) };
+      return result.ok ? result.stages : prev;
+    });
+    queueMicrotask(() => {
+      if (!outcome) return;
+      const { result, stage } = outcome;
+      if (!result.ok) {
+        if (result.reason !== 'noop') setReorderNote(REORDER_REFUSALS[result.reason] || 'That move could not be applied.');
+        return;
+      }
+      if (stage) announceMove(stage, srcTabId, result);
+    });
   };
 
   const onStageDragStart = (e, stageId) => {
@@ -8837,21 +8991,67 @@ export default function BookkeeperProToolkit() {
     e.dataTransfer.dropEffect = 'move';
   };
 
+  /** Announce a stage move the same way a tab move is announced. */
+  const announceStageMove = (stage, result) => {
+    const sLabel = effLabel(stageItemKey(stage.id), stage.label);
+    setReorderNote(`Moved ${sLabel} to position ${result.to + 1} of ${result.total} in the sidebar.`);
+  };
+
+  /** The stage half of announceTabEdge — kept out of moveStage for the same reason. */
+  const announceStageEdge = (stage, delta) => {
+    const sLabel = effLabel(stageItemKey(stage.id), stage.label);
+    setReorderNote(`${sLabel} is already ${delta < 0 ? 'first' : 'last'} in the sidebar.`);
+  };
+
+  /**
+   * Move a whole stage one place. The keyboard and touch half of stage reordering, which
+   * before this existed only as a mouse drag.
+   */
+  const moveStage = (stageId, delta) => {
+    let outcome = null;
+    setStages(prev => {
+      const result = moveStageByStep(prev, stageId, delta);
+      outcome = { result, stage: prev.find(s => s.id === stageId) };
+      return result.ok ? result.stages : prev;
+    });
+    queueMicrotask(() => {
+      if (!outcome) return;
+      const { result, stage } = outcome;
+      if (!result.ok || !stage) {
+        if (result.reason === 'at-edge' && stage) { announceStageEdge(stage, delta); return; }
+        setReorderNote(STAGE_REORDER_REFUSALS[result.reason] || 'That move could not be applied.');
+        return;
+      }
+      announceStageMove(stage, result);
+    });
+  };
+
+  // ★ RESOLVED BY stageReorderVerdict, NOT BY A SPLICE HERE. This was the last hand-rolled
+  //   array splice in the sidebar — no arbiter, no refusal path, no announcement and no
+  //   test. The tab drop was rescued from exactly that shape; a stage drop is the same
+  //   class of operation and now goes through the same kind of tested function.
   const onStageDrop = (e, targetStageId) => {
     if (dragRef.current.kind !== 'stage') return;
     e.preventDefault();
     const srcStageId = dragRef.current.stageId;
-    if (!srcStageId || srcStageId === targetStageId) return;
+    let outcome = null;
     setStages(prev => {
-      const next = [...prev];
-      const srcIdx = next.findIndex(s => s.id === srcStageId);
-      const tgtIdx = next.findIndex(s => s.id === targetStageId);
-      if (srcIdx === -1 || tgtIdx === -1) return prev;
-      const [moved] = next.splice(srcIdx, 1);
-      next.splice(tgtIdx, 0, moved);
-      return next;
+      const result = stageReorderVerdict(prev, srcStageId, targetStageId);
+      outcome = { result, stage: prev.find(s => s.id === srcStageId) };
+      return result.ok ? result.stages : prev;
     });
     dragRef.current = { kind: null, stageId: null, tabId: null };
+    queueMicrotask(() => {
+      if (!outcome) return;
+      const { result, stage } = outcome;
+      if (!result.ok) {
+        if (result.reason !== 'noop') {
+          setReorderNote(STAGE_REORDER_REFUSALS[result.reason] || 'That move could not be applied.');
+        }
+        return;
+      }
+      if (stage) announceStageMove(stage, result);
+    });
   };
 
   // ── Auth gate ────────────────────────────────────────────────────────────
@@ -9303,6 +9503,31 @@ export default function BookkeeperProToolkit() {
                         {!isCollapsed && <div className="text-[10px] leading-tight mt-0.5" style={{ color: C.textMute }}>{stage.desc}</div>}
                       </div>
                     </button>
+                    {editMode && (() => {
+                      // Stages had a drag handle and nothing else — unusable from a
+                      // keyboard and on touch, which is the same gap the tab rows had.
+                      const pos = stages.findIndex(s => s.id === stage.id);
+                      const sLabel = effLabel(stageItemKey(stage.id), stage.label);
+                      const first = pos <= 0;
+                      const last = pos === -1 || pos >= stages.length - 1;
+                      const btn = 'flex-shrink-0 rounded flex items-center justify-center '
+                        + 'min-h-[24px] min-w-[24px] transition nav-hover-strong';
+                      const edgeStyle = (edge) => ({ color: C.textSoft, opacity: edge ? 0.4 : 1 });
+                      return (
+                        <span className="flex flex-shrink-0 items-center">
+                          <button type="button" className={btn} aria-disabled={first || undefined}
+                            onClick={() => moveStage(stage.id, -1)} style={edgeStyle(first)}
+                            aria-label={`Move section ${sLabel} up`} title="Move section up">
+                            <ChevronUp size={14} aria-hidden="true" />
+                          </button>
+                          <button type="button" className={btn} aria-disabled={last || undefined}
+                            onClick={() => moveStage(stage.id, 1)} style={edgeStyle(last)}
+                            aria-label={`Move section ${sLabel} down`} title="Move section down">
+                            <ChevronDown size={14} aria-hidden="true" />
+                          </button>
+                        </span>
+                      );
+                    })()}
                   </div>
                 )}
 
@@ -9321,8 +9546,12 @@ export default function BookkeeperProToolkit() {
                       <div key={t.id}
                         draggable={editMode}
                         onDragStart={editMode ? (e) => onTabDragStart(e, stage.id, t.id) : undefined}
-                        onDragOver={editMode ? onTabDragOver : undefined}
+                        onDragOver={editMode ? (e) => onTabDragOver(e, stage.id, t.id) : undefined}
+                        onDragLeave={editMode ? onTabDragLeave : undefined}
+                        onDragEnd={editMode ? onTabDragEnd : undefined}
                         onDrop={editMode ? (e) => onTabDrop(e, stage.id, t.id) : undefined}
+                        style={dropTarget === `${stage.id}:${t.id}`
+                          ? { outline: `2px dashed ${C.red}`, outlineOffset: -2, borderRadius: 8 } : undefined}
                         className={`group flex items-center ${hasNumber ? 'pl-3 pr-3' : 'px-3'} ${editMode ? '' : 'pl-0'} relative`}>
                         {editMode && (
                           <span className="cursor-grab active:cursor-grabbing select-none px-1 text-xs flex-shrink-0" style={{ color: C.textMute }} title="Drag to reorder">⋮⋮</span>
@@ -9386,6 +9615,63 @@ export default function BookkeeperProToolkit() {
                             </a>
                           </>
                         )}
+                        {editMode && (() => {
+                          // ★ REORDERING MUST NOT BE MOUSE-ONLY. HTML5 drag-and-drop does not
+                          //   work from the keyboard and is unusable on touch, so these two
+                          //   buttons — not the ⋮⋮ grip — are the real control; the grip is a
+                          //   convenience. They are SIBLINGS of the rename button, never nested
+                          //   inside it: a button inside a button is invalid and the inner one
+                          //   stops being reachable.
+                          // ★ READ THE SAME LIST THE MOVE WRITES. `stage` here comes from
+                          //   the entitlement-FILTERED list, while moveTab operates on the
+                          //   unfiltered `stages`. Unreachable today — only a Super Admin
+                          //   holds sidebar.customize and they resolve FULL_ENTITLEMENT —
+                          //   but if that permission is ever widened, the boundary state
+                          //   and the move would disagree and a tab could jump past one
+                          //   the actor cannot see.
+                          const liveStage = stages.find(s => s.id === stage.id) || stage;
+                          const siblings = orderedSiblingIds(liveStage, t.id);
+                          const pos = siblings.indexOf(t.id);
+                          const gKey = groupKeyOfTab(liveStage, t.id);
+                          const within = gKey
+                            ? effLabel(groupItemKey(stage.id, gKey), (stage.groups.find(g => g.key === gKey) || {}).label)
+                            : effLabel(stageItemKey(stage.id), stage.label);
+                          const atTop = pos <= 0;
+                          const atEnd = pos === -1 || pos >= siblings.length - 1;
+                          // ★ 24x24 IS THE FLOOR (WCAG 2.2 SC 2.5.8), AND THIS IS A PHONE
+                          //   CONTROL. Below `lg` the sidebar IS the off-canvas drawer, so
+                          //   these were ~17x17 targets on exactly the device that cannot
+                          //   drag at all. The row grows a little in edit mode only.
+                          const btn = 'flex-shrink-0 rounded flex items-center justify-center '
+                            + 'min-h-[24px] min-w-[24px] transition nav-hover-strong';
+                          // ★ aria-disabled, NEVER disabled. A browser BLURS a focused
+                          //   element the moment it becomes disabled, so pressing Up until
+                          //   a tab reached position 1 threw a keyboard user out to <body>
+                          //   mid-reorder. Kept focusable, the press at the edge falls
+                          //   through to moveTabByStep, which already refuses with
+                          //   'at-edge' and already announces it.
+                          const edgeStyle = (edge) => ({ color: C.textSoft, opacity: edge ? 0.4 : 1 });
+                          return (
+                            <span className="flex flex-shrink-0 items-center">
+                              <button type="button" className={btn}
+                                aria-disabled={atTop || undefined}
+                                onClick={() => moveTab(stage.id, t.id, -1)}
+                                style={edgeStyle(atTop)}
+                                aria-label={`Move ${tLabel} up in ${within}`}
+                                title={`Move up in ${within}`}>
+                                <ChevronUp size={14} aria-hidden="true" />
+                              </button>
+                              <button type="button" className={btn}
+                                aria-disabled={atEnd || undefined}
+                                onClick={() => moveTab(stage.id, t.id, 1)}
+                                style={edgeStyle(atEnd)}
+                                aria-label={`Move ${tLabel} down in ${within}`}
+                                title={`Move down in ${within}`}>
+                                <ChevronDown size={14} aria-hidden="true" />
+                              </button>
+                            </span>
+                          );
+                        })()}
                       </div>
                     );
                   };
@@ -9522,10 +9808,34 @@ export default function BookkeeperProToolkit() {
                   Reset
                 </button>
               </div>
+              {/* ★ THE OLD COPY SAID "Done saves for everyone" FULL STOP, WHICH WAS HALF TRUE.
+                  Labels are global in sidebar_settings; tab order is per-user in
+                  window.storage; collapse state never leaves this browser. One sentence
+                  covering all three meant an admin reordering the sidebar believed they
+                  were curating it for their students, and nothing said otherwise. */}
               <div className="mt-2 text-[10px] leading-relaxed" style={{ color: C.textMute }}>
-                Click any label to rename · Press Enter to confirm a field · Done saves for everyone
+                Click any label to rename · Press Enter to confirm a field
+                <br />
+                {/* ★ TWO REACHES, NOT THREE. "on this account" read as a promise that the
+                    order follows you to another computer. It does not: window.storage is
+                    localStorage namespaced per user (src/main.jsx), so tab order and
+                    collapse state are both per-user AND per-browser — only the labels are
+                    global. Saying otherwise sends an admin looking for a sync that was
+                    never built. */}
+                <strong style={{ color: C.textSoft }}>Labels</strong> save for everyone ·{' '}
+                <strong style={{ color: C.textSoft }}>Tab order</strong> and open/closed sections{' '}
+                save for you in this browser
               </div>
             </>
+          )}
+          {/* Announces every reorder, and every refused one. Outside the editMode branch so a
+              message is never removed from the accessibility tree in the same tick it is set. */}
+          <div aria-live="polite" role="status" className="sr-only">{reorderNote}</div>
+          {editMode && reorderNote && (
+            <div className="mt-2 text-[10px] leading-relaxed flex items-start gap-1.5" style={{ color: C.textSoft }}>
+              <ArrowUpDown size={11} className="flex-shrink-0 mt-px" />
+              <span>{reorderNote}</span>
+            </div>
           )}
           {labelsErr && (
             <div role="alert" className="mt-2 text-[10px] leading-relaxed flex items-start gap-1.5" style={{ color: C.red }}>
@@ -22568,8 +22878,13 @@ function certificateTitle(rawTitle = '') {
 const COURSE_ROW_SELECT = 'id,slug,title,subtitle,description,month,course_date,published,position,cover_path,source_course_id,access_tier,created_at,updated_at';
 const COURSE_MODULE_SELECT = 'id,course_id,title,position';
 // zoom_replay_url (#37b) sits where the table puts it — after duration_label, before position.
-// load() and duplicateCourse()'s read both go through selectCourseLessons() below.
-const COURSE_LESSON_SELECT = 'id,module_id,course_id,title,type,video_url,video_provider,storage_path,text_content,duration_label,zoom_replay_url,position';
+// content_format (#65) is appended. load() and duplicateCourse()'s read both go through
+// selectCourseLessons() below.
+const COURSE_LESSON_SELECT = 'id,module_id,course_id,title,type,video_url,video_provider,storage_path,text_content,duration_label,zoom_replay_url,content_format,position';
+// ★ The pre-#65 shape — its OWN tier, exactly as the frozen note below instructs. A database
+// with #37b but without #65 answers 42703 for the full list; narrowing to this one keeps
+// replay links working and simply reads every lesson as plain text.
+const COURSE_LESSON_SELECT_PRE_RICH = 'id,module_id,course_id,title,type,video_url,video_provider,storage_path,text_content,duration_label,zoom_replay_url,position';
 // ★ The pre-#37b shape — FROZEN. A database that has not run that migration answers 42703 for the
 // WHOLE select, and load()'s not-configured branch reads "does not exist" as "the course tables are
 // missing" — which would blank the entire course platform for every user over one optional field.
@@ -22583,19 +22898,317 @@ function isMissingColumnError(e) {
   return e?.code === '42703' || e?.code === 'PGRST204' || /column .* does not exist/i.test(e?.message || '');
 }
 
-/** Run a course_lessons query, falling back to the pre-#37b column list on a missing column. */
+/** A table/function the database does not have yet (a migration has not been run). */
+function isMissingTable(e) {
+  return e?.code === '42P01' || e?.code === 'PGRST205' || e?.code === 'PGRST202'
+    || /relation .* does not exist/i.test(e?.message || '');
+}
+
+/**
+ * Run a course_lessons query, narrowing the column list once per missing migration.
+ *
+ * Three tiers, newest first: #65 (content_format) -> #37b (zoom_replay_url) -> the frozen
+ * pre-#37b shape. Each step degrades ONE feature and keeps the course platform loading;
+ * the alternative is load()'s not-configured branch reading "column does not exist" as
+ * "the course tables are missing" and blanking the platform for every user.
+ */
 async function selectCourseLessons(build) {
   const res = await build(COURSE_LESSON_SELECT);
-  if (res?.error && isMissingColumnError(res.error)) {
-    console.warn('[CourseProgram] course_lessons.zoom_replay_url is missing — run db/2026-08-05-lesson-zoom-replay.sql (#37b). Continuing without replay links.');
-    return build(COURSE_LESSON_SELECT_LEGACY);
-  }
-  return res;
+  if (!res?.error || !isMissingColumnError(res.error)) return res;
+  console.warn('[CourseProgram] course_lessons.content_format is missing — run db/2026-09-20-course-lesson-assets.sql (#65). Lesson instructions will render as plain text.');
+  const mid = await build(COURSE_LESSON_SELECT_PRE_RICH);
+  if (!mid?.error || !isMissingColumnError(mid.error)) return mid;
+  console.warn('[CourseProgram] course_lessons.zoom_replay_url is missing — run db/2026-08-05-lesson-zoom-replay.sql (#37b). Continuing without replay links.');
+  return build(COURSE_LESSON_SELECT_LEGACY);
 }
 
 /** True when loaded lesson rows came back without #37b's column, i.e. the DB predates it. */
 function lessonRowsArePreReplay(rows) {
   return Array.isArray(rows) && rows.length > 0 && !('zoom_replay_url' in rows[0]);
+}
+
+/** True when loaded lesson rows came back without #65's column. */
+function lessonRowsArePreRichContent(rows) {
+  return Array.isArray(rows) && rows.length > 0 && !('content_format' in rows[0]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lesson instructions (#65) — resolving private images, and rendering the document
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Signed URLs for every image ONE lesson cites, keyed by asset id.
+ *
+ * ★ ONE select and ONE createSignedUrls call per lesson, never one per image — the
+ *   community gallery's idiom. Ten images on a lesson page is two requests, not eleven.
+ * ★ The URLs are refreshed BEFORE they expire. A student reading a long lesson past the
+ *   hour would otherwise watch every screenshot turn into a broken image, with nothing
+ *   on screen explaining why and no way to recover but a reload.
+ * ★ Nothing here decides who may see an image. The storage policy does, by reference; a
+ *   denial simply comes back without a signed URL and renders as the unavailable state.
+ */
+function useLessonAssetUrls(lesson) {
+  const [urls, setUrls] = useState({});
+  const signedAtRef = useRef(0);
+  const ids = useMemo(
+    () => lessonAssetIds(lesson?.text_content, lesson?.content_format),
+    [lesson?.text_content, lesson?.content_format],
+  );
+  const idKey = ids.join(',');
+
+  useEffect(() => {
+    if (!idKey) { setUrls({}); return undefined; }
+    let cancelled = false;
+    const wanted = idKey.split(',');
+
+    // ★ AN ID MUST END UP undefined (still working), a string (ready) or null (we tried and
+    //   there is nothing). Every early return used to leave the map empty, which LessonImage
+    //   could not tell apart from "not started" — so a genuine failure would now sit under a
+    //   loading placeholder for ever. Settling every wanted id is what makes the placeholder
+    //   safe to show at all.
+    const settleUnavailable = () => {
+      if (cancelled) return;
+      setUrls(Object.fromEntries(wanted.map((id) => [id, null])));
+    };
+
+    const resolve = async () => {
+      try {
+        const { data: rows, error } = await supabase
+          .from('course_lesson_assets').select('id,storage_path').in('id', wanted);
+        if (cancelled) return;
+        if (error) {
+          // A pre-#65 database answers "relation does not exist". That is not an error
+          // worth showing a student: their lesson simply has no images.
+          if (!isMissingTable(error)) console.error('[lesson-assets] could not resolve images', error.code || error.message);
+          settleUnavailable();
+          return;
+        }
+        const pathById = new Map((rows || []).map(r => [r.storage_path, r.id]));
+        const paths = (rows || []).map(r => r.storage_path);
+        if (!paths.length) { settleUnavailable(); return; }
+        const { data: signed, error: signErr } = await supabase.storage
+          .from(LESSON_ASSET_BUCKET).createSignedUrls(paths, LESSON_ASSET_SIGN_TTL_SECONDS);
+        if (cancelled) return;
+        if (signErr) {
+          console.error('[lesson-assets] signing failed', signErr.message || signErr.name);
+          settleUnavailable();
+          return;
+        }
+        const next = Object.fromEntries(wanted.map((id) => [id, null]));
+        (signed || []).forEach((r, i) => {
+          const p = r.path || paths[i];
+          const id = pathById.get(p);
+          if (r.signedUrl && id) next[id] = r.signedUrl;
+        });
+        signedAtRef.current = Date.now();
+        setUrls(next);
+      } catch (e) {
+        if (!cancelled) console.error('[lesson-assets] resolve failed', e?.message || 'error');
+        settleUnavailable();
+      }
+    };
+
+    resolve();
+    const ttlMs = LESSON_ASSET_SIGN_TTL_SECONDS * 1000;
+    const timer = setInterval(() => {
+      if (Date.now() - signedAtRef.current >= ttlMs - LESSON_ASSET_RESIGN_MARGIN_MS) resolve();
+    }, 60_000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [idKey]);
+
+  return urls;
+}
+
+/** One lesson image, or a readable explanation of why it is not there. */
+function LessonImage({ assetId, alt, url, caption = null, block = true }) {
+  const [failed, setFailed] = useState(false);
+  // ★ CLEARED WHEN A NEW URL ARRIVES, OR THE REFRESH LOOP IS POINTLESS. `failed` used to
+  //   latch for the life of the mount, and the call sites key by POSITION — so a re-signed
+  //   URL landed on a component already showing the fallback and the new src was never
+  //   even attempted. useLessonAssetUrls goes to real trouble to re-sign before the TTL
+  //   expires precisely so a long read does not end in broken images; without this, one
+  //   dropped request during first paint produced that outcome permanently anyway.
+  useEffect(() => { setFailed(false); }, [url]);
+  // ★ `label` IS THE ALT TEXT, AND A CAPTION IS A DIFFERENT THING. Alt is what a screen
+  //   reader announces and what stands in when the picture will not load; the caption is
+  //   visible prose under it. Rendering the caption into alt — or alt into the caption —
+  //   makes a screen reader read the same sentence twice.
+  const label = alt || 'Image';
+  // ★ "NOT RESOLVED YET" IS NOT "FAILED". useLessonAssetUrls needs a select and a signing
+  //   round trip before any url exists, and this branch fired on `!url` — so every lesson with
+  //   images opened by telling the student, in words, that the picture could not be loaded,
+  //   then swapped it for the picture. A pending image says nothing; only a real failure, or a
+  //   resolution that produced no url, gets the card.
+  if (url === undefined && !failed) {
+    return (
+      <div className={block ? 'my-4' : 'inline-block align-middle'} aria-hidden="true">
+        <div className="rounded-xl border border-dashed animate-pulse motion-reduce:animate-none"
+          style={{ borderColor: GLASS.borderSoft, background: 'var(--wash)', height: block ? 120 : 24 }} />
+      </div>
+    );
+  }
+  if (!url || failed) {
+    // ★ NEVER A BROKEN-IMAGE ICON. A student who cannot load a screenshot should be told
+    //   that in words, and still get the description of what it showed.
+    return (
+      <div className={block ? 'my-4' : 'inline-block align-middle'}
+        role="img" aria-label={`Image unavailable: ${label}`}>
+        <div className="rounded-xl border-2 border-dashed px-4 py-5 text-center text-[13px]"
+          style={{ borderColor: GLASS.borderSoft, color: C.textMute, background: 'var(--wash)' }}>
+          <ImageOff size={18} className="mx-auto mb-1.5" aria-hidden="true" />
+          <div style={{ color: C.textSoft }}>{label}</div>
+          <div className="mt-0.5 text-[11px]">This image could not be loaded.</div>
+          {/* ★ VISIBLE, NOT sr-only. The caption is the sentence explaining the picture; hiding
+              it here took it from the sighted reader at the one moment the picture is missing —
+              exactly when the words are all they have. The alt text is already spoken through
+              the wrapper's aria-label, so this is not a duplicate announcement. */}
+          {caption && (
+            <figcaption className="mt-1.5 text-[12px] leading-snug" style={{ color: C.textSoft }}>
+              {caption}
+            </figcaption>
+          )}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <figure className={block ? 'my-4' : 'inline'}>
+      <img
+        src={url}
+        alt={label}
+        loading="lazy"
+        decoding="async"
+        onError={() => setFailed(true)}
+        data-asset-id={assetId}
+        className="rounded-xl max-w-full h-auto block"
+        style={{ border: `1px solid ${GLASS.borderSoft}`, maxHeight: 560, objectFit: 'contain' }}
+      />
+      {caption && (
+        // ★ textSoft, NOT textMute. A caption is prose a student reads, so it is normal-size
+        //   body text and owes 4.5:1. Measured on the rendered page, --c-text-mute is 2.98:1
+        //   on the lesson surface in light mode — fine for a hint beside a field, not for
+        //   the sentence explaining the screenshot above it.
+        <figcaption className="mt-1.5 text-[13px] leading-snug"
+          style={{ color: C.textSoft, overflowWrap: 'anywhere' }}>
+          {caption}
+        </figcaption>
+      )}
+    </figure>
+  );
+}
+
+/** The visible words of an inline token list — used to decide if a link states its host. */
+function tokenText(tokens) {
+  return (tokens || []).map((t) => {
+    if (t.type === 'text') return t.value;
+    if (t.tokens) return tokenText(t.tokens);
+    return '';
+  }).join('');
+}
+
+/**
+ * Render a lesson's instructions.
+ *
+ * ★ REACT ELEMENTS FROM TYPED TOKENS. There is no dangerouslySetInnerHTML here and there
+ *   must never be: the parser emits a closed token set, so markup a creator types is
+ *   text, not structure. Two suites already forbid the prop in their regions; §22 of
+ *   test/uiSafety.test.mjs adds this one.
+ * ★ A 'plain' lesson takes the ORIGINAL branch — escaped text, whitespace-pre-line —
+ *   byte-for-byte what every lesson written before #65 already rendered.
+ */
+function LessonRichText({ lesson, className = '', style = {} }) {
+  const format = normalizeFormat(lesson?.content_format);
+  const text = lesson?.text_content || '';
+  const assetUrls = useLessonAssetUrls(lesson);
+  const blocks = useMemo(() => parseLessonContent(text, format), [text, format]);
+  if (!text.trim()) return null;
+
+  if (format === 'plain') {
+    return (
+      <div className={`text-slate-700 whitespace-pre-line leading-relaxed text-[15px] ${className}`} style={style}>
+        {text}
+      </div>
+    );
+  }
+
+  const inline = (tokens, keyBase) => (tokens || []).map((t, i) => {
+    const k = `${keyBase}.${i}`;
+    switch (t.type) {
+      case 'text': return <React.Fragment key={k}>{t.value}</React.Fragment>;
+      case 'break': return <br key={k} />;
+      case 'bold': return <strong key={k} style={{ fontWeight: 700, color: C.text }}>{inline(t.tokens, k)}</strong>;
+      case 'image':
+        return <LessonImage key={k} assetId={t.assetId} alt={t.alt} url={assetUrls[t.assetId]} block={false} />;
+      case 'badimage':
+        return <LessonImage key={k} assetId={null} alt={t.alt} url={null} block={false} />;
+      // An unsafe target never becomes an href — the label stays as readable text.
+      case 'badlink': return <React.Fragment key={k}>{inline(t.tokens, k)}</React.Fragment>;
+      case 'link': {
+        const external = t.kind === 'external';
+        // ★ SAY WHERE IT GOES WHEN THE WORDS DO NOT. safeLessonHref already refuses the
+        //   credential trick ("https://forms.google.com@evil.example"), but nothing stops
+        //   a creator — or anyone who ever gets to edit a lesson — pointing the word
+        //   "HERE" at docs-google.com. A student cannot hover on a phone and a screen
+        //   reader does not read an href aloud, so an opaque label carries its real host.
+        //   A label that already shows the host does not need it repeated.
+        const shownHost = external && !t.bare && t.host && !tokenText(t.tokens).toLowerCase().includes(t.host.toLowerCase())
+          ? t.host : null;
+        // ★ primarySolid, NOT primary, for the link text. C.primary measures 3.65:1 on the
+        //   lesson surface and this is 15px/600 — normal text, which owes 4.5:1. CLAUDE.md
+        //   is explicit that C.primary is for borders, icons, rings and bars, and that text
+        //   uses --primary-solid (#0070E0, 4.78:1). Students read these links.
+        return (
+          <a key={k}
+            href={t.href}
+            {...(external ? { target: '_blank', rel: 'noopener noreferrer' } : {})}
+            {...(external && t.host ? { title: `Opens ${t.host} in a new tab` } : {})}
+            className="underline underline-offset-2 transition hover:opacity-75 rounded-sm"
+            style={{ color: C.primarySolid, fontWeight: 600, overflowWrap: 'anywhere' }}>
+            {inline(t.tokens, k)}
+            {shownHost && (
+              // textSoft for the same reason as the caption: 12px prose owes 4.5:1, and
+              // --c-text-mute measures 2.98:1 light / 3.59:1 dark here.
+              <span className="ml-1 text-[0.82em] font-normal no-underline" style={{ color: C.textSoft }}>
+                ({shownHost})
+              </span>
+            )}
+            {external && <ExternalLink size={12} className="inline-block ml-0.5 -translate-y-px" aria-hidden="true" />}
+          </a>
+        );
+      }
+      default: return null;
+    }
+  });
+
+  return (
+    <div className={`lesson-instructions text-slate-700 leading-relaxed text-[15px] ${className}`} style={style}>
+      {blocks.map((b, i) => {
+        if (b.type === 'paragraph') {
+          return <p key={i} className="my-2.5" style={{ overflowWrap: 'anywhere' }}>{inline(b.tokens, `p${i}`)}</p>;
+        }
+        if (b.type === 'list') {
+          // Named ListTag, not List: `List` is an imported lucide icon, and shadowing it
+          // here would work today and break silently the day this function needs the icon.
+          const ListTag = b.ordered ? 'ol' : 'ul';
+          return (
+            <ListTag key={i} className={`my-2.5 pl-5 ${b.ordered ? 'list-decimal' : 'list-disc'}`}
+              style={{ overflowWrap: 'anywhere' }}>
+              {b.items.map((item, j) => <li key={j} className="my-1">{inline(item, `l${i}.${j}`)}</li>)}
+            </ListTag>
+          );
+        }
+        if (b.type === 'imageBlock') {
+          return <LessonImage key={i} assetId={b.assetId} alt={b.alt} url={assetUrls[b.assetId]}
+            caption={b.caption ? inline(b.caption, `c${i}`) : null} />;
+        }
+        if (b.type === 'badimageBlock') {
+          return <LessonImage key={i} assetId={null} alt={b.alt} url={null}
+            caption={b.caption ? inline(b.caption, `c${i}`) : null} />;
+        }
+        return null;
+      })}
+    </div>
+  );
 }
 // course_completions has only (user_id, course_id, completed_at) — composite PK, no id/created_at
 // columns (see COURSE_SETUP.md). Selecting non-existent columns returns a PostgREST 400, so request
@@ -24391,6 +25004,32 @@ function CourseProgram({
   // sit below the fold. Without this, a blocked save looks like a dead Save button.
   const replayInputRef = useRef(null);
 
+  // ── Lesson instructions composer (#65) ──────────────────────────────────────
+  // The textarea, so a refused save can scroll to and focus the thing that is wrong.
+  const lessonBodyRef = useRef(null);
+  // The caret at the moment a toolbar button was pressed. Clicking a button blurs the
+  // textarea, and reading selectionStart AFTER that gives 0 — which silently inserted
+  // every link at the very beginning of the document.
+  const lessonSelRef = useRef({ start: 0, end: 0 });
+  const [lessonPreview, setLessonPreview] = useState(false);
+  // { open, url, label } — an inline bar, NOT a nested dialog. A modal inside the lesson
+  // drawer would be a second portaled overlay over a first, and the drawer's own focus
+  // trap fights anything that opens inside it.
+  const [linkBar, setLinkBar] = useState(null);
+  const linkUrlRef = useRef(null);
+  /**
+   * Images uploaded during this editing session:
+   * { key, name, status: uploading|registering|ready|error|removed, progress, error,
+   *   assetId, path, alt }
+   * An entry is NOT a reference — the lesson text is. These rows exist so the creator can
+   * watch, retry, cancel and describe an upload; what the lesson actually shows is decided
+   * by the tokens in the text, and by the trigger that reads them.
+   */
+  const [lessonImages, setLessonImages] = useState([]);
+  const lessonImagesRef = useRef([]);
+  useEffect(() => { lessonImagesRef.current = lessonImages; }, [lessonImages]);
+  const lessonImageInputRef = useRef(null);
+
   // Certificate state
   const [studentName, setStudentName] = useState(
     user?.user_metadata?.full_name || user?.user_metadata?.name ||
@@ -24974,6 +25613,10 @@ function CourseProgram({
     // Without this the replay link is invisible to the dirty check, so typing one and
     // hitting Cancel discards it with no prompt and no beforeunload guard.
     zoom_replay_url: l.zoom_replay_url || '',
+    // Same reason (#65): turning formatting ON without otherwise editing the text is a
+    // real change — it is what makes links and images render — and a dirty check that
+    // could not see it would discard that choice on Cancel without asking.
+    content_format: l.content_format || 'plain',
   });
   const lessonDraftDirty = !!(isAdmin && editingLesson && originalEditingLesson &&
     JSON.stringify(lessonComparable(editingLesson)) !== JSON.stringify(lessonComparable(originalEditingLesson)));
@@ -25013,6 +25656,24 @@ function CourseProgram({
       // Best-effort and reference-aware: a duplicated course can legitimately share a path.
       Promise.resolve(removeMediaIfUnreferenced([orphan])).catch(() => { /* best effort */ });
     }
+    // ★ The same sweep for lesson IMAGES, and for the same reason. An image uploaded and
+    //   registered but never placed in the text — or placed and then deleted before Save —
+    //   is an object no lesson cites.
+    //   ★ IT IS COMPARED AGAINST THE SAVED ROW, NOT THE DRAFT. Closing discards the draft, so
+    //     an image the creator had placed in it is cited by nothing that survives — and since
+    //     the lesson was never saved, no reference row exists either. Measuring against the
+    //     draft therefore skipped exactly the images this sweep exists to collect, leaving
+    //     them in the private bucket until some later save in the same course ran the 1-day
+    //     pass. Session-only here: the age-bounded crash-recovery pass belongs with a
+    //     successful save, not with a Cancel that may be one of several open tabs.
+    Promise.resolve(sweepLessonAssetOrphans({
+      sessionOnly: true,
+      citedText: originalEditingLesson?.text_content || '',
+      citedFormat: originalEditingLesson?.content_format,
+    })).catch(() => { /* best effort */ });
+    setLessonImages([]);
+    setLessonPreview(false);
+    setLinkBar(null);
     clearLessonDraft();
     setVideoUploadState(UPLOAD_STATES.EMPTY);
     setEditingLesson(null);
@@ -25246,6 +25907,11 @@ function CourseProgram({
       //   any other provider (a mid-edit inconsistency, a hand-fixed row) used to leak its object
       //   forever, because the provider test failed while the file was still there.
       if (l.storage_path) await removeMediaIfUnreferenced([l.storage_path]);
+      // The FK cascade has already removed this lesson's image references, so any image it
+      // was the last to cite is now an orphan. Same order as the video sweep above, and
+      // for the same reason: the row must be gone before anything counts references.
+      // Age-bounded, so it can never take an upload another tab is mid-way through.
+      await sweepLessonAssetOrphans();
       setActiveLessonId(prev => (prev === l.id ? null : prev)); // don't keep a deleted lesson active
       await load();
     } catch (e) { logDbError('[CourseProgram] deleteLesson', e, { courseId: course.id, lessonId: l.id }); setErr(describeDbError(e, 'Could not delete lesson.')); }
@@ -25285,6 +25951,399 @@ function CourseProgram({
       return next;
     });
   }
+
+  // ── Lesson instructions composer (#65) ──────────────────────────────────────
+
+  /** Remember the caret. Toolbar buttons blur the textarea, and reading the selection
+   *  after that returns 0 — which silently inserted every link at the top of the file. */
+  const rememberLessonSelection = () => {
+    const el = lessonBodyRef.current;
+    if (el) lessonSelRef.current = { start: el.selectionStart ?? 0, end: el.selectionEnd ?? 0 };
+  };
+
+  /**
+   * Put focus back in the instructions box after a composer control CLOSES WITHOUT EDITING.
+   *
+   * ★ THE CANCEL PATHS ARE THE ONES THAT NEEDED THIS — the edit paths never did.
+   *   Update and Unlink both end in applyLessonEdit, which already focuses the textarea on a
+   *   rAF, so the review's "closing the link bar drops focus" was true of three sites only:
+   *   Escape and Cancel in the link bar, and Remove on an image card. Each of those unmounts
+   *   the element that HAD focus — the URL input, or the button itself — and a browser moves
+   *   focus to <body> when that happens, stranding a keyboard user at the top of the document
+   *   with the drawer still open (WCAG 2.4.3). The textarea is the right target for all three:
+   *   it is where the caret was, and for Remove it is where the token was just stripped from.
+   *   The rAF is not decorative — the unmount happens in the same commit, so focusing before
+   *   it lands is undone by React removing the node.
+   */
+  const returnFocusToLessonBody = () => {
+    requestAnimationFrame(() => {
+      const el = lessonBodyRef.current;
+      if (!el) return;
+      el.focus();
+      const { start, end } = lessonSelRef.current || {};
+      if (Number.isFinite(start)) el.setSelectionRange(start, Number.isFinite(end) ? end : start);
+    });
+  };
+
+  /** Write a composer result back into the draft and restore the caret. */
+  const applyLessonEdit = (result) => {
+    if (!result || typeof result.text !== 'string') return;
+    setEditingLesson(s => ({ ...s, text_content: result.text }));
+    const { selectionStart: a, selectionEnd: b } = result;
+    requestAnimationFrame(() => {
+      const el = lessonBodyRef.current;
+      if (!el) return;
+      el.focus();
+      if (Number.isFinite(a)) { el.setSelectionRange(a, Number.isFinite(b) ? b : a); lessonSelRef.current = { start: a, end: b ?? a }; }
+    });
+  };
+
+  const lessonFormat = normalizeFormat(editingLesson?.content_format);
+  // ★ THE OPT-IN PROTECTS SAVED PROSE, NOT WHAT WAS JUST TYPED — and reading the DRAFT
+  //   here instead of the saved row was a real bug, caught in the browser. Writing the
+  //   first sentence of a brand-new lesson made the draft non-empty, which replaced the
+  //   whole toolbar with "Turn on formatting": the creator typed a line and the Link
+  //   button vanished. Nothing written in this session needs protecting from
+  //   reinterpretation — the creator is watching it. Only text that was already stored
+  //   as plain can be silently changed by turning formatting on, so that is what the
+  //   question is about.
+  const savedLessonText = (originalEditingLesson?.text_content || '').trim();
+  const needsFormatOptIn = lessonFormat === 'plain' && !!savedLessonText;
+
+  /**
+   * Turn formatting on for this lesson.
+   *
+   * ★ EXISTING TEXT IS ESCAPED, AND THAT IS WHY THIS IS AN EXPLICIT BUTTON RATHER THAN
+   *   SOMETHING THE FIRST TOOLBAR CLICK DOES QUIETLY. Escaping shifts every character
+   *   offset after it, so a toolbar action that converted and then inserted at the
+   *   remembered caret would land in the wrong place — subtly, and only in text that
+   *   happened to contain a metacharacter. Converting as its own step, with the caret
+   *   moved to the end, cannot be subtly wrong.
+   */
+  const enableLessonFormatting = () => {
+    setEditingLesson((s) => {
+      const converted = plainToMarkdown(s?.text_content || '');
+      return { ...s, content_format: 'markdown', text_content: converted };
+    });
+    requestAnimationFrame(() => {
+      const el = lessonBodyRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+    });
+  };
+
+  /** Ensure markdown before an insertion. Safe silently only when the body is empty. */
+  const ensureLessonMarkdown = () => {
+    if (lessonFormat === 'markdown') return true;
+    if (needsFormatOptIn) { enableLessonFormatting(); return false; }
+    setEditingLesson(s => ({ ...s, content_format: 'markdown' }));
+    return true;
+  };
+
+  const runLessonTool = (fn) => {
+    if (!ensureLessonMarkdown()) return;
+    const { start, end } = lessonSelRef.current;
+    applyLessonEdit(fn(editingLesson?.text_content || '', start, end));
+  };
+
+  const openLinkBar = () => {
+    if (!ensureLessonMarkdown()) return;
+    rememberLessonSelection();
+    const text = editingLesson?.text_content || '';
+    const { start, end } = lessonSelRef.current;
+    // ★ EDIT THE LINK THE CARET IS IN, DO NOT WRAP IT AGAIN. Selecting the words of an
+    //   existing link and pressing Ctrl+K used to wrap the whole token in a new one and
+    //   produce `[label(url)](newurl)` — a link whose visible text is raw markdown. With
+    //   a range in hand, confirm replaces the token instead of the selection.
+    const found = linkAtSelection(text, start, end);
+    setLinkBar(found
+      ? {
+        url: found.url, label: found.label, error: '',
+        range: { start: found.start, end: found.end },
+        // What the bar was opened ON, so a later edit to the fields cannot be mistaken for
+        // the document still holding the token we captured. See liveLinkRange().
+        wasUrl: found.url, wasLabel: found.label,
+      }
+      : { url: '', label: text.slice(start, end), error: '', range: null });
+    requestAnimationFrame(() => linkUrlRef.current?.focus());
+  };
+
+  /**
+   * Re-find the link this bar is editing in the CURRENT text, or null if it has moved.
+   *
+   * ★ THE CAPTURED RANGE IS A GUESS THE MOMENT IT IS TAKEN. The bar renders BELOW the body and
+   *   the textarea stays editable, so a creator can type, paste or delete while it is open —
+   *   and the offsets captured by openLinkBar then point at whatever moved into their place.
+   *   Update and Unlink spliced there blind, silently rewriting the wrong span. Re-deriving is
+   *   cheap and turns a corrupted document into a message.
+   */
+  const liveLinkRange = () => {
+    if (!linkBar?.range) return null;
+    const at = linkAtSelection(editingLesson?.text_content || '', linkBar.range.start, linkBar.range.start);
+    if (!at || at.start !== linkBar.range.start) return null;
+    if (at.url !== linkBar.wasUrl || at.label !== linkBar.wasLabel) return null;
+    return at;
+  };
+
+  const LINK_MOVED = 'The lesson text changed while this was open. Close this, then put the cursor '
+    + 'in the link and press Ctrl+K again.';
+
+  const confirmLinkBar = () => {
+    let start; let end;
+    if (linkBar?.range) {
+      const live = liveLinkRange();
+      if (!live) { setLinkBar(b => ({ ...b, error: LINK_MOVED })); return; }
+      start = live.start; end = live.end;
+    } else {
+      ({ start, end } = lessonSelRef.current);
+    }
+    const result = applyLink(editingLesson?.text_content || '', start, end, linkBar?.url,
+      { label: (linkBar?.label || '').trim() || null });
+    if (!result.ok) {
+      setLinkBar(b => ({ ...b, error: result.reason === 'insecure'
+        ? 'Links must start with https:// — an http:// link is not secure.'
+        : 'That is not a valid https:// web address.' }));
+      return;
+    }
+    setLinkBar(null);
+    applyLessonEdit(result);
+  };
+
+  /** Take the address off the link the bar is editing, keeping its words. */
+  const removeLinkAtBar = () => {
+    if (!linkBar?.range) return;
+    const live = liveLinkRange();
+    if (!live) { setLinkBar(b => ({ ...b, error: LINK_MOVED })); return; }
+    const result = applyUnlink(editingLesson?.text_content || '', live.start, live.start);
+    if (!result.ok) { setLinkBar(b => ({ ...b, error: LINK_MOVED })); return; }
+    setLinkBar(null);
+    applyLessonEdit(result);
+  };
+
+  const patchImage = (key, patch) =>
+    setLessonImages(list => list.map(im => (im.key === key ? { ...im, ...patch } : im)));
+
+  /** Upload one image and register it. Both halves, so a retry repeats both. */
+  const uploadLessonImage = async (entry) => {
+    const lessonId = editingLesson?.id;
+    const courseId = course?.id;
+    if (!lessonId || !courseId) return;
+    patchImage(entry.key, { status: 'uploading', error: '' });
+    // A fresh object id every attempt: a retry after a partial failure must never collide
+    // with a half-written object from the previous one.
+    const objectName = lessonAssetObjectName(entry.mimeType, crypto.randomUUID());
+    const path = lessonAssetPath(courseId, lessonId, objectName);
+    try {
+      const { error: upErr } = await supabase.storage.from(LESSON_ASSET_BUCKET)
+        .upload(path, entry.file, { upsert: false, contentType: entry.mimeType });
+      if (upErr) throw upErr;
+      // Cancelled while the bytes were in flight: supabase-js exposes no AbortSignal for
+      // an upload, so the honest thing is to let it finish and remove it immediately.
+      if ((lessonImagesRef.current.find(im => im.key === entry.key) || {}).status === 'cancelled') {
+        await supabase.storage.from(LESSON_ASSET_BUCKET).remove([path]).catch(() => {});
+        return;
+      }
+      patchImage(entry.key, { status: 'registering', path });
+      const { data: assetId, error: rpcErr } = await supabase.rpc('course_lesson_asset_register', {
+        p_course_id: courseId,
+        p_lesson_id: lessonId,
+        p_storage_path: path,
+        p_mime_type: entry.mimeType,
+        p_byte_size: entry.file.size,
+      });
+      if (rpcErr) {
+        // The object exists but nothing points at it. Drop it now rather than leaving a
+        // file only the age-bounded sweep would ever find.
+        await supabase.storage.from(LESSON_ASSET_BUCKET).remove([path]).catch(() => {});
+        throw rpcErr;
+      }
+      // ★ RE-CHECKED AFTER THE RPC TOO. The earlier check only covers a cancel during the
+      //   TRANSFER; a cancel during registration used to be silently undone, because this
+      //   line then flipped the row the creator had just dismissed back to Ready. Registry
+      //   and bytes both go, since nothing cites them.
+      if ((lessonImagesRef.current.find(im => im.key === entry.key) || {}).status === 'cancelled') {
+        await supabase.rpc('course_lesson_asset_delete', { p_asset_id: assetId }).catch(() => {});
+        await supabase.storage.from(LESSON_ASSET_BUCKET).remove([path]).catch(() => {});
+        return;
+      }
+      patchImage(entry.key, { status: 'ready', assetId, path });
+    } catch (e) {
+      logDbError('[lesson-assets] upload', e, { courseId, lessonId });
+      // ★ A CANCELLED ROW STAYS CANCELLED. Without this, an upload the creator cancelled
+      //   and that then failed would flip itself back to 'error' — reappearing in the list
+      //   they had just dismissed, with a Retry button for a file they no longer want.
+      if ((lessonImagesRef.current.find(im => im.key === entry.key) || {}).status === 'cancelled') return;
+      patchImage(entry.key, {
+        status: 'error',
+        error: isMissingTable(e) || e?.code === 'PGRST202'
+          ? 'Lesson images need a database migration that has not been run yet (db/2026-09-20-course-lesson-assets.sql).'
+          : describeDbError(e, 'That image could not be uploaded.'),
+      });
+    }
+  };
+
+  /** Accept picked or pasted files, refusing the unusable ones before any transfer. */
+  const addLessonImages = (files) => {
+    setLessonErr('');
+    const incoming = Array.from(files || []);
+    if (!incoming.length) return;
+    const already = lessonAssetIds(editingLesson?.text_content, editingLesson?.content_format).length;
+    const queued = lessonImages.filter(im => ['uploading', 'registering', 'ready'].includes(im.status)).length;
+    const accepted = [];
+    for (const file of incoming) {
+      if (already + queued + accepted.length >= LESSON_IMAGE_MAX_PER_LESSON) {
+        setLessonErr(`A lesson can show up to ${LESSON_IMAGE_MAX_PER_LESSON} images.`);
+        break;
+      }
+      const verdict = validateLessonImageFile(file);
+      if (!verdict.ok) { setLessonErr(verdict.message); continue; }
+      accepted.push({
+        key: crypto.randomUUID(), name: file.name || 'image', file,
+        mimeType: verdict.mimeType, status: 'uploading', error: '', alt: '', assetId: null, path: null,
+      });
+    }
+    if (!accepted.length) return;
+    setLessonImages(list => [...list, ...accepted]);
+    accepted.forEach(uploadLessonImage);
+  };
+
+  /**
+   * Paste-to-upload. The FIRST paste handler in this codebase.
+   *
+   * ★ ONLY REAL FILES ARE TAKEN. Copying an image from a web page puts BOTH a file and an
+   *   HTML fragment on the clipboard; taking the HTML would mean hot-linking a third
+   *   party's server from every student's lesson page. If there is no file but the HTML
+   *   names a remote image, the creator is told to download it — never silently linked.
+   */
+  const onLessonPaste = (e) => {
+    const dt = e.clipboardData;
+    if (!dt) return;
+    const files = Array.from(dt.files || []).filter(f => /^image\//i.test(f.type || ''));
+    if (files.length) {
+      e.preventDefault();
+      rememberLessonSelection();
+      addLessonImages(files);
+      return;
+    }
+    const html = dt.getData?.('text/html') || '';
+    if (/<img\b/i.test(html)) {
+      // ★ REFUSE THE PICTURE, KEEP THE WORDS.
+      //   Copying a paragraph out of a web page brings any inline image along with it, and
+      //   preventDefault() on its own threw away the WHOLE paste — including the prose the
+      //   creator actually wanted. The remote image still has to go (a hot-linked image
+      //   breaks the day that site changes it, and asks that site for every student's IP
+      //   address), but discarding the text with it reads as "pasting is broken", which is
+      //   exactly how it was reported. Inserting the plain-text flavour is what the browser
+      //   would have done anyway for a text-only paste, so it introduces nothing new to
+      //   validate: the save-time check still runs over the finished document.
+      e.preventDefault();
+      rememberLessonSelection();
+      const plain = dt.getData?.('text/plain') || '';
+      const { start, end } = lessonSelRef.current;
+      let kept = false;
+      if (plain) {
+        const body = editingLesson?.text_content || '';
+        applyLessonEdit({
+          text: body.slice(0, start) + plain + body.slice(end),
+          selectionStart: start + plain.length,
+          selectionEnd: start + plain.length,
+        });
+        kept = true;
+      }
+      setLessonErr((kept
+        ? 'The text was pasted. The picture in it was not: it is hosted on another website. '
+        : 'That image is hosted on another website, so it was not added. ')
+        + 'A linked image would break when that site changes it, and would tell that site who '
+        + 'is reading your lesson. Save the picture to your computer, then use the Image button.');
+    }
+  };
+
+  /** Put a ready image into the text at the remembered caret. */
+  const insertLessonImage = (entry) => {
+    const alt = (entry.alt || '').trim();
+    if (!entry.assetId || !alt) return;
+    if (!ensureLessonMarkdown()) return;
+    const { start, end } = lessonSelRef.current;
+    const result = applyImage(editingLesson?.text_content || '', start, end, entry.assetId, alt, entry.caption);
+    if (!result.ok) return;
+    applyLessonEdit(result);
+    patchImage(entry.key, { status: 'placed' });
+  };
+
+  /** Drop an image the creator no longer wants, and its bytes when nothing cites it. */
+  const removeLessonImage = async (entry) => {
+    if (entry.status === 'uploading' || entry.status === 'registering') {
+      patchImage(entry.key, { status: 'cancelled' });
+      return;
+    }
+    setLessonImages(list => list.filter(im => im.key !== entry.key));
+    // This unmounts the button that currently has focus, so hand it back to the textarea.
+    returnFocusToLessonBody();
+    if (!entry.assetId) return;
+    // ★ TAKE THE TOKEN OUT OF THE TEXT FIRST, OR THE LESSON CANNOT BE SAVED AT ALL.
+    //   Reference rows are derived by a trigger on SAVE, so an image placed in the draft
+    //   and removed before saving has no reference — the server's LESSON_ASSET_IN_USE
+    //   guard cannot fire, the row and bytes go, and the orphaned
+    //   `![alt](lesson-asset://…)` left behind makes the next save die on
+    //   LESSON_ASSET_UNKNOWN_REF. The only way out was to hand-delete a raw token from
+    //   inside a textarea. Removing the token is not cosmetic; it is what keeps the text
+    //   and the assets describing the same lesson.
+    setEditingLesson((s) => {
+      if (!s) return s;
+      const stripped = removeAssetToken(s.text_content || '', entry.assetId);
+      return stripped.ok ? { ...s, text_content: stripped.text } : s;
+    });
+    try {
+      const { data: path, error } = await supabase.rpc('course_lesson_asset_delete', { p_asset_id: entry.assetId });
+      // IN_USE is not a failure here: the lesson text still cites it, which is the
+      // database refusing to break a live lesson. Leave the bytes alone.
+      if (error) { if (appErrorCode(error) !== 'LESSON_ASSET_IN_USE') throw error; return; }
+      if (path) await supabase.storage.from(LESSON_ASSET_BUCKET).remove([path]).catch(() => {});
+    } catch (e) {
+      logDbError('[lesson-assets] delete', e, { assetId: entry.assetId });
+    }
+  };
+
+  /**
+   * Remove images this course holds that no lesson cites.
+   *
+   * Two passes with different reach, on purpose. The session pass is exact — it deletes
+   * what THIS editing session uploaded and the saved text does not use. The age-bounded
+   * pass is crash recovery: a closed laptop or a killed tab leaves an object no client
+   * can reach, and only something like this will ever find it. It is bounded to a day so
+   * it can never delete an upload another admin is mid-way through in another tab.
+   */
+  const sweepLessonAssetOrphans = async ({ sessionOnly = false, citedText = undefined, citedFormat = undefined } = {}) => {
+    const courseId = course?.id;
+    if (!courseId) return;
+    const drop = async (assetId) => {
+      try {
+        const { data: path, error } = await supabase.rpc('course_lesson_asset_delete', { p_asset_id: assetId });
+        if (error) return;                       // referenced, or not ours — leave it
+        if (path) await supabase.storage.from(LESSON_ASSET_BUCKET).remove([path]).catch(() => {});
+      } catch (_) { /* best-effort cleanup never fails the save that already succeeded */ }
+    };
+    // ★ "CITED" MUST MEAN THE TEXT THAT SURVIVES, NOT THE ONE ON SCREEN. This read the DRAFT,
+    //   so on the discard path every image the creator had placed counted as cited and was
+    //   skipped — while the draft citing it was thrown away and the lesson was never saved, so
+    //   no reference row ever existed. The bytes then sat in the private bucket until some
+    //   later successful save in the same course happened to run the 1-day pass.
+    //   closeLessonEditor passes the SAVED row's text; every other caller keeps the draft,
+    //   which by then is what was just written.
+    const cited = new Set(citedText === undefined
+      ? lessonAssetIds(editingLesson?.text_content, editingLesson?.content_format)
+      : lessonAssetIds(citedText, citedFormat));
+    const mine = lessonImagesRef.current.filter(im => im.assetId && !cited.has(im.assetId));
+    for (const im of mine) await drop(im.assetId);
+    if (sessionOnly) return;
+    try {
+      const { data, error } = await supabase.rpc('course_lesson_asset_orphans',
+        { p_course_id: courseId, p_min_age: '1 day' });
+      if (error) return;
+      for (const row of data || []) await drop(row.asset_id);
+    } catch (_) { /* best-effort */ }
+  };
 
   async function saveLesson() {
     if (!editingLesson) return;
@@ -25327,6 +26386,35 @@ function CourseProgram({
       return;
     }
     if (!isVideo && !hasText) { setLessonErr('Add some lesson content before saving.'); return; }
+    // ★ AN IMAGE STILL TRANSFERRING MUST NOT BE SAVED. Its token is already in the text, but
+    //   no asset row exists yet, so the #65 trigger would refuse the whole save with
+    //   LESSON_ASSET_UNKNOWN_REF — an accurate error that reads like a bug. Say the real thing.
+    if (lessonImages.some(im => im.status === 'uploading' || im.status === 'registering')) {
+      setLessonErr('Wait for the image upload to finish before saving.'); return;
+    }
+    // Everything wrong with the instructions, at once, rather than one round trip per fault.
+    const contentVerdict = validateLessonContent(d.text_content, d.content_format, { required: !isVideo });
+    if (!contentVerdict.ok) {
+      setLessonErr(contentVerdict.errors.map(e => e.message).join(' '));
+      // ★ A REFUSAL MUST LAND ON THE THING IT IS REFUSING. In Preview the <textarea> is
+      //   not mounted, so lessonBodyRef.current was null and both calls below silently did
+      //   nothing: the creator got a footer alert and no indication of where to look, on a
+      //   surface they could not type into anyway. Leaving preview is part of the refusal.
+      setLessonPreview(false);
+      // IMAGE_ALT_REQUIRED names the image it means, so focus THAT field rather than the
+      // whole document. It falls back to the body for an image uploaded in an earlier
+      // session, which has no card in this drawer.
+      const named = contentVerdict.errors.find(e => e.assetId);
+      requestAnimationFrame(() => {
+        // React flushes a click handler's updates synchronously, so the textarea is in the
+        // DOM by the time this frame runs.
+        const field = named ? document.getElementById(`lesson-alt-${named.assetId}`) : null;
+        const target = field || lessonBodyRef.current;
+        target?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        target?.focus({ preventScroll: true });
+      });
+      return;
+    }
     // Supplementary replay link. Returning here leaves the modal open with the draft intact,
     // because clearLessonDraft()/setEditingLesson(null) are further down.
     const replay = parseReplayUrl(d.zoom_replay_url);
@@ -25362,8 +26450,15 @@ function CourseProgram({
       // Omitted entirely (not sent as undefined) when the DB predates #37b: postgrest-js
       // unions Object.keys() into ?columns=, so even undefined would 42703 the whole update.
       if (!lessonRowsArePreReplay(allLessons)) payload.zoom_replay_url = replay.kind === 'none' ? null : replay.url;
+      // Same omit-don't-send-undefined rule for #65. A pre-#65 database keeps every lesson
+      // plain, which is exactly what its renderer expects.
+      if (!lessonRowsArePreRichContent(allLessons)) payload.content_format = normalizeFormat(d.content_format);
       const { error } = await supabase.from('course_lessons').update(payload).eq('id', d.id);
       if (error) throw error;
+      // The save succeeded, so the trigger has rebuilt this lesson's image references.
+      // Anything uploaded during this editing session that the final text does NOT cite is
+      // now an orphan — swept here rather than left for the crash-recovery pass.
+      await sweepLessonAssetOrphans();
       // If a previously-uploaded file was replaced or removed, purge the old object — but only if no
       // other course (e.g. a duplicate that reused this path) still references it (copy-on-write).
       if (oldPath && oldPath !== payload.storage_path) await removeMediaIfUnreferenced([oldPath]);
@@ -25372,6 +26467,9 @@ function CourseProgram({
       // path anyway — this keeps the bookkeeping honest rather than leaning on that.)
       pendingVideoPathRef.current = null;
       setVideoUploadState(UPLOAD_STATES.EMPTY);
+      setLessonImages([]);
+      setLessonPreview(false);
+      setLinkBar(null);
       clearLessonDraft();
       setEditingLesson(null);
       await load();
@@ -25428,7 +26526,7 @@ function CourseProgram({
     if (!lesson) return null;
     if (lesson.type === 'text') {
       return lesson.text_content
-        ? <div className="text-slate-700 whitespace-pre-line leading-relaxed text-[15px]">{lesson.text_content}</div>
+        ? <LessonRichText lesson={lesson} />
         : <div className="rounded-xl border-2 border-dashed border-slate-200 p-10 text-center text-slate-400">No content yet.</div>;
     }
     // Private bucket → signed URL. This is the only shape a NEW lesson can have.
@@ -25706,7 +26804,7 @@ function CourseProgram({
                 <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">{activeLesson.title}</div>
                 {activeLesson.duration_label && <div className="text-xs text-slate-400 mt-0.5">{activeLesson.duration_label}</div>}
                 {activeLesson.type === 'video' && activeLesson.text_content && (
-                  <div className="mt-4 text-slate-700 whitespace-pre-line leading-relaxed text-[15px]">{activeLesson.text_content}</div>
+                  <LessonRichText lesson={activeLesson} className="mt-4" />
                 )}
               </div>
               {/* Below the lesson body, above the completion controls — the placement
@@ -25885,6 +26983,272 @@ function CourseProgram({
   // containing block for every position:fixed descendant. This editor used to be a hand-rolled
   // `fixed inset-0` overlay and therefore anchored to the course canvas (many viewports tall)
   // rather than the window: it opened off-screen as soon as the builder was scrolled.
+  /**
+   * The lesson instructions composer: a toolbar, the body, a preview, and the images
+   * uploaded in this session.
+   *
+   * ★ A PLAIN TEXTAREA IS STILL THE EDITING SURFACE. A contenteditable WYSIWYG would mean
+   *   accepting HTML from the DOM and having to sanitize it back into a safe subset —
+   *   exactly the position this feature is designed never to be in. The toolbar writes
+   *   the same tokens a creator could type, so what is stored is always what was shown.
+   */
+  function renderLessonComposer(d) {
+    const isVideo = d.type === 'video';
+    const bodyId = `lesson-body-${d.id}`;
+    const fmt = normalizeFormat(d.content_format);
+    const rich = fmt === 'markdown';
+    // The database has no content_format column: offer the plain field and say why,
+    // rather than a toolbar whose every button would fail on save.
+    const preRich = lessonRowsArePreRichContent(allLessons);
+    const toolBtn = 'inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold transition disabled:opacity-40';
+    const toolStyle = { background: 'var(--wash-strong)', color: C.textSoft };
+    const liveImages = lessonImages.filter(im => im.status !== 'cancelled');
+
+    return (
+      <div className="block">
+        <div className="flex items-center justify-between gap-2 mb-1">
+          <label htmlFor={bodyId} className="text-xs font-semibold text-slate-500">
+            {isVideo ? 'Lesson instructions (optional)' : 'Lesson content'}
+          </label>
+          {rich && !preRich && (
+            // ★ NO aria-pressed BESIDE A LABEL THAT FLIPS. It carried both, so with preview on
+            //   a screen reader announced "Edit, pressed" — naming the action it would perform
+            //   and the state of something else in one breath. The visible label changing is
+            //   the useful half and is a correct accessible name on its own.
+            <button type="button" onClick={() => setLessonPreview(p => !p)}
+              className={toolBtn} style={toolStyle}
+              title={lessonPreview ? 'Back to editing' : 'See exactly what students will see'}>
+              <Eye size={12} aria-hidden="true" />{lessonPreview ? 'Edit' : 'Preview'}
+            </button>
+          )}
+        </div>
+
+        {preRich ? (
+          <div className="mb-2 rounded-lg px-3 py-2 text-[11px] leading-relaxed"
+            style={{ background: 'var(--status-warn-bg)', border: `1px solid var(--status-warn-bd)`, color: 'var(--status-warn-fg)' }}>
+            <strong>Links and images are not available yet.</strong> They need one database
+            migration that has not been run: <code>db/2026-09-20-course-lesson-assets.sql</code>.
+            Until then this field saves as plain text, exactly as before.
+          </div>
+        ) : needsFormatOptIn ? (
+          <div className="mb-2 flex flex-wrap items-center gap-2 rounded-lg px-3 py-2"
+            style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <span className="text-[11px] leading-relaxed" style={{ color: C.textSoft }}>
+              Turn on formatting to add links and images. Your existing text is kept exactly as it reads now.
+            </span>
+            <button type="button" onClick={enableLessonFormatting} className={toolBtn}
+              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff' }}>
+              Turn on formatting
+            </button>
+          </div>
+        ) : (
+          // ★ INERT WHILE PREVIEWING. These buttons edit text_content at the remembered
+          //   caret. In Preview the textarea is unmounted, so pressing one changed the
+          //   document with nothing on screen to show it had — the creator's only clue
+          //   was the result appearing when they went back to Edit.
+          <div className="mb-2 flex flex-wrap items-center gap-1.5" role="group" aria-label="Formatting">
+            <button type="button" className={toolBtn} style={toolStyle} onClick={openLinkBar}
+              disabled={lessonPreview}
+              title="Add or edit a link (Ctrl+K)"><Link2 size={12} aria-hidden="true" />Link</button>
+            <button type="button" className={toolBtn} style={toolStyle}
+              onClick={() => { rememberLessonSelection(); lessonImageInputRef.current?.click(); }}
+              disabled={lessonPreview}
+              title="Add an image"><ImagePlus size={12} aria-hidden="true" />Image</button>
+            <button type="button" className={toolBtn} style={toolStyle} disabled={lessonPreview}
+              onClick={() => runLessonTool(applyBold)} title="Bold"><Bold size={12} aria-hidden="true" />Bold</button>
+            <button type="button" className={toolBtn} style={toolStyle} disabled={lessonPreview}
+              onClick={() => runLessonTool((t, a, b) => applyList(t, a, b, false))}
+              title="Bulleted list"><List size={12} aria-hidden="true" />Bullets</button>
+            <button type="button" className={toolBtn} style={toolStyle} disabled={lessonPreview}
+              onClick={() => runLessonTool((t, a, b) => applyList(t, a, b, true))}
+              title="Numbered list"><ListOrdered size={12} aria-hidden="true" />Numbers</button>
+            <input ref={lessonImageInputRef} type="file" accept={LESSON_IMAGE_ACCEPT} multiple className="hidden"
+              onChange={(e) => { addLessonImages(e.target.files); e.target.value = ''; }} />
+          </div>
+        )}
+
+        {lessonPreview && rich && !preRich ? (
+          <div className="rounded-lg border border-slate-200 px-3 py-3 min-h-[120px]" style={{ background: C.white }}>
+            {(d.text_content || '').trim()
+              ? <LessonRichText lesson={d} />
+              : <div className="text-sm" style={{ color: C.textMute }}>Nothing to preview yet.</div>}
+          </div>
+        ) : (
+          <textarea
+            id={bodyId}
+            ref={lessonBodyRef}
+            value={d.text_content || ''}
+            onChange={e => setEditingLesson(s => ({ ...s, text_content: e.target.value }))}
+            onSelect={rememberLessonSelection}
+            onKeyUp={rememberLessonSelection}
+            onClick={rememberLessonSelection}
+            onBlur={rememberLessonSelection}
+            onPaste={preRich ? undefined : onLessonPaste}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K') && !preRich) {
+                e.preventDefault(); rememberLessonSelection(); openLinkBar();
+              }
+            }}
+            rows={isVideo ? 5 : 9}
+            className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm"
+            style={{ fontFamily: fontMono, lineHeight: 1.6 }}
+          />
+        )}
+
+        {!preRich && (
+          <div className="mt-1 text-[10px] leading-relaxed" style={{ color: C.textMute }}>
+            {rich
+              ? 'Paste a screenshot straight into the box, or use Image. Select a word and press Ctrl+K to link it — '
+                + 'put the caret inside a link and press Ctrl+K again to change or remove it.'
+              : 'Plain text. Use a formatting button above to add links or images.'}
+          </div>
+        )}
+
+        {/* The link bar: inline, never a dialog. A modal inside this drawer would be a
+            second portaled overlay over a first, fighting the drawer's own focus trap. */}
+        {linkBar && (
+          <div className="mt-2 rounded-lg px-3 py-2.5 space-y-2"
+            style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <div className="flex flex-wrap items-end gap-2">
+              <label className="flex-1 min-w-[180px] block">
+                <span className="text-[10px] font-semibold text-slate-500">Link address</span>
+                <input ref={linkUrlRef} value={linkBar.url} inputMode="url"
+                  placeholder="https://docs.google.com/forms/…"
+                  onChange={e => setLinkBar(b => ({ ...b, url: e.target.value, error: '' }))}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') { e.preventDefault(); confirmLinkBar(); }
+                    // ★ stopPropagation, NOT just preventDefault. SidePanel listens for Escape
+                    //   on WINDOW, so the event reached it from here and closed the whole lesson
+                    //   editor — which then asked "Discard unsaved lesson changes?". Dismissing a
+                    //   small inline bar must not put the creator's draft at risk.
+                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setLinkBar(null); returnFocusToLessonBody(); }
+                  }}
+                  className="mt-0.5 w-full px-2.5 py-1.5 rounded-md border border-slate-200 text-sm" />
+              </label>
+              <label className="flex-1 min-w-[140px] block">
+                <span className="text-[10px] font-semibold text-slate-500">Text to show</span>
+                <input value={linkBar.label}
+                  onChange={e => setLinkBar(b => ({ ...b, label: e.target.value }))}
+                  onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); confirmLinkBar(); } }}
+                  className="mt-0.5 w-full px-2.5 py-1.5 rounded-md border border-slate-200 text-sm" />
+              </label>
+              <div className="flex gap-1.5">
+                <button type="button" onClick={confirmLinkBar} className={toolBtn}
+                  style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff', padding: '7px 12px' }}>
+                  {linkBar.range ? 'Update link' : 'Add link'}
+                </button>
+                {/* Removing a link needed raw-text editing before this: there was no way to
+                    take an address off words without deleting the brackets by hand. */}
+                {linkBar.range && (
+                  <button type="button" onClick={removeLinkAtBar} className={toolBtn}
+                    style={{ ...toolStyle, padding: '7px 12px' }}
+                    title="Keep the words, remove the address">Unlink</button>
+                )}
+                <button type="button" onClick={() => { setLinkBar(null); returnFocusToLessonBody(); }} className={toolBtn}
+                  style={{ ...toolStyle, padding: '7px 12px' }}>Cancel</button>
+              </div>
+            </div>
+            {linkBar.error && (
+              <div role="alert" className="text-[11px] flex items-center gap-1.5" style={{ color: C.red }}>
+                <AlertCircle size={11} aria-hidden="true" />{linkBar.error}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Images uploaded in this session. Alt text is required BEFORE the image can be
+            placed, because a description added later is a description never added. */}
+        {liveImages.length > 0 && (
+          <ul className="mt-2 space-y-1.5">
+            {liveImages.map(im => (
+              <li key={im.key} className="rounded-lg px-3 py-2"
+                style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+                <div className="flex items-center gap-2 text-[11px]" style={{ color: C.textSoft }}>
+                  <ImagePlus size={12} className="flex-shrink-0" aria-hidden="true" />
+                  <span className="flex-1 truncate" title={im.name}>{im.name}</span>
+                  <span style={{ color: C.textMute }}>
+                    {im.status === 'uploading' ? 'Uploading…'
+                      : im.status === 'registering' ? 'Finishing…'
+                      : im.status === 'error' ? 'Failed'
+                      : im.status === 'placed' ? 'In the lesson'
+                      : 'Ready'}
+                  </span>
+                  {im.status === 'error' && (
+                    <button type="button" className={toolBtn} style={toolStyle}
+                      onClick={() => uploadLessonImage(im)}>Retry</button>
+                  )}
+                  <button type="button" className={toolBtn} style={toolStyle}
+                    onClick={() => removeLessonImage(im)}>
+                    {im.status === 'uploading' || im.status === 'registering' ? 'Cancel' : 'Remove'}
+                  </button>
+                </div>
+                {(im.status === 'uploading' || im.status === 'registering') && (
+                  // Indeterminate on purpose: supabase-js exposes no progress callback for
+                  // an upload, and a bar that invents a percentage is worse than one that
+                  // admits it does not know.
+                  <div className="mt-1.5 h-1 rounded-full overflow-hidden" style={{ background: 'var(--wash-strong)' }}>
+                    <div className="h-full w-1/3 rounded-full motion-reduce:animate-none animate-pulse"
+                      style={{ background: C.primary }} />
+                  </div>
+                )}
+                {im.status === 'error' && im.error && (
+                  <div role="alert" className="mt-1 text-[11px]" style={{ color: C.red }}>{im.error}</div>
+                )}
+                {(im.status === 'ready' || im.status === 'placed') && (
+                  <div className="mt-1.5 space-y-1.5">
+                    <label className="block">
+                      <span className="text-[10px] font-semibold text-slate-500">
+                        Describe this image <span style={{ color: C.red }} aria-hidden="true">*</span>
+                      </span>
+                      {/* ★ aria-required, because the red asterisk is aria-hidden. A screen
+                          reader otherwise met a field with no hint that it is the one thing
+                          standing between this image and the lesson. */}
+                      <input value={im.alt} maxLength={LESSON_IMAGE_ALT_MAX}
+                        id={`lesson-alt-${im.assetId || im.key}`}
+                        required aria-required="true"
+                        aria-invalid={!(im.alt || '').trim() || undefined}
+                        placeholder="Google Form menu showing the three-dot button"
+                        onChange={e => patchImage(im.key, { alt: e.target.value })}
+                        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); insertLessonImage(im); } }}
+                        aria-describedby={`alt-why-${im.key}`}
+                        className="mt-0.5 w-full px-2.5 py-1.5 rounded-md border border-slate-200 text-sm" />
+                    </label>
+                    {/* ★ A CAPTION IS NOT THE ALT TEXT. Alt is announced by a screen reader and
+                        stands in when the picture will not load; a caption is visible prose under
+                        it. Repeating one as the other makes a screen reader say it twice, so they
+                        are two fields and only the first is required. */}
+                    <label className="block">
+                      <span className="text-[10px] font-semibold text-slate-500">Caption (optional)</span>
+                      <input value={im.caption || ''} maxLength={LESSON_IMAGE_CAPTION_MAX}
+                        placeholder="Figure 1 — the three-dot button"
+                        onChange={e => patchImage(im.key, { caption: e.target.value })}
+                        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); insertLessonImage(im); } }}
+                        aria-describedby={`cap-why-${im.key}`}
+                        className="mt-0.5 w-full px-2.5 py-1.5 rounded-md border border-slate-200 text-sm" />
+                    </label>
+                    <div className="flex flex-wrap items-end justify-between gap-2">
+                      <div className="flex-1 min-w-[180px] text-[10px]" style={{ color: C.textMute }}>
+                        <div id={`alt-why-${im.key}`}>
+                          Read aloud to students using a screen reader, and shown if the image cannot load.
+                        </div>
+                        <div id={`cap-why-${im.key}`}>Printed under the picture for everyone to read.</div>
+                      </div>
+                      <button type="button" className={toolBtn} disabled={!(im.alt || '').trim()}
+                        style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff', padding: '7px 12px' }}
+                        onClick={() => insertLessonImage(im)}>
+                        {im.status === 'placed' ? 'Place again' : 'Add to lesson'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    );
+  }
+
   function renderLessonEditor() {
     const d = editingLesson;
     // A pre-#44 row still carrying an external link. It is READ-ONLY here — shown so the
@@ -26008,14 +27372,10 @@ function CourseProgram({
           </>
         )}
 
-        {/* Heading flips for a text lesson: its main body is content, not "notes". */}
-        <SettingsSectionLabel>{d.type === 'video' ? 'Notes & metadata' : 'Content & metadata'}</SettingsSectionLabel>
+        {/* Heading flips for a text lesson: its main body is content, not "instructions". */}
+        <SettingsSectionLabel>{d.type === 'video' ? 'Instructions & metadata' : 'Content & metadata'}</SettingsSectionLabel>
         <div className="space-y-3">
-          <label className="block">
-            <span className="text-xs font-semibold text-slate-500">{d.type === 'video' ? 'Lesson notes (optional)' : 'Lesson content'}</span>
-            <textarea value={d.text_content || ''} onChange={e => setEditingLesson(s => ({ ...s, text_content: e.target.value }))} rows={d.type === 'text' ? 6 : 3}
-              className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
-          </label>
+          {renderLessonComposer(d)}
           <label className="block">
             <span className="text-xs font-semibold text-slate-500">Duration label (optional, e.g. 8:32)</span>
             <input value={d.duration_label || ''} onChange={e => setEditingLesson(s => ({ ...s, duration_label: e.target.value }))}
@@ -26387,6 +27747,45 @@ async function removeMediaIfUnreferenced(rawPaths) {
  * not a leak; they are billable storage nobody can see. Scoped to ONE course on purpose:
  * never a global prefix sweep, and never a delete straight out of storage.objects.
  */
+/**
+ * Collect a deleted course's lesson images.
+ *
+ * ★ READ THE ROWS FIRST, DELETE THE COURSE, THEN ASK PER ASSET. The order is the same one
+ *   removeMediaIfUnreferenced needs and for the same reason: the course's own lessons must
+ *   stop citing an image before anything can judge whether it is still in use. The
+ *   per-asset decision is the SERVER's — course_lesson_asset_delete refuses with
+ *   LESSON_ASSET_IN_USE while a surviving lesson (a duplicate of this course) still shows
+ *   the image, and only then are the bytes removed.
+ *
+ * Returns the rows to pass back after the course row is gone.
+ */
+async function readCourseLessonAssets(courseId) {
+  if (!courseId) return [];
+  try {
+    const { data, error } = await supabase
+      .from('course_lesson_assets').select('id,storage_path').eq('course_id', courseId);
+    if (error) {
+      if (!isMissingTable(error)) console.error('[lesson-assets] could not list course images:', error.message || error.code);
+      return [];
+    }
+    return data || [];
+  } catch (e) {
+    console.error('[lesson-assets] could not list course images:', e?.message || 'error');
+    return [];
+  }
+}
+
+/** Delete each asset the server agrees is no longer used, then its bytes. Best-effort. */
+async function purgeLessonAssets(rows) {
+  for (const row of rows || []) {
+    try {
+      const { data: path, error } = await supabase.rpc('course_lesson_asset_delete', { p_asset_id: row.id });
+      if (error) continue;                       // still cited by a duplicate, or not ours
+      if (path) await supabase.storage.from(LESSON_ASSET_BUCKET).remove([path]).catch(() => {});
+    } catch (_) { /* cleanup never fails the delete that already succeeded */ }
+  }
+}
+
 async function findOrphanLessonVideos(courseId) {
   if (!courseId) return { orphans: [], error: null };
   const prefix = `lessons/${courseId}`;
@@ -26709,7 +28108,16 @@ function CourseCatalog({
       // resets to today) a replay is often evergreen, and the copy is born a draft the admin
       // reviews. On a DB predating #37b the key is left OFF the payload entirely rather than
       // sent as undefined, which postgrest-js would still union into ?columns= and 42703 the insert.
+      // content_format is copied for the same reason as the text it describes — a copy whose
+      // format reverted to plain would show the source's markdown as literal punctuation.
+      // The lesson-asset REFERENCES are not copied here and must not be: the #65 trigger
+      // derives them from the inserted text, and it allows the copy to cite the source's
+      // images because they share a duplication root — courses.source_course_id, which step 3
+      // above already wrote, two inserts before this one. That ordering is load-bearing: set
+      // the lineage after the lessons and every copied image would be refused as unrelated.
+      // So the images are reused by reference, exactly like storage_path above.
       const preReplayDb = lessonRowsArePreReplay(lessons);
+      const preRichDb = lessonRowsArePreRichContent(lessons);
       const lessonPayloads = (lessons || [])
         .filter(l => moduleIdMap.has(l.module_id))
         .map(l => ({
@@ -26719,6 +28127,7 @@ function CourseCatalog({
           text_content: l.text_content,
           duration_label: l.duration_label, position: l.position,
           ...(preReplayDb ? {} : { zoom_replay_url: l.zoom_replay_url ?? null }),
+          ...(preRichDb ? {} : { content_format: normalizeFormat(l.content_format) }),
         }));
       if (lessonPayloads.length) {
         const { error } = await supabase.from('course_lessons').insert(lessonPayloads);
@@ -26790,11 +28199,17 @@ function CourseCatalog({
         (ls || []).forEach(r => r.storage_path && candidates.add(r.storage_path));
       } catch (_) { /* best-effort */ }
       if (c.cover_path) candidates.add(c.cover_path);
+      // Lesson images (#65) live in their own private bucket and are NOT named by any path
+      // listing above, so they are read as rows while the course still exists.
+      const lessonAssets = await readCourseLessonAssets(c.id);
 
       const { error } = await supabase.from('courses').delete().eq('id', c.id); // FK ON DELETE CASCADE clears children
       if (error) throw error;
       // After the row (and its lessons) are gone, drop only files no surviving course references.
       await removeMediaIfUnreferenced([...candidates]);
+      // Same rule, different bucket: an image a DUPLICATE of this course still shows keeps
+      // both its row (course_id becomes null) and its bytes. The server decides per asset.
+      await purgeLessonAssets(lessonAssets);
       if (selectedId === c.id) { setSelectedId(null); writeCatalogRoute(null, true); }
       if (lastDuplicatedId === c.id) setLastDuplicatedId(null);
       await loadCatalog();

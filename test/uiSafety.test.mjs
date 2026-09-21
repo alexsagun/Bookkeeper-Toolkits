@@ -1016,3 +1016,518 @@ test('the finance loading card and the daily chart respect the reader', () => {
   assert.match(chart, /<figcaption/, 'the chart is named by its caption');
   assert.match(chart, /<svg[^>]*role="img"/, 'and the svg carries the full spoken description');
 });
+
+// ── 22. Grouped sidebar tabs actually reorder ───────────────────────────────
+//
+// The owner reported that rearranging worked under Training and did nothing under Job
+// Application or Client Management. It was not a rendering glitch: onTabDrop reordered
+// stage.tabs and persisted it faithfully, but a stage with `groups` re-derives its list
+// from groups[].tabIds, and mergeStoredWithDefaults re-stamped `groups` from the code
+// defaults on every load. The drag was saved and then ignored, every time.
+//
+// src/lib/sidebarLayout.js now owns the rules and test/sidebarLayout.test.mjs proves
+// them. What CANNOT be reached from there is whether the component still asks — so these
+// scans pin the wiring: that the handlers go through the library rather than splicing
+// arrays themselves, that reordering is not mouse-only, and that Cancel can cancel.
+
+const sidebarRegion = () => {
+  const src = app();
+  const start = src.indexOf('const renderTab = (t) => {');
+  assert.ok(start > 0, 'renderTab moved');
+  const end = src.indexOf('Click any label to rename', start);
+  assert.ok(end > start, 'the sidebar footer moved');
+  return src.slice(start, end);
+};
+
+/** The stage HEADER, which renders above renderTab and so outside sidebarRegion(). */
+const stageHeaderRegion = () => {
+  const src = app();
+  const start = src.indexOf('{/* Stage header */}');
+  assert.ok(start > 0, 'the stage header moved');
+  const end = src.indexOf('const renderTab = (t) => {', start);
+  assert.ok(end > start, 'renderTab moved');
+  return src.slice(start, end);
+};
+
+test('a drop is resolved by reorderVerdict, and the handler splices nothing itself', () => {
+  const src = app();
+  const drop = fnBody(src, 'const onTabDrop = (e, targetStageId, targetTabId) => {');
+  assert.match(drop, /reorderVerdict\(/, 'the refusal rules live in ONE tested place');
+  assert.ok(!/\.splice\(/.test(drop),
+    'a handler that splices tabs itself is how a tab left its group and vanished from '
+    + 'the sidebar with no error — g.tabIds.map(...).filter(Boolean) simply dropped it');
+  assert.match(drop, /if \(!result\.ok\)/, 'a refused drop must not fall through into a write');
+  assert.match(drop, /REORDER_REFUSALS\[result\.reason\]/,
+    'a silent refusal is what made the original bug feel like "the sidebar ignores me"');
+});
+
+test('the up/down buttons exist, are labelled, and mark the edges without losing focus', () => {
+  const region = sidebarRegion();
+  assert.match(region, /moveTab\(stage\.id, t\.id, -1\)/, 'Move up must be wired');
+  assert.match(region, /moveTab\(stage\.id, t\.id, 1\)/, 'Move down must be wired');
+  assert.match(region, /const atTop = pos <= 0;/, 'the first tab cannot move up');
+  assert.match(region, /const atEnd = pos === -1 \|\| pos >= siblings\.length - 1;/,
+    'the last tab cannot move down');
+
+  // ★ aria-disabled, NEVER disabled. A browser blurs a focused element the instant it
+  //   becomes disabled, so pressing Up until a tab reached position 1 dropped a keyboard
+  //   user onto <body> in the middle of reordering. Left focusable, the press falls
+  //   through to moveTabByStep, which refuses with 'at-edge' and announces it.
+  assert.match(region, /aria-disabled=\{atTop \|\| undefined\}/);
+  assert.match(region, /aria-disabled=\{atEnd \|\| undefined\}/);
+  const moveBlock = region.slice(region.indexOf('const atTop'), region.indexOf('Move ${tLabel} down') + 200);
+  // The lookbehind matters: `\bdisabled=` matches INSIDE `aria-disabled=`, because the
+  // hyphen is a word boundary — so a naive scan passes on the very attribute it forbids.
+  assert.ok(!/(?<!aria-)disabled=\{/.test(moveBlock),
+    'a real `disabled` on a move button takes focus away mid-reorder');
+
+  // ★ 24x24 IS THE FLOOR (WCAG 2.2 SC 2.5.8) AND THIS IS A PHONE CONTROL: below `lg` the
+  //   sidebar IS the off-canvas drawer, so a `p-0.5` around a 13px icon — about 17x17 —
+  //   was the target on the one device that cannot drag at all.
+  assert.match(moveBlock, /min-h-\[24px\] min-w-\[24px\]/,
+    'the move buttons must meet the 24x24 minimum target size');
+
+  assert.match(region, /aria-label=\{`Move \$\{tLabel\} up in \$\{within\}`\}/,
+    'the accessible name must say WHICH tab and WHICH section, not just "move up"');
+  assert.match(region, /aria-label=\{`Move \$\{tLabel\} down in \$\{within\}`\}/);
+});
+
+test('whole sections reorder too, by keyboard and touch, through the same arbiter', () => {
+  const src = app();
+  const header = stageHeaderRegion();
+  // ★ onStageDrop WAS THE LAST HAND-ROLLED SPLICE IN THE SIDEBAR. No arbiter, no refusal,
+  //   no announcement, and drag-only — the exact shape the tab path was rescued from.
+  const drop = src.slice(src.indexOf('const onStageDrop'), src.indexOf('const onStageDrop') + 1400);
+  assert.ok(!/\.splice\(/.test(drop), 'a stage drop must go through stageReorderVerdict, not a splice');
+  assert.match(drop, /stageReorderVerdict\(prev, srcStageId, targetStageId\)/);
+  assert.match(drop, /STAGE_REORDER_REFUSALS\[result\.reason\]/, 'a refused stage drop must say so');
+
+  assert.match(header, /moveStage\(stage\.id, -1\)/, 'sections need a keyboard Move up');
+  assert.match(header, /moveStage\(stage\.id, 1\)/, 'sections need a keyboard Move down');
+  assert.match(header, /aria-label=\{`Move section \$\{sLabel\} up`\}/);
+  assert.match(header, /aria-label=\{`Move section \$\{sLabel\} down`\}/);
+  assert.match(header, /min-h-\[24px\] min-w-\[24px\]/, 'and they are touch targets too');
+});
+
+test('a cross-group drag is refused while it is still a drag', () => {
+  const src = app();
+  const over = src.slice(src.indexOf('const onTabDragOver'), src.indexOf('const onTabDragLeave') + 120);
+  // Setting 'move' over every row showed a legal-looking cursor the whole way across a
+  // group boundary, and explained itself only after the drop had already failed.
+  assert.match(over, /dropEffect = allowed \? 'move' : 'none'/);
+  assert.match(over, /groupKeyOfTab\(/, 'validity is decided by the same grouping the drop uses');
+  assert.match(src, /onDragOver=\{editMode \? \(e\) => onTabDragOver\(e, stage\.id, t\.id\) : undefined\}/,
+    'the row must tell the handler which target it is');
+});
+
+test('reordering is not mouse-only, and the buttons are not nested in the rename button', () => {
+  const region = sidebarRegion();
+  // HTML5 drag-and-drop cannot be operated from a keyboard and is unusable on touch, so
+  // the grip is a convenience and these buttons are the real control.
+  assert.match(region, /<button type="button" className=\{btn\}/,
+    'the move controls must be real buttons, reachable by Tab');
+  const renameAt = region.indexOf('title="Click to rename"');
+  const moveAt = region.indexOf('Move ${tLabel} up');
+  assert.ok(renameAt > 0 && moveAt > renameAt,
+    'the move buttons must be SIBLINGS after the rename button — a button nested inside '
+    + 'another button is invalid and the inner one stops being reachable');
+});
+
+test('every reorder, including a refused one, is announced', () => {
+  const src = app();
+  assert.match(src, /aria-live="polite" role="status" className="sr-only">\{reorderNote\}/,
+    'a screen-reader user gets no visual confirmation that a row moved');
+  const announce = fnBody(src, 'const announceMove = (stage, tabId, result) => {');
+  assert.match(announce, /position \$\{result\.to \+ 1\} of \$\{result\.total\}/,
+    'the announcement must say where the tab landed, not merely that something happened');
+  assert.match(announce, /effLabel\(/,
+    'it must speak the EFFECTIVE label — what the admin sees — not the code default');
+});
+
+test('ordering logic reads ids; only the announcement reads labels', () => {
+  const src = app();
+  const move = fnBody(src, 'const moveTab = (stageId, tabId, delta) => {');
+  assert.ok(!/effLabel\(/.test(move),
+    'visible labels are sidebar_settings overrides — ordering that compared them would '
+    + 'rearrange itself the moment an admin renamed a tab');
+});
+
+test('the layout is NOT persisted while Customize is open, so Cancel can cancel', () => {
+  const src = app();
+  const at = src.indexOf("window.storage.set('sidebar:stages'");
+  assert.ok(at > 0, 'the layout persist effect moved');
+  const effect = src.slice(src.lastIndexOf('useEffect(', at), src.indexOf('}, [', at) + 40);
+  assert.match(effect, /if \(editMode\) return;/,
+    'this effect used to fire on every drag, which made Cancel a lie');
+  assert.match(effect, /\}, \[stages, storageReady, editMode\]\)/,
+    'editMode must be a dependency, or leaving edit mode never triggers the commit');
+  assert.match(effect, /stagesToStorable\(stages\)/,
+    'the write must go through stagesToStorable, which is what persists groups[].tabIds');
+});
+
+test('Cancel restores the snapshot taken when Customize opened', () => {
+  const src = app();
+  const enter = fnBody(src, 'const enterCustomize = () => {');
+  assert.match(enter, /layoutSnapshotRef\.current = stages;/, 'nothing to restore otherwise');
+  const cancel = fnBody(src, 'const cancelSidebarEdit = () => {');
+  assert.match(cancel, /if \(layoutSnapshotRef\.current\) setStages\(layoutSnapshotRef\.current\);/,
+    'Cancel must put the layout back, not just drop the label drafts');
+});
+
+test('the footer no longer claims everything saves for everyone', () => {
+  const src = app();
+  const at = src.indexOf('Click any label to rename');
+  const footer = src.slice(at, at + 1600);
+  assert.ok(!/Done saves for everyone/.test(footer),
+    'labels are global, tab order is per-user and collapse state is per-device — one '
+    + 'sentence covering all three told an admin they were curating for their students');
+  assert.match(footer, /<strong[^>]*>Labels<\/strong> save for everyone/);
+  assert.match(footer, /<strong[^>]*>Tab order<\/strong> and open\/closed sections/);
+
+  // ★ TWO REACHES, NOT THREE — AND NO SYNC PROMISE. The copy said tab order "saves for
+  //   you on this account" beside collapse state that "stays on this device", drawing a
+  //   distinction the app does not implement: window.storage is localStorage namespaced
+  //   per user (src/main.jsx), so BOTH are per-user and per-browser. Only labels are
+  //   global. "on this account" sent an admin looking for a sync that was never built.
+  assert.match(footer, /save for you in this browser/);
+  // Strip the JSX comment first: it QUOTES the wording it exists to warn against, and a
+  // bare scan of the region would fail on the explanation rather than on the copy. Same
+  // shape as the jsCode() idiom in lessonContentSql.test.mjs.
+  const shown = footer.replace(/\{\/\*[\s\S]*?\*\/\}/g, '');
+  assert.ok(!/on this account/.test(shown),
+    'tab order does not follow the account to another browser or device');
+  const src2 = app();
+  assert.ok(!/Tab order saved for you\.'/.test(src2),
+    'the success toast must make the same promise the footer does');
+});
+
+// ── 23. The lesson instructions composer ────────────────────────────────────
+//
+// src/lib/lessonContent.js owns what a document MAY contain and test/lessonContent.test.mjs
+// proves it. What lives only in the component is the lifecycle around it: when an upload
+// is allowed to become part of a lesson, what happens to one that never does, and whether
+// a save can proceed while bytes are still moving. Those are the parts that leak storage
+// or save a lesson citing an image the database has never heard of.
+
+const composer = () => {
+  const src = app();
+  const i = src.indexOf('function renderLessonComposer(');
+  assert.ok(i > 0, 'renderLessonComposer was not found');
+  return src.slice(i, src.indexOf('\n  function renderLessonEditor(', i));
+};
+
+test('an image cannot be placed in a lesson without a description', () => {
+  const src = app();
+  const insert = fnBody(src, 'const insertLessonImage = (entry) => {');
+  assert.match(insert, /if \(!entry\.assetId \|\| !alt\) return;/,
+    'alt text is required BEFORE placement — a description added later is one never added');
+  assert.match(composer(), /disabled=\{!\(im\.alt \|\| ''\)\.trim\(\)\}/,
+    'and the button must say so rather than failing on save');
+});
+
+test('a save is blocked while an image is still uploading', () => {
+  const save = fnBody(app(), 'async function saveLesson() {');
+  assert.match(save, /lessonImages\.some\(im => im\.status === 'uploading' \|\| im\.status === 'registering'\)/,
+    "the token is already in the text but no asset row exists yet, so the trigger would "
+    + 'refuse the whole save with an accurate error that reads like a bug');
+  assert.match(save, /validateLessonContent\(d\.text_content, d\.content_format/,
+    'every fault at once, not one round trip per fault');
+});
+
+test('an abandoned image upload is swept when the drawer closes', () => {
+  const close = fnBody(app(), 'const closeLessonEditor = () => {');
+  assert.match(close, /sweepLessonAssetOrphans\(\{[\s\S]*?sessionOnly: true/,
+    'an image uploaded and never placed is an object no lesson cites — the same failure '
+    + 'that left 1.60 GiB of orphaned video in production');
+  // ★ AND IT IS MEASURED AGAINST THE SAVED ROW, NOT THE DRAFT BEING DISCARDED. Closing throws
+  //   the draft away, so an image the creator PLACED in it is cited by nothing that survives —
+  //   and the lesson was never saved, so no reference row exists either. Comparing against the
+  //   draft skipped exactly the images this sweep exists to collect.
+  assert.match(close, /citedText: originalEditingLesson\?\.text_content \|\| ''/,
+    'the discard path must not treat the discarded draft as evidence that an image is in use');
+  assert.match(close, /citedFormat: originalEditingLesson\?\.content_format/);
+  assert.match(close, /setLessonImages\(\[\]\)/, 'and the session list must not leak into the next lesson');
+});
+
+test('the orphan sweep is session-exact, with an age-bounded crash-recovery pass', () => {
+  const sweep = fnBody(app(), 'const sweepLessonAssetOrphans = async (');
+  assert.match(sweep, /p_min_age: '1 day'/,
+    'an unbounded broad sweep could delete an upload another admin is mid-way through '
+    + 'in another tab');
+  assert.match(sweep, /if \(sessionOnly\) return;/,
+    'Cancel must sweep only what this session uploaded');
+  assert.match(sweep, /cited\.has\(im\.assetId\)/,
+    'what the SAVED text cites decides what survives, not what was uploaded');
+});
+
+test('deleting a lesson or a course cleans up the images they were the last to show', () => {
+  const src = app();
+  assert.match(fnBody(src, 'async function deleteLesson(l) {'), /sweepLessonAssetOrphans\(\)/);
+  const del = src.slice(src.indexOf('async function deleteCourse('), src.indexOf('async function deleteCourse(') + 3000);
+  assert.ok(del.indexOf('readCourseLessonAssets(c.id)') < del.indexOf("from('courses').delete()"),
+    'the rows must be read BEFORE the course is deleted — afterwards they no longer name it');
+  assert.ok(del.indexOf('purgeLessonAssets(lessonAssets)') > del.indexOf("from('courses').delete()"),
+    'and purged after, so this course has stopped citing them');
+});
+
+test('pasting a remote image is refused, never hot-linked', () => {
+  const paste = fnBody(app(), 'const onLessonPaste = (e) => {');
+  assert.ok(paste.includes('dt.files') && paste.includes('.filter(f =>'),
+    'only real FILES are taken from the clipboard');
+  assert.ok(paste.includes("getData?.('text/html')") && paste.includes('<img'),
+    'and the HTML flavour is inspected — an image copied from a web page arrives as both');
+  assert.match(paste, /hosted on another website/,
+    'a linked image breaks when that site changes it, and tells that site who is reading');
+  assert.ok(!/src\s*=\s*.?https?:/.test(paste), 'no remote URL may ever be adopted');
+
+  // ★ REFUSING THE PICTURE MUST NOT THROW AWAY THE WORDS.
+  //   preventDefault() on its own discarded the WHOLE paste, so copying a paragraph out of a
+  //   web page that happened to contain an inline image lost the prose the creator wanted.
+  assert.ok(paste.includes("getData?.('text/plain')"),
+    'the plain-text flavour must be read, or the prose is discarded with the picture');
+  assert.match(paste, /applyLessonEdit\(\{/,
+    'and inserted at the caret through the normal edit path');
+  // Scoped to the <img> branch on purpose: rememberLessonSelection() is ALSO called in the
+  // files branch above, so an unscoped indexOf() finds that one and the ordering assertion
+  // holds no matter what this branch does. (It survived its own mutation until scoped.)
+  const imgBranch = paste.slice(paste.indexOf('/<img'));
+  assert.ok(imgBranch.indexOf('rememberLessonSelection()') >= 0
+    && imgBranch.indexOf('rememberLessonSelection()') < imgBranch.indexOf("getData?.('text/plain')"),
+    'the caret is captured before the insert, or the text lands wherever it last was');
+  assert.match(paste, /kept\s*$/m, 'the message has to say which of the two happened');
+  assert.match(paste, /The text was pasted/,
+    'saying only "not added" about a paste that DID keep the text is the bug reported');
+});
+
+test('images are resolved in ONE batched signing call per lesson, and refreshed', () => {
+  const hook = fnBody(app(), 'function useLessonAssetUrls(lesson) {');
+  assert.match(hook, /createSignedUrls\(paths, LESSON_ASSET_SIGN_TTL_SECONDS\)/,
+    'ten images on a lesson page is two requests, not eleven');
+  assert.ok(!/createSignedUrl\(/.test(hook.replace(/createSignedUrls\(/g, '')),
+    'the singular form here would be one request per image');
+  assert.match(hook, /LESSON_ASSET_RESIGN_MARGIN_MS/,
+    'a student reading past the hour would otherwise watch every screenshot break');
+});
+
+test('the caret is captured before a toolbar button steals focus', () => {
+  const src = app();
+  assert.match(src, /const rememberLessonSelection = \(\) => \{/);
+  assert.match(composer(), /onSelect=\{rememberLessonSelection\}/,
+    'clicking a toolbar button blurs the textarea, and reading selectionStart after that '
+    + 'returns 0 — which inserts every link at the top of the document');
+  assert.match(composer(), /onKeyDown=\{\(e\) => \{\s*if \(\(e\.metaKey \|\| e\.ctrlKey\)/,
+    'Ctrl/Cmd+K must reach the link bar');
+});
+
+test('closing a composer control without editing returns focus to the textarea', () => {
+  // ★ THE CANCEL PATHS ONLY. Update and Unlink already end in applyLessonEdit, which focuses
+  //   the textarea on a rAF — so this is not about them. Escape, the Cancel button and Remove
+  //   each UNMOUNT the element holding focus (the URL input, or the button itself), and a
+  //   browser then moves focus to <body>: a keyboard user is dropped at the top of the
+  //   document with the drawer still open (WCAG 2.4.3).
+  const src = app();
+  const fn = fnBody(src, 'const returnFocusToLessonBody = () => {');
+  assert.match(fn, /requestAnimationFrame\(/,
+    'the unmount happens in the same commit — focusing before it lands is undone by React');
+  assert.match(fn, /lessonBodyRef\.current/);
+  assert.match(fn, /el\.focus\(\)/);
+  assert.match(fn, /setSelectionRange\(/, 'and the caret goes back where it was');
+
+  const c = composer();
+  assert.match(c, /Escape'\) \{ e\.preventDefault\(\); e\.stopPropagation\(\); setLinkBar\(null\); returnFocusToLessonBody\(\); \}/,
+    'Escape in the link bar');
+  assert.match(c, /onClick=\{\(\) => \{ setLinkBar\(null\); returnFocusToLessonBody\(\); \}\}/,
+    'the Cancel button');
+
+  const rm = fnBody(src, 'const removeLessonImage = async (entry) => {');
+  assert.ok(rm.indexOf('returnFocusToLessonBody()') > rm.indexOf('list.filter(im => im.key !== entry.key)'),
+    'removing an image card unmounts the focused button, so focus is handed back after');
+});
+
+test('a database without the migration degrades to plain text with an actionable notice', () => {
+  const c = composer();
+  assert.match(c, /const preRich = lessonRowsArePreRichContent\(allLessons\)/);
+  assert.match(c, /db\/2026-09-20-course-lesson-assets\.sql/,
+    'the notice must name the file to run, not merely say a feature is unavailable');
+  assert.match(c, /onPaste=\{preRich \? undefined : onLessonPaste\}/,
+    'pasting an image into a database that cannot store it must not start an upload');
+});
+
+test('the formatting opt-in guards SAVED prose, not what was just typed', () => {
+  // ★ CAUGHT IN THE BROWSER. Reading the DRAFT here meant that writing the first sentence
+  //   of a brand-new lesson made it non-empty, which replaced the whole toolbar with
+  //   "Turn on formatting" — the creator typed one line and the Link button vanished.
+  //   Nothing written in this session needs protecting from reinterpretation; only text
+  //   already STORED as plain can be silently changed by turning formatting on.
+  const src = app();
+  const at = src.indexOf('const needsFormatOptIn =');
+  assert.ok(at > 0, 'needsFormatOptIn moved');
+  const line = src.slice(at, src.indexOf('\n', at));
+  assert.match(line, /savedLessonText/, 'the question must be about the SAVED row');
+  assert.ok(!/editingLesson\?\.text_content/.test(line),
+    'reading the draft here is the bug this test exists to prevent');
+  assert.match(src, /const savedLessonText = \(originalEditingLesson\?\.text_content \|\| ''\)\.trim\(\);/);
+});
+
+test('students read the instructions below the video and above the replay link', () => {
+  // The owner asked for this placement in words: "It will be shown below the video
+  // tutorial as instruction". #37b already fixed the replay card's slot ("below the lesson
+  // body and above Mark complete"), so the instructions have to land between the title and
+  // that card — which is also the reading order a lesson actually has.
+  const src = app();
+  const at = src.indexOf("{activeLesson.type === 'video' && activeLesson.text_content && (");
+  assert.ok(at > 0, 'the video-lesson instructions block moved');
+  // Offsets are taken in the FULL source, not a window: "Mark complete" sits a few hundred
+  // characters past the replay card, and a window sized to miss it made the last assertion
+  // pass on -1 rather than on the order it claims to check.
+  const region = src;
+
+  const iStage = region.indexOf('{stageLesson && renderVideo(activeLesson)}', at - 1400);
+  const iTitle = region.indexOf('{activeLesson.title}', iStage);
+  const iBody = region.indexOf('<LessonRichText lesson={activeLesson}', iTitle);
+  const iReplay = region.indexOf('<LessonReplayLink', iBody);
+  const iDone = region.indexOf('Mark complete', iReplay);
+  for (const [name, i] of [['stage', iStage], ['title', iTitle], ['body', iBody],
+    ['replay', iReplay], ['done', iDone]]) {
+    assert.ok(i > 0, `${name} not found — the lesson page was restructured`);
+  }
+
+  assert.ok(iStage >= 0 && iTitle > iStage, 'the media stage comes first, then the title');
+  assert.ok(iBody > iTitle, 'instructions come after the title');
+  assert.ok(iReplay > iBody, 'and BEFORE the Zoom replay card');
+  assert.ok(iDone > iReplay, 'which is itself before the completion controls');
+});
+
+test('both learner render sites go through the same safe renderer', () => {
+  const src = app();
+  const uses = (src.match(/<LessonRichText lesson=/g) || []).length;
+  assert.ok(uses >= 2, 'a text lesson and a video lesson\'s notes must share one renderer');
+  assert.ok(!/whitespace-pre-line leading-relaxed text-\[15px\]">\{lesson\.text_content\}/.test(src),
+    'the old raw text-lesson render must be gone, not merely bypassed');
+  assert.ok(!/whitespace-pre-line leading-relaxed text-\[15px\]">\{activeLesson\.text_content\}/.test(src),
+    'and the old raw video-notes render too');
+});
+
+test('a cancelled image upload stays cancelled, even if it then fails', () => {
+  // Without this, an upload the creator dismissed and that then errored flipped itself
+  // back to 'error' — reappearing in the list they had just cleared, offering Retry for a
+  // file they no longer want.
+  const up = fnBody(app(), 'const uploadLessonImage = async (entry) => {');
+  const catchAt = up.indexOf('} catch (e) {');
+  assert.ok(catchAt > 0, 'uploadLessonImage has no catch');
+  const tail = up.slice(catchAt);
+  const guardAt = tail.indexOf("=== 'cancelled'");
+  const setErrAt = tail.indexOf("status: 'error'");
+  assert.ok(guardAt > 0 && guardAt < setErrAt,
+    'the cancelled check must come BEFORE the error state is written');
+});
+
+test('removing an image takes its token out of the draft, not just its card', () => {
+  const src = app();
+  const fn = src.slice(src.indexOf('const removeLessonImage = async (entry)'),
+    src.indexOf('const removeLessonImage = async (entry)') + 1800);
+  // ★ REFERENCES ARE DERIVED ON SAVE, SO THE SERVER CANNOT PROTECT THIS ONE. An image
+  //   placed in a draft and removed before saving has no reference row, so
+  //   LESSON_ASSET_IN_USE cannot fire: the row and bytes go, and the orphaned token left
+  //   in the text makes the NEXT save die on LESSON_ASSET_UNKNOWN_REF, recoverable only
+  //   by hand-deleting raw markup out of a textarea.
+  assert.match(fn, /removeAssetToken\(s\.text_content \|\| '', entry\.assetId\)/,
+    'the token must be stripped from the draft when the image is removed');
+  const stripAt = fn.indexOf('removeAssetToken');
+  const rpcAt = fn.indexOf("rpc('course_lesson_asset_delete'");
+  assert.ok(stripAt > 0 && rpcAt > 0 && stripAt < rpcAt,
+    'strip the text BEFORE asking the server to delete the asset');
+});
+
+test('a refused save leaves Preview and lands on the field it is refusing', () => {
+  const src = app();
+  const at = src.indexOf('const contentVerdict = validateLessonContent(');
+  assert.ok(at > 0, 'the save validation moved');
+  const block = src.slice(at, at + 1400);
+  // ★ In Preview the <textarea> is unmounted, so lessonBodyRef.current is null and both
+  //   the scroll and the focus silently did nothing — a footer alert with no indication
+  //   of where to look, on a surface that cannot be typed into anyway.
+  assert.match(block, /setLessonPreview\(false\)/, 'a refusal must return to the editor');
+  assert.match(block, /errors\.find\(e => e\.assetId\)/,
+    'IMAGE_ALT_REQUIRED names the image it means — use it');
+  assert.match(block, /getElementById\(`lesson-alt-\$\{named\.assetId\}`\)/);
+  assert.match(block, /const target = field \|\| lessonBodyRef\.current/,
+    'and fall back to the body for an image uploaded in an earlier session');
+});
+
+test('the formatting toolbar is inert while Preview is on', () => {
+  const src = app();
+  const bar = src.slice(src.indexOf('aria-label="Formatting"'), src.indexOf('aria-label="Formatting"') + 2000);
+  const buttons = bar.match(/<button type="button"/g) || [];
+  const guards = bar.match(/disabled=\{lessonPreview\}/g) || [];
+  assert.equal(guards.length, buttons.length,
+    'every toolbar button edits text_content at the remembered caret, and in Preview '
+    + 'there is nothing on screen to show that it did');
+  assert.ok(buttons.length >= 5, `expected the five formatting buttons, found ${buttons.length}`);
+});
+
+test('a link can be edited and unlinked, not only created', () => {
+  const src = app();
+  const open = src.slice(src.indexOf('const openLinkBar = () => {'), src.indexOf('const confirmLinkBar'));
+  // ★ Without a range, confirm replaced the SELECTION — so re-linking existing words
+  //   wrapped the whole token and produced `[label(url)](newurl)`, a link whose visible
+  //   text is raw markdown.
+  assert.match(open, /linkAtSelection\(text, start, end\)/);
+  assert.match(open, /range: \{ start: found\.start, end: found\.end \}/);
+  // ★ THE CAPTURED RANGE IS RE-DERIVED BEFORE IT IS USED. The bar renders BELOW the body and
+  //   the textarea stays editable, so typing while it is open leaves those offsets pointing at
+  //   whatever moved into their place — and Update/Unlink then spliced there blind, rewriting
+  //   the wrong span of somebody's lesson. liveLinkRange re-finds the token and also checks it
+  //   is still the one the bar opened on, so a moved link becomes a message, not a corruption.
+  assert.match(open, /wasUrl: found\.url, wasLabel: found\.label/,
+    'the bar must remember what it opened ON, or an edit to its own fields looks like the document');
+  const live = src.slice(src.indexOf('const liveLinkRange'), src.indexOf('const LINK_MOVED'));
+  assert.match(live, /linkAtSelection\(editingLesson\?\.text_content \|\| '', linkBar\.range\.start/);
+  assert.match(live, /at\.start !== linkBar\.range\.start/);
+  assert.match(live, /at\.url !== linkBar\.wasUrl \|\| at\.label !== linkBar\.wasLabel/);
+
+  // ★ Each path is sliced to ITSELF. A window that ran from confirmLinkBar all the way to
+  //   patchImage also contained removeLinkAtBar, so the regex matched that function's copy and
+  //   a mutation deleting the revalidation from CONFIRM survived. Two callers, two assertions.
+  const confirm = src.slice(src.indexOf('const confirmLinkBar'), src.indexOf('const removeLinkAtBar'));
+  assert.match(confirm, /const live = liveLinkRange\(\);/,
+    'an edit must replace the token as it stands NOW, never the offsets captured earlier');
+  assert.match(confirm, /if \(!live\) \{ setLinkBar\(b => \(\{ \.\.\.b, error: LINK_MOVED \}\)\); return; \}/);
+
+  const unlink = src.slice(src.indexOf('const removeLinkAtBar'), src.indexOf('const patchImage'));
+  assert.match(unlink, /const live = liveLinkRange\(\);/, 'Unlink revalidates too');
+  assert.match(unlink, /applyUnlink\(editingLesson\?\.text_content \|\| '', live\.start, live\.start\)/);
+  assert.ok(!/range\.start, range\.start/.test(unlink),
+    'the captured offsets must not be used directly any more');
+  assert.match(src, /linkBar\.range && \(/, 'Unlink only shows when a link is being edited');
+});
+
+test('Escape in the link bar dismisses the bar, not the whole lesson editor', () => {
+  const src = app();
+  const bar = src.slice(src.indexOf('placeholder="https://docs.google.com/forms/'), src.indexOf('Text to show'));
+  // ★ preventDefault IS NOT ENOUGH. SidePanel listens for Escape on WINDOW, so the event
+  //   reached it from this input and closed the drawer — which then asked "Discard unsaved
+  //   lesson changes?". Dismissing a small inline bar must never put a draft at risk.
+  assert.match(bar, /e\.key === 'Escape'[\s\S]{0,80}e\.stopPropagation\(\)/,
+    'the Escape handler must stop the event before the drawer\'s window listener sees it');
+  const panel = src.slice(src.indexOf('function SidePanel'), src.indexOf('function SidePanel') + 1800);
+  assert.match(panel, /window\.addEventListener\('keydown', onKey\)/,
+    'this is why: the drawer listens on window, above the React root');
+});
+
+test('a caption is a second, optional field — never the alt text', () => {
+  const src = app();
+  const card = src.slice(src.indexOf('Describe this image'), src.indexOf('Describe this image') + 3400);
+  assert.match(card, /maxLength=\{LESSON_IMAGE_ALT_MAX\}/);
+  assert.match(card, /Caption \(optional\)/, 'the caption is optional and says so');
+  assert.match(card, /maxLength=\{LESSON_IMAGE_CAPTION_MAX\}/);
+  assert.match(card, /patchImage\(im\.key, \{ caption: e\.target\.value \}\)/);
+  assert.match(card, /disabled=\{!\(im\.alt \|\| ''\)\.trim\(\)\}/,
+    'alt stays REQUIRED before an image can be placed; the caption never gates it');
+  // ★ And assistive tech is TOLD it is required — the red asterisk carries aria-hidden, so
+  //   without this the field announced as an ordinary optional input.
+  assert.match(card, /required aria-required="true"/);
+  assert.match(card, /aria-invalid=\{!\(im\.alt \|\| ''\)\.trim\(\) \|\| undefined\}/);
+  assert.match(src, /applyImage\([^)]*entry\.assetId, alt, entry\.caption\)/,
+    'the caption must reach the document');
+});

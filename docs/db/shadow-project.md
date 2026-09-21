@@ -107,7 +107,7 @@ whenever a dated migration is folded into the bootstrap.
 ### 5. Run the suite
 
 ```bash
-npm run test:db     # 132 tests across six suites
+npm run test:db     # every *.dbtest.mjs suite (ten of them as of #65)
 ```
 
 It is slow because every fixture statement is an HTTPS round trip to the Management API. That is the
@@ -126,7 +126,7 @@ Without a target the suite simply cannot start; with one it works again immediat
 
 ## What the suite covers (and why it is worth the wait)
 
-Across six files (`test-db/*.dbtest.mjs`). The two oldest are described below; the rest follow the
+Across ten files (`test-db/*.dbtest.mjs`). The two oldest are described below; the rest follow the
 same persona-driven shape:
 
 - `test-db/entitlements.dbtest.mjs` — cohort runs, registry allocation, the FIFO queue, batch

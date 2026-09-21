@@ -165,6 +165,33 @@ export async function clearStaff(persona) {
 }
 
 /** SQL string literal with quote escaping. Fixtures only — never user input. */
+/**
+ * Run fixture SQL with auth.uid() set to a persona, inside ONE transaction.
+ *
+ * ★ WHY THIS EXISTS. The Management API runs as `postgres` with no JWT, so auth.uid() is
+ *   null and every self-gating trigger refuses. #48 added `courses_publish_insert_guard`
+ *   (BEFORE INSERT ... WHEN new.published), which means a fixture cannot create a
+ *   PUBLISHED course from here at all — it fails with COURSE_PUBLISH_FORBIDDEN before a
+ *   single test runs.
+ *
+ * ★ AND WHY NOT `ALTER TABLE ... DISABLE TRIGGER`. Setting the claim leaves the guard
+ *   armed: it still runs, still reads a real staff membership, and still has to pass. A
+ *   fixture that satisfies the rule is evidence; one that switches the rule off is a
+ *   fixture that would keep working after the rule broke.
+ *
+ * `is_local = true` scopes the identity to this DO block's implicit transaction, so
+ * nothing else in the run inherits it. Pass statements, each ending in a semicolon.
+ */
+export async function asUser(userId, sql) {
+  await runSql(`do $as$
+    begin
+      perform set_config('request.jwt.claims',
+        json_build_object('sub', ${lit(String(userId))})::text, true);
+      ${sql}
+    end
+  $as$`);
+}
+
 export function lit(v) {
   if (v === null || v === undefined) return 'null';
   return `'${String(v).replace(/'/g, "''")}'`;
@@ -353,6 +380,13 @@ export async function resetShadow() {
       -- accumulate across runs until a slug collision made the failure look unrelated.
       -- CASCADE carries course_modules/course_lessons/lesson_progress/course_completions
       -- and the course_ai_* rows; naming the two children anyway keeps the intent legible.
+      -- ★ #65's two tables are named for the same reason, and one of them needs it more
+      --   than legibility: course_lesson_assets.course_id is ON DELETE SET NULL, so a row
+      --   would survive a plain DELETE of its course. TRUNCATE CASCADE reaches it anyway
+      --   (cascade follows the reference, not the delete action), but a reader checking
+      --   whether test data leaks between suites should not have to know that.
+      public.course_lesson_asset_refs,
+      public.course_lesson_assets,
       public.course_lessons,
       public.course_modules,
       public.courses
@@ -371,7 +405,7 @@ export async function resetShadow() {
   await runSql(`do $storage$
     begin
       perform set_config('storage.allow_delete_query', 'true', true);
-      delete from storage.objects where bucket_id = 'course-videos';
+      delete from storage.objects where bucket_id in ('course-videos', 'course-lesson-assets');
     end
   $storage$`);
   // Cohorts and their spaces: delete the batches, let the FK cascade take the

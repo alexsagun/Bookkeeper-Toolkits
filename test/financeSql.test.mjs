@@ -50,7 +50,7 @@ const PARITY = 'db/2026-09-14-finance-parity.sql';
  * strictly weaker than reading the one that runs last. Repoint it whenever a migration restates
  * the catalog, exactly as CURRENT_CATALOG_MIGRATION is repointed in communityStaffSql.test.mjs.
  */
-const CATALOG_OWNER = 'db/2026-09-18-management-hardening.sql';
+const CATALOG_OWNER = 'db/2026-09-20-course-lesson-assets.sql';
 
 /** The bootstrap carries every migration; scope it to the §45 fold. */
 function financeSection(rel) {

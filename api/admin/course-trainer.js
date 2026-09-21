@@ -34,6 +34,7 @@ import { requireStaff, callerCanManageCourse, service, serviceConfigured } from 
 import { courseScopeVerdict, staffCan } from '../../src/lib/staffRoles.js';
 import { elevenLabsApiBase } from '../elevenlabs/signed-url.js';
 import { chunkText, ENROLLMENT_PLAN_KEYS } from '../../src/lib/trainerContent.js';
+import { lessonContentToPlainText } from '../../src/lib/lessonContent.js';
 
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
 const ANON_KEY = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
@@ -71,7 +72,13 @@ function rateLimited(userId) {
 const sha256hex = (text) => crypto.createHash('sha256').update(String(text || ''), 'utf8').digest('hex');
 function isNotMigrated(err) {
   const code = err?.code || '';
-  return code === '42P01' || code === '42883' || code === 'PGRST202' || code === 'PGRST204';
+  // ★ 42703 (undefined_column) belongs here and was missing. Every other member of this
+  //   list is "the database predates a migration", and a column this code asks for and the
+  //   database does not have is exactly that — but it fell through to the generic catch and
+  //   returned a 500 "Trainer operation failed." for a database that was merely older,
+  //   rather than the honest "not migrated yet" every other shape gets.
+  return code === '42P01' || code === '42883' || code === '42703'
+    || code === 'PGRST202' || code === 'PGRST204';
 }
 
 // Embed an array of texts via the trainer-embed Edge Function.
@@ -195,12 +202,33 @@ async function doSync(admin, courseId) {
   //    LIVE lesson text is the sole authority: emptying a lesson's text DELETES its
   //    lesson_text source (cascade drops its chunks) so removed content can never be
   //    resurrected by a later re-index of a stale snapshot.
-  const { data: lessons, error: lerr } = await admin.from('course_lessons')
-    .select('id,title,text_content').eq('course_id', courseId);
+  // content_format (#65) decides how text_content is READ. Narrow and retry on a database
+  // that predates it — every lesson there is plain, which is what the fallback assumes.
+  let { data: lessons, error: lerr } = await admin.from('course_lessons')
+    .select('id,title,text_content,content_format').eq('course_id', courseId);
+  if (lerr && (lerr.code === '42703' || lerr.code === 'PGRST204')) {
+    ({ data: lessons, error: lerr } = await admin.from('course_lessons')
+      .select('id,title,text_content').eq('course_id', courseId));
+    // ★ STAMP THE ASSUMPTION, DO NOT LEAVE IT TO A DEFAULT. These rows carry no
+    //   content_format because the database predates the column, and every lesson on such
+    //   a database is plain by definition. For the first life of #65 the library defaulted
+    //   an absent format to MARKDOWN, so this fallback re-parsed every plain lesson as
+    //   markup: each hash moved and the whole course re-indexed and re-embedded for
+    //   nothing — the exact opposite of the invariant stated below.
+    if (Array.isArray(lessons)) lessons = lessons.map((l) => ({ ...l, content_format: 'plain' }));
+  }
   if (lerr) { if (isNotMigrated(lerr)) return { status: 200, body: { ok: true, migrated: false } }; throw lerr; }
   const liveText = new Map();
   for (const l of lessons || []) {
-    const text = String(l.text_content || '').trim();
+    // ★ THE INDEX STORES PROSE, NOT MARKUP, AND THIS IS THE ONLY PLACE THAT DECIDES SO.
+    //   Everything downstream copies this string byte for byte: chunkText only normalizes
+    //   line endings, and buildTrainerEnvelope only truncates. Send the raw document and
+    //   the voice agent narrates "star star Important star star" and reads a URL out one
+    //   character at a time. lessonContentToPlainText keeps link labels as words, turns an
+    //   image into its alt text, and emits no asset id, scheme or storage path at all.
+    //   A 'plain' lesson is returned unchanged, so its hash does not move and it is not
+    //   needlessly re-indexed.
+    const text = lessonContentToPlainText(l.text_content, l.content_format).trim();
     liveText.set(l.id, text);
     const { data: existing } = await admin.from('course_ai_sources')
       .select('id,content_hash,status,source_version').eq('lesson_id', l.id).eq('kind', 'lesson_text').maybeSingle();

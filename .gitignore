@@ -52,3 +52,16 @@ Google Financial script/
 
 # Vercel CLI project link (created by `vercel link`): account and project ids, machine-local.
 .vercel/
+
+# Local debugging artifacts from the lesson-video work, kept on disk as reference but never
+# committed. `video upload error.mp4` is ~5.8 MB, and a binary that size is effectively
+# permanent once it enters history, so this guards against a stray `git add -A`.
+video upload error.mp4
+Video upload
+
+# Scratch probe scripts from the same work (no credentials, but not shippable).
+.probe/
+
+# The standalone HTML artifact the Portfolio Generator was ported from. The shipping engine
+# lives in src/lib/portfolioGenerator.js; this is the original single-file reference copy.
+bookkeeper-portfolio-generator.html

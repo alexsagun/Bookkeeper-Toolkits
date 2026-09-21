@@ -247,11 +247,11 @@ async function main() {
   // And the LESSON bucket specifically: the effective ceiling is min(bucket, project),
   // so raising the project alone does not deliver 2 GB if that bucket is lower.
   //
-  // ★ Deliberately NOT a blanket "every bucket must reach the lesson cap" rule. Four of
-  //   the five buckets are meant to be far smaller — avatars 5 MB, enrollment-receipts
-  //   10 MB, community-media and course-media 50 MB — and failing them would make this
-  //   report permanently red, which is precisely how the #44 external-link check stopped
-  //   being read and how this whole class of drift survived.
+  // ★ Deliberately NOT a blanket "every bucket must reach the lesson cap" rule. Five of
+  //   the six buckets are meant to be far smaller — avatars 5 MB, enrollment-receipts
+  //   10 MB, course-lesson-assets 10 MB, community-media and course-media 50 MB — and
+  //   failing them would make this report permanently red, which is precisely how the #44
+  //   external-link check stopped being read and how this whole class of drift survived.
   const lc = lessonCeiling(afterBuckets, gotLimit);
 
   if (!afterVerdict.ok || !lc.present || lc.ceiling < target) {

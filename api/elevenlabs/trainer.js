@@ -99,10 +99,13 @@ function service() {
   });
 }
 
-// A missing table/function (pre-#27 DB) reads as one of these Postgres codes.
+// A missing table/function/column (a DB predating a migration) reads as one of these.
+// 42703 (undefined_column) was missing from the set and belongs to it for the same reason
+// as the others: it means "older database", not "this request failed".
 function isNotMigrated(err) {
   const code = err?.code || '';
-  return code === '42P01' || code === '42883' || code === 'PGRST202' || code === 'PGRST204';
+  return code === '42P01' || code === '42883' || code === '42703'
+    || code === 'PGRST202' || code === 'PGRST204';
 }
 
 function envelope(res, obj) {
