@@ -1369,3 +1369,381 @@ body.is-col-resizing iframe { pointer-events: none; }
   .pf-swatch { transition: none; }
   .pf-swatch:hover { transform: none; }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LESSON INSTRUCTIONS CANVAS  (src/editor/LessonDocumentEditor.jsx)
+
+   A document surface, not a form field. The creator writes where the words will
+   appear, so the typography here is the READING typography — not the monospace
+   of the textarea this replaced.
+
+   ★ THE TOOLBAR IS A FLEX SIBLING ABOVE THE SCROLLER, NEVER `sticky` INSIDE IT.
+     That is the shape the course rail had to be rescued into: a sticky header
+     with a transparent backdrop inside its own scroller let the content scroll
+     visibly THROUGH it. Three rows of one flex column — toolbar, canvas, link
+     bar — and only the middle one scrolls.
+
+   ★ THE CANVAS IS BOUNDED AT BOTH ENDS. Without a max-height a long lesson
+     grows the drawer body until the Save button is a scroll away; without a
+     min-height an empty one is a sliver you cannot aim at.
+
+   ★ NO COLOUR LITERALS. This file is loaded by a lazy chunk that must not
+     import the monolith's design tokens, so every colour here is a var().
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.lesson-doc-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid var(--glass-border-soft);
+  border-radius: 12px;
+  background: var(--input-bg);
+  overflow: hidden;
+  container-type: inline-size;
+}
+
+.lesson-doc-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 24px 16px;
+  font-size: 13px;
+  color: var(--c-text-soft);
+}
+
+/* ── Toolbar ──────────────────────────────────────────────────────────────── */
+
+.lesson-doc-toolbar {
+  flex-shrink: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 8px;
+  background: var(--wash);
+  border-bottom: 1px solid var(--glass-border-soft);
+}
+
+.lesson-doc-tool {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* WCAG 2.2 SC 2.5.8 wants 24x24; below lg the drawer IS the whole screen. */
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0 6px;
+  border-radius: 6px;
+  color: var(--c-text-soft);
+  background: transparent;
+  transition: background 120ms var(--ease), color 120ms var(--ease);
+}
+
+.lesson-doc-tool:hover:not(:disabled) { background: var(--wash-strong); color: var(--c-text); }
+.lesson-doc-tool.is-active { background: var(--primary-tint); color: var(--primary-solid); }
+.lesson-doc-tool:disabled { opacity: 0.4; cursor: not-allowed; }
+/* aria-disabled, not disabled: still focusable, so pressing Redo to the end of the
+   stack cannot blur the button and drop focus to <body> inside the dialog. */
+.lesson-doc-tool[aria-disabled="true"] { opacity: 0.4; cursor: not-allowed; }
+.lesson-doc-tool[aria-disabled="true"]:hover { background: transparent; }
+
+.lesson-doc-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 4px;
+  background: var(--glass-border-soft);
+}
+
+/* ── The canvas ───────────────────────────────────────────────────────────── */
+
+.lesson-doc-canvas {
+  flex: 1 1 auto;
+  /* min-height: 0 or a flex item refuses to shrink below its content and the
+     whole panel grows instead of this one scrolling. */
+  min-height: 0;
+  max-height: min(58vh, 620px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.lesson-doc-surface {
+  min-height: 200px;
+  padding: 16px 18px;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 15px;
+  line-height: 1.7;
+  color: var(--c-text);
+  outline: none;
+}
+
+.lesson-doc-surface > * + * { margin-top: 0.75em; }
+.lesson-doc-surface p { margin: 0; }
+
+.lesson-doc-surface ul,
+.lesson-doc-surface ol { margin: 0; padding-left: 1.5em; }
+.lesson-doc-surface ul { list-style: disc; }
+.lesson-doc-surface ol { list-style: decimal; }
+.lesson-doc-surface li { margin: 0.2em 0; }
+.lesson-doc-surface li > p { margin: 0; }
+.lesson-doc-surface strong { font-weight: 700; }
+
+/* A link has to LOOK like a link while editing — that is the whole point. */
+.lesson-doc-link {
+  color: var(--primary-solid);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: text;
+}
+
+/* Storage holds something this model cannot express. It is shown, not hidden and
+   not silently rewritten; validateLessonContent refuses the save and says why. */
+.lesson-doc-broken {
+  padding: 0 3px;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  background: var(--status-warn-bg);
+  color: var(--status-warn-fg);
+  border: 1px dashed var(--status-warn-bd);
+}
+
+.lesson-doc-surface p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
+  pointer-events: none;
+  color: var(--c-text-faint);
+}
+
+/* ── Figures ──────────────────────────────────────────────────────────────── */
+
+.lesson-doc-figure {
+  position: relative;
+  margin: 1em 0;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  transition: border-color 120ms var(--ease);
+}
+
+.lesson-doc-figure.is-selected { border-color: var(--c-primary); }
+.lesson-doc-figure.needs-alt { border-color: var(--status-warn-bd); }
+.lesson-doc-figure.is-failed { border-color: var(--c-red); }
+
+.lesson-doc-figure-inner {
+  position: relative;
+  margin: 0;
+  border-radius: 9px;
+  overflow: hidden;
+  background: var(--wash);
+}
+
+/* ★ max-width, NEVER width. `width: 100%` UPSCALES: a small screenshot, an icon or a
+   logo is blown up to the full canvas and rendered blurry — caught by looking at a
+   2x2 test image fill an 800px box. A picture is never shown larger than it is. */
+.lesson-doc-image {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.lesson-doc-image.is-dim { opacity: 0.55; }
+
+.lesson-doc-image-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 96px;
+  font-size: 13px;
+  color: var(--c-text-soft);
+}
+
+.lesson-doc-image-state.is-bad { color: var(--status-warn-fg); background: var(--status-warn-bg); }
+
+.lesson-doc-caption {
+  padding: 6px 10px 8px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--c-text-soft);
+  background: var(--wash);
+}
+
+.lesson-doc-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--status-warn-strong-bg);
+  color: var(--status-warn-fg);
+  border: 1px solid var(--status-warn-bd);
+}
+
+.lesson-doc-pending-bar {
+  position: absolute;
+  inset-inline: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--c-text);
+  background: var(--glass-card-elev);
+}
+
+.lesson-doc-progress {
+  position: absolute;
+  inset-inline: 0;
+  top: 0;
+  height: 3px;
+  overflow: hidden;
+  background: var(--wash-strong);
+}
+
+/* Indeterminate on purpose: supabase-js reports no progress for an upload, and a
+   bar that invents a percentage is worse than one that admits it does not know. */
+.lesson-doc-progress-bar {
+  width: 35%;
+  height: 100%;
+  background: var(--c-primary);
+  animation: lesson-doc-slide 1.4s var(--ease) infinite;
+}
+
+@keyframes lesson-doc-slide {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(340%); }
+}
+
+.lesson-doc-figure-bar,
+.lesson-doc-figure-panel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 6px 2px 0;
+}
+
+.lesson-doc-figure-panel {
+  align-items: flex-end;
+  padding: 8px;
+  margin-top: 4px;
+  border-radius: 8px;
+  background: var(--wash);
+  border: 1px solid var(--glass-border-soft);
+}
+
+/* ── Shared small controls ────────────────────────────────────────────────── */
+
+.lesson-doc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--c-text-soft);
+  background: var(--wash-strong);
+  transition: background 120ms var(--ease), color 120ms var(--ease);
+}
+
+.lesson-doc-chip:hover { color: var(--c-text); }
+.lesson-doc-chip.is-primary { background: var(--primary-solid); color: #fff; }
+.lesson-doc-chip.is-danger:hover { background: var(--status-danger-bg); color: var(--c-red); }
+
+.lesson-doc-field { display: block; }
+.lesson-doc-field.is-grow { flex: 1 1 180px; min-width: 160px; }
+
+.lesson-doc-field-label {
+  display: block;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--c-text-soft);
+}
+
+.lesson-doc-req { color: var(--c-red); }
+
+.lesson-doc-input {
+  width: 100%;
+  margin-top: 2px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--c-border);
+  background: var(--input-bg);
+  color: var(--c-text);
+  font-size: 13px;
+}
+
+.lesson-doc-input:focus { background: var(--input-bg-focus); }
+
+.lesson-doc-hint {
+  display: block;
+  margin-top: 3px;
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--c-text-soft);
+}
+
+/* ── The link bar ─────────────────────────────────────────────────────────── */
+
+/* Inline, never a nested dialog: a second portaled overlay inside the drawer
+   would fight SidePanel's own focus trap. */
+.lesson-doc-linkbar {
+  flex-shrink: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--wash);
+  border-top: 1px solid var(--glass-border-soft);
+}
+
+.lesson-doc-linkbar-actions { display: flex; gap: 6px; }
+
+.lesson-doc-error {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--c-red);
+}
+
+/* ── Narrow ───────────────────────────────────────────────────────────────── */
+
+/* A container query, not a media query — the drawer's width is what matters
+   here, and it changes at breakpoints the viewport knows nothing about. */
+@container (max-width: 460px) {
+  .lesson-doc-surface { padding: 12px 12px; font-size: 14px; }
+  .lesson-doc-canvas { max-height: min(52vh, 460px); }
+  .lesson-doc-field.is-grow { flex-basis: 100%; }
+  .lesson-doc-linkbar-actions { width: 100%; }
+}
+
+/* ── Per-theme ink ───────────────────────────────────────────────────────── */
+
+/* ★ MEASURED, NOT ASSUMED. --primary-solid is documented as the blue for white text on
+   a flat fill; as blue TEXT on the dark canvas it is 4.17:1, under the 4.5 floor, while
+   --c-primary is 5.46:1 there and 3.49:1 in light. Neither token passes both themes, so
+   each theme takes the one that does. The active-toolbar tint follows the same pair so
+   the two never drift apart. */
+[data-theme="dark"] .lesson-doc-link { color: var(--c-primary); }
+[data-theme="dark"] .lesson-doc-tool.is-active { color: var(--c-primary); }
+
+/* ── Scoped a11y ──────────────────────────────────────────────────────────── */
+
+.lesson-doc-shell :focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+.lesson-doc-surface:focus-visible { outline-offset: -2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .lesson-doc-progress-bar { animation: none; width: 100%; opacity: 0.5; }
+  .lesson-doc-tool,
+  .lesson-doc-chip,
+  .lesson-doc-figure { transition: none; }
+}

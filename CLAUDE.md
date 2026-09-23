@@ -34,6 +34,11 @@ active paid plan.
   `@import` inside a component `<style>` block (eight of those were removed in the theme pass).
 - **Lucide React** for icons, **XLSX** (spreadsheet parse/generate) — XLSX is **lazy-loaded** via
   dynamic `import()` so it stays out of the main bundle.
+- **Tiptap 3 / ProseMirror** (`@tiptap/core`, `@tiptap/pm`, `@tiptap/react`, `@tiptap/extensions`
+  and six individual extension packages, all pinned at `3.31.3`) — ONLY for the course-lesson
+  instructions canvas, and **lazy-loaded into its own chunk** (120 KB gzip; zero ProseMirror in
+  either app chunk). Individual packages rather than `starter-kit` on purpose: what is not
+  installed cannot be enabled. See `src/editor/LessonDocumentEditor.jsx`.
 - **Anthropic Claude API** for AI features, via a key-hiding proxy (see below).
 - **Supabase** (`@supabase/supabase-js`) for **user authentication** (email/password signup & login).
   See the "Authentication" section below. This is Phase 1; a paid-subscriber gate is the planned Phase 2.
@@ -52,7 +57,7 @@ npm run ai:knowledge:check # rebuild the knowledge doc in memory + diff vs disk;
 npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge base
 npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
 npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, bootstrapFolds, courseVideo, courseVideoSql, courseVideoContent, mp4Faststart, studentProgress, studentProgressSql, uiSafety, coaIntegrity, portfolioGenerator,
-                           approveGrantSql, financeDailyIncome, financeDailyIncomeSql, lessonContent, lessonContentSql, sidebarLayout, …)
+                           approveGrantSql, financeDailyIncome, financeDailyIncomeSql, lessonContent, lessonContentSql, lessonDocument, sidebarLayout, …)
 npm run storage:config     # read the PROJECT-WIDE Supabase Storage upload limit and the effective
                            # limit of every bucket; --apply raises it to LESSON_VIDEO_MAX_BYTES.
                            # The bucket limit alone is a ceiling, not a grant — Supabase enforces
@@ -111,6 +116,35 @@ that reads the bare `localStorage['ui:theme']` pref (falling back to `prefers-co
 
 ### [src/lib/supabase.js](src/lib/supabase.js) + [src/auth/AuthProvider.jsx](src/auth/AuthProvider.jsx) — auth infra
 
+### [src/editor/LessonDocumentEditor.jsx](src/editor/LessonDocumentEditor.jsx) — the one component outside the monolith
+
+The lesson instructions canvas: the Tiptap **schema**, the React wrapper and the node views, and
+nothing else. Every piece of product behaviour — uploading, the Supabase RPCs, the save gate, the
+orphan sweep, the error copy — stays in `BookkeeperPro.jsx` and arrives as a prop.
+
+- ★ **IT IMPORTS NOTHING FROM `BookkeeperPro.jsx`, AND NO SUPABASE CLIENT.** The point of the module
+  is that it is lazy-loaded (`loadLessonEditorModule`, the `tus-js-client` idiom): ~120 KB gzip of
+  ProseMirror for the handful of people who can edit a course, not for every student reading one.
+  A single import of the design-token object `C` would pull the 37k-line monolith into this chunk
+  and undo that completely, so everything here is styled with CSS classes over the `var(--…)`
+  tokens in `src/index.css`. **Do not add it to `manualChunks`.** `uiSafety` §24 pins all of it,
+  including a scan of `dist/` that the app chunks carry no ProseMirror.
+- ★ **A CONTENTEDITABLE EDITOR IS SAFE HERE, AND THE OLD OBJECTION IS ANSWERED, NOT IGNORED.** The
+  composer was a `<textarea>` because a WYSIWYG was read as "accept HTML from the DOM and sanitize
+  it back into a safe subset" — a losing position, and still is. ProseMirror is not that: its
+  SCHEMA is an allowlist, so markup it does not declare cannot exist in the document; the document
+  is serialized back to the same closed markdown by `lessonDocument.js`; and that text is checked
+  by the same `validateLessonContent` and rendered to students by the same `LessonRichText`. Three
+  independent layers, and the stored bytes are byte-compatible with what shipped before.
+- The schema is exactly `LESSON_DOC_NODES` / `LESSON_DOC_MARKS`. Not `@tiptap/starter-kit` (it
+  brings headings, italic, strike, code, code blocks, blockquote, rules), and **not
+  `@tiptap/extension-link`** — that package depends on `linkifyjs`, whose idea of a URL is not this
+  app's, and a second opinion about what counts as a safe address is how one door stays unlocked.
+  The `link` mark is written here so `safeLessonHref()` stays the only scheme authority, on paste
+  as well as on save.
+- `lessonImage` has **no `parseHTML` rule**, so nothing in a pasted document — least of all an
+  `<img>` — can become one. An image gets in by being uploaded, and only then.
+
 The sanctioned exceptions to the single-file rule (same spirit as the `main.jsx` shims):
 - `lib/supabase.js` — the single Supabase client, built from `VITE_SUPABASE_URL` /
   `VITE_SUPABASE_ANON_KEY` (public anon key; safe in the bundle — RLS is the real boundary).
@@ -142,6 +176,28 @@ The sanctioned exceptions to the single-file rule (same spirit as the `main.jsx`
   trainer. **No markdown library**: it emits a closed token set and the renderer builds React
   elements from it, so unsafe markup is unrepresentable rather than filtered. See "Changing what a
   lesson's INSTRUCTIONS may contain".
+- `src/lib/lessonDocument.js` — the bridge between that stored markdown and the WYSIWYG canvas
+  (pure; the SECOND sanctioned lib→lib import, after `mp4Faststart.js` → `courseVideo.js`).
+  `markdownToDoc()` / `docToMarkdown()` convert both ways against plain ProseMirror-shaped JSON,
+  which is data, not a dependency — so `node --test` covers every rule directly. The editor's
+  document model lives only while a drawer is open; `text_content` keeps storing the same closed
+  subset, so there is **no migration behind the canvas**.
+  ★ **EVERY NORMALIZATION THE SERIALIZER PERFORMS, `normalizeInline` MUST PERFORM TOO.**
+  `blockMarkdown()` serializes a block, re-parses it and checks it still says the same thing, then
+  falls back to a more conservative rendering. That check cannot tell a CORRECT normalization from
+  corruption, so one the model does not know about sends the block to the literal tier — which
+  **drops the link or the bold it was trying to protect**. **FIVE** live there for that reason: a
+  refused href loses its mark, `]` cannot survive inside a label, an unbalanced parenthesis is
+  percent-encoded, a trailing `*` is peeled out of a bold run, and — added after code review found
+  it missing — **a newline inside a text node collapses to a space**, which `escapeText()` was doing
+  unilaterally. Measured: a bold run containing `"a\nb"` beside a link serialized to `"a b and link"`,
+  losing **both** marks, where the same content without the newline kept both. `bare` is excluded
+  from the comparison key — it is a rendering hint, not content.
+  ★ **`docToMarkdown` NORMALIZES FIRST, so several guards are a deliberate second line** and a
+  mutation of them survives by design: the write-time href check (canonMarks already applied it),
+  `boldWrap`'s peel, and the three `uploadingImage` exclusions. The last is unbreakable by removal
+  at all — an atom with no content has nothing to emit — so the test that guards it scans the
+  serializer for `uploadKey` instead. See "Changing what a lesson's INSTRUCTIONS may contain".
 - `src/lib/coursePlayerLayout.js` — the lesson-page track arithmetic (pure): rail bounds,
   the derived two-pane threshold, the drag clamp, and the persisted layout shape. See
   "Course lesson workspace" below.
@@ -314,8 +370,10 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
   failure no longer reflows the page. The stage caps its **WIDTH** at `min(78vh,900px)*16/9` —
   capping `max-height` on a `aspect-ratio: 16/9` box leaves it full-width and pillarboxes the
   video, which is exactly the bug the old clamp would have caused.
-  ★ **Text lessons never get the black frame** (`lessonUsesMediaStage`), and `renderVideo`'s
-  second caller — the admin `max-w-md` lesson-editor preview — stays width-bounded.
+  ★ **Text lessons never get the black frame** (`lessonUsesMediaStage`, derived INSIDE `LessonCard`
+  so the learner page and the student preview cannot answer it differently), and `LessonStage`'s
+  other caller — the admin `max-w-md` lesson-editor preview, which keeps `adminView` — stays
+  width-bounded.
   ★ **The rail's sticky offset is MEASURED, not assumed.** `showHead` is false on a lesson page,
   but `InterviewPrep` renders its OWN sticky `SectionHead` (~200px) above the embedded catalog,
   and `container-type`'s containment means no z-index can lift the rail out from under it. The
@@ -336,6 +394,78 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
   recording pages send `X-Frame-Options`. A value that is invalid *in the database* (hand-edited row)
   never becomes a clickable `href`: learners see nothing, admins see a warning strip. The column has
   **no CHECK and no index** by design, so that module is the **only** enforcement point.
+- **Student preview (pre-save).** The lesson editor's footer carries **"Preview as student"**, which
+  shows the WHOLE student lesson page for the **unsaved draft** — media stage, title, duration,
+  formatted instructions with images, the Zoom replay card and the completion controls — so a
+  creator can judge the finished thing before saving. It is **not** the retired instructions-only
+  Edit/Preview toggle.
+  ★ **ONE RENDERER, TWO CALLERS.** The learner page and the preview both render the module-scope
+  **`LessonCard`** (→ `LessonStage`), placed after `LessonReplayLink`. A preview that drifts from
+  the real student view is worse than none, because the creator has started trusting it — so there
+  is no second copy to drift from. `uiSafety` pins `<LessonCard` at exactly **2** render sites.
+  ★ **`adminView`, NOT `isAdmin`, and the rename IS the safety.** It means "render the admin-only
+  diagnostics", never "the viewer has admin rights" — in the preview those are OPPOSITE. It
+  defaults to `false`, so a forgotten prop fails closed to the student render, and the preview
+  passes a **literal** `adminView={false}`.
+  ★ **Both components are MODULE SCOPE, and that is not a style choice.** Declared inside
+  `CourseProgram` they would be a new type every render, so React would unmount the subtree —
+  `SignedLessonVideo` re-signs and `<video>` returns to 0:00. `CourseProgram` re-renders on every
+  progress tick, rail resize and notice, so a student's lesson would restart at random moments.
+  ★ **ONE DRAWER, TWO FACES — never a second overlay.** `SidePanel` registers a **window-level**
+  keydown handler. Measured in Chrome with a full-screen preview portalled above the still-mounted
+  drawer: **Escape dismissed the lesson editor outright** (popping its discard confirm) and one Tab
+  landed on the drawer's hidden "Close lesson editor" button *behind* the preview. So preview mode
+  switches the SAME `SidePanel`'s title/icon/footer and remaps `onClose`, making Escape, the X and
+  the backdrop all mean **"back to editing"**. Never portal a preview above the z-[70] drawer.
+  ★ **The editor body is `hidden`, NEVER unmounted** (`<div hidden={lessonPreview}>`). ProseMirror's
+  undo history lives in the editor INSTANCE, so an earlier version that returned a different
+  `SidePanel` silently threw it away — preview, go back, Ctrl+Z, nothing happened — while a comment
+  claimed the opposite. Caught in the browser, not by reading. Hiding also keeps an in-flight video
+  upload alive. (`SidePanel`'s Tab query still *matches* hidden nodes — `querySelectorAll` does not
+  care — but the browser skips them, and the footer and header always supply the trap's endpoints.)
+  ★ **THE ONE EXCEPTION IS THE DRAWER'S OWN `max-w-md` PLAYER, which is UNMOUNTED** while previewing.
+  Hiding is right for the canvas and wrong for a player: a hidden `<video>` is still a mounted
+  `SignedLessonVideo`, so preview mode would hold **two** signed URLs and two `preload="metadata"`
+  players for one lesson — and `display:none` does not pause media, so a video the admin had started
+  there would keep talking underneath the student preview. It is a leaf with no state worth carrying,
+  and it re-signs on return. Found in code review, which noticed this was the exact cost option B was
+  chosen over A and C to avoid.
+  ★ **A REFUSED SAVE IS NEVER SILENT — `refuseSave()` LEAVES PREVIEW MODE FIRST.** Save sits in the
+  preview's own footer, but the `lessonErr` alert renders only in the EDITING footer and the replay
+  error lives inside the body preview hides. So five reachable refusals (an empty lesson, a refused
+  file pick, an image still uploading, any `validateLessonContent` fault, an invalid replay link)
+  produced **no visible change at all** — press Save, nothing happens. The likeliest of them is a
+  missing image description, which the canvas lets you incur by placing a picture and moving on; and
+  `focusImage()` returns true against the HIDDEN canvas, so even the scroll fallback was suppressed.
+  Every refusal now routes through one helper that exits preview, so the message, the field it names
+  and the canvas the caret lands in are all on screen. Found in code review; pinned by `uiSafety` §25
+  and verified in the browser (message shown, returned to editing, zero lesson writes).
+  ★ **`liveLessonDraft()` is the ONE derivation the save and the preview share.** The canvas reports
+  upward on a 180 ms debounce, so `editingLesson.text_content` lags; if the preview re-derived its
+  own live copy the two could disagree about what the lesson SAYS — the same failure as two
+  renderers, one level down in the data. Its `typeof … && liveMarkdown !== …` guard is load-bearing,
+  not an optimization: with no canvas (a pre-#65 database, or legacy prose on the plain field) the
+  ref is null, and without it merely OPENING such a lesson would stamp `content_format:'markdown'`
+  on it. The Preview button `flush()`es the canvas first.
+  ★ **The preview subtree is `inert=""`** (never `inert={true}` — React 18.3 warns). A draft carries
+  a **real lesson id**, so one stray "Mark complete" would write `lesson_progress` through
+  `complete_course_lesson` and fan a progress event out to the dashboards. `INERT_LESSON_ACTIONS` is
+  **nulls, not no-ops** — a no-op is a live call site someone later "fixes" by wiring the real
+  handler in. `inert` also removes the subtree from the a11y tree, which matters concretely: the
+  media stage renders `role="status"` while signing and `role="alert"` on failure, and a preview
+  must not announce an alert into someone's editing session. `uiSafety` counts `markComplete(` at
+  exactly **3** file-wide (the declaration, its one binding, and the unrelated feature-guide one).
+  ★ **`LESSON_PREVIEW_MAX_W = 598` IS MEASURED, AND ITS DIRECTION IS THE POINT.** On the live
+  learner page the same lesson is **356px** wide on a phone, **598px** at 1280, **700px** at 1440,
+  **718px** at 768 and **1180px** at 1920 — there is no single "student width", so the preview can
+  only choose which way to be wrong, and the two directions are not symmetric. Too WIDE lets a
+  creator approve a line that wraps badly for the student; too NARROW only shows wrapping the
+  student will not hit. Capping at the narrowest common desktop width makes it exact at 1280 and
+  at-or-under everywhere else (verified: 596px desktop, 339px at 390). Uncapped in the drawer it
+  measured **845px — 41% wider than a 1280 student**.
+  ★ **Preview is deliberately NOT disabled while the lesson cannot be saved** (mid-upload, missing
+  alt text, a refused pick). It is a preview, not a save, and that state is part of what the creator
+  wants to look at. Only Save is gated.
 - **In-app delete = data cleanup (reference-aware):** `CourseCatalog.deleteCourse()` deletes the row
   (FK cascade clears modules/lessons/progress/completions) then calls the module-level
   `removeMediaIfUnreferenced()` to purge the course's storage files **only when no other course still
@@ -395,7 +525,8 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
   **open** three ways, ignored `courses.published`, and mis-authorized duplicated courses (which
   share a `storage_path` by reference, so a duplicate's video lives in the SOURCE course's
   folder). It is dropped by #44.
-  ★ **TEMPORARY:** `renderVideo` still plays pre-#44 link lessons from one clearly-marked block,
+  ★ **TEMPORARY:** `LessonStage` (the module-scope component `renderVideo` became) still plays
+  pre-#44 link lessons from one clearly-marked block,
   because on 2026-08-24 **101 of 102 live video lessons were YouTube links across three published
   courses**. Authoring and playback were split deliberately so nothing went dark. **Removal
   criterion: `npm run media:audit` reports 0 external links** — then delete the block.
@@ -2935,6 +3066,24 @@ docs **in the same change**:
   added to `COURSE_LESSON_SELECT_LEGACY` — that constant is a frozen pre-#37b snapshot, and making
   the two lists identical means the narrow-and-retry re-fails and the whole fallback silently stops
   working. The chain is now three deep: full → `COURSE_LESSON_SELECT_PRE_RICH` (#65) → legacy.
+  ★ And it will appear in the **student preview** for free, because the preview renders the same
+  `LessonCard` the learner page does — but only if it reaches `liveLessonDraft()`'s output. A column
+  the editor holds in some other state is invisible there.
+- **Changing what a STUDENT sees on a lesson page** → there is exactly ONE renderer, and the whole
+  point is that it stays one: `LessonCard` / `LessonStage` (module scope, after `LessonReplayLink`)
+  ↔ the learner page's render ↔ `renderLessonPreviewBody()` ↔ `test/uiSafety.test.mjs` §25. A
+  preview that drifts from the real student view is worse than no preview, because the creator has
+  started trusting it — so never add a second render site, and never let the preview pass anything
+  but a literal `adminView={false}`, `done={false}` and `INERT_LESSON_ACTIONS`. **There is no SQL
+  half**: the preview renders a draft the creator already holds, through signing paths that already
+  work for them, so nothing about storage, RLS or entitlements changes.
+  ★ **The width cap (`LESSON_PREVIEW_MAX_W`) is a MEASUREMENT, not a taste call** — re-measure the
+  live learner page before changing it, and keep it at or below the narrowest common desktop
+  student width. See the "Student preview" bullet in the Course platform section for the numbers
+  and for why erring narrow is the safe direction.
+  ★ **Never make the preview a second overlay**, and never unmount the editor body to show it —
+  both were tried, both failed in the browser (Escape dismissed the lesson editor; Ctrl+Z stopped
+  undoing). Same bullet has the detail.
 - **Changing what a lesson's INSTRUCTIONS may contain** → the rules live in ONE pure module and are
   mirrored in SQL. Move together: [src/lib/lessonContent.js](src/lib/lessonContent.js) ↔
   `course_lesson_sync_assets()` / `course_lesson_asset_readable()` / `course_lesson_asset_course_id()`
@@ -2943,6 +3092,41 @@ docs **in the same change**:
   `renderLessonComposer` in BookkeeperPro.jsx ↔ `test/lessonContent.test.mjs` +
   `test/lessonContentSql.test.mjs` + `test-db/courseLessonAssets.dbtest.mjs` ↔ the `#65` block in
   `scripts/audit-db.mjs`.
+  ★ **AND SINCE THE CANVAS, THREE MORE MOVE WITH THEM:**
+  [src/lib/lessonDocument.js](src/lib/lessonDocument.js) (both directions, plus the matching
+  normalization — see its entry above) ↔ the schema in
+  [src/editor/LessonDocumentEditor.jsx](src/editor/LessonDocumentEditor.jsx)
+  (`LESSON_DOC_NODES` / `LESSON_DOC_MARKS` are the allowlist the schema is built from) ↔
+  `test/lessonDocument.test.mjs` + `test/uiSafety.test.mjs` §23–§24.
+  ★ **A TOOLBAR CONTROL THAT CANNOT SURVIVE A SAVE MUST NOT EXIST.** Adding italic — or any other
+  mark — means changing SIX things together: the closed parser, `lessonDocument.js`'s converter,
+  the student renderer, `lessonContentToPlainText`, `validateLessonContent`, and the tests. Until
+  all six know about it, the button would write something the next save silently deletes.
+  ★ **UNDO/REDO ARE `aria-disabled`, NEVER `disabled`** (`softDisabled` on `ToolButton`). A browser
+  blurs a focused element the instant it becomes disabled, so pressing Redo until the stack emptied
+  dropped focus to `<body>` — inside an `aria-modal` dialog, where `SidePanel`'s Tab trap cannot
+  recover it (it only acts when the active element is first, last or the panel), so Tab then walked
+  the page behind the scrim. Verbatim the sidebar Move up/Move down defect. Real `disabled` stays
+  correct for the whole-toolbar case, which is driven by a save rather than by the button under the
+  user's finger. `aria-disabled` needs its own CSS — `:disabled` no longer matches these two.
+  ★ **A HARD BREAK INSIDE A LIST ITEM BECOMES A SPACE, NEVER NOTHING** (`flattenBreaksToSpaces`, at
+  both the parse and serialize sites). An item is ONE line in the stored grammar, so the break cannot
+  survive — but dropping it GLUED TWO WORDS TOGETHER: Shift+Enter is an ordinary gesture (HardBreak
+  binds it, ListItem does not override it), the canvas kept showing two lines because normalization
+  happens at serialize time, and the student read *"open the formthen bold word"*. The round-trip net
+  is structurally blind to it — it compares against the already-normalized model, so both sides
+  agreed on the corrupted text. Found in code review and reproduced on the live converter.
+  ★ **THE EDITOR SCHEMA IS NOT DERIVED FROM `LESSON_DOC_NODES`/`LESSON_DOC_MARKS`** — the docblock
+  used to say it was, and nothing performed it. They are two independent allowlists (ProseMirror's
+  schema, and this converter ignoring what it does not recognise), which is safe only while they
+  agree, so `uiSafety` §24 now checks each name against the extension that declares it in BOTH
+  directions. A comment that claims an enforcement nobody performs is the failure this file keeps
+  recording; this is the third instance in one change.
+  ★ **THE PLAIN FIELD STAYS FOR TWO CASES, AND BOTH ARE LOAD-BEARING.** A database without #65
+  (`preRich`) and legacy prose that has not been converted (`needsFormatOptIn`, which reads the
+  SAVED row) never open in the canvas — the canvas serializes to markdown, so touching a key in one
+  would escape its metacharacters and flip `content_format`, converting a lesson by looking at it.
+  `usesCanvas = !preRich && !needsFormatOptIn` is where that is decided.
   ★ **NO FUNCTION IN THAT MODULE MAY DEFAULT ITS `format` PARAMETER, and the scar is recent.**
   Five exports were written `format = 'markdown'`. A JS default fires on `undefined`, which is
   exactly what a row carries when the column is absent — on a database without #65, and on a lesson

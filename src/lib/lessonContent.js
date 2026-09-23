@@ -95,11 +95,30 @@ const UUID_RE = new RegExp(`^${UUID_SRC}$`);
  */
 export const LESSON_ASSET_TOKEN_SRC = `!\\[([^\\]\\n]*)\\]\\(lesson-asset://(${UUID_SRC})\\)`;
 
-/** Characters a backslash may escape. Kept minimal: every one of these starts a token. */
-const ESCAPABLE = '\\*[]!-.';
+/**
+ * Characters a backslash may escape. Kept minimal: every one of these starts a token.
+ *
+ * ★ `)` IS HERE FOR THE POSITIONAL RULE BELOW, AND IT WAS MISSING.
+ *   escapeMarkdown already wrote `1\)` to stop `1) Step one` becoming a list — but `)`
+ *   was not escapable, so parseInline never consumed that backslash and the creator read
+ *   `1\) Step one` back. Like `-` and `.`, it is escapable by POSITION only: the
+ *   character loop skips it, so ordinary prose full of brackets does not turn into
+ *   backslash soup.
+ */
+const ESCAPABLE = '\\*[]!-.)';
+/** The three ESCAPABLE characters the character loop leaves alone; see escapeMarkdown. */
+const POSITIONAL_ONLY = '-.)';
 
-/** Bare URLs we auto-link, matching the community feed's long-standing behaviour. */
-const BARE_URL_RE = /https?:\/\/[^\s<>"')\]]+/i;
+/**
+ * Bare URLs we auto-link, matching the community feed's long-standing behaviour.
+ *
+ * ★ EXPORTED so src/lib/lessonDocument.js can replay this exact match when deciding
+ *   whether a bare URL may be written back AS a bare URL. A copy over there would be a
+ *   second reading of the same thing — the failure mode this whole module exists to
+ *   avoid — and the character class is greedy, so a wrong reading silently changes a
+ *   destination rather than failing.
+ */
+export const BARE_URL_RE = /https?:\/\/[^\s<>"')\]]+/i;
 
 const isStr = (v) => typeof v === 'string';
 
@@ -198,16 +217,21 @@ export function escapeMarkdown(text) {
   if (!isStr(text)) return '';
   return text.split('\n').map((line) => {
     let out = '';
-    for (const ch of line) out += ESCAPABLE.includes(ch) && ch !== '-' && ch !== '.' ? `\\${ch}` : ch;
+    for (const ch of line) out += ESCAPABLE.includes(ch) && !POSITIONAL_ONLY.includes(ch) ? `\\${ch}` : ch;
     // Only a LEADING "- " or "1. " makes a list, so those two are escaped by position
     // rather than everywhere — escaping every hyphen would turn ordinary prose into
     // backslash soup the creator then has to read.
     // No `* ` rule here: the character loop above already escaped every `*`, so no line
     // can still begin with a bare one. A rule for it would be dead code that reads like
     // a guarantee.
+    // ★ THE SEPARATOR IS \s, NOT A LITERAL SPACE, AND THAT WAS A REAL DEFECT.
+    //   UL_RE and OL_RE accept `\s+`, but these two rules required a space — so `-\tx`
+    //   escaped to itself and then parsed as a LIST, and the converted lesson silently
+    //   lost its hyphen. That breaks this module's headline promise that converting a
+    //   plain lesson does not change what it looks like.
     return out
-      .replace(/^(\s*)- /, '$1\\- ')
-      .replace(/^(\s*)(\d+)([.)]) /, '$1$2\\$3 ');
+      .replace(/^(\s*)-(\s)/, '$1\\-$2')
+      .replace(/^(\s*)(\d+)([.)])(\s)/, '$1$2\\$3$4');
   }).join('\n');
 }
 
@@ -237,11 +261,17 @@ export function sanitizeCaption(value) {
 }
 
 /** Build one image token. Returns '' when the inputs cannot make a valid one. */
-export function buildAssetToken(assetId, altText) {
+export function buildAssetToken(assetId, altText, { requireAlt = true } = {}) {
   const id = isStr(assetId) ? assetId.trim().toLowerCase() : '';
   if (!UUID_RE.test(id)) return '';
   const alt = sanitizeAltText(altText);
-  if (!alt) return '';
+  // ★ requireAlt STAYS TRUE FOR THE COMPOSER: an image with no description is never
+  //   INSERTED into a lesson. A serializer needs the other answer, because an alt-less
+  //   image ALREADY in a document has to be written back — otherwise the picture
+  //   disappears on the next save AND the IMAGE_ALT_REQUIRED that would have told the
+  //   creator disappears with it. Declining to write it is not a refusal; it is a
+  //   silent deletion of somebody's screenshot.
+  if (requireAlt && !alt) return '';
   return `![${alt}](${LESSON_ASSET_SCHEME}${id})`;
 }
 
@@ -282,7 +312,22 @@ const closingParen = (src, open) => {
   return -1;
 };
 
-const imageAt = (src, i) => {
+/**
+ * ★ `withSource` IS OPT-IN, AND THAT IS THE WHOLE POINT.
+ *
+ * The parse that the RENDERER, `validateLessonContent` and the AI trainer see is
+ * unchanged: a refused remote target still does not survive anywhere in it, which
+ * `test/lessonContent.test.mjs` asserts by stringifying the whole document and looking
+ * for the attacker's host. Recording it unconditionally would break that, and would put
+ * a third party's URL into the trainer's neighbourhood for no gain.
+ *
+ * Only `src/lib/lessonDocument.js` asks for the source bytes, and the only thing it does
+ * with them is write them back out unchanged, so that a document the editor cannot
+ * REPRESENT is still a document the editor cannot silently REWRITE. It never becomes an
+ * href and never becomes an <img src>: a lesson containing one of these cannot be saved
+ * at all — `validateLessonContent` refuses it.
+ */
+const imageAt = (src, i, withSource) => {
   if (src[i] !== '!' || src[i + 1] !== '[') return null;
   const close = src.indexOf(']', i + 2);
   if (close === -1 || src[close + 1] !== '(') return null;
@@ -299,9 +344,10 @@ const imageAt = (src, i) => {
   //   orphan sweep would then delete its bytes while the lesson still displayed it, and
   //   course_lesson_asset_delete would raise no LESSON_ASSET_IN_USE. Of the two possible
   //   disagreements that is the unsafe one, so the three parsers agree exactly.
+  const source = withSource ? { raw: src.slice(i, next) } : null;
   if (target.startsWith(LESSON_ASSET_SCHEME)) {
     const id = target.slice(LESSON_ASSET_SCHEME.length);
-    if (!UUID_RE.test(id)) return { token: { type: 'badimage', alt, reason: 'bad-id' }, next };
+    if (!UUID_RE.test(id)) return { token: { type: 'badimage', alt, reason: 'bad-id', ...source }, next };
     return { token: { type: 'image', assetId: id.toLowerCase(), alt: alt.trim() }, next };
   }
   // ★ A REMOTE IMAGE IS NEVER RENDERED, NOT EVEN AS A BROKEN ONE.
@@ -309,10 +355,10 @@ const imageAt = (src, i) => {
   //   handing that server each student's IP, referrer and viewing time. Pasting rich
   //   HTML from a web page is the common way this arrives, so the creator is told to
   //   download the image and upload it instead.
-  return { token: { type: 'badimage', alt, reason: 'remote' }, next };
+  return { token: { type: 'badimage', alt, reason: 'remote', ...source }, next };
 };
 
-const linkAt = (src, i, depth) => {
+const linkAt = (src, i, depth, withSource) => {
   if (src[i] !== '[') return null;
   const close = src.indexOf(']', i + 1);
   if (close === -1 || src[close + 1] !== '(') return null;
@@ -328,17 +374,25 @@ const linkAt = (src, i, depth) => {
   //   reader to example.com, silently ignoring the destination the author chose. Same
   //   class of fault as the unbalanced-parenthesis one: the link works, and goes
   //   somewhere else. Inside a label, a bare URL stays text.
-  const tokens = parseInline(label, depth + 1, true);
+  const tokens = parseInline(label, depth + 1, true, withSource);
   const next = end + 1;
   // An invalid target keeps the LABEL as readable text and carries no href at all —
   // the rule safeLinkHref() established: never emit a "safe-looking" fallback URL.
   if (verdict.kind === 'none' || verdict.kind === 'invalid') {
-    return { token: { type: 'badlink', tokens, reason: verdict.reason || 'empty' }, next };
+    return {
+      token: {
+        type: 'badlink', tokens, reason: verdict.reason || 'empty',
+        ...(withSource ? { raw: src.slice(i, next) } : null),
+      },
+      next,
+    };
   }
   return { token: { type: 'link', href: verdict.href, host: verdict.host, kind: verdict.kind, tokens }, next };
 };
 
-function parseInline(src, depth = 0, inLink = false) {
+// `withSource` defaults to false — the safe value, the same direction normalizeFormat
+// fails in. A caller that does not ask gets exactly the tokens it got before.
+function parseInline(src, depth = 0, inLink = false, withSource = false) {
   const out = [];
   let buf = '';
   let i = 0;
@@ -355,16 +409,16 @@ function parseInline(src, depth = 0, inLink = false) {
       if (close > i + 2) {
         flush();
         // Bold inside a label is fine; it carries inLink so a URL in it stays text.
-        out.push({ type: 'bold', tokens: parseInline(src.slice(i + 2, close), depth + 1, inLink) });
+        out.push({ type: 'bold', tokens: parseInline(src.slice(i + 2, close), depth + 1, inLink, withSource) });
         i = close + 2; continue;
       }
     }
     if (ch === '!') {
-      const img = imageAt(src, i);
+      const img = imageAt(src, i, withSource);
       if (img) { flush(); out.push(img.token); i = img.next; continue; }
     }
     if (ch === '[' && depth < 3 && !inLink) {
-      const lnk = linkAt(src, i, depth);
+      const lnk = linkAt(src, i, depth, withSource);
       if (lnk) { flush(); out.push(lnk.token); i = lnk.next; continue; }
     }
     if ((ch === 'h' || ch === 'H') && depth < 3 && !inLink) {
@@ -399,7 +453,7 @@ const OL_RE = /^(\s*)(\d+)[.)]\s+(.*)$/;
  * `plain` is not parsed at all: it returns one paragraph of literal text per line group,
  * which is byte-for-byte what `whitespace-pre-line` rendered before this module existed.
  */
-export function parseLessonContent(text, format) {
+export function parseLessonContent(text, format, { withSource = false } = {}) {
   const src = isStr(text) ? text.replace(/\r\n?/g, '\n') : '';
   if (!src.trim()) return [];
   if (normalizeFormat(format) === 'plain') {
@@ -418,7 +472,7 @@ export function parseLessonContent(text, format) {
     const joined = para.join('\n');
 
     const rows = para.map((line) => {
-      const toks = parseInline(line);
+      const toks = parseInline(line, 0, false, withSource);
       const m = CAPTION_RE.exec(line);
       const meaningful = meaningfulOf(toks);
       // A caption may not carry an image token: it would render inside the figcaption
@@ -445,7 +499,7 @@ export function parseLessonContent(text, format) {
       let pending = null;
       rows.forEach((r) => {
         if (r.caption) {
-          if (pending) pending.caption = parseInline(r.caption);
+          if (pending) pending.caption = parseInline(r.caption, 0, false, withSource);
           return;
         }
         r.meaningful.forEach((t) => {
@@ -478,7 +532,7 @@ export function parseLessonContent(text, format) {
       flushPara();
       const ordered = !!ol;
       if (!list || list.ordered !== ordered) { flushList(); list = { type: 'list', ordered, items: [] }; }
-      list.items.push(parseInline((ul ? ul[2] : ol[3])));
+      list.items.push(parseInline((ul ? ul[2] : ol[3]), 0, false, withSource));
       continue;
     }
     flushList();
@@ -641,20 +695,37 @@ export function validateLessonContent(text, format, { required = false } = {}) {
 // Plain-text projection (the AI trainer's view)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const inlineToText = (tokens) => (tokens || []).map((t) => {
-  switch (t.type) {
-    case 'text': return t.value;
-    case 'break': return '\n';
-    case 'bold': return inlineToText(t.tokens);
-    // A link reads as its LABEL. The agent is speaking, not clicking — reading a URL
-    // aloud is noise, and the label is the thing the creator wrote for a human.
-    case 'link': return t.bare ? (t.host || '') : inlineToText(t.tokens);
-    case 'badlink': return inlineToText(t.tokens);
-    case 'image': return t.alt ? `Image: ${t.alt}` : '';
-    case 'badimage': return t.alt ? `Image: ${t.alt}` : '';
-    default: return '';
-  }
-}).join('');
+/**
+ * Flatten inline tokens to prose.
+ *
+ * ★ `bareLinkAs` EXISTS BECAUSE THE DEFAULT SILENTLY REWRITES A CAPTION.
+ *   A bare URL reads as its HOST for the AI trainer, and that is right there — the agent
+ *   is speaking, not clicking, and ninety characters of query string is noise. But a
+ *   caption is a plain-text ATTRIBUTE the editor reads back and writes out again, so the
+ *   same rule turns `see https://forms.gle/abc123 for the form` into
+ *   `see forms.gle for the form` — permanently, on the creator's next save, with nothing
+ *   on screen to say it happened. `bareLinkAs: 'text'` keeps the words.
+ *   The default is unchanged, so `lessonContentToPlainText` is byte-identical and no
+ *   lesson is re-hashed or re-embedded for this.
+ */
+export function inlineToText(tokens, { bareLinkAs = 'host' } = {}) {
+  const opts = { bareLinkAs };
+  return (tokens || []).map((t) => {
+    switch (t.type) {
+      case 'text': return t.value;
+      case 'break': return '\n';
+      case 'bold': return inlineToText(t.tokens, opts);
+      // A link reads as its LABEL. The agent is speaking, not clicking — reading a URL
+      // aloud is noise, and the label is the thing the creator wrote for a human.
+      case 'link':
+        return t.bare && bareLinkAs !== 'text' ? (t.host || '') : inlineToText(t.tokens, opts);
+      case 'badlink': return inlineToText(t.tokens, opts);
+      case 'image': return t.alt ? `Image: ${t.alt}` : '';
+      case 'badimage': return t.alt ? `Image: ${t.alt}` : '';
+      default: return '';
+    }
+  }).join('');
+}
 
 /**
  * The document as prose, for the AI course trainer's knowledge index.

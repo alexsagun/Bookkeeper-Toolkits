@@ -552,7 +552,11 @@ test('all three SignedLessonVideo states share one media stage frame', () => {
   const src = app();
   const i = src.indexOf('function SignedLessonVideo');
   assert.ok(i > 0, 'SignedLessonVideo was not found');
-  const body = src.slice(i, src.indexOf('\nfunction resumableUploadEndpoint', i));
+  // ★ THE WINDOW IS THE NEXT TOP-LEVEL FUNCTION, WHATEVER IT IS. Naming
+  //   resumableUploadEndpoint made this a tripwire for anything dropped in between:
+  //   LessonStage alone holds four `course-stage` wrappers, so landing it in that range
+  //   would count 7 and fail with a message about a defect that had not happened.
+  const body = src.slice(i, src.indexOf('\nfunction ', i + 1));
   assert.equal((body.match(/className="course-stage"/g) || []).length, 3,
     'error, signing and ready must each return the SAME .course-stage wrapper — otherwise '
     + 'a signing failure resizes the page under the learner, as it did before');
@@ -565,14 +569,19 @@ test('all three SignedLessonVideo states share one media stage frame', () => {
 
 test('a text lesson never gets the black video frame', () => {
   const src = app();
-  const i = src.indexOf('function renderVideo(lesson)');
-  assert.ok(i > 0, 'renderVideo was not found');
+  const i = src.indexOf('function LessonStage({ lesson, adminView = false })');
+  assert.ok(i > 0, 'LessonStage was not found');
   const textBranch = src.slice(i, src.indexOf("video_provider === 'upload'", i));
   assert.ok(!/course-stage/.test(textBranch),
     'the type === "text" branch must not render a media stage — its prose and its '
     + '"No content yet." card would sit in a black video box');
-  assert.ok(/lessonUsesMediaStage\(activeLesson\)/.test(src),
-    'renderLearner must gate the full-bleed stage slot on lessonUsesMediaStage');
+  // ★ THE GATE IS DERIVED IN THE SHARED CARD, so the student page and the editor's
+  //   preview cannot answer it differently. It used to be computed in renderLearner,
+  //   where a second caller would have needed its own copy.
+  assert.match(lessonCard(), /const stageLesson = lessonUsesMediaStage\(lesson\);/,
+    'the full-bleed gate belongs to LessonCard, once');
+  assert.ok(!/lessonUsesMediaStage/.test(fnBody(src, 'function renderLearner() {')),
+    'and renderLearner must not keep a second copy of it');
 });
 
 // Only a TWO-PANE WORKSPACE gets the wide canvas, and each member had to earn it with a
@@ -767,10 +776,12 @@ test('★ a refused pick can never save silently', () => {
   const body = fnBody(src, 'async function saveLesson(');
   // Anchored on `if (` and the whole arm, so a `false &&` or an inverted test cannot
   // leave the condition text in place while disabling it.
-  const guard = /if \(videoUploadState === UPLOAD_STATES\.UNSUPPORTED_FILE && !d\.storage_path\) \{\s*setLessonErr\([\s\S]{0,400}?return;\s*\}/
+  // refuseSave(), not setLessonErr(): the message alone is invisible when Save was pressed
+  // from the student preview, so every refusal leaves preview mode on its way out.
+  const guard = /if \(videoUploadState === UPLOAD_STATES\.UNSUPPORTED_FILE && !d\.storage_path\) \{\s*refuseSave\([\s\S]{0,400}?return;\s*\}/
     .exec(body);
   assert.ok(guard,
-    'saving a lesson whose only picked file was refused must set lessonErr and RETURN, '
+    'saving a lesson whose only picked file was refused must refuseSave() and RETURN, '
     + 'not no-op: the drawer used to close on an unchanged, still-un-publishable lesson '
     + 'with no error anywhere, which is indistinguishable from "the upload is broken"');
   const lib = readFileSync(join(REPO, 'src/lib/courseVideo.js'), 'utf8');
@@ -1216,13 +1227,67 @@ const composer = () => {
   return src.slice(i, src.indexOf('\n  function renderLessonEditor(', i));
 };
 
-test('an image cannot be placed in a lesson without a description', () => {
+/** The WYSIWYG canvas. Its own module, and deliberately not part of the monolith. */
+const editor = () => readFileSync(join(REPO, 'src/editor/LessonDocumentEditor.jsx'), 'utf8');
+
+/** The pure markdown↔document converter the canvas serializes through. */
+const lessonDoc = () => readFileSync(join(REPO, 'src/lib/lessonDocument.js'), 'utf8');
+
+/**
+ * The ONE student lesson renderer, shared by the learner page and the editor's preview.
+ *
+ * The window runs to the next top-level function, so it can never be short — the old
+ * learner-order test sliced a fixed 1400 characters and "Mark complete" sat past the end,
+ * which made its last assertion pass on an indexOf of -1 rather than on the order it
+ * claimed to check.
+ */
+const lessonCard = () => {
   const src = app();
-  const insert = fnBody(src, 'const insertLessonImage = (entry) => {');
-  assert.match(insert, /if \(!entry\.assetId \|\| !alt\) return;/,
-    'alt text is required BEFORE placement — a description added later is one never added');
-  assert.match(composer(), /disabled=\{!\(im\.alt \|\| ''\)\.trim\(\)\}/,
-    'and the button must say so rather than failing on save');
+  const i = src.indexOf('function LessonCard({');
+  assert.ok(i > 0, 'LessonCard was not found');
+  return src.slice(i, src.indexOf('\nfunction ', i + 1));
+};
+
+/**
+ * Executable source only.
+ *
+ * ★ ASSERT AGAINST CODE, NEVER AGAINST "THIS STRING APPEARS NOWHERE IN THE FILE". That
+ *   shape is defeated by the comment that EXPLAINS the invariant — a docblock reading
+ *   "there is no Supabase import here and there must never be one" fails a naive scan for
+ *   `supabase`, and the tempting fix is deleting the sentence that documents the rule.
+ *   The same idiom as jsCode() in test/lessonContentSql.test.mjs.
+ */
+const jsCode = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+
+test('a description is demanded the moment an image lands, and blocks the save', () => {
+  // ★ THE RULE SURVIVED THE REWRITE; ITS MECHANISM HAD TO CHANGE. It used to be "an image
+  //   cannot be PLACED without a description" — which only worked because placement was a
+  //   separate button press on a card below the box. The picture now appears at the caret
+  //   the instant the upload finishes, which is the whole point, so "before placement" no
+  //   longer exists as a moment. The same intent is kept by three things together.
+  const ed = editor();
+  // 1. The panel opens by itself on a new image — but does NOT steal the caret.
+  assert.match(ed, /setPanel\('alt'\);\s*\n\s*setFocusPanel\(!busy\);/,
+    'a description asked for later is a description never written — so it always OPENS');
+  assert.match(ed, /announced\.current === assetId/,
+    'and it fires once per image, not on every render');
+  // ★ AN IMAGE BECOMES REAL WHEN ITS UPLOAD FINISHES — seconds after the creator moved on.
+  //   Focusing unconditionally there yanked the caret mid-sentence and the rest of the
+  //   sentence went into the alt field; with several images pasted at once, each
+  //   completion stole it again. WCAG 3.2.2: focus must not move on something the user did
+  //   not initiate. A panel the creator OPENS does take focus — that is togglePanel.
+  assert.match(ed, /const busy = \(editor && !editor\.isDestroyed && editor\.isFocused\)/);
+  assert.match(fnBody(ed, 'const togglePanel = (which) => {'), /setFocusPanel\(true\)/,
+    'opening it deliberately is a different act from it opening itself');
+  // 2. It is visible on the picture until it is filled in.
+  assert.match(ed, /needsAlt \? ' needs-alt' : ''/);
+  assert.match(ed, /Needs description/);
+  assert.match(ed, /const needsAlt = !sanitizeAltText\(alt\)/,
+    'whitespace is not a description — ask the module that owns the rule');
+  // 3. The save still refuses, which is the part that cannot be skipped.
+  const save = fnBody(app(), 'async function saveLesson() {');
+  assert.match(save, /validateLessonContent\(d\.text_content, d\.content_format/,
+    'IMAGE_ALT_REQUIRED is raised there, over the document as it will be stored');
 });
 
 test('a save is blocked while an image is still uploading', () => {
@@ -1270,33 +1335,38 @@ test('deleting a lesson or a course cleans up the images they were the last to s
     'and purged after, so this course has stopped citing them');
 });
 
-test('pasting a remote image is refused, never hot-linked', () => {
-  const paste = fnBody(app(), 'const onLessonPaste = (e) => {');
-  assert.ok(paste.includes('dt.files') && paste.includes('.filter(f =>'),
+test('pasting a remote image is refused, never hot-linked — and the words survive', () => {
+  const ed = editor();
+  const paste = fnBody(ed, 'const handlePaste = useCallback((event) => {');
+  assert.ok(paste.includes('dt.files') && paste.includes('.filter('),
     'only real FILES are taken from the clipboard');
-  assert.ok(paste.includes("getData?.('text/html')") && paste.includes('<img'),
+  assert.ok(paste.includes("getData('text/html')") && paste.includes('<img'),
     'and the HTML flavour is inspected — an image copied from a web page arrives as both');
-  assert.match(paste, /hosted on another website/,
-    'a linked image breaks when that site changes it, and tells that site who is reading');
   assert.ok(!/src\s*=\s*.?https?:/.test(paste), 'no remote URL may ever be adopted');
 
-  // ★ REFUSING THE PICTURE MUST NOT THROW AWAY THE WORDS.
-  //   preventDefault() on its own discarded the WHOLE paste, so copying a paragraph out of a
-  //   web page that happened to contain an inline image lost the prose the creator wanted.
-  assert.ok(paste.includes("getData?.('text/plain')"),
-    'the plain-text flavour must be read, or the prose is discarded with the picture');
-  assert.match(paste, /applyLessonEdit\(\{/,
-    'and inserted at the caret through the normal edit path');
-  // Scoped to the <img> branch on purpose: rememberLessonSelection() is ALSO called in the
-  // files branch above, so an unscoped indexOf() finds that one and the ordering assertion
-  // holds no matter what this branch does. (It survived its own mutation until scoped.)
-  const imgBranch = paste.slice(paste.indexOf('/<img'));
-  assert.ok(imgBranch.indexOf('rememberLessonSelection()') >= 0
-    && imgBranch.indexOf('rememberLessonSelection()') < imgBranch.indexOf("getData?.('text/plain')"),
-    'the caret is captured before the insert, or the text lands wherever it last was');
-  assert.match(paste, /kept\s*$/m, 'the message has to say which of the two happened');
-  assert.match(paste, /The text was pasted/,
+  // ★ FILES FIRST, AND CLAIM THE EVENT. One screenshot is on the clipboard as BOTH a file
+  //   and an HTML fragment, so handling the file without returning true inserts it twice.
+  const filesAt = paste.indexOf('if (files.length)');
+  const htmlAt = paste.indexOf("getData('text/html')");
+  assert.ok(filesAt > 0 && filesAt < htmlAt, 'the file branch must come first');
+  assert.match(paste.slice(filesAt, htmlAt), /event\.preventDefault\(\); addFiles\(files\); return true;/,
+    'claiming the event is what stops the same picture arriving twice');
+
+  // ★ REFUSING THE PICTURE MUST NOT THROW AWAY THE WORDS — and the fix is now structural.
+  //   The old handler called preventDefault() and had to re-insert the plain text by hand.
+  //   The schema has no rule that turns an <img> into anything, so ProseMirror drops it and
+  //   keeps the prose by itself; cancelling the paste would be what discards the paragraph.
+  const htmlBranch = paste.slice(htmlAt);
+  assert.ok(!/preventDefault/.test(htmlBranch),
+    'the <img> branch must NOT cancel the paste, or the prose goes with the picture');
+  assert.match(htmlBranch, /noticeRef\.current\?\.\(REMOTE_IMAGE_NOTICE\)/,
+    'but it must still say what happened');
+  assert.match(ed, /The text was pasted\. The picture in it was not/,
     'saying only "not added" about a paste that DID keep the text is the bug reported');
+  // And the structural half: nothing in a pasted document may become an image node.
+  const imgNode = ed.slice(ed.indexOf("name: 'lessonImage'"), ed.indexOf("name: 'uploadingImage'"));
+  assert.match(imgNode, /parseHTML\(\) \{ return \[\]; \}/,
+    'an image gets into a lesson by being uploaded, and only then');
 });
 
 test('images are resolved in ONE batched signing call per lesson, and refreshed', () => {
@@ -1309,39 +1379,54 @@ test('images are resolved in ONE batched signing call per lesson, and refreshed'
     'a student reading past the hour would otherwise watch every screenshot break');
 });
 
-test('the caret is captured before a toolbar button steals focus', () => {
-  const src = app();
-  assert.match(src, /const rememberLessonSelection = \(\) => \{/);
-  assert.match(composer(), /onSelect=\{rememberLessonSelection\}/,
-    'clicking a toolbar button blurs the textarea, and reading selectionStart after that '
-    + 'returns 0 — which inserts every link at the top of the document');
-  assert.match(composer(), /onKeyDown=\{\(e\) => \{\s*if \(\(e\.metaKey \|\| e\.ctrlKey\)/,
-    'Ctrl/Cmd+K must reach the link bar');
+test('an edit lands where the caret is, and the canvas is never re-seeded under it', () => {
+  // ★ THE OLD HAZARD IS GONE BY CONSTRUCTION, AND A NEW ONE TOOK ITS PLACE. Offsets into a
+  //   markdown string are no longer how anything is inserted — ProseMirror owns the
+  //   selection — so "the caret was captured as 0 and the link went to the top" cannot
+  //   happen. What CAN happen is worse and quieter: re-deriving the document from the prop
+  //   on every render wipes the caret and the undo history while somebody is typing.
+  const ed = editor();
+  assert.match(ed, /const initialDoc = useMemo\(\s*\n\s*\(\) => markdownToDoc\(initialMarkdown, initialFormat\),/,
+    'the document is derived from the prop ONCE');
+  const memo = ed.slice(ed.indexOf('const initialDoc = useMemo('), ed.indexOf('const extensions = useMemo('));
+  assert.match(memo, /\[\],\s*\n\s*\);/, 'with an EMPTY dep array — mount only');
+  assert.match(ed, /useEditor\(\{[\s\S]*?\}, \[\]\);/,
+    'and the editor instance itself is never rebuilt by a dep change');
+  // ★ THE PARENT SUPPLIES IDENTITY, AND IT MUST BE THE LESSON ID ALONE. The key was
+  //   `${d.id}:${fmt}` and `fmt` reads the DRAFT — but a new lesson is selected with
+  //   COURSE_LESSON_SELECT_LEGACY, which carries no content_format, so it mounted as
+  //   'plain' and the FIRST edit set content_format:'markdown'. The key changed, React
+  //   remounted the editor mid-type, focus dropped to <body>, undo history went, and a
+  //   screenshot pasted as the first action was lost with its upload orphaned — a pending
+  //   placeholder serializes to nothing, so even an empty document tripped it.
+  assert.match(composer(), /key=\{d\.id\}/, 'keyed on the lesson, and nothing that changes while editing');
+  const c = composer();
+  assert.ok(!/key=\{`\$\{d\.id\}:/.test(c), 'no draft-derived value may ever enter this key');
+  assert.ok(!/COURSE_LESSON_SELECT_LEGACY.*content_format/.test(app()),
+    'the frozen legacy select still has no content_format — which is why the above matters');
+  // Ctrl/Cmd+K still has to reach the link bar, through a ref so it cannot go stale.
+  assert.match(ed, /'Mod-k': \(\) => \{ handlersRef\.current\?\.openLink\?\.\(\); return true; \}/,
+    'a keyboard shortcut that closes over render-scope state is a shortcut that stops working');
 });
 
-test('closing a composer control without editing returns focus to the textarea', () => {
-  // ★ THE CANCEL PATHS ONLY. Update and Unlink already end in applyLessonEdit, which focuses
-  //   the textarea on a rAF — so this is not about them. Escape, the Cancel button and Remove
-  //   each UNMOUNT the element holding focus (the URL input, or the button itself), and a
-  //   browser then moves focus to <body>: a keyboard user is dropped at the top of the
-  //   document with the drawer still open (WCAG 2.4.3).
-  const src = app();
-  const fn = fnBody(src, 'const returnFocusToLessonBody = () => {');
-  assert.match(fn, /requestAnimationFrame\(/,
-    'the unmount happens in the same commit — focusing before it lands is undone by React');
-  assert.match(fn, /lessonBodyRef\.current/);
-  assert.match(fn, /el\.focus\(\)/);
-  assert.match(fn, /setSelectionRange\(/, 'and the caret goes back where it was');
-
-  const c = composer();
-  assert.match(c, /Escape'\) \{ e\.preventDefault\(\); e\.stopPropagation\(\); setLinkBar\(null\); returnFocusToLessonBody\(\); \}/,
-    'Escape in the link bar');
-  assert.match(c, /onClick=\{\(\) => \{ setLinkBar\(null\); returnFocusToLessonBody\(\); \}\}/,
-    'the Cancel button');
-
-  const rm = fnBody(src, 'const removeLessonImage = async (entry) => {');
-  assert.ok(rm.indexOf('returnFocusToLessonBody()') > rm.indexOf('list.filter(im => im.key !== entry.key)'),
-    'removing an image card unmounts the focused button, so focus is handed back after');
+test('closing a composer control without editing hands focus back to the document', () => {
+  // ★ SAME RULE, NEW SURFACE. Escape and Cancel each UNMOUNT the element holding focus, and
+  //   a browser then moves focus to <body>: a keyboard user is dropped at the top of the
+  //   page with the drawer still open (WCAG 2.4.3). The target used to be the textarea; it
+  //   is the canvas now, and ProseMirror restores its own selection when refocused.
+  const ed = editor();
+  const close = fnBody(ed, 'const closeLink = useCallback((e) => {');
+  assert.match(close, /e\.preventDefault\(\); e\.stopPropagation\(\);/,
+    'see the Escape test below for why stopPropagation is not optional here');
+  assert.match(close, /editor\?\.chain\(\)\.focus\(\)\.run\(\)/,
+    'focus goes back to the document, not to <body>');
+  // Both dismissals route through it rather than each hand-rolling the same two steps.
+  assert.match(ed, /onKeyDown=\{\(e\) => \{ if \(e\.key === 'Escape' && linkBar\) closeLink\(e\); \}\}/);
+  assert.match(ed, /onClick=\{closeLink\} aria-label="Cancel"/);
+  // The image panel is the third such control, and it dismisses the same way.
+  const panelClose = fnBody(ed, 'const closePanel = (e) => {');
+  assert.match(panelClose, /e\.preventDefault\(\); e\.stopPropagation\(\);/,
+    'an image panel inside the canvas must not let Escape reach the drawer either');
 });
 
 test('a database without the migration degrades to plain text with an actionable notice', () => {
@@ -1349,8 +1434,13 @@ test('a database without the migration degrades to plain text with an actionable
   assert.match(c, /const preRich = lessonRowsArePreRichContent\(allLessons\)/);
   assert.match(c, /db\/2026-09-20-course-lesson-assets\.sql/,
     'the notice must name the file to run, not merely say a feature is unavailable');
-  assert.match(c, /onPaste=\{preRich \? undefined : onLessonPaste\}/,
-    'pasting an image into a database that cannot store it must not start an upload');
+  // ★ THE CANVAS IS NOT MOUNTED AT ALL THERE, which is a stronger guarantee than the old
+  //   `onPaste={preRich ? undefined : …}`: there is no surface to paste an image into, so
+  //   no upload can start against a database with nowhere to record it.
+  assert.match(c, /const usesCanvas = !preRich && !needsFormatOptIn;/);
+  assert.match(c, /\{usesCanvas \? \(/, 'the canvas renders only when both are false');
+  const plainBranch = c.slice(c.indexOf('<textarea'));
+  assert.ok(!/onPaste/.test(plainBranch), 'and the plain field takes no image paste at all');
 });
 
 test('the formatting opt-in guards SAVED prose, not what was just typed', () => {
@@ -1375,159 +1465,677 @@ test('students read the instructions below the video and above the replay link',
   // body and above Mark complete"), so the instructions have to land between the title and
   // that card — which is also the reading order a lesson actually has.
   const src = app();
-  const at = src.indexOf("{activeLesson.type === 'video' && activeLesson.text_content && (");
-  assert.ok(at > 0, 'the video-lesson instructions block moved');
-  // Offsets are taken in the FULL source, not a window: "Mark complete" sits a few hundred
-  // characters past the replay card, and a window sized to miss it made the last assertion
-  // pass on -1 rather than on the order it claims to check.
-  const region = src;
-
-  const iStage = region.indexOf('{stageLesson && renderVideo(activeLesson)}', at - 1400);
-  const iTitle = region.indexOf('{activeLesson.title}', iStage);
-  const iBody = region.indexOf('<LessonRichText lesson={activeLesson}', iTitle);
-  const iReplay = region.indexOf('<LessonReplayLink', iBody);
-  const iDone = region.indexOf('Mark complete', iReplay);
+  // The window is the WHOLE card now (lessonCard() runs to the next top-level function),
+  // so it cannot be accidentally short the way a fixed 1400-character slice was.
+  const card = lessonCard();
+  const iStage = card.indexOf('{stageLesson && <LessonStage');
+  const iTitle = card.indexOf('{lesson.title}', iStage);
+  const iBody = card.indexOf('<LessonRichText lesson={lesson}', iTitle);
+  const iReplay = card.indexOf('<LessonReplayLink', iBody);
+  const iDone = card.indexOf('Mark complete', iReplay);
   for (const [name, i] of [['stage', iStage], ['title', iTitle], ['body', iBody],
     ['replay', iReplay], ['done', iDone]]) {
-    assert.ok(i > 0, `${name} not found — the lesson page was restructured`);
+    assert.ok(i > 0, `${name} not found — the lesson card was restructured`);
   }
 
-  assert.ok(iStage >= 0 && iTitle > iStage, 'the media stage comes first, then the title');
+  assert.ok(iTitle > iStage, 'the media stage comes first, then the title');
   assert.ok(iBody > iTitle, 'instructions come after the title');
   assert.ok(iReplay > iBody, 'and BEFORE the Zoom replay card');
   assert.ok(iDone > iReplay, 'which is itself before the completion controls');
+
+  // ★ AND THIS IS NOW THE ONLY ORDER THAT EXISTS. #37b's placement contract lives in
+  //   course_lessons.zoom_replay_url's COMMENT; before the extraction the editor's
+  //   student preview could have shipped a second, silently different one.
+  const renders = (src.match(/<LessonCard\b/g) || []).length;
+  assert.ok(renders >= 1 && renders <= 2,
+    `expected the student page and (once built) the editor preview — found ${renders} renders `
+    + 'of LessonCard. A third is a third place the reading order could differ.');
 });
 
 test('both learner render sites go through the same safe renderer', () => {
   const src = app();
   const uses = (src.match(/<LessonRichText lesson=/g) || []).length;
   assert.ok(uses >= 2, 'a text lesson and a video lesson\'s notes must share one renderer');
+  // ★ A RATCHET THAT CAN NO LONGER FAIL IS NOT A RATCHET. The assertion below used to
+  //   name `activeLesson.text_content` only — and after the card was extracted that
+  //   identifier stopped existing inside it, so the check quietly became unfailable
+  //   while still reading like a guarantee. Police both spellings.
+  for (const id of ['lesson', 'activeLesson']) {
+    assert.ok(!new RegExp(`whitespace-pre-line leading-relaxed text-\\[15px\\]">\\{${id}\\.text_content\\}`).test(src),
+      `the old raw render must be gone, not merely renamed (${id})`);
+  }
   assert.ok(!/whitespace-pre-line leading-relaxed text-\[15px\]">\{lesson\.text_content\}/.test(src),
     'the old raw text-lesson render must be gone, not merely bypassed');
   assert.ok(!/whitespace-pre-line leading-relaxed text-\[15px\]">\{activeLesson\.text_content\}/.test(src),
     'and the old raw video-notes render too');
 });
 
-test('a cancelled image upload stays cancelled, even if it then fails', () => {
-  // Without this, an upload the creator dismissed and that then errored flipped itself
-  // back to 'error' — reappearing in the list they had just cleared, offering Retry for a
-  // file they no longer want.
-  const up = fnBody(app(), 'const uploadLessonImage = async (entry) => {');
-  const catchAt = up.indexOf('} catch (e) {');
-  assert.ok(catchAt > 0, 'uploadLessonImage has no catch');
-  const tail = up.slice(catchAt);
-  const guardAt = tail.indexOf("=== 'cancelled'");
-  const setErrAt = tail.indexOf("status: 'error'");
-  assert.ok(guardAt > 0 && guardAt < setErrAt,
-    'the cancelled check must come BEFORE the error state is written');
+test('a cancelled upload cannot reappear, and its object is still collected', () => {
+  // ★ THE OLD DEFECT IS UNREACHABLE NOW, BY REMOVING THE SECOND MECHANISM RATHER THAN
+  //   FIXING IT. Cancelling used to mean flipping a card to 'cancelled', which three
+  //   separate points in the upload then had to re-check — and the one in the catch block
+  //   was missing, so a dismissed upload that then failed came back offering Retry.
+  //   Cancelling is now deleting the placeholder node. The upload finishes, finds no
+  //   placeholder, and stops; nothing can put it back on screen because the thing that
+  //   would have drawn it is gone.
+  const ed = editor();
+  const settle = fnBody(ed, 'const settleUpload = useCallback((uploadKey, assetId) => {');
+  assert.match(settle, /if \(!at\) \{ releasePreview\(uploadKey\); pendingFilesRef\.current\.delete\(uploadKey\); return false; \}/,
+    'no placeholder means the creator took it out — respect that and clean up');
+  const fail = fnBody(ed, 'const failUpload = useCallback((uploadKey, message) => {');
+  assert.match(fail, /if \(!at\) \{ releasePreview\(uploadKey\); pendingFilesRef\.current\.delete\(uploadKey\); return; \}/,
+    'and a FAILURE after a cancel must not resurrect it either — this is the old bug');
+  // The object still exists in storage, so the sweep has to be the thing that collects it.
+  const sweep = fnBody(app(), 'const sweepLessonAssetOrphans = async (');
+  assert.match(sweep, /cited\.has\(im\.assetId\)/,
+    'what the text cites decides what survives; a cancelled upload cites nothing');
 });
 
-test('removing an image takes its token out of the draft, not just its card', () => {
+test('removing an image never deletes its bytes on the click — the sweep decides', () => {
+  // ★ AN IMMEDIATE DELETE IS UNDO-UNSAFE, AND THIS SCHEMA HAS UNDO. Remove used to call
+  //   course_lesson_asset_delete straight away. For an image uploaded in this session no
+  //   reference row exists yet, so LESSON_ASSET_IN_USE cannot fire and the row and the
+  //   bytes went — then one Ctrl+Z brought the node back pointing at an asset that no
+  //   longer existed. validateLessonContent cannot see that, so the save reached the
+  //   trigger and died on LESSON_ASSET_UNKNOWN_REF, with the picture still on screen and
+  //   no way out but finding and deleting that node by hand. The same click also killed a
+  //   SECOND copy of the same image elsewhere in the lesson, which the format allows.
+  const ed = editor();
+  const code = jsCode(ed);
+  assert.ok(!/course_lesson_asset_delete/.test(code),
+    'the canvas must not reach the delete RPC at all');
+  assert.ok(!/onDropped/.test(code), 'nor route a deletion request out through a prop');
+  const bar = ed.slice(ed.indexOf('className="lesson-doc-figure-bar"'), ed.indexOf('{panel && !readOnly'));
+  assert.match(bar, /onClick=\{\(\) => \{ deleteNode\(\); restoreFocus\(\); \}\}/,
+    'Remove takes the node out of the document, and nothing else');
+  // What survives is decided by what the SAVED text cites — the sweep's job, and it
+  // already runs on both ways out of the drawer.
   const src = app();
-  const fn = src.slice(src.indexOf('const removeLessonImage = async (entry)'),
-    src.indexOf('const removeLessonImage = async (entry)') + 1800);
-  // ★ REFERENCES ARE DERIVED ON SAVE, SO THE SERVER CANNOT PROTECT THIS ONE. An image
-  //   placed in a draft and removed before saving has no reference row, so
-  //   LESSON_ASSET_IN_USE cannot fire: the row and bytes go, and the orphaned token left
-  //   in the text makes the NEXT save die on LESSON_ASSET_UNKNOWN_REF, recoverable only
-  //   by hand-deleting raw markup out of a textarea.
-  assert.match(fn, /removeAssetToken\(s\.text_content \|\| '', entry\.assetId\)/,
-    'the token must be stripped from the draft when the image is removed');
-  const stripAt = fn.indexOf('removeAssetToken');
-  const rpcAt = fn.indexOf("rpc('course_lesson_asset_delete'");
-  assert.ok(stripAt > 0 && rpcAt > 0 && stripAt < rpcAt,
-    'strip the text BEFORE asking the server to delete the asset');
+  assert.match(fnBody(src, 'const closeLessonEditor = () => {'), /sweepLessonAssetOrphans\(\{/);
+  assert.match(fnBody(src, 'async function saveLesson() {'), /await sweepLessonAssetOrphans\(\);/);
+  assert.match(fnBody(src, 'const sweepLessonAssetOrphans = async ('), /cited\.has\(im\.assetId\)/,
+    'and it is the SAVED text that decides, not a click');
 });
 
-test('a refused save leaves Preview and lands on the field it is refusing', () => {
+test('a refused save lands on the image it is refusing', () => {
   const src = app();
   const at = src.indexOf('const contentVerdict = validateLessonContent(');
   assert.ok(at > 0, 'the save validation moved');
-  const block = src.slice(at, at + 1400);
-  // ★ In Preview the <textarea> is unmounted, so lessonBodyRef.current is null and both
-  //   the scroll and the focus silently did nothing — a footer alert with no indication
-  //   of where to look, on a surface that cannot be typed into anyway.
-  assert.match(block, /setLessonPreview\(false\)/, 'a refusal must return to the editor');
+  const block = src.slice(at, at + 1600);
+  // ★ A FOOTER ALERT ON ITS OWN LEAVES THE CREATOR HUNTING. IMAGE_ALT_REQUIRED carries the
+  //   asset id precisely so it does not have to — and in a long document the offending
+  //   picture is very likely scrolled out of sight.
   assert.match(block, /errors\.find\(e => e\.assetId\)/,
     'IMAGE_ALT_REQUIRED names the image it means — use it');
-  assert.match(block, /getElementById\(`lesson-alt-\$\{named\.assetId\}`\)/);
-  assert.match(block, /const target = field \|\| lessonBodyRef\.current/,
-    'and fall back to the body for an image uploaded in an earlier session');
+  assert.match(block, /lessonEditorRef\.current\?\.focusImage\(named\.assetId\)/,
+    'select it in the canvas, which scrolls it in and opens its own controls');
+  assert.match(block, /lessonBodyRef\.current\?\.focus\(\{ preventScroll: true \}\)/,
+    'and fall back for a fault in the prose, or a lesson still on the plain field');
+  // The canvas half: selecting an image has to scroll it into view, or "focus" is a claim
+  // about the DOM that the creator cannot see.
+  const focusImage = editor().slice(editor().indexOf('focusImage: (assetId) => {'));
+  assert.match(focusImage, /setNodeSelection\(pos\)/);
+  assert.match(focusImage, /scrollIntoView\(\{ block: 'center', behavior: 'smooth' \}\)/);
+  assert.match(focusImage, /return false;/, 'and it reports when there was nothing to select');
 });
 
-test('the formatting toolbar is inert while Preview is on', () => {
-  const src = app();
-  const bar = src.slice(src.indexOf('aria-label="Formatting"'), src.indexOf('aria-label="Formatting"') + 2000);
-  const buttons = bar.match(/<button type="button"/g) || [];
-  const guards = bar.match(/disabled=\{lessonPreview\}/g) || [];
+test('every toolbar control is inert while the lesson is being saved', () => {
+  // ★ THE OLD SHAPE OF THIS RULE IS RETIRED WITH PREVIEW. Buttons used to edit
+  //   text_content at a remembered caret, so pressing one in Preview changed the document
+  //   with nothing on screen to show it had. The canvas IS the render, so there is no such
+  //   state — but there is still a window where editing must not happen: mid-save, when
+  //   the payload has been read and a write is in flight.
+  const ed = editor();
+  const bar = ed.slice(ed.indexOf('aria-label="Formatting"'), ed.indexOf('<div className="lesson-doc-canvas">'));
+  const buttons = bar.match(/<ToolButton/g) || [];
+  const guards = bar.match(/disabled=\{disabled( \|\| [^}]+)?\}/g) || [];
   assert.equal(guards.length, buttons.length,
-    'every toolbar button edits text_content at the remembered caret, and in Preview '
-    + 'there is nothing on screen to show that it did');
-  assert.ok(buttons.length >= 5, `expected the five formatting buttons, found ${buttons.length}`);
+    'every toolbar control must be gated, not just the ones that felt dangerous');
+  assert.ok(buttons.length >= 7, `expected bold, two lists, link, image, undo, redo — found ${buttons.length}`);
+  assert.match(composer(), /disabled=\{savingLesson\}/, 'and the parent is what says so');
+  // The surface itself, not only its buttons.
+  assert.match(ed, /if \(editor\) editor\.setEditable\(!disabled\)/,
+    'a disabled toolbar over a typeable document is not disabled');
+  // The Source view is the one place raw markdown is visible, and it is READ-ONLY.
+  const c = composer();
+  const details = c.slice(c.indexOf('<details'));
+  assert.match(details, /<pre/, 'the source is rendered, never edited');
+  assert.ok(!/<textarea|contentEditable/.test(details),
+    'a source view that can be typed into is a markdown editor by another name');
 });
 
 test('a link can be edited and unlinked, not only created', () => {
+  // ★ THE WHOLE CLASS OF "THE CAPTURED RANGE WENT STALE" IS GONE. The old bar remembered
+  //   character offsets into a markdown string while the textarea stayed editable beneath
+  //   it, so typing moved the token and Update/Unlink then spliced blind over whatever had
+  //   taken its place. ProseMirror maps positions through every intervening step, so there
+  //   is nothing to re-derive and nothing to go stale — which is why liveLinkRange and its
+  //   LINK_MOVED message no longer exist.
   const src = app();
-  const open = src.slice(src.indexOf('const openLinkBar = () => {'), src.indexOf('const confirmLinkBar'));
-  // ★ Without a range, confirm replaced the SELECTION — so re-linking existing words
-  //   wrapped the whole token and produced `[label(url)](newurl)`, a link whose visible
-  //   text is raw markdown.
-  assert.match(open, /linkAtSelection\(text, start, end\)/);
-  assert.match(open, /range: \{ start: found\.start, end: found\.end \}/);
-  // ★ THE CAPTURED RANGE IS RE-DERIVED BEFORE IT IS USED. The bar renders BELOW the body and
-  //   the textarea stays editable, so typing while it is open leaves those offsets pointing at
-  //   whatever moved into their place — and Update/Unlink then spliced there blind, rewriting
-  //   the wrong span of somebody's lesson. liveLinkRange re-finds the token and also checks it
-  //   is still the one the bar opened on, so a moved link becomes a message, not a corruption.
-  assert.match(open, /wasUrl: found\.url, wasLabel: found\.label/,
-    'the bar must remember what it opened ON, or an edit to its own fields looks like the document');
-  const live = src.slice(src.indexOf('const liveLinkRange'), src.indexOf('const LINK_MOVED'));
-  assert.match(live, /linkAtSelection\(editingLesson\?\.text_content \|\| '', linkBar\.range\.start/);
-  assert.match(live, /at\.start !== linkBar\.range\.start/);
-  assert.match(live, /at\.url !== linkBar\.wasUrl \|\| at\.label !== linkBar\.wasLabel/);
+  assert.ok(!/liveLinkRange|LINK_MOVED/.test(src),
+    'the offset-revalidation machinery must be gone, not merely bypassed');
 
-  // ★ Each path is sliced to ITSELF. A window that ran from confirmLinkBar all the way to
-  //   patchImage also contained removeLinkAtBar, so the regex matched that function's copy and
-  //   a mutation deleting the revalidation from CONFIRM survived. Two callers, two assertions.
-  const confirm = src.slice(src.indexOf('const confirmLinkBar'), src.indexOf('const removeLinkAtBar'));
-  assert.match(confirm, /const live = liveLinkRange\(\);/,
-    'an edit must replace the token as it stands NOW, never the offsets captured earlier');
-  assert.match(confirm, /if \(!live\) \{ setLinkBar\(b => \(\{ \.\.\.b, error: LINK_MOVED \}\)\); return; \}/);
+  const ed = editor();
+  const open = fnBody(ed, 'const openLink = useCallback(() => {');
+  assert.match(open, /const existing = editor\.getAttributes\('link'\)/,
+    'the caret being INSIDE a link is what opens it for editing');
+  assert.match(open, /editing: !!existing\.href/);
+  const confirm = fnBody(ed, 'const confirmLink = useCallback(() => {');
+  assert.match(confirm, /if \(linkBar\.editing\) chain\.extendMarkRange\('link'\)/,
+    'an edit must replace the WHOLE existing link, or re-linking nests one inside another');
+  assert.match(confirm, /const verdict = safeLessonHref\(linkBar\.href\)/,
+    'and the address is re-checked at the moment it is applied');
 
-  const unlink = src.slice(src.indexOf('const removeLinkAtBar'), src.indexOf('const patchImage'));
-  assert.match(unlink, /const live = liveLinkRange\(\);/, 'Unlink revalidates too');
-  assert.match(unlink, /applyUnlink\(editingLesson\?\.text_content \|\| '', live\.start, live\.start\)/);
-  assert.ok(!/range\.start, range\.start/.test(unlink),
-    'the captured offsets must not be used directly any more');
-  assert.match(src, /linkBar\.range && \(/, 'Unlink only shows when a link is being edited');
+  const unlink = fnBody(ed, 'const removeLink = useCallback(() => {');
+  assert.match(unlink, /extendMarkRange\('link'\)\.unsetMark\('link'\)/,
+    'Unlink keeps the words and drops only the address');
+  assert.match(ed, /\{linkBar\.editing && \(/, 'Unlink only shows when a link is being edited');
 });
 
-test('Escape in the link bar dismisses the bar, not the whole lesson editor', () => {
-  const src = app();
-  const bar = src.slice(src.indexOf('placeholder="https://docs.google.com/forms/'), src.indexOf('Text to show'));
+test('Escape inside the canvas dismisses what is open there, not the whole lesson editor', () => {
   // ★ preventDefault IS NOT ENOUGH. SidePanel listens for Escape on WINDOW, so the event
-  //   reached it from this input and closed the drawer — which then asked "Discard unsaved
-  //   lesson changes?". Dismissing a small inline bar must never put a draft at risk.
-  assert.match(bar, /e\.key === 'Escape'[\s\S]{0,80}e\.stopPropagation\(\)/,
-    'the Escape handler must stop the event before the drawer\'s window listener sees it');
-  const panel = src.slice(src.indexOf('function SidePanel'), src.indexOf('function SidePanel') + 1800);
+  //   reaches it from anything inside the drawer and closes it — which then asks "Discard
+  //   unsaved lesson changes?". Dismissing a small inline control must never put a draft
+  //   at risk, and the canvas now has three such controls.
+  const ed = editor();
+  assert.match(ed, /onKeyDown=\{\(e\) => \{ if \(e\.key === 'Escape' && linkBar\) closeLink\(e\); \}\}/,
+    'the shell claims Escape only while something inside it is open');
+  const close = fnBody(ed, 'const closeLink = useCallback((e) => {');
+  assert.match(close, /e\.stopPropagation\(\)/,
+    'the handler must stop the event before the drawer\'s window listener sees it');
+  const panelClose = fnBody(ed, 'const closePanel = (e) => {');
+  assert.match(panelClose, /e\.stopPropagation\(\)/, 'and the image panel does the same');
+
+  const src = app();
+  const panel = src.slice(src.indexOf('function SidePanel'), src.indexOf('function SidePanel') + 2600);
   assert.match(panel, /window\.addEventListener\('keydown', onKey\)/,
     'this is why: the drawer listens on window, above the React root');
+  // ★ AND Escape WITH NOTHING OPEN MUST STILL REACH THE DRAWER. Claiming it unconditionally
+  //   would make a contenteditable the one surface in the app you cannot Escape out of.
+  assert.ok(!/onKeyDown=\{\(e\) => \{ if \(e\.key === 'Escape'\) \{ e\.stopPropagation/.test(ed),
+    'an unconditional stopPropagation would trap the creator in the editor');
+});
+
+test('the canvas is reachable and escapable by keyboard', () => {
+  const src = app();
+  // ★ [contenteditable] IS IN THE FOCUS-TRAP SELECTOR BECAUSE THE CANVAS IS ONE. Without
+  //   it the editing surface is invisible to the wrap: the browser still tabs INTO it, but
+  //   first/last are computed as if it were not there, so Shift+Tab from the top lands past
+  //   the document instead of at the end of the drawer.
+  const panel = src.slice(src.indexOf('function SidePanel'), src.indexOf('function SidePanel') + 2400);
+  assert.match(panel, /\[contenteditable="true"\]/,
+    'the one focusable element in the drawer that is neither input nor button');
+  // ★ AND TAB INSIDE IT MOVES FOCUS OUT, RATHER THAN INDENTING. ListItem binds Tab to
+  //   sink/lift by default; nesting is unrepresentable here, so those would be a keyboard
+  //   trap that does nothing at all (WCAG 2.1.2).
+  const ed = editor();
+  assert.match(ed, /addKeyboardShortcuts\(\) \{ return \{ Tab: \(\) => false, 'Shift-Tab': \(\) => false \}; \}/,
+    'returning false leaves the event unhandled, so the browser moves focus');
+  assert.match(ed, /content: 'paragraph',/,
+    'and nesting is impossible by schema, so there is nothing for Tab to do');
+  // Every control carries a name; an icon-only button with none is a button with no label.
+  assert.match(ed, /aria-label=\{label\}/);
+  const tools = ed.match(/<ToolButton\s+label="[^"]+"/g) || [];
+  assert.ok(tools.length >= 7, `every toolbar control needs a label — found ${tools.length}`);
 });
 
 test('a caption is a second, optional field — never the alt text', () => {
-  const src = app();
-  const card = src.slice(src.indexOf('Describe this image'), src.indexOf('Describe this image') + 3400);
-  assert.match(card, /maxLength=\{LESSON_IMAGE_ALT_MAX\}/);
-  assert.match(card, /Caption \(optional\)/, 'the caption is optional and says so');
-  assert.match(card, /maxLength=\{LESSON_IMAGE_CAPTION_MAX\}/);
-  assert.match(card, /patchImage\(im\.key, \{ caption: e\.target\.value \}\)/);
-  assert.match(card, /disabled=\{!\(im\.alt \|\| ''\)\.trim\(\)\}/,
-    'alt stays REQUIRED before an image can be placed; the caption never gates it');
-  // ★ And assistive tech is TOLD it is required — the red asterisk carries aria-hidden, so
+  // ★ ALT IS ANNOUNCED; A CAPTION IS PRINTED. Using one as the other makes a screen reader
+  //   read the same sentence twice, so they are two fields and only the first is required.
+  const ed = editor();
+  const panel = ed.slice(ed.indexOf('{panel && !readOnly && ('), ed.indexOf('function UploadingImageView'));
+  assert.match(panel, /maxLength=\{LESSON_IMAGE_ALT_MAX\}/);
+  assert.match(panel, /Caption \(optional\)/, 'the caption is optional and says so');
+  assert.match(panel, /maxLength=\{LESSON_IMAGE_CAPTION_MAX\}/);
+  assert.match(panel, /updateAttributes\(\{ caption: e\.target\.value \}\)/);
+  assert.match(panel, /updateAttributes\(\{ alt: e\.target\.value \}\)/);
+  // ★ And assistive tech is TOLD alt is required — the red asterisk carries aria-hidden, so
   //   without this the field announced as an ordinary optional input.
-  assert.match(card, /required aria-required="true"/);
-  assert.match(card, /aria-invalid=\{!\(im\.alt \|\| ''\)\.trim\(\) \|\| undefined\}/);
-  assert.match(src, /applyImage\([^)]*entry\.assetId, alt, entry\.caption\)/,
-    'the caption must reach the document');
+  assert.match(panel, /required aria-required="true"/);
+  assert.match(panel, /aria-invalid=\{needsAlt \|\| undefined\}/);
+  assert.ok(!/required/.test(panel.slice(panel.indexOf('Caption (optional)'))),
+    'the caption must never be required');
+  // Both reach the document as node attributes, and the caption is rendered under the image.
+  assert.match(ed, /assetId: \{ default: '' \}, alt: \{ default: '' \}, caption: \{ default: '' \}/);
+  assert.match(ed, /<figcaption className="lesson-doc-caption">\{caption\}<\/figcaption>/,
+    'a caption nobody can see is a caption that was not written');
+});
+
+test('a selected image offers every action, and Replace keeps the words', () => {
+  const ed = editor();
+  const bar = ed.slice(ed.indexOf('className="lesson-doc-figure-bar"'), ed.indexOf('{panel && !readOnly'));
+  for (const action of ['Add description|Description', 'Add caption|Caption', 'Replace', 'Remove']) {
+    assert.ok(new RegExp(action).test(bar), `the action bar is missing ${action}`);
+  }
+  // ★ REPLACE SWAPS THE PICTURE AND KEEPS THE DESCRIPTION. Alt and caption describe what
+  //   the image SHOWS, and a replacement is nearly always a fresh capture of the same
+  //   thing — so updateAttributes carries only the id.
+  const swap = fnBody(ed, 'const onPickReplacement = async (e) => {');
+  assert.match(swap, /updateAttributes\(\{ assetId: res\.assetId \}\)/,
+    'only the id changes; alt and caption survive');
+  // ★ AND THE OLD ASSET IS NOT DELETED HERE EITHER — same reason as Remove. The swap only
+  //   has to succeed BEFORE anything else happens, so a failed upload cannot leave the
+  //   lesson citing a picture that is already gone.
+  assert.match(swap, /if \(res && res\.ok && res\.assetId\) \{/,
+    'the new id must exist before the node is repointed');
+  assert.match(swap, /onNotice\?\.\(/, 'a failed replacement has to say so');
+  assert.ok(!/onDropped|course_lesson_asset_delete/.test(jsCode(swap)),
+    'replacing must not destroy bytes a duplicate elsewhere may still be showing');
+  // The hidden input needs a name of its own; it is the thing a screen reader lands on.
+  assert.match(ed, /aria-label="Choose a replacement image"/);
+});
+
+test('an image is never shown larger than it is, and a bad file is refused before it appears', () => {
+  // ★ `width: 100%` UPSCALES. A small screenshot, an icon or a logo was blown up to the
+  //   full canvas width and rendered blurry — found by watching a 2x2 test image fill an
+  //   800px box, not by reading the rule.
+  const block = css().slice(css().indexOf('.lesson-doc-image {'), css().indexOf('.lesson-doc-image.is-dim'));
+  assert.match(block, /max-width: 100%/);
+  assert.ok(!/^\s*width: 100%/m.test(block), 'width:100% forces a small picture to be upscaled');
+  assert.match(block, /height: auto/, 'or the aspect ratio goes');
+  // Refusing before a placeholder exists also means no object URL is minted for it.
+  const add = fnBody(editor(), 'const addFiles = useCallback((files) => {');
+  const validateAt = add.indexOf('validateLessonImageFile(file)');
+  const urlAt = add.indexOf('URL.createObjectURL');
+  assert.ok(validateAt > 0 && urlAt > 0 && validateAt < urlAt,
+    'validate BEFORE minting an object URL nobody would revoke');
+});
+
+// ── 24. The instructions canvas cannot store what it cannot represent ───────
+//
+// src/lib/lessonDocument.js proves the CONVERSION is faithful, and
+// test/lessonDocument.test.mjs covers it exhaustively. What only a source scan can prove
+// is that the editor module never grew a second way in: another parseHTML rule, another
+// scheme authority, an innerHTML escape hatch, or a Supabase client of its own.
+
+test('the editor schema is exactly the allowlist, and nothing else is enabled', () => {
+  const ed = editor();
+  const code = jsCode(ed);
+  // Nothing may be imported that is not in the allowlist — "do not enable every default
+  // extension merely because it is available" is kept by not INSTALLING them.
+  assert.ok(!/@tiptap\/starter-kit/.test(code),
+    'StarterKit brings headings, italic, strike, code, code blocks, blockquote and rules');
+  assert.ok(!/@tiptap\/extension-link/.test(code),
+    'that package brings linkifyjs, whose idea of a URL is not safeLessonHref');
+  for (const banned of ['Heading', 'Italic', 'Strike', 'Underline', 'CodeBlock', 'Blockquote',
+    'HorizontalRule', 'Table', 'Youtube', 'TextStyle', 'Color', 'FontFamily']) {
+    assert.ok(!new RegExp(`import .*\\b${banned}\\b`).test(code), `${banned} must not be imported`);
+  }
+  // The node list the schema is built from, in one place, matching the pure module's.
+  assert.match(ed, /export const buildLessonExtensions = \(handlersRef, placeholder\) => \[/);
+  const built = ed.slice(ed.indexOf('export const buildLessonExtensions'), ed.indexOf('// ─', ed.indexOf('export const buildLessonExtensions')));
+  for (const node of ['Document', 'Paragraph', 'Text', 'HardBreak', 'Bold', 'BulletList',
+    'OrderedList', 'FlatListItem', 'LessonLink', 'LessonImage', 'UploadingImage', 'BrokenToken']) {
+    assert.ok(built.includes(node), `${node} must be in the extension list`);
+  }
+});
+
+test('the canvas has no second door: no innerHTML, no Supabase, no other scheme authority', () => {
+  const ed = editor();
+  const code = jsCode(ed);
+  assert.ok(!/dangerouslySetInnerHTML/.test(code),
+    'the whole point is that unsafe markup is unrepresentable, not filtered');
+  assert.ok(!/innerHTML|outerHTML|insertAdjacentHTML|document\.write/.test(code));
+  // ★ NO SUPABASE, AND NOTHING FROM THE MONOLITH. The first would put storage credentials
+  //   and RPC names in a module whose job is text; the second would pull the 37k-line
+  //   BookkeeperPro into this lazy chunk and undo the code-splitting entirely.
+  assert.ok(!/supabase/i.test(code), 'every Supabase call stays in the parent, behind props');
+  assert.ok(!/course_lesson_asset_|storage\.from\(/.test(code),
+    'no RPC name and no bucket reach this module — the parent owns both');
+  assert.ok(!/from '\.\.\/BookkeeperPro/.test(code), 'one design-token import would cost ~440 KB gzip');
+  // safeLessonHref is the ONLY thing that decides a scheme, on the way in as well as out.
+  const linkMark = ed.slice(ed.indexOf('const LessonLink = Mark.create('), ed.indexOf('const LessonImage'));
+  assert.match(linkMark, /const verdict = safeLessonHref\(el\.getAttribute\('href'\)\)/,
+    'a pasted link is judged by the same function the serializer uses');
+  assert.match(linkMark, /: false;/, 'and returning false REFUSES the mark, keeping the words');
+  assert.match(linkMark, /rel: 'noopener noreferrer', target: '_blank'/,
+    'an editor preview still opens a real browser tab');
+});
+
+test('an upload placeholder is transient, and its object URL is released', () => {
+  const ed = editor();
+  // ★ NEVER STORED. The asset row does not exist while bytes are moving, so a token for it
+  //   would make the trigger refuse the whole save with an accurate error reading like a bug.
+  assert.match(ed, /\/\*\* A transfer in progress\. Never serialized/);
+  // ★ The placeholder is an ATOM with no content, so the serializer has nothing to emit for
+  //   it even if every explicit exclusion were deleted — which means a removal mutation
+  //   survives by design. Scan the serializer for the upload key instead, the idiom
+  //   CLAUDE.md prescribes for exactly this case. (The line that used to sit here was
+  //   `assert.ok(render === '' || true)` — unfailable, and reported by code review.)
+  assert.match(lessonDoc(), /uploadKey/,
+    'the serializer must still name uploadKey — that is what makes the exclusion checkable');
+  assert.ok(!/uploadingImage/.test(jsCode(app())),
+    'the placeholder is the editor module\'s business; the monolith must not learn about it');
+  const lib = readFileSync(join(REPO, 'src/lib/lessonDocument.js'), 'utf8');
+  assert.match(lib, /if \(n\.type === 'uploadingImage'\) continue;/,
+    'the serializer must have no case for it at all');
+  assert.match(lib, /case 'uploadingImage':/, 'and normalization drops it before that');
+  // ★ OBJECT URLS ARE REVOKED. A held preview of a 10 MB screenshot is a leak nobody sees.
+  assert.match(ed, /URL\.revokeObjectURL/);
+  assert.match(ed, /objectUrlsRef\.current\.forEach\(\(u\) => \{ try \{ URL\.revokeObjectURL\(u\); \}/,
+    'and again on unmount, for the ones no placeholder ever released');
+  // ★ THE PLACEHOLDER IS FOUND BY KEY AT COMMIT TIME, not by a position captured when the
+  //   transfer started — the creator keeps typing, and that position moves.
+  const settle = fnBody(ed, 'const settleUpload = useCallback((uploadKey, assetId) => {');
+  assert.match(settle, /findUpload\(uploadKey\)/);
+  assert.ok(!/getPos\(\)/.test(settle), 'a remembered position is a position that has moved');
+  // ★ AND IT MUST NOT DISPATCH INTO A DESTROYED VIEW. closeLessonEditor deliberately does
+  //   NOT wait for an image upload, so a transfer regularly settles after ProseMirror has
+  //   torn the view down. Dispatching there throws inside a catch that then throws again —
+  //   an unhandled rejection with no cause a user could ever see.
+  assert.match(fnBody(ed, 'const findUpload = useCallback((uploadKey) => {'),
+    /if \(!editor \|\| editor\.isDestroyed\) return null;/,
+    'a closed drawer is not a null editor — it is a destroyed one');
+});
+
+test('the canvas debounces, and the save reads the LIVE document anyway', () => {
+  // ★ SERIALIZING IS ~6 ms ON A FULL-SIZE LESSON even with the block cache, and the parent
+  //   then runs two JSON.stringify dirty checks and a synchronous localStorage write of the
+  //   whole draft. Per keystroke that is visible lag — measured at 16 ms before the cache.
+  const ed = editor();
+  assert.match(ed, /onUpdate: \(\{ editor: ed \}\) => \{ scheduleEmit\(ed\); \}/);
+  assert.match(ed, /onBlur: \(\{ editor: ed \}\) => \{ flushEmit\(ed\); \}/,
+    'blur is a flush point — clicking Cancel or Save blurs the canvas first');
+  assert.match(fnBody(ed, 'const scheduleEmit = useCallback((ed) => {'), /setTimeout\(/);
+  // ★ AND THE PARENT MUST NEVER READ A STALE DOCUMENT. A save triggered any other way
+  //   would otherwise race the debounce and store the text as of 180 ms ago.
+  // ★ ONE DERIVATION, TWO CALLERS — the LessonCard rule, one level down in the DATA. The
+  //   save and the student preview must agree about what the lesson SAYS; if the preview
+  //   re-derived its own live copy, a creator could approve text the save would not store.
+  const src = app();
+  const live = fnBody(src, 'function liveLessonDraft() {');
+  assert.match(live, /const liveMarkdown = lessonEditorRef\.current\?\.getMarkdown\?\.\(\);/,
+    'the live draft reads the canvas directly rather than trusting the debounced copy');
+  // ★ THE `!==` GUARD IS LOAD-BEARING, NOT AN OPTIMIZATION. On a pre-#65 database, and for
+  //   legacy prose still on the plain field, there IS no canvas — the ref is null and
+  //   getMarkdown is undefined. Without the typeof/!== pair, merely OPENING such a lesson
+  //   would stamp content_format:'markdown' on it and escape its metacharacters on save.
+  assert.match(live, /typeof liveMarkdown === 'string' && liveMarkdown !== editingLesson\.text_content/,
+    'a lesson with no canvas must come back untouched');
+  assert.match(live, /content_format: 'markdown'/);
+  for (const caller of ["async function saveLesson() {", "function renderLessonPreviewBody() {"]) {
+    assert.match(fnBody(src, caller), /liveLessonDraft\(\)/,
+      `${caller} must go through liveLessonDraft(), not re-derive it`);
+  }
+  const save = fnBody(src, 'async function saveLesson() {');
+  const liveAt = save.indexOf('liveLessonDraft()');
+  const validateAt = save.indexOf('validateLessonContent(d.text_content');
+  assert.ok(liveAt > 0 && liveAt < validateAt, 'and the save does so BEFORE anything is validated');
+  assert.match(ed, /getMarkdown: \(\) => \(editor && !editor\.isDestroyed \? docToMarkdown\(editor\.getJSON\(\)\) : ''\)/);
+});
+
+// ─── §25 The student preview ────────────────────────────────────────────────
+
+test('the editor schema and the converter vocabulary agree, in both directions', () => {
+  // ★ THEY ARE TWO INDEPENDENT ALLOWLISTS, NOT ONE DERIVED FROM THE OTHER — the converter's
+  //   docblock used to claim the schema was "built from" its constants, which nothing did.
+  //   Code review caught it. The guarantee still holds (ProseMirror's schema is an allowlist
+  //   and the converter ignores what it does not recognise), but only while the two agree,
+  //   so the agreement is checked here rather than asserted in prose.
+  const ed = jsCode(editor());
+  const lib = lessonDoc();
+  const listed = (name) => {
+    const m = new RegExp(`export const ${name} = Object\\.freeze\\(\\[([^\\]]*)\\]`).exec(lib);
+    assert.ok(m, `${name} is missing from lessonDocument.js`);
+    return m[1].split(',').map((x) => x.trim().replace(/^'|'$/g, '')).filter(Boolean);
+  };
+  const nodes = listed('LESSON_DOC_NODES');
+  const marks = listed('LESSON_DOC_MARKS');
+
+  // Every vocabulary name maps to exactly one extension in buildLessonExtensions.
+  const EXT_FOR = {
+    doc: 'Document', paragraph: 'Paragraph', text: 'Text', hardBreak: 'HardBreak',
+    bulletList: 'BulletList', orderedList: 'OrderedList', listItem: 'FlatListItem',
+    lessonImage: 'LessonImage', uploadingImage: 'UploadingImage', brokenToken: 'BrokenToken',
+    bold: 'Bold', link: 'LessonLink',
+  };
+  const build = /export const buildLessonExtensions = \(handlersRef, placeholder\) => \[([\s\S]*?)\];/.exec(ed);
+  assert.ok(build, 'buildLessonExtensions was not found');
+  const declared = build[1];
+  for (const name of [...nodes, ...marks]) {
+    const ext = EXT_FOR[name];
+    assert.ok(ext, `${name} is in the converter vocabulary with no extension mapped — add it here`);
+    assert.match(declared, new RegExp(`\\b${ext}\\b`),
+      `${name} is in the converter vocabulary but ${ext} is not in buildLessonExtensions`);
+  }
+  // …and the reverse: no schema-bearing extension the vocabulary does not know about. The
+  // five behavioural ones carry no node or mark, so they are named as the exceptions.
+  const BEHAVIOURAL = ['UndoRedo', 'Dropcursor', 'Gapcursor', 'Placeholder', 'createShortcuts'];
+  const known = new Set([...Object.values(EXT_FOR), ...BEHAVIOURAL]);
+  // Quoted strings out first — the placeholder copy ("Write the lesson instructions…") put
+  // a capitalised word in the identifier scan and failed on correct code.
+  const idents = declared.replace(/'[^']*'|"[^"]*"|`[^`]*`/g, "''");
+  for (const ident of idents.match(/\b[A-Z][A-Za-z]+\b|\bcreateShortcuts\b/g) || []) {
+    assert.ok(known.has(ident),
+      `${ident} is in the editor schema but nothing in LESSON_DOC_NODES/MARKS names it — a `
+      + 'node the converter does not know about silently drops out of every save');
+  }
+  // The custom extensions really declare the names mapped above.
+  for (const [nodeName, ext] of Object.entries(EXT_FOR)) {
+    if (!['LessonLink', 'LessonImage', 'UploadingImage', 'BrokenToken'].includes(ext)) continue;
+    assert.match(ed, new RegExp(`name: '${nodeName}'`),
+      `${ext} must declare name: '${nodeName}'`);
+  }
+});
+
+test('Undo and Redo never blur themselves out of the dialog', () => {
+  // ★ aria-disabled, NEVER disabled — the sidebar Move up/Move down precedent, and here it
+  //   happens inside an aria-modal dialog. A browser blurs a focused element the instant it
+  //   becomes disabled, so pressing Redo until the stack empties dropped focus to <body>,
+  //   where SidePanel's Tab trap cannot recover it (it only acts when the active element is
+  //   first, last or the panel) — so Tab then walked the page behind the scrim.
+  const ed = jsCode(editor());
+  assert.match(ed, /label="Undo" disabled=\{disabled\} softDisabled=\{!editor\.can\(\)\.undo\(\)\}/);
+  assert.match(ed, /label="Redo" disabled=\{disabled\} softDisabled=\{!editor\.can\(\)\.redo\(\)\}/);
+  assert.ok(!/disabled=\{disabled \|\| !editor\.can\(\)/.test(ed),
+    'a state that flips under the user\'s own finger must never be a real `disabled`');
+  // The shell has to honour it: no listener attached, and the aria flag rather than the attr.
+  assert.match(ed, /onClick=\{softDisabled \? undefined : onClick\}/);
+  assert.match(ed, /aria-disabled=\{softDisabled \? true : undefined\}/);
+  // …and it must still LOOK unavailable, or the button lies about being pressable.
+  assert.match(readFileSync(join(REPO, 'src/index.css'), 'utf8'),
+    /\.lesson-doc-tool\[aria-disabled="true"\] \{ opacity: 0\.4; cursor: not-allowed; \}/,
+    'aria-disabled needs its own styling — :disabled no longer matches these two buttons');
+});
+
+test('a refused save is never silent, wherever Save was pressed', () => {
+  // ★ CODE REVIEW CAUGHT THIS, AND IT WAS THE FEATURE'S OWN PRIMARY PATH. Save sits in the
+  //   student preview's footer, but the lessonErr alert renders only in the EDITING footer
+  //   and the replay error lives inside the body preview hides — so five reachable refusals
+  //   produced no visible change at all. The likeliest is a missing image description, which
+  //   the canvas lets you incur by placing a picture and moving on.
+  const src = app();
+  const save = fnBody(src, 'async function saveLesson() {');
+  const upTo = save.slice(0, save.indexOf('setSavingLesson(true)'));
+  // Exactly one setLessonErr survives in the refusal region: the clear at the top.
+  assert.equal((upTo.match(/setLessonErr\(/g) || []).length, 1,
+    'every refusal must go through refuseSave(), which leaves preview mode first');
+  assert.ok((upTo.match(/refuseSave\(/g) || []).length >= 5,
+    'all five content/upload refusals route through refuseSave()');
+  const refuse = fnBody(src, 'function refuseSave(message) {');
+  assert.match(refuse, /setLessonPreview\(false\)/,
+    'refuseSave must leave preview — the error, the field it names and the canvas the caret '
+    + 'lands in are all hidden while previewing');
+  assert.match(refuse, /setLessonErr\(message\)/);
+  // The replay branch has its own field-local alert, also inside the hidden body.
+  assert.match(upTo, /setReplayErr\(replay\.message\);[\s\S]{0,220}setLessonPreview\(false\)/,
+    'an invalid replay link must leave preview too — its role="alert" is inside the hidden body');
+});
+
+test('the drawer\'s own video is UNMOUNTED while previewing, not just hidden', () => {
+  // Hiding is right for the canvas (undo history lives in the editor instance) and wrong for
+  // a player: a hidden <video> is still a mounted SignedLessonVideo, so preview mode would
+  // hold two signed URLs and two preload="metadata" players for one lesson — and display:none
+  // does not pause media, so a video started in the drawer keeps talking under the preview.
+  assert.match(app(), /\{!lessonPreview && d\.video_provider === 'upload' && d\.storage_path && \(/,
+    'the admin max-w-md stage must be gated on !lessonPreview');
+});
+
+test('the student preview renders the SAME card the learner page does', () => {
+  const src = app();
+  // ★ MODULE SCOPE, pinned with a leading newline — `indexOf('function LessonCard({')` also
+  //   matches an INDENTED nested declaration. Declared inside CourseProgram these become a
+  //   new type every render, so React unmounts the subtree: SignedLessonVideo re-signs and
+  //   <video> returns to 0:00, on every progress tick, rail resize and notice.
+  for (const fn of ['LessonCard', 'LessonStage']) {
+    assert.match(src, new RegExp(`\\nfunction ${fn}\\(`),
+      `${fn} must be declared at module scope, never inside CourseProgram`);
+  }
+  // Two render sites, and only two: the student page and the preview. A third is a third
+  // place the lesson layout could drift from what students actually get.
+  assert.equal((src.match(/<LessonCard\b/g) || []).length, 2,
+    'LessonCard must be rendered exactly twice — the learner page and the preview');
+  const body = fnBody(src, 'function renderLessonPreviewBody() {');
+  // adminView must be a LITERAL false. `adminView={isAdmin}` is the one mistake this prop
+  // was renamed to prevent: in the preview the viewer IS an admin and the render must not be.
+  assert.match(body, /adminView=\{false\}/,
+    'the preview renders the STUDENT view — a literal false, never adminView={isAdmin}');
+  assert.match(body, /done=\{false\}/);
+  assert.match(body, /actions=\{INERT_LESSON_ACTIONS\}/);
+});
+
+test('the preview cannot reach progress, and is inert', () => {
+  const src = app();
+  const body = jsCode(fnBody(src, 'function renderLessonPreviewBody() {'));
+  // ★ A DRAFT CARRIES A REAL LESSON ID. One stray "Mark complete" writes lesson_progress
+  //   through complete_course_lesson and fans a progress event out to the dashboards.
+  for (const forbidden of ['supabase', 'complete_course_lesson', 'STUDENT_PROGRESS_CHANGE_EVENT',
+    'dispatchEvent', 'markComplete', 'onComplete:']) {
+    assert.ok(!body.includes(forbidden),
+      `the preview body must not name ${forbidden} — it is a preview, not a write path`);
+  }
+  // inert="" — NOT inert={true}, which React 18.3 warns about as a non-boolean attribute.
+  assert.match(body, /<div inert=""/,
+    'the preview subtree is inert: no clicks, and role="status"/role="alert" inside the media'
+    + ' stage stay out of the a11y tree so it cannot announce into an editing session');
+  // ★ jsCode(), not src: the comment directly above the attribute EXPLAINS this very hazard,
+  //   so a raw scan matches its own explanation and fails on the correct answer — the exact
+  //   failure shape CLAUDE.md warns about ("assert against extracted vocabularies, never
+  //   'this string appears nowhere in the file'"). It bit here on the first run.
+  assert.ok(!/inert=\{true\}/.test(jsCode(src)), 'inert={true} makes React 18.3 warn — use inert=""');
+
+  // ★ THE STRONGEST GUARD IS A COUNT. markComplete appears exactly three times file-wide:
+  //   CourseProgram's declaration, its ONE binding in the learner card, and the entirely
+  //   unrelated markComplete() in the feature-guide player. A fourth is a second path in.
+  assert.equal((jsCode(src).match(/markComplete\(/g) || []).length, 3,
+    'a new markComplete( call site is a new way for a preview to record real progress');
+  // INERT_LESSON_ACTIONS is nulls, not no-ops: a no-op is a live call site someone later
+  // "fixes" by wiring the real handler in; a null onClick attaches no listener at all.
+  assert.match(src, /const INERT_LESSON_ACTIONS = Object\.freeze\(\{ onPrev: null, onNext: null, onComplete: null \}\);/);
+});
+
+test('preview mode swaps the drawer BODY — it never stacks a second overlay', () => {
+  // ★ MEASURED IN CHROME, NOT ASSUMED. SidePanel registers a WINDOW-level keydown handler
+  //   that closes the drawer on Escape and wraps Tab into it. With a full-screen preview
+  //   portalled ABOVE a still-mounted drawer: Escape dismissed the lesson editor outright
+  //   (and popped its discard confirm), and one Tab landed on the drawer's hidden
+  //   "Close lesson editor" button behind the preview. Swapping the body keeps SidePanel
+  //   the only owner of those keys, and remapping onClose makes all three exits mean
+  //   "back to editing".
+  const src = app();
+  const editor = fnBody(src, 'function renderLessonEditor() {');
+  // ONE panel, two faces — never a second overlay.
+  assert.equal((editor.match(/<SidePanel$/gm) || []).length, 1,
+    'the editor and its preview must be the SAME drawer, or SidePanel stops being the only '
+    + 'owner of Escape and the Tab wrap');
+  assert.match(editor, /onClose=\{lessonPreview \? \(\) => setLessonPreview\(false\) : closeLessonEditor\}/,
+    'while previewing, Escape/X/backdrop must all mean back-to-editing, never discard-the-lesson');
+  assert.match(editor, /closeLabel=\{lessonPreview \? 'Back to editing' : 'Close lesson editor'\}/);
+  // No second portal for the preview anywhere.
+  assert.ok(!/z-\[7[5-9]\]/.test(src), 'a preview overlay above the z-[70] drawer is the shape that failed');
+
+  // ★ HIDDEN, NOT UNMOUNTED — and this one was caught in the browser, not by reading.
+  //   The first version returned a DIFFERENT SidePanel for preview mode, which unmounts the
+  //   canvas: ProseMirror's undo history lives in the editor instance, so previewing and
+  //   going back silently threw it away (Ctrl+Z did nothing) while a shipped comment claimed
+  //   the history survived. Hiding also keeps an in-flight video upload alive.
+  assert.match(editor, /<div hidden=\{lessonPreview\}>/,
+    'the editor body must be hidden while previewing, never replaced — undo history and any '
+    + 'in-flight upload live in components inside it');
+  const hideAt = editor.indexOf('<div hidden={lessonPreview}>');
+  const previewAt = editor.indexOf('{lessonPreview && renderLessonPreviewBody()}');
+  assert.ok(hideAt > 0 && previewAt > hideAt,
+    'the preview renders as a SIBLING of the hidden editor body, inside the same panel');
+});
+
+test('preview mode cannot outlive the drawer', () => {
+  // ★ A REAL BUG ON THE PRIMARY HAPPY PATH. Save sits in the preview's own footer — "look,
+  //   then save it" is the point — so the drawer routinely closes FROM preview mode. Nothing
+  //   in closeLessonEditor or saveLesson's success path cleared the flag, so the next lesson
+  //   opened as a read-only student view with the editor hidden and no hint why.
+  const src = app();
+  assert.match(src, /useEffect\(\(\) => \{ if \(!editingLesson\) setLessonPreview\(false\); \}, \[editingLesson\]\);/,
+    'preview mode must reset when the drawer closes, keyed on the drawer\'s own lifetime');
+  // Keyed on editingLesson, not on the exit call sites: there are five of those (three opens,
+  // two closes) and a sixth added later would silently miss.
+  const decl = src.indexOf('const [editingLesson, setEditingLesson]');
+  const eff = src.indexOf('if (!editingLesson) setLessonPreview(false)');
+  assert.ok(decl > 0 && eff > decl,
+    'the effect reads editingLesson, so it must come after the declaration (TDZ)');
+});
+
+test('Preview is reachable even when the lesson cannot be saved', () => {
+  const src = app();
+  // It is a preview, not a save: mid-upload, a missing alt text or a refused pick are all
+  // states the creator specifically wants to look at. Only Save is gated on them.
+  const i = src.indexOf('Preview as student');
+  assert.ok(i > 0, 'the entry point is missing');
+  const btn = src.slice(src.lastIndexOf('<button', i), i);
+  assert.ok(!/disabled=/.test(btn), 'the Preview button must not be disabled by the save gate');
+  // flush() first, or the preview renders the canvas as of up to 180 ms ago.
+  assert.match(btn, /lessonEditorRef\.current\?\.flush\?\.\(\)/,
+    'flush the canvas before previewing, or it shows the debounced copy');
+});
+
+test('the preview width is capped, and capped NARROW', () => {
+  const src = app();
+  // ★ MEASURED on the live learner page at six viewports: the same lesson is 356px wide on
+  //   a phone, 598px at 1280, 700px at 1440, 718px at 768 and 1180px at 1920. There is no
+  //   single student width, so the preview can only choose WHICH WAY to be wrong — and the
+  //   directions are not symmetric. Too wide lets a creator approve a line that wraps badly
+  //   for the student; too narrow only shows wrapping the student will not hit. Uncapped in
+  //   the drawer the preview measured 845px: 41% wider than a 1280 student.
+  const m = /const LESSON_PREVIEW_MAX_W = (\d+);/.exec(src);
+  assert.ok(m, 'LESSON_PREVIEW_MAX_W is missing');
+  const cap = Number(m[1]);
+  assert.ok(cap <= 598,
+    `the cap must not exceed the narrowest measured desktop student width (598px at 1280); got ${cap}`);
+  assert.match(fnBody(src, 'function renderLessonPreviewBody() {'),
+    /maxWidth: LESSON_PREVIEW_MAX_W/,
+    'and the preview must actually apply it');
+});
+
+test('the toolbar re-renders on a selection change, or it announces the wrong state', () => {
+  // ★ @tiptap/react 3 DEFAULTS THIS OFF. Without it the component re-rendered only when
+  //   the serialized TEXT changed, so moving the caret into a bold word left Bold looking
+  //   inactive and announcing aria-pressed="false" — and pressing Bold on a collapsed
+  //   caret (a stored mark, no text change) lit nothing at all, so the creator pressed it
+  //   again and turned it back off. Debouncing onUpdate would have made it strictly worse.
+  assert.match(editor(), /shouldRerenderOnTransaction: true,/);
+});
+
+test('the canvas is lazy, and stays out of every student bundle', () => {
+  const src = app();
+  assert.match(src, /const loadLessonEditorModule = \(\) => import\('\.\/editor\/LessonDocumentEditor\.jsx'\)/,
+    'the tus-js-client / XLSX idiom');
+  // Gated on a drawer being open, so reading a course never fetches it.
+  const eff = src.slice(src.indexOf('if (!editingLesson || !isAdmin || editorMod'), src.indexOf('if (!editingLesson || !isAdmin || editorMod') + 600);
+  assert.match(eff, /editorMod \|\| editorModErr\) return undefined;/,
+    'and it is imported once, not on every reopen');
+  assert.match(src, /setEditorModErr/, 'a failed import gets an actionable card, not an empty box');
+  const vite = readFileSync(join(REPO, 'vite.config.js'), 'utf8');
+  assert.ok(!/LessonDocumentEditor|tiptap|prosemirror/i.test(vite),
+    'naming it in manualChunks would merge it back into a chunk students download');
+  // The built artifact is the only proof that actually counts.
+  const dist = join(REPO, 'dist/assets');
+  if (existsSync(dist)) {
+    const files = readdirSync(dist);
+    const own = files.filter((f) => /^LessonDocumentEditor-.*\.js$/.test(f));
+    assert.equal(own.length, 1, 'the editor must land in a chunk of its own');
+    for (const f of files.filter((n) => /^index-.*\.js$/.test(n))) {
+      const body = readFileSync(join(dist, f), 'utf8');
+      assert.ok(!/prosemirror-model|ProseMirror\b/.test(body),
+        `${f} carries ProseMirror — the lazy boundary leaked`);
+    }
+  }
 });

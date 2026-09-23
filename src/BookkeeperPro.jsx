@@ -9,7 +9,7 @@ import {
   MessageSquare, Mic, MicOff, Eye, HelpCircle, User, Target,
   Building2, Landmark, CalendarClock, CalendarCheck, ExternalLink,
   Heart, HeartHandshake, DollarSign, Phone, AlertCircle, Activity, Clock, Wallet,
-  ArrowUp, ArrowDown, ArrowUpDown, X, Copy, Check, ImageOff, ImagePlus, Bold, List, ListOrdered,
+  ArrowUp, ArrowDown, ArrowUpDown, X, Copy, Check, ImageOff, List,
   TrendingUp as Growth, BookMarked, Globe, Coins, GraduationCap,
   LogOut, Lock, Mail, KeyRound, Menu,
   Plus, Trash2, Save, Play, Video, ArrowRight, ArrowLeft, ChevronUp, MoreVertical,
@@ -65,11 +65,9 @@ import {
 } from './lib/sidebarLayout';
 import {
   LESSON_ASSET_BUCKET, LESSON_ASSET_SIGN_TTL_SECONDS, LESSON_ASSET_RESIGN_MARGIN_MS,
-  LESSON_IMAGE_ACCEPT, LESSON_IMAGE_MAX_PER_LESSON, LESSON_IMAGE_ALT_MAX,
-  LESSON_IMAGE_CAPTION_MAX,
-  applyBold, applyImage, applyLink, applyList, applyUnlink,
-  lessonAssetIds, lessonAssetObjectName, lessonAssetPath, linkAtSelection,
-  normalizeFormat, parseLessonContent, plainToMarkdown, removeAssetToken,
+  LESSON_IMAGE_MAX_PER_LESSON,
+  lessonAssetIds, lessonAssetObjectName, lessonAssetPath,
+  normalizeFormat, parseLessonContent, plainToMarkdown,
   validateLessonContent, validateLessonImageFile,
 } from './lib/lessonContent';
 import {
@@ -5756,8 +5754,12 @@ function SidePanel({ title, subtitle, icon: Icon, onClose, children, tone = 'pri
       if (!panelRef.current) return;
       if (e.key === 'Escape') { close(); return; }
       if (e.key !== 'Tab') return;
+      // ★ [contenteditable] IS IN THE LIST BECAUSE THE LESSON CANVAS IS ONE. Without it
+      //   the editing surface is invisible to this wrap: the browser still tabs INTO it,
+      //   but first/last are computed as if it were not there, so Shift+Tab from the top
+      //   lands past the document instead of at the end of the drawer.
       const f = panelRef.current.querySelectorAll(
-        'button:not([disabled]), [href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        'button:not([disabled]), [href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [contenteditable="true"], [tabindex]:not([tabindex="-1"])'
       );
       if (!f.length) return;
       const first = f[0], last = f[f.length - 1];
@@ -22937,6 +22939,18 @@ function lessonRowsArePreRichContent(rows) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
+ * The WYSIWYG instructions canvas, in its own chunk.
+ *
+ * ★ LAZY, AND THE BUNDLE MATH IS THE WHOLE REASON. ProseMirror plus the Tiptap glue is
+ *   roughly 120 KB gzipped, for a surface only people who can edit a course ever open —
+ *   against an app chunk every student downloads to read one. It is the tus-js-client /
+ *   XLSX idiom, and it is why src/editor/LessonDocumentEditor.jsx imports nothing from
+ *   this file: one import of the design tokens would pull the whole monolith in behind
+ *   it and there would be no saving at all. Do NOT add it to manualChunks.
+ */
+const loadLessonEditorModule = () => import('./editor/LessonDocumentEditor.jsx');
+
+/**
  * Signed URLs for every image ONE lesson cites, keyed by asset id.
  *
  * ★ ONE select and ONE createSignedUrls call per lesson, never one per image — the
@@ -24484,6 +24498,251 @@ function LessonReplayLink({ value, lessonTitle = '', isAdmin = false }) {
   );
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The student lesson view — ONE renderer, two callers.
+//
+// ★ WHY THIS IS NOT INSIDE CourseProgram, AND WHY THAT IS NOT A STYLE CHOICE.
+//   A component declared inside a component is a NEW TYPE on every render, so React
+//   unmounts and remounts its whole subtree. SignedLessonVideo would re-sign, the
+//   <video> would be a new DOM node, and currentTime would return to 0:00 — and
+//   CourseProgram re-renders on every progress tick, every rail resize and every
+//   notice. A student would watch their lesson restart at apparently random moments.
+//
+// ★ WHY THERE IS ONLY ONE OF THEM. The lesson editor previews a DRAFT through this
+//   same card. A preview that drifts from the real student view is worse than no
+//   preview, because the creator has started trusting it — so there is no second copy
+//   to drift from. uiSafety pins the number of render sites, so a third one cannot be
+//   added without saying so out loud.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The media stage: an uploaded video, a legacy embedded link, or a text lesson's prose.
+ *
+ * ★ `adminView`, NOT `isAdmin`, AND THE RENAME IS THE SAFETY. It means "render the
+ *   admin-only diagnostics", never "the person looking has admin rights". In the
+ *   editor's student preview those two are OPPOSITE: the viewer is an admin and the
+ *   render must not be. A prop called `isAdmin` invites `isAdmin={isAdmin}` at the one
+ *   call site where that is precisely the bug. It defaults to false, so a forgotten
+ *   prop fails CLOSED — to the student's render.
+ */
+function LessonStage({ lesson, adminView = false }) {
+  if (!lesson) return null;
+  if (lesson.type === 'text') {
+    return lesson.text_content
+      ? <LessonRichText lesson={lesson} />
+      : <div className="rounded-xl border-2 border-dashed border-slate-200 p-10 text-center text-slate-400">No content yet.</div>;
+  }
+  // Private bucket → signed URL. This is the only shape a NEW lesson can have.
+  if (lesson.video_provider === 'upload' && lesson.storage_path) {
+    return <SignedLessonVideo key={lesson.id} lesson={lesson} isAdmin={adminView} />;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // TEMPORARY — LEGACY LINK PLAYBACK. Delete this whole block when the migration is done.
+  // ══════════════════════════════════════════════════════════════════════════════
+  // REMOVAL CRITERION, exactly: `npm run media:audit` reports 0 external links. Then
+  // delete this block, and LessonStage falls through to the empty state below.
+  //
+  // WHY IT IS STILL HERE. Authoring went upload-only in #44 — the editor has no link
+  // field and course_lessons_video_guard refuses the write — but on 2026-08-24 every
+  // single video lesson in the live database was a YouTube link: 101 of 102, across three
+  // PUBLISHED courses, with zero uploaded files anywhere. Removing playback in the same
+  // change would have shown 96 lessons a placeholder to paying members until ~59 videos
+  // had been re-uploaded one at a time. So authoring and playback were deliberately
+  // separated: no new links can be created, and the ones already sold stay watchable.
+  //
+  // ★ This block ADDS NO EXPOSURE. It renders links that are already stored and were
+  //   already being rendered; it cannot come into existence for a new lesson.
+  // ★ It DOES tighten one thing on the way out: the mp4 branch used to bind video_url
+  //   straight into <video src> with no validation anywhere in its life — parseVideoUrl
+  //   labelled ANY unrecognised string 'mp4' and saveLesson stored it verbatim, so a
+  //   `javascript:` or `data:` value would have been bound as a media source. It is now
+  //   proven to be an absolute https URL first, by the same parseReplayUrl() that guards
+  //   the Zoom field two sections down.
+  if (classifyLessonVideo(lesson) === 'legacy-link') {
+    // Margins, not just mb-2: the stage below is now FULL-BLEED in the player card,
+    // so this notice is the only thing between it and the card edge and has to inset
+    // itself. (This branch is unreachable from the admin preview at the bottom of
+    // renderBuilder, which is gated on video_provider === 'upload'.)
+    const notice = adminView ? (
+      <div className="rounded-lg mx-5 mt-5 sm:mx-6 sm:mt-6 mb-3 px-3 py-2 text-xs flex items-start gap-2"
+        style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
+        <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
+        <span><b>Upload replacement required.</b> This lesson still plays from an external
+          {' '}{lesson.video_provider} link. Edit it and upload the video file — the course can’t be
+          published or duplicated until you do.</span>
+      </div>
+    ) : null;
+
+    // The stored value is not usable as a media source. ONE fallback for every reason,
+    // so no branch below can quietly fall through to binding the raw value.
+    const unusable = (
+      // No role="status": this is the lesson's permanent state, not a live region, and
+      // announcing it on every lesson change is noise.
+      <>{notice}<div className="course-stage">
+        <div className="course-stage-msg">
+          {adminView
+            ? 'This lesson’s stored video link isn’t one this player can use. Upload the video file.'
+            : 'This lesson is being updated. Please check back shortly.'}
+        </div>
+      </div></>
+    );
+
+    if (lesson.video_provider === 'mp4') {
+      // parseReplayUrl proves an absolute https URL with no credentials, and only a
+      // proven result carries a `url` — the same primitive the Zoom field is built on.
+      const checked = parseReplayUrl(lesson.video_url);
+      if (checked.kind !== 'zoom' && checked.kind !== 'external') return unusable;
+      return <>{notice}<div className="course-stage">
+        <video key={lesson.id} controls preload="metadata" playsInline src={checked.url} />
+      </div></>;
+    }
+
+    // ★ Gate on the PROVIDER parseVideoUrl returned, not merely on embedUrl being truthy.
+    //   parseVideoUrl falls through to `{ provider: 'mp4', embedUrl: <the raw string> }`
+    //   for anything it does not recognise — so a row stored as 'youtube' whose URL the
+    //   11-character id pattern cannot match (youtube.com/live/…, music.youtube.com, an
+    //   extra path segment: exactly the shapes #44's trigger comment cites) had its raw,
+    //   never-validated video_url bound straight into an <iframe src>. Only the
+    //   RECONSTRUCTED youtube/vimeo embed URLs — built from a captured id or digits, and
+    //   therefore safe by construction — reach the iframe.
+    const parsed = parseVideoUrl(lesson.video_url);
+    if ((parsed.provider !== 'youtube' && parsed.provider !== 'vimeo') || !parsed.embedUrl) return unusable;
+    return (
+      <>{notice}
+        {/* ★ THE COMMON CASE, and the one that gains most. On 2026-08-24, 101 of 102
+            live video lessons were YouTube links, and this box was width-driven with
+            no height clamp at all — so the `maxHeight: 460` everyone reached for was
+            never even in this path. The hand-rolled `paddingBottom: 56.25%` hack is
+            now .course-stage's aspect-ratio, which also gives it the viewport cap and
+            the identical frame an uploaded video gets. */}
+        <div className="course-stage">
+          <iframe src={parsed.embedUrl} title={lesson.title} loading="lazy"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen />
+        </div>
+      </>
+    );
+  }
+  // ═════════════════════ END TEMPORARY LEGACY BLOCK ═════════════════════════════
+
+  return (
+    <div className="course-stage">
+      <div className="course-stage-msg">
+        <Video size={28} className="opacity-60" aria-hidden="true" />
+        {adminView ? 'No video uploaded yet.' : 'No video added yet.'}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * What a student is handed when the lesson card has nothing to act on.
+ *
+ * ★ null, NOT no-op FUNCTIONS. A no-op is a live call site somebody later "fixes" by
+ *   wiring the real thing in; a null onClick is no listener at all, so React attaches
+ *   nothing and a click inside a preview has nowhere to go. That matters more than it
+ *   looks: a DRAFT carries a REAL lesson id, so one stray markComplete would write a
+ *   genuine completion through complete_course_lesson and fan a global progress event
+ *   out to the dashboards.
+ */
+const INERT_LESSON_ACTIONS = Object.freeze({ onPrev: null, onNext: null, onComplete: null });
+
+/**
+ * How wide the student preview may render.
+ *
+ * ★ MEASURED, on the live learner page, at six viewports: the same lesson is 356px wide on
+ *   a phone, 598px on a 1280 laptop, 700px at 1440, 718px at 768, and 1180px at 1920. There
+ *   is no single "student width" to be exact about — so the preview picks the narrowest
+ *   COMMON DESKTOP one and never exceeds it. Erring narrow only shows the creator wrapping a
+ *   student will not hit; erring wide lets them approve a line that breaks for the student,
+ *   which is the failure this whole feature exists to prevent. Below this width the drawer
+ *   bounds it naturally, so a phone-sized preview stays phone-sized.
+ */
+const LESSON_PREVIEW_MAX_W = 598;
+
+/**
+ * One lesson, as a student sees it: media stage, title, instructions, replay link,
+ * completion controls.
+ *
+ * @param {object}  lesson   the row to render — a saved row on the student page, the
+ *                           unsaved DRAFT in the editor's preview
+ * @param {boolean} adminView  render admin-only diagnostics (see LessonStage)
+ * @param {number}  index    0-based position, for "Lesson N of M" and the Prev/Next gates
+ * @param {number}  total    lessons in the course
+ * @param {boolean} done     is THIS lesson complete for THIS viewer
+ * @param {object}  actions  { onPrev, onNext, onComplete } — or INERT_LESSON_ACTIONS
+ */
+function LessonCard({ lesson, adminView = false, index = 0, total = 1, done = false, actions = INERT_LESSON_ACTIONS }) {
+  if (!lesson) return null;
+  // ★ DERIVED HERE, NEVER A PROP. This decides full-bleed stage vs inside-the-padding
+  //   prose. If either caller could answer it, the student page and the preview would
+  //   diverge on the exact thing this component exists to keep identical.
+  const stageLesson = lessonUsesMediaStage(lesson);
+  const act = actions || INERT_LESSON_ACTIONS;
+  return (
+    // C.white (var(--surface-2)), not a literal '#fff': a hex here out-cascades both
+    // .glass-card and the dark compat layer, leaving the card white — and its
+    // text-slate-700 body copy illegible — in dark mode.
+    // overflow-hidden clips the FULL-BLEED media stage to the card's radius. The card's
+    // p-5 sm:p-6 lives on the inner wrapper, which is worth ~48px of video width at every
+    // breakpoint — the difference between missing and clearing the 700px target at
+    // 1440x900. ★ Neither is a prop: .course-stage has no radius of its own because both
+    // call sites clip it, and the legacy notice's mx-5 sm:mx-6 hand-mirrors this padding.
+    <div className="glass-card rounded-2xl overflow-hidden" style={{ background: C.white }}>
+      {stageLesson && <LessonStage lesson={lesson} adminView={adminView} />}
+      <div className="p-5 sm:p-6">
+      {/* A text lesson's body is prose, so it renders INSIDE the padding rather
+          than edge-to-edge. Reading order is unchanged either way.
+          ★ TWO SLOTS, NEVER ONE TERNARY AROUND THE CARD — that shape remounts <video>. */}
+      {!stageLesson && <LessonStage lesson={lesson} adminView={adminView} />}
+      <div className={stageLesson ? undefined : 'mt-5'}>
+        <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">{lesson.title}</div>
+        {lesson.duration_label && <div className="text-xs text-slate-400 mt-0.5">{lesson.duration_label}</div>}
+        {lesson.type === 'video' && lesson.text_content && (
+          <LessonRichText lesson={lesson} className="mt-4" />
+        )}
+      </div>
+      {/* Below the lesson body, above the completion controls — the placement
+          recorded in course_lessons.zoom_replay_url's COMMENT (#37b). */}
+      <LessonReplayLink value={lesson.zoom_replay_url} lessonTitle={lesson.title} isAdmin={adminView} />
+      <div className="mt-5 pt-4 border-t border-slate-100">
+        <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-3">Lesson {index + 1} of {total}</div>
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          {/* `disabled` stays driven by the position, never by the handler, so the
+              disabled:opacity-40 states are exactly the ones a student sees. tabIndex
+              keeps an inert control out of the tab order without changing a pixel. */}
+          <button onClick={act.onPrev || undefined} tabIndex={act.onPrev ? undefined : -1} disabled={index <= 0}
+            className="px-4 py-2.5 rounded-xl text-sm font-semibold text-slate-600 border border-slate-200 disabled:opacity-40 inline-flex items-center gap-1.5">
+            <ArrowLeft size={15} /> Previous
+          </button>
+          <div className="flex items-center gap-2">
+            {done ? (
+              <span className="px-4 py-2.5 rounded-xl text-sm font-semibold inline-flex items-center gap-2" style={{ background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)' }}>
+                <Check size={16} /> Completed
+              </span>
+            ) : (
+              <button onClick={act.onComplete || undefined} tabIndex={act.onComplete ? undefined : -1}
+                className="px-5 py-2.5 rounded-xl text-white text-sm font-semibold inline-flex items-center gap-2"
+                style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+                <CheckCircle2 size={16} /> Mark complete
+              </button>
+            )}
+            <button onClick={act.onNext || undefined} tabIndex={act.onNext ? undefined : -1} disabled={index >= total - 1}
+              className="px-5 py-2.5 rounded-xl text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-40"
+              style={done
+                ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff' }
+                : { background: 'var(--wash-strong)', color: C.textSoft }}>
+              Next <ArrowRight size={15} />
+            </button>
+          </div>
+        </div>
+      </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Admin: AI Trainer panel inside the course builder ───────────────────────────
 // Self-contained (reads course_ai_sources via admin RLS, does server work through
 // courseTrainerApi). Lets an admin enable the course for the AI voice trainer, watch
@@ -25005,30 +25264,48 @@ function CourseProgram({
   const replayInputRef = useRef(null);
 
   // ── Lesson instructions composer (#65) ──────────────────────────────────────
-  // The textarea, so a refused save can scroll to and focus the thing that is wrong.
+  // The plain field, kept for the two cases the canvas must not open: a database without
+  // the migration, and legacy prose that has not been converted yet. A refused save still
+  // scrolls to and focuses it there.
   const lessonBodyRef = useRef(null);
-  // The caret at the moment a toolbar button was pressed. Clicking a button blurs the
-  // textarea, and reading selectionStart AFTER that gives 0 — which silently inserted
-  // every link at the very beginning of the document.
-  const lessonSelRef = useRef({ start: 0, end: 0 });
+  // The canvas itself, in its own chunk. Loaded when a drawer first opens and kept after,
+  // so opening a second lesson is not a second import.
+  const [editorMod, setEditorMod] = useState(null);
+  const [editorModErr, setEditorModErr] = useState(null);
+  // Reaches into the canvas for the one thing the parent has to drive: putting a refused
+  // save on the image it is refusing.
+  const lessonEditorRef = useRef(null);
+  // Preview mode REPLACES the drawer body rather than stacking a second overlay on top.
+  // Measured, not assumed: a full-screen overlay above the still-mounted drawer inherited
+  // SidePanel's window-level key handler, so Escape DISMISSED THE LESSON EDITOR (and popped
+  // its discard confirm) and one Tab landed on the drawer's hidden "Close lesson editor"
+  // button behind the preview. Both reproduced in Chrome; see the Phase 2 spike.
   const [lessonPreview, setLessonPreview] = useState(false);
-  // { open, url, label } — an inline bar, NOT a nested dialog. A modal inside the lesson
-  // drawer would be a second portaled overlay over a first, and the drawer's own focus
-  // trap fights anything that opens inside it.
-  const [linkBar, setLinkBar] = useState(null);
-  const linkUrlRef = useRef(null);
+  // ★ AND IT MUST NOT OUTLIVE THE DRAWER. Save sits in the preview's own footer — "look,
+  //   then save it" is the whole point — so the drawer routinely CLOSES from preview mode.
+  //   Nothing in closeLessonEditor or saveLesson's success path cleared this flag, so the
+  //   next lesson anyone opened came up as a read-only student view with the editor hidden
+  //   and no hint why. One effect on the drawer's own lifetime covers every exit, including
+  //   ones added later; clearing it at the five open/close call sites instead would be five
+  //   chances to miss one.
+  useEffect(() => { if (!editingLesson) setLessonPreview(false); }, [editingLesson]);
   /**
    * Images uploaded during this editing session:
-   * { key, name, status: uploading|registering|ready|error|removed, progress, error,
-   *   assetId, path, alt }
-   * An entry is NOT a reference — the lesson text is. These rows exist so the creator can
-   * watch, retry, cancel and describe an upload; what the lesson actually shows is decided
-   * by the tokens in the text, and by the trigger that reads them.
+   * { key, name, status: uploading|registering|ready|error, error, assetId, path }
+   *
+   * ★ A LEDGER, NOT A UI LIST ANY MORE. The cards this used to draw are gone — the
+   *   picture is in the document now — but the rows still have two jobs nothing else can
+   *   do: the orphan sweep reads them to name an object this session created that the
+   *   saved text does not cite, and the save gate reads them to ask whether anything is
+   *   still transferring. An entry is NOT a reference; the tokens in the text are, and
+   *   the trigger that reads them decides what a lesson may show.
    */
   const [lessonImages, setLessonImages] = useState([]);
   const lessonImagesRef = useRef([]);
   useEffect(() => { lessonImagesRef.current = lessonImages; }, [lessonImages]);
-  const lessonImageInputRef = useRef(null);
+  // Signed URLs for the images the DRAFT cites. Keyed on the id set, so typing does not
+  // re-sign anything and adding a picture signs exactly once.
+  const editorAssetUrls = useLessonAssetUrls(editingLesson);
 
   // Certificate state
   const [studentName, setStudentName] = useState(
@@ -25672,8 +25949,6 @@ function CourseProgram({
       citedFormat: originalEditingLesson?.content_format,
     })).catch(() => { /* best effort */ });
     setLessonImages([]);
-    setLessonPreview(false);
-    setLinkBar(null);
     clearLessonDraft();
     setVideoUploadState(UPLOAD_STATES.EMPTY);
     setEditingLesson(null);
@@ -25954,49 +26229,37 @@ function CourseProgram({
 
   // ── Lesson instructions composer (#65) ──────────────────────────────────────
 
-  /** Remember the caret. Toolbar buttons blur the textarea, and reading the selection
-   *  after that returns 0 — which silently inserted every link at the top of the file. */
-  const rememberLessonSelection = () => {
-    const el = lessonBodyRef.current;
-    if (el) lessonSelRef.current = { start: el.selectionStart ?? 0, end: el.selectionEnd ?? 0 };
-  };
+  /**
+   * Load the canvas the first time a lesson drawer opens, and keep it.
+   *
+   * Gated on `editingLesson` so a student reading a course never fetches the chunk, and
+   * on `editorMod` so reopening a second lesson does not re-import. A failure renders an
+   * actionable card rather than an empty box — the useLazyData idiom, inline because the
+   * composer is a method and cannot call a hook.
+   */
+  useEffect(() => {
+    if (!editingLesson || !isAdmin || editorMod || editorModErr) return undefined;
+    let on = true;
+    loadLessonEditorModule()
+      .then((m) => { if (on) setEditorMod(m); })
+      .catch((e) => {
+        console.error('[lesson-editor] the instructions canvas failed to load', e);
+        if (on) setEditorModErr(e);
+      });
+    return () => { on = false; };
+  }, [editingLesson, isAdmin, editorMod, editorModErr]);
 
   /**
-   * Put focus back in the instructions box after a composer control CLOSES WITHOUT EDITING.
-   *
-   * ★ THE CANCEL PATHS ARE THE ONES THAT NEEDED THIS — the edit paths never did.
-   *   Update and Unlink both end in applyLessonEdit, which already focuses the textarea on a
-   *   rAF, so the review's "closing the link bar drops focus" was true of three sites only:
-   *   Escape and Cancel in the link bar, and Remove on an image card. Each of those unmounts
-   *   the element that HAD focus — the URL input, or the button itself — and a browser moves
-   *   focus to <body> when that happens, stranding a keyboard user at the top of the document
-   *   with the drawer still open (WCAG 2.4.3). The textarea is the right target for all three:
-   *   it is where the caret was, and for Remove it is where the token was just stripped from.
-   *   The rAF is not decorative — the unmount happens in the same commit, so focusing before
-   *   it lands is undone by React removing the node.
+   * The editor tells the parent what the document now says. Nothing goes back the other
+   * way: the canvas is seeded from text_content ONCE per lesson and is keyed on the
+   * lesson id, so a prop feeding back in could only destroy the caret and the undo
+   * history. Everything downstream — the dirty check, the draft autosave, beforeunload,
+   * validateLessonContent, lessonAssetIds, the orphan sweep — keeps reading text_content
+   * exactly as it did when this was a textarea.
    */
-  const returnFocusToLessonBody = () => {
-    requestAnimationFrame(() => {
-      const el = lessonBodyRef.current;
-      if (!el) return;
-      el.focus();
-      const { start, end } = lessonSelRef.current || {};
-      if (Number.isFinite(start)) el.setSelectionRange(start, Number.isFinite(end) ? end : start);
-    });
-  };
-
-  /** Write a composer result back into the draft and restore the caret. */
-  const applyLessonEdit = (result) => {
-    if (!result || typeof result.text !== 'string') return;
-    setEditingLesson(s => ({ ...s, text_content: result.text }));
-    const { selectionStart: a, selectionEnd: b } = result;
-    requestAnimationFrame(() => {
-      const el = lessonBodyRef.current;
-      if (!el) return;
-      el.focus();
-      if (Number.isFinite(a)) { el.setSelectionRange(a, Number.isFinite(b) ? b : a); lessonSelRef.current = { start: a, end: b ?? a }; }
-    });
-  };
+  const onLessonDocChange = useCallback((markdown) => {
+    setEditingLesson((s) => (s ? { ...s, text_content: markdown, content_format: 'markdown' } : s));
+  }, []);
 
   const lessonFormat = normalizeFormat(editingLesson?.content_format);
   // ★ THE OPT-IN PROTECTS SAVED PROSE, NOT WHAT WAS JUST TYPED — and reading the DRAFT
@@ -26025,132 +26288,68 @@ function CourseProgram({
       const converted = plainToMarkdown(s?.text_content || '');
       return { ...s, content_format: 'markdown', text_content: converted };
     });
-    requestAnimationFrame(() => {
-      const el = lessonBodyRef.current;
-      if (!el) return;
-      el.focus();
-      el.setSelectionRange(el.value.length, el.value.length);
-    });
-  };
-
-  /** Ensure markdown before an insertion. Safe silently only when the body is empty. */
-  const ensureLessonMarkdown = () => {
-    if (lessonFormat === 'markdown') return true;
-    if (needsFormatOptIn) { enableLessonFormatting(); return false; }
-    setEditingLesson(s => ({ ...s, content_format: 'markdown' }));
-    return true;
-  };
-
-  const runLessonTool = (fn) => {
-    if (!ensureLessonMarkdown()) return;
-    const { start, end } = lessonSelRef.current;
-    applyLessonEdit(fn(editingLesson?.text_content || '', start, end));
-  };
-
-  const openLinkBar = () => {
-    if (!ensureLessonMarkdown()) return;
-    rememberLessonSelection();
-    const text = editingLesson?.text_content || '';
-    const { start, end } = lessonSelRef.current;
-    // ★ EDIT THE LINK THE CARET IS IN, DO NOT WRAP IT AGAIN. Selecting the words of an
-    //   existing link and pressing Ctrl+K used to wrap the whole token in a new one and
-    //   produce `[label(url)](newurl)` — a link whose visible text is raw markdown. With
-    //   a range in hand, confirm replaces the token instead of the selection.
-    const found = linkAtSelection(text, start, end);
-    setLinkBar(found
-      ? {
-        url: found.url, label: found.label, error: '',
-        range: { start: found.start, end: found.end },
-        // What the bar was opened ON, so a later edit to the fields cannot be mistaken for
-        // the document still holding the token we captured. See liveLinkRange().
-        wasUrl: found.url, wasLabel: found.label,
-      }
-      : { url: '', label: text.slice(start, end), error: '', range: null });
-    requestAnimationFrame(() => linkUrlRef.current?.focus());
+    // The canvas mounts on the next render and seeds itself from the converted text; it
+    // is keyed on the format for exactly this, so there is no caret here to restore.
   };
 
   /**
-   * Re-find the link this bar is editing in the CURRENT text, or null if it has moved.
+   * Can this lesson take another image?
    *
-   * ★ THE CAPTURED RANGE IS A GUESS THE MOMENT IT IS TAKEN. The bar renders BELOW the body and
-   *   the textarea stays editable, so a creator can type, paste or delete while it is open —
-   *   and the offsets captured by openLinkBar then point at whatever moved into their place.
-   *   Update and Unlink spliced there blind, silently rewriting the wrong span. Re-deriving is
-   *   cheap and turns a corrupted document into a message.
+   * The save-time bound is validateLessonContent TOO_MANY_IMAGES, counted over DISTINCT
+   * ids in the saved text. This is the same question asked BEFORE a byte moves, so a
+   * creator is told now rather than after a 10 MB transfer they then have to undo.
    */
-  const liveLinkRange = () => {
-    if (!linkBar?.range) return null;
-    const at = linkAtSelection(editingLesson?.text_content || '', linkBar.range.start, linkBar.range.start);
-    if (!at || at.start !== linkBar.range.start) return null;
-    if (at.url !== linkBar.wasUrl || at.label !== linkBar.wasLabel) return null;
-    return at;
-  };
-
-  const LINK_MOVED = 'The lesson text changed while this was open. Close this, then put the cursor '
-    + 'in the link and press Ctrl+K again.';
-
-  const confirmLinkBar = () => {
-    let start; let end;
-    if (linkBar?.range) {
-      const live = liveLinkRange();
-      if (!live) { setLinkBar(b => ({ ...b, error: LINK_MOVED })); return; }
-      start = live.start; end = live.end;
-    } else {
-      ({ start, end } = lessonSelRef.current);
+  const canAddLessonImages = useCallback((count) => {
+    const already = lessonAssetIds(editingLesson?.text_content, editingLesson?.content_format).length;
+    const pending = lessonImagesRef.current
+      .filter(im => im.status === 'uploading' || im.status === 'registering').length;
+    if (already + pending + count > LESSON_IMAGE_MAX_PER_LESSON) {
+      return `A lesson can show up to ${LESSON_IMAGE_MAX_PER_LESSON} images.`;
     }
-    const result = applyLink(editingLesson?.text_content || '', start, end, linkBar?.url,
-      { label: (linkBar?.label || '').trim() || null });
-    if (!result.ok) {
-      setLinkBar(b => ({ ...b, error: result.reason === 'insecure'
-        ? 'Links must start with https:// — an http:// link is not secure.'
-        : 'That is not a valid https:// web address.' }));
-      return;
-    }
-    setLinkBar(null);
-    applyLessonEdit(result);
-  };
+    return null;
+  }, [editingLesson?.text_content, editingLesson?.content_format]);
 
-  /** Take the address off the link the bar is editing, keeping its words. */
-  const removeLinkAtBar = () => {
-    if (!linkBar?.range) return;
-    const live = liveLinkRange();
-    if (!live) { setLinkBar(b => ({ ...b, error: LINK_MOVED })); return; }
-    const result = applyUnlink(editingLesson?.text_content || '', live.start, live.start);
-    if (!result.ok) { setLinkBar(b => ({ ...b, error: LINK_MOVED })); return; }
-    setLinkBar(null);
-    applyLessonEdit(result);
-  };
-
-  const patchImage = (key, patch) =>
-    setLessonImages(list => list.map(im => (im.key === key ? { ...im, ...patch } : im)));
-
-  /** Upload one image and register it. Both halves, so a retry repeats both. */
-  const uploadLessonImage = async (entry) => {
+  /**
+   * Upload one image and register it, for the canvas.
+   *
+   * ★ THE SESSION LEDGER IS WHAT THE ORPHAN SWEEP READS, and it is the only reason this
+   *   still keeps a list. The cards it used to draw are gone — the picture is in the
+   *   document now — but `lessonImages` still has to record every asset this session
+   *   created, because an image uploaded and then deleted from the document is an object
+   *   no lesson cites and only this list can name. It also still answers the save gate's
+   *   question: is anything still transferring?
+   * ★ NO CANCELLATION RE-CHECKS ANY MORE. Cancelling is deleting the placeholder node,
+   *   which the editor does locally; the upload finishes, registers, finds no placeholder
+   *   to replace, and the sweep collects it on close or save. That is one mechanism doing
+   *   the work instead of two agreeing with each other.
+   * ★ A FRESH OBJECT NAME EVERY ATTEMPT, so a retry after a partial failure can never
+   *   collide with a half-written object from the one before it.
+   */
+  const uploadLessonImageForEditor = useCallback(async (file) => {
     const lessonId = editingLesson?.id;
     const courseId = course?.id;
-    if (!lessonId || !courseId) return;
-    patchImage(entry.key, { status: 'uploading', error: '' });
-    // A fresh object id every attempt: a retry after a partial failure must never collide
-    // with a half-written object from the previous one.
-    const objectName = lessonAssetObjectName(entry.mimeType, crypto.randomUUID());
+    if (!lessonId || !courseId) return { ok: false, message: 'Open a lesson before adding an image.' };
+    const verdict = validateLessonImageFile(file);
+    if (!verdict.ok) return { ok: false, message: verdict.message };
+
+    const key = crypto.randomUUID();
+    setLessonImages(list => [...list, {
+      key, name: file.name || 'image', mimeType: verdict.mimeType,
+      status: 'uploading', error: '', assetId: null, path: null,
+    }]);
+    const objectName = lessonAssetObjectName(verdict.mimeType, crypto.randomUUID());
     const path = lessonAssetPath(courseId, lessonId, objectName);
     try {
       const { error: upErr } = await supabase.storage.from(LESSON_ASSET_BUCKET)
-        .upload(path, entry.file, { upsert: false, contentType: entry.mimeType });
+        .upload(path, file, { upsert: false, contentType: verdict.mimeType });
       if (upErr) throw upErr;
-      // Cancelled while the bytes were in flight: supabase-js exposes no AbortSignal for
-      // an upload, so the honest thing is to let it finish and remove it immediately.
-      if ((lessonImagesRef.current.find(im => im.key === entry.key) || {}).status === 'cancelled') {
-        await supabase.storage.from(LESSON_ASSET_BUCKET).remove([path]).catch(() => {});
-        return;
-      }
-      patchImage(entry.key, { status: 'registering', path });
+      setLessonImages(list => list.map(im => (im.key === key ? { ...im, status: 'registering', path } : im)));
       const { data: assetId, error: rpcErr } = await supabase.rpc('course_lesson_asset_register', {
         p_course_id: courseId,
         p_lesson_id: lessonId,
         p_storage_path: path,
-        p_mime_type: entry.mimeType,
-        p_byte_size: entry.file.size,
+        p_mime_type: verdict.mimeType,
+        p_byte_size: file.size,
       });
       if (rpcErr) {
         // The object exists but nothing points at it. Drop it now rather than leaving a
@@ -26158,152 +26357,17 @@ function CourseProgram({
         await supabase.storage.from(LESSON_ASSET_BUCKET).remove([path]).catch(() => {});
         throw rpcErr;
       }
-      // ★ RE-CHECKED AFTER THE RPC TOO. The earlier check only covers a cancel during the
-      //   TRANSFER; a cancel during registration used to be silently undone, because this
-      //   line then flipped the row the creator had just dismissed back to Ready. Registry
-      //   and bytes both go, since nothing cites them.
-      if ((lessonImagesRef.current.find(im => im.key === entry.key) || {}).status === 'cancelled') {
-        await supabase.rpc('course_lesson_asset_delete', { p_asset_id: assetId }).catch(() => {});
-        await supabase.storage.from(LESSON_ASSET_BUCKET).remove([path]).catch(() => {});
-        return;
-      }
-      patchImage(entry.key, { status: 'ready', assetId, path });
+      setLessonImages(list => list.map(im => (im.key === key ? { ...im, status: 'ready', assetId, path } : im)));
+      return { ok: true, assetId };
     } catch (e) {
       logDbError('[lesson-assets] upload', e, { courseId, lessonId });
-      // ★ A CANCELLED ROW STAYS CANCELLED. Without this, an upload the creator cancelled
-      //   and that then failed would flip itself back to 'error' — reappearing in the list
-      //   they had just dismissed, with a Retry button for a file they no longer want.
-      if ((lessonImagesRef.current.find(im => im.key === entry.key) || {}).status === 'cancelled') return;
-      patchImage(entry.key, {
-        status: 'error',
-        error: isMissingTable(e) || e?.code === 'PGRST202'
-          ? 'Lesson images need a database migration that has not been run yet (db/2026-09-20-course-lesson-assets.sql).'
-          : describeDbError(e, 'That image could not be uploaded.'),
-      });
+      const message = isMissingTable(e) || e?.code === 'PGRST202'
+        ? 'Lesson images need a database migration that has not been run yet (db/2026-09-20-course-lesson-assets.sql).'
+        : describeDbError(e, 'That image could not be uploaded.');
+      setLessonImages(list => list.map(im => (im.key === key ? { ...im, status: 'error', error: message } : im)));
+      return { ok: false, message };
     }
-  };
-
-  /** Accept picked or pasted files, refusing the unusable ones before any transfer. */
-  const addLessonImages = (files) => {
-    setLessonErr('');
-    const incoming = Array.from(files || []);
-    if (!incoming.length) return;
-    const already = lessonAssetIds(editingLesson?.text_content, editingLesson?.content_format).length;
-    const queued = lessonImages.filter(im => ['uploading', 'registering', 'ready'].includes(im.status)).length;
-    const accepted = [];
-    for (const file of incoming) {
-      if (already + queued + accepted.length >= LESSON_IMAGE_MAX_PER_LESSON) {
-        setLessonErr(`A lesson can show up to ${LESSON_IMAGE_MAX_PER_LESSON} images.`);
-        break;
-      }
-      const verdict = validateLessonImageFile(file);
-      if (!verdict.ok) { setLessonErr(verdict.message); continue; }
-      accepted.push({
-        key: crypto.randomUUID(), name: file.name || 'image', file,
-        mimeType: verdict.mimeType, status: 'uploading', error: '', alt: '', assetId: null, path: null,
-      });
-    }
-    if (!accepted.length) return;
-    setLessonImages(list => [...list, ...accepted]);
-    accepted.forEach(uploadLessonImage);
-  };
-
-  /**
-   * Paste-to-upload. The FIRST paste handler in this codebase.
-   *
-   * ★ ONLY REAL FILES ARE TAKEN. Copying an image from a web page puts BOTH a file and an
-   *   HTML fragment on the clipboard; taking the HTML would mean hot-linking a third
-   *   party's server from every student's lesson page. If there is no file but the HTML
-   *   names a remote image, the creator is told to download it — never silently linked.
-   */
-  const onLessonPaste = (e) => {
-    const dt = e.clipboardData;
-    if (!dt) return;
-    const files = Array.from(dt.files || []).filter(f => /^image\//i.test(f.type || ''));
-    if (files.length) {
-      e.preventDefault();
-      rememberLessonSelection();
-      addLessonImages(files);
-      return;
-    }
-    const html = dt.getData?.('text/html') || '';
-    if (/<img\b/i.test(html)) {
-      // ★ REFUSE THE PICTURE, KEEP THE WORDS.
-      //   Copying a paragraph out of a web page brings any inline image along with it, and
-      //   preventDefault() on its own threw away the WHOLE paste — including the prose the
-      //   creator actually wanted. The remote image still has to go (a hot-linked image
-      //   breaks the day that site changes it, and asks that site for every student's IP
-      //   address), but discarding the text with it reads as "pasting is broken", which is
-      //   exactly how it was reported. Inserting the plain-text flavour is what the browser
-      //   would have done anyway for a text-only paste, so it introduces nothing new to
-      //   validate: the save-time check still runs over the finished document.
-      e.preventDefault();
-      rememberLessonSelection();
-      const plain = dt.getData?.('text/plain') || '';
-      const { start, end } = lessonSelRef.current;
-      let kept = false;
-      if (plain) {
-        const body = editingLesson?.text_content || '';
-        applyLessonEdit({
-          text: body.slice(0, start) + plain + body.slice(end),
-          selectionStart: start + plain.length,
-          selectionEnd: start + plain.length,
-        });
-        kept = true;
-      }
-      setLessonErr((kept
-        ? 'The text was pasted. The picture in it was not: it is hosted on another website. '
-        : 'That image is hosted on another website, so it was not added. ')
-        + 'A linked image would break when that site changes it, and would tell that site who '
-        + 'is reading your lesson. Save the picture to your computer, then use the Image button.');
-    }
-  };
-
-  /** Put a ready image into the text at the remembered caret. */
-  const insertLessonImage = (entry) => {
-    const alt = (entry.alt || '').trim();
-    if (!entry.assetId || !alt) return;
-    if (!ensureLessonMarkdown()) return;
-    const { start, end } = lessonSelRef.current;
-    const result = applyImage(editingLesson?.text_content || '', start, end, entry.assetId, alt, entry.caption);
-    if (!result.ok) return;
-    applyLessonEdit(result);
-    patchImage(entry.key, { status: 'placed' });
-  };
-
-  /** Drop an image the creator no longer wants, and its bytes when nothing cites it. */
-  const removeLessonImage = async (entry) => {
-    if (entry.status === 'uploading' || entry.status === 'registering') {
-      patchImage(entry.key, { status: 'cancelled' });
-      return;
-    }
-    setLessonImages(list => list.filter(im => im.key !== entry.key));
-    // This unmounts the button that currently has focus, so hand it back to the textarea.
-    returnFocusToLessonBody();
-    if (!entry.assetId) return;
-    // ★ TAKE THE TOKEN OUT OF THE TEXT FIRST, OR THE LESSON CANNOT BE SAVED AT ALL.
-    //   Reference rows are derived by a trigger on SAVE, so an image placed in the draft
-    //   and removed before saving has no reference — the server's LESSON_ASSET_IN_USE
-    //   guard cannot fire, the row and bytes go, and the orphaned
-    //   `![alt](lesson-asset://…)` left behind makes the next save die on
-    //   LESSON_ASSET_UNKNOWN_REF. The only way out was to hand-delete a raw token from
-    //   inside a textarea. Removing the token is not cosmetic; it is what keeps the text
-    //   and the assets describing the same lesson.
-    setEditingLesson((s) => {
-      if (!s) return s;
-      const stripped = removeAssetToken(s.text_content || '', entry.assetId);
-      return stripped.ok ? { ...s, text_content: stripped.text } : s;
-    });
-    try {
-      const { data: path, error } = await supabase.rpc('course_lesson_asset_delete', { p_asset_id: entry.assetId });
-      // IN_USE is not a failure here: the lesson text still cites it, which is the
-      // database refusing to break a live lesson. Leave the bytes alone.
-      if (error) { if (appErrorCode(error) !== 'LESSON_ASSET_IN_USE') throw error; return; }
-      if (path) await supabase.storage.from(LESSON_ASSET_BUCKET).remove([path]).catch(() => {});
-    } catch (e) {
-      logDbError('[lesson-assets] delete', e, { assetId: entry.assetId });
-    }
-  };
+  }, [editingLesson?.id, course?.id]);
 
   /**
    * Remove images this course holds that no lesson cites.
@@ -26345,12 +26409,59 @@ function CourseProgram({
     } catch (_) { /* best-effort */ }
   };
 
+  // ★ READ THE LIVE DOCUMENT, NOT THE DEBOUNCED COPY. The canvas tells the parent what it
+  //   says on a short trailing debounce (serializing a full-size lesson is ~6 ms, and the
+  //   parent then runs two JSON.stringify dirty checks and a synchronous localStorage write
+  //   of the whole draft). Blur flushes it — and clicking Save does blur the canvas — but a
+  //   save triggered any other way must not race that.
+  //
+  // ★ IT IS ONE FUNCTION BECAUSE THE STUDENT PREVIEW READS IT TOO. If the preview derived
+  //   its own copy of this, the preview and the save could disagree about what the lesson
+  //   SAYS — which is the failure the whole preview feature exists to prevent, one level
+  //   down in the data instead of in the render. One derivation, two callers, like the card.
+  //
+  // ★ THE `!==` GUARD IS LOAD-BEARING, NOT AN OPTIMIZATION. For a lesson on the plain field
+  //   (a pre-#65 database, or legacy prose not yet converted) there is no canvas, so the ref
+  //   is null and `liveMarkdown` is undefined — the typeof test fails and the row is returned
+  //   untouched. Without it, merely LOOKING at such a lesson would stamp
+  //   content_format:'markdown' on it and escape its metacharacters on the next save.
+  function liveLessonDraft() {
+    if (!editingLesson) return null;
+    const liveMarkdown = lessonEditorRef.current?.getMarkdown?.();
+    return (typeof liveMarkdown === 'string' && liveMarkdown !== editingLesson.text_content)
+      ? { ...editingLesson, text_content: liveMarkdown, content_format: 'markdown' }
+      : editingLesson;
+  }
+
+  /**
+   * Refuse a save, and make the refusal VISIBLE wherever it was triggered from.
+   *
+   * ★ THIS EXISTS BECAUSE THE PREVIEW'S OWN SAVE BUTTON FAILED SILENTLY. Save sits in
+   *   the student preview's footer — "look, then save it" is the whole feature — but the
+   *   lessonErr alert renders only in the EDITING footer, and the replay error renders
+   *   inside the body that preview mode hides. So five reachable refusals (an empty video
+   *   lesson, a refused file pick, an image still uploading, any validateLessonContent
+   *   fault, an invalid replay link) produced NO visible change at all: press Save,
+   *   nothing happens. The likeliest of them is a missing image description, which the
+   *   canvas lets you incur by placing a picture and moving on.
+   *
+   * ★ IT LEAVES PREVIEW RATHER THAN RENDERING THE ALERT THERE, because every one of these
+   *   is fixed in the EDITOR — and the IMAGE_ALT_REQUIRED path then focuses the offending
+   *   image in a canvas that is actually on screen. focusImage() returns true against the
+   *   HIDDEN canvas too (the node is still there), so it would have reported success and
+   *   suppressed the scroll fallback as well.
+   */
+  function refuseSave(message) {
+    setLessonPreview(false);
+    setLessonErr(message);
+  }
+
   async function saveLesson() {
     if (!editingLesson) return;
     // Cleared first: the gates below return early, and a stale message would otherwise sit
     // alongside the new one, contradicting it.
     setLessonErr('');
-    const d = editingLesson;
+    const d = liveLessonDraft();
     const isVideo = d.type === 'video';
     const prevRow = allLessons.find(x => x.id === d.id) || null;
     // ★ The three video columns are built by lessonVideoPayload(), the same pure function
@@ -26366,12 +26477,12 @@ function CourseProgram({
     // ★ A replay link deliberately does NOT satisfy this gate: it renders below the player
     // slot, so a replay-only lesson would still show students an empty video.
     if (isVideo && !isUpload && !hasLegacyLink && !hasText) {
-      setLessonErr('Upload the lesson video, or write some lesson notes, before saving.'); return;
+      refuseSave('Upload the lesson video, or write some lesson notes, before saving.'); return;
     }
     // A half-finished upload must never be saved: the row would point at an object that is
     // still transferring, or at nothing at all.
     if (blocksLessonSave(videoUploadState)) {
-      setLessonErr('Wait for the video upload to finish before saving.'); return;
+      refuseSave('Wait for the video upload to finish before saving.'); return;
     }
     // ★ A REFUSED PICK MUST NOT SAVE SILENTLY. UNSUPPORTED_FILE is deliberately not in the
     //   UNFINISHED set above — that set also drives hasUnfinishedUpload, and adding it would
@@ -26381,37 +26492,34 @@ function CourseProgram({
     //   changed — the lesson keeps its old link, stays un-publishable, and no error is ever
     //   shown. Reported as "I can't upload this video", which is exactly what it looks like.
     if (videoUploadState === UPLOAD_STATES.UNSUPPORTED_FILE && !d.storage_path) {
-      setLessonErr('The file you chose was not uploaded, so this lesson still has no video. '
+      refuseSave('The file you chose was not uploaded, so this lesson still has no video. '
         + 'Pick a different file, or press Dismiss under the uploader to leave the lesson as it is.');
       return;
     }
-    if (!isVideo && !hasText) { setLessonErr('Add some lesson content before saving.'); return; }
+    if (!isVideo && !hasText) { refuseSave('Add some lesson content before saving.'); return; }
     // ★ AN IMAGE STILL TRANSFERRING MUST NOT BE SAVED. Its token is already in the text, but
     //   no asset row exists yet, so the #65 trigger would refuse the whole save with
     //   LESSON_ASSET_UNKNOWN_REF — an accurate error that reads like a bug. Say the real thing.
     if (lessonImages.some(im => im.status === 'uploading' || im.status === 'registering')) {
-      setLessonErr('Wait for the image upload to finish before saving.'); return;
+      refuseSave('Wait for the image upload to finish before saving.'); return;
     }
     // Everything wrong with the instructions, at once, rather than one round trip per fault.
     const contentVerdict = validateLessonContent(d.text_content, d.content_format, { required: !isVideo });
     if (!contentVerdict.ok) {
-      setLessonErr(contentVerdict.errors.map(e => e.message).join(' '));
-      // ★ A REFUSAL MUST LAND ON THE THING IT IS REFUSING. In Preview the <textarea> is
-      //   not mounted, so lessonBodyRef.current was null and both calls below silently did
-      //   nothing: the creator got a footer alert and no indication of where to look, on a
-      //   surface they could not type into anyway. Leaving preview is part of the refusal.
-      setLessonPreview(false);
-      // IMAGE_ALT_REQUIRED names the image it means, so focus THAT field rather than the
-      // whole document. It falls back to the body for an image uploaded in an earlier
-      // session, which has no card in this drawer.
+      refuseSave(contentVerdict.errors.map(e => e.message).join(' '));
+      // ★ A REFUSAL MUST LAND ON THE THING IT IS REFUSING. A footer alert on its own
+      //   leaves the creator hunting through a document for which picture is missing its
+      //   description — and IMAGE_ALT_REQUIRED carries the asset id precisely so it does
+      //   not have to. Selecting the image in the canvas scrolls it into view and opens
+      //   its own controls, which is where the description is typed.
       const named = contentVerdict.errors.find(e => e.assetId);
       requestAnimationFrame(() => {
-        // React flushes a click handler's updates synchronously, so the textarea is in the
-        // DOM by the time this frame runs.
-        const field = named ? document.getElementById(`lesson-alt-${named.assetId}`) : null;
-        const target = field || lessonBodyRef.current;
-        target?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-        target?.focus({ preventScroll: true });
+        // React flushes a click handler's updates synchronously, so the canvas and the
+        // plain field are both in the DOM by the time this frame runs.
+        if (named && lessonEditorRef.current?.focusImage(named.assetId)) return;
+        // Nothing to select: a fault in the prose, or a lesson still on the plain field.
+        lessonBodyRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        lessonBodyRef.current?.focus({ preventScroll: true });
       });
       return;
     }
@@ -26420,6 +26528,8 @@ function CourseProgram({
     const replay = parseReplayUrl(d.zoom_replay_url);
     if (replay.kind === 'invalid') {
       setReplayErr(replay.message);
+      // Its role="alert" lives inside <div hidden={lessonPreview}>, so leave preview too.
+      setLessonPreview(false);
       // Bring the offending field (and its role="alert") into view — the message is useless
       // if Save just appears to do nothing.
       requestAnimationFrame(() => {
@@ -26468,8 +26578,6 @@ function CourseProgram({
       pendingVideoPathRef.current = null;
       setVideoUploadState(UPLOAD_STATES.EMPTY);
       setLessonImages([]);
-      setLessonPreview(false);
-      setLinkBar(null);
       clearLessonDraft();
       setEditingLesson(null);
       await load();
@@ -26521,117 +26629,6 @@ function CourseProgram({
     setTimeout(() => { try { w.focus(); w.print(); } catch (_) { /* ignore */ } }, 350);
   }
 
-  // ── Video / content renderer ──
-  function renderVideo(lesson) {
-    if (!lesson) return null;
-    if (lesson.type === 'text') {
-      return lesson.text_content
-        ? <LessonRichText lesson={lesson} />
-        : <div className="rounded-xl border-2 border-dashed border-slate-200 p-10 text-center text-slate-400">No content yet.</div>;
-    }
-    // Private bucket → signed URL. This is the only shape a NEW lesson can have.
-    if (lesson.video_provider === 'upload' && lesson.storage_path) {
-      return <SignedLessonVideo key={lesson.id} lesson={lesson} isAdmin={isAdmin} />;
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════════
-    // TEMPORARY — LEGACY LINK PLAYBACK. Delete this whole block when the migration is done.
-    // ══════════════════════════════════════════════════════════════════════════════
-    // REMOVAL CRITERION, exactly: `npm run media:audit` reports 0 external links. Then
-    // delete this block, and renderVideo falls through to the empty state below.
-    //
-    // WHY IT IS STILL HERE. Authoring went upload-only in #44 — the editor has no link
-    // field and course_lessons_video_guard refuses the write — but on 2026-08-24 every
-    // single video lesson in the live database was a YouTube link: 101 of 102, across three
-    // PUBLISHED courses, with zero uploaded files anywhere. Removing playback in the same
-    // change would have shown 96 lessons a placeholder to paying members until ~59 videos
-    // had been re-uploaded one at a time. So authoring and playback were deliberately
-    // separated: no new links can be created, and the ones already sold stay watchable.
-    //
-    // ★ This block ADDS NO EXPOSURE. It renders links that are already stored and were
-    //   already being rendered; it cannot come into existence for a new lesson.
-    // ★ It DOES tighten one thing on the way out: the mp4 branch used to bind video_url
-    //   straight into <video src> with no validation anywhere in its life — parseVideoUrl
-    //   labelled ANY unrecognised string 'mp4' and saveLesson stored it verbatim, so a
-    //   `javascript:` or `data:` value would have been bound as a media source. It is now
-    //   proven to be an absolute https URL first, by the same parseReplayUrl() that guards
-    //   the Zoom field two sections down.
-    if (classifyLessonVideo(lesson) === 'legacy-link') {
-      // Margins, not just mb-2: the stage below is now FULL-BLEED in the player card,
-      // so this notice is the only thing between it and the card edge and has to inset
-      // itself. (This branch is unreachable from the admin preview at the bottom of
-      // renderBuilder, which is gated on video_provider === 'upload'.)
-      const notice = isAdmin ? (
-        <div className="rounded-lg mx-5 mt-5 sm:mx-6 sm:mt-6 mb-3 px-3 py-2 text-xs flex items-start gap-2"
-          style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
-          <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
-          <span><b>Upload replacement required.</b> This lesson still plays from an external
-            {' '}{lesson.video_provider} link. Edit it and upload the video file — the course can’t be
-            published or duplicated until you do.</span>
-        </div>
-      ) : null;
-
-      // The stored value is not usable as a media source. ONE fallback for every reason,
-      // so no branch below can quietly fall through to binding the raw value.
-      const unusable = (
-        // No role="status": this is the lesson's permanent state, not a live region, and
-        // announcing it on every lesson change is noise.
-        <>{notice}<div className="course-stage">
-          <div className="course-stage-msg">
-            {isAdmin
-              ? 'This lesson’s stored video link isn’t one this player can use. Upload the video file.'
-              : 'This lesson is being updated. Please check back shortly.'}
-          </div>
-        </div></>
-      );
-
-      if (lesson.video_provider === 'mp4') {
-        // parseReplayUrl proves an absolute https URL with no credentials, and only a
-        // proven result carries a `url` — the same primitive the Zoom field is built on.
-        const checked = parseReplayUrl(lesson.video_url);
-        if (checked.kind !== 'zoom' && checked.kind !== 'external') return unusable;
-        return <>{notice}<div className="course-stage">
-          <video key={lesson.id} controls preload="metadata" playsInline src={checked.url} />
-        </div></>;
-      }
-
-      // ★ Gate on the PROVIDER parseVideoUrl returned, not merely on embedUrl being truthy.
-      //   parseVideoUrl falls through to `{ provider: 'mp4', embedUrl: <the raw string> }`
-      //   for anything it does not recognise — so a row stored as 'youtube' whose URL the
-      //   11-character id pattern cannot match (youtube.com/live/…, music.youtube.com, an
-      //   extra path segment: exactly the shapes #44's trigger comment cites) had its raw,
-      //   never-validated video_url bound straight into an <iframe src>. Only the
-      //   RECONSTRUCTED youtube/vimeo embed URLs — built from a captured id or digits, and
-      //   therefore safe by construction — reach the iframe.
-      const parsed = parseVideoUrl(lesson.video_url);
-      if ((parsed.provider !== 'youtube' && parsed.provider !== 'vimeo') || !parsed.embedUrl) return unusable;
-      return (
-        <>{notice}
-          {/* ★ THE COMMON CASE, and the one that gains most. On 2026-08-24, 101 of 102
-              live video lessons were YouTube links, and this box was width-driven with
-              no height clamp at all — so the `maxHeight: 460` everyone reached for was
-              never even in this path. The hand-rolled `paddingBottom: 56.25%` hack is
-              now .course-stage's aspect-ratio, which also gives it the viewport cap and
-              the identical frame an uploaded video gets. */}
-          <div className="course-stage">
-            <iframe src={parsed.embedUrl} title={lesson.title} loading="lazy"
-              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen />
-          </div>
-        </>
-      );
-    }
-    // ═════════════════════ END TEMPORARY LEGACY BLOCK ═════════════════════════════
-
-    return (
-      <div className="course-stage">
-        <div className="course-stage-msg">
-          <Video size={28} className="opacity-60" aria-hidden="true" />
-          {isAdmin ? 'No video uploaded yet.' : 'No video added yet.'}
-        </div>
-      </div>
-    );
-  }
-
   // ── Sub-views ──
   function renderLearner() {
     if (totalLessons === 0) {
@@ -26654,8 +26651,6 @@ function CourseProgram({
       );
     }
     const activeIdx = activeLesson ? allLessons.findIndex(l => l.id === activeLesson.id) : -1;
-    // A text lesson gets no black frame — see lessonUsesMediaStage's comment.
-    const stageLesson = lessonUsesMediaStage(activeLesson);
     return (
       <div
         ref={workspaceRef}
@@ -26787,60 +26782,21 @@ function CourseProgram({
         {/* Player */}
         <div className="course-stage-col">
           {activeLesson ? (
-            // C.white (var(--surface-2)), not a literal '#fff': a hex here out-cascades both
-            // .glass-card and the dark compat layer, leaving the card white — and its
-            // text-slate-700 body copy illegible — in dark mode.
-            // overflow-hidden is new: it clips the now FULL-BLEED media stage to the card's
-            // radius. The card's own p-5 sm:p-6 moved to the inner wrapper below, which is
-            // worth ~48px of video width at every breakpoint — the difference between
-            // missing and clearing the 700px target at 1440x900.
-            <div className="glass-card rounded-2xl overflow-hidden" style={{ background: C.white }}>
-              {stageLesson && renderVideo(activeLesson)}
-              <div className="p-5 sm:p-6">
-              {/* A text lesson's body is prose, so it renders INSIDE the padding rather
-                  than edge-to-edge. Reading order is unchanged either way. */}
-              {!stageLesson && renderVideo(activeLesson)}
-              <div className={stageLesson ? undefined : 'mt-5'}>
-                <div style={{ fontFamily: fontDisplay, color: NAVY }} className="text-xl font-bold">{activeLesson.title}</div>
-                {activeLesson.duration_label && <div className="text-xs text-slate-400 mt-0.5">{activeLesson.duration_label}</div>}
-                {activeLesson.type === 'video' && activeLesson.text_content && (
-                  <LessonRichText lesson={activeLesson} className="mt-4" />
-                )}
-              </div>
-              {/* Below the lesson body, above the completion controls — the placement
-                  recorded in course_lessons.zoom_replay_url's COMMENT (#37b). */}
-              <LessonReplayLink value={activeLesson.zoom_replay_url} lessonTitle={activeLesson.title} isAdmin={isAdmin} />
-              <div className="mt-5 pt-4 border-t border-slate-100">
-                <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-3">Lesson {activeIdx + 1} of {totalLessons}</div>
-                <div className="flex items-center justify-between gap-2 flex-wrap">
-                  <button onClick={() => goAdjacent(activeLesson, -1)} disabled={activeIdx <= 0}
-                    className="px-4 py-2.5 rounded-xl text-sm font-semibold text-slate-600 border border-slate-200 disabled:opacity-40 inline-flex items-center gap-1.5">
-                    <ArrowLeft size={15} /> Previous
-                  </button>
-                  <div className="flex items-center gap-2">
-                    {doneIds.has(activeLesson.id) ? (
-                      <span className="px-4 py-2.5 rounded-xl text-sm font-semibold inline-flex items-center gap-2" style={{ background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)' }}>
-                        <Check size={16} /> Completed
-                      </span>
-                    ) : (
-                      <button onClick={() => markComplete(activeLesson)}
-                        className="px-5 py-2.5 rounded-xl text-white text-sm font-semibold inline-flex items-center gap-2"
-                        style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
-                        <CheckCircle2 size={16} /> Mark complete
-                      </button>
-                    )}
-                    <button onClick={() => goAdjacent(activeLesson, 1)} disabled={activeIdx >= totalLessons - 1}
-                      className="px-5 py-2.5 rounded-xl text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-40"
-                      style={doneIds.has(activeLesson.id)
-                        ? { background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff' }
-                        : { background: 'var(--wash-strong)', color: C.textSoft }}>
-                      Next <ArrowRight size={15} />
-                    </button>
-                  </div>
-                </div>
-              </div>
-              </div>
-            </div>
+            // ★ ONE RENDERER, TWO CALLERS. The lesson editor previews an unsaved draft
+            //   through this same component, so the preview cannot drift from what a
+            //   student actually sees — there is no second copy to drift from.
+            <LessonCard
+              lesson={activeLesson}
+              adminView={isAdmin}
+              index={activeIdx}
+              total={totalLessons}
+              done={doneIds.has(activeLesson.id)}
+              actions={{
+                onPrev: () => goAdjacent(activeLesson, -1),
+                onNext: () => goAdjacent(activeLesson, 1),
+                onComplete: () => markComplete(activeLesson),
+              }}
+            />
           ) : (
             <div className="glass-card rounded-2xl p-10 text-center text-slate-400">Select a lesson to begin.</div>
           )}
@@ -26984,43 +26940,51 @@ function CourseProgram({
   // `fixed inset-0` overlay and therefore anchored to the course canvas (many viewports tall)
   // rather than the window: it opened off-screen as soon as the builder was scrolled.
   /**
-   * The lesson instructions composer: a toolbar, the body, a preview, and the images
-   * uploaded in this session.
+   * The lesson instructions composer: a WYSIWYG document canvas, or the plain field for
+   * the two cases that must not be reinterpreted.
    *
-   * ★ A PLAIN TEXTAREA IS STILL THE EDITING SURFACE. A contenteditable WYSIWYG would mean
-   *   accepting HTML from the DOM and having to sanitize it back into a safe subset —
-   *   exactly the position this feature is designed never to be in. The toolbar writes
-   *   the same tokens a creator could type, so what is stored is always what was shown.
+   * ★ THE EDITING SURFACE IS NOW A DOCUMENT, AND THE OLD OBJECTION IS ANSWERED RATHER
+   *   THAN IGNORED. This used to be a <textarea>, because a contenteditable WYSIWYG was
+   *   read as "accept HTML from the DOM and sanitize it back into a safe subset" — which
+   *   is a losing position, and still is. ProseMirror is not that. Its SCHEMA is an
+   *   allowlist (src/editor/LessonDocumentEditor.jsx), so markup it does not declare
+   *   cannot exist in the document; the document is serialized back to the SAME closed
+   *   markdown subset by src/lib/lessonDocument.js; and that text is then checked by the
+   *   same validateLessonContent and rendered to students by the same LessonRichText.
+   *   Nothing HTML-shaped is ever persisted, and the stored bytes are byte-compatible
+   *   with what shipped before the canvas existed — there is no migration behind this.
    */
   function renderLessonComposer(d) {
     const isVideo = d.type === 'video';
     const bodyId = `lesson-body-${d.id}`;
     const fmt = normalizeFormat(d.content_format);
-    const rich = fmt === 'markdown';
     // The database has no content_format column: offer the plain field and say why,
-    // rather than a toolbar whose every button would fail on save.
+    // rather than a canvas whose every control would fail on save.
     const preRich = lessonRowsArePreRichContent(allLessons);
-    const toolBtn = 'inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold transition disabled:opacity-40';
-    const toolStyle = { background: 'var(--wash-strong)', color: C.textSoft };
+    // ★ A PLAIN LESSON IS NOT OPENED IN THE CANVAS UNTIL IT IS CONVERTED, ON PURPOSE.
+    //   The canvas serializes to markdown, so merely opening a legacy note in it and
+    //   touching a key would escape its metacharacters and change content_format —
+    //   converting a lesson by looking at it. `needsFormatOptIn` reads the SAVED row, so
+    //   a brand-new lesson (nothing stored yet) goes straight to the canvas and only
+    //   genuinely legacy prose gets the plain field plus an explicit button.
+    const usesCanvas = !preRich && !needsFormatOptIn;
     const liveImages = lessonImages.filter(im => im.status !== 'cancelled');
+    const failed = liveImages.filter(im => im.status === 'error');
 
     return (
       <div className="block">
         <div className="flex items-center justify-between gap-2 mb-1">
-          <label htmlFor={bodyId} className="text-xs font-semibold text-slate-500">
+          {/* ★ A <label> WITH NO CONTROL LABELS NOTHING. The canvas is a contenteditable,
+              which htmlFor cannot point at, so this used to be an orphan label beside a
+              surface whose accessible name came from an aria-label that did not contain
+              the visible "(optional)" — WCAG 2.5.3, Label in Name. Naming the element and
+              pointing the canvas at it with aria-labelledby makes the two the same words. */}
+          <label
+            {...(usesCanvas ? { id: `${bodyId}-label` } : { htmlFor: bodyId })}
+            className="text-xs font-semibold text-slate-500"
+          >
             {isVideo ? 'Lesson instructions (optional)' : 'Lesson content'}
           </label>
-          {rich && !preRich && (
-            // ★ NO aria-pressed BESIDE A LABEL THAT FLIPS. It carried both, so with preview on
-            //   a screen reader announced "Edit, pressed" — naming the action it would perform
-            //   and the state of something else in one breath. The visible label changing is
-            //   the useful half and is a correct accessible name on its own.
-            <button type="button" onClick={() => setLessonPreview(p => !p)}
-              className={toolBtn} style={toolStyle}
-              title={lessonPreview ? 'Back to editing' : 'See exactly what students will see'}>
-              <Eye size={12} aria-hidden="true" />{lessonPreview ? 'Edit' : 'Preview'}
-            </button>
-          )}
         </div>
 
         {preRich ? (
@@ -27034,216 +26998,102 @@ function CourseProgram({
           <div className="mb-2 flex flex-wrap items-center gap-2 rounded-lg px-3 py-2"
             style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
             <span className="text-[11px] leading-relaxed" style={{ color: C.textSoft }}>
-              Turn on formatting to add links and images. Your existing text is kept exactly as it reads now.
+              Turn on formatting to write in the document editor, with links and images.
+              Your existing text is kept exactly as it reads now.
             </span>
-            <button type="button" onClick={enableLessonFormatting} className={toolBtn}
+            <button type="button" onClick={enableLessonFormatting}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold transition"
               style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff' }}>
               Turn on formatting
             </button>
           </div>
-        ) : (
-          // ★ INERT WHILE PREVIEWING. These buttons edit text_content at the remembered
-          //   caret. In Preview the textarea is unmounted, so pressing one changed the
-          //   document with nothing on screen to show it had — the creator's only clue
-          //   was the result appearing when they went back to Edit.
-          <div className="mb-2 flex flex-wrap items-center gap-1.5" role="group" aria-label="Formatting">
-            <button type="button" className={toolBtn} style={toolStyle} onClick={openLinkBar}
-              disabled={lessonPreview}
-              title="Add or edit a link (Ctrl+K)"><Link2 size={12} aria-hidden="true" />Link</button>
-            <button type="button" className={toolBtn} style={toolStyle}
-              onClick={() => { rememberLessonSelection(); lessonImageInputRef.current?.click(); }}
-              disabled={lessonPreview}
-              title="Add an image"><ImagePlus size={12} aria-hidden="true" />Image</button>
-            <button type="button" className={toolBtn} style={toolStyle} disabled={lessonPreview}
-              onClick={() => runLessonTool(applyBold)} title="Bold"><Bold size={12} aria-hidden="true" />Bold</button>
-            <button type="button" className={toolBtn} style={toolStyle} disabled={lessonPreview}
-              onClick={() => runLessonTool((t, a, b) => applyList(t, a, b, false))}
-              title="Bulleted list"><List size={12} aria-hidden="true" />Bullets</button>
-            <button type="button" className={toolBtn} style={toolStyle} disabled={lessonPreview}
-              onClick={() => runLessonTool((t, a, b) => applyList(t, a, b, true))}
-              title="Numbered list"><ListOrdered size={12} aria-hidden="true" />Numbers</button>
-            <input ref={lessonImageInputRef} type="file" accept={LESSON_IMAGE_ACCEPT} multiple className="hidden"
-              onChange={(e) => { addLessonImages(e.target.files); e.target.value = ''; }} />
-          </div>
-        )}
+        ) : null}
 
-        {lessonPreview && rich && !preRich ? (
-          <div className="rounded-lg border border-slate-200 px-3 py-3 min-h-[120px]" style={{ background: C.white }}>
-            {(d.text_content || '').trim()
-              ? <LessonRichText lesson={d} />
-              : <div className="text-sm" style={{ color: C.textMute }}>Nothing to preview yet.</div>}
-          </div>
+        {usesCanvas ? (
+          editorModErr ? (
+            <div role="alert" className="rounded-lg px-3 py-3 text-[12px] leading-relaxed"
+              style={{ background: 'var(--status-danger-bg)', border: `1px solid ${C.red}`, color: C.red }}>
+              The instructions editor could not be loaded. Check your connection and reload
+              the page — your saved lesson text has not been touched.
+            </div>
+          ) : editorMod ? (
+            // ★ KEYED ON THE LESSON ID ALONE, AND THE FORMAT MUST NEVER BE IN THIS KEY.
+            //   It used to be `${d.id}:${fmt}`, and `fmt` reads the DRAFT. A new lesson is
+            //   selected with COURSE_LESSON_SELECT_LEGACY, which carries no
+            //   content_format, so the canvas mounted as 'plain' — and the first edit sets
+            //   content_format:'markdown', which changed the key and REMOUNTED the editor
+            //   mid-type: focus dropped to <body>, the undo history went, and a screenshot
+            //   pasted as the FIRST action was lost with its upload orphaned (a pending
+            //   placeholder serializes to nothing, so even an empty document tripped it).
+            //   Turning formatting on does not need the key either: that path renders the
+            //   plain field right up to the moment it converts, so the canvas mounts fresh.
+            <editorMod.default
+              key={d.id}
+              ref={lessonEditorRef}
+              initialMarkdown={d.text_content || ''}
+              initialFormat={fmt}
+              assetUrls={editorAssetUrls}
+              onChange={onLessonDocChange}
+              uploadImage={uploadLessonImageForEditor}
+              onNotice={setLessonErr}
+              canAddImages={canAddLessonImages}
+              disabled={savingLesson}
+              labelledBy={`${bodyId}-label`}
+              placeholder={isVideo
+                ? 'Steps students should follow — paste a screenshot straight in.'
+                : 'Write the lesson. Paste a screenshot straight in, or select words and press Ctrl+K to link them.'}
+            />
+          ) : (
+            <div className="rounded-lg border border-slate-200 px-3 py-6 flex items-center justify-center gap-2 text-sm"
+              style={{ color: C.textMute }} role="status">
+              <Loader2 size={15} className="motion-reduce:animate-none animate-spin" aria-hidden="true" />
+              Loading the editor…
+            </div>
+          )
         ) : (
           <textarea
             id={bodyId}
             ref={lessonBodyRef}
             value={d.text_content || ''}
             onChange={e => setEditingLesson(s => ({ ...s, text_content: e.target.value }))}
-            onSelect={rememberLessonSelection}
-            onKeyUp={rememberLessonSelection}
-            onClick={rememberLessonSelection}
-            onBlur={rememberLessonSelection}
-            onPaste={preRich ? undefined : onLessonPaste}
-            onKeyDown={(e) => {
-              if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K') && !preRich) {
-                e.preventDefault(); rememberLessonSelection(); openLinkBar();
-              }
-            }}
             rows={isVideo ? 5 : 9}
             className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm"
             style={{ fontFamily: fontMono, lineHeight: 1.6 }}
           />
         )}
 
-        {!preRich && (
-          <div className="mt-1 text-[10px] leading-relaxed" style={{ color: C.textMute }}>
-            {rich
-              ? 'Paste a screenshot straight into the box, or use Image. Select a word and press Ctrl+K to link it — '
-                + 'put the caret inside a link and press Ctrl+K again to change or remove it.'
-              : 'Plain text. Use a formatting button above to add links or images.'}
+        <div className="mt-1 text-[10px] leading-relaxed" style={{ color: C.textMute }}>
+          {usesCanvas
+            ? 'Paste a screenshot straight into the page, or use the image button. Select words and '
+              + 'press Ctrl+K to link them — put the cursor inside a link and press Ctrl+K again to change or remove it.'
+            : 'Plain text. Turn on formatting above to add links and images.'}
+        </div>
+
+        {/* An upload that failed is reported here as well as on the picture itself: the
+            picture may be scrolled out of the canvas, and a save the creator cannot
+            explain is worse than a line of text they did not need. */}
+        {failed.length > 0 && (
+          <div role="alert" className="mt-1.5 text-[11px]" style={{ color: C.red }}>
+            {failed.length === 1
+              ? (failed[0].error || 'An image could not be uploaded.')
+              : `${failed.length} images could not be uploaded. Retry or remove them in the lesson above.`}
           </div>
         )}
 
-        {/* The link bar: inline, never a dialog. A modal inside this drawer would be a
-            second portaled overlay over a first, fighting the drawer's own focus trap. */}
-        {linkBar && (
-          <div className="mt-2 rounded-lg px-3 py-2.5 space-y-2"
+        {/* ★ READ-ONLY, AND COLLAPSED. The canvas IS the render, so there is nothing a
+            preview would add — but a lesson can also be hand-edited straight into the
+            database, and when something in one cannot be expressed here this is how a
+            creator sees what is actually stored. It is never an editing surface, so no
+            markdown is exposed during ordinary writing. */}
+        {usesCanvas && (d.text_content || '').trim() && (
+          <details className="mt-2 rounded-lg px-3 py-2"
             style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
-            <div className="flex flex-wrap items-end gap-2">
-              <label className="flex-1 min-w-[180px] block">
-                <span className="text-[10px] font-semibold text-slate-500">Link address</span>
-                <input ref={linkUrlRef} value={linkBar.url} inputMode="url"
-                  placeholder="https://docs.google.com/forms/…"
-                  onChange={e => setLinkBar(b => ({ ...b, url: e.target.value, error: '' }))}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') { e.preventDefault(); confirmLinkBar(); }
-                    // ★ stopPropagation, NOT just preventDefault. SidePanel listens for Escape
-                    //   on WINDOW, so the event reached it from here and closed the whole lesson
-                    //   editor — which then asked "Discard unsaved lesson changes?". Dismissing a
-                    //   small inline bar must not put the creator's draft at risk.
-                    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setLinkBar(null); returnFocusToLessonBody(); }
-                  }}
-                  className="mt-0.5 w-full px-2.5 py-1.5 rounded-md border border-slate-200 text-sm" />
-              </label>
-              <label className="flex-1 min-w-[140px] block">
-                <span className="text-[10px] font-semibold text-slate-500">Text to show</span>
-                <input value={linkBar.label}
-                  onChange={e => setLinkBar(b => ({ ...b, label: e.target.value }))}
-                  onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); confirmLinkBar(); } }}
-                  className="mt-0.5 w-full px-2.5 py-1.5 rounded-md border border-slate-200 text-sm" />
-              </label>
-              <div className="flex gap-1.5">
-                <button type="button" onClick={confirmLinkBar} className={toolBtn}
-                  style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff', padding: '7px 12px' }}>
-                  {linkBar.range ? 'Update link' : 'Add link'}
-                </button>
-                {/* Removing a link needed raw-text editing before this: there was no way to
-                    take an address off words without deleting the brackets by hand. */}
-                {linkBar.range && (
-                  <button type="button" onClick={removeLinkAtBar} className={toolBtn}
-                    style={{ ...toolStyle, padding: '7px 12px' }}
-                    title="Keep the words, remove the address">Unlink</button>
-                )}
-                <button type="button" onClick={() => { setLinkBar(null); returnFocusToLessonBody(); }} className={toolBtn}
-                  style={{ ...toolStyle, padding: '7px 12px' }}>Cancel</button>
-              </div>
-            </div>
-            {linkBar.error && (
-              <div role="alert" className="text-[11px] flex items-center gap-1.5" style={{ color: C.red }}>
-                <AlertCircle size={11} aria-hidden="true" />{linkBar.error}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Images uploaded in this session. Alt text is required BEFORE the image can be
-            placed, because a description added later is a description never added. */}
-        {liveImages.length > 0 && (
-          <ul className="mt-2 space-y-1.5">
-            {liveImages.map(im => (
-              <li key={im.key} className="rounded-lg px-3 py-2"
-                style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
-                <div className="flex items-center gap-2 text-[11px]" style={{ color: C.textSoft }}>
-                  <ImagePlus size={12} className="flex-shrink-0" aria-hidden="true" />
-                  <span className="flex-1 truncate" title={im.name}>{im.name}</span>
-                  <span style={{ color: C.textMute }}>
-                    {im.status === 'uploading' ? 'Uploading…'
-                      : im.status === 'registering' ? 'Finishing…'
-                      : im.status === 'error' ? 'Failed'
-                      : im.status === 'placed' ? 'In the lesson'
-                      : 'Ready'}
-                  </span>
-                  {im.status === 'error' && (
-                    <button type="button" className={toolBtn} style={toolStyle}
-                      onClick={() => uploadLessonImage(im)}>Retry</button>
-                  )}
-                  <button type="button" className={toolBtn} style={toolStyle}
-                    onClick={() => removeLessonImage(im)}>
-                    {im.status === 'uploading' || im.status === 'registering' ? 'Cancel' : 'Remove'}
-                  </button>
-                </div>
-                {(im.status === 'uploading' || im.status === 'registering') && (
-                  // Indeterminate on purpose: supabase-js exposes no progress callback for
-                  // an upload, and a bar that invents a percentage is worse than one that
-                  // admits it does not know.
-                  <div className="mt-1.5 h-1 rounded-full overflow-hidden" style={{ background: 'var(--wash-strong)' }}>
-                    <div className="h-full w-1/3 rounded-full motion-reduce:animate-none animate-pulse"
-                      style={{ background: C.primary }} />
-                  </div>
-                )}
-                {im.status === 'error' && im.error && (
-                  <div role="alert" className="mt-1 text-[11px]" style={{ color: C.red }}>{im.error}</div>
-                )}
-                {(im.status === 'ready' || im.status === 'placed') && (
-                  <div className="mt-1.5 space-y-1.5">
-                    <label className="block">
-                      <span className="text-[10px] font-semibold text-slate-500">
-                        Describe this image <span style={{ color: C.red }} aria-hidden="true">*</span>
-                      </span>
-                      {/* ★ aria-required, because the red asterisk is aria-hidden. A screen
-                          reader otherwise met a field with no hint that it is the one thing
-                          standing between this image and the lesson. */}
-                      <input value={im.alt} maxLength={LESSON_IMAGE_ALT_MAX}
-                        id={`lesson-alt-${im.assetId || im.key}`}
-                        required aria-required="true"
-                        aria-invalid={!(im.alt || '').trim() || undefined}
-                        placeholder="Google Form menu showing the three-dot button"
-                        onChange={e => patchImage(im.key, { alt: e.target.value })}
-                        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); insertLessonImage(im); } }}
-                        aria-describedby={`alt-why-${im.key}`}
-                        className="mt-0.5 w-full px-2.5 py-1.5 rounded-md border border-slate-200 text-sm" />
-                    </label>
-                    {/* ★ A CAPTION IS NOT THE ALT TEXT. Alt is announced by a screen reader and
-                        stands in when the picture will not load; a caption is visible prose under
-                        it. Repeating one as the other makes a screen reader say it twice, so they
-                        are two fields and only the first is required. */}
-                    <label className="block">
-                      <span className="text-[10px] font-semibold text-slate-500">Caption (optional)</span>
-                      <input value={im.caption || ''} maxLength={LESSON_IMAGE_CAPTION_MAX}
-                        placeholder="Figure 1 — the three-dot button"
-                        onChange={e => patchImage(im.key, { caption: e.target.value })}
-                        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); insertLessonImage(im); } }}
-                        aria-describedby={`cap-why-${im.key}`}
-                        className="mt-0.5 w-full px-2.5 py-1.5 rounded-md border border-slate-200 text-sm" />
-                    </label>
-                    <div className="flex flex-wrap items-end justify-between gap-2">
-                      <div className="flex-1 min-w-[180px] text-[10px]" style={{ color: C.textMute }}>
-                        <div id={`alt-why-${im.key}`}>
-                          Read aloud to students using a screen reader, and shown if the image cannot load.
-                        </div>
-                        <div id={`cap-why-${im.key}`}>Printed under the picture for everyone to read.</div>
-                      </div>
-                      <button type="button" className={toolBtn} disabled={!(im.alt || '').trim()}
-                        style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, color: '#fff', padding: '7px 12px' }}
-                        onClick={() => insertLessonImage(im)}>
-                        {im.status === 'placed' ? 'Place again' : 'Add to lesson'}
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </li>
-            ))}
-          </ul>
+            <summary className="text-[11px] font-semibold cursor-pointer" style={{ color: C.textSoft }}>
+              Markdown source (read-only)
+            </summary>
+            <pre className="mt-2 overflow-x-auto text-[11px] leading-relaxed whitespace-pre-wrap break-words"
+              style={{ fontFamily: fontMono, color: C.textMute }}>{d.text_content}</pre>
+          </details>
         )}
       </div>
     );
@@ -27269,16 +27119,40 @@ function CourseProgram({
     const mIdx = modules.findIndex(m => m.id === d.module_id);
     const moduleLabel = mIdx >= 0 ? `Module ${mIdx + 1} · ${modules[mIdx].title || 'Untitled module'}` : null;
     const drawerSubtitle = [course?.title, moduleLabel].filter(Boolean).join(' — ') || undefined;
+    // ★ ONE DRAWER, TWO FACES — never a second overlay stacked on the first.
+    //   MEASURED IN CHROME, not assumed: with a full-screen preview portalled ABOVE a still-
+    //   mounted drawer, SidePanel's WINDOW-level key handler still owned the keys, so Escape
+    //   dismissed the lesson editor outright (popping its discard confirm) and one Tab landed
+    //   on the drawer's hidden "Close lesson editor" button behind the preview.
+    //   Here SidePanel stays the only owner of Escape, Tab and the backdrop, and while
+    //   previewing all three are remapped to mean "back to editing".
     return (
       <SidePanel
-        title="Edit lesson"
-        subtitle={drawerSubtitle}
-        icon={Edit3}
-        maxW="sm:max-w-xl lg:max-w-2xl"
-        canClose={!savingLesson}
-        onClose={closeLessonEditor}
-        closeLabel="Close lesson editor"
-        footer={(
+        title={lessonPreview ? 'Student preview' : 'Edit lesson'}
+        subtitle={lessonPreview ? (d.title || 'Untitled lesson') : drawerSubtitle}
+        icon={lessonPreview ? Eye : Edit3}
+        // Instructional screenshots are the content here, and at the old cap a 1280px-wide
+      // one rendered at about a third of its size. Static classes, or the JIT never sees
+      // them; still a full-width sheet below sm.
+      maxW="sm:max-w-2xl lg:max-w-3xl xl:max-w-4xl"
+        canClose={lessonPreview || !savingLesson}
+        onClose={lessonPreview ? () => setLessonPreview(false) : closeLessonEditor}
+        closeLabel={lessonPreview ? 'Back to editing' : 'Close lesson editor'}
+        footer={lessonPreview ? (
+          <div className="flex items-center justify-end gap-2.5">
+            <button type="button" onClick={() => setLessonPreview(false)}
+              className="mr-auto px-4 py-2 rounded-xl text-sm font-semibold inline-flex items-center gap-1.5 text-slate-600 border border-slate-200">
+              <ArrowLeft size={15} aria-hidden="true" /> Back to editing
+            </button>
+            {/* Save stays right here: the point of the feature is "look, then save it". */}
+            <button type="button" onClick={saveLesson} disabled={lessonBusy}
+              className="px-5 py-2 rounded-xl text-white text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-60"
+              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
+              {savingLesson ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
+              {savingLesson ? 'Saving…' : 'Save lesson'}
+            </button>
+          </div>
+        ) : (
           <>
             {/* The alert lives in the footer, not the top of the body: a save is usually attempted
                 from the bottom of a long form, and the footer is pinned — so the message always
@@ -27293,9 +27167,20 @@ function CourseProgram({
               </div>
             )}
             <div className="flex items-center justify-end gap-2.5">
-              {lessonDraftDirty && !lessonBusy && (
-                <span className="mr-auto text-[11px]" style={{ color: C.textSoft }}>Unsaved changes</span>
-              )}
+              <div className="mr-auto flex items-center gap-3">
+                {/* ★ Deliberately NOT disabled while the lesson cannot be saved (mid-upload,
+                    missing alt text, a refused pick). It is a preview, not a save — and that
+                    state is part of what the creator wants to look at. flush() first so the
+                    canvas's live document is in state before we render it. */}
+                <button type="button"
+                  onClick={() => { lessonEditorRef.current?.flush?.(); setLessonPreview(true); }}
+                  className="px-3.5 py-2 rounded-xl text-sm font-semibold inline-flex items-center gap-1.5 text-slate-600 border border-slate-200">
+                  <Eye size={15} aria-hidden="true" /> Preview as student
+                </button>
+                {lessonDraftDirty && !lessonBusy && (
+                  <span className="text-[11px]" style={{ color: C.textSoft }}>Unsaved changes</span>
+                )}
+              </div>
               <button type="button" onClick={closeLessonEditor} disabled={savingLesson}
                 className="px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 border border-slate-200 disabled:opacity-60">Cancel</button>
               <button type="button" onClick={saveLesson} disabled={lessonBusy}
@@ -27307,6 +27192,13 @@ function CourseProgram({
             </div>
           </>
         )}>
+        {/* ★ hidden, NOT unmounted. ProseMirror's undo history lives in the editor INSTANCE,
+            so replacing this subtree with the preview threw it away: preview, go back,
+            Ctrl+Z, and nothing happened. Caught in the browser — the first version of this
+            feature returned a different SidePanel and a comment claimed the opposite.
+            Hiding also keeps an in-flight video upload alive across the round trip, and
+            [hidden] is already invisible to SidePanel's Tab query. */}
+        <div hidden={lessonPreview}>
         <SettingsSectionLabel first>Lesson details</SettingsSectionLabel>
         <div className="space-y-3">
           <label className="block">
@@ -27365,8 +27257,15 @@ function CourseProgram({
               />
               {/* Bounded by max-WIDTH, never max-height — the player derives its height from its
                   width, so a height clamp combined with overflow-hidden would crop the controls. */}
-              {d.video_provider === 'upload' && d.storage_path && (
-                <div className="rounded-xl overflow-hidden max-w-md">{renderVideo(d)}</div>
+              {/* ★ UNMOUNTED DURING PREVIEW, unlike the rest of this body. Hiding is right for
+                  the canvas (its undo history lives in the editor instance) and wrong here: a
+                  hidden <video> is still a mounted SignedLessonVideo, so preview mode would
+                  hold TWO signed URLs and two preload="metadata" players for one lesson — and
+                  display:none does not pause media, so a video the admin had started playing
+                  here would keep talking underneath the student preview. This is a leaf with
+                  no state worth carrying across the round trip; it re-signs on return. */}
+              {!lessonPreview && d.video_provider === 'upload' && d.storage_path && (
+                <div className="rounded-xl overflow-hidden max-w-md">{/* adminView: this IS the uploader's diagnostic view */}<LessonStage lesson={d} adminView /></div>
               )}
             </div>
           </>
@@ -27442,10 +27341,54 @@ function CourseProgram({
             </>
           )}
         </div>
+        </div>
+        {lessonPreview && renderLessonPreviewBody()}
       </SidePanel>
     );
   }
 
+  // The student view of the UNSAVED draft — the same LessonCard the learner page renders,
+  // so there is no second copy of the lesson layout that could drift from the real one.
+  //
+  // ★ THE WIDTH CAP IS MEASURED, AND ITS DIRECTION IS THE POINT. A real student has no one
+  //   width: the same lesson is 598px wide on a 1280 laptop, 700px at 1440, 1180px at 1920
+  //   and 356px on a phone (measured on the live learner page). So a preview cannot be
+  //   pixel-exact for everyone — it can only choose which way to be wrong, and the two
+  //   directions are NOT symmetric. Too WIDE lets the creator approve a line that wraps
+  //   badly for the student; too NARROW only shows wrapping the student will not hit.
+  //   Capping at the narrowest common desktop width makes the preview exact at 1280 and
+  //   at-or-under the real width at every other size, so "it reads well here" is sound
+  //   everywhere. Uncapped in the drawer it was 845px — 41% WIDER than a 1280 student.
+  function renderLessonPreviewBody() {
+    const d = liveLessonDraft();
+    if (!d) return null;
+    const idx = allLessons.findIndex(x => x.id === d.id);
+    return (
+      <div>
+        {/* Said plainly, because a preview of an unsaved lesson in a course students may
+            not be able to open yet is genuinely not the same thing as the live page. */}
+        <div className="mb-5 flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs"
+          style={{ background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)', color: 'var(--status-info-fg)' }}>
+          <Eye size={14} aria-hidden="true" className="flex-shrink-0 mt-px" />
+          <span>Student view of your <b>unsaved draft</b>
+            {course?.published ? '' : ' — this course is still a draft, so no student can open it yet'}.
+            {' '}Nothing here saves progress, and admin-only warnings are hidden.</span>
+        </div>
+        {/* ★ inert, NOT disabled handlers. A draft carries a REAL lesson id, so one stray
+            "Mark complete" would write lesson_progress through complete_course_lesson and
+            fan a progress event out to the dashboards. inert also takes the subtree out of
+            the a11y tree, which matters concretely: the media stage renders role="status"
+            while signing and role="alert" when signing fails, and a preview must not
+            announce an alert into the middle of someone's editing session.
+            Written inert="" — inert={true} makes React 18.3 warn about a non-boolean attr. */}
+        <div inert="" style={{ maxWidth: LESSON_PREVIEW_MAX_W, marginInline: 'auto' }}>
+          <LessonCard lesson={d} adminView={false} done={false}
+            index={idx < 0 ? 0 : idx} total={totalLessons || 1}
+            actions={INERT_LESSON_ACTIONS} />
+        </div>
+      </div>
+    );
+  }
   function renderCertificate() {
     const unlocked = isComplete || !!completion || isAdmin;
     if (!unlocked) {
@@ -41084,8 +41027,9 @@ function loadVimeoPlayerSdk() {
 // Renders the guide video AND detects completion: native <video onEnded> for uploads/MP4,
 // the YouTube IFrame API / Vimeo Player SDK for embeds. Calls onComplete() once the video
 // finishes. Safety valve: if a third-party API can't load, it unlocks rather than trapping
-// the user (this gate is product guidance, not security). The admin editor preview uses the
-// separate renderVideo() helper, which intentionally does NOT track completion.
+// the user (this gate is product guidance, not security). The admin editor preview uses this
+// file's own renderVideo(g) helper just below, which intentionally does NOT track completion.
+// (Unrelated to the COURSE lesson player — that one is the module-scope LessonStage.)
 function GuideVideoPlayer({ guide, onComplete }) {
   const ytHostRef = useRef(null);
   const vimeoFrameRef = useRef(null);
