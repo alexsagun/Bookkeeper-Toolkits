@@ -1249,6 +1249,27 @@ const lessonCard = () => {
 };
 
 /**
+ * The renderer that turns a lesson's stored markdown into elements a student reads.
+ *
+ * ★ SLICED ON THE COLUMN-ZERO BRACE, NOT WITH fnBody(). fnBody cuts at the first `\n  }`,
+ *   and LessonRichText's `plain` early-return closes on one about sixty lines above the
+ *   part worth checking — so that window would end before the link arm and every
+ *   assertion below would pass against text it never saw.
+ * ★ AND THE SEARCH IS `\n}`, NOT `\n}\n`. This working tree is CRLF, so a closing brace
+ *   reads `\r\n}\r\n` and the trailing `\n` never follows the brace. `\nfunction ` (the
+ *   lessonCard idiom above) survives that by accident — `\r\n` still contains `\n` — but
+ *   anything asserting what comes AFTER the match does not.
+ */
+const richText = () => {
+  const src = app();
+  const i = src.indexOf('function LessonRichText({');
+  assert.ok(i > 0, 'LessonRichText was not found');
+  const end = src.indexOf('\n}', i);
+  assert.ok(end > i, 'LessonRichText has no top-level close');
+  return src.slice(i, end);
+};
+
+/**
  * Executable source only.
  *
  * ★ ASSERT AGAINST CODE, NEVER AGAINST "THIS STRING APPEARS NOWHERE IN THE FILE". That
@@ -1508,6 +1529,65 @@ test('both learner render sites go through the same safe renderer', () => {
     'the old raw text-lesson render must be gone, not merely bypassed');
   assert.ok(!/whitespace-pre-line leading-relaxed text-\[15px\]">\{activeLesson\.text_content\}/.test(src),
     'and the old raw video-notes render too');
+});
+
+test('a lesson link is plain words — its destination is announced, not printed', () => {
+  // ★ OWNER DECISION, 2026-09-24. A link used to render as `here (us06web.zoom.us) ↗`:
+  //   the host in grey parentheses whenever the visible words did not already contain it,
+  //   plus an arrow. The reasoning was sound — an opaque label pointed at a lookalike
+  //   domain is a phishing shape, and a student on a phone cannot hover — but the PRICE
+  //   was wrong. Writing a lesson needs course_lessons write access, i.e. staff, never a
+  //   student or a community member; the clutter was paid by every honest link in every
+  //   lesson. So the disclosure moved to channels that cost no pixels. It was NOT dropped,
+  //   and the assertions below police both halves of that sentence.
+  // ★ jsCode() IS LOAD-BEARING HERE. The comment in the source names the removed chip, so
+  //   a raw scan would be defeated by the very text explaining the rule.
+  const code = jsCode(richText());
+  const a = code.indexOf("case 'link': {");
+  const b = code.indexOf('default: return null;', a);
+  assert.ok(a > 0 && b > a, 'the link arm of LessonRichText was not found');
+  const link = code.slice(a, b);
+
+  // 1. Nothing is painted after the words. Both ornaments are gone.
+  assert.ok(!/shownHost/.test(link),
+    'the grey "(host)" chip beside a lesson link was removed deliberately — do not '
+    + 'reinstate it "for safety"; the host now rides the accessible name instead');
+  assert.ok(!/<ExternalLink/.test(link),
+    'and so did the arrow after it — the owner asked for a plain link, matching Thinkific');
+
+  // 2. But it MOVED rather than vanished. A screen reader is told where an opaque link
+  //    goes — which today it learns only because that grey span sat inside the <a>.
+  assert.match(link, /'aria-label': ariaLabel/,
+    'an opaque link must still name its destination to a screen reader');
+  assert.match(link, /opens \$\{t\.host\} in a new tab/,
+    'and it must name the HOST, not merely say the link opens somewhere else');
+  assert.match(link, /title: `Opens \$\{t\.host\} in a new tab`/,
+    'the hover tooltip stays too — that is the desktop half of the same fact');
+
+  // 3. It is the SAME condition the chip used, so exactly the links that showed a host
+  //    now speak one, and a label already reading "zoom.us" gains no new verbosity.
+  assert.match(link, /tokenText\(t\.tokens\)/,
+    'the opaque-label test must survive, or every link starts announcing a host');
+  assert.match(link, /!words\.toLowerCase\(\)\.includes\(t\.host\.toLowerCase\(\)\)/,
+    'a label that already states its host must not repeat it');
+
+  // ★ THE VISIBLE WORDS COME FIRST. An aria-label REPLACES the link text as the
+  //   accessible name, so one not leading with what is on screen breaks WCAG 2.5.3
+  //   Label in Name — a speech-input user saying "click here" stops matching "here".
+  assert.match(link, /`\$\{words\} — opens/,
+    'the accessible name must begin with the words actually on screen');
+
+  // ★ AND A LINK WITH NO VISIBLE WORDS STILL GETS ONE. `[](url)` and `[   ](url)` both
+  //   parse to a real link, and the removed chip was incidentally the only thing naming
+  //   them — so gating the label on `words` (the first attempt here) left an unlabelled
+  //   link, a WCAG 4.1.2 failure the chip version did not have.
+  assert.ok(!/t\.host && words\b/.test(link),
+    'the label must NOT be gated on there being visible words — that leaves `[](url)` '
+    + 'with no accessible name at all. The empty case takes a host-only label instead.');
+  assert.match(link, /\? \(words \? `\$\{words\} — opens \$\{t\.host\} in a new tab`/,
+    'words present: the visible words lead the accessible name');
+  assert.match(link, /: `Opens \$\{t\.host\} in a new tab`\)/,
+    'no words: the destination alone becomes the accessible name, so the link is named');
 });
 
 test('a cancelled upload cannot reappear, and its object is still collected', () => {

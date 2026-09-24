@@ -23159,14 +23159,41 @@ function LessonRichText({ lesson, className = '', style = {} }) {
       case 'badlink': return <React.Fragment key={k}>{inline(t.tokens, k)}</React.Fragment>;
       case 'link': {
         const external = t.kind === 'external';
-        // ★ SAY WHERE IT GOES WHEN THE WORDS DO NOT. safeLessonHref already refuses the
-        //   credential trick ("https://forms.google.com@evil.example"), but nothing stops
-        //   a creator — or anyone who ever gets to edit a lesson — pointing the word
-        //   "HERE" at docs-google.com. A student cannot hover on a phone and a screen
-        //   reader does not read an href aloud, so an opaque label carries its real host.
-        //   A label that already shows the host does not need it repeated.
-        const shownHost = external && !t.bare && t.host && !tokenText(t.tokens).toLowerCase().includes(t.host.toLowerCase())
-          ? t.host : null;
+        // ★ SAY WHERE IT GOES WHEN THE WORDS DO NOT — BUT SAY IT, DO NOT PRINT IT.
+        //   safeLessonHref already refuses the credential trick
+        //   ("https://forms.google.com@evil.example"), but nothing stops a creator — or
+        //   anyone who ever gets to edit a lesson — pointing the word "HERE" at
+        //   docs-google.com. A student cannot hover on a phone and a screen reader does
+        //   not read an href aloud, so an opaque label has to carry its real host somehow.
+        //   Until 2026-09-24 that was a grey "(host)" span plus an arrow, painted beside
+        //   every such link. The guard was right and its PRICE was wrong: the shape it
+        //   stops needs someone who can WRITE course_lessons — course staff, never a
+        //   student — while the clutter was paid by every honest link in every lesson,
+        //   which is what the owner reported. So the same condition now chooses the
+        //   ACCESSIBLE NAME instead. Nothing is lost: the host was only ever announced
+        //   because that span happened to sit inside the <a>.
+        // ★ THE VISIBLE WORDS COME FIRST, AND THAT IS NOT DECORATION. An aria-label
+        //   REPLACES the link text as the accessible name, so a name that did not lead
+        //   with what is on screen breaks WCAG 2.5.3 Label in Name — a speech-input user
+        //   saying "click here" would stop matching the link reading "here".
+        //   LessonReplayLink already uses this shape; this follows it.
+        // ★ A LINK WITH NO VISIBLE WORDS NEEDS THE LABEL MOST, NOT LEAST. `[](url)` and
+        //   `[   ](url)` both parse to a real link, and the grey chip was incidentally the
+        //   only thing NAMING them — so a first attempt here that skipped the label when
+        //   there were no words produced an unlabelled link, a WCAG 4.1.2 failure the old
+        //   code did not have. It skipped them to stop a label overriding the alt text of
+        //   an image-only link; that case cannot occur, because `linkAt` scans for the
+        //   first `]`, so `[![alt](lesson-asset://…)](https://…)` parses as a link whose
+        //   href is a refused scheme and comes back a BADLINK. A lesson link cannot
+        //   contain an image. Pinned in test/lessonContent.test.mjs, so the day that stops
+        //   being true this branch is revisited rather than silently eating an alt.
+        //   The condition is therefore byte-for-byte the one the chip used.
+        const words = tokenText(t.tokens).trim();
+        const speaksHost = external && !t.bare && t.host
+          && !words.toLowerCase().includes(t.host.toLowerCase());
+        const ariaLabel = speaksHost
+          ? (words ? `${words} — opens ${t.host} in a new tab` : `Opens ${t.host} in a new tab`)
+          : null;
         // ★ primarySolid, NOT primary, for the link text. C.primary measures 3.65:1 on the
         //   lesson surface and this is 15px/600 — normal text, which owes 4.5:1. CLAUDE.md
         //   is explicit that C.primary is for borders, icons, rings and bars, and that text
@@ -23176,17 +23203,10 @@ function LessonRichText({ lesson, className = '', style = {} }) {
             href={t.href}
             {...(external ? { target: '_blank', rel: 'noopener noreferrer' } : {})}
             {...(external && t.host ? { title: `Opens ${t.host} in a new tab` } : {})}
+            {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}
             className="underline underline-offset-2 transition hover:opacity-75 rounded-sm"
             style={{ color: C.primarySolid, fontWeight: 600, overflowWrap: 'anywhere' }}>
             {inline(t.tokens, k)}
-            {shownHost && (
-              // textSoft for the same reason as the caption: 12px prose owes 4.5:1, and
-              // --c-text-mute measures 2.98:1 light / 3.59:1 dark here.
-              <span className="ml-1 text-[0.82em] font-normal no-underline" style={{ color: C.textSoft }}>
-                ({shownHost})
-              </span>
-            )}
-            {external && <ExternalLink size={12} className="inline-block ml-0.5 -translate-y-px" aria-hidden="true" />}
           </a>
         );
       }

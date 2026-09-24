@@ -3176,6 +3176,33 @@ docs **in the same change**:
   directions. The fallback is visible on the page and undone by moving the prose to its own
   paragraph, so nobody loses work; a wrong token boundary is an image that renders but cannot
   load, or one that is readable and invisible.
+  ★ **A LESSON LINK NAMES ITS DESTINATION OUT LOUD, NOT ON SCREEN** (owner decision,
+  2026-09-24). `LessonRichText` used to append the host in grey parentheses to any external
+  link whose visible words did not already contain it, plus an `ExternalLink` arrow —
+  `here (us06web.zoom.us) ↗` — so an opaque label could not quietly point at a lookalike
+  domain. The guard was right and its PRICE was wrong: the shape it stops needs someone who
+  can WRITE `course_lessons`, which is course staff and never a student or a community
+  member, while the clutter was paid by every honest link in every lesson, which is what the
+  owner reported. The **same condition** now chooses the `aria-label` instead, so exactly the
+  links that showed a chip announce one and no others gain verbosity; the hover `title` is
+  unchanged. Nothing was lost — the host was only ever spoken because that grey span happened
+  to sit inside the `<a>`. ★ **The visible words come FIRST in that label**: an `aria-label`
+  REPLACES the link text as the accessible name, so one not leading with what is on screen
+  breaks WCAG 2.5.3 Label in Name — a speech-input user saying "click here" would stop
+  matching the link reading "here". ★ **A link with NO visible words needs the label most, not
+  least**, and a first attempt here got that backwards. `[](url)` and `[   ](url)` both parse to
+  a real link, and the grey chip was incidentally the only thing NAMING them — so skipping the
+  label when there were no words left an unlabelled link, a WCAG 4.1.2 failure the chip version
+  did not have. The empty case takes a host-only label (`Opens <host> in a new tab`) instead, so
+  the condition is byte-for-byte the one the chip used. It skipped them to stop a label
+  overriding an image-only link's alt text, and **that case cannot occur**: `linkAt` scans for
+  the first `]`, so `[![alt](lesson-asset://…)](https://…)` parses as a link whose href is a
+  refused scheme and comes back a **badlink** — a lesson link cannot contain an image, pinned by
+  `test/lessonContent.test.mjs` so the day that changes this branch is revisited rather than
+  silently eating an alt. ★ **`LessonReplayLink` deliberately KEEPS its visible host**: it is a labelled card,
+  not inline prose, and its subtitle is the one place a student learns where a replay lives.
+  Do not reinstate the inline chip "for safety"; `uiSafety` §25 pins its absence and every
+  guard there is mutation-tested.
   ★ **A BARE URL PROJECTS AS ITS HOST IN THE TRAINER INDEX, AND THAT IS DELIBERATE.**
   `lessonContentToPlainText` emits a labelled link's LABEL and a bare link's HOST, because the
   agent is speaking, not clicking, and reading ninety characters of query string aloud is noise.

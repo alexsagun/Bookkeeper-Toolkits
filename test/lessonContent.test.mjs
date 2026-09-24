@@ -177,6 +177,34 @@ test('the parser emits only known token types', () => {
   }
 });
 
+test('a link can never contain an image, and LessonRichText depends on that', () => {
+  // ★ THIS PINS AN ASSUMPTION MADE ELSEWHERE, WHICH IS THE ONLY REASON IT IS A TEST.
+  //   LessonRichText gives an external link whose visible words do not name its host an
+  //   aria-label — INCLUDING when there are no visible words at all, because `[](url)`
+  //   parses to a real link and would otherwise have no accessible name whatsoever.
+  //   An aria-label REPLACES the contents as the accessible name, so if a link could wrap
+  //   an image that label would silently eat the alt text. It cannot: `linkAt` scans for
+  //   the FIRST `]`, so the inner image token's `]` closes the label and the href becomes
+  //   `lesson-asset://…`, a scheme safeLessonHref refuses. The result is a badlink.
+  //   If this ever stops holding, the empty-words branch in LessonRichText needs an
+  //   image check — which is why this fails loudly rather than the render going quiet.
+  const md = `[${img('A screenshot', ID_A)}](https://example.com/page)`;
+  const [block] = parseLessonContent(md, 'markdown');
+  const types = [];
+  const walk = (ts) => (ts || []).forEach((t) => { types.push(t.type); if (t.tokens) walk(t.tokens); });
+  walk(block.tokens);
+
+  assert.ok(types.includes('badlink'),
+    'a link label holding an image must come back refused, not as a link');
+  for (const t of block.tokens) {
+    if (t.type !== 'link') continue;
+    const inner = [];
+    (function collect(ts) { (ts || []).forEach((x) => { inner.push(x.type); if (x.tokens) collect(x.tokens); }); })(t.tokens);
+    assert.ok(!inner.includes('image') && !inner.includes('badimage'),
+      'no link token may carry an image — LessonRichText would override its alt text');
+  }
+});
+
 // ── plain stays plain ───────────────────────────────────────────────────────
 
 test('a plain lesson is never parsed, so nothing it contains can become formatting', () => {
