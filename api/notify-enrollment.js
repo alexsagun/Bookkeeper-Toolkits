@@ -9,7 +9,11 @@
 //                 (RLS enroll_req_own_select proves ownership); the email content is
 //                 built from the DB row, never from the request body.
 //   'decision'  — an ADMIN approved / rejected / expired a request → notify the student.
-//                 Auth: same admin check as notify-access.js.
+//                 Auth: requireStaff('enrollments.review'). The body names ONLY
+//                 { requestId, status }; plan and reason are read from the request row and
+//                 the RECIPIENT from the student's profile (never the request's typed
+//                 email), both with the caller's JWT, and the send is refused unless
+//                 `status` is the decision actually recorded (2026-09-24 — see the handler).
 //   'test'      — an ADMIN sends a sample admin alert to confirm config end-to-end.
 //                 Auth: admin JWT (same gate as 'decision'). Returns { to, source }.
 //
@@ -190,6 +194,45 @@ async function fetchOwnRequest(requestId, token) {
     }
   }
   return null;
+}
+
+// The row a DECISION email is about, read with the reviewer's own JWT — so RLS, not this
+// file, decides whether they may see it. Null on any failure: no row, no email.
+async function fetchDecidedRequest(requestId, token) {
+  if (!token || !SUPABASE_URL || !SUPABASE_ANON) return null;
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/enrollment_requests?id=eq.${encodeURIComponent(requestId)}` +
+      '&select=id,user_id,full_name,plan_name,status,rejection_reason',
+      { headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}` } }
+    );
+    if (!r.ok) return null;
+    const rows = await r.json();
+    return Array.isArray(rows) && rows[0] ? rows[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+// The ACCOUNT a decision email goes to — never enrollment_requests.email. The student
+// writes that column at insert (enroll_req_own_insert checks only user_id, status and
+// batch), so reading the recipient from it would let anyone who signs up file a request
+// naming a third party's address and have a reviewer's decision mail the business's own
+// branded email there. profiles.email is the address the account signed up with. Read
+// with the reviewer's JWT: profiles_admin_select admits enrollments.review since #45.
+async function fetchAccountContact(userId, token) {
+  if (!token || !SUPABASE_URL || !SUPABASE_ANON || !userId) return null;
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(userId)}&select=email,full_name`,
+      { headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}` } }
+    );
+    if (!r.ok) return null;
+    const rows = await r.json();
+    return Array.isArray(rows) && rows[0] ? rows[0] : null;
+  } catch {
+    return null;
+  }
 }
 
 // Best-effort "is this a renewal?" — any prior subscription row (caller's own JWT;
@@ -503,17 +546,37 @@ export default async function handler(req, res) {
     if (rateLimited(adminId)) {
       return res.status(429).json({ ok: false, error: 'Too many emails — wait a minute and try again.' });
     }
-    const { email, fullName, status, reason, planName } = body || {};
-    if (!isEmail(email)) return res.status(400).json({ error: 'Valid recipient email required.' });
+    // ★ THE BROWSER NAMES A REQUEST; THE SERVER DECIDES WHO IS EMAILED AND WHAT IT SAYS.
+    //   This action used to take `email`, `fullName`, `planName` and `reason` straight from
+    //   the body, so any enrollments.review holder — an Operations Admin included — could send
+    //   the business's own "Your enrollment is approved" email to ANY address, with any name
+    //   and any "reason" text (a link rides along in plain text). #61 made the same rule for
+    //   Communications: the page describes; the server resolves. Now the row is read with the
+    //   CALLER's JWT (RLS decides whether they may see it), and the email is refused unless
+    //   the decision it announces is the one actually recorded on that row.
+    const { requestId, status } = body || {};
+    if (typeof requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)) {
+      return res.status(400).json({ error: 'requestId (uuid) required.' });
+    }
     if (!['approved', 'rejected', 'expired'].includes(status)) {
       return res.status(400).json({ error: "status must be 'approved', 'rejected' or 'expired'." });
+    }
+    const row = await fetchDecidedRequest(requestId, gate.user.token);
+    if (!row) return res.status(404).json({ ok: false, error: 'Request not found.' });
+    if (row.status !== status) {
+      return res.status(409).json({ ok: false, error: 'That decision is not the one recorded on this request.' });
+    }
+    const account = await fetchAccountContact(row.user_id, gate.user.token);
+    if (!account || !isEmail(account.email)) {
+      return res.status(422).json({ ok: false, error: 'This student account has no valid email address on file.' });
     }
     if (!apiKey) return res.status(200).json({ ok: false, skipped: 'email_not_configured' });
     if (!from) return res.status(200).json({ ok: false, skipped: 'email_from_not_configured' });
 
-    const { subject, html } = decisionEmail(status, fullName, planName, status === 'approved' ? null : reason);
+    const { subject, html } = decisionEmail(status, account.full_name || row.full_name, row.plan_name,
+      status === 'approved' ? null : row.rejection_reason);
     try {
-      const out = await sendResend(apiKey, from, email, subject, html);
+      const out = await sendResend(apiKey, from, account.email, subject, html);
       return res.status(out.ok ? 200 : 502).json(out.ok ? out : { ok: false, error: 'Email provider rejected the request.' });
     } catch (err) {
       console.error('[notify-enrollment] send failed:', String(err));

@@ -82,6 +82,16 @@ no user-update RLS policy.
 compat layer at the bottom of `index.css` (`bg-white`, `text-slate-*`, `border-slate-*`,
 red/emerald/amber families) — a new color utility needs a compat rule or a `dark:` variant.
 **QA every change in BOTH themes** (cycle the sidebar Sun/Moon/Monitor toggle) before calling it done.
+**Layout by the workspace, not the viewport.** The sidebar is 288px open, 76px as the rail and 0 below
+`lg`, so one viewport width gives a tab three different widths, and `md:`/`lg:` cannot tell them apart.
+When a tool's arrangement depends on available width, put a **named container query on the narrowest
+wrapper that needs it** (never TabPanel), make the narrow layout the base, derive thresholds from the
+measured content and write the derivation in the CSS — `.course-workspace`, `.pf-tool` and
+`.enroll-card` in `index.css` are the models. **Never put a row of buttons in an `auto` grid track
+beside a `minmax(0,1fr)` column**: grid gives the `auto` track its max-content first, and on
+2026-09-24 that squeezed the Enrollments card's student identity to 0px with the sidebar open while
+nothing overflowed. Actions get their own row. Verify with `npm run test:e2e`, sidebar open AND
+collapsed — an overflow check is not a layout check.
 
 ## AI calls (use the shared `callClaude()` helper)
 

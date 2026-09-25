@@ -458,11 +458,18 @@ textarea.gh-input, select.gh-input {
 .gh-halo {
   position: relative;
 }
+/* ★ The glow's SIDEWAYS reach mirrors TabPanel's padding (p-4 sm:p-6 lg:p-10), for the
+   same reason SectionHead's band does. A flat `inset: -40px` fits exactly inside lg:p-10,
+   and on a phone (16px of padding) it hung 24px past the edge and scrolled the Dashboard
+   sideways — measured at 390: <main> held 404px in 380. A pseudo-element is invisible to
+   querySelectorAll, which is why an element-by-element overflow scan could not find it. */
 .gh-halo::after {
-  content: ''; position: absolute; inset: -40px;
+  content: ''; position: absolute; inset: -40px -16px;
   background: radial-gradient(circle at center, var(--primary-halo) 0%, transparent 60%);
   z-index: -1; pointer-events: none;
 }
+@media (min-width: 640px)  { .gh-halo::after { inset: -40px -24px; } }
+@media (min-width: 1024px) { .gh-halo::after { inset: -40px; } }
 
 /* Animated progress stripes */
 .gh-progress-stripes {
@@ -1746,4 +1753,187 @@ body.is-col-resizing iframe { pointer-events: none; }
   .lesson-doc-tool,
   .lesson-doc-chip,
   .lesson-doc-figure { transition: none; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ENROLLMENT REQUEST CARD  (Admin → Enrollments — AdminEnrollments in BookkeeperPro.jsx)
+
+   ★ THE ACTIONS ARE NOT A GRID TRACK, AND THAT IS THE WHOLE FIX. Until 2026-09-24 the
+     card was one grid row, `auto | minmax(0,1fr) | auto | auto | auto`, and the last
+     `auto` held a wrapping row of up to eight buttons. Grid resolves `auto` tracks to
+     their max-content BEFORE an `fr` track receives anything, and `minmax(0,1fr)` has a
+     zero floor, so the buttons sized the grid and the student's identity got whatever
+     was left. Measured on the shadow project: 0px at 1024, 1280, 1366 and 1440 with the
+     sidebar open, 60px at 1920. The phone number wrapped a few characters per line and
+     the package and amount painted over it — on the screen that decides whether a
+     payment unlocks the toolkit. The card never overflowed, so an overflow check called
+     it fine. Now the head grid holds identity, plan and status only, and the actions
+     are a block row underneath it, where their width cannot reach identity at all.
+
+   ★ A CONTAINER QUERY, NOT A MEDIA QUERY — the same reason as .course-workspace and
+     .pf-tool. The sidebar is 288px open, 76px as a rail and 0 below lg, so one viewport
+     width gives the card three different widths. The old `lg:` switched to one row at
+     1024px of VIEWPORT, which is 646px of card with the sidebar open.
+
+   ★ IDENTITY CANNOT COLLAPSE IN THE WIDE LAYOUT. It is the only flexible track. Plan is
+     capped at 15rem and status is one nowrap pill (the longest label, "Follow-up due",
+     is under 120px), so at the 760px threshold identity keeps at least
+     760 - 240 - 120 - 2*16 = 368px, and only grows from there.
+
+   ★ container-type implies layout + style containment: the card is a stacking context
+     and the containing block for position:fixed descendants. Every dialog this card
+     opens goes through AccountModal or SidePanel, which portal to document.body. Do not
+     add an in-card fixed overlay or dropdown — it would be clipped to the card.
+
+   Pinned by test/uiSafety.test.mjs §26 (shape) and test-e2e/enrollmentLayout.e2etest.mjs
+   (measured geometry across viewports, sidebar states, themes and zoom).
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.enroll-card { container: enroll-card / inline-size; }
+.enroll-card:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+/* The list (or the empty state that replaces it) is where focus lands when the decided card
+   left the view. A mouse-driven programmatic focus shows nothing; a keyboard one shows this. */
+.enroll-list:focus { outline: none; }
+.enroll-list:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 4px; border-radius: 16px; }
+
+/* ── Default (about 420-759px of card): identity alone, then plan | status ──── */
+.enroll-card__head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "who  who"
+    "plan status";
+  gap: 12px 16px;
+  align-items: start;
+}
+.enroll-card__who { grid-area: who; display: flex; align-items: flex-start; gap: 12px; min-width: 0; }
+/* 52px = the 40px avatar + the 12px gap, so plan and amount line up under the name. */
+.enroll-card__plan { grid-area: plan; min-width: 0; padding-inline-start: 52px; }
+.enroll-card__status { grid-area: status; justify-self: end; }
+
+.enroll-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+.enroll-card__actions > .enroll-card__action { justify-content: center; }
+
+.enroll-card__details { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+/* min(13rem, 100%) so a single column can never be wider than a phone card. */
+.enroll-card__intake { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(13rem, 100%), 1fr)); gap: 6px 16px; }
+
+/* ── Narrow (under 420px of card — a phone): everything stacks ─────────────── */
+@container enroll-card (max-width: 419px) {
+  .enroll-card__head {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "who" "plan" "status";
+  }
+  .enroll-card__plan { padding-inline-start: 0; }
+  .enroll-card__status { justify-self: start; }
+  /* Two actions per row with a real touch target, rather than a ragged wrap. */
+  .enroll-card__actions > .enroll-card__action { flex: 1 1 calc(50% - 4px); min-height: 40px; }
+}
+
+/* ── Wide (760px of card and up): identity | plan | status on one row ─────── */
+@container enroll-card (min-width: 760px) {
+  .enroll-card__head {
+    grid-template-columns: minmax(0, 1fr) minmax(10rem, 15rem) auto;
+    grid-template-areas: "who plan status";
+    align-items: center;
+  }
+  .enroll-card__plan { padding-inline-start: 0; }
+}
+
+@container enroll-card (min-width: 720px) {
+  .enroll-card__details { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   WIDTH-AWARE STRIPS FOUND BY THE WORKSPACE SWEEP (2026-09-24)
+
+   test-e2e/workspaceSweep.e2etest.mjs walks every route at 1024 and 1280 with the
+   sidebar open and collapsed. After the Enrollments card, three more layouts failed,
+   all at 1024 with the sidebar open (726px of <main>, 646px of content):
+
+   • Progress & Rankings → the staff report's four StatCards sat in `lg:grid-cols-4`,
+     so each card's text column was 39px and "14+ days without progress" stacked on
+     four lines.
+   • Dashboard → the career roadmap's seven stage tiles sat in `md:grid-cols-7`: a
+     54px label box, so "Client Management & Delivery" took three lines.
+   • Invoice Creator → every line item was a fixed `grid-cols-12` with the amount in
+     `col-span-1`: 44px, so "$1,500.00" painted 26px into the remove button.
+
+   The first two are the Enrollments bug exactly: a VIEWPORT breakpoint that cannot see
+   the sidebar. The third is a track too narrow for its content at any width. All three
+   now follow the rule in CLAUDE.md — a named container on the narrowest wrapper, the
+   narrow layout as the base, thresholds derived from the content (derivations below).
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── StatCard strip (Progress staff report) ──────────────────────────────────
+   One StatCard needs ~242px: 2×24 padding + the 48px icon + a 16px gap + ~130px of text
+   (the 10px uppercase label "FILTERED LEARNERS" is ~115px, and the sub-line then wraps to
+   at most two lines). Two columns: 2×242 + 12 = 496. Four: 4×242 + 3×12 = 1004. Three is
+   skipped on purpose — four cards in three columns leave an orphan. */
+.stat-strip { container: stat-strip / inline-size; }
+.stat-strip__grid { display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr); }
+@container stat-strip (min-width: 496px) {
+  .stat-strip__grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container stat-strip (min-width: 1004px) {
+  .stat-strip__grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+
+/* ── Career roadmap (Dashboard) ──────────────────────────────────────────────
+   A stage tile needs ~104px: an 80px label box (so "Management" at 10px, ~60px, never
+   overflows and a three-word label wraps to at most two lines) plus 2×12 padding.
+   Four across: 4×104 + 3×8 = 440. Seven across — the only layout where the arrows
+   between stages mean anything — 7×104 + 6×8 = 776. */
+.roadmap-strip { container: roadmap / inline-size; }
+.roadmap-strip__grid { display: grid; gap: 8px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.roadmap-strip__chevron { display: none; }
+@container roadmap (min-width: 440px) {
+  .roadmap-strip__grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+@container roadmap (min-width: 776px) {
+  .roadmap-strip__grid { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+  .roadmap-strip__chevron { display: flex; }
+}
+
+/* ── Invoice line items (Invoice Creator) ────────────────────────────────────
+   Narrow (the base): the description gets the whole first row, the numbers share the
+   second, and the amount is sized to its CONTENT, so a currency value can never paint
+   into the next control. A short amount in an `auto`-width track is safe; a wrapping row
+   of buttons is not (see the Enrollments card).
+   Wide: one row per line, the old arrangement. Services need 140 (description) + 72
+   (qty) + 104 (rate) + 88 (amount) + 32 (remove) + 4×8 = 468px; time entries add a
+   136px date and a gap: 612px. Below either, the column headers are hidden, so every
+   input carries its own aria-label. */
+.inv-lines { container: inv-lines / inline-size; }
+.inv-line {
+  display: grid; gap: 8px; align-items: center; margin-bottom: 8px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(5.5rem, max-content) 2rem;
+  grid-template-areas: "desc desc desc desc" "qty rate amount remove";
+}
+.inv-line--time { grid-template-areas: "desc desc desc desc" "date date date date" "qty rate amount remove"; }
+.inv-line > .inv-line__desc   { grid-area: desc;   min-width: 0; }
+.inv-line > .inv-line__date   { grid-area: date;   min-width: 0; }
+.inv-line > .inv-line__qty    { grid-area: qty;    min-width: 0; }
+.inv-line > .inv-line__rate   { grid-area: rate;   min-width: 0; }
+.inv-line > .inv-line__amount { grid-area: amount; white-space: nowrap; text-align: right; }
+.inv-line > .inv-line__remove { grid-area: remove; }
+.inv-lines__head { display: none; }
+@container inv-lines (min-width: 468px) {
+  .inv-line:not(.inv-line--time) {
+    grid-template-columns: minmax(0, 1fr) 4.5rem 6.5rem minmax(5.5rem, max-content) 2rem;
+    grid-template-areas: "desc qty rate amount remove";
+  }
+}
+@container inv-lines (min-width: 612px) {
+  .inv-line--time, .inv-lines__head {
+    display: grid;
+    grid-template-columns: 8.5rem minmax(0, 1fr) 4.5rem 6.5rem minmax(5.5rem, max-content) 2rem;
+    grid-template-areas: "date desc qty rate amount remove";
+  }
 }

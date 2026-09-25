@@ -58,6 +58,10 @@ npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge 
 npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
 npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, bootstrapFolds, courseVideo, courseVideoSql, courseVideoContent, mp4Faststart, studentProgress, studentProgressSql, uiSafety, coaIntegrity, portfolioGenerator,
                            approveGrantSql, financeDailyIncome, financeDailyIncomeSql, lessonContent, lessonContentSql, lessonDocument, sidebarLayout, …)
+npm run test:e2e           # RENDERED suites (test-e2e/*.e2etest.mjs): the real app served by Vite against
+                           # the SHADOW project, driven through Chrome by a zero-dependency CDP client.
+                           # Measures geometry a source scan cannot see (enrollmentLayout, workspaceSweep).
+                           # Needs .env.test + Chrome; skips loudly without them. Never targets production.
 npm run storage:config     # read the PROJECT-WIDE Supabase Storage upload limit and the effective
                            # limit of every bucket; --apply raises it to LESSON_VIDEO_MAX_BYTES.
                            # The bucket limit alone is a ceiling, not a grant — Supabase enforces
@@ -1092,7 +1096,14 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   enrollment processing-hours copy" below). Neither is admin-editable like the `payment_settings`
   copy on the same screen — move them there if they must change without a deploy;
   JWT-ownership auth),
-  `decision` (admin→student), `test` (admin-only diagnostic → the **"Test email"** button in the
+  `decision` (admin→student — ★ since 2026-09-24 the body names ONLY `{ requestId, status }`; the
+  package and rejection reason are read from the request row and the RECIPIENT from the student's
+  `profiles` row (never the student-typed `enrollment_requests.email`), both with the reviewer's own JWT,
+  and the send is refused (409) unless `status` is the decision actually recorded. It used to take
+  `email`/`fullName`/`planName`/`reason` from the body, so any `enrollments.review` holder could send
+  the business's own "your enrollment is approved" email to any address with any text — the #61 rule,
+  "the page describes, the server resolves", now holds here too; pinned by
+  `test/notifyEnrollmentDecision.test.mjs`), `test` (admin-only diagnostic → the **"Test email"** button in the
   Enrollments toolbar; verifies the admin JWT server-side and reports sent/not-configured/provider
   error). The admin **recipient** resolves `NOTIFY_ADMIN_EMAIL` → the admin-editable
   `payment_settings.notify_email` ("Proof / support email" field, read with the caller's JWT) →
@@ -1313,8 +1324,23 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   staff-activation-consistency (#50) → access-request-staff-target (#51) →
   student-progress-rankings (#52) → progress-rankings-followup (#53) →
   progress-course-family-scoping (#54) → approve-rpc-grant-revoke (#55) →
-  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61) → meetings-tasks (#62) → management-hardening (#63) → finance-daily-income (#64) → course-lesson-assets (#65)** — see the Staff-authorization
-  and Progress & Rankings sections for what each does. **#57**
+  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61) → meetings-tasks (#62) → management-hardening (#63) → finance-daily-income (#64) → course-lesson-assets (#65) → enrollment-decision-lock (#66)** — see the Staff-authorization
+  and Progress & Rankings sections for what each does. **#66**
+  ([db/2026-09-24-enrollment-decision-lock.sql](db/2026-09-24-enrollment-decision-lock.sql), fold
+  **§53**) makes a DECIDED enrollment request final: #48's column grant let every
+  `enrollments.review` holder PATCH `status`, and both existing guards fire only on a move TO
+  `approved`, so approve → PATCH back to `pending_review` → approve again stacked a **second paid
+  term on one payment** with no finance entry and no audit row (reproduced on the shadow project:
+  2 terms, 1 collection). `enrollment_decision_lock` is a BEFORE UPDATE trigger whose WHEN clause is
+  exactly "status changes out of approved | rejected | expired"; it refuses with the existing
+  `INVALID_MEMBERSHIP_TRANSITION` (no catalog restatement), exempts a Super Admin and the table
+  owner's explicit `app.enrollment_admin_override` (the #38 idiom — never "no JWT means trusted"),
+  and logs every permitted reopen to `enrollment_request_events` as `decision_reopened`. ★ A reopen moves
+  ONLY the request row — re-approving stacks another term, and rejecting leaves the term, seats and
+  collection in place; the file's break-glass runbook says what to change first. Same-status
+  writes (notes, notify stamps) are untouched. Client-neutral; `doDecline` also filters
+  `.eq('status','pending_review')`. Pinned by `test/enrollmentDecisionLockSql.test.mjs`,
+  `test-db/enrollmentDecisionLock.dbtest.mjs` and the `#66` block in `npm run db:audit`. **#57**
   ([db/2026-09-08-lesson-video-quicktime.sql](db/2026-09-08-lesson-video-quicktime.sql), fold
   **§44**) widens `course-videos.allowed_mime_types` to
   `video/mp4 + video/quicktime` so an iPhone/Mac `.mov` uploads instead of being refused.
@@ -1414,8 +1440,11 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   (`AccessRequests` + `AdminEnrollments`) are built from the shared module-scope kit right above them:
   `AdminNotice` (status-token banners), `AdminFilterChip`/`AdminFilterCaption` (labeled filter rows),
   `AdminListSkeleton` (first-load skeleton; refresh keeps the list), `AdminUserCell`
-  (avatar/name/badges/email/meta identity block), `ADMIN_BTN_OK`/`ADMIN_BTN_DANGER` (token-gradient
-  action buttons). New admin surfaces must reuse these. `ProfileSettingsBody` (rendered in the
+  (avatar/name/badges/email/meta identity block; `wrap` = name and email wrap instead of truncating,
+  used by the Enrollments card only), `ADMIN_BTN_OK`/`ADMIN_BTN_DANGER` (token-gradient
+  action buttons). New admin surfaces must reuse these. ★ **An admin row's ACTIONS are never a grid
+  track beside the identity** — see "Layout by the workspace, not the viewport" in Styling
+  conventions; the Enrollments card is the scar. `ProfileSettingsBody` (rendered in the
   `AccountSettingsPanel` drawer) takes `showBilling` (false → billing sections drop out; admins get
   a role/capabilities card) — see the Account-Center section list in the account-menu bullet — and
   the root gates the billing panel render sites with
@@ -1911,7 +1940,7 @@ payee + account quick-picks, never an amount, seeded by category only).
   all lock their row before checking. Add, Match and status changes refuse inside a closed reconciliation.
 - Re-signs five #58 functions (each dropped first) and restates the catalog; #60 restates it again, so
   the catalog has been restated again since, so `CURRENT_CATALOG_MIGRATION` (communityStaffSql) and
-  `CATALOG_OWNER` (financeSql) both point at **#63** — repoint them with every restatement. No permission changes.
+  `CATALOG_OWNER` (financeSql) both point at **#65** (119 codes; #66 adds none) — repoint them with every restatement. No permission changes.
   Suite: `test/financeParitySql.test.mjs` (it pins every stage-review fix above).
 
 **Daily Income (#64, [db/2026-09-19-finance-daily-income.sql](db/2026-09-19-finance-daily-income.sql), fold §51)** —
@@ -2257,7 +2286,7 @@ deleted them silently.
 - ★ **`CATALOG_OWNER` in `test/financeSql.test.mjs` had been stale since #60.** The finance-code check read
   #59's catalog, which is a superseded definition — it kept passing only because no migration since added a
   `FINANCE_` code. Repoint it, and `CURRENT_CATALOG_MIGRATION` in `test/communityStaffSql.test.mjs`, whenever
-  a migration restates `app_error_catalog()`. Both now name #63 (112 codes).
+  a migration restates `app_error_catalog()`. Both now name #65 (119 codes; #66 adds none).
 - Suite: `test/managementHardeningSql.test.mjs` — every assertion runs against the dated file AND the §50
   fold, and all 40 guards are mutation-tested. ★ The mutation runner counts a run that did not finish as an
   ERROR, never as a passing guard: it once read a timeout as "SURVIVED".
@@ -2618,6 +2647,21 @@ explain/quiz/practice/recap the Supabase-hosted courses. Full setup:
   resolve bare keys). `useTheme` live-follows the OS in system mode and syncs `<meta theme-color>`.
 - **Dark-mode QA is part of tool acceptance** — check any new/edited screen in both themes before
   calling it done.
+- ★ **Layout by the workspace, not the viewport.** The sidebar is 288px open, 76px as the rail and 0
+  below `lg`, so at ONE viewport width a tab has three different amounts of room — 726px, 938px or the
+  whole screen at 1024. A `md:`/`lg:`/`xl:` breakpoint cannot see which. Anything inside a TabPanel
+  whose arrangement depends on available width uses a **named container query on the narrowest
+  wrapper that needs it** (never on TabPanel itself — `container-type` makes that element a stacking
+  context and the containing block for `position:fixed` descendants), with the narrow layout as the
+  base and thresholds derived from measured content, the derivation written in the CSS.
+  Precedents: `.course-workspace`, `.pf-tool`, `.enroll-card`.
+  ★ **And never put a row of buttons in an `auto` grid track beside a `minmax(0,1fr)` column.** Grid
+  grows `auto` tracks to their max-content BEFORE any `fr` track gets space, so the buttons sized the
+  grid and the Enrollments card's identity column resolved to **0px** at 1024/1280/1366/1440 with the
+  sidebar open — measured, with the phone number wrapping a digit per line — while the card reported
+  `scrollWidth === clientWidth`. An overflow check is not a layout check. Actions go in their own row.
+  `npm run test:e2e` (`test-e2e/enrollmentLayout.e2etest.mjs` + `workspaceSweep.e2etest.mjs`) measures
+  this in a real browser with the sidebar open and collapsed.
 
 ## Environment & secrets
 
@@ -3261,6 +3305,18 @@ docs **in the same change**:
   hash does not move and it is not needlessly re-indexed — and `course_ai_mark_lesson_stale()` was
   patched in place (the #56 instrument) to watch `content_format`, because otherwise a lesson
   converted to markdown without editing its words would sit `ready` for ever.
+- **Changing the Enrollments request card's layout** → four places move together: the "ENROLLMENT
+  REQUEST CARD" block in `src/index.css` (the `.enroll-card` container and its 420/760px thresholds)
+  ↔ the card JSX in `AdminEnrollments` (its `data-enroll-region` hooks) ↔ `test/uiSafety.test.mjs` §26
+  (shape) ↔ `test-e2e/enrollmentLayout.e2etest.mjs` + `test-e2e/_enrollmentProbe.mjs` (measured
+  geometry). Run `npm run test:e2e` before calling a layout change done — §26 alone cannot see a 0px
+  column, which is how this shipped.
+- **Deciding a request, or reopening one** → a decided request is final for everyone but a Super
+  Admin (#66). Moving together: `enrollment_decision_lock()` ↔ `admin_finalize_enrollment()`'s
+  pending-only rule ↔ `doDecline`'s `.eq('status','pending_review')` ↔ the `decision_reopened` timeline
+  label ↔ `test/enrollmentDecisionLockSql.test.mjs` + `test-db/enrollmentDecisionLock.dbtest.mjs`.
+  ★ Never "fix" a stuck request by adding a client path that PATCHes a decided row back to pending —
+  that path IS the hole #66 closed.
 - **Adding an error code** → `app_error_catalog()` ↔ `APP_ERROR_CODES` **and `APP_ERROR_COPY`** in
   `src/lib/appErrors.js`. Clients branch on `error.hint`, never on the HTTP status.
 - **Changing when a batch locks, or what an admin may edit on it** → four places move together:

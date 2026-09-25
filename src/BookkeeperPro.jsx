@@ -7810,8 +7810,8 @@ function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImport
 //     say so. The wider canvas is also what keeps the preview's zoom near 1:1.
 //
 // ★ ONLY the max-width is conditional. The `p-4 sm:p-6 lg:p-10` padding stays exactly as
-//   it is: SectionHead's full-bleed band uses `-mx-10 -mt-10 px-10`, hard-coupled to the
-//   lg:p-10 value across ~70 call sites, and would tear if it moved.
+//   it is: SectionHead's full-bleed band MIRRORS it at every breakpoint (`-mx-4 … sm:-mx-6
+//   … lg:-mx-10`), across ~70 call sites, and would tear if either one moved alone.
 // ★ 'interview' hosts the Interview Winning Strategy course catalog as one of seven
 //   subtabs, so the other six render on the wider canvas too — checked at 1920 when this
 //   shipped. Both class strings must stay COMPLETE LITERALS for Tailwind's JIT scanner;
@@ -8343,7 +8343,23 @@ export default function BookkeeperProToolkit() {
   // Desktop-only icon-rail collapse (mobile keeps its existing off-canvas drawer). Default = expanded,
   // so the look is unchanged until the user collapses it; the saved preference takes over after load.
   const [railCollapsed, setRailCollapsed] = useState(false);
-  const toggleRail = () => setRailCollapsed(v => !v);
+  // ★ The toggle is TWO buttons: "Collapse sidebar" lives in the expanded header, which the rail
+  //   hides, and "Expand sidebar" exists only in the rail. Pressing either one removes it from
+  //   view, so a keyboard user was dropped on <body> at the top of the page. When the pressed
+  //   toggle had focus, hand focus to its counterpart once the other state has rendered.
+  const railCollapseBtnRef = useRef(null);
+  const railExpandBtnRef = useRef(null);
+  const railToggleHadFocusRef = useRef(false);
+  const toggleRail = () => {
+    const active = document.activeElement;
+    railToggleHadFocusRef.current = !!active && (active === railCollapseBtnRef.current || active === railExpandBtnRef.current);
+    setRailCollapsed(v => !v);
+  };
+  useEffect(() => {
+    if (!railToggleHadFocusRef.current) return;
+    railToggleHadFocusRef.current = false;
+    (railCollapsed ? railExpandBtnRef : railCollapseBtnRef).current?.focus();
+  }, [railCollapsed]);
   // The Administration group in the scrolling nav (per user, `sidebar:adminExpanded`). Default
   // open, so moving the links out of the fixed header costs nobody a click.
   const [adminNavOpen, setAdminNavOpen] = useState(true);
@@ -9237,6 +9253,7 @@ export default function BookkeeperProToolkit() {
             </div>
             {/* Collapse to icon-rail — desktop only (mobile uses the X / hamburger) */}
             <button
+              ref={railCollapseBtnRef}
               onClick={toggleRail}
               title="Collapse sidebar"
               aria-label="Collapse sidebar"
@@ -9289,6 +9306,7 @@ export default function BookkeeperProToolkit() {
             <img src={LOGO_DATA_URI} alt="Get Hired With Alex"
               style={{ width: 38, height: 38, objectFit: 'contain', filter: 'drop-shadow(0 4px 12px rgba(10,132,255,0.18))' }} />
             <button
+              ref={railExpandBtnRef}
               onClick={toggleRail}
               title="Expand sidebar"
               aria-label="Expand sidebar"
@@ -9323,8 +9341,8 @@ export default function BookkeeperProToolkit() {
                 key={`rail-admin-${item.id}`}
                 href={tabHref(item.id)}
                 onClick={(e) => { if (shouldHandleInAppClick(e)) { e.preventDefault(); setTab(item.id); } }}
-                title={`${item.label}${item.count ? ` (${item.count} pending)` : ''}`}
-                aria-label={item.label}
+                title={item.count ? `${item.label} — ${adminBadgePhrase(item.id, item.count)}` : item.label}
+                aria-label={item.count ? `${item.label}, ${adminBadgePhrase(item.id, item.count)}` : item.label}
                 aria-current={tab === item.id ? 'page' : undefined}
                 className="relative flex items-center justify-center rounded-xl transition mb-1"
                 style={tab === item.id
@@ -9332,7 +9350,7 @@ export default function BookkeeperProToolkit() {
                   : { width: 40, height: 40, background: 'rgba(10,132,255,0.06)', color: C.primary, border: '1px solid rgba(10,132,255,0.16)' }}>
                 <item.Icon size={18} />
                 {item.count > 0 && (
-                  <span className="absolute -top-1 -right-1 px-1 rounded-full text-[9px] font-bold flex items-center justify-center"
+                  <span aria-hidden="true" className="absolute -top-1 -right-1 px-1 rounded-full text-[9px] font-bold flex items-center justify-center"
                     style={{ minWidth: 16, height: 16, background: item.tone, color: item.tone === C.amber ? INK.text : 'white', border: `2px solid ${C.white}` }}>
                     {item.count}
                   </span>
@@ -9417,8 +9435,11 @@ export default function BookkeeperProToolkit() {
                     Administration
                   </span>
                   {!adminNavOpen && waiting > 0 && (
-                    <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold" style={{ background: C.amber, color: INK.text }}
-                      aria-label={`${waiting} waiting for review`}>{waiting}</span>
+                    <>
+                      <span aria-hidden="true" title={`${waiting} ${waiting === 1 ? 'item needs' : 'items need'} attention in Administration`}
+                        className="px-1.5 py-0.5 rounded-full text-[10px] font-bold" style={{ background: C.amber, color: INK.text }}>{waiting}</span>
+                      <span className="sr-only">, {waiting} {waiting === 1 ? 'item needs' : 'items need'} attention</span>
+                    </>
                   )}
                 </button>
                 {/* No display utility on this ul: the collapse rests entirely on preflight's
@@ -9436,9 +9457,12 @@ export default function BookkeeperProToolkit() {
                         <item.Icon size={15} style={{ color: tab === item.id ? C.primary : C.textMute, flexShrink: 0 }} />
                         <span className="flex-1 truncate">{item.label}</span>
                         {item.count > 0 && (
-                          <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold flex-shrink-0"
-                            style={{ background: item.tone === C.amber ? C.amber : C.primarySolid, color: item.tone === C.amber ? INK.text : 'white' }}
-                            aria-label={`${item.count} pending`}>{item.count}</span>
+                          <>
+                            <span aria-hidden="true" title={adminBadgePhrase(item.id, item.count)}
+                              className="px-1.5 py-0.5 rounded-full text-[10px] font-bold flex-shrink-0"
+                              style={{ background: item.tone === C.amber ? C.amber : C.primarySolid, color: item.tone === C.amber ? INK.text : 'white' }}>{item.count}</span>
+                            <span className="sr-only">, {adminBadgePhrase(item.id, item.count)}</span>
+                          </>
                         )}
                       </a>
                     </li>
@@ -10020,6 +10044,18 @@ const ADMIN_BTN_DANGER = {
   boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.25), 0 4px 12px -2px var(--red-glow)',
 };
 
+// What an admin sidebar count MEANS, as a sentence. A bare "1" beside "Enrollments" was
+// read as "someone signed up"; it is the number of payment-proof requests waiting for a
+// decision (enrollment_requests.status = 'pending_review', the same set the Pending chip
+// counts). Screen readers used to get either the bare number or nothing: the phrase sat in
+// an aria-label on a <span>, which a generic element does not take.
+function adminBadgePhrase(id, n) {
+  if (id === 'enrollments') return `${n} enrollment ${n === 1 ? 'request' : 'requests'} awaiting review`;
+  if (id === 'accessrequests') return `${n} access ${n === 1 ? 'request' : 'requests'} awaiting review`;
+  if (id === 'studentimports') return `${n} open import ${n === 1 ? 'job' : 'jobs'}`;
+  return `${n} waiting`;
+}
+
 // Success / error banner with a dismiss control (status-token colors end to end).
 // 'warn' (#38) is for something an admin should act on but that has broken
 // nothing yet — e.g. no batch is open for next month. Red overstates those and
@@ -10032,9 +10068,15 @@ const ADMIN_NOTICE_KINDS = {
 };
 
 function AdminNotice({ kind = 'ok', children, onDismiss }) {
-  const { fg, bg, bd, Icon } = ADMIN_NOTICE_KINDS[kind] || ADMIN_NOTICE_KINDS.danger;
+  const tone = ADMIN_NOTICE_KINDS[kind] ? kind : 'danger';
+  const { fg, bg, bd, Icon } = ADMIN_NOTICE_KINDS[tone];
+  // A live region: an approval, a rejection or a failed save changes nothing a screen
+  // reader is focused on, so without a role the outcome was never announced at all.
+  // Urgency follows the RESOLVED tone, so a banner that looks like an error is announced
+  // like one ('error', or any kind not in the table, renders as danger).
+  const urgent = tone === 'danger';
   return (
-    <div className="mt-4 flex items-start gap-3 p-4 rounded-xl border"
+    <div role={urgent ? 'alert' : 'status'} className="mt-4 flex items-start gap-3 p-4 rounded-xl border"
       style={{ background: bg, borderColor: bd }}>
       <Icon size={18} className="mt-0.5 flex-shrink-0" style={{ color: fg }} />
       <div className="text-sm flex-1" style={{ color: C.text }}>{children}</div>
@@ -10097,24 +10139,30 @@ function AdminListSkeleton({ rows = 4 }) {
 // Avatar-initial + name (+ optional badges) + email + meta line — the shared identity
 // block at the head of every admin row. Rendered as TWO grid/flex items (avatar, text)
 // via a fragment.
-function AdminUserCell({ name, email, meta, badges }) {
+// ★ `wrap` (the Enrollments card only): name, email and meta WRAP instead of truncating.
+//   On the card that decides who gets paid access, an ellipsis over the name or the email
+//   is how the wrong student gets approved. Opt-in, so Access Requests and Batches keep
+//   their one-line rows unchanged.
+function AdminUserCell({ name, email, meta, badges, wrap = false }) {
   const initial = (((name || email || '?').trim()[0]) || '?').toUpperCase();
+  const clip = wrap ? '[overflow-wrap:anywhere]' : 'truncate';
   return (
     <>
       <div className="flex items-center justify-center flex-shrink-0 rounded-full text-white text-sm font-bold"
         style={{ width: 40, height: 40, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>
         {initial}
       </div>
-      <div className="min-w-0">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="truncate" style={{ fontWeight: 700, fontSize: 14, color: C.text }}>
+      <div className={wrap ? 'min-w-0 flex-1' : 'min-w-0'}>
+        <div className={wrap ? 'flex items-center gap-x-2 gap-y-1 flex-wrap' : 'flex items-center gap-2 flex-wrap'}>
+          <span className={clip} style={{ fontWeight: 700, fontSize: 14, color: C.text }}>
             {name || email?.split('@')[0] || 'Unknown'}
           </span>
           {badges}
         </div>
-        <div className="truncate" style={{ fontSize: 12.5, color: C.textSoft }}>{email}</div>
+        <div className={clip} style={{ fontSize: 12.5, color: C.textSoft }}>{email}</div>
         {meta && (
-          <div className="mt-1 flex items-center gap-3 flex-wrap" style={{ fontSize: 11, color: C.textMute }}>{meta}</div>
+          <div className={wrap ? 'mt-1 flex items-center gap-x-3 gap-y-1 flex-wrap [overflow-wrap:anywhere]' : 'mt-1 flex items-center gap-3 flex-wrap'}
+            style={{ fontSize: 11, color: C.textMute }}>{meta}</div>
         )}
       </div>
     </>
@@ -16686,7 +16734,8 @@ function FinancialManagement() {
               ))}
             </div>
             {/* Daily Income is a month view with its own picker; this range would do nothing there. */}
-            {sub !== 'daily' && <div className="flex items-end gap-2 ml-auto">
+            {/* Wraps: two date inputs and a button are ~375px, wider than a phone's card. */}
+            {sub !== 'daily' && <div className="flex flex-wrap items-end gap-2 ml-auto">
               <label className="text-xs" style={{ color: C.textMute }}>
                 From<br />
                 <input type="date" value={from} onChange={(e) => setFrom(e.target.value)}
@@ -18877,6 +18926,36 @@ function AdminEnrollments({ onCountChange }) {
   const emailSuffix = (mail) =>
     mail?.ok ? ' · email sent' : mail?.skipped ? ' · email not configured' : ' · email not sent';
 
+  // After a decision the button that was pressed usually disappears — the card leaves the
+  // Pending view, or its actions change — and the browser drops focus to <body>, throwing a
+  // keyboard user back to the top of the page. Put focus on the same card if it is still
+  // listed, else on the card that took its place, else on the list. Only when focus was
+  // actually lost: if a dialog handed it back to a control that still exists, leave it.
+  // `visible` is the list as it was when the action started, which is what "the card that
+  // took its place" has to be measured against.
+  const refocusAfterDecision = (id) => {
+    const order = visible.map((x) => x.id);
+    const at = order.indexOf(id);
+    let frames = 0;
+    const step = () => {
+      // ★ An open modal FIRST, whatever holds focus. The reject dialog disables its own
+      //   button while the request runs, which drops focus to <body> — and focusing a card
+      //   then would put focus BEHIND an aria-modal dialog that is still on screen. Wait
+      //   for it to close; confirmReject calls this again once it has.
+      if (document.querySelector('[role="dialog"][aria-modal="true"]')) {
+        if (++frames < 30) requestAnimationFrame(step);
+        return;
+      }
+      const active = document.activeElement;
+      if (active && active !== document.body) return;   // focus was not lost
+      const card = (x) => (x ? document.getElementById(`enroll-card-${x}`) : null);
+      // `enroll-list` is the list, or — once the last card in this view is decided — the
+      // empty state that replaced it. Both carry the id, so focus always has somewhere to go.
+      (card(id) || card(order[at + 1]) || card(order[at - 1]) || document.getElementById('enroll-list'))?.focus();
+    };
+    requestAnimationFrame(() => requestAnimationFrame(step));
+  };
+
   // Admin-only diagnostic: fire a test admin alert through /api/notify-enrollment so an
   // admin can confirm outside-the-app email works end-to-end (verifies the admin JWT
   // server-side, resolves the recipient, and reports sent / not-configured / provider error).
@@ -18939,6 +19018,7 @@ function AdminEnrollments({ onCountChange }) {
         : x));
       setProfilesById(prev => ({ ...prev, [r.user_id]: { ...(prev[r.user_id] || { id: r.user_id }), is_paid: true } }));
       onCountChange?.();
+      refocusAfterDecision(r.id);
       load(true);   // refresh the membership strip/filters with the new subscription term
       if (out.already) {
         setNotice(`${r.email} was already approved — nothing changed.`);
@@ -18950,7 +19030,7 @@ function AdminEnrollments({ onCountChange }) {
       const grantedEndsAt = out.ends_at ?? null;
       let subNote = grantedEndsAt ? ` · access until ${fmtEnrollDate(grantedEndsAt)}` : ' · no expiry';
       if (out.batch_code) subNote += ` · batch ${out.batch_code}`;
-      const mail = await notifyDecision({ email: r.email, fullName: r.full_name, status: 'approved', planName: r.plan_name });
+      const mail = await notifyDecision({ requestId: r.id, status: 'approved' });
       setNotice(`Approved ${r.email} — ${r.plan_name}${emailSuffix(mail)}${subNote}.`);
     } catch (e) {
       console.error('[enroll] approve failed', { id: r.id, code: e?.code, message: e?.message });
@@ -19093,7 +19173,7 @@ function AdminEnrollments({ onCountChange }) {
             p_request_id: r.id, p_batch_id: bulk.batchId || null,
           });
           if (error) throw error;
-          if (!data?.already) await notifyDecision({ email: r.email, fullName: r.full_name, status: 'approved', planName: r.plan_name });
+          if (!data?.already) await notifyDecision({ requestId: r.id, status: 'approved' });
           results.push({ id: r.id, email: r.email, ok: true, note: data?.already ? 'already approved' : 'approved' });
         } else if (kind === 'reject') {
           const nowIso = new Date().toISOString();
@@ -19102,7 +19182,7 @@ function AdminEnrollments({ onCountChange }) {
             .eq('id', r.id).eq('status', 'pending_review').select('id');
           if (error) throw error;
           if (!data?.[0]) throw new Error('Not changed — it may already have been decided.');
-          await notifyDecision({ email: r.email, fullName: r.full_name, status: 'rejected', reason: bulk.reason.trim(), planName: r.plan_name });
+          await notifyDecision({ requestId: r.id, status: 'rejected' });
           results.push({ id: r.id, email: r.email, ok: true, note: 'rejected' });
         } else if (kind === 'hold') {
           const { error } = await supabase.rpc('admin_set_enrollment_hold', {
@@ -19157,16 +19237,22 @@ function AdminEnrollments({ onCountChange }) {
         .from('enrollment_requests')
         .update({ status, rejection_reason: reason, reviewed_at: nowIso, reviewed_by: user?.id || null, updated_at: nowIso })
         .eq('id', r.id)
+        // Only a request still WAITING may be declined. Without this a card left open while
+        // someone else approved the request would overwrite the approval with a rejection —
+        // the member keeps the access they paid for while their request reads "Rejected".
+        // The bulk path has always filtered this way; #66 refuses it in the database too.
+        .eq('status', 'pending_review')
         .select('id,status');
       if (error) throw error;
       if (!data?.[0]) {
-        throw new Error('No row was updated — your admin permissions may not be applied. Re-run db/2026-07-04-enrollment.sql, confirm you are flagged is_admin, then sign out and back in.');
+        throw new Error('Not changed — this request may already have been decided. Click Refresh to see where it stands.');
       }
       setRows(prev => prev.map(x => x.id === r.id
         ? { ...x, status, rejection_reason: reason, reviewed_at: nowIso, reviewed_by: user?.id || null }
         : x));
       onCountChange?.();
-      const mail = await notifyDecision({ email: r.email, fullName: r.full_name, status, reason, planName: r.plan_name });
+      refocusAfterDecision(r.id);
+      const mail = await notifyDecision({ requestId: r.id, status });
       setNotice(`${status === 'expired' ? 'Marked expired' : 'Rejected'}: ${r.email}${emailSuffix(mail)}.`);
     } catch (e) {
       console.error('[enroll] decline failed', { id: r.id, status, code: e?.code, message: e?.message });
@@ -19181,6 +19267,7 @@ function AdminEnrollments({ onCountChange }) {
     if (!row) return;
     await doDecline(row, 'rejected', rejectReason.trim() || null);
     setRejectFor(null); setRejectReason('');
+    refocusAfterDecision(row.id);
   };
 
   const saveNotes = async (r) => {
@@ -19380,7 +19467,7 @@ function AdminEnrollments({ onCountChange }) {
   const StatusPill = ({ request }) => {
     const s = STATUS_STYLE[holdOf(request) ? 'onhold' : isOverdue(request) ? 'overdue' : request.status] || STATUS_STYLE.pending_review;
     return (
-      <span className="px-2.5 py-1 rounded-full text-[11px] font-bold" style={{ background: s.bg, color: s.fg, border: `1px solid ${s.bd}` }}>
+      <span className="inline-block whitespace-nowrap px-2.5 py-1 rounded-full text-[11px] font-bold" style={{ background: s.bg, color: s.fg, border: `1px solid ${s.bd}` }}>
         {s.label}
       </span>
     );
@@ -19389,18 +19476,23 @@ function AdminEnrollments({ onCountChange }) {
   // Admin-alert email outcome, stamped on the row by api/notify-enrollment.js via the
   // record_enrollment_notification RPC. Turns a silently-failed/unconfigured admin email
   // into a visible per-submission badge. null (legacy rows / not yet attempted) → hidden.
+  // ★ "Review alert", not "Admin emailed": this is the alert sent TO staff when the student
+  //   submitted. "Admin emailed" read as "an admin emailed the student", which is a different
+  //   email with its own line on the card ("Student emailed …", from Communications).
   const NOTIFY_META = {
-    sent:                      { label: 'Admin emailed',              tone: 'ok'     },
-    email_not_configured:      { label: 'Email not sent — no key',    tone: 'warn'   },
-    email_from_not_configured: { label: 'Email not sent — no sender', tone: 'warn'   },
-    admin_email_invalid:       { label: 'Email not sent — no recipient', tone: 'warn' },
-    provider_error:            { label: 'Email not sent — provider',  tone: 'danger' },
+    sent:                      { label: 'Review alert sent',                  tone: 'ok'     },
+    email_not_configured:      { label: 'Review alert not sent — no key',     tone: 'warn'   },
+    email_from_not_configured: { label: 'Review alert not sent — no sender',  tone: 'warn'   },
+    admin_email_invalid:       { label: 'Review alert not sent — no recipient', tone: 'warn' },
+    provider_error:            { label: 'Review alert not sent — provider',   tone: 'danger' },
   };
   const NotifyBadge = ({ request }) => {
     const meta = NOTIFY_META[request.notify_status];
     if (!meta) return null;
     const tip = [
-      meta.tone === 'ok' ? 'Admin alert email sent' : 'Admin alert email did not send',
+      meta.tone === 'ok'
+        ? 'The enrollment review alert was sent to the configured administrator.'
+        : 'The enrollment review alert to the configured administrator did not send.',
       request.notified_at ? new Date(request.notified_at).toLocaleString() : null,
       request.notify_detail || null,
     ].filter(Boolean).join(' · ');
@@ -19607,7 +19699,10 @@ function AdminEnrollments({ onCountChange }) {
       ) : loading && rows.length === 0 ? (
         <AdminListSkeleton />
       ) : visible.length === 0 ? (
-        <div className="mt-6 rounded-2xl border-2 border-dashed p-12 text-center" style={{ borderColor: C.border, color: C.textMute }}>
+        // Shares the list's id: deciding the LAST card in a view renders this instead of the
+        // list, and refocusAfterDecision's final fallback must still find somewhere to land.
+        <div id="enroll-list" role="group" tabIndex={-1} aria-label="Enrollment requests"
+          className="enroll-list mt-6 rounded-2xl border-2 border-dashed p-12 text-center" style={{ borderColor: C.border, color: C.textMute }}>
           <Receipt size={26} className="mx-auto" style={{ color: C.textMute }} />
           <div className="mt-3 text-sm font-medium">
             {(searchQ || planFilter) ? 'No requests in this view match your search.' : ({ pending: 'No pending enrollment requests.', overdue: 'No overdue enrollment requests.',
@@ -19621,7 +19716,10 @@ function AdminEnrollments({ onCountChange }) {
           {filter === 'pending' && <div className="mt-1 text-xs">New payment-proof submissions will appear here for review.</div>}
         </div>
       ) : (
-        <div className="mt-5 space-y-2.5">
+        // role="group": these two are FOCUS TARGETS (refocusAfterDecision), and a focused element
+        // is announced by its name — but a role-less div is `generic`, which ARIA forbids naming,
+        // so the aria-label was dropped and a screen reader read the whole card instead.
+        <div id="enroll-list" role="group" tabIndex={-1} aria-label="Enrollment requests" className="enroll-list mt-5 space-y-2.5">
           {visible.map(r => {
             const rowBusy = busyId === r.id;
             const overdueRow = isOverdue(r);
@@ -19641,9 +19739,15 @@ function AdminEnrollments({ onCountChange }) {
             const amountMismatch = Number(r.amount_paid) !== Number(r.amount_expected);
             const expanded = expandedId === r.id;
             return (
-              <div key={r.id} className="glass-card p-4">
-                <div className="grid grid-cols-[auto,minmax(0,1fr)] lg:grid-cols-[auto,minmax(0,1fr),auto,auto,auto] gap-x-4 gap-y-2.5 items-center">
-                  <AdminUserCell name={r.full_name} email={r.email}
+              // Layout: src/index.css "ENROLLMENT REQUEST CARD". The head grid holds identity,
+              // plan and status ONLY; the actions are a row of their own below it. They used to
+              // be a fifth `auto` grid track, and their max-content squeezed the student's
+              // identity to 0px on every laptop with the sidebar open (2026-09-24).
+              <div key={r.id} id={`enroll-card-${r.id}`} role="group" tabIndex={-1} aria-label={`Enrollment request from ${r.full_name || r.email}`}
+                className="glass-card p-4 enroll-card">
+                <div className="enroll-card__head">
+                  <div className="enroll-card__who" data-enroll-region="who">
+                  <AdminUserCell wrap name={r.full_name} email={r.email}
                     badges={<>
                       {grantIncomplete && (
                         <span className="px-2 py-0.5 rounded-full text-[10px] font-bold" style={{ background: 'var(--status-danger-bg)', color: 'var(--status-danger-fg)', border: '1px solid var(--status-danger-bd)' }}>
@@ -19683,20 +19787,24 @@ function AdminEnrollments({ onCountChange }) {
                     meta={<>
                       {r.phone && <span className="inline-flex items-center gap-1"><Phone size={11} /> {r.phone}</span>}
                       {r.city_country && <span className="inline-flex items-center gap-1"><Globe size={11} /> {r.city_country}</span>}
-                      <span className="inline-flex items-center gap-1"><Clock size={11} /> {fmtEnrollDate(r.created_at)}</span>
+                      {/* A date and a countdown are single facts: "Sep 24," over "2026" misreads.
+                          The phone keeps the meta row's overflow-wrap, which only breaks a word
+                          that cannot fit a line on its own — a 40-character number on a phone. */}
+                      <span className="inline-flex items-center gap-1 whitespace-nowrap"><Clock size={11} /> {fmtEnrollDate(r.created_at)}</span>
                       {emailStatus[r.id] && (
                         <span className="inline-flex items-center gap-1" title={emailStatus[r.id].last_subject || ''}>
-                          <Mail size={11} /> Emailed {commWhen(emailStatus[r.id].last_sent_at)}{Number(emailStatus[r.id].sent_count) > 1 ? ` · ${emailStatus[r.id].sent_count} emails` : ''}
+                          <Mail size={11} /> Student emailed {commWhen(emailStatus[r.id].last_sent_at)}{Number(emailStatus[r.id].sent_count) > 1 ? ` · ${emailStatus[r.id].sent_count} emails` : ''}
                         </span>
                       )}
                       {daysInfo(r) && (
-                        <span className="inline-flex items-center gap-1 font-semibold" style={{ color: overdueRow ? 'var(--status-warn-fg)' : C.textMute }}>
+                        <span className="inline-flex items-center gap-1 font-semibold whitespace-nowrap" style={{ color: overdueRow ? 'var(--status-warn-fg)' : C.textMute }}>
                           <Hourglass size={11} /> {daysInfo(r)}
                         </span>
                       )}
                     </>} />
-                  <div className="col-start-2 lg:col-start-3 min-w-[150px]">
-                    <div style={{ fontSize: 12, fontWeight: 700, color: C.text }}>{r.plan_name || PLAN_LABELS[r.plan_key] || r.plan_key}</div>
+                  </div>
+                  <div className="enroll-card__plan" data-enroll-region="plan">
+                    <div className="[overflow-wrap:anywhere]" style={{ fontSize: 12, fontWeight: 700, color: C.text }}>{r.plan_name || PLAN_LABELS[r.plan_key] || r.plan_key}</div>
                     {!planEntitlement(r.plan_key).full && (
                       <div className="inline-flex items-center gap-1 mt-0.5 mb-0.5 px-1.5 py-0.5 rounded-md" style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', fontSize: 10, fontWeight: 600, color: 'var(--status-warn-fg)' }}>
                         <Lock size={10} /> {planEntitlement(r.plan_key).scopeLabel}
@@ -19705,25 +19813,28 @@ function AdminEnrollments({ onCountChange }) {
                     <div style={{ fontFamily: fontMono, fontSize: 13, fontWeight: 700, color: C.text }}>{phpFmt(r.amount_paid)}</div>
                     {r.status === 'pending_review' && holdsAvailable && (
                       <button type="button" onClick={() => { setDialogErr(''); setAmountFor({ row: r, amount: String(r.amount_paid ?? ''), note: '' }); }}
-                        className="hover:underline" style={{ fontSize: 10.5, fontWeight: 600, color: C.primary }}>
+                        className="hover:underline inline-flex items-center min-h-[24px]" style={{ fontSize: 10.5, fontWeight: 600, color: C.primary }}>
                         Correct amount
                       </button>
                     )}
                     {amountMismatch && (
                       <div style={{ fontSize: 10.5, fontWeight: 600, color: 'var(--status-warn-fg)' }}>expected {phpFmt(r.amount_expected)}</div>
                     )}
+                    {/* The reference WRAPS. It is what the reviewer checks against the bank app, so
+                        an ellipsis here hides the one field they came to read. */}
                     {r.payment_reference && (
-                      <div className="truncate" style={{ fontFamily: fontMono, fontSize: 10.5, color: C.textMute, maxWidth: 160 }} title={r.payment_reference}>
+                      <div className="[overflow-wrap:anywhere]" style={{ fontFamily: fontMono, fontSize: 10.5, color: C.textMute }} title={r.payment_reference}>
                         ref: {r.payment_reference}
                       </div>
                     )}
                   </div>
-                  <div className="col-start-2 lg:col-start-4 justify-self-start lg:justify-self-end">
+                  <div className="enroll-card__status" data-enroll-region="status">
                     <StatusPill request={r} />
                   </div>
-                  <div className="col-start-2 lg:col-start-5 flex items-center gap-2 flex-wrap">
+                </div>
+                <div className="enroll-card__actions" data-enroll-region="actions">
                     {r.status === 'pending_review' && (
-                      <label className="inline-flex items-center gap-1 text-xs" style={{ color: C.textSoft }}>
+                      <label className="inline-flex items-center gap-1.5 text-xs min-h-[32px] pr-1" style={{ color: C.textSoft }}>
                         <input type="checkbox" checked={!!selected[r.id]} aria-label={`Select ${r.email}`}
                           onChange={(e) => setSelected((s) => { const next = { ...s }; if (e.target.checked) next[r.id] = true; else delete next[r.id]; return next; })} />
                         Select
@@ -19731,21 +19842,21 @@ function AdminEnrollments({ onCountChange }) {
                     )}
                     {r.receipt_path && (
                       <button onClick={() => viewReceipt(r)} disabled={rowBusy}
-                        className="px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
+                        className="enroll-card__action px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
                         style={{ background: 'var(--primary-tint)', color: C.primary, border: '1px solid var(--primary-selection)' }}>
                         <Eye size={14} /> Receipt
                       </button>
                     )}
                     {(r.status !== 'approved' || grantIncomplete) && (
                       <button onClick={() => setApproveFor(r)} disabled={rowBusy}
-                        className="px-3.5 py-2 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 transition disabled:opacity-60"
+                        className="enroll-card__action px-3.5 py-2 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 transition disabled:opacity-60"
                         style={ADMIN_BTN_OK}>
                         {rowBusy ? <Loader2 size={14} className="animate-spin" /> : <UserCheck size={14} />} Approve
                       </button>
                     )}
                     {r.status === 'pending_review' && (
                       <button onClick={() => { setRejectFor(r); setRejectReason(''); }} disabled={rowBusy}
-                        className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
+                        className="enroll-card__action px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
                         style={{ background: 'var(--status-danger-bg)', color: 'var(--status-danger-fg)', border: '1px solid var(--status-danger-bd)' }}>
                         <UserX size={14} /> Reject
                       </button>
@@ -19753,32 +19864,33 @@ function AdminEnrollments({ onCountChange }) {
                     {r.status === 'pending_review' && holdsAvailable && (
                       <button onClick={() => { setDialogErr(''); setHoldFor({ row: r, reason: holds[r.id]?.reason || '', followUp: holds[r.id]?.follow_up_on || '', existing: !!holds[r.id] }); }}
                         disabled={rowBusy}
-                        className="px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
+                        className="enroll-card__action px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
                         style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
                         <Pause size={14} /> {holds[r.id] ? 'Edit hold' : 'Hold'}
                       </button>
                     )}
                     {canEmail && r.email && (
                       <button onClick={() => setEmailFor(r)} disabled={rowBusy}
-                        className="px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
+                        className="enroll-card__action px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
                         style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
                         <Mail size={14} /> Email
                       </button>
                     )}
                     {overdueRow && (
                       <button onClick={() => doDecline(r, 'expired', null)} disabled={rowBusy}
-                        className="px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
+                        className="enroll-card__action px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-60"
                         style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
                         <Clock size={14} /> Mark expired
                       </button>
                     )}
-                    <button onClick={() => { setExpandedId(expanded ? null : r.id); setNotesDraft(d => ({ ...d, [r.id]: d[r.id] ?? (r.admin_notes || '') })); }}
-                      className="p-2 rounded-xl transition"
-                      style={{ background: C.white, color: C.textMute, border: `1px solid ${C.border}` }}
-                      title={expanded ? 'Hide details' : 'Show details'}>
-                      {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                    {/* A labelled disclosure. It was an icon-only chevron whose only name was a
+                        `title`, and it never said whether the panel was open. */}
+                    <button type="button" onClick={() => { setExpandedId(expanded ? null : r.id); setNotesDraft(d => ({ ...d, [r.id]: d[r.id] ?? (r.admin_notes || '') })); }}
+                      aria-expanded={expanded} aria-controls={`enroll-details-${r.id}`}
+                      className="enroll-card__action ml-auto px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition"
+                      style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+                      {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />} {expanded ? 'Hide details' : 'Details'}
                     </button>
-                  </div>
                 </div>
 
                 {/* Membership strip — the student's CURRENT subscription term (latest row) */}
@@ -19842,8 +19954,13 @@ function AdminEnrollments({ onCountChange }) {
                   );
                 })()}
 
+                {/* The disclosure's target always exists, so aria-controls never names a missing
+                    element; its contents mount only when opened. Columns follow the CARD's width
+                    (.enroll-card__details), not the viewport — `md:grid-cols-2` split a 646px card
+                    into two ~300px columns and truncated every intake answer. */}
+                <div id={`enroll-details-${r.id}`} hidden={!expanded}>
                 {expanded && (
-                  <div className="mt-3.5 pt-3.5 grid gap-3.5 md:grid-cols-2" style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
+                  <div className="mt-3.5 pt-3.5 enroll-card__details" style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
                     <div>
                       {/* #42: the full intake. Rows submitted before the intake form
                           shipped have none of these columns, so they fall back to the
@@ -19851,7 +19968,7 @@ function AdminEnrollments({ onCountChange }) {
                       {(r.ph_experience || r.college_course || r.current_job || r.intake?.struggles) ? (
                         <>
                           <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: C.textMute }}>Applicant intake</div>
-                          <div className="mt-2 grid gap-x-4 gap-y-1.5 sm:grid-cols-2" style={{ fontSize: 12 }}>
+                          <div className="mt-2 enroll-card__intake" style={{ fontSize: 12 }}>
                             {[
                               ['Course', r.college_course],
                               ['Current role', r.current_job],
@@ -19864,7 +19981,7 @@ function AdminEnrollments({ onCountChange }) {
                             ].filter(([, v]) => v).map(([k, v]) => (
                               <div key={k} className="flex gap-1.5 min-w-0">
                                 <span style={{ color: C.textMute, flexShrink: 0 }}>{k}:</span>
-                                <span className="truncate" style={{ color: C.textSoft, fontWeight: 600 }} title={v}>{v}</span>
+                                <span className="min-w-0 [overflow-wrap:anywhere]" data-enroll-intake-value="" style={{ color: C.textSoft, fontWeight: 600 }}>{v}</span>
                               </div>
                             ))}
                           </div>
@@ -19953,7 +20070,7 @@ function AdminEnrollments({ onCountChange }) {
                               {eventsByReq[r.id].map((ev) => (
                                 <li key={ev.id} style={{ fontSize: 12, color: C.textSoft }}>
                                   <span style={{ fontWeight: 600, color: C.text }}>
-                                    {({ hold_set: 'Put on hold', hold_updated: 'Hold updated', hold_cleared: ev.detail?.cause === 'decided' ? 'Hold released — request decided' : 'Hold removed', amount_corrected: `Amount corrected ${phpFmt(ev.detail?.before)} → ${phpFmt(ev.detail?.after)}` })[ev.action] || ev.action}
+                                    {({ hold_set: 'Put on hold', hold_updated: 'Hold updated', hold_cleared: ev.detail?.cause === 'decided' ? 'Hold released — request decided' : 'Hold removed', amount_corrected: `Amount corrected ${phpFmt(ev.detail?.before)} → ${phpFmt(ev.detail?.after)}`, decision_reopened: `Decision reopened: ${ev.detail?.from || '?'} → ${ev.detail?.to || '?'}${ev.detail?.via === 'owner_override' ? ' (database override)' : ''}` })[ev.action] || ev.action}
                                   </span>
                                   {ev.reason ? ` — ${ev.reason}` : ''}
                                   <div style={{ fontSize: 10.5, color: C.textMute }}>{new Date(ev.created_at).toLocaleString()}{ev.actor_email ? ` · ${ev.actor_email}` : ''}</div>
@@ -19966,6 +20083,7 @@ function AdminEnrollments({ onCountChange }) {
                     </div>
                   </div>
                 )}
+                </div>
               </div>
             );
           })}
@@ -21671,15 +21789,16 @@ function Dashboard({ goto }) {
         </div>
       </div>
 
-      {/* Career Journey Roadmap */}
-      <div className="glass-card p-6 mb-10">
+      {/* Career Journey Roadmap — columns follow the CARD's width (src/index.css .roadmap-strip):
+          `md:grid-cols-7` gave each stage label a 54px box with the sidebar open at 1024. */}
+      <div className="glass-card p-6 mb-10 roadmap-strip">
         <div className="flex items-center justify-between mb-4">
           <div>
             <div className="gh-label" style={{ color: C.primary }}>Your Career Roadmap</div>
             <div className="text-xs mt-0.5" style={{ color: C.textMute }}>{stageTiles.length} stages · learn at your pace</div>
           </div>
         </div>
-        <div className="grid grid-cols-3 md:grid-cols-7 gap-2">
+        <div className="roadmap-strip__grid">
           {stageTiles.map((s, i) => (
             <div key={s.number} className="relative">
               <div className="text-center p-3 rounded-2xl transition-all duration-200 cursor-default"
@@ -21692,7 +21811,7 @@ function Dashboard({ goto }) {
                 <div className="text-[10px] font-medium leading-tight mt-1" style={{ color: C.textSoft, letterSpacing: '0.02em' }}>{s.label}</div>
               </div>
               {i < stageTiles.length - 1 && (
-                <div className="hidden md:flex absolute top-1/2 -right-1 -translate-y-1/2 z-10 items-center justify-center" style={{ color: C.textMute }}>
+                <div className="roadmap-strip__chevron absolute top-1/2 -right-1 -translate-y-1/2 z-10 items-center justify-center" style={{ color: C.textMute }}>
                   <ChevronRight size={14} strokeWidth={2.5} />
                 </div>
               )}
@@ -22176,11 +22295,15 @@ function StaffProgressReport() {
 
       {err && <AdminNotice kind="danger">{err}</AdminNotice>}
 
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-        <StatCard label="Filtered learners" value={total} sub="Operational records" icon={Users} />
-        <StatCard label="Cohort average" value={progressPercent(average)} sub="Normalized progress" icon={Activity} />
-        <StatCard label="Needs attention" value={attention} sub="14+ days without progress" icon={AlertTriangle} />
-        <StatCard label="Completed" value={Number(distribution.complete) || 0} sub="Reached all eligible milestones" icon={CheckCircle2} />
+      {/* Columns follow THIS strip's width (src/index.css .stat-strip), not the viewport:
+          `lg:grid-cols-4` left each card a 39px text column with the sidebar open at 1024. */}
+      <div className="stat-strip">
+        <div className="stat-strip__grid">
+          <StatCard label="Filtered learners" value={total} sub="Operational records" icon={Users} />
+          <StatCard label="Cohort average" value={progressPercent(average)} sub="Normalized progress" icon={Activity} />
+          <StatCard label="Needs attention" value={attention} sub="14+ days without progress" icon={AlertTriangle} />
+          <StatCard label="Completed" value={Number(distribution.complete) || 0} sub="Reached all eligible milestones" icon={CheckCircle2} />
+        </div>
       </div>
 
       <div className="glass-card overflow-hidden">
@@ -39867,14 +39990,16 @@ ${showTimesheet && timesheet.length > 0 && timesheetSubtotal > 0 ? `
           <div style={{ fontFamily: fontDisplay }} className="text-base font-bold">💼 Fixed-Fee Services / Retainer</div>
           <button onClick={addService} className="text-xs font-bold px-3 py-1.5 rounded-lg bg-white/20 hover:bg-white/30 transition">+ Add Line</button>
         </div>
-        <div className="p-3">
+        {/* Line layout: src/index.css .inv-lines — the amount track is sized to its content.
+            A fixed `col-span-1` of twelve was 44px with the sidebar open at 1024. */}
+        <div className="p-3 inv-lines">
           {services.map((s) => (
-            <div key={s.id} className="grid grid-cols-12 gap-2 mb-2 items-center">
-              <input className="col-span-7 px-3 py-2 rounded-lg border border-slate-200 text-sm" placeholder="Service description (e.g., Monthly Bookkeeping Retainer — May 2026)" value={s.description} onChange={e => updateService(s.id, 'description', e.target.value)} />
-              <input type="number" min="0" step="0.5" className="col-span-1 px-2 py-2 rounded-lg border border-slate-200 text-sm text-right" placeholder="Qty" value={s.quantity} onChange={e => updateService(s.id, 'quantity', e.target.value)} />
-              <input type="number" min="0" step="50" className="col-span-2 px-2 py-2 rounded-lg border border-slate-200 text-sm text-right" placeholder="Rate" value={s.rate} onChange={e => updateService(s.id, 'rate', e.target.value)} />
-              <div className="col-span-1 text-right text-sm font-bold" style={{ color: NAVY }}>{formatCurrency(s.quantity * s.rate)}</div>
-              <button onClick={() => removeService(s.id)} className="col-span-1 text-red-400 hover:text-red-600 text-sm">✕</button>
+            <div key={s.id} className="inv-line">
+              <input aria-label="Service description" className="inv-line__desc px-3 py-2 rounded-lg border border-slate-200 text-sm" placeholder="Service description (e.g., Monthly Bookkeeping Retainer — May 2026)" value={s.description} onChange={e => updateService(s.id, 'description', e.target.value)} />
+              <input aria-label="Quantity" type="number" min="0" step="0.5" className="inv-line__qty px-2 py-2 rounded-lg border border-slate-200 text-sm text-right" placeholder="Qty" value={s.quantity} onChange={e => updateService(s.id, 'quantity', e.target.value)} />
+              <input aria-label="Rate" type="number" min="0" step="50" className="inv-line__rate px-2 py-2 rounded-lg border border-slate-200 text-sm text-right" placeholder="Rate" value={s.rate} onChange={e => updateService(s.id, 'rate', e.target.value)} />
+              <div className="inv-line__amount text-sm font-bold" style={{ color: NAVY }}>{formatCurrency(s.quantity * s.rate)}</div>
+              <button type="button" aria-label="Remove this service line" onClick={() => removeService(s.id)} className="inv-line__remove text-red-400 hover:text-red-600 text-sm">✕</button>
             </div>
           ))}
           <div className="mt-2 pt-2 border-t border-slate-100 flex justify-between items-center text-sm">
@@ -39897,23 +40022,25 @@ ${showTimesheet && timesheet.length > 0 && timesheetSubtotal > 0 ? `
           {showTimesheet && <button onClick={addTime} className="text-xs font-bold px-3 py-1.5 rounded-lg bg-white/20 hover:bg-white/30 transition">+ Add Entry</button>}
         </div>
         {showTimesheet && (
-          <div className="p-3">
-            <div className="grid grid-cols-12 gap-2 mb-2 text-[10px] uppercase tracking-wider font-bold text-slate-500 px-1">
-              <div className="col-span-2">Date</div>
-              <div className="col-span-5">Description of Work</div>
-              <div className="col-span-1 text-right">Hours</div>
-              <div className="col-span-2 text-right">Rate</div>
-              <div className="col-span-1 text-right">Amount</div>
-              <div className="col-span-1"></div>
+          <div className="p-3 inv-lines">
+            {/* Same line layout as the services above (src/index.css .inv-lines). The column
+                headers exist only in the one-row layout; every input names itself. */}
+            <div className="inv-lines__head gap-2 mb-2 text-[10px] uppercase tracking-wider font-bold text-slate-500 px-1" aria-hidden="true">
+              <div>Date</div>
+              <div>Description of Work</div>
+              <div className="text-right">Hours</div>
+              <div className="text-right">Rate</div>
+              <div className="text-right">Amount</div>
+              <div></div>
             </div>
             {timesheet.map((t) => (
-              <div key={t.id} className="grid grid-cols-12 gap-2 mb-2 items-center">
-                <input type="date" className="col-span-2 px-2 py-2 rounded-lg border border-slate-200 text-xs" value={t.date} onChange={e => updateTime(t.id, 'date', e.target.value)} />
-                <input className="col-span-5 px-3 py-2 rounded-lg border border-slate-200 text-sm" placeholder="What you did (e.g., Bank reconciliation — Operating account)" value={t.description} onChange={e => updateTime(t.id, 'description', e.target.value)} />
-                <input type="number" min="0" step="0.25" className="col-span-1 px-2 py-2 rounded-lg border border-slate-200 text-sm text-right" placeholder="Hrs" value={t.hours} onChange={e => updateTime(t.id, 'hours', e.target.value)} />
-                <input type="number" min="0" step="5" className="col-span-2 px-2 py-2 rounded-lg border border-slate-200 text-sm text-right" placeholder="Rate" value={t.rate} onChange={e => updateTime(t.id, 'rate', e.target.value)} />
-                <div className="col-span-1 text-right text-sm font-bold" style={{ color: NAVY }}>{formatCurrency(t.hours * t.rate)}</div>
-                <button onClick={() => removeTime(t.id)} className="col-span-1 text-red-400 hover:text-red-600 text-sm">✕</button>
+              <div key={t.id} className="inv-line inv-line--time">
+                <input aria-label="Date" type="date" className="inv-line__date px-2 py-2 rounded-lg border border-slate-200 text-xs" value={t.date} onChange={e => updateTime(t.id, 'date', e.target.value)} />
+                <input aria-label="Description of work" className="inv-line__desc px-3 py-2 rounded-lg border border-slate-200 text-sm" placeholder="What you did (e.g., Bank reconciliation — Operating account)" value={t.description} onChange={e => updateTime(t.id, 'description', e.target.value)} />
+                <input aria-label="Hours" type="number" min="0" step="0.25" className="inv-line__qty px-2 py-2 rounded-lg border border-slate-200 text-sm text-right" placeholder="Hrs" value={t.hours} onChange={e => updateTime(t.id, 'hours', e.target.value)} />
+                <input aria-label="Rate" type="number" min="0" step="5" className="inv-line__rate px-2 py-2 rounded-lg border border-slate-200 text-sm text-right" placeholder="Rate" value={t.rate} onChange={e => updateTime(t.id, 'rate', e.target.value)} />
+                <div className="inv-line__amount text-sm font-bold" style={{ color: NAVY }}>{formatCurrency(t.hours * t.rate)}</div>
+                <button type="button" aria-label="Remove this time entry" onClick={() => removeTime(t.id)} className="inv-line__remove text-red-400 hover:text-red-600 text-sm">✕</button>
               </div>
             ))}
             <div className="mt-2 pt-2 border-t border-slate-100 flex justify-between items-center text-sm">
@@ -45164,8 +45291,8 @@ ${(report.strategicInsights || []).map(s => `
         desc="THE highest-converting sales tool in this toolkit. Offer a free 24-hour diagnostic to any prospect. Paste their P&L and Balance Sheet — get a branded report with health score, red flags, quick wins, industry benchmarks, and a closing pitch. Send it as a Word doc. Prospects who receive this report close at 3-5× the rate of those who just get a proposal."
       />
 
-      {/* PROGRESS STEPS */}
-      <div className="mt-6 mb-5 flex items-center gap-2 text-xs font-bold">
+      {/* PROGRESS STEPS — they wrap: on a phone the third step ran 22px off-screen. */}
+      <div className="mt-6 mb-5 flex flex-wrap items-center gap-2 text-xs font-bold">
         {[
           { n: 1, label: 'Company + Bookkeeper Info' },
           { n: 2, label: 'Paste Statements' },
@@ -45713,7 +45840,12 @@ function SectionHead({ eyebrow, title, desc, gold }) {
     // gh-section-head is a marker, not a style hook: it is how a sticky pane BELOW this
     // header (the course lesson rail) measures the offset it has to clear. Nothing sets
     // any property on it.
-    <div className="gh-section-head sticky top-0 z-30 -mx-10 -mt-10 px-10 pt-8 pb-6 mb-7"
+    // ★ The full-bleed band's negative margins MIRROR TabPanel's padding at every
+    //   breakpoint (`p-4 sm:p-6 lg:p-10`). It used a flat `-mx-10 -mt-10 px-10`, which is
+    //   right only from lg up: below it the band overhung the 16px phone padding by 24px on
+    //   each side, and every tab scrolled sideways on a phone (measured at 320: <main>
+    //   334px of content in 310px). lg and up are unchanged.
+    <div className="gh-section-head sticky top-0 z-30 -mx-4 -mt-4 px-4 sm:-mx-6 sm:-mt-6 sm:px-6 lg:-mx-10 lg:-mt-10 lg:px-10 pt-8 pb-6 mb-7"
       style={{
         background: 'var(--section-head-bg)',
         backdropFilter: 'blur(24px) saturate(160%)',

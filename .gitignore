@@ -65,3 +65,6 @@ Video upload
 # The standalone HTML artifact the Portfolio Generator was ported from. The shipping engine
 # lives in src/lib/portfolioGenerator.js; this is the original single-file reference copy.
 bookkeeper-portfolio-generator.html
+
+# Screenshots from `npm run test:e2e` (test-e2e/). Review evidence, regenerated every run.
+test-e2e/.artifacts/

@@ -2219,3 +2219,178 @@ test('the canvas is lazy, and stays out of every student bundle', () => {
     }
   }
 });
+
+// ─── §26 The Enrollments request card ───────────────────────────────────────
+//
+// On 2026-09-24 the card that decides whether a student gets paid access rendered its
+// student-identity column at 0px on every common laptop with the sidebar open (measured on
+// the shadow project: 0px at 1024, 1280, 1366 and 1440; 60px at 1920), so the phone number
+// wrapped a few characters per line and the package and amount painted over it.
+// The cause was one class list: `lg:grid-cols-[auto,minmax(0,1fr),auto,auto,auto]`. Grid
+// gives `auto` tracks their max-content BEFORE it hands anything to an `fr` track, and the
+// last `auto` held a wrapping row of up to eight buttons — so the buttons sized the grid and
+// identity got what was left. `lg:` made it worse: it reads the VIEWPORT, and the sidebar
+// takes 288px of it. The card never overflowed, so an overflow check reported success.
+// These scans pin the shape; test-e2e/enrollmentLayout.e2etest.mjs measures the geometry.
+
+const enrollCardRegion = () => {
+  const src = app();
+  const fn = src.indexOf('function AdminEnrollments(');
+  const start = src.indexOf('{visible.map(r => {', fn);
+  const end = src.indexOf('{/* Membership strip', start);
+  assert.ok(fn > 0 && start > fn && end > start, 'the Enrollments request card could not be found');
+  return src.slice(start, end);
+};
+const cssRules = (sheet, selector) => {
+  const out = [];
+  const re = new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\{([^}]*)\\}`, 'g');
+  let m;
+  while ((m = re.exec(sheet))) out.push(m[1]);
+  return out;
+};
+
+test('the Enrollments card lays out by its OWN width, never the viewport', () => {
+  const card = enrollCardRegion();
+  assert.ok(!/\b(sm|md|lg|xl|2xl):grid-cols-/.test(card),
+    'a viewport breakpoint cannot see the sidebar — the card must use its @container rules');
+  assert.match(card, /className="glass-card p-4 enroll-card"/, 'the card is the query container');
+  const sheet = css();
+  assert.match(sheet, /\.enroll-card\s*\{[^}]*container:\s*enroll-card\s*\/\s*inline-size/,
+    'the card must be a named inline-size container');
+  assert.match(sheet, /@container enroll-card \(min-width: \d+px\)/, 'the wide layout is a container query');
+  assert.ok(!/overflow-(x-)?hidden|overflow-hidden/.test(card),
+    'clipping hides the collapse instead of fixing it');
+});
+
+test('no Enrollments card grid track can be sized by the action buttons', () => {
+  const card = enrollCardRegion();
+  const head = card.indexOf('className="enroll-card__head"');
+  const actions = card.indexOf('className="enroll-card__actions"');
+  assert.ok(head > 0 && actions > head, 'the actions row must follow the head grid');
+  // The actions are a block row of their own. If they ever move back into the head grid,
+  // the grid's max-content pass hands them width before identity gets any.
+  for (const rule of cssRules(css(), '.enroll-card__head')) {
+    assert.ok(!/actions/.test(rule), 'the actions must not be a grid area of the head');
+    const cols = /grid-template-columns:\s*([^;]+);/.exec(rule)?.[1];
+    if (!cols) continue;
+    assert.ok((cols.match(/\bauto\b/g) || []).length <= 1,
+      `at most ONE auto track (the status pill) — got "${cols}"`);
+    assert.match(cols, /^minmax\(0, 1fr\)/, 'identity is the first track and the only flexible one');
+  }
+  assert.match(card, /data-enroll-region="who"/);
+  assert.match(card, /data-enroll-region="plan"/);
+  assert.match(card, /data-enroll-region="status"/);
+  assert.match(card, /data-enroll-region="actions"/);
+});
+
+test('an Enrollments card never truncates who the student is or what they paid', () => {
+  const card = enrollCardRegion();
+  assert.match(card, /<AdminUserCell wrap\b/, 'identity wraps; an ellipsis can hide which student this is');
+  assert.ok(!/maxWidth:\s*160/.test(card), 'the payment reference is evidence, not decoration');
+  assert.ok(!/min-w-\[150px\]/.test(card), 'a hard minimum on the plan column is what overlapped identity');
+  const cell = app().slice(app().indexOf('function AdminUserCell('), app().indexOf('function AdminUserCell(') + 1600);
+  assert.match(cell, /wrap = false/, 'the wrap mode is opt-in, so Access Requests and Batches are unchanged');
+});
+
+test('the details toggle says what it does and whether it is open', () => {
+  const src = app();
+  const card = enrollCardRegion();
+  assert.match(card, /aria-expanded=\{expanded\}/);
+  assert.match(card, /aria-controls=\{`enroll-details-\$\{r\.id\}`\}/);
+  assert.match(src, /id=\{`enroll-details-\$\{r\.id\}`\}/, 'aria-controls must name a real element');
+  assert.match(card, /\{expanded \? 'Hide details' : 'Details'\}/, 'an icon-only chevron did not say what it opened');
+});
+
+test('the review-alert badge says who was emailed, and the student line says it was the student', () => {
+  const src = app();
+  assert.ok(!src.includes("label: 'Admin emailed'"), '"Admin emailed" read as "an admin emailed the student"');
+  assert.match(src, /sent:\s*\{ label: 'Review alert sent'/);
+  assert.match(src, /The enrollment review alert was sent to the configured administrator\./);
+  assert.match(enrollCardRegion(), /Student emailed \{commWhen\(/,
+    'the Communications line is a different email to a different person');
+});
+
+test('admin count badges are announced as sentences, not bare numbers', () => {
+  const src = app();
+  assert.match(src, /function adminBadgePhrase\(id, n\)/);
+  assert.match(src, /enrollment \$\{n === 1 \? 'request' : 'requests'\} awaiting review/);
+  const aside = sidebarOf(src);
+  // aria-label on a plain <span> is ignored by screen readers (a generic role takes no name).
+  assert.ok(!/<span[^>]*aria-label=\{`\$\{(item\.count|waiting)\}/.test(aside),
+    'the count phrase must be real text (sr-only), not an aria-label on a span');
+  assert.match(aside, /aria-label=\{item\.count \? `\$\{item\.label\}, \$\{adminBadgePhrase\(item\.id, item\.count\)\}` : item\.label\}/,
+    'the collapsed rail link dropped the count from its accessible name');
+});
+
+test('a decision email names a request, never a recipient', () => {
+  const src = app();
+  const calls = src.match(/notifyDecision\(\{[^}]*\}\)/g) || [];
+  assert.ok(calls.length >= 3, 'the three decision paths were not found');
+  for (const c of calls) {
+    assert.match(c, /requestId: r\.id/, c);
+    assert.ok(!/\bemail:/.test(c), `${c} — the server reads the recipient from the request row`);
+  }
+});
+
+test('a single reject or expire cannot overwrite an already-decided request', () => {
+  const body = app().slice(app().indexOf('const doDecline = async'), app().indexOf('const doDecline = async') + 1200);
+  assert.match(body, /\.eq\('status', 'pending_review'\)/, 'a stale card could re-decide an approved request');
+});
+
+test("the sidebar toggle hands focus to its counterpart, never to <body>", () => {
+  // The toggle is two buttons, and pressing either removes it from view. Measured before the
+  // fix (test-e2e/enrollmentLayout.e2etest.mjs): focus landed on BODY in both directions.
+  const src = app();
+  assert.match(src, /ref=\{railCollapseBtnRef\}\s+onClick=\{toggleRail\}/);
+  assert.match(src, /ref=\{railExpandBtnRef\}\s+onClick=\{toggleRail\}/);
+  assert.ok(src.includes('(railCollapsed ? railExpandBtnRef : railCollapseBtnRef).current?.focus()'),
+    'focus must move to the OTHER toggle once the new state has rendered');
+  assert.ok(src.includes('railToggleHadFocusRef.current = !!active && (active === railCollapseBtnRef.current || active === railExpandBtnRef.current)'),
+    'only when the pressed toggle had focus — a mouse user elsewhere must not have focus moved');
+});
+
+test('the layouts the workspace sweep caught follow their own width, not the viewport', () => {
+  // test-e2e/workspaceSweep.e2etest.mjs measured each of these broken at 1024 with the sidebar
+  // open: a 39px StatCard text column, a 54px roadmap label box, a 44px invoice amount track.
+  // That suite needs .env.test; this scan keeps the shape pinned everywhere else.
+  const src = app();
+  const sheet = css();
+  for (const name of ['stat-strip', 'roadmap', 'inv-lines']) {
+    assert.match(sheet, new RegExp(`container:\\s*${name}\\s*/\\s*inline-size`), `${name} must be a named inline-size container`);
+    assert.match(sheet, new RegExp(`@container ${name} \\(min-width: \\d+px\\)`), `${name} must switch columns by container query`);
+  }
+  assert.ok(src.includes('<div className="stat-strip">'), 'the Progress staff-report stats must sit in the stat-strip container');
+  assert.ok(!src.includes('<div className="grid grid-cols-2 lg:grid-cols-4 gap-3">\n        <StatCard label="Filtered learners"'),
+    'the viewport-breakpoint StatCard grid is back');
+  assert.ok(src.includes('glass-card p-6 mb-10 roadmap-strip'), 'the career roadmap must be its own container');
+  assert.ok(!/grid grid-cols-3 md:grid-cols-7/.test(src), 'the roadmap may not switch to seven columns on the viewport');
+  assert.ok(!/col-span-1 text-right text-sm font-bold" style=\{\{ color: NAVY \}\}>\{formatCurrency/.test(src),
+    'an invoice amount may not live in a fixed one-twelfth track');
+  assert.equal((src.match(/className="inv-line__amount /g) || []).length, 2, 'both invoice line lists size the amount to its content');
+});
+
+test('the SectionHead band mirrors TabPanel padding at every breakpoint, so no tab scrolls sideways on a phone', () => {
+  // It was a flat `-mx-10 -mt-10 px-10`, right only from lg up: below it the band overhung the
+  // 16px phone padding by 24px each side and every tab scrolled sideways (measured at 320:
+  // <main> held 334px in 310). test-e2e/workspaceSweep.e2etest.mjs checks this at 390.
+  const src = app();
+  assert.ok(src.includes('<div className="gh-section-head sticky top-0 z-30 -mx-4 -mt-4 px-4 sm:-mx-6 sm:-mt-6 sm:px-6 lg:-mx-10 lg:-mt-10 lg:px-10 '),
+    'the band must mirror p-4 sm:p-6 lg:p-10 exactly');
+  assert.ok(src.includes("p-4 sm:p-6 lg:p-10 ${WIDE_CANVAS_TABS"), 'the padding it mirrors must still be the TabPanel padding');
+  // The Dashboard hero's glow is a PSEUDO-element, which no element scan can see, and its flat
+  // `inset: -40px` hung 24px past a phone's 16px padding. Same rule, one layer down.
+  const sheet = css();
+  assert.match(sheet, /\.gh-halo::after \{[^}]*inset: -40px -16px;/, 'the halo reaches 16px sideways at phone width');
+  assert.match(sheet, /@media \(min-width: 640px\)\s*\{ \.gh-halo::after \{ inset: -40px -24px; \} \}/);
+  assert.match(sheet, /@media \(min-width: 1024px\) \{ \.gh-halo::after \{ inset: -40px; \} \}/);
+});
+
+test("the focus targets a decision returns to carry a name a screen reader can read", () => {
+  // refocusAfterDecision() focuses the card (or the list). A role-less div is `generic`,
+  // which ARIA forbids naming, so its aria-label was dropped on focus.
+  const card = enrollCardRegion();
+  assert.ok(card.includes('id={`enroll-card-${r.id}`} role="group" tabIndex={-1} aria-label='),
+    'the card is a focus target and must be a named group');
+  assert.ok(app().includes('id="enroll-list" role="group" tabIndex={-1} aria-label="Enrollment requests"'),
+    'the list is the fallback focus target and must be a named group');
+});
