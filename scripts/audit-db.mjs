@@ -1265,6 +1265,31 @@ export const OBJECT_CHECKS = [
      where n.nspname='public' and (p.proname like 'course_lesson_asset%'
         or p.proname in ('course_family_root','course_lesson_sync_assets'))`],
 
+  // ── #66, a decided enrollment request stays decided ────────────────────────
+  // ★ The WHEN clause is the scope. Dropping it would refuse every admin_notes save on a
+  //   decided row; dropping a state from it would reopen the reopen-and-approve-again path
+  //   (a second paid term on one payment) through that state.
+  ['#66    the decision lock is armed and scoped to a status change out of a decided state', `select count(*) = 1 as ok
+      from pg_trigger t
+     where t.tgname = 'enrollment_decision_lock' and t.tgrelid = 'public.enrollment_requests'::regclass
+       and not t.tgisinternal and t.tgenabled = 'O'
+       and pg_get_triggerdef(t.oid) ilike '%BEFORE UPDATE%'
+       and pg_get_triggerdef(t.oid) like '%approved%' and pg_get_triggerdef(t.oid) like '%rejected%'
+       and pg_get_triggerdef(t.oid) like '%expired%'
+       and pg_get_triggerdef(t.oid) ilike '%IS DISTINCT FROM old.status%'`],
+  ['#66    the lock refuses non-Super-Admins and is reachable only as a trigger', `select count(*) = 1 as ok
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname='public' and p.proname='enrollment_decision_lock' and p.prosecdef
+       and p.prosrc like '%INVALID_MEMBERSHIP_TRANSITION%' and p.prosrc like '%is_super_admin()%'
+       and p.prosrc like '%app.enrollment_admin_override%' and p.prosrc like '%decision_reopened%'
+       and coalesce(array_to_string(p.proconfig, ','), '') like '%search_path=public, pg_temp%'
+       and not has_function_privilege('authenticated', p.oid, 'execute')
+       and not has_function_privilege('anon', p.oid, 'execute')`],
+  ['#66    a reopened decision can be recorded, and that CHECK is VALID', `select count(*) = 1 as ok
+      from pg_constraint where conname = 'enrollment_request_events_action_check'
+        and conrelid = 'public.enrollment_request_events'::regclass and convalidated
+        and pg_get_constraintdef(oid) like '%decision_reopened%'`],
+
 ];
 
 async function main() {
