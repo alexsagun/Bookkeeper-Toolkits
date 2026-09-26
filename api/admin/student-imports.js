@@ -1,775 +1,567 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Vercel serverless endpoint — ADMIN-ONLY student import (Thinkific migration).
+// Vercel serverless endpoint — the legacy student migration (#67). SUPER ADMIN ONLY.
 // ─────────────────────────────────────────────────────────────────────────────
-// This is the ONLY place that holds the Supabase SERVICE-ROLE key and the ONLY
-// place that creates Auth accounts / grants imported subscription terms. Every
-// action:
-//   1. verifies the caller's Supabase Bearer JWT (against /auth/v1/user), AND
-//   2. independently confirms profiles.is_admin (read with the CALLER's JWT),
-//   BEFORE the service-role client is ever constructed.
-// The service key is server-only (SUPABASE_SECRET_KEY, legacy fallback
-// SUPABASE_SERVICE_ROLE_KEY), never VITE_-prefixed, and is NEVER returned in a
-// response or logged. Names/emails/raw rows/invite links are never logged either.
+// The only place that holds the service-role key for student migration, and the only
+// place that creates Auth accounts for it. Every action:
+//   1. passes requireStaff(req, { permission: 'students.legacy_migrate' }) — a verified
+//      JWT plus the caller's LIVE staff context — BEFORE service() is constructed;
+//   2. hands the verified caller to the database as p_actor, and every SQL function
+//      re-checks that actor's permission (auth.uid() is NULL under the service role).
+//
+// ★ THE BROWSER DESCRIBES, THE DATABASE DECIDES. The browser sends parsed rows to
+//   stage and row ids to activate. It never sends a user id, a plan, a batch, a date,
+//   a paid status or an amount for an activation: legacy_import_activate_row() reads
+//   all of them from the staged row, which only legacy_import_stage() wrote.
+//
+// ★ ONE ACTIVATION IS ONE DATABASE TRANSACTION, AND THE AUTH USER COMES FIRST.
+//   Supabase Auth and Postgres cannot share a transaction, so the saga is ordered to be
+//   retry-safe at every step: claim the row → find or create the Auth user (createUser
+//   sends no email) → record it on the row → activate (subscription + cohort run +
+//   approval + audit, all or nothing) → mint and send the invitation → record delivery.
+//   A timeout anywhere is resumed by the next request; an Auth user is never deleted.
 //
 // Actions (POST body.action):
-//   'dry-run'       — recompute matches + proposed actions for a job's staged rows
-//                     (NO account/subscription mutations). Idempotent.
-//   'process'       — process the next bounded batch from the job cursor; persist
-//                     every row result so a browser close / deploy / timeout resumes.
-//   'resend-invite' — re-mint a fresh set-password link for one imported, not-yet-
-//                     onboarded user (no new user / subscription).
-//   GET             — health: { ok, configured, hasSecretKey, hasResend } (booleans only).
+//   health            readiness booleans (email, APP_URL, support address, service key)
+//   stage             { filename, fileSha256, rows, mapping, dateFormat, planMapping,
+//                       batchMapping, eligibleBatchCodes } → a durable job (or the
+//                       existing one for the same roster)
+//   preflight         { jobId, rowIds } → the counts the confirmation dialog shows
+//   start-activation  { jobId, rowIds, phrase, clientKey } → a durable run
+//   activate-chunk    { runId, retryFailed } → as many rows as fit in the time budget
+//   pause-run         { runId }
+//   resend            { rowId } → a fresh link under a new generation
+//   send-test         → the activation email, with sample details and no token, to the
+//                       CALLING Super Admin's own address: proves the migration sender
+//                       (support@alexsagun.com) is verified before any student is emailed
+//   GET               { ok, configured } — nothing that describes the deployment
 //
-// Idempotency (retry-safe): auth email uniqueness (Supabase) + student_external_accounts
-// unique(source, external_user_id) + subscriptions.source_import_row_id unique. A retry
-// after "auth user created but grant failed" re-matches the existing user and completes
-// the grant — never a duplicate account / link / subscription. An existing Auth user is
-// NEVER auto-deleted.
-//
-// Runs on Vercel AND under `npm run dev` (via the studentImportDevApi middleware in
-// vite.config.js), so the same auth gate is exercised locally.
+// ★ NOTHING HERE LOGS A NAME, AN EMAIL, A LINK OR A PROVIDER BODY. Failures log the
+//   action and a safe code only; rows carry codes, never messages.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { requireStaff, service } from '../_lib/staffAuth.js';
+import { createHash, randomBytes } from 'node:crypto';
+
+import { requireStaff, service, serviceConfigured } from '../_lib/staffAuth.js';
+import { emailConfigured, sendEmail } from '../_lib/email.js';
+import { MIGRATION_SENDER_ADDRESS, legacyMembershipEmail } from '../_lib/legacyClaimEmail.js';
+import { buildClaimUrl, buildSignInUrl } from '../../src/lib/importClaim.js';
 import {
-  normalizeEmail, isValidEmail,
-  resolveMatchDecision, computeImportTerm, decideOnboardingStep,
-} from '../../src/lib/studentImport.js';
-import { planSegment, resolveBatchForImport, batchGapForProcess } from '../../src/lib/communitySpaces.js';
+  ACTIVATION_FUNCTION_MAX_SECONDS, DATE_FORMATS, MAX_ACTIVATION_RUN, MAX_STAGE_ROWS,
+  normalizeLegacyRows,
+} from '../../src/lib/legacyMigration.js';
 
-const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
-const ANON_KEY = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
-const SERVICE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const PERMISSION = 'students.legacy_migrate';
 
-const BRAND = 'Toolkits by Alex';
-const SOURCE = 'thinkific';
-const MAX_BATCH = 25;
-const CHUNK = 200;                       // bulk .in() lookup chunk size
-const PLAN_ALLOWLIST_FALLBACK = ['sampler', 'silver_self_paced', 'vip'];   // #39: the three-plan catalog
+// ★ Every migration email is sent from, and answered at, support@alexsagun.com (owner
+//   requirement). MIGRATION_EMAIL_FROM may override it — e.g. with a display name — but the
+//   domain must be verified in Resend either way; "send-test" proves it.
+function migrationSender() {
+  const env = String(process.env.MIGRATION_EMAIL_FROM || '').trim();
+  return env || MIGRATION_SENDER_ADDRESS;
+}
+/** The bare address inside "Name <addr>" or a bare address, for reply-to and the footer. */
+function migrationSupportAddress() {
+  const raw = migrationSender();
+  const m = /<([^>]+)>/.exec(raw);
+  return (m ? m[1] : raw).trim();
+}
 
-// ── Per-warm-instance burst guard (same best-effort pattern as the other endpoints) ──
+// ── Time budget ──────────────────────────────────────────────────────────────
+// vercel.json gives this function ACTIVATION_FUNCTION_MAX_SECONDS (60). A chunk stops
+// claiming once a whole row could no longer finish inside it; a row it could not reach
+// stays `ready` for the next request, and a row claimed by a request that died is
+// reclaimable after STALE_CLAIM_MINUTES (10), which is longer than the function can live.
+const RPC_TIMEOUT_MS = 8_000;
+const AUTH_TIMEOUT_MS = 8_000;
+const SEND_TIMEOUT_MS = 10_000;
+const CHUNK_BUDGET_MS = (ACTIVATION_FUNCTION_MAX_SECONDS - 12) * 1000;
+// A realistic ceiling for one row (a normal row takes 1–3 s). Every call below still has
+// its own limit; a row that outruns the function is resumed by the stale-claim rule, and
+// its grant is one transaction, so it is either wholly done or wholly absent.
+const PER_ROW_WORST_MS = 20_000;
+const PACE_MS = 600;                       // Resend's default limit is 2 requests/second
+const MAX_STAGE_BODY_CHARS = 3_500_000;    // under Vercel's 4.5 MB request limit
+
+// ── Per-warm-instance burst guard ────────────────────────────────────────────
 const RATE_WINDOW_MS = 60_000;
-const RATE_MAX_PER_WINDOW = 30;
+const RATE_MAX_PER_WINDOW = 60;
 const rateHits = new Map();
 function rateLimited(userId) {
   const now = Date.now();
-  const cutoff = now - RATE_WINDOW_MS;
-  const hits = (rateHits.get(userId) || []).filter((t) => t >= cutoff);
+  const hits = (rateHits.get(userId) || []).filter((t) => t >= now - RATE_WINDOW_MS);
   if (hits.length >= RATE_MAX_PER_WINDOW) { rateHits.set(userId, hits); return true; }
   hits.push(now); rateHits.set(userId, hits);
   return false;
 }
 
-// ── Auth ──
-// callerUser / callerIsAdmin / service moved to api/_lib/staffAuth.js in #45.
-// They were one of four byte-identical copies of the same profiles.is_admin read.
-// This endpoint now gates on the students.import CAPABILITY, so an Operations
-// Admin can run a migration without holding course, staff or settings authority.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ── Redacted audit event (IDs + safe codes only — never PII/links) ───────────────
-async function logEvent(admin, { jobId, rowId, actorId, kind, status, detail }) {
+/** A database call with a time limit. Returns { data, error }; never throws. */
+async function rpc(admin, fn, args, timeoutMs = RPC_TIMEOUT_MS) {
   try {
-    await admin.from('student_import_events').insert({
-      job_id: jobId, row_id: rowId || null, actor: actorId || null,
-      kind, status: status || null, detail: detail || {},
-    });
-  } catch { /* audit is best-effort; never blocks the operation */ }
+    const { data, error } = await admin.rpc(fn, args).abortSignal(AbortSignal.timeout(timeoutMs));
+    return { data, error };
+  } catch (e) {
+    return { data: null, error: { code: e?.name === 'TimeoutError' || e?.name === 'AbortError' ? 'rpc_timeout' : 'rpc_failed' } };
+  }
 }
 
-// ── Resend invite email (link generated, emailed, then DISCARDED) ────────────────
-const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
-  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-function inviteHtml(actionLink) {
-  return `<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f4f7fb;padding:32px 0;">
-  <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e6ebf2;">
-    <div style="background:linear-gradient(180deg,#3aa0ff,#0A84FF);padding:26px;text-align:center;">
-      <h1 style="margin:0;color:#fff;font-size:18px;font-weight:800;">${esc(BRAND)}</h1></div>
-    <div style="padding:28px;color:#1c2430;">
-      <h2 style="font-size:18px;margin:0 0 8px;">Your account is ready — set your password</h2>
-      <p style="font-size:14px;line-height:1.6;color:#48505e;margin:0 0 20px;">We've moved your membership into the new ${esc(BRAND)} toolkit. Click below to set your own password and sign in. This link is single-use and expires soon.</p>
-      <div style="text-align:center;margin:0 0 20px;">
-        <a href="${esc(actionLink)}" style="display:inline-block;background:#0A84FF;color:#fff;border-radius:10px;padding:12px 24px;font-size:14px;font-weight:700;text-decoration:none;">Set my password</a>
-      </div>
-      <p style="font-size:12px;color:#8a93a3;margin:8px 0 0;">If you didn't expect this, you can ignore it.</p>
-    </div></div></div>`;
+/** The safe code of a PostgREST / app_error failure — never its message. */
+function codeOf(error) {
+  if (!error) return 'unexpected';
+  const hint = typeof error.hint === 'string' && /^[A-Z_]{3,60}$/.test(error.hint) ? error.hint : null;
+  return hint || String(error.code || 'unexpected').replace(/[^A-Za-z0-9_:.-]/g, '').slice(0, 60) || 'unexpected';
 }
-async function sendInviteEmail(email, actionLink) {
-  const apiKey = process.env.RESEND_API_KEY;
-  const from = process.env.RESEND_FROM;
-  if (!apiKey || !from) return { ok: false, code: 'email_not_configured' };
-  // Honor Retry-After / 429 with a small exponential backoff.
-  for (let attempt = 0; attempt < 3; attempt++) {
-    let r;
+
+function statusOf(code) {
+  if (code === 'FORBIDDEN') return 403;
+  if (/NOT_FOUND$/.test(code)) return 404;
+  if (/INVALID|MISMATCH$/.test(code) && code !== 'LEGACY_IDENTITY_MISMATCH') return 422;
+  if (code === 'PGRST202' || code === 'PGRST205' || code === '42883') return 503;
+  if (/^LEGACY_|^MEMBERSHIP_/.test(code)) return 409;
+  return 500;
+}
+
+function fail(res, action, error, fallback) {
+  const code = codeOf(error);
+  console.error(`[student-imports] ${action} refused: ${code}`);
+  if (code === 'PGRST202' || code === 'PGRST205' || code === '42883') {
+    return res.status(503).json({ error: 'The migration needs db/2026-09-25-legacy-student-migration.sql (#67). Run it, then try again.', code: 'MIGRATION_MISSING' });
+  }
+  return res.status(statusOf(code)).json({ error: fallback, code, context: safeContext(error) });
+}
+
+/** Only the structured context app_error() attaches (ids, counts), never a message. */
+function safeContext(error) {
+  try {
+    const d = typeof error?.details === 'string' ? JSON.parse(error.details) : null;
+    return d && typeof d.context === 'object' ? d.context : null;
+  } catch { return null; }
+}
+
+// ── Readiness ────────────────────────────────────────────────────────────────
+/**
+ * The first-party origin a claim link points at: APP_URL, and only APP_URL, on any Vercel
+ * deployment. The old sender fell back to SUPABASE_URL and produced links to the database
+ * host; a Host-header fallback on a PREVIEW deployment — which shares production's
+ * database — would email real students links to a throwaway preview. The request's own
+ * origin is used only by a local dev server (npm run dev), whose links nobody real gets.
+ */
+function appOrigin(req) {
+  const env = String(process.env.APP_URL || '').trim().replace(/\/+$/, '');
+  if (/^https?:\/\//i.test(env)) return env;
+  if (process.env.VERCEL_ENV) return null;
+  const host = String(req?.headers?.host || '').trim();
+  return /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host) ? `http://${host}` : null;
+}
+
+async function readiness(admin, req) {
+  // The emails name the migration sender as their support contact; the payment-settings
+  // support address is kept only as a diagnostic, and no longer decides readiness.
+  const origin = appOrigin(req);
+  const sender = migrationSupportAddress();
+  const out = {
+    service: serviceConfigured(),
+    // RESEND_FROM is not needed here: migration mail names its own sender.
+    email: Boolean(process.env.RESEND_API_KEY),
+    appUrl: Boolean(origin),
+    support: /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(sender),
+    sender,
+  };
+  out.canActivate = out.service && out.email && out.appUrl && out.support;
+  return { flags: out, origin, supportEmail: sender };
+}
+
+function notReadyMessage(flags) {
+  const missing = [];
+  if (!flags.email) missing.push('email sending (RESEND_API_KEY)');
+  if (!flags.appUrl) missing.push('the app address (APP_URL)');
+  if (!flags.support) missing.push('a valid migration sender (MIGRATION_EMAIL_FROM)');
+  return `Activation is paused until the server has ${missing.join(', ')}. Staging still works.`;
+}
+
+// ── Staging ──────────────────────────────────────────────────────────────────
+/** A fingerprint of the roster's CONTENT, independent of column order and mappings. */
+function contentFingerprint(rows) {
+  const canonical = rows.map((r) => Object.keys(r).sort().map((k) => [k, String(r[k] ?? '').trim()]));
+  return createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest('hex');
+}
+
+async function doStage(admin, actorId, body) {
+  const rows = Array.isArray(body?.rows) ? body.rows : null;
+  if (!rows || rows.length < 1 || rows.length > MAX_STAGE_ROWS) {
+    return { status: 422, body: { error: `A roster must hold between 1 and ${MAX_STAGE_ROWS.toLocaleString('en-US')} rows.`, code: 'LEGACY_STAGE_INVALID' } };
+  }
+  if (!rows.every((r) => r && typeof r === 'object' && !Array.isArray(r))) {
+    return { status: 422, body: { error: 'Every row must be a set of named columns.', code: 'LEGACY_STAGE_INVALID' } };
+  }
+  if (!DATE_FORMATS.includes(body?.dateFormat)) {
+    return { status: 422, body: { error: 'Declare the date format before staging.', code: 'LEGACY_STAGE_INVALID' } };
+  }
+
+  const [plansRes, batchesRes] = await Promise.all([
+    admin.from('enrollment_plans').select('key,name,price_php,active').abortSignal(AbortSignal.timeout(RPC_TIMEOUT_MS)),
+    admin.from('batches').select('id,code,name,status').abortSignal(AbortSignal.timeout(RPC_TIMEOUT_MS)),
+  ]);
+  if (plansRes.error || batchesRes.error) {
+    return { status: 503, body: { error: 'Could not read the plan catalog or the batch registry. Nothing was staged; try again.', code: 'rpc_failed' } };
+  }
+
+  const normalized = normalizeLegacyRows(rows, {
+    mapping: body.mapping || {},
+    dateFormat: body.dateFormat,
+    planMapping: body.planMapping || {},
+    batchMapping: body.batchMapping || {},
+    plans: plansRes.data || [],
+    batches: batchesRes.data || [],
+    eligibleBatchCodes: Array.isArray(body.eligibleBatchCodes) ? body.eligibleBatchCodes : [],
+    nowMs: Date.now(),
+  });
+
+  const job = {
+    filename: String(body.filename || '').slice(0, 200) || null,
+    file_sha256: /^[0-9a-f]{64}$/i.test(String(body.fileSha256 || '')) ? String(body.fileSha256).toLowerCase() : null,
+    content_sha256: contentFingerprint(rows),
+    mapping: body.mapping || {},
+    date_format: body.dateFormat,
+    plan_mapping: body.planMapping || {},
+    batch_mapping: body.batchMapping || {},
+    eligible_batch_codes: Array.isArray(body.eligibleBatchCodes) ? body.eligibleBatchCodes : [],
+  };
+  const sqlRows = normalized.map((r) => ({
+    source_row_number: r.source_row_number,
+    external_user_id: r.external_user_id,
+    email_normalized: r.email_normalized,
+    email_display: r.email_display,
+    first_name: r.first_name,
+    last_name: r.last_name,
+    plan_key: r.plan_key,
+    legacy_plan_label: r.legacy_plan_label,
+    batch_code: r.batch_code,
+    legacy_batch_label: r.legacy_batch_label,
+    start_date: r.start_date,
+    end_date: r.end_date,
+    payment_status: r.payment_status,
+    amount_paid: r.amount_paid,
+    currency: r.currency,
+    phone: r.phone,
+    errors: r.errors,
+    warnings: r.warnings,
+  }));
+
+  const { data, error } = await rpc(admin, 'legacy_import_stage', { p_actor: actorId, p_job: job, p_rows: sqlRows }, 30_000);
+  if (error) return { error };
+  return { status: 200, body: data };
+}
+
+// ── Activation ───────────────────────────────────────────────────────────────
+async function findAuthUser(admin, actorId, email) {
+  const { data, error } = await rpc(admin, 'legacy_import_find_auth_user', { p_actor: actorId, p_email: email });
+  if (error) throw Object.assign(new Error('find_failed'), { safeCode: codeOf(error) });
+  return data || [];
+}
+
+async function resolveAuthUser(admin, actorId, row) {
+  if (row.target_user_id) return { uid: row.target_user_id, created: false };
+  const found = await findAuthUser(admin, actorId, row.email);
+  if (found.length > 1) throw Object.assign(new Error('ambiguous'), { safeCode: 'identity_ambiguous' });
+  if (found.length === 1) return { uid: found[0].user_id, created: false };
+
+  let created = null;
+  try {
+    const { data, error } = await Promise.race([
+      admin.auth.admin.createUser({
+        email: row.email,
+        email_confirm: false,          // confirmed by the claim link, never assumed
+        user_metadata: row.full_name ? { full_name: row.full_name } : {},
+        // ★ Marks the account as THIS row's. If createUser times out but succeeds, the retry
+        //   finds it by email and legacy_import_bind_user() still knows the import created
+        //   it — rather than recording a stranger's never-confirmed signup.
+        app_metadata: { legacy_import_row_id: row.row_id },
+      }),
+      sleep(AUTH_TIMEOUT_MS).then(() => ({ data: null, error: { code: 'auth_timeout' } })),
+    ]);
+    if (!error && data?.user?.id) created = data.user.id;
+  } catch { /* re-resolved below */ }
+  if (created) return { uid: created, created: true };
+
+  // "Already registered", a timeout that succeeded anyway, a race with another window:
+  // whatever happened, the address is the identity — look it up again.
+  const again = await findAuthUser(admin, actorId, row.email);
+  if (again.length === 1) return { uid: again[0].user_id, created: false };
+  throw Object.assign(new Error('create_failed'), { safeCode: again.length > 1 ? 'identity_ambiguous' : 'auth_create_failed' });
+}
+
+/**
+ * Mint (for a claim) and send one invitation under a new generation, then record it.
+ * Returns the recorded state. A provider answer that may have been delivered is
+ * `uncertain`, never retried under a new token automatically.
+ */
+async function sendInvite(admin, actorId, rowId, ctx, { resend = false } = {}) {
+  const { data: inv, error } = await rpc(admin, 'legacy_import_begin_invite', { p_actor: actorId, p_row_id: rowId, p_resend: resend });
+  if (error) return { state: 'error', code: codeOf(error) };
+  if (!inv || inv.skip) return { state: 'skipped' };
+
+  const record = async (state, code) => {
+    const r = await rpc(admin, 'legacy_import_record_delivery', {
+      p_actor: actorId, p_row_id: rowId, p_generation: inv.generation, p_state: state, p_code: code || null,
+    });
+    if (r.error) console.error(`[student-imports] record delivery failed: ${codeOf(r.error)}`);
+    return { state, code };
+  };
+
+  let url = null;
+  if (inv.kind === 'claim') {
+    let tokenHash = null;
     try {
-      r = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ from, to: [email], subject: `Set your ${BRAND} password`, html: inviteHtml(actionLink) }),
-      });
-    } catch { r = null; }
-    if (r && r.ok) return { ok: true };
-    if (r && r.status === 429) {
-      const retryAfter = Number(r.headers.get('retry-after')) || (2 ** attempt);
-      await new Promise((res) => setTimeout(res, Math.min(retryAfter, 5) * 1000));
-      continue;
-    }
-    if (r) { console.error(`[student-imports] resend ${r.status}`); return { ok: false, code: `resend_${r.status}` }; }
-    await new Promise((res) => setTimeout(res, (2 ** attempt) * 500));
-  }
-  return { ok: false, code: 'resend_failed' };
-}
-
-// ── Bulk match lookups (dry-run) ────────────────────────────────────────────────
-async function chunkedIn(admin, table, column, values, select) {
-  const out = [];
-  const uniq = [...new Set(values.filter(Boolean))];
-  for (let i = 0; i < uniq.length; i += CHUNK) {
-    const slice = uniq.slice(i, i + CHUNK);
-    const { data, error } = await admin.from(table).select(select).in(column, slice);
-    if (error) throw error;
-    if (data) out.push(...data);
-  }
-  return out;
-}
-
-// Resolve the proposed action for a single already-normalized staged row.
-function proposeForRow(row, { bySourceMap, byEmailMap, comboPlanMap, planAccessDays, planRows, batchesByCode, defaultTermMode, now }) {
-  const warnings = [];
-  const errors = [];
-  const emailNorm = row.email_normalized || '';
-  const hasEmail = emailNorm.length > 0;
-  const emailValid = hasEmail; // email_normalized is '' unless it already validated
-
-  const bySource = row.external_user_id ? (bySourceMap.get(row.external_user_id) || null) : null;
-  const emailHit = hasEmail ? byEmailMap.get(emailNorm) : null;
-  const byEmail = emailHit && emailHit.length === 1 ? emailHit[0] : null;
-  const byEmailAmbiguous = !!(emailHit && emailHit.length > 1);
-
-  const match = resolveMatchDecision({ hasEmail, emailValid }, { bySource, byEmail, byEmailAmbiguous });
-
-  // Plan mapping comes from the admin's explicit decision, never inferred. A per-row
-  // `plan_key` (the supplemental-CSV override column, §3.4) wins over the course-combo map,
-  // but ONLY when it names a known/allowlisted plan — an unknown or blank override falls
-  // through to the combo mapping (and ultimately manual_review) rather than silently
-  // granting the wrong plan. Same trust level as the combo map: an admin-typed value, not
-  // inferred from a title/date/amount.
-  const comboKey = row.mapped?.combo_key || '';
-  const rowOverride = (row.mapped?.plan_key && planAccessDays.has(row.mapped.plan_key))
-    ? row.mapped.plan_key : null;
-  const mapping = rowOverride || comboPlanMap[comboKey] || null;
-  const overrideMode = row.mapped?.term_mode || defaultTermMode || 'preserve';
-
-  let intended = match.intended_action;
-  let planKey = null;
-  let termMode = overrideMode;
-  let proposedStart = row.proposed_started_at ? Date.parse(row.proposed_started_at) : null;
-  let proposedEnds = row.proposed_ends_at ? Date.parse(row.proposed_ends_at) : null;
-  let proposedBatchId = null;
-  let blocked = match.blocked;
-
-  if (match.reason && match.blocked) errors.push(match.reason);
-  else if (match.reason) warnings.push(match.reason);
-
-  // Explicit "profile only / manual review" mappings override the term entirely.
-  const mappedTarget = row.mapped?.plan_choice || mapping || null;
-  if (mappedTarget === 'profile_only') {
-    intended = 'profile_only'; termMode = 'profile_only'; blocked = false;
-  } else if (mappedTarget === 'manual_review' || !mappedTarget) {
-    intended = 'manual_review'; blocked = true;
-    warnings.push('No confirmed plan mapping for this course combination.');
-  } else if (!match.blocked) {
-    planKey = mappedTarget;
-    const accessDays = planAccessDays.has(planKey) ? planAccessDays.get(planKey) : null;
-    const term = computeImportTerm({
-      planKey, accessDays, startedAt: proposedStart, endsAt: proposedEnds,
-      mode: termMode, now,
-    });
-    if (term.action === 'block_missing_expiry') {
-      blocked = true; intended = 'manual_review';
-      errors.push('Preserve mode needs an exact expiry date — supply it or choose another term mode.');
-    } else if (term.action === 'block_conflict') {
-      blocked = true; intended = 'manual_review';
-      errors.push(term.reason || 'Plan conflict — resolve manually.');
-    }
-    proposedStart = term.started_at;
-    proposedEnds = term.ends_at;
-
-    // Batch resolution (#32): VIP rows need an explicit, confirmed OPEN
-    // batch_code — NEVER inferred from Thinkific history. resolveBatchForImport
-    // blocks premium rows without one; general rows ignore a stray code.
-    const batchRes = resolveBatchForImport({
-      segment: planSegment(planKey, planRows || {}),
-      batchCodeRaw: row.mapped?.batch_code,
-      batchesByCode: batchesByCode || {},
-    });
-    if (batchRes.blocked) {
-      blocked = true; intended = 'manual_review';
-      errors.push(batchRes.reason);
-    } else {
-      proposedBatchId = batchRes.batchId;
-      if (batchRes.warning) warnings.push(batchRes.warning);
-    }
+      const { data, error: gErr } = await Promise.race([
+        admin.auth.admin.generateLink({ type: 'magiclink', email: inv.email }),
+        sleep(AUTH_TIMEOUT_MS).then(() => ({ data: null, error: { code: 'auth_timeout' } })),
+      ]);
+      // ★ hashed_token ONLY. action_link is Supabase's /auth/v1/verify, which spends
+      //   the token on a GET — a mail scanner would claim the account.
+      if (!gErr) tokenHash = data?.properties?.hashed_token || null;
+    } catch { /* recorded below */ }
+    url = tokenHash ? buildClaimUrl({ appUrl: ctx.origin, tokenHash, type: 'magiclink' }) : null;
+    if (!url) return record('failed', 'link_failed');
+  } else {
+    url = buildSignInUrl(ctx.origin);
+    if (!url) return record('failed', 'app_url_missing');
   }
 
-  return {
-    match_result: match.match_result,
-    target_user_id: match.target_user_id,
-    intended_action: intended,
-    proposed_plan_key: planKey,
-    proposed_term_mode: termMode,
-    proposed_started_at: proposedStart != null ? new Date(proposedStart).toISOString() : null,
-    proposed_ends_at: proposedEnds != null ? new Date(proposedEnds).toISOString() : null,
-    proposed_batch_id: proposedBatchId,
-    processing_status: blocked ? 'blocked' : (intended === 'skip' ? 'skipped' : 'ready'),
-    warnings, errors,
-  };
-}
-
-// Throws on any failure other than "the #32 column isn't there yet". Degrading to the
-// hardcoded PLAN_SEGMENT_FALLBACK would classify every premium plan key that isn't
-// literally `vip` as `general` — skipping the batch requirement and granting
-// batch-less access with no blocked row to show for it — and would also leave
-// access_days empty so every term lands with a null expiry. Segment and term length
-// must come from the live table or the run must stop.
-async function loadPlanAccessDays(admin) {
-  const map = new Map();
-  const allow = new Set(PLAN_ALLOWLIST_FALLBACK);
-  const planRows = {};    // key → { community_segment } (planSegment falls back pre-#32)
-  let segmentAvailable = true;
-  // community_segment arrives with #32; a pre-#32 DB 42703s → retry without it.
-  let res = await admin.from('enrollment_plans').select('key, access_days, community_segment');
-  if (res.error && ['42703', 'PGRST204'].includes(String(res.error.code))) {
-    segmentAvailable = false;
-    res = await admin.from('enrollment_plans').select('key, access_days');
-  }
-  if (res.error) {
-    const err = new Error('Could not read enrollment_plans — aborting so no row is graded against stale plan data.');
-    err.code = String(res.error.code || 'plans_unavailable');
-    err.safeMessage = 'Could not read the plan list from the database. Nothing was changed — try again in a moment.';
-    throw err;
-  }
-  const data = res.data;
-  // Only replace the fallback allowlist when the table actually returned rows — an empty
-  // result would otherwise clear() to an empty set and fail EVERY grant ("not in allowlist").
-  if (Array.isArray(data) && data.length) {
-    allow.clear();
-    for (const p of data) {
-      map.set(p.key, p.access_days ?? null);
-      allow.add(p.key);
-      planRows[p.key] = p;
-    }
-  }
-  return { map, allow, planRows, segmentAvailable };
-}
-
-// batches registry for import batch_code resolution (#32). Pre-#32 (no table)
-// → {} — resolveBatchForImport then blocks every premium row, which is the
-// correct fail-closed behavior.
-async function loadBatches(admin) {
-  const byCode = {};
-  const byId = {};
-  const { data, error } = await admin.from('batches').select('id, code, status');
-  // Missing table = genuinely pre-#32 → empty registry, every premium row blocks.
-  if (error && !['42P01', 'PGRST205'].includes(String(error.code))) {
-    // A transient failure must NOT masquerade as "pre-#32": every premium row would be
-    // blocked with "batch no longer exists", diagnosing a live batch as deleted.
-    const err = new Error('Could not read the batches registry — aborting rather than mis-blocking premium rows.');
-    err.code = String(error.code || 'batches_unavailable');
-    err.safeMessage = 'Could not read the batch list from the database. Nothing was changed — try again in a moment.';
-    throw err;
-  }
-  for (const b of data || []) { byCode[b.code] = b; byId[b.id] = b; }
-  return { byCode, byId };
-}
-
-// ── dry-run ──────────────────────────────────────────────────────────────────────
-async function doDryRun(admin, { jobId, actorId }) {
-  const { data: job, error: jerr } = await admin.from('student_import_jobs').select('*').eq('id', jobId).single();
-  if (jerr || !job) return { status: 404, body: { error: 'Import job not found.' } };
-
-  const { data: rows, error: rerr } = await admin.from('student_import_rows')
-    .select('*').eq('job_id', jobId).order('source_row_number', { ascending: true });
-  if (rerr) return { status: 500, body: { error: 'Could not load staged rows.' } };
-
-  const { map: planAccessDays, planRows } = await loadPlanAccessDays(admin);
-  const { byCode: batchesByCode } = await loadBatches(admin);
-
-  // Bulk matches: external ids → existing links; emails → existing profiles.
-  const extIds = rows.map((r) => r.external_user_id).filter(Boolean);
-  const emails = rows.map((r) => r.email_normalized).filter(Boolean);
-  const links = await chunkedIn(admin, 'student_external_accounts', 'external_user_id',
-    extIds, 'external_user_id, user_id').catch(() => []);
-  const profs = await chunkedIn(admin, 'profiles', 'email', emails, 'id, email').catch(() => []);
-
-  const bySourceMap = new Map();
-  for (const l of links) if (l.external_user_id) bySourceMap.set(l.external_user_id, l.user_id);
-  const byEmailMap = new Map();
-  for (const p of profs) {
-    const key = normalizeEmail(p.email);
-    if (!key) continue;
-    const arr = byEmailMap.get(key) || [];
-    if (!arr.includes(p.id)) arr.push(p.id);
-    byEmailMap.set(key, arr);
-  }
-
-  const settings = job.settings || {};
-  const now = Date.now();
-  const counts = { total: rows.length, ready: 0, warnings: 0, blocked: 0, new: 0, existing: 0, conflicts: 0, done: 0 };
-
-  // Compute proposals (pure/sync) + tally first, then persist in bounded-concurrency
-  // chunks — 358 sequential awaited UPDATEs would risk a serverless timeout.
-  const updates = [];
-  for (const row of rows) {
-    // Never re-open a row that already processed — a re-run of dry-run is safe.
-    if (row.processing_status === 'done' || row.processing_status === 'processing') {
-      counts.done++;
-      continue;
-    }
-    const p = proposeForRow(row, {
-      bySourceMap, byEmailMap,
-      comboPlanMap: settings.combo_plan_map || {},
-      planAccessDays, planRows, batchesByCode,
-      defaultTermMode: settings.default_term_mode || 'preserve',
-      now,
-    });
-    updates.push({ id: row.id, p });
-
-    if (p.processing_status === 'blocked') counts.blocked++;
-    else if (p.processing_status === 'ready') counts.ready++;
-    if (p.warnings.length) counts.warnings++;
-    if (p.match_result === 'new') counts.new++;
-    if (p.match_result === 'existing_by_source' || p.match_result === 'existing_by_email') counts.existing++;
-    if (p.match_result === 'conflict' || p.match_result === 'ambiguous') counts.conflicts++;
-  }
-
-  const stamp = new Date().toISOString();
-  // proposed_batch_id is a #32 column — on a pre-#32 DB the first 42703/PGRST204
-  // flips the flag and the batch retries without it (rows then stay batch-less,
-  // which processRow treats as "no batch to grant").
-  let includeBatchCol = true;
-  const rowPatch = (p) => ({
-    match_result: p.match_result, target_user_id: p.target_user_id, intended_action: p.intended_action,
-    proposed_plan_key: p.proposed_plan_key, proposed_term_mode: p.proposed_term_mode,
-    proposed_started_at: p.proposed_started_at, proposed_ends_at: p.proposed_ends_at,
-    ...(includeBatchCol ? { proposed_batch_id: p.proposed_batch_id ?? null } : {}),
-    processing_status: p.processing_status, warnings: p.warnings, errors: p.errors, updated_at: stamp,
+  const msg = legacyMembershipEmail({
+    kind: inv.kind,
+    actionUrl: url,
+    fullName: inv.full_name,
+    email: inv.email,
+    planName: inv.plan_name,
+    planKey: inv.plan_key,
+    batchName: inv.batch_name,
+    startDate: inv.start_date,
+    endDate: inv.end_date,
+    supportEmail: ctx.supportEmail,
+    nowMs: Date.now(),
   });
-  // Rows whose proposal never reached the database. `counts` is computed in memory, so
-  // without this the admin would confirm against numbers that don't describe the DB.
-  let persistFailures = 0;
-  for (let i = 0; i < updates.length; i += 20) {
-    const batch = updates.slice(i, i + 20);
-    let results = await Promise.all(batch.map(({ id, p }) =>
-      admin.from('student_import_rows').update(rowPatch(p)).eq('id', id)));
-    if (includeBatchCol && results.some((r) => r.error && ['42703', 'PGRST204'].includes(String(r.error.code)))) {
-      includeBatchCol = false;
-      results = await Promise.all(batch.map(({ id, p }) =>
-        admin.from('student_import_rows').update(rowPatch(p)).eq('id', id)));
-    }
-    for (const r of results) {
-      if (!r.error) continue;
-      persistFailures++;
-      console.warn('[student-imports] dry-run row persist failed', String(r.error.code || 'error'));
-    }
-  }
+  url = null;   // the token lives only inside msg until it is sent; nothing else keeps it
 
-  await admin.from('student_import_jobs').update({
-    status: 'dry_run', counts, updated_at: new Date().toISOString(),
-  }).eq('id', jobId);
-  await logEvent(admin, {
-    jobId, actorId, kind: 'dry_run',
-    status: persistFailures ? 'partial' : 'ok',
-    detail: { counts, ...(persistFailures ? { persist_failures: persistFailures } : {}) },
+  const sent = await sendEmail({
+    to: inv.email,
+    subject: msg.subject,
+    html: msg.html,
+    text: msg.text,
+    replyTo: ctx.supportEmail,
+    from: migrationSender(),
+    idempotencyKey: `legacy-claim-${rowId}-${inv.generation}`,
+    tag: 'student-imports',
+    timeoutMs: SEND_TIMEOUT_MS,
+    // A second attempt reuses THIS key and THIS token, so the provider de-duplicates it.
+    // A 429 is not slept on inside the time budget: it is recorded as failed (nothing
+    // was delivered) and resent later under a new generation.
+    maxAttempts: 2,
+    retry429: false,
   });
-  return { status: 200, body: { ok: true, counts, persistFailures } };
+  if (sent.ok) return record(inv.kind === 'claim' ? 'sent' : 'notified', null);
+  const unclear = sent.code === 'resend_timeout' || sent.code === 'resend_failed' || sent.code === 'resend_409'
+    || /^resend_5\d\d$/.test(sent.code || '');
+  return record(unclear ? 'uncertain' : 'failed', sent.code);
 }
 
-// ── process one row (idempotent, partial-failure recoverable) ────────────────────
-async function processRow(admin, row, ctx) {
-  const { jobId, actorId, planAllow, planAccessDays, planRows, batchesById, appUrl, conflictPolicy, now } = ctx;
-  const patch = { attempts: (row.attempts || 0) + 1, updated_at: new Date().toISOString() };
-
-  // Blocked / non-processing intents never enter processing.
-  if (row.processing_status === 'blocked' ||
-      ['skip', 'manual_review', 'profile_only'].includes(row.intended_action)) {
-    patch.processing_status = row.intended_action === 'profile_only' ? 'done' : 'skipped';
-    await admin.from('student_import_rows').update(patch).eq('id', row.id);
-    return patch.processing_status;
-  }
-
-  // Re-validate the batch at PROCESS time (#32): the dry run may be stale —
-  // a since-closed/deleted batch, or a premium row whose proposal predates the
-  // batch rules, is (re-)blocked here instead of granted.
-  {
-    const gap = batchGapForProcess({
-      segment: planSegment(row.proposed_plan_key, planRows || {}),
-      proposedBatchId: row.proposed_batch_id || null,
-      batch: row.proposed_batch_id ? (batchesById || {})[row.proposed_batch_id] || null : null,
-    });
-    if (gap) {
-      patch.processing_status = 'blocked';
-      patch.errors = [...(row.errors || []), gap];
-      await admin.from('student_import_rows').update(patch).eq('id', row.id);
-      await logEvent(admin, { jobId, rowId: row.id, actorId, kind: 'row', status: 'blocked', detail: { reason: 'batch_invalid' } });
-      return 'blocked';
-    }
-  }
-
-  const planKey = row.proposed_plan_key;
-  if (!planKey || !planAllow.has(planKey)) {
-    patch.processing_status = 'failed';
-    patch.errors = [...(row.errors || []), 'Plan is not in the allowlist.'];
-    await admin.from('student_import_rows').update(patch).eq('id', row.id);
-    await logEvent(admin, { jobId, rowId: row.id, actorId, kind: 'row', status: 'failed', detail: { reason: 'plan_not_allowed' } });
-    return 'failed';
-  }
-
+async function processRow(admin, actorId, runId, row, ctx) {
   try {
-    let userId = row.target_user_id || null;
-    let inviteLink = null;
-    const email = row.email_normalized;
-
-    // 1) Resolve / create the account (idempotent).
-    if (!userId) {
-      // Re-check for an existing account at process time (covers a create raced by a merge,
-      // and a retry after a prior partial run).
-      if (row.external_user_id) {
-        const { data: link } = await admin.from('student_external_accounts')
-          .select('user_id').eq('source', SOURCE).eq('external_user_id', row.external_user_id).maybeSingle();
-        if (link?.user_id) userId = link.user_id;
-      }
-      if (!userId && email) {
-        const { data: prof } = await admin.from('profiles').select('id').eq('email', email).maybeSingle();
-        if (prof?.id) userId = prof.id;
-      }
-      if (!userId) {
-        if (!email || !isValidEmail(email)) {
-          patch.processing_status = 'failed';
-          patch.errors = [...(row.errors || []), 'A valid email is required to create an account.'];
-          await admin.from('student_import_rows').update(patch).eq('id', row.id);
-          return 'failed';
-        }
-        const { data: gen, error: gerr } = await admin.auth.admin.generateLink({
-          type: 'invite', email,
-          options: { data: { account_origin: 'import' }, redirectTo: `${appUrl}/welcome/set-password` },
-        });
-        if (gerr) {
-          const msg = String(gerr.message || gerr);
-          if (/already|registered|exists/i.test(msg)) {
-            // Race / pre-existing account — fall back to a merge lookup.
-            const { data: prof } = await admin.from('profiles').select('id').eq('email', email).maybeSingle();
-            if (prof?.id) userId = prof.id;
-            else throw new Error('email_registered_but_profile_missing');
-          } else {
-            throw gerr;
-          }
-        } else {
-          userId = gen?.user?.id;
-          inviteLink = gen?.properties?.action_link || null;
-          patch.auth_user_created = true;
-        }
-      }
-    }
-    if (!userId) throw new Error('could_not_resolve_user');
-
-    // Persist that the account exists BEFORE granting, so a mid-row failure is recoverable.
-    if (patch.auth_user_created) {
-      await admin.from('student_import_rows').update({ auth_user_created: true, updated_at: new Date().toISOString() }).eq('id', row.id);
-    }
-
-    // 2) Durable source link (idempotent via unique(source, external_user_id)).
-    if (row.external_user_id) {
-      await admin.from('student_external_accounts').upsert({
-        user_id: userId, source: SOURCE, external_user_id: row.external_user_id,
-        source_created_at: row.mapped?.source_created_at || null,
-        last_sign_in_at: row.mapped?.last_sign_in_at || null,
-        sign_in_count: row.mapped?.sign_in_count ?? null,
-        legacy_enrollments: row.mapped?.legacy_enrollments || [],
-        import_job_id: jobId, import_row_id: row.id,
-      }, { onConflict: 'source,external_user_id' });
-    }
-
-    // 3) Subscription grant (idempotent via subscriptions.source_import_row_id unique).
-    const { data: existingGrant } = await admin.from('subscriptions')
-      .select('id, status').eq('source_import_row_id', row.id).maybeSingle();
-
-    let granted = row.subscription_granted;
-    let skippedGrant = false;
-    if (existingGrant) {
-      granted = true;
-    } else {
-      const { data: active } = await admin.from('subscriptions')
-        .select('plan_key, ends_at, grace_ends_at').eq('user_id', userId).eq('status', 'active')
-        .order('created_at', { ascending: false }).limit(1).maybeSingle();
-      const existingActiveSub = active ? {
-        plan_key: active.plan_key,
-        ends_at: active.ends_at ? Date.parse(active.ends_at) : null,
-        grace_ends_at: active.grace_ends_at ? Date.parse(active.grace_ends_at) : null,
-      } : null;
-
-      const term = computeImportTerm({
-        planKey,
-        accessDays: planAccessDays.has(planKey) ? planAccessDays.get(planKey) : null,
-        startedAt: row.proposed_started_at ? Date.parse(row.proposed_started_at) : null,
-        endsAt: row.proposed_ends_at ? Date.parse(row.proposed_ends_at) : null,
-        mode: row.proposed_term_mode || 'preserve',
-        existingActiveSub, conflictPolicy, now,
-      });
-
-      if (term.action === 'grant') {
-        if (existingActiveSub && term.status === 'active') {
-          await admin.from('subscriptions').update({ status: 'expired', updated_at: new Date().toISOString() })
-            .eq('user_id', userId).eq('status', 'active');
-        }
-        const { error: sErr } = await admin.from('subscriptions').insert({
-          user_id: userId, plan_key: planKey, status: term.status,
-          started_at: term.started_at ? new Date(term.started_at).toISOString() : new Date().toISOString(),
-          ends_at: term.ends_at ? new Date(term.ends_at).toISOString() : null,
-          grace_ends_at: term.grace_ends_at ? new Date(term.grace_ends_at).toISOString() : null,
-          grant_source: 'import', source_import_row_id: row.id, approved_by: actorId,
-          // #32: the confirmed batch for gold/vip rows; omitted (not null) when
-          // absent so a pre-#32 subscriptions table still accepts the insert.
-          ...(row.proposed_batch_id ? { batch_id: row.proposed_batch_id } : {}),
-        });
-        if (sErr) {
-          // Unique(source_import_row_id) → a concurrent grant already landed; treat as success.
-          if (String(sErr.code) === '23505') granted = true;
-          else throw sErr;
-        } else {
-          granted = true;
-          // is_paid is a "has paid at least once" cache — true for an active OR expired-history
-          // import (both represent someone who paid). An expired term + is_paid=true routes the
-          // student to the Membership Expired / renewal screen rather than a cold paywall.
-          await admin.from('profiles').update({ is_paid: true, plan: planKey }).eq('id', userId);
-        }
-      } else if (term.action === 'skip_preserve_longer') {
-        skippedGrant = true; // keep the existing longer/active term untouched
-      } else {
-        // block_conflict / block_missing_expiry surfaced at process time → mark blocked.
-        patch.processing_status = 'blocked';
-        patch.target_user_id = userId;
-        patch.errors = [...(row.errors || []), term.reason || 'Membership conflict — resolve manually.'];
-        await admin.from('student_import_rows').update(patch).eq('id', row.id);
-        await logEvent(admin, { jobId, rowId: row.id, actorId, kind: 'row', status: 'blocked', detail: { action: term.action } });
-        return 'blocked';
-      }
-    }
-
-    // 4) Onboarding + invite (import-created stub only). A confirmed native user is NOT re-invited.
-    // Derive from PERSISTED row state (row.auth_user_created), not just this pass's
-    // patch flag: if a prior run created the account (line above persisted the flag) but
-    // then failed at step 2/3, the retry resolves userId via link/email — so generateLink
-    // never runs this pass, patch.auth_user_created stays unset, and the stamp + invite
-    // would be skipped forever, stranding the user with an account but no password and a
-    // set-password gate that never fires (it keys on account_origin==='import'). Keying on
-    // the durable flag makes the stamp + invite retry-safe.
-    let inviteStatus = row.invite_status;
-    const { isImportStub, shouldInvite } = decideOnboardingStep({
-      createdThisPass: patch.auth_user_created === true,
-      authUserCreated: row.auth_user_created === true,
-      inviteStatus,
+    const { uid, created } = await resolveAuthUser(admin, actorId, row);
+    const bind = await rpc(admin, 'legacy_import_bind_user', {
+      p_actor: actorId, p_row_id: row.row_id, p_run_id: runId, p_user_id: uid, p_created: created,
     });
-    if (isImportStub) {
-      // Idempotent: only advances a still-fresh 'none' row (account_origin + onboarding set
-      // together, so a row already at 'invited' is fully stamped and safely skipped).
-      await admin.from('profiles').update({
-        account_origin: 'import', onboarding_status: 'invited', invited_at: new Date().toISOString(),
-      }).eq('id', userId).eq('onboarding_status', 'none');
-      if (shouldInvite) {
-        // On a retry the account already existed, so generateLink didn't run this pass and we
-        // hold no link — mint a fresh single-use recovery link for the existing user so the
-        // invite email still goes out. Discarded after send (never persisted or logged).
-        if (!inviteLink && email && isValidEmail(email)) {
-          const { data: reGen } = await admin.auth.admin.generateLink({
-            type: 'recovery', email,
-            options: { redirectTo: `${appUrl}/welcome/set-password` },
-          }).catch(() => ({ data: null }));
-          inviteLink = reGen?.properties?.action_link || null;
-        }
-        if (inviteLink) {
-          const sent = await sendInviteEmail(email, inviteLink);
-          inviteStatus = sent.ok ? 'sent' : 'failed';
-        }
-      }
-      inviteLink = null; // discard — never persisted or logged
-    }
+    if (bind.error) throw Object.assign(new Error('bind'), { safeCode: codeOf(bind.error) });
 
-    patch.processing_status = 'done';
-    patch.target_user_id = userId;
-    patch.subscription_granted = granted;
-    patch.invite_status = inviteStatus;
-    await admin.from('student_import_rows').update(patch).eq('id', row.id);
-    await logEvent(admin, {
-      jobId, rowId: row.id, actorId, kind: 'row', status: 'done',
-      detail: { match: row.match_result, granted, skippedGrant, invite: inviteStatus },
+    const act = await rpc(admin, 'legacy_import_activate_row', { p_actor: actorId, p_row_id: row.row_id, p_run_id: runId }, 15_000);
+    if (act.error) throw Object.assign(new Error('activate'), { safeCode: codeOf(act.error) });
+    if (!act.data?.ok) return { row_id: row.row_id, outcome: 'blocked', reason: act.data?.reason || 'blocked' };
+
+    const inv = await sendInvite(admin, actorId, row.row_id, ctx);
+    return { row_id: row.row_id, outcome: 'activated', status: act.data.status, invite: inv.state };
+  } catch (e) {
+    const code = e?.safeCode || 'unexpected';
+    const marked = await rpc(admin, 'legacy_import_mark_failed', { p_actor: actorId, p_row_id: row.row_id, p_run_id: runId, p_code: code });
+    if (marked.error) console.error(`[student-imports] mark failed refused: ${codeOf(marked.error)}`);
+    console.error(`[student-imports] row failed: ${code}`);
+    return { row_id: row.row_id, outcome: 'failed', code };
+  }
+}
+
+async function doActivateChunk(admin, actorId, body, ctx) {
+  const runId = body?.runId;
+  if (!runId) return { status: 400, body: { error: 'runId required.' } };
+  const lease = randomBytes(18).toString('base64url');
+  const t0 = Date.now();
+  const left = () => CHUNK_BUDGET_MS - (Date.now() - t0);
+  const results = [];
+  const tried = [];
+
+  // Pass 1: rows not yet activated, one at a time, while a whole row still fits.
+  while (left() > PER_ROW_WORST_MS) {
+    const claim = await rpc(admin, 'legacy_import_claim_rows', {
+      p_actor: actorId, p_run_id: runId, p_lease: lease, p_limit: 1,
+      p_retry_failed: Boolean(body.retryFailed), p_exclude: tried,
     });
-    return 'done';
-  } catch (err) {
-    patch.processing_status = 'failed';
-    patch.errors = [...(row.errors || []), 'Processing failed — safe to retry.'];
-    await admin.from('student_import_rows').update(patch).eq('id', row.id);
-    // Audit stores only a safe code — a raw Postgres error message can embed the row's
-    // email/values (e.g. a unique-violation), which must never land in the audit trail.
-    await logEvent(admin, { jobId, rowId: row.id, actorId, kind: 'row', status: 'failed', detail: { code: err?.code || err?.name || 'error' } });
-    return 'failed';
+    if (claim.error) {
+      if (!results.length) return { error: claim.error };
+      break;
+    }
+    const rows = Array.isArray(claim.data) ? claim.data : [];
+    if (!rows.length) break;
+    for (const row of rows) {
+      tried.push(row.row_id);
+      results.push(await processRow(admin, actorId, runId, row, ctx));
+      await sleep(PACE_MS);
+    }
   }
+
+  // Pass 2: rows a previous request activated but never emailed.
+  while (left() > SEND_TIMEOUT_MS + 2 * RPC_TIMEOUT_MS) {
+    const pending = await rpc(admin, 'legacy_import_pending_invites', { p_actor: actorId, p_run_id: runId, p_limit: 1 });
+    const ids = Array.isArray(pending.data) ? pending.data : [];
+    if (pending.error || !ids.length) break;
+    const inv = await sendInvite(admin, actorId, ids[0], ctx);
+    results.push({ row_id: ids[0], outcome: 'invited', invite: inv.state });
+    if (inv.state === 'skipped' || inv.state === 'error') break;
+    await sleep(PACE_MS);
+  }
+
+  const rel = await rpc(admin, 'legacy_import_release_run', { p_actor: actorId, p_run_id: runId, p_lease: lease, p_pause: false });
+  if (rel.error) console.error(`[student-imports] release refused: ${codeOf(rel.error)}`);
+  return { status: 200, body: { ok: true, results, run: rel.data || null } };
 }
 
-// ── process a bounded batch ──────────────────────────────────────────────────────
-async function doProcess(admin, { jobId, actorId, batchSize, retryFailed }) {
-  const size = Math.min(Math.max(1, Number(batchSize) || 10), MAX_BATCH);
-  const { data: job, error: jerr } = await admin.from('student_import_jobs').select('*').eq('id', jobId).single();
-  if (jerr || !job) return { status: 404, body: { error: 'Import job not found.' } };
-
-  const { allow: planAllow, map: planAccessDays, planRows } = await loadPlanAccessDays(admin);
-
-  // Forward pass processes only ready/pending so progress is monotonic and the client's
-  // auto-continue can never loop on a re-failing row. 'failed' rows are re-tried ONLY on an
-  // explicit retryFailed request (the "Retry failed" button), never blocked/done/skipped.
-  const statuses = retryFailed ? ['ready', 'pending', 'failed'] : ['ready', 'pending'];
-  const { data: rows, error: rerr } = await admin.from('student_import_rows')
-    .select('*').eq('job_id', jobId).in('processing_status', statuses)
-    .order('source_row_number', { ascending: true }).limit(size);
-  if (rerr) return { status: 500, body: { error: 'Could not load rows to process.' } };
-
-  // Load the batch registry BEFORE flipping the job to 'processing'. loadBatches
-  // throws on a transient failure, and the 503 it produces says "nothing was
-  // changed" — which would be a lie if we had already moved the job's status.
-  const batchesById = (await loadBatches(admin)).byId;
-
-  await admin.from('student_import_jobs').update({ status: 'processing', updated_at: new Date().toISOString() }).eq('id', jobId);
-
-  const ctx = {
-    jobId, actorId, planAllow, planAccessDays, planRows,
-    batchesById,
-    appUrl: (process.env.APP_URL || '').replace(/\/+$/, '') || SUPABASE_URL,
-    conflictPolicy: (job.settings && job.settings.conflict_policy) || 'keep_longer',
-    now: Date.now(),
-  };
-
-  let processed = 0;
-  // Sequential for correctness (avoids racing the one-active index for the same user).
-  for (const row of rows) {
-    // eslint-disable-next-line no-await-in-loop
-    await processRow(admin, row, ctx);
-    processed++;
-    const cursor = Math.max(job.cursor || 0, row.source_row_number);
-    // eslint-disable-next-line no-await-in-loop
-    await admin.from('student_import_jobs').update({ cursor, updated_at: new Date().toISOString() }).eq('id', jobId);
-  }
-
-  // Recompute live counts + terminal status.
-  const { data: agg } = await admin.from('student_import_rows').select('processing_status').eq('job_id', jobId);
-  const tally = { total: agg?.length || 0, done: 0, failed: 0, blocked: 0, skipped: 0, remaining: 0 };
-  for (const r of (agg || [])) {
-    if (r.processing_status === 'done') tally.done++;
-    else if (r.processing_status === 'failed') tally.failed++;
-    else if (r.processing_status === 'blocked') tally.blocked++;
-    else if (r.processing_status === 'skipped') tally.skipped++;
-    else tally.remaining++;
-  }
-  // remaining = ready/pending/processing (see tally). Forward progress is monotonic, so
-  // done ⇔ nothing left to process; 'more' tells the client to auto-continue the batch loop.
-  const done = tally.remaining === 0;
-  await admin.from('student_import_jobs').update({
-    status: done ? 'completed' : 'processing', counts: { ...(job.counts || {}), ...tally }, updated_at: new Date().toISOString(),
-  }).eq('id', jobId);
-
-  return { status: 200, body: { ok: true, processed, done, tally, more: !done } };
-}
-
-// ── resend invite ────────────────────────────────────────────────────────────────
-async function doResendInvite(admin, { rowId, actorId }) {
-  const { data: row, error } = await admin.from('student_import_rows').select('*').eq('id', rowId).single();
-  if (error || !row) return { status: 404, body: { error: 'Row not found.' } };
-  const email = row.email_normalized;
-  if (!email || !isValidEmail(email)) return { status: 400, body: { error: 'Row has no valid email.' } };
-
-  // Only re-invite an import-origin, not-yet-onboarded account.
-  let userId = row.target_user_id;
-  if (!userId) {
-    const { data: prof } = await admin.from('profiles').select('id').eq('email', email).maybeSingle();
-    userId = prof?.id || null;
-  }
-  if (!userId) return { status: 409, body: { error: 'No account to re-invite — run process first.' } };
-  const { data: prof } = await admin.from('profiles').select('account_origin, onboarding_status').eq('id', userId).maybeSingle();
-  // Only re-invite accounts THIS import created — never email an import-branded set-password
-  // link to a merged native member who happens to be linked to an import row.
-  if (prof?.account_origin !== 'import') {
-    return { status: 409, body: { error: 'This account was not created by an import — nothing to re-invite.' } };
-  }
-  if (prof?.onboarding_status === 'completed') {
-    return { status: 409, body: { error: 'This member already completed onboarding.' } };
-  }
-
-  const { data: gen, error: gerr } = await admin.auth.admin.generateLink({
-    type: 'recovery', email,
-    options: { redirectTo: `${(process.env.APP_URL || '').replace(/\/+$/, '') || SUPABASE_URL}/welcome/set-password` },
-  });
-  if (gerr) return { status: 502, body: { error: 'Could not generate an invite link.' } };
-  const link = gen?.properties?.action_link;
-  const sent = link ? await sendInviteEmail(email, link) : { ok: false, code: 'no_link' };
-  await admin.from('student_import_rows').update({ invite_status: sent.ok ? 'resent' : 'failed', updated_at: new Date().toISOString() }).eq('id', rowId);
-  await logEvent(admin, { jobId: row.job_id, rowId, actorId, kind: 'resend_invite', status: sent.ok ? 'sent' : 'failed', detail: {} });
-  return { status: sent.ok ? 200 : 502, body: sent.ok ? { ok: true } : { ok: false, error: 'Invite email could not be sent.' } };
-}
-
-// ── HTTP handler ─────────────────────────────────────────────────────────────────
+// ── HTTP handler ─────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
   if (req.method === 'GET') {
-    return res.status(200).json({
-      ok: true,
-      configured: Boolean(SUPABASE_URL && SERVICE_KEY),
-      hasSecretKey: Boolean(SERVICE_KEY),
-      hasResend: Boolean(process.env.RESEND_API_KEY && process.env.RESEND_FROM),
-    });
+    // Unauthenticated: says only whether the server can do privileged work at all.
+    return res.status(200).json({ ok: true, configured: serviceConfigured() });
   }
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-  if (!SUPABASE_URL || !SERVICE_KEY) {
-    return res.status(500).json({ error: 'Server import is not configured (SUPABASE_SECRET_KEY missing).' });
+  if (!serviceConfigured()) {
+    return res.status(500).json({ error: 'The migration server is not configured (SUPABASE_SECRET_KEY missing).' });
   }
 
-  // Auth: valid JWT + independently-confirmed capability, BEFORE the service
-  // client exists. #45 moved the check into api/_lib/staffAuth.js and made it a
-  // named permission — importing students is Operations work, not a blanket
-  // admin power.
-  const gate = await requireStaff(req, { permission: 'students.import' });
+  // ★ The gate, BEFORE the service client exists. students.legacy_migrate is held by
+  //   super_admin alone: activating a legacy student creates paid access with no payment
+  //   in this system.
+  const gate = await requireStaff(req, { permission: PERMISSION });
   if (!gate.ok) return res.status(gate.status).json({ error: gate.error, code: gate.code });
-  const u = gate.user;
-  if (rateLimited(u.id)) return res.status(429).json({ error: 'Too many requests — wait a minute.' });
+  const actorId = gate.user.id;
+  if (rateLimited(actorId)) return res.status(429).json({ error: 'Too many requests. Wait a minute and try again.' });
 
   let body = req.body;
-  if (typeof body === 'string') { try { body = JSON.parse(body); } catch { body = {}; } }
+  if (typeof body === 'string') {
+    if (body.length > MAX_STAGE_BODY_CHARS) return res.status(413).json({ error: 'That roster is too large to send in one request.', code: 'LEGACY_STAGE_INVALID' });
+    try { body = JSON.parse(body); } catch { body = {}; }
+  }
   const action = body?.action;
   const admin = service();
 
   try {
-    if (action === 'dry-run') {
-      if (!body?.jobId) return res.status(400).json({ error: 'jobId required.' });
-      const r = await doDryRun(admin, { jobId: body.jobId, actorId: u.id });
+    if (action === 'health') {
+      const r = await readiness(admin, req);
+      return res.status(200).json({ ok: true, ...r.flags });
+    }
+
+    if (action === 'stage') {
+      const r = await doStage(admin, actorId, body);
+      if (r.error) return fail(res, action, r.error, 'The roster could not be staged.');
       return res.status(r.status).json(r.body);
     }
-    if (action === 'process') {
-      if (!body?.jobId) return res.status(400).json({ error: 'jobId required.' });
-      const r = await doProcess(admin, { jobId: body.jobId, actorId: u.id, batchSize: body.batchSize, retryFailed: !!body.retryFailed });
+
+    if (action === 'preflight') {
+      if (!body?.jobId || !Array.isArray(body?.rowIds)) return res.status(400).json({ error: 'jobId and rowIds required.' });
+      const ids = body.rowIds.slice(0, MAX_ACTIVATION_RUN + 1);
+      const [pf, ready] = await Promise.all([
+        rpc(admin, 'legacy_import_preflight', { p_actor: actorId, p_job_id: body.jobId, p_row_ids: ids }),
+        readiness(admin, req),
+      ]);
+      if (pf.error) return fail(res, action, pf.error, 'The confirmation counts could not be read.');
+      return res.status(200).json({ ok: true, preflight: pf.data, readiness: ready.flags,
+        readinessMessage: ready.flags.canActivate ? null : notReadyMessage(ready.flags) });
+    }
+
+    if (action === 'start-activation') {
+      const ready = await readiness(admin, req);
+      if (!ready.flags.canActivate) {
+        return res.status(409).json({ error: notReadyMessage(ready.flags), code: 'NOT_READY', readiness: ready.flags });
+      }
+      const { data, error } = await rpc(admin, 'legacy_import_start_run', {
+        p_actor: actorId, p_job_id: body?.jobId, p_row_ids: Array.isArray(body?.rowIds) ? body.rowIds : [],
+        p_phrase: String(body?.phrase || ''), p_client_key: String(body?.clientKey || ''),
+      });
+      if (error) return fail(res, action, error, 'The activation could not be started.');
+      return res.status(200).json(data);
+    }
+
+    if (action === 'activate-chunk') {
+      const ready = await readiness(admin, req);
+      if (!ready.flags.canActivate) {
+        return res.status(409).json({ error: notReadyMessage(ready.flags), code: 'NOT_READY', readiness: ready.flags });
+      }
+      const r = await doActivateChunk(admin, actorId, body, { origin: ready.origin, supportEmail: ready.supportEmail });
+      if (r.error) return fail(res, action, r.error, 'The activation could not continue.');
       return res.status(r.status).json(r.body);
     }
-    if (action === 'resend-invite') {
+
+    if (action === 'pause-run') {
+      if (!body?.runId) return res.status(400).json({ error: 'runId required.' });
+      const { data, error } = await rpc(admin, 'legacy_import_release_run', { p_actor: actorId, p_run_id: body.runId, p_lease: null, p_pause: true });
+      if (error) return fail(res, action, error, 'The activation could not be paused.');
+      return res.status(200).json(data);
+    }
+
+    if (action === 'send-test') {
+      const ready = await readiness(admin, req);
+      if (!ready.flags.email) return res.status(409).json({ error: notReadyMessage(ready.flags), code: 'NOT_READY' });
+      // The recipient is the CALLER's own Auth address, resolved here — never a body field,
+      // so this action cannot be pointed at anyone else.
+      let to = '';
+      try {
+        const { data: au } = await Promise.race([
+          admin.auth.admin.getUserById(actorId),
+          sleep(AUTH_TIMEOUT_MS).then(() => ({ data: null })),
+        ]);
+        to = String(au?.user?.email || '').trim();
+      } catch { /* answered below */ }
+      if (!to) return res.status(422).json({ error: 'Your account has no email address to send the test to.' });
+      // Sample details and a link to the app's own sign-in page: no token is minted, and
+      // nothing about any student is read or sent.
+      const msg = legacyMembershipEmail({
+        kind: 'claim', actionUrl: ready.origin ? `${ready.origin}/` : 'https://example.invalid/',
+        fullName: 'Sample Student', email: 'sample.student@example.invalid',
+        planName: 'Personalized Coaching Program', planKey: 'vip', batchName: 'October 2026',
+        startDate: '2026-10-12', endDate: '2027-04-12', supportEmail: ready.supportEmail, nowMs: Date.now(),
+      });
+      const sent = await sendEmail({
+        to, subject: `[Test] ${msg.subject}`, html: msg.html, text: msg.text,
+        replyTo: ready.supportEmail, from: migrationSender(), tag: 'student-imports-test',
+        timeoutMs: SEND_TIMEOUT_MS, maxAttempts: 1, retry429: false,
+      });
+      if (!sent.ok) console.error(`[student-imports] test send failed: ${sent.code}`);
+      return res.status(200).json({ ok: sent.ok, code: sent.ok ? null : sent.code, sender: ready.flags.sender });
+    }
+
+    if (action === 'resend') {
       if (!body?.rowId) return res.status(400).json({ error: 'rowId required.' });
-      const r = await doResendInvite(admin, { rowId: body.rowId, actorId: u.id });
-      return res.status(r.status).json(r.body);
+      const ready = await readiness(admin, req);
+      if (!ready.flags.canActivate) {
+        return res.status(409).json({ error: notReadyMessage(ready.flags), code: 'NOT_READY', readiness: ready.flags });
+      }
+      const inv = await sendInvite(admin, actorId, body.rowId, { origin: ready.origin, supportEmail: ready.supportEmail }, { resend: true });
+      if (inv.state === 'error') return fail(res, action, { hint: inv.code }, 'The invitation could not be resent.');
+      return res.status(200).json({ ok: true, state: inv.state, code: inv.code || null });
     }
-    return res.status(400).json({ error: "action must be 'dry-run', 'process' or 'resend-invite'." });
+
+    return res.status(400).json({ error: 'Unknown action.' });
   } catch (err) {
-    // Log only a safe code/name — a raw DB error message can carry row PII.
-    console.error(`[student-imports] ${action} failed: ${String(err?.code || err?.name || 'error')}`);
-    // Deliberate aborts (plans/batches registry unreadable) carry a STATIC message we
-    // authored, so it is safe to surface and tells the admin to retry rather than
-    // assume the source data is bad. Everything else stays generic.
-    if (err?.safeMessage) return res.status(503).json({ error: err.safeMessage });
-    return res.status(500).json({ error: 'Import operation failed.' });
+    console.error(`[student-imports] ${String(action || 'request').slice(0, 30)} failed: ${String(err?.safeCode || err?.code || err?.name || 'error').slice(0, 60)}`);
+    return res.status(500).json({ error: 'The migration request failed. Nothing was sent twice; try again.' });
   }
 }
 
-// Exported for focused testing of the pure row reducer without a database.
-export { proposeForRow };
+// Exported for test/legacyMigrationSql.test.mjs source and behaviour checks.
+export { appOrigin, codeOf, contentFingerprint, doStage, notReadyMessage };

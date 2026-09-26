@@ -40,7 +40,7 @@ const MIGRATION = 'db/2026-09-05-community-staff-authority.sql';
 //   definition is strictly weaker than pointing it at the one that runs last.
 //   Same idiom as CURRENT_SEED_MIGRATION in test/staffRolesSql.test.mjs: when a new
 //   migration restates the catalog, repoint this.
-const CURRENT_CATALOG_MIGRATION = 'db/2026-09-20-course-lesson-assets.sql';
+const CURRENT_CATALOG_MIGRATION = 'db/2026-09-25-legacy-student-migration.sql';
 const BOOTSTRAP = 'db/000_full_database_bootstrap.sql';
 const CHANNELS = 'db/2026-08-18-community-channels.sql';
 const FILES = [MIGRATION, BOOTSTRAP];

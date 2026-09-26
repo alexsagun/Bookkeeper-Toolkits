@@ -16,6 +16,13 @@
 //                 `status` is the decision actually recorded (2026-09-24 — see the handler).
 //   'test'      — an ADMIN sends a sample admin alert to confirm config end-to-end.
 //                 Auth: admin JWT (same gate as 'decision'). Returns { to, source }.
+//   'import_onboarded' — a MIGRATED STUDENT (#67) has just set their password → email the
+//                 administrator ("Student Successfully Onboarded") and the student (their
+//                 account is ready). Auth: the student's own JWT, verified here. The body
+//                 carries NOTHING: the service-only legacy_import_onboarding_notice(uid)
+//                 reads every fact from that student's own import row, and 'sent' is final,
+//                 so the admin inbox rings once per student.
+//                 Both emails come from support@alexsagun.com (MIGRATION_EMAIL_FROM).
 //
 // Admin-recipient resolution ('submitted' + 'test'), first valid email wins:
 //   NOTIFY_ADMIN_EMAIL → payment_settings.notify_email → address inside RESEND_FROM.
@@ -39,7 +46,9 @@
 
 import { phpAmount } from '../src/lib/planCatalog.js';
 import { intakeSelectColumns, ENROLLMENT_PROCESSING_NOTE } from '../src/lib/enrollmentIntake.js';
-import { requireStaff } from './_lib/staffAuth.js';
+import { requireStaff, service, serviceConfigured } from './_lib/staffAuth.js';
+import { sendEmail } from './_lib/email.js';
+import { MIGRATION_SENDER_ADDRESS, onboardedAdminEmail, onboardedStudentEmail } from './_lib/legacyClaimEmail.js';
 
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
 const SUPABASE_ANON = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
@@ -584,6 +593,72 @@ export default async function handler(req, res) {
     }
   }
 
+  if (action === 'import_onboarded') {
+    const u = await callerUser(req.headers?.authorization);
+    if (!u) return res.status(403).json({ error: 'Authorization required.' });
+    if (rateLimited(u.id)) {
+      return res.status(429).json({ ok: false, error: 'Too many requests — wait a minute and try again.' });
+    }
+    if (!apiKey) return res.status(200).json({ ok: false, skipped: 'email_not_configured' });
+    if (!serviceConfigured()) return res.status(503).json({ ok: false, error: 'The server is not configured for this.' });
+
+    // ★ SERVICE-ONLY, AND ONLY EVER WITH THE uid callerUser() VERIFIED. The notice RPC is
+    //   revoked from every client role: while it was the student's own call, a student could
+    //   record 'sent' themselves (so the admin was never told) or loop reserve → 'failed'
+    //   into the append-only event log. The request body still names nothing.
+    const svc = service();
+    const notice = async (args) => {
+      try {
+        const { data, error } = await svc.rpc('legacy_import_onboarding_notice', { p_user: u.id, ...args })
+          .abortSignal(AbortSignal.timeout(8000));
+        return error ? null : data;
+      } catch {
+        return null;
+      }
+    };
+
+    // Reserves the send and returns the facts, all read from the student's OWN import row.
+    // A student who is not a migrated, onboarded account gets a skip, never an email.
+    const claim = await notice({});
+    if (!claim) return res.status(503).json({ ok: false, error: 'Could not reach the database. Try again.' });
+    if (!claim.ok) return res.status(200).json({ ok: false, skipped: claim.skip || 'not_eligible' });
+
+    const sender = String(process.env.MIGRATION_EMAIL_FROM || '').trim() || MIGRATION_SENDER_ADDRESS;
+    const support = fromAddress(sender);
+    // The request's own host only under `npm run dev`: on Vercel a preview shares
+    // production's database, so without APP_URL the email carries no dashboard link at all.
+    const appUrl = (process.env.APP_URL || '').replace(/\/+$/, '') ||
+      (!process.env.VERCEL_ENV && req.headers?.host ? `http://${req.headers.host}` : '');
+    const facts = {
+      fullName: claim.full_name, email: claim.email, batchName: claim.batch_name,
+      planName: claim.plan_name, planKey: claim.plan_key, startDate: claim.started_at,
+      endDate: claim.ends_at, status: claim.status,
+    };
+
+    const { to: adminTo } = await resolveAdminRecipient(u.token);
+    const adminMsg = onboardedAdminEmail({ ...facts, onboardedAt: claim.onboarded_at,
+      dashboardUrl: appUrl ? `${appUrl}/admin/student-imports` : null });
+    const studentMsg = onboardedStudentEmail({ ...facts, dashboardUrl: appUrl ? `${appUrl}/` : null,
+      supportEmail: support, nowMs: Date.now() });
+
+    const send = (to, msg, who) => (isEmail(to)
+      ? sendEmail({ to, subject: msg.subject, html: msg.html, text: msg.text, from: sender, replyTo: support,
+          idempotencyKey: `legacy-onboarded-${who}-${claim.row_id}`, tag: 'student-onboarded',
+          timeoutMs: 10_000, maxAttempts: 2, retry429: false })
+      : Promise.resolve({ ok: false, code: 'recipient_invalid' }));
+    const [adminOut, studentOut] = await Promise.all([
+      send(adminTo, adminMsg, 'admin'),
+      send(claim.email, studentMsg, 'student'),
+    ]);
+    const ok = adminOut.ok && studentOut.ok;
+    // 'failed' is retryable (the app asks again the next time the student opens it, at most
+    // five reservations in all), and the idempotency keys stop the one that already went out
+    // from going twice.
+    await notice({ p_result: ok ? 'sent' : 'failed' });
+    if (!ok) console.error(`[notify-enrollment] onboarded notice: admin ${adminOut.ok ? 'ok' : adminOut.code}, student ${studentOut.ok ? 'ok' : studentOut.code}`);
+    return res.status(200).json({ ok, admin: adminOut.ok ? 'sent' : adminOut.code, student: studentOut.ok ? 'sent' : studentOut.code });
+  }
+
   if (action === 'test') {
     // Admin-only diagnostic — sends a sample admin alert to the resolved recipient so an
     // admin can confirm email works end-to-end. Strictly admin-gated: a non-admin can't
@@ -627,5 +702,5 @@ export default async function handler(req, res) {
     }
   }
 
-  return res.status(400).json({ error: "action must be 'submitted', 'decision' or 'test'." });
+  return res.status(400).json({ error: "action must be 'submitted', 'decision', 'test' or 'import_onboarded'." });
 }

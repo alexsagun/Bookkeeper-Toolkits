@@ -1,199 +1,220 @@
-# Student Import — Thinkific → Toolkit migration (setup & runbook)
+# Student Imports — the legacy Thinkific migration (setup & runbook)
 
-The **Student Imports** admin tab migrates legacy students from Thinkific into the Toolkit's own
-Supabase membership system. It creates **real** Supabase Auth accounts (students set their own
-password) and grants **real, dated subscription terms** that flow through `public.is_enrolled()`
-exactly like a paid enrollment — never fake `enrollment_requests`, receipts, or payments.
+The Student Imports tab moves legacy paid Thinkific students into the Toolkit. It is **Super Admin
+only** (`students.legacy_migrate`), and it works in two separate steps:
 
-> **The single most important fact:** a Thinkific **User** export (the file with `First Name, Last
-> Name, ID, … Email, Enrollments - list, …`) has **blank emails** and **no reliable expiry**. It
-> **stages** but grants **nothing**. You must supply each student's **email** and **exact current
-> access expiry** from a second source before anything goes live. The tool enforces this — it never
-> guesses paid access from a course title, an account-created date, a last-sign-in, or amount-spent.
+1. **Stage.** A roster becomes a durable job. Every row is marked *Ready to activate*, *Inactive* or
+   *Blocked*. Staging creates **no** account, membership, approval or email.
+2. **Activate.** A Super Admin selects ready rows, reads the confirmation counts, and types
+   `ACTIVATE <n>`. Each row then gets a real account, a real membership and an invitation email.
+
+Built by migration **#67** (`db/2026-09-25-legacy-student-migration.sql`), on the #26 tables.
 
 ---
 
 ## 1. What you need
 
-**Source exports (merge as many as apply):**
+| Setting | Where | Why |
+|---|---|---|
+| `SUPABASE_SECRET_KEY` | Vercel (server only) | The endpoint creates Auth accounts |
+| `RESEND_API_KEY` | Vercel (server only) | Every migration email |
+| The sender, **support@alexsagun.com** | Resend → Domains: **alexsagun.com must be verified** | Every migration email comes from, and is answered at, this address. `MIGRATION_EMAIL_FROM` (optional) overrides it |
+| `APP_URL` | Vercel (server only) | The activation link points here. **Required on every Vercel deployment.** |
+| `NOTIFY_ADMIN_EMAIL` | Vercel (server only) | Where "Student Successfully Onboarded" goes (else Payment settings → "Proof / support email") |
 
-1. **Thinkific User export** — user `ID`, name, course history (`Enrollments - list`), activity. This
-   is the roster; it supplies the **Thinkific user id** (the durable match key) and course history.
-2. **Thinkific Orders / Transactions export** — `email`, purchased product, payment status, amount,
-   transaction date. This is where **email** and **payment** truthfully come from.
-3. **An admin ledger** — if you track exact current access **expiry** per student anywhere else.
-4. **A manually-prepared supplemental CSV** (the template below) — for anything that happened outside
-   Thinkific, or to hand-correct a handful of students.
+Activation refuses to start until email, `APP_URL` and the sender are all configured. Staging
+works without them. The tab shows all three as readiness chips.
 
-**The import template** (downloadable from the tab, exact columns):
+**Before activating anyone, press Send test email.** It sends the activation email — sample details,
+a link that does nothing — from support@alexsagun.com to your own inbox. If Resend refuses the
+sender, the chip says so: verify alexsagun.com in Resend and send the test again. Check the test did
+not land in spam.
 
-```
-thinkific_user_id, first_name, last_name, email, plan_key,
-membership_started_at, membership_ends_at, payment_status, amount_paid, currency, legacy_enrollments, batch_code
-```
-
-- `thinkific_user_id` — the Thinkific `ID` (kept as a string; leading zeros preserved). The match key.
-- `email` — required to create a new account.
-- `plan_key` — one of `sampler`, `silver_self_paced`, `vip` (read
-  live from `enrollment_plans`; you also map course-combos → plan inside the tool). This is a
-  **per-row override**: when present and a recognized plan, it **wins over** the course-combo map
-  for that row; a blank or unrecognized value falls back to the combo mapping (never a silent grant).
-- `membership_started_at` / `membership_ends_at` — **ISO dates (UTC)**, e.g. `2026-07-20` or
-  `2026-07-20T01:52:00Z`. `membership_ends_at` is the **exact** current expiry (required for the
-  default *preserve* term mode).
-- `batch_code` (#32) — **required for `vip` rows** (VIP is the only cohort plan): the cohort's code
-  (e.g. `2026-08`), which must match an existing **open** batch in Admin → Batches. It sets
-  `subscriptions.batch_id` and unlocks that batch's private VIP community. A premium row
-  without a confirmed open batch is **blocked** (never guessed from course history, dates, or
-  amounts). A blocked row is rejected **before** any account is created, so it produces no user,
-  no profile and no subscription — it will **not** appear in Admin → Batches → "Needs batch
-  assignment" (that queue lists *granted* premium subscriptions that have no batch, e.g. rows
-  imported before #32 or granted by direct SQL). To clear a blocked row: create/open the batch in
-  Admin → Batches, add its `batch_code` to the source or supplemental CSV, re-run the dry-run,
-  then process. General-plan rows ignore the column (warning only).
+Migration #67 must be applied (it follows #66). Run `npm run db:audit` afterwards; the `#67` block
+checks the permission, the scheduled status, the cron job, the read-only tables and the audit guard.
 
 ---
 
-## 2. Environment & Supabase setup
+## 2. The roster
 
-**Supabase (SQL):** run migration **`db/2026-07-23-student-imports.sql`** (or, on a fresh project,
-the whole `db/000_full_database_bootstrap.sql`). It requires the enrollment + subscription-lifecycle
-migrations first (it aborts with a clear message otherwise).
+One student per row, CSV or XLSX. The template (Download → Template) has these columns:
 
-**Supabase (Dashboard → Auth → URL Configuration → Redirect URLs):** add
-`https://YOUR-DOMAIN/welcome/set-password` (and your Vercel preview origin) so the invite/recovery
-link lands on the forced set-password screen. Confirm your **Invite** email template is enabled (or
-rely on Resend below — this app sends its own invite email).
+`thinkific_user_id, first_name, last_name, email, plan_key, membership_started_at,
+membership_ends_at, payment_status, amount_paid, currency, legacy_enrollments, batch_code`
 
-**Environment variables** (Vercel → Settings → Environment Variables, Production + Preview; and `.env`
-for a local pilot). See `.env.example` for the full annotated block:
+- **Dates:** you declare the format — `M/D/YYYY`, `D/M/YYYY` or `YYYY-MM-DD`. Nothing is guessed.
+  Two-digit years and impossible dates (2/31/2026) block the row.
+- **Plan:** each distinct label (for example `VIP`) is mapped to a plan explicitly. The screen
+  suggests an exact match and you confirm it.
+- **Batch:** each distinct label (for example `October 2026`) is mapped to a registry batch. The
+  label must name the same month as the batch, and each start date must fall in or next to that
+  month. Otherwise the row is blocked.
+- **Payment:** only `Paid` is paid. The amount is kept as history only. It does not change today's
+  price and nothing is posted to Financial Management.
+- **Identity:** a real Thinkific id is used when present. Otherwise the normalized email is the
+  identity. People are never matched by name.
 
-| Var | Purpose |
-|---|---|
-| `SUPABASE_SECRET_KEY` | **Service-role secret.** Server-only, used ONLY inside `api/admin/student-imports.js` after an admin check. **Never `VITE_`-prefixed, never in the browser.** (Legacy fallback: `SUPABASE_SERVICE_ROLE_KEY`.) |
-| `RESEND_API_KEY` / `RESEND_FROM` | Sends the one-time set-password invite link (link is emailed then **discarded**, never stored/logged). |
-| `APP_URL` | Origin for the `/welcome/set-password` redirect (e.g. `https://toolkits.alexsagun.com`). |
-| `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` | Reused for the caller auth check (already set). |
-
-Unlike the `notify-*` functions, this endpoint **also runs under `npm run dev`** (via the
-`studentImportDevApi` middleware in `vite.config.js`), so you can run a local pilot with a local
-`SUPABASE_SECRET_KEY`.
-
-Health check: `GET /api/admin/student-imports` → `{ ok, configured, hasSecretKey, hasResend }`
-(booleans only — no key/address is ever returned).
+**Never commit a real roster.** The two real CSVs are gitignored (`/CSV Per students*.csv`); keep
+any future roster in `private-imports/`, which is also ignored. Tests use synthetic data only.
 
 ---
 
-## 3. The workflow (in the tab)
+## 3. Staging
 
-1. **Upload** the Thinkific User CSV/XLSX (BOM, quoted commas, and Excel are handled; size/row/column
-   caps enforced; a SHA-256 fingerprint flags a duplicate file).
-2. **Map columns** to the canonical fields.
-3. **Reconcile** a supplementary file (Orders/ledger/manual template) — joined by `thinkific_user_id`
-   or email — to fill in the missing **email** and **exact dates**.
-4. **Map course-combos → plan** — each distinct `Enrollments - list` combination is shown with a row
-   count; map it to a plan, to **"Profile only (no access)"**, or to **"Manual review."** Suggestions
-   are advisory only (QBO+Resume → *maybe* `silver_self_paced`; a **QBO-only** history yields **no
-   suggestion at all** now that the QBO-only plan is retired — map it manually or send it to review;
-   Sampler and VIP are never inferred). Per-student overrides are allowed.
-5. **Validate & match** — the tool pre-checks client-side, then a **server dry-run** authoritatively
-   matches each row (by Thinkific source link, then by normalized email — **never by name**).
-6. **Preview** — an editable table with search/filters, a row-detail panel, and summary counts
-   (Total / Ready / Warnings / Blocked / New / Existing / Conflicts / …).
-7. **Dry run** — server writes each row's proposed action back; no accounts change.
-8. **Confirm** — a modal states exactly how many accounts will be **created / merged / skipped /
-   granted / imported-as-expired / invited**. **Blocked rows can never be processed.**
-9. **Process** — bounded, resumable batches. You can pause/resume; a browser close, deploy, or
-   timeout resumes from the persisted cursor.
-10. **Review** — retry failed rows, resend an invite, and download a **sanitized** (formula-safe)
-    error report.
+1. **Stage a roster** → choose the file.
+2. Match the columns (required fields are marked).
+3. Declare the date format.
+4. Confirm the plan and batch mappings.
+5. Tick the batches that may be activated. Only the newest batch in the file is pre-ticked. Every
+   other valid row stages as **Inactive**.
+6. Tick the confirmation and press **Stage**.
+
+The same roster staged twice opens the first job; nothing is staged twice. A corrected roster
+stages anyone already staged elsewhere as **Duplicate**. To replace a roster, discard the old job
+(with a reason) and stage the new one.
+
+**Staging the same file again with different settings is refused**, and the message names what
+differs — the date format, the column matching, either label matching, or the cohorts ticked for
+activation. Open the staged job to check it (the notice links straight to it), or discard that job
+and stage again. This matters because the file's fingerprint is taken from its cells, not from how
+you read them: 11/10 read as 10/11 still falls inside the batch's month, so nothing later would
+catch it.
 
 ---
 
-## 4. Membership rules (how terms are granted)
+## 4. Activating
 
-- **Default = preserve exact dated expiry.** Active members get `ends_at` from the source (+3-day
-  grace, matching the Toolkit policy); status is `active` only while the term is valid.
-- **An existing longer/active term is NEVER silently shortened.** A same-plan import that ends sooner
-  is skipped (the live term is preserved); a later one extends it.
-- **Different active plan → manual review** by default (not silently overwritten).
-- **Expired source memberships** import as **expired history** so the student lands on the normal
-  renewal screen.
-- **"Start a fresh full term today"** and **"Lifetime (no expiry)"** are explicit, non-default modes
-  you choose per combo — never a hidden default.
-- Imported subscriptions are marked `grant_source='import'` and linked to their import row, so a
-  migration grant is always distinguishable from a verified payment.
-- **VIP rows need a confirmed open `batch_code`** (#32) — blocked otherwise, and re-validated
-  at process time (a batch closed between dry-run and process re-blocks the row). Batch-less
-  premium grants (e.g. rows imported before #32) surface in Admin → Batches → "Needs batch
-  assignment" and can be bulk-assigned there (idempotent, audited).
-- **Batch capacities are NOT enforced on the import path.** Seat limits are checked (under a
-  row lock) only when approving an enrollment or assigning a batch from Admin → Batches. A bulk
-  import can therefore push a batch past its stated capacity — check the counts in
-  Admin → Batches after importing a premium cohort.
+1. Open the job. Filter to **Pending activation**. Tick rows, or use **Select all ready in this
+   view**, which only ever selects pending rows. One activation takes at most 200 rows.
+2. **Activate** opens the workflow, in two steps.
+   - **Step 1 — Membership terms.** The selection grouped by plan, batch and dates, as the roster
+     gave them. For a start still ahead, **Open access today** is ticked: the students reach their
+     dashboard as soon as they set a password, and their paid end date does not move. Untick it to
+     keep the roster's start (they can set a password now and reach the dashboard on that day).
+     **Change plan, batch or dates…** assigns different terms to a group. Every change is recorded
+     with who made it and what it was before; the roster's own values stay on the row.
+   - **Step 2 — Confirm.** New versus existing accounts, activation emails versus sign-in
+     notifications, the plan and the final dates, the cohort seats each batch will get (including
+     months that have no batch), capacity context and email readiness.
+3. Type `ACTIVATE <n>` exactly and confirm.
 
----
+One row's terms can also be changed from its panel (**Edit terms…**), with a reason, any time before
+it is activated.
 
-## 5. Onboarding (how a student gets in)
+Progress is shown chunk by chunk. You can **Pause**, refresh the page, and **Resume** later; a row
+that already succeeded is never repeated. Leaving the job is held until you pause, because leaving
+takes the Pause button with it while the server keeps going.
 
-A new imported account receives **one** email with a single-use link to
-`/welcome/set-password`. On first sign-in the app forces a **set-password** screen (driven by
-`profiles.account_origin='import'` + `onboarding_status != 'completed'`), the student sets their own
-password, `complete_import_onboarding()` marks them done, and they drop into the normal membership
-experience with their correct plan and exact remaining term. **Passwords are never emailed, shared,
-generated into a CSV, or logged.** An existing confirmed Toolkit user is **merged** (linked + granted)
-and receives **no** invite.
+**Retry failed rows** is offered once no activation is open, and covers failed rows from any run of
+the job. It opens the same confirmation, with its own typed phrase, and gives each row a fresh set
+of attempts. A row left mid-activation by a dropped connection becomes **Failed** after ten minutes
+and is retried the same way — it was granted nothing, because the grant is one transaction.
 
----
+For each row, the server:
 
-## 6. Pilot before the full population (do this first)
+1. creates or finds the Auth account (no email is sent by this step);
+2. records it on the row;
+3. in **one transaction**: creates the membership from the roster's own dates (00:00 Manila on the
+   start date to the last moment of the end date, plus the 3-day grace), grants the cohort run from
+   the live batch registry, approves the profile, and writes the audit event;
+4. sends the email.
 
-1. Run migration #26 on staging (or prod off-hours) and set the env vars.
-2. Build a **synthetic** 3–5 row supplemental CSV (test emails you control; real-looking dates; one
-   expired; one whose email matches an existing native account). **Never use the real student CSV for
-   the pilot.**
-3. Stage → map → **dry-run**; verify the proposed actions + counts.
-4. Confirm → **process one small batch**; watch the results + events.
-5. Verify each pilot account end-to-end: new → single invite → set password → correct plan + exact
-   remaining term; existing → merged, no duplicate/invite; expired → renewal screen.
-6. **Re-run the same job** to prove idempotency (no duplicate users/links/subscriptions/invites).
-7. Only then, with the real Orders/ledger data, scale up in bounded batches with pause/resume.
+It never creates an enrollment request, a receipt or a payment record.
 
----
+A row is **blocked for review** instead when the account is rejected, belongs to staff, already has
+a current or upcoming membership, or does not match its email. A blocked row changes nothing about
+the person's account: someone who signed up on their own, or bought a membership between staging and
+activation, keeps their own sign-in and stays in **Access Requests** where you can still decide them.
 
-## 7. Resume, retry & idempotency
+### Memberships that start later
 
-- **Resumable:** the job stores a `cursor` and every row result. Re-invoking `process` continues from
-  where it stopped — safe after a browser close, deploy, or serverless timeout.
-- **Idempotent:** three keys make retries safe — Supabase auth-email uniqueness,
-  `student_external_accounts.unique(source, external_user_id)`, and
-  `subscriptions.unique(source_import_row_id)`. A retry after "auth user created but grant failed"
-  re-matches the existing user and completes the grant — never a second account.
-- **Never destructive:** the importer never auto-deletes an existing Auth user.
+A start date still in the future creates a **scheduled** membership. The student can claim the
+account and set a password, but courses and the batch community stay closed until the start date.
+They see a "Your membership starts on …" screen with no price. A 15-minute job opens it on the
+day; the student's own screen can open it too.
+
+### Batches that are closed
+
+A roster row whose batch has since closed still gets its seat in that batch. The batch is not
+reopened. An archived batch blocks the row.
 
 ---
 
-## 8. Privacy, security & retention
+## 5. The email and the claim
 
-- The **raw uploaded file never leaves the browser** except as normalized, purgeable staged rows.
-- Audit events store **IDs + safe status codes only** — never names, emails, raw rows, invite links,
-  or secrets.
-- Downloaded error reports are **CSV-formula-injection-safe** (cells starting with `= + - @` are
-  neutralized).
-- **Retention:** after a job completes, purge its staged raw rows (the job's `mapped` payloads) — the
-  counts and audit trail remain. (`student_import_jobs.purged_at` marks a purged job.)
-- Non-admins cannot reach the route (Admins-only screen), the API (401/403), or any `student_*` table
-  (RLS admin-only). The service key never appears in the browser bundle.
+- **New account, or one that never confirmed its email:** "Your learning account has moved —
+  activate it now", from support@alexsagun.com. It lists their name, email, batch, plan,
+  subscription start and expiry, says the membership is already paid, and has a one-time link to
+  `/activate-account`. The link works for 24 hours; a resend replaces it.
+- **Existing account with a password:** a notification with a plain sign-in link. No password reset.
+
+Activating: the student presses **Activate my account**. The next page shows their name (which
+they can correct) and their email (locked — it is how they sign in), and asks for a password
+twice. Then a summary shows their name, email, batch, plan, subscription status and expiry, with
+**Go To Dashboard**. No price appears anywhere on the way.
+
+When they finish, two emails go out once, from support@alexsagun.com: **"Student Successfully
+Onboarded"** to you, and a confirmation to the student with their subscription details, a link to
+their dashboard and the support address. The row then shows **Onboarded**, and its panel says whether
+those emails were sent. If sending failed (Resend down, say), the app tries again the next time the
+student opens it — five tries in all — and the admin email is never sent twice.
+
+If the link expired, they use **Forgot password** with the same email; setting a password that way
+also finishes the setup and sends the same two emails.
+
+**Resend** is on the row. Every resend is a new link; the previous one stops working.
+
+---
+
+## 6. Later cohorts (August, September)
+
+Inactive rows stay staged. To activate some later:
+
+1. select them, **Make ready…** (with a reason);
+2. activate them as above.
+
+They keep their original dates and batch. They are never moved into October.
+
+---
+
+## 7. Recovery
+
+- **Revert** (row → Revert activation, with a reason) undoes an activation the student has not
+  used: a scheduled membership, or a new account that has not been claimed. The membership is
+  cancelled and the cohort seats are revoked. The account is kept — and so is its approval, so a
+  claim email already sent still signs the student in; they will then see the enrollment page,
+  because they no longer hold a membership. Tell them, or re-activate the row.
+- After a student has claimed their account, change the membership from Enrollments.
+- No Auth account is ever deleted by this feature.
+
+---
+
+## 8. Privacy and retention
+
+- The audit trail stores ids and short codes only, and it cannot be edited or deleted.
+- **Remove raw names and emails** (job toolbar) clears names and addresses from activated and
+  reverted rows, and from every row of a discarded job. The record key, dates, plan, batch,
+  payment history and audit trail remain. Inactive rows keep their data because they may still be
+  activated.
+- Links and tokens are never logged or stored.
 
 ---
 
 ## 9. Troubleshooting
 
-- **"Server import is not configured"** → `SUPABASE_SECRET_KEY` (or `SUPABASE_SERVICE_ROLE_KEY`) is
-  unset. Set it and redeploy.
-- **Every row is Blocked (missing email)** → expected for a bare User export. Reconcile with an
-  Orders/ledger export or the template to supply emails.
-- **Invite email not received** → check `RESEND_API_KEY`/`RESEND_FROM` and that the Resend sender
-  domain is verified; use **Resend invite** on the row after fixing config.
-- **Student stuck on set-password** → confirm `${APP_URL}/welcome/set-password` is in Supabase's
-  Redirect URLs and the link hasn't expired (use **Resend invite** to mint a fresh one).
+- **"Activation is paused until the server has …"** — set the missing `RESEND_*`, `APP_URL` or
+  support address, then redeploy. `APP_URL` is needed on preview deployments too, not just
+  production: without it, activation refuses there rather than emailing students a preview link.
+- **"This roster is already staged with different settings"** — open the staged job from the notice
+  and check it, or discard it (with a reason) and stage the file again.
+- **A row sits on Activating and nothing moves** — after ten minutes it becomes Failed by itself,
+  and the job can be discarded or the row retried. It was granted nothing.
+- **"Retry failed rows" is not offered** — an activation is still open. Pause or let it finish
+  first; the button then covers failed rows from every run of the job.
+- **Every row is Blocked** — check the declared date format and the plan and batch mappings. The
+  **Problems CSV** lists each blocked row with its reasons.
+- **"No batch exists for …"** in the confirmation — the cohort run skips that month, and a batch
+  created for it later cannot join the run. Create the batch **before** activating if it should
+  count.
+- **An email shows "Invitation failed"** — press Resend on the row.
+- **A student says the link expired** — they use Forgot password with the same email, or you resend.

@@ -51,10 +51,17 @@ export const GATE_SCREENS = Object.freeze({
   RECOVERY: 'recovery',
   AUTH: 'auth',
   IMPORT_ONBOARDING: 'import_onboarding',
+  // #67: the migrated-student claim link (src/lib/importClaim.js) — redeem the one-time
+  // token on a click, then IMPORT_ONBOARDING sets the password.
+  IMPORT_CLAIM: 'import_claim',
+  // #67: the one-time onboarding summary, straight after the password is set. Never a price.
+  IMPORT_WELCOME: 'import_welcome',
   STAFF_INVITATION: 'staff_invitation',
   REJECTED: 'rejected',
   ENROLL_PENDING: 'enroll_pending',
   MEMBERSHIP_EXPIRED: 'membership_expired',
+  // #67: a paid membership whose start date is still ahead. Never a price.
+  MEMBERSHIP_SCHEDULED: 'membership_scheduled',
   RENEWAL_PAYWALL: 'renewal_paywall',
   PAYWALL: 'paywall',
   // The profile READ failed (not "there is no profile"). Every membership fact is
@@ -117,6 +124,7 @@ export function resolveGateScreen(state) {
     staffReady = true, staffDegraded = false, staffMembership,
     staff, enroll, renewNow = false, inviteDismissed = false, hasInviteToken = false,
     inviteDeferred = false, profileFailed = false,
+    hasClaimToken = false, claimDismissed = false, importWelcomePending = false,
     requireApproval = true, requireEnrollment = true,
   } = s;
 
@@ -126,6 +134,11 @@ export function resolveGateScreen(state) {
     // No session yet, so no profile and therefore no ban to check — redeeming the
     // token is what creates the session the rest of this function reasons about.
     return { screen: GATE_SCREENS.STAFF_INVITATION, reason: 'staff_invitation_token' };
+  }
+  // #67: a signed-out holder of a migration claim link gets the claim screen, not the
+  // login form — they have no password yet. Redeeming creates the session.
+  if (hasClaimToken && !claimDismissed && !user) {
+    return { screen: GATE_SCREENS.IMPORT_CLAIM, reason: 'import_claim_token' };
   }
   if (!user) return { screen: GATE_SCREENS.AUTH, reason: 'signed_out' };
 
@@ -150,6 +163,11 @@ export function resolveGateScreen(state) {
   if (!profileReady) {
     if (!inviteDismissed && hasInviteToken) {
       return { screen: GATE_SCREENS.STAFF_INVITATION, reason: 'staff_invitation_token' };
+    }
+    // #67: the same rule for a claim link — verifyOtp() creates the session that makes
+    // profileReady false, and the claim screen must not be unmounted mid-redemption.
+    if (!claimDismissed && hasClaimToken) {
+      return { screen: GATE_SCREENS.IMPORT_CLAIM, reason: 'import_claim_token' };
     }
     return { screen: GATE_SCREENS.SPLASH, reason: 'profile_loading' };
   }
@@ -182,6 +200,27 @@ export function resolveGateScreen(state) {
   //   hired, lifting the ban is the deliberate act that comes first.
   if (requireApproval && !isAdmin && profile?.approval_status === 'rejected') {
     return { screen: GATE_SCREENS.REJECTED, reason: 'approval_rejected' };
+  }
+
+  // ── A claim link opened while already signed in (#67) ─────────────────────
+  // BELOW the ban (a banned account never reaches a redemption) and below imported
+  // onboarding (someone mid-setup finishes it first). The screen offers "continue as
+  // this account" or "sign out and use the link"; it redeems nothing by itself.
+  if (hasClaimToken && !claimDismissed) {
+    return { screen: GATE_SCREENS.IMPORT_CLAIM, reason: 'import_claim_signed_in' };
+  }
+
+  // ── The onboarding summary (#67) ──────────────────────────────────────────
+  // Shown ONCE, right after a migrated student sets their password: their plan, batch
+  // and dates, then "Go To Dashboard". `importWelcomePending` is session state the setup
+  // screen sets; a reload skips the summary, which is harmless — it grants nothing and
+  // the dashboard shows the same membership. Below the ban (a banned account never
+  // sees it) and only once onboarding is really complete, so it cannot stand in for
+  // setting a password. It shows no price.
+  if (importWelcomePending && !isAdmin
+    && profile?.account_origin === 'import'
+    && profile?.onboarding_status === 'completed') {
+    return { screen: GATE_SCREENS.IMPORT_WELCOME, reason: 'import_welcome' };
   }
 
   // ── Pending staff invitation ──────────────────────────────────────────────
@@ -309,6 +348,10 @@ function enrollmentScreen(enroll, renewNow) {
     case 'paywall':
     case 'paywall_notice':
       return { screen: GATE_SCREENS.PAYWALL, reason: `enroll_${enroll.state}` };
+    case 'scheduled':
+      // #67: paid, not started. Deliberately NOT in PRICING_SCREENS, so it never waits
+      // on the staff context and never becomes PROFILE_UNAVAILABLE.
+      return { screen: GATE_SCREENS.MEMBERSHIP_SCHEDULED, reason: 'enroll_scheduled' };
     case 'pass':
     default:
       return null;

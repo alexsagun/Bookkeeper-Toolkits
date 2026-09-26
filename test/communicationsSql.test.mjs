@@ -688,7 +688,11 @@ test('the sender records only its own attempt, keys each retry generation, and n
   assert.ok(!/admin\.rpc\(/.test(src.replace(/async function rpcWithin\([\s\S]*?\n}\n/, '')), 'every RPC goes through rpcWithin, so none is unbounded');
   assert.ok(/await admin\.rpc\(fn, args\)\.abortSignal\(signal\);/.test(src), 'rpcWithin attaches the time limit');
   assert.ok(/select\('key,value'\)\.abortSignal\(AbortSignal\.timeout\(RPC_TIMEOUT_MS\)\)/.test(src), 'the payment details read has a time limit');
-  assert.ok(/eq\('key', 'notify_email'\)\s+\.abortSignal\(AbortSignal\.timeout\(RPC_TIMEOUT_MS\)\)/.test(src), 'the support address read has a time limit');
+  // #67 moved the support-address read into api/_lib/supportAddress.js, shared with the
+  // migration's claim emails. The limit is still the sender's own RPC limit.
+  const support = jsCode(read('api/_lib/supportAddress.js'));
+  assert.ok(/eq\('key', 'notify_email'\)\s+\.abortSignal\(AbortSignal\.timeout\(timeoutMs\)\)/.test(support), 'the support address read has a time limit');
+  assert.ok(/sharedSupportAddress\(admin, \{ timeoutMs: RPC_TIMEOUT_MS \}\)/.test(src), 'and the sender passes its own RPC limit to it');
   assert.ok(!/stillWanted|STOP_CHECK_MS/.test(src), 'the read-only stop check is replaced by the clearance');
   assert.ok(/p_error_code: 'deferred'/.test(src), 'a row the budget cannot reach is handed back, not left sending');
 });

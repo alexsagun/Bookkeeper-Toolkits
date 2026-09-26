@@ -204,6 +204,12 @@ export async function callerCanManageCourse(user, courseId) {
 /**
  * The service-role client. Construct it ONLY after requireStaff() returned ok.
  *
+ * One narrower exception (#67): api/notify-enrollment.js's `import_onboarded` builds it
+ * after callerUser() has verified a STUDENT's JWT, and calls exactly one service-only
+ * function, legacy_import_onboarding_notice(p_user), with that verified uid and nothing
+ * from the request body. That function is revoked from every client role precisely so a
+ * student cannot record their own notice outcome.
+ *
  * The key is read at module load, but the CLIENT is built here — the invariant
  * every admin handler documents is about the client, and keeping construction
  * behind a function call is what makes "after the gate" reviewable.

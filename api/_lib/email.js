@@ -82,9 +82,13 @@ export async function sendEmail({
   //   invitation mid-flight and repeating it under the same key draws a 409 while the first is
   //   still being processed, which it reports as "not sent" — and the admin invites again.
   timeoutMs = null, retry429 = true, maxAttempts = 3,
+  // #67: a flow may send from its own address (the migration sends from
+  // support@alexsagun.com). Omitted, it is RESEND_FROM exactly as before. The domain must
+  // be verified in Resend, or the provider refuses the message with a 403.
+  from: fromOverride = null,
 }) {
   const apiKey = process.env.RESEND_API_KEY;
-  const from = process.env.RESEND_FROM;
+  const from = (typeof fromOverride === 'string' && fromOverride.trim()) || process.env.RESEND_FROM;
   if (!apiKey) return { ok: false, code: 'email_not_configured' };
   if (!from) return { ok: false, code: 'email_from_not_configured' };
   if (!to || !subject || !html) return { ok: false, code: 'email_incomplete' };
@@ -253,6 +257,26 @@ export function roleCard({ label, description }) {
     <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#7b8798;font-weight:700;margin:0 0 6px;">Your role</div>
     <div style="font-size:17px;font-weight:800;color:#12304f;margin:0 0 6px;">${esc(label)}</div>
     <div style="font-size:13px;line-height:1.6;color:#48505e;">${esc(description)}</div>
+  </div>`;
+}
+
+/**
+ * A labelled facts card (#67): "Your membership" with plan, batch and dates. Every
+ * label and value is escaped. Rows with an empty value are dropped rather than
+ * rendered as a dangling label.
+ *
+ * @param {{ title: string, rows: Array<[string, string|null|undefined]> }} opts
+ */
+export function detailsCard({ title, rows }) {
+  const body = (rows || [])
+    .filter(([, v]) => v != null && String(v).trim() !== '')
+    .map(([k, v]) => `<tr>
+        <td style="padding:4px 12px 4px 0;font-size:13px;color:#7b8798;vertical-align:top;white-space:nowrap;">${esc(k)}</td>
+        <td style="padding:4px 0;font-size:14px;font-weight:700;color:#12304f;">${esc(v)}</td>
+      </tr>`).join('');
+  return `<div style="border:1px solid #dce4ef;background:#f7fafd;border-radius:12px;padding:16px 18px;margin:0 0 20px;">
+    <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#7b8798;font-weight:700;margin:0 0 8px;">${esc(title)}</div>
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0">${body}</table>
   </div>`;
 }
 

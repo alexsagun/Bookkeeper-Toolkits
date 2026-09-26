@@ -168,3 +168,64 @@ test('the resend audit row records the act, never the link', () => {
   assert.ok(!/url|link|token/i.test(body.replace(/--[^\n]*/g, '').replace(/one-time credential/gi, '')),
     'the ledger must stay clean of the credential');
 });
+
+// ── #67: the migrated-student claim link — the same secret, the same rules ────
+
+const importApi = read('api/admin/student-imports.js');
+const claimLib = read('src/lib/importClaim.js');
+const claimEmail = read('api/_lib/legacyClaimEmail.js');
+const migration67 = read('db/2026-09-25-legacy-student-migration.sql');
+
+test('the claim fragment is stripped in the same function that parses it', () => {
+  const fn = region(app, 'function readImportClaimFromUrl', 'const INITIAL_IMPORT_CLAIM');
+  assert.match(fn, /parseClaimHash/);
+  assert.match(fn, /history\.replaceState/);
+  assert.match(fn, /window\.location\.pathname \+ window\.location\.search/);
+});
+
+test('the claim screen redeems on a click, single-flight, and drops the secret when spent', () => {
+  const fn = region(app, 'function ImportClaimScreen', 'const fmtManilaDate');
+  assert.match(fn, /const lockRef = useRef\(false\)/, 'a ref lock, not a state flag');
+  assert.match(fn, /onClick=\{redeem\}/, 'redeemed by a click, never on load');
+  assert.ok(!/useEffect\([^)]*redeem/.test(fn), 'no effect may redeem the token by itself');
+  assert.match(fn, /tokenRef\.current = null/);
+  // Root state keeps nothing once the token is spent.
+  assert.ok(app.includes('const redeemImportClaim = useCallback(() => { setImportClaim(null); }, []);'));
+});
+
+test('the claim link puts the token in the fragment, never the query', () => {
+  assert.match(claimLib, /#claim=/);
+  assert.ok(!/\?claim=/.test(claimLib));
+});
+
+test('the migration endpoint extracts hashed_token, never action_link, and never logs it', () => {
+  assert.match(importApi, /properties\?\.hashed_token/);
+  const code = importApi.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+  assert.ok(!/properties\?\.action_link|properties\.action_link/.test(code),
+    'action_link is consumed on GET — a mail scanner would claim the account');
+  for (const line of tokenLines(importApi)) {
+    assert.ok(!/console\./.test(line), `token on a console line: ${line.trim()}`);
+  }
+  for (const line of importApi.split('\n').filter((l) => /console\./.test(l))) {
+    assert.ok(!/email|url|link|token|html|text\b/i.test(line.replace('console.error(`[student-imports]', '')),
+      `a log line may carry a student's data: ${line.trim()}`);
+  }
+});
+
+test('the claim URL reaches no response body', () => {
+  const jsonCalls = importApi.match(/res\.status\([^)]*\)\.json\([\s\S]*?\);/g) || [];
+  assert.ok(jsonCalls.length > 8, 'expected to find the response sites');
+  for (const call of jsonCalls) {
+    assert.ok(!/tokenHash|hashed_token|actionUrl|\burl\b/.test(call), `token or link in a response: ${call.slice(0, 80)}…`);
+  }
+});
+
+test('the claim email builder is pure', () => {
+  assert.ok(!/console\.|localStorage|sessionStorage|window\.|process\.env/.test(claimEmail));
+});
+
+test('#67 stores no token column', () => {
+  const code = migration67.split('\n').filter((l) => !/^\s*--/.test(l)).join('\n');
+  assert.ok(!/token_hash|hashed_token|action_link|claim_token/.test(code),
+    'invite_state / invite_generation / invite_code are the only delivery state');
+});

@@ -669,3 +669,110 @@ test('a ban and a staff bypass both still outrank the unavailable hold', () => {
     'active staff were never being priced, so nothing changes for them',
   );
 });
+
+// ── #67: the migrated-student claim link and the scheduled membership ────────
+
+const scheduled = (over = {}) => student({
+  profile: { is_admin: false, approval_status: 'approved', is_paid: true, account_origin: 'import', onboarding_status: 'completed' },
+  enroll: { active: true, ready: true, configured: true, state: 'scheduled' },
+  ...over,
+});
+
+test('a paid student whose membership starts later sees the start date, never a price', () => {
+  assert.equal(screenOf(scheduled()), GATE_SCREENS.MEMBERSHIP_SCHEDULED);
+});
+
+test('the scheduled screen does not wait on the staff context — it quotes no price', () => {
+  assert.equal(screenOf(scheduled({ staffReady: false })), GATE_SCREENS.MEMBERSHIP_SCHEDULED);
+});
+
+test('a failed profile read does not replace the scheduled screen', () => {
+  assert.equal(screenOf(scheduled({ profileFailed: true })), GATE_SCREENS.MEMBERSHIP_SCHEDULED);
+});
+
+test('imported onboarding (set a password) comes before the scheduled screen', () => {
+  const s = scheduled({ profile: { is_admin: false, approval_status: 'approved', is_paid: true,
+    account_origin: 'import', onboarding_status: 'invited' } });
+  assert.equal(screenOf(s), GATE_SCREENS.IMPORT_ONBOARDING);
+});
+
+test('a ban outranks a scheduled membership', () => {
+  const s = scheduled({ profile: { is_admin: false, approval_status: 'rejected', is_paid: true,
+    account_origin: 'import', onboarding_status: 'completed' } });
+  assert.equal(screenOf(s), GATE_SCREENS.REJECTED);
+});
+
+test('active staff with a scheduled term are not held on it', () => {
+  const s = scheduled({ staff: { isStaff: true, status: 'active', roleKey: 'trainer', permissions: ['courses.create'] } });
+  assert.equal(screenOf(s), GATE_SCREENS.APP);
+});
+
+test('a signed-out holder of a claim link gets the claim screen, not the login form', () => {
+  assert.equal(screenOf(student({ user: null, hasClaimToken: true })), GATE_SCREENS.IMPORT_CLAIM);
+  assert.equal(screenOf(student({ user: null, hasClaimToken: true, claimDismissed: true })), GATE_SCREENS.AUTH);
+});
+
+test('a claim in flight is NOT replaced by the splash while the profile loads', () => {
+  assert.equal(screenOf(student({ profileReady: false, hasClaimToken: true })), GATE_SCREENS.IMPORT_CLAIM);
+  assert.equal(screenOf(student({ profileReady: false })), GATE_SCREENS.SPLASH);
+});
+
+test('a claim link cannot carry a banned account past the ban', () => {
+  const s = student({ hasClaimToken: true, profile: { is_admin: false, approval_status: 'rejected' } });
+  assert.equal(screenOf(s), GATE_SCREENS.REJECTED);
+});
+
+test('a claim link does not pre-empt a password recovery or the initial load', () => {
+  assert.equal(screenOf(student({ recovery: true, hasClaimToken: true })), GATE_SCREENS.RECOVERY);
+  assert.equal(screenOf(student({ loading: true, hasClaimToken: true })), GATE_SCREENS.SPLASH);
+});
+
+test('someone already signed in who opens a claim link is asked, not silently switched', () => {
+  assert.equal(screenOf(student({ hasClaimToken: true })), GATE_SCREENS.IMPORT_CLAIM);
+  assert.equal(screenOf(student({ hasClaimToken: true, claimDismissed: true })), GATE_SCREENS.APP);
+});
+
+test('the scheduled and claim screens are declared ids', () => {
+  const declared = new Set(Object.values(GATE_SCREENS));
+  assert.ok(declared.has(screenOf(scheduled())));
+  assert.ok(declared.has(screenOf(student({ user: null, hasClaimToken: true }))));
+});
+
+// ── #67: the onboarding summary, straight after the account is created ──────
+
+const onboarded = (over = {}) => student({
+  profile: { is_admin: false, approval_status: 'approved', is_paid: true, account_origin: 'import', onboarding_status: 'completed' },
+  enroll: { active: true, ready: true, configured: true, state: 'pass' },
+  importWelcomePending: true,
+  ...over,
+});
+
+test('the summary shows once the account is created, before the dashboard', () => {
+  assert.equal(screenOf(onboarded()), GATE_SCREENS.IMPORT_WELCOME);
+  assert.equal(screenOf(onboarded({ importWelcomePending: false })), GATE_SCREENS.APP, 'Go To Dashboard moves on');
+});
+
+test('the summary never stands in for setting a password', () => {
+  const s = onboarded({ profile: { is_admin: false, approval_status: 'approved', is_paid: true,
+    account_origin: 'import', onboarding_status: 'invited' } });
+  assert.equal(screenOf(s), GATE_SCREENS.IMPORT_ONBOARDING);
+});
+
+test('a ban outranks the summary', () => {
+  const s = onboarded({ profile: { is_admin: false, approval_status: 'rejected', is_paid: true,
+    account_origin: 'import', onboarding_status: 'completed' } });
+  assert.equal(screenOf(s), GATE_SCREENS.REJECTED);
+});
+
+test('the summary is for migrated accounts only, and quotes no price while staff load', () => {
+  const ordinary = onboarded({ profile: { is_admin: false, approval_status: 'approved', is_paid: true } });
+  assert.notEqual(screenOf(ordinary), GATE_SCREENS.IMPORT_WELCOME);
+  assert.equal(screenOf(onboarded({ staffReady: false })), GATE_SCREENS.IMPORT_WELCOME);
+  assert.ok(new Set(Object.values(GATE_SCREENS)).has(GATE_SCREENS.IMPORT_WELCOME));
+});
+
+test('a student who opens access on the activation day reaches the dashboard, a later start the scheduled screen', () => {
+  assert.equal(screenOf(onboarded({ importWelcomePending: false })), GATE_SCREENS.APP);
+  assert.equal(screenOf(onboarded({ importWelcomePending: false,
+    enroll: { active: true, ready: true, configured: true, state: 'scheduled' } })), GATE_SCREENS.MEMBERSHIP_SCHEDULED);
+});

@@ -2394,3 +2394,198 @@ test("the focus targets a decision returns to carry a name a screen reader can r
   assert.ok(app().includes('id="enroll-list" role="group" tabIndex={-1} aria-label="Enrollment requests"'),
     'the list is the fallback focus target and must be a named group');
 });
+
+// ─── §27 The legacy migration workspace (#67) ───────────────────────────────
+//
+// The old wizard inserted jobs and rows from the BROWSER, processed "every ready row"
+// with no selection, and offered no way back to a job after a refresh. Each of those is
+// pinned here as a property of the source.
+
+function migrationRegion() {
+  const src = app();
+  const start = src.indexOf('// COMPONENT: STUDENT IMPORTS — the legacy migration workspace (#67)');
+  const end = src.indexOf('// COMPONENT: RESTRICTED TAB', start);
+  assert.ok(start > 0 && end > start, 'the migration workspace region must exist');
+  return src.slice(start, end);
+}
+
+test('§27 the browser never writes an import table', () => {
+  const region = migrationRegion();
+  assert.ok(!/from\(\s*'student_import[a-z_]*'\s*\)\s*\.\s*(insert|update|upsert|delete)/.test(region),
+    'staging and every row change go through the endpoint or a SECURITY DEFINER RPC');
+  assert.ok(!/from\(\s*'(subscriptions|profiles|batch_entitlements)'\s*\)\s*\.\s*(insert|update|upsert|delete)/.test(region));
+  assert.ok(region.includes("migrationApi('stage'"), 'the roster is staged by the server');
+  assert.ok(region.includes("migrationRpc('legacy_import_rows_page'"), 'rows are read page by page');
+});
+
+test('§27 the tab is gated on students.legacy_migrate, and so is the nav entry', () => {
+  const region = migrationRegion();
+  assert.ok(region.includes("can('students.legacy_migrate')"));
+  assert.ok(!region.includes("can('students.import')"), 'students.import no longer exists');
+  assert.ok(!app().includes("'students.import'"), 'no screen may still ask for the retired key');
+});
+
+test('§27 "select all" selects READY rows only, and activation sends only activatable ids', () => {
+  const region = migrationRegion();
+  assert.ok(region.includes("migrationRpc('legacy_import_ready_ids'"), 'the bulk selection asks the server for READY ids');
+  assert.ok(/const readySelected = \[\.\.\.selected\.entries\(\)\]\.filter\(\(\[, s\]\) => s === 'ready'\)/.test(region));
+  // An activation takes ready rows plus failed rows being retried — never inactive or blocked
+  // ones, whatever the filter. legacy_import_start_run refuses the whole request otherwise.
+  assert.ok(/const activatableSelected = \[\.\.\.selected\.entries\(\)\]\.filter\(\(\[, s\]\) => s === 'ready' \|\| s === 'failed'\)/.test(region));
+  assert.ok(region.includes('onClick={() => setActivateIds(activatableSelected)}'), 'the Activate button hands over those ids only');
+  assert.ok(region.includes("const selectable = ['ready', 'inactive', 'failed'].includes(r.activation_state) && !discarded;"),
+    'only those three states have a checkbox');
+});
+
+// Failed rows from ANY run are retried through a new, typed confirmation, so neither an older
+// run nor the per-run attempt cap can leave a row that no button in the workspace reaches.
+test('§27 retrying failed rows goes through the confirmation, for every run of the job', () => {
+  const region = migrationRegion();
+  assert.ok(region.includes("migrationRpc('legacy_import_ready_ids', { p_job_id: jobId, p_state: 'failed' })"));
+  assert.ok(region.includes('if ((ids || []).length) setActivateIds(ids);'), 'the retry opens the same confirmation dialog');
+  assert.ok(!/runLoop\(summary\.runs\[0\]\.id/.test(region), 'never keyed on the newest run alone');
+});
+
+// runLoop lives for minutes. Reloading through a captured `reload` repainted the table with
+// rows for the filter the run STARTED with, contradicting the filter shown above it.
+test('§27 a long run always reloads with the filter showing now', () => {
+  const region = migrationRegion();
+  assert.ok(region.includes('const reloadRef = useRef(reload);') && region.includes('reloadRef.current = reload;'));
+  assert.ok(!/\n\s+await reload\(\);/.test(region.slice(region.indexOf('const runLoop = async'), region.indexOf('const onStarted ='))),
+    'runLoop must call reloadRef.current(), never the captured reload');
+  // Only the newest answer paints: a filter change, a keystroke and a chunk all start a load.
+  assert.ok(region.includes('const rowsSeq = useRef(0);') && region.includes('if (seq === rowsSeq.current) setRowsPage('));
+});
+
+// Leaving unmounts the workspace, and with it the only Pause control for a run the server
+// keeps executing; reopening then met LEGACY_RUN_BUSY until the lease expired.
+test('§27 you cannot navigate away from a running activation', () => {
+  const region = migrationRegion();
+  assert.ok(/onClick=\{onBack\} disabled=\{runState\.running\}/.test(region));
+});
+
+test('§27 activation requires the typed phrase the server will check', () => {
+  const region = migrationRegion();
+  assert.ok(region.includes('phraseMatches(typed, n)'));
+  // ★ The run is started over the PREFLIGHT's ids, and the phrase count is theirs: sending the
+  //   raw selection after a row stopped being ready refused the whole run once the terms had
+  //   already been saved — a dead end the dialog itself had promised would not happen.
+  assert.ok(region.includes("migrationApi('start-activation', { jobId, rowIds: activateIds, phrase: typed.trim(), clientKey: keyRef.current })"));
+  assert.ok(region.includes('const activateIds = Array.isArray(p?.row_ids) ? p.row_ids : [];'));
+  assert.ok(region.includes('&& Array.isArray(p.row_ids) && p.row_ids.length === n;'), 'confirm stays disabled unless the ids and the phrase agree');
+  assert.ok(!region.includes("migrationApi('start-activation', { jobId, rowIds,"), 'never the raw selection');
+  assert.ok(region.includes('const keyRef = useRef(newClientKey());'), 'one key per dialog, so a double click reuses the same run');
+});
+
+test('§27 the confirmation says in words that no payment is recorded', () => {
+  const region = migrationRegion();
+  assert.ok(/already-paid legacy memberships\. No enrollment request, receipt or payment record is created/.test(region));
+});
+
+test('§27 a job survives a refresh: it is in the URL and an unfinished run offers Resume', () => {
+  const region = migrationRegion();
+  assert.ok(region.includes("u.searchParams.set('job', id)"));
+  assert.ok(region.includes('useState(() => readImportJobParam())'));
+  assert.ok(region.includes('Resume activation'));
+});
+
+test('§27 the date format has no default; the admin declares it', () => {
+  const region = migrationRegion();
+  assert.ok(region.includes("const [dateFormat, setDateFormat] = useState('');"));
+  assert.ok(region.includes('DATE_FORMATS.includes(dateFormat)'), 'nothing previews or stages without it');
+});
+
+test('§27 the workspace is laid out by its container, not the viewport', () => {
+  assert.ok(app().includes('<div className="import-workspace">'));
+  const sheet = css();
+  assert.match(sheet, /\.import-workspace \{ container: import-ws \/ inline-size; \}/);
+  assert.match(sheet, /@container import-ws \(min-width: 900px\)/);
+});
+
+test('§27 the gate renders the claim and scheduled screens it can choose', () => {
+  const src = app();
+  assert.ok(src.includes('case GATE_SCREENS.IMPORT_CLAIM:'), 'an unhandled screen falls through to the app');
+  assert.ok(src.includes('case GATE_SCREENS.MEMBERSHIP_SCHEDULED:'));
+  assert.ok(src.includes('hasClaimToken: !!importClaim,'));
+  assert.ok(src.includes('if (path === IMPORT_CLAIM_PATH) return false;'), 'the claim path is never rewritten away from its token');
+  const scheduled = src.slice(src.indexOf('function MembershipScheduledScreen'), src.indexOf('function MembershipScheduledScreen') + 6000);
+  assert.ok(!/EnrollmentPaywall|price_php|phpFmt|Renew/.test(scheduled), 'the scheduled screen shows no price and no renewal');
+  assert.ok(scheduled.includes("supabase.rpc('activate_my_due_membership')"), 'it can open a due membership itself');
+});
+
+// ★ THE ACCOUNT PAGE THE OWNER DESCRIBED: name prefilled and editable, the email prefilled
+//   and LOCKED (it is the sign-in identity), a password and a matching confirmation.
+test('§27 the migrated account page locks the email and confirms the password', () => {
+  const src = app();
+  const at = src.indexOf('function AccountSetupScreen(');
+  assert.ok(at > 0, 'the account setup screen exists');
+  const screen = src.slice(at, src.indexOf('function ImportWelcomeScreen(', at));
+  assert.ok(/id="setup-email"[^>]*readOnly aria-readonly="true"/.test(screen), 'the email is read-only, not merely styled');
+  assert.ok(screen.includes('value={user?.email || \'\'}'), 'and it is the account\'s own address, not a typed one');
+  assert.ok(screen.includes("useState(() => String(profile?.full_name || '').trim())"), 'the name is prefilled');
+  assert.ok(screen.includes("if (password !== confirm) { setErr('The two passwords do not match.'); return; }"),
+    'a mismatched confirmation is refused before anything is sent');
+  assert.ok(screen.includes("supabase.rpc('complete_import_onboarding', { p_full_name: cleanName })"));
+  assert.ok(screen.indexOf('await notifyImportOnboarded();') < screen.indexOf('onFinished?.();'),
+    'the onboarding emails are asked for before the summary opens');
+  assert.ok(src.includes('return <AccountSetupScreen onFinished={markImportWelcome} />;'));
+  // A retry after a later step failed must not ask Supabase to "change" the password to the
+  // one it already has (it refuses with same_password), and a failed profile read must not
+  // leave the button spinning.
+  assert.ok(screen.includes('if (passwordSetRef.current !== password) {'));
+  assert.ok(screen.includes("if (error && error.code !== 'same_password') throw error;"));
+  assert.ok(/const fresh = await refreshProfile\(\);\s+if \(!fresh\) \{[\s\S]{0,300}setBusy\(false\);/.test(screen));
+});
+
+// ★ A FAILED "YOU'RE IN" NOTICE IS RETRIED, and that promise is kept by the root: once per
+//   session, for a migrated account whose setup is complete. The server stops at five.
+test('§27 a failed onboarding notice is asked for again once per session', () => {
+  const src = app();
+  assert.ok(/const importNoticeDue = Boolean\(user\?\.id && profile && !profile\.is_admin && !importWelcome\s+&& profile\.account_origin === 'import' && profile\.onboarding_status === 'completed'\);/.test(src));
+  assert.ok(/if \(!importNoticeDue \|\| importNoticeAskedRef\.current === user\?\.id\) return;\s+importNoticeAskedRef\.current = user\?\.id;\s+notifyImportOnboarded\(\);/.test(src),
+    'once per signed-in account per session, never on every render');
+});
+
+test('§27 the onboarding summary shows the membership and leads to the dashboard, never a price', () => {
+  const src = app();
+  const at = src.indexOf('function ImportWelcomeScreen(');
+  const screen = src.slice(at, at + 5000);
+  assert.ok(screen.includes("supabase.rpc('my_migration_summary')"), 'facts come from the student\'s own row');
+  for (const label of ['Name', 'Email', 'Batch', 'Membership plan', 'Subscription status', 'Subscription expiry']) {
+    assert.ok(screen.includes(`['${label}',`), `${label} is shown`);
+  }
+  assert.ok(screen.includes('Go To Dashboard'));
+  assert.ok(!/EnrollmentPaywall|price_php|phpFmt/.test(screen), 'no price on the summary');
+  // "Already paid" is said only while a membership is live or scheduled: a reverted term
+  // keeps the account, and "nothing to buy" beside "Cancelled" would be untrue.
+  assert.ok(screen.includes("{(!s || s.status === 'active' || s.status === 'scheduled') ? ("));
+  assert.ok(src.includes("case GATE_SCREENS.IMPORT_WELCOME:"), 'the gate renders it');
+  assert.ok(/case GATE_SCREENS\.IMPORT_WELCOME:[\s\S]{0,500}setTab\('dashboard'\)/.test(src), 'Go To Dashboard lands on the Dashboard');
+});
+
+// ★ STEP 1 ASSIGNS, STEP 2 COMMITS: the terms are written (audited) and the preflight is
+//   re-read BEFORE the typed phrase, so the confirmation shows what will be granted.
+test('§27 activation assigns terms first and confirms second', () => {
+  const region = migrationRegion();
+  const modal = region.slice(region.indexOf('function MigrationActivateModal('), region.indexOf('// ── One row, in full'));
+  assert.ok(modal.includes("const [step, setStep] = useState('terms');"), 'the dialog opens on the terms step');
+  const setAt = modal.indexOf("await migrationRpc('legacy_import_set_terms'");
+  const reloadAt = modal.indexOf('await loadPreflight();', setAt);
+  const confirmAt = modal.indexOf("setStep('confirm');", reloadAt);
+  assert.ok(setAt > 0 && reloadAt > setAt && confirmAt > reloadAt, 'assign → re-read → confirm, in that order');
+  assert.ok(modal.includes("const canStart = step === 'confirm' && p && n > 0"), 'nothing starts from the terms step');
+  assert.ok(modal.includes('openNow: e.openNow ?? (g.start_date > today)'), 'a future start is offered as "open today", pre-ticked');
+  assert.ok(!/p_end: e\.openNow/.test(modal), 'opening access early never moves the paid end date');
+});
+
+test('§27 the sender can be proven before any student is emailed', () => {
+  const region = migrationRegion();
+  assert.ok(region.includes("setTest(await migrationApi('send-test', {}))"));
+  assert.ok(region.includes('Send test email'));
+  const api = readFileSync(join(REPO, 'api/admin/student-imports.js'), 'utf8');
+  const at = api.indexOf("if (action === 'send-test') {");
+  const block = api.slice(at, api.indexOf("if (action === 'resend') {", at));
+  assert.ok(block.includes('admin.auth.admin.getUserById(actorId)'), 'the test goes to the caller\'s own address');
+  assert.ok(!/body\?\.(to|email)/.test(block), 'never to an address the request names');
+  assert.ok(!block.includes('generateLink'), 'the test mints no token');
+});

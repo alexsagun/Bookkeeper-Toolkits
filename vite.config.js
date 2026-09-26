@@ -109,9 +109,10 @@ const studentImportDevApi = (env) => ({
   name: 'student-imports-dev',
   configureServer(server) {
     server.middlewares.use('/api/admin/student-imports', async (req, res) => {
+      // #67: NOTIFY_ADMIN_EMAIL is the support-address fallback the claim emails reply to.
       const keys = [
         'SUPABASE_SECRET_KEY', 'SUPABASE_SERVICE_ROLE_KEY',
-        'RESEND_API_KEY', 'RESEND_FROM', 'APP_URL',
+        'RESEND_API_KEY', 'RESEND_FROM', 'APP_URL', 'NOTIFY_ADMIN_EMAIL',
         'VITE_SUPABASE_URL', 'VITE_SUPABASE_ANON_KEY', 'SUPABASE_URL', 'SUPABASE_ANON_KEY',
       ];
       for (const k of keys) {

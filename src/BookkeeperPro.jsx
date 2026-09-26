@@ -23,11 +23,13 @@ import {
 import { createPortal } from 'react-dom';
 import { useAuth } from './auth/AuthProvider.jsx';
 import { supabase } from './lib/supabase';
+import { toCsv, parseCsv, IMPORT_TEMPLATE_COLUMNS } from './lib/studentImport';
 import {
-  normalizeEmail, parseExternalId, parseStrictDate, toCsv,
-  parseCsv, parseEnrollmentsList, comboKeyOf, suggestPlanForCombo,
-  validateRowFields, IMPORT_TEMPLATE_COLUMNS,
-} from './lib/studentImport';
+  DATE_FORMATS, LEGACY_ERROR_LABELS, LEGACY_FIELDS, LEGACY_WARNING_LABELS, MAX_ACTIVATION_RUN, MAX_STAGE_ROWS,
+  activationPhrase, autoMapLegacyHeaders, cohortSummary, defaultEligibleCodes, distinctLabels,
+  formatCalendarDate, missingRequiredFields, normalizeLegacyRows, phraseMatches, rowDisplayState,
+  suggestBatchForLabel, suggestPlanForLabel, manilaTodayISO,
+} from './lib/legacyMigration';
 import {
   planSegment, isPremiumSegment, isValidBatchCode, normalizeBatchCode,
   approvalBatchPreselect, pickInitialSpace,
@@ -46,7 +48,7 @@ import {
   formatBatchDate, hasUpcomingOpenBatch, isPastBatch, monthBounds, periodProgress,
   validateBatchEdit,
 } from './lib/batchLifecycle';
-import { appErrorCode, appErrorMessage, isMigrationMissing } from './lib/appErrors';
+import { APP_ERROR_COPY, appErrorCode, appErrorMessage, isMigrationMissing } from './lib/appErrors';
 import {
   ADMIN_TAB_PERMISSION, STAFF_PERMISSIONS, STAFF_ROLES, STAFF_STATUSES,
   adminTabVisible, canManageCourseClient, communityAuthority, lastSuperAdminGuard, permissionsForRole,
@@ -54,6 +56,7 @@ import {
   staffRole, staffStatusLabel,
 } from './lib/staffRoles';
 import { parseInviteHash, STAFF_INVITE_PATH } from './lib/staffInvite';
+import { IMPORT_CLAIM_PATH, parseClaimHash } from './lib/importClaim';
 import {
   stagesToStorable as stagesToStorableLib,
   mergeStoredWithDefaults as mergeStoredWithDefaultsLib,
@@ -76,6 +79,7 @@ import {
   resolveDeclineTarget,
 } from './lib/inviteMachine';
 import { GATE_SCREENS, resolveGateScreen } from './lib/gateScreen';
+import { enrollGateState, subAccess } from './lib/enrollGate';
 import {
   ENROLLMENT_PLANS_FALLBACK, PLAN_LABELS, PLAN_ENTITLEMENTS, planEntitlement,
   FULL_ENTITLEMENT, NO_ACCESS_ENTITLEMENT, filterStagesForEntitlement, extensionPrice, phpAmount,
@@ -370,6 +374,7 @@ function normalizeUnknownRoute() {
   if (typeof window === 'undefined' || !window.history) return false;
   const path = normalizePath(window.location.pathname);
   if (path === STAFF_INVITE_PATH) return false;
+  if (path === IMPORT_CLAIM_PATH) return false;   // #67: the claim link, same reason
 
   const params = new URLSearchParams(window.location.search);
   const queryTab = params.get('tab');
@@ -477,7 +482,7 @@ const VOICE_TAB_INFO = {
   communications: { label: 'Communications', stage: 'Admin', desc: 'Admin screen: send announcements and student emails, manage email automations, and read the delivery tracker. Super Admin only.', adminOnly: true },
   meetings: { label: 'Meetings & Tasks', stage: 'Admin', desc: 'Admin screen: schedule Zoom meetings, invite students, keep meeting templates, and use the shared staff to-do board. Super Admin only.', adminOnly: true },
   enrollments:  { label: 'Enrollments', stage: 'Admin', desc: 'Admin screen: review payment receipts, approve subscriptions, and manage renewals.', adminOnly: true },
-  studentimports: { label: 'Student Imports', stage: 'Admin', desc: 'Admin screen: migrate legacy Thinkific students — validate, map course-combos to plans, dry-run, and import accounts + memberships.', adminOnly: true },
+  studentimports: { label: 'Student Imports', stage: 'Admin', desc: 'Super Admin screen: stage legacy Thinkific rosters, then activate already-paid memberships in controlled, audited steps and send each student a set-password email.', adminOnly: true },
   staffroles: { label: 'Team & Roles', stage: 'Admin', desc: 'Admin screen: invite staff and manage who they are — assign the Super Admin, Operations Admin and Trainer roles, suspend or revoke access, and read the audit trail of every role change. Super Admin only.', adminOnly: true },
   batches: { label: 'Batches', stage: 'Admin', desc: 'Admin screen: manage the VIP batches — create a monthly batch, edit its name, code, dates, timezone and seat capacities while the batch is current or upcoming, close or archive it, and assign members to their private batch communities. A batch closes automatically once its month ends, and a batch whose period has passed becomes read-only.', adminOnly: true },
 };
@@ -2097,20 +2102,32 @@ function AuthScreen({ themePref, onCycleTheme } = {}) {
 // Lets them set a new password — then clearRecovery() drops them into the toolkit
 // (they're already signed in via the recovery session).
 function UpdatePasswordScreen() {
-  const { updatePassword, clearRecovery } = useAuth();
+  const { updatePassword, clearRecovery, profile, refreshProfile } = useAuth();
   const [password, setPassword] = useState('');
   const [showPw, setShowPw] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [done, setDone] = useState(false);
+  // #67: for a migrated student this screen IS their account setup, so it asks for the
+  // same 8 characters AccountSetupScreen does; everyone else keeps Supabase's minimum.
+  const importSetup = profile?.account_origin === 'import' && profile?.onboarding_status !== 'completed';
+  const minLength = importSetup ? 8 : 6;
 
   const submit = async (e) => {
     e.preventDefault();
     setErr('');
+    if (password.length < minLength) { setErr(`Use at least ${minLength} characters for your password.`); return; }
     setBusy(true);
     try {
       const { error } = await updatePassword(password);
       if (error) throw error;
+      // #67: a migrated student whose claim link expired recovers through "Forgot
+      // password". Setting a password here IS finishing onboarding — without this they
+      // would be asked for a second password by AccountSetupScreen straight after.
+      if (importSetup) {
+        const { error: obErr } = await supabase.rpc('complete_import_onboarding');
+        if (!obErr) { await notifyImportOnboarded(); await refreshProfile?.(); }
+      }
       setDone(true);
     } catch (e2) {
       setErr(e2?.message || 'Could not update your password. Please try again.');
@@ -2153,7 +2170,7 @@ function UpdatePasswordScreen() {
               <Lock size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
               <input className="w-full pl-10 pr-10 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
                 type={showPw ? 'text' : 'password'} autoComplete="new-password" placeholder="New password"
-                value={password} onChange={e => setPassword(e.target.value)} required minLength={6} />
+                value={password} onChange={e => setPassword(e.target.value)} required minLength={minLength} />
               <button type="button" onClick={() => setShowPw(s => !s)} tabIndex={-1}
                 className="absolute right-3 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} aria-label="Toggle password visibility">
                 <Eye size={15} />
@@ -2178,33 +2195,74 @@ function UpdatePasswordScreen() {
   );
 }
 
-// Forced set-password onboarding for an IMPORTED student (db #26). Shown by the auth
-// gate when profile.account_origin === 'import' && onboarding_status !== 'completed',
-// regardless of how the invite link authenticated them. Reuses updatePassword(), then
-// marks onboarding complete via the narrow complete_import_onboarding() RPC and
-// refreshes the profile — which drops them past this gate into the normal membership
-// flow with their imported plan + exact remaining term. (Separate from the recovery
-// UpdatePasswordScreen: that clears the recovery flag; this clears the onboarding flag.)
-function SetPasswordScreen() {
+// #67: the two "you're in" emails — to the administrator and to the student — once a
+// migrated account has its password. Best-effort and bounded: the body carries NOTHING,
+// because api/notify-enrollment.js reads every fact from the caller's own import row, and
+// the database lets it send once. A failure here never blocks the student.
+async function notifyImportOnboarded() {
+  try {
+    const { data: sess } = await supabase.auth.getSession();
+    const token = sess?.session?.access_token;
+    if (!token) return;
+    await Promise.race([
+      fetch('/api/notify-enrollment', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ action: 'import_onboarded' }),
+      }),
+      new Promise((resolve) => setTimeout(resolve, 8000)),
+    ]);
+  } catch { /* best-effort — the student is never held on an email */ }
+}
+
+// Account setup for a MIGRATED student (#67; the forced onboarding of db #26). Shown by
+// the gate when profile.account_origin === 'import' && onboarding_status !== 'completed',
+// however the student authenticated. Name (prefilled, editable), email (the account's
+// own, LOCKED — it is the sign-in identity and is changed only through support), password
+// and a confirmation. Then complete_import_onboarding() records the name and the
+// completion, the onboarding emails go out, and onFinished() opens the summary.
+function AccountSetupScreen({ onFinished }) {
   const { updatePassword, refreshProfile, signOut, user, profile } = useAuth();
+  const [name, setName] = useState(() => String(profile?.full_name || '').trim());
   const [password, setPassword] = useState('');
+  const [confirm, setConfirm] = useState('');
   const [showPw, setShowPw] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
-  const first = ((profile?.full_name || '').trim().split(/\s+/)[0]) || '';
+  // The password that is ALREADY set, if a later step failed. Supabase refuses to "change" a
+  // password to the one it already has, so a retry must not ask it to.
+  const passwordSetRef = useRef(null);
+  const first = (name.trim().split(/\s+/)[0]) || '';
+  const mismatch = confirm.length > 0 && confirm !== password;
 
   const submit = async (e) => {
     e.preventDefault();
     setErr('');
+    const cleanName = name.trim().replace(/\s+/g, ' ');
+    if (!cleanName) { setErr('Enter your name as you want it on your account.'); return; }
+    if (cleanName.length > 120) { setErr('That name is too long — 120 characters at most.'); return; }
+    if (password.length < 8) { setErr('Use at least 8 characters for your password.'); return; }
+    if (password !== confirm) { setErr('The two passwords do not match.'); return; }
     setBusy(true);
     try {
-      const { error } = await updatePassword(password);
-      if (error) throw error;
-      // Mark onboarding complete (own-row, onboarding fields only). Non-fatal if it
-      // errors — but on failure we must NOT leave them stranded, so surface it.
-      const { error: rpcErr } = await supabase.rpc('complete_import_onboarding');
+      if (passwordSetRef.current !== password) {
+        const { error } = await updatePassword(password);
+        if (error && error.code !== 'same_password') throw error;
+        passwordSetRef.current = password;
+      }
+      // Name + completion in one own-row call. On failure we must NOT leave them stranded
+      // with a password but no account, so the error is shown and the form stays.
+      const { error: rpcErr } = await supabase.rpc('complete_import_onboarding', { p_full_name: cleanName });
       if (rpcErr) throw rpcErr;
-      await refreshProfile(); // flips onboarding_status → the gate unmounts this screen
+      await notifyImportOnboarded();
+      onFinished?.();
+      // Flips onboarding_status → the gate moves to the summary and this screen unmounts.
+      // If the read fails the screen stays, so it must not stay spinning.
+      const fresh = await refreshProfile();
+      if (!fresh) {
+        setErr('Your account is set up. We could not load it just now — press Create my account again to continue.');
+        setBusy(false);
+      }
     } catch (e2) {
       setErr(e2?.message || 'Could not finish setting up your account. Please try again.');
       setBusy(false);
@@ -2212,10 +2270,13 @@ function SetPasswordScreen() {
   };
 
   const inputStyle = { background: C.white, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody };
+  const label = (text, htmlFor) => (
+    <label htmlFor={htmlFor} className="block text-xs font-semibold mb-1" style={{ color: C.textSoft }}>{text}</label>
+  );
 
   return (
-    <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
-      <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden" style={{
+    <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg overflow-y-auto" style={{ fontFamily: fontBody, color: C.text }}>
+      <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden my-auto" style={{
         background: GLASS.cardDeep,
         backdropFilter: 'blur(30px) saturate(180%)',
         WebkitBackdropFilter: 'blur(30px) saturate(180%)',
@@ -2228,43 +2289,151 @@ function SetPasswordScreen() {
             {first ? `Welcome, ${first}!` : 'Welcome!'}
           </div>
           <div className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>
-            Your membership has moved into the new toolkit. Set a password to finish setting up your account.
+            Your account has moved to our new platform. Check your name and create your password.
           </div>
         </div>
 
-        <form onSubmit={submit} className="px-8 py-7 space-y-3.5">
-          <div className="relative">
-            <Lock size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
-            <input className="w-full pl-10 pr-10 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
-              type={showPw ? 'text' : 'password'} autoComplete="new-password" placeholder="Choose a password"
-              value={password} onChange={e => setPassword(e.target.value)} required minLength={8} />
-            <button type="button" onClick={() => setShowPw(s => !s)} tabIndex={-1}
-              className="absolute right-3 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} aria-label="Toggle password visibility">
-              <Eye size={15} />
-            </button>
+        <form onSubmit={submit} className="px-8 py-7 space-y-3.5" noValidate>
+          <div>
+            {label('Name', 'setup-name')}
+            <div className="relative">
+              <User size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+              <input id="setup-name" className="w-full pl-10 pr-3 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
+                type="text" autoComplete="name" value={name} onChange={e => setName(e.target.value)} maxLength={120} required />
+            </div>
           </div>
-          <div style={{ fontSize: 11.5, color: C.textMute }}>Use at least 8 characters.</div>
+          <div>
+            {label('Email', 'setup-email')}
+            <div className="relative">
+              <Mail size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+              {/* ★ LOCKED: the sign-in identity. readOnly (not disabled) so it stays readable,
+                  focusable and announced; a change of address goes through support. */}
+              <input id="setup-email" className="w-full pl-10 pr-10 py-2.5 rounded-xl text-sm outline-none" readOnly aria-readonly="true"
+                style={{ ...inputStyle, background: 'var(--wash)', color: C.textSoft, cursor: 'not-allowed' }}
+                type="email" autoComplete="username" value={user?.email || ''} />
+              <Lock size={14} className="absolute right-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} aria-hidden="true" />
+            </div>
+            <div className="mt-1" style={{ fontSize: 11.5, color: C.textMute }}>This is your sign-in email. To change it, contact support.</div>
+          </div>
+          <div>
+            {label('Create password', 'setup-password')}
+            <div className="relative">
+              <Lock size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+              <input id="setup-password" className="w-full pl-10 pr-10 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
+                type={showPw ? 'text' : 'password'} autoComplete="new-password"
+                value={password} onChange={e => setPassword(e.target.value)} required minLength={8} aria-describedby="setup-password-hint" />
+              <button type="button" onClick={() => setShowPw(s => !s)} tabIndex={-1}
+                className="absolute right-3 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} aria-label="Toggle password visibility">
+                <Eye size={15} />
+              </button>
+            </div>
+            <div id="setup-password-hint" className="mt-1" style={{ fontSize: 11.5, color: C.textMute }}>Use at least 8 characters.</div>
+          </div>
+          <div>
+            {label('Confirm password', 'setup-confirm')}
+            <div className="relative">
+              <Lock size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
+              <input id="setup-confirm" className="w-full pl-10 pr-3 py-2.5 rounded-xl text-sm outline-none transition" style={inputStyle}
+                type={showPw ? 'text' : 'password'} autoComplete="new-password"
+                value={confirm} onChange={e => setConfirm(e.target.value)} required aria-invalid={mismatch ? 'true' : undefined} />
+            </div>
+            {mismatch && <div className="mt-1" role="status" style={{ fontSize: 11.5, color: C.red }}>The passwords do not match yet.</div>}
+          </div>
 
           {err && (
-            <div className="flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs" style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: `1px solid rgba(208,35,35,0.18)` }}>
+            <div role="alert" className="flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs" style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: `1px solid rgba(208,35,35,0.18)` }}>
               <AlertTriangle size={14} className="flex-shrink-0 mt-px" /> <span>{err}</span>
             </div>
           )}
 
           <button type="submit" disabled={busy}
             className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
-            style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
-            {busy && <Loader2 size={15} className="animate-spin" />} Set password & continue
+            style={MIGRATION_PRIMARY_BTN}>
+            {busy && <Loader2 size={15} className="animate-spin" />} Create my account
           </button>
 
           <div className="text-center pt-1">
             <button type="button" onClick={signOut} className="text-xs" style={{ color: C.textMute }}>
-              Signed in as {user?.email} · Sign out
+              Not you? Sign out
             </button>
           </div>
         </form>
       </div>
     </div>
+  );
+}
+
+// #67: the one-time onboarding summary, straight after the account is created. What the
+// student now has, read from my_migration_summary() — their own row, nothing typed — and
+// a single way on. It shows no price: the membership is already paid.
+function ImportWelcomeScreen({ onContinue, onSignOut }) {
+  const { user, profile } = useAuth();
+  const [s, setS] = useState(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    supabase.rpc('my_migration_summary').then(({ data, error }) => {
+      if (!alive) return;
+      if (error || !data) setFailed(true); else setS(data);
+    }, () => { if (alive) setFailed(true); });
+    return () => { alive = false; };
+  }, []);
+
+  const name = s?.full_name || profile?.full_name || '';
+  const first = name.trim().split(/\s+/)[0] || '';
+  const status = s?.status === 'active' ? 'Active'
+    : s?.status === 'scheduled' ? `Starts ${fmtManilaDate(s.started_at)}`
+    : s?.status ? s.status.charAt(0).toUpperCase() + s.status.slice(1) : '—';
+  const rows = [
+    ['Name', name || '—'],
+    ['Email', s?.email || user?.email || '—'],
+    ['Batch', s?.batch_name || '—'],
+    ['Membership plan', s?.plan_name || '—'],
+    ['Subscription status', status],
+    ['Subscription expiry', s?.ends_at ? fmtManilaDate(s.ends_at) : '—'],
+  ];
+  const loadingRow = (k) => !s && !failed && k !== 'Name' && k !== 'Email';
+
+  return (
+    <MigrationGateCard title={first ? `Welcome, ${first}!` : 'Welcome!'}
+      subtitle="Your account is ready. Here is what moved across with you.">
+      <dl className="rounded-2xl px-4 py-1" style={{ background: 'var(--wash)', border: `1px solid ${C.border}` }} aria-busy={!s && !failed}>
+        {rows.map(([k, v]) => (
+          <div key={k} className="flex items-baseline justify-between gap-3 py-2" style={{ borderBottom: `1px solid ${C.border}` }}>
+            <dt className="text-xs" style={{ color: C.textMute }}>{k}</dt>
+            <dd className="text-sm font-semibold text-right break-words min-w-0" style={{ color: C.text }}>
+              {loadingRow(k) ? <span className="inline-block h-3 w-24 rounded shimmer" aria-hidden="true" /> : v}
+            </dd>
+          </div>
+        ))}
+      </dl>
+      {failed && (
+        <p role="status" style={{ fontSize: 12.5, color: C.textSoft }}>
+          We could not load every detail just now. Your membership is on your account either way.
+        </p>
+      )}
+      {/* "Already paid" only while there IS a live or scheduled membership. A term reverted
+          in Student Imports keeps the account (so the link still works) but holds nothing,
+          and saying "nothing to buy" beside a cancelled status is untrue. */}
+      {(!s || s.status === 'active' || s.status === 'scheduled') ? (
+        <div className="rounded-2xl px-4 py-3" role="note" style={{ background: 'var(--status-ok-bg)', border: '1px solid var(--status-ok-bd)', color: 'var(--status-ok-fg)', fontSize: 13, lineHeight: 1.55 }}>
+          Your membership is already paid. There is nothing to buy.
+        </div>
+      ) : (
+        <div className="rounded-2xl px-4 py-3" role="note" style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)', fontSize: 13, lineHeight: 1.55 }}>
+          Your account is ready, but there is no active membership on it right now. If you expected one, reply to your invitation email and support will sort it out.
+        </div>
+      )}
+      <button type="button" onClick={onContinue}
+        className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition"
+        style={MIGRATION_PRIMARY_BTN}>
+        Go To Dashboard
+      </button>
+      <button type="button" onClick={onSignOut} className="w-full py-2 text-xs font-semibold" style={{ color: C.textMute }}>
+        Sign out
+      </button>
+    </MigrationGateCard>
   );
 }
 
@@ -2295,6 +2464,253 @@ function readStaffInviteFromUrl() {
   }
 }
 const INITIAL_STAFF_INVITE = readStaffInviteFromUrl();
+
+// ── Migrated-student claim link (#67) ────────────────────────────────────────
+// The same rules as the staff invitation above, for the same reasons, and a
+// separate reader so neither link can be steered into the other's screen:
+// read ONCE at module load, stripped from the address bar in the same breath,
+// never written to storage, never logged. src/lib/importClaim.js owns the format.
+function readImportClaimFromUrl() {
+  if (typeof window === 'undefined') return null;
+  try {
+    const parsed = parseClaimHash(window.location.hash);
+    if (!parsed) return null;
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+const INITIAL_IMPORT_CLAIM = readImportClaimFromUrl();
+
+// The shared shell of the two migration gate screens: logo, heading, body.
+function MigrationGateCard({ title, subtitle, children }) {
+  return (
+    <div className="h-screen w-full flex items-center justify-center p-6 gh-app-bg overflow-y-auto" style={{ fontFamily: fontBody, color: C.text }}>
+      <div className="auth-in w-full max-w-md rounded-3xl overflow-hidden my-auto" style={{
+        background: GLASS.cardDeep,
+        backdropFilter: 'blur(30px) saturate(180%)',
+        WebkitBackdropFilter: 'blur(30px) saturate(180%)',
+        border: `1px solid ${GLASS.border}`,
+        boxShadow: '0 24px 60px -12px rgba(10,30,80,0.22), inset 0 1px 0 rgba(255,255,255,0.6)',
+      }}>
+        <div className="px-8 pt-8 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+          <img src={LOGO_DATA_URI} alt="Get Hired With Alex" style={{ width: 56, height: 56, objectFit: 'contain', margin: '0 auto', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
+          <h1 className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 18, letterSpacing: '-0.02em', color: C.text }}>{title}</h1>
+          {subtitle && <p className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>{subtitle}</p>}
+        </div>
+        <div className="px-8 py-7 space-y-4">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+const MIGRATION_PRIMARY_BTN = {
+  background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`,
+  boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)',
+};
+
+/**
+ * #67 — the screen a migrated student lands on from their claim email.
+ *
+ * ★ THE TOKEN IS SPENT ON A CLICK, NEVER ON LOAD. A mail scanner or a link preview that
+ *   opens the page redeems nothing. The exchange is single-flight behind a ref (a state
+ *   flag is not a lock: setState is async and StrictMode double-invokes), and the secret
+ *   lives in a ref that is cleared the moment it is spent.
+ * ★ AFTER REDEMPTION THERE IS NO SECOND STEP HERE. The session makes the profile load, and
+ *   the gate moves on by itself: account_origin='import' → AccountSetupScreen, then the
+ *   scheduled screen or the app. Every fact that decides that is durable, so a refresh at
+ *   any point lands in the same place.
+ */
+function ImportClaimScreen({ claim, user, onRedeemed, onDismiss, onSignOut }) {
+  const tokenRef = useRef(claim?.token || null);
+  const lockRef = useRef(false);
+  const [busy, setBusy] = useState(false);
+  const [failure, setFailure] = useState(null);   // null | 'expired' | 'retry'
+
+  const redeem = async () => {
+    const token = tokenRef.current;
+    if (lockRef.current || !token) return;
+    lockRef.current = true;
+    setBusy(true);
+    setFailure(null);
+    const type = claim?.type;
+    try {
+      const { error } = await supabase.auth.verifyOtp({ token_hash: token, type });
+      if (error) throw error;
+      tokenRef.current = null;                       // spent — nothing keeps it now
+      try { window.history.replaceState(null, '', '/'); } catch { /* cosmetic */ }
+      onRedeemed();
+    } catch (e) {
+      const kind = classifyExchangeError(e);
+      if (exchangeErrorIsRetryable(kind)) {
+        setFailure('retry');
+        lockRef.current = false;                     // the same token may still work
+      } else {
+        tokenRef.current = null;
+        setFailure('expired');
+      }
+      setBusy(false);
+    }
+  };
+
+  if (user && !claim?.redeemed) {
+    return (
+      <MigrationGateCard title="You are already signed in" subtitle={`Signed in as ${user.email}`}>
+        <p style={{ fontSize: 13.5, lineHeight: 1.6, color: C.textSoft }}>
+          This link sets up a migrated membership. If it was sent to you for a different email address,
+          sign out first and then open the link again.
+        </p>
+        <button type="button" onClick={onDismiss}
+          className="w-full py-2.5 rounded-xl text-white text-sm font-bold transition" style={MIGRATION_PRIMARY_BTN}>
+          Continue as {user.email}
+        </button>
+        <button type="button" onClick={onSignOut} className="w-full py-2 text-xs font-semibold" style={{ color: C.textMute }}>
+          Sign out and use this link
+        </button>
+      </MigrationGateCard>
+    );
+  }
+
+  if (failure === 'expired') {
+    return (
+      <MigrationGateCard title="This link has already been used or has expired"
+        subtitle="Your membership is safe; nothing was lost.">
+        <p style={{ fontSize: 13.5, lineHeight: 1.6, color: C.textSoft }}>
+          If you received a newer email from us, use the link in that one. Otherwise, go to the sign-in page,
+          choose <strong>Forgot password</strong>, and enter the same email address — you will get a link to set
+          your password. You can also reply to our email and we will help.
+        </p>
+        <button type="button" onClick={onDismiss}
+          className="w-full py-2.5 rounded-xl text-white text-sm font-bold transition" style={MIGRATION_PRIMARY_BTN}>
+          Go to sign in
+        </button>
+      </MigrationGateCard>
+    );
+  }
+
+  return (
+    <MigrationGateCard title="Activate your account"
+      subtitle="Your learning account has been migrated to our new platform.">
+      <div className="rounded-2xl px-4 py-3" role="note" style={{ background: 'var(--status-ok-bg)', border: '1px solid var(--status-ok-bd)', color: 'var(--status-ok-fg)', fontSize: 13, lineHeight: 1.55 }}>
+        Your membership is already paid. There is nothing to buy and no plan to choose.
+      </div>
+      <p style={{ fontSize: 13.5, lineHeight: 1.6, color: C.textSoft }}>
+        Press the button to confirm this is you. Next you will check your name and create your password.
+      </p>
+      {failure === 'retry' && (
+        <div role="alert" className="flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs"
+          style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
+          <AlertTriangle size={14} className="flex-shrink-0 mt-px" />
+          <span>We could not reach the server. Check your connection and press the button again.</span>
+        </div>
+      )}
+      <button type="button" onClick={redeem} disabled={busy}
+        className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+        style={MIGRATION_PRIMARY_BTN}>
+        {busy && <Loader2 size={15} className="animate-spin" />} Activate my account
+      </button>
+      <button type="button" onClick={onDismiss} className="w-full py-2 text-xs font-semibold" style={{ color: C.textMute }}>
+        I already have a password — sign in instead
+      </button>
+    </MigrationGateCard>
+  );
+}
+
+// Calendar dates in the business timezone, so a start of 00:00 Manila never reads as
+// the day before for a viewer elsewhere.
+const fmtManilaDate = (s) => {
+  if (!s) return '—';
+  const d = new Date(s);
+  return isNaN(d) ? '—' : d.toLocaleDateString('en-US', { timeZone: 'Asia/Manila', year: 'numeric', month: 'long', day: 'numeric' });
+};
+
+/**
+ * #67 — a paid membership whose start date is still ahead.
+ *
+ * ★ NO PRICE, NO PLAN PICKER, NO RENEW. The member has paid; the database grants nothing
+ *   until the start (the subscription is `scheduled`), and this screen only explains that.
+ * ★ IT CAN OPEN THE DOOR ITSELF. On mount and whenever the tab regains focus it asks
+ *   activate_my_due_membership(), which flips the member's OWN term if its start has
+ *   passed — so a missed cron run never keeps a paid member out on their first day.
+ */
+function MembershipScheduledScreen({ sub, profile, email, onSignOut, onRefresh }) {
+  const [batchName, setBatchName] = useState('');
+  const [checking, setChecking] = useState(false);
+  const startMs = sub?.started_at ? new Date(sub.started_at).getTime() : null;
+  const planName = PLAN_LABELS[sub?.plan_key] || 'Your membership';
+  const first = ((profile?.full_name || '').trim().split(/\s+/)[0]) || '';
+
+  useEffect(() => {
+    let alive = true;
+    if (!sub?.batch_id) return undefined;
+    supabase.from('batches').select('name').eq('id', sub.batch_id).maybeSingle()
+      .then(({ data }) => { if (alive && data?.name) setBatchName(data.name); }, () => {});
+    return () => { alive = false; };
+  }, [sub?.batch_id]);
+
+  const checkStart = useCallback(async () => {
+    if (!startMs || Date.now() < startMs) return;
+    setChecking(true);
+    try {
+      const { data, error } = await supabase.rpc('activate_my_due_membership');
+      if (!error && data?.activated > 0) await onRefresh?.();
+    } catch { /* the cron sweep will still open it */ }
+    setChecking(false);
+  }, [startMs, onRefresh]);
+
+  useEffect(() => {
+    checkStart();
+    const onFocus = () => { checkStart(); };
+    window.addEventListener('focus', onFocus);
+    // Also wake up at the start itself if the tab is left open across it.
+    const wait = startMs ? startMs - Date.now() : null;
+    const timer = wait && wait > 0 && wait < 2 ** 31 - 1 ? setTimeout(checkStart, wait + 5_000) : null;
+    return () => { window.removeEventListener('focus', onFocus); if (timer) clearTimeout(timer); };
+  }, [checkStart, startMs]);
+
+  const rows = [
+    ['Program', planName],
+    ['Batch', batchName || null],
+    ['Access starts', fmtManilaDate(sub?.started_at)],
+    ['Access until', fmtManilaDate(sub?.ends_at)],
+  ].filter(([, v]) => v);
+
+  return (
+    <MigrationGateCard title={first ? `You are all set, ${first}` : 'You are all set'}
+      subtitle={`Your membership starts on ${fmtManilaDate(sub?.started_at)}.`}>
+      <div className="rounded-2xl px-4 py-3" role="note" style={{ background: 'var(--status-ok-bg)', border: '1px solid var(--status-ok-bd)', color: 'var(--status-ok-fg)', fontSize: 13, lineHeight: 1.55 }}>
+        Your membership is already paid. There is nothing to buy, and you will not be asked for a payment.
+      </div>
+      <dl className="rounded-2xl px-4 py-3 space-y-1.5" style={{ background: GLASS.card, border: `1px solid ${GLASS.border}` }}>
+        {rows.map(([k, v]) => (
+          <div key={k} className="flex items-baseline justify-between gap-3">
+            <dt style={{ fontSize: 12, color: C.textMute }}>{k}</dt>
+            <dd style={{ fontSize: 13.5, fontWeight: 700, color: C.text, textAlign: 'right' }}>{v}</dd>
+          </div>
+        ))}
+      </dl>
+      <p style={{ fontSize: 13.5, lineHeight: 1.6, color: C.textSoft }}>
+        Your courses and your batch community open on your start date. Come back then and sign in with the same
+        email — this page will take you straight in.
+      </p>
+      <p style={{ fontSize: 12.5, lineHeight: 1.6, color: C.textMute }}>
+        Questions? Reply to the email we sent you, and our team will help.
+      </p>
+      <div className="flex flex-col gap-2">
+        <button type="button" onClick={checkStart} disabled={checking || (startMs != null && Date.now() < startMs)}
+          className="w-full py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+          style={{ background: GLASS.card, border: `1px solid ${GLASS.border}`, color: C.text }}>
+          {checking && <Loader2 size={15} className="animate-spin" />}
+          {startMs != null && Date.now() < startMs ? `Opens ${fmtManilaDate(sub?.started_at)}` : 'Check again'}
+        </button>
+        <button type="button" onClick={onSignOut} className="w-full py-2 text-xs font-semibold" style={{ color: C.textMute }}>
+          Signed in as {email} · Sign out
+        </button>
+      </div>
+    </MigrationGateCard>
+  );
+}
 
 /**
  * The screen an invited staff member sees. Two ways in:
@@ -3313,54 +3729,10 @@ const fmtEnrollDate = (s) => {
   return isNaN(d) ? '—' : d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 };
 
-// Subscription access math (client mirror of the date check in public.is_enrolled()).
-// ends_at === undefined (column missing — lifecycle migration not run) and
-// ends_at === null (legacy pre-lifecycle row) both mean "no expiry" — so a deploy
-// ahead of db/2026-07-04-subscription-lifecycle.sql can never lock a member out.
-function subAccess(sub) {
-  if (!sub) return { has: false, valid: false, legacy: false, ends: null, graceEnds: null, daysLeft: null, graceDaysLeft: null, inGrace: false, expired: false };
-  const legacy = sub.ends_at === undefined || sub.ends_at === null;
-  const ends = legacy ? null : new Date(sub.ends_at);
-  const graceEnds = !legacy && sub.grace_ends_at ? new Date(sub.grace_ends_at) : null;
-  const now = Date.now();
-  const active = sub.status === 'active';
-  const inGrace = active && !legacy && ends <= now && !!graceEnds && graceEnds > now;
-  const valid = active && (legacy || ends > now || inGrace);
-  // Days remaining until the access boundary. Inside a grace window the term has
-  // already passed, so measure to the grace end (never show a negative "N days left").
-  const daysLeft = legacy ? null
-    : Math.max(0, Math.ceil(((inGrace ? graceEnds.getTime() : ends.getTime()) - now) / 86400000));
-  // Days left in the grace window specifically (null unless currently in grace) — lets
-  // the UI show "grace: N days" distinctly from the pre-expiry days-remaining count.
-  const graceDaysLeft = inGrace ? Math.max(0, Math.ceil((graceEnds.getTime() - now) / 86400000)) : null;
-  return { has: true, valid, legacy, ends, graceEnds, daysLeft, graceDaysLeft, inGrace, expired: !valid };
-}
-
-// The gate decision, as one named state (root gate switches on it):
-//   pass           → app shell (valid subscription, or grandfathered paid user)
-//   renew_pending  → paid member, term ended, renewal submitted → review screen
-//   finalizing     → request approved, profile/subscription flip in flight
-//   expired        → paid member, term ended, no live renewal → expired screen
-//   pending        → unpaid, first payment under review
-//   paywall_notice → unpaid, prior request rejected/expired → paywall w/ notice
-//   paywall        → unpaid, no request yet
-function enrollGateState({ profile, latestReq: r, sub }) {
-  const acc = subAccess(sub);
-  const overdue = r?.status === 'pending_review' && r?.expires_at && new Date(r.expires_at) < new Date();
-  const pendingReq = r?.status === 'pending_review' && !overdue;
-  if (profile?.is_paid) {
-    if (acc.valid || !acc.has) return 'pass';   // active term, or paid before the subscriptions era
-    // Paid but the term ended — only a request NEWER than the ended term counts as a renewal.
-    const reqIsRenewal = r && sub?.started_at && new Date(r.created_at) > new Date(sub.started_at);
-    if (pendingReq && reqIsRenewal) return 'renew_pending';
-    if (r?.status === 'approved' && reqIsRenewal) return 'finalizing';
-    return 'expired';
-  }
-  if (pendingReq) return 'pending';
-  if (r?.status === 'approved') return 'finalizing';
-  if (r) return 'paywall_notice';
-  return 'paywall';
-}
+// subAccess() and enrollGateState() live in src/lib/enrollGate.js since #67, which added
+// the `scheduled` state (a paid migrated membership whose start is still ahead) and pinned
+// both with test/enrollGate.test.mjs. A scheduled term is neither valid nor expired, and it
+// resolves to 'scheduled' before the is_paid branch, so it is never shown a price.
 
 // Compact membership status for the account menu badge (single source, reusable). Pending
 // precedence mirrors MembershipPanel's pills: a live request under review outranks the
@@ -3371,6 +3743,7 @@ function membershipStatus(sub, latestReq) {
   if (pendingLive) return { label: 'Pending review', tone: C.amber };
   const a = subAccess(sub);
   if (!a.has) return { label: 'No plan', tone: C.textMute };
+  if (a.scheduled) return { label: `Starts ${fmtManilaDate(sub?.started_at)}`, tone: C.primary };   // #67
   if (a.inGrace) return { label: 'Grace period', tone: C.red };
   if (!a.valid) return { label: 'Expired', tone: C.red };
   if (a.legacy) return { label: 'Active', tone: C.green };
@@ -7859,6 +8232,31 @@ export default function BookkeeperProToolkit() {
   // URL there. Held in state (never storage) so it survives this component's
   // re-renders and is dropped the moment it is spent or declined.
   const [staffInvite, setStaffInvite] = useState(INITIAL_STAFF_INVITE);
+  // #67: the migrated-student claim link, captured once at module load. The secret is
+  // dropped the moment it is spent; claimDismissed is session-only ("sign in instead").
+  const [importClaim, setImportClaim] = useState(INITIAL_IMPORT_CLAIM);
+  const [importClaimDismissed, setImportClaimDismissed] = useState(false);
+  // #67: the onboarding summary is shown once, straight after the account is created.
+  const [importWelcome, setImportWelcome] = useState(false);
+  const markImportWelcome = useCallback(() => { setImportWelcome(true); }, []);
+  // #67: the two "you're in" emails, RETRIED. The setup screens send them the moment setup
+  // completes; if that attempt failed (the provider down, the function killed mid-send),
+  // this asks once more per session. The server answers 'sent' at once, re-sends only a
+  // failed or abandoned notice, and gives up after five reservations — so this is what makes
+  // "retried the next time the student opens the app" true.
+  const importNoticeAskedRef = useRef(null);
+  const importNoticeDue = Boolean(user?.id && profile && !profile.is_admin && !importWelcome
+    && profile.account_origin === 'import' && profile.onboarding_status === 'completed');
+  useEffect(() => {
+    if (!importNoticeDue || importNoticeAskedRef.current === user?.id) return;
+    importNoticeAskedRef.current = user?.id;
+    notifyImportOnboarded();
+  }, [importNoticeDue, user?.id]);
+  const redeemImportClaim = useCallback(() => { setImportClaim(null); }, []);
+  const dismissImportClaim = useCallback(() => {
+    setImportClaimDismissed(true);
+    try { if (window.location.pathname === IMPORT_CLAIM_PATH) window.history.replaceState(null, '', '/'); } catch { /* cosmetic */ }
+  }, []);
   const [staffInviteDismissed, setStaffInviteDismissed] = useState(false);
   // #50: "finish later" for a staff-only invitee. Distinct from `dismissed` on
   // purpose — dismissed means "fall through to the student gate", which is only
@@ -8440,13 +8838,15 @@ export default function BookkeeperProToolkit() {
   // useCallback: passed to the memoized Student Imports TabPanel (onImportCount).
   const refreshImportCount = useCallback(async () => {
     if (!canRunImports) return;
+    // #67: jobs with work waiting — rows ready to activate, an unfinished activation, or
+    // an email that needs a resend. A staged job whose rows are all inactive is not work.
     try {
-      const { count, error } = await supabase
-        .from('student_import_jobs')
-        .select('id', { count: 'exact', head: true })
-        .in('status', ['draft', 'validating', 'dry_run', 'ready', 'processing', 'paused']);
-      if (!error) setImportActiveCount(count || 0);
-    } catch { /* table not migrated — leave at 0 */ }
+      const { data, error } = await supabase.rpc('legacy_import_jobs_list');
+      if (!error && Array.isArray(data)) {
+        setImportActiveCount(data.filter((j) => !j.discarded_at
+          && ((j.states?.ready || 0) > 0 || j.run_open || (j.invite_problems || 0) > 0)).length);
+      }
+    } catch { /* #67 not applied — leave at 0 */ }
   }, [canRunImports]);
   useEffect(() => { refreshImportCount(); /* eslint-disable-next-line */ }, [canRunImports]);
   const [labelByKey, setLabelByKey] = useState({});
@@ -9086,6 +9486,9 @@ export default function BookkeeperProToolkit() {
     enroll, renewNow, inviteDismissed: staffInviteDismissed,
     hasInviteToken: !!staffInvite,
     inviteDeferred: staffInviteDeferred,
+    hasClaimToken: !!importClaim,
+    claimDismissed: importClaimDismissed,
+    importWelcomePending: importWelcome,
     requireApproval: REQUIRE_ADMIN_APPROVAL,
     requireEnrollment: REQUIRE_ENROLLMENT,
   });
@@ -9109,7 +9512,27 @@ export default function BookkeeperProToolkit() {
     // A migrated account must own its password before it can be told about a
     // subscription (db #26).
     case GATE_SCREENS.IMPORT_ONBOARDING:
-      return <SetPasswordScreen />;
+      return <AccountSetupScreen onFinished={markImportWelcome} />;
+
+    // #67: the summary, then "Go To Dashboard" — the Dashboard, not the claim path.
+    case GATE_SCREENS.IMPORT_WELCOME:
+      return (
+        <ImportWelcomeScreen onSignOut={signOut} onContinue={() => {
+          try { if (window.location.pathname === IMPORT_CLAIM_PATH) window.history.replaceState(null, '', '/'); } catch { /* cosmetic */ }
+          setTab('dashboard');
+          setImportWelcome(false);
+        }} />
+      );
+
+    // #67: a migrated student's claim link — redeemed on a click, then onboarding above.
+    case GATE_SCREENS.IMPORT_CLAIM:
+      return <ImportClaimScreen claim={importClaim} user={user} onRedeemed={redeemImportClaim}
+        onDismiss={dismissImportClaim} onSignOut={signOut} />;
+
+    // #67: paid, not started. No price, no Renew — a start date and a way to check again.
+    case GATE_SCREENS.MEMBERSHIP_SCHEDULED:
+      return <MembershipScheduledScreen sub={enroll.sub} profile={profile} email={user?.email}
+        onSignOut={signOut} onRefresh={enroll.refresh} />;
 
     // #49: both entry paths land here — arriving from the email link (a token in
     // `staffInvite`), and signing in normally with a pending membership waiting,
@@ -10052,7 +10475,7 @@ const ADMIN_BTN_DANGER = {
 function adminBadgePhrase(id, n) {
   if (id === 'enrollments') return `${n} enrollment ${n === 1 ? 'request' : 'requests'} awaiting review`;
   if (id === 'accessrequests') return `${n} access ${n === 1 ? 'request' : 'requests'} awaiting review`;
-  if (id === 'studentimports') return `${n} open import ${n === 1 ? 'job' : 'jobs'}`;
+  if (id === 'studentimports') return `${n} migration ${n === 1 ? 'job' : 'jobs'} with work waiting`;
   return `${n} waiting`;
 }
 
@@ -20459,43 +20882,25 @@ function AdminEnrollments({ onCountChange }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// COMPONENT: STUDENT IMPORTS — admin Thinkific → Toolkit migration wizard
+// COMPONENT: STUDENT IMPORTS — the legacy migration workspace (#67)
 // ═══════════════════════════════════════════════════════════════════
-// Stages a legacy roster, maps course-combos → plans, runs a server DRY-RUN
-// (authoritative matching), then processes real accounts + dated subscription
-// grants in resumable batches via api/admin/student-imports.js. Reuses the shared
-// admin kit + design tokens. Server-side is the real boundary (RLS admin-only +
-// admin-verified endpoint); this screen also self-guards on profile.is_admin.
-const IMPORT_LIMITS = { maxBytes: 8 * 1024 * 1024, maxRows: 5000, maxCols: 40 };
-const IMPORT_CANON_FIELDS = [
-  { key: 'thinkific_user_id', label: 'Thinkific user id', hints: ['thinkific_user_id', 'id', 'user id', 'thinkific'] },
-  { key: 'email', label: 'Email', hints: ['email', 'e-mail'] },
-  { key: 'first_name', label: 'First name', hints: ['first_name', 'first name', 'first'] },
-  { key: 'last_name', label: 'Last name', hints: ['last_name', 'last name', 'last'] },
-  { key: 'enrollments_list', label: 'Enrollments (course list)', hints: ['enrollments - list', 'enrollments_list', 'legacy_enrollments', 'courses'] },
-  { key: 'plan_key', label: 'Plan key', hints: ['plan_key', 'plan'] },
-  { key: 'membership_started_at', label: 'Membership start', hints: ['membership_started_at', 'started', 'start date'] },
-  { key: 'membership_ends_at', label: 'Membership expiry', hints: ['membership_ends_at', 'ends', 'expiry', 'expiration', 'expires'] },
-  { key: 'source_created_at', label: 'Account created', hints: ['date created', 'created'] },
-  { key: 'last_sign_in_at', label: 'Last sign in', hints: ['last sign in', 'last_sign_in'] },
-  { key: 'sign_in_count', label: 'Sign-in count', hints: ['sign in count', 'sign_in_count'] },
-  // #32: VIP rows must carry an explicit batch — never inferred from history.
-  // The 'cohort' hint stays: legacy exports use that header, and dropping it would
-  // silently stop matching those files.
-  { key: 'batch_code', label: 'Batch code (VIP)', hints: ['batch_code', 'batch', 'cohort'] },
-];
-const IMPORT_TERM_MODES = [
-  { key: 'preserve', label: 'Preserve exact expiry (default)', desc: 'Uses membership_ends_at from the source; expired → renewal.' },
-  { key: 'expired_history', label: 'Import as expired history', desc: 'Records a past term; the student lands on the renewal screen.' },
-  { key: 'fresh', label: 'Fresh full term today', desc: 'Ignores source dates; starts a new plan term now.' },
-  { key: 'lifetime', label: 'Lifetime (no expiry)', desc: 'Never expires until you change it (grandfathered).' },
-];
-const IMPORT_PLAN_CHOICES_EXTRA = [
-  { key: 'profile_only', label: 'Profile only (no access)' },
-  { key: 'manual_review', label: 'Manual review' },
-];
+// Super Admin only (students.legacy_migrate). A roster is STAGED once into a durable
+// job; every row is then Inactive, Ready to activate or Blocked, and nothing is granted
+// until a Super Admin selects READY rows, reads the confirmation counts and types
+// ACTIVATE <n>. Activation runs in bounded, resumable chunks on the server.
+//
+// ★ THE BROWSER NEVER WRITES AN IMPORT TABLE. It parses the file, previews it with the
+//   same library the server stages with (src/lib/legacyMigration.js), and sends parsed
+//   rows to api/admin/student-imports.js. Reads go through the legacy_import_* RPCs.
+//   uiSafety §27 pins that no supabase.from('student_import_…') write appears here.
+// ★ A REFRESH LOSES NOTHING. Jobs, runs and every row state live in the database; the
+//   open job is in the URL (?job=), and an unfinished run offers Resume.
+// ★ "SELECT ALL" SELECTS READY ROWS ONLY — legacy_import_ready_ids() — and the server
+//   refuses any id that is not ready anyway (legacy_import_start_run).
+const IMPORT_LIMITS = { maxBytes: 8 * 1024 * 1024, maxRows: MAX_STAGE_ROWS, maxCols: 40 };
+const IMPORT_PAGE_SIZE = 50;
 
-async function importApi(action, payload) {
+async function migrationApi(action, payload) {
   const { data: sess } = await supabase.auth.getSession();
   const token = sess?.session?.access_token;
   if (!token) throw new Error('Your session expired — sign in again.');
@@ -20507,12 +20912,27 @@ async function importApi(action, payload) {
   const text = await res.text();
   let json = {};
   try { json = text ? JSON.parse(text) : {}; } catch { /* non-JSON */ }
-  if (!res.ok) throw new Error(json?.error || `Request failed (${res.status}).`);
+  if (!res.ok) {
+    const e = new Error((json?.code && APP_ERROR_COPY[json.code]) || json?.error || `Request failed (${res.status}).`);
+    e.code = json?.code || null;
+    e.context = json?.context || null;
+    throw e;
+  }
   return json;
 }
 
-// Admin AI-trainer indexing/transcription endpoint (mirrors importApi). Used by the
-// CourseAiTrainerPanel and the saveLesson auto re-index kick.
+async function migrationRpc(fn, args) {
+  const { data, error } = await supabase.rpc(fn, args);
+  if (error) {
+    const e = new Error(appErrorMessage(error, 'That did not go through. Nothing was changed.'));
+    e.code = appErrorCode(error);
+    throw e;
+  }
+  return data;
+}
+
+// Admin AI-trainer indexing/transcription endpoint. Used by the CourseAiTrainerPanel and
+// the saveLesson auto re-index kick. (It lived beside the old importApi; kept verbatim.)
 async function courseTrainerApi(action, payload = {}) {
   const { data: sess } = await supabase.auth.getSession();
   const token = sess?.session?.access_token;
@@ -20544,711 +20964,1366 @@ async function sha256Hex(arrayBuffer) {
   } catch { return ''; }
 }
 
-function autoMapHeaders(headers) {
-  const map = {};
-  const lower = headers.map((h) => (h || '').trim().toLowerCase());
-  for (const field of IMPORT_CANON_FIELDS) {
-    let idx = -1;
-    for (const hint of field.hints) {
-      idx = lower.indexOf(hint);
-      if (idx === -1) idx = lower.findIndex((h) => h.includes(hint));
-      if (idx !== -1) break;
-    }
-    if (idx !== -1) map[field.key] = headers[idx];
-  }
-  return map;
+const newClientKey = () => {
+  try { return crypto.randomUUID().replace(/-/g, ''); }
+  catch { return `k${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`; }
+};
+
+const IMPORT_JOB_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function readImportJobParam() {
+  try {
+    const v = new URLSearchParams(window.location.search).get('job');
+    return IMPORT_JOB_RE.test(v || '') ? v : null;
+  } catch { return null; }
+}
+function writeImportJobParam(id) {
+  try {
+    const u = new URL(window.location.href);
+    if (id) u.searchParams.set('job', id); else u.searchParams.delete('job');
+    window.history.replaceState(window.history.state, '', u.pathname + u.search + u.hash);
+  } catch { /* cosmetic */ }
 }
 
-function StudentImports({ onCountChange }) {
-  const { profile, can, staffReady, staffDegraded } = useAuth();
-  // #45: the migration wizard is `students.import`. api/admin/student-imports.js
-  // already gates on exactly this key, so before this change the screen and its
-  // own endpoint disagreed about who could use it.
-  const isAdmin = staffDegraded ? !!profile?.is_admin : (staffReady && can('students.import'));
+const labelOfError = (code) => LEGACY_ERROR_LABELS[code] || String(code || '').replace(/_/g, ' ');
+const labelOfWarning = (code) => LEGACY_WARNING_LABELS[code] || String(code || '').replace(/_/g, ' ');
+const MIGRATION_TONES = {
+  'Ready to activate': 'info', Inactive: 'neutral', Blocked: 'danger', Activating: 'info',
+  Activated: 'ok', 'Invitation failed': 'warn', Claimed: 'ok', Failed: 'danger', Reverted: 'neutral', Staged: 'neutral',
+};
 
-  const [step, setStep] = useState('upload');            // upload | map | plans | preview | results
+function MigrationStatePill({ row }) {
+  const label = rowDisplayState(row);
+  const tone = MIGRATION_TONES[label] || 'neutral';
+  return (
+    <span className="inline-block px-2 py-0.5 rounded-full text-xs font-semibold whitespace-nowrap"
+      style={{ background: `var(--status-${tone}-bg)`, border: `1px solid var(--status-${tone}-bd)`, color: `var(--status-${tone}-fg)` }}>
+      {label}
+    </span>
+  );
+}
+
+function MigrationReadiness({ readiness }) {
+  const [test, setTest] = useState(null);   // null | { busy } | { ok, code, sender }
+  if (!readiness) return null;
+  const items = [
+    ['Email sending', readiness.email],
+    ['App address', readiness.appUrl],
+    ['Sender', readiness.support],
+  ];
+  // ★ PROVE THE SENDER FIRST. Migration mail comes from support@alexsagun.com, and Resend
+  //   refuses a sender whose domain is not verified — with a 403 on the first STUDENT's
+  //   email if nobody checks. This sends the activation email, with sample details and no
+  //   link that does anything, to the Super Admin's own inbox.
+  const sendTest = async () => {
+    setTest({ busy: true });
+    try { setTest(await migrationApi('send-test', {})); }
+    catch (e) { setTest({ ok: false, code: e.message }); }
+  };
+  const failText = (code) => (code === 'resend_403' || code === 'resend_422'
+    ? 'Resend refused the sender. Verify the alexsagun.com domain in Resend, then send the test again.'
+    : `The test email was not sent (${code || 'unknown'}).`);
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2" aria-label="Activation readiness">
+        {items.map(([label, ok]) => (
+          <span key={label} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold"
+            style={{ background: `var(--status-${ok ? 'ok' : 'warn'}-bg)`, border: `1px solid var(--status-${ok ? 'ok' : 'warn'}-bd)`, color: `var(--status-${ok ? 'ok' : 'warn'}-fg)` }}>
+            {ok ? <CheckCircle2 size={12} /> : <AlertCircle size={12} />} {label}{ok ? '' : ' missing'}
+          </span>
+        ))}
+        <button type="button" onClick={sendTest} disabled={!!test?.busy || !readiness.email}
+          className="gh-btn-ghost px-2.5 py-1 rounded-full text-xs font-semibold inline-flex items-center gap-1.5">
+          {test?.busy ? <Loader2 size={12} className="animate-spin" /> : <Mail size={12} />} Send test email
+        </button>
+      </div>
+      {readiness.sender && <p className="text-xs" style={{ color: C.textMute }}>Emails are sent from {readiness.sender}.</p>}
+      {test && !test.busy && (
+        <p className="text-xs" role="status" style={{ color: test.ok ? 'var(--status-ok-fg)' : 'var(--status-warn-fg)' }}>
+          {test.ok ? `Sent from ${test.sender} to your own inbox. Check it arrived, and not in spam, before activating anyone.` : failText(test.code)}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// Edit one row's membership terms before activation. The roster's values stay on the row;
+// what is saved here is what legacy_import_activate_row() grants.
+function MigrationTermsModal({ row, busy, onSave, onClose }) {
+  const [plans, setPlans] = useState([]);
+  const [batches, setBatches] = useState([]);
+  const [plan, setPlan] = useState(row.plan_key || '');
+  const [batchCode, setBatchCode] = useState(row.batch_code || '');
+  const [startDate, setStartDate] = useState(row.start_date || '');
+  const [endDate, setEndDate] = useState(row.end_date || '');
+  useEffect(() => {
+    let alive = true;
+    Promise.all([
+      supabase.from('enrollment_plans').select('key,name,active').order('position', { ascending: true }),
+      supabase.from('batches').select('id,code,name,status').order('code', { ascending: true }),
+    ]).then(([pl, bt]) => {
+      if (!alive) return;
+      setPlans((pl.data || []).filter((x) => x.active !== false));
+      setBatches((bt.data || []).filter((x) => x.status !== 'archived'));
+    }, () => {});
+    return () => { alive = false; };
+  }, []);
+  const batchId = batches.find((b) => b.code === batchCode)?.id || null;
+  const change = {
+    p_plan_key: plan && plan !== row.plan_key ? plan : null,
+    p_batch_id: batchCode && batchCode !== row.batch_code ? batchId : null,
+    p_start: startDate && startDate !== row.start_date ? startDate : null,
+    p_end: endDate && endDate !== row.end_date ? endDate : null,
+  };
+  const changed = Object.values(change).some(Boolean);
+  const today = manilaTodayISO(Date.now());
+  return (
+    <MigrationReasonModal title="Edit membership terms" busy={busy} confirmLabel="Save terms"
+      subtitle="The roster's own values are kept on the row. These apply when the student is activated."
+      onClose={onClose} onConfirm={(reason) => (changed ? onSave(change, reason) : onClose())}>
+      <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(11rem, 1fr))' }}>
+        <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Plan
+          <select className="gh-input w-full mt-1 text-sm" value={plan} onChange={(e) => setPlan(e.target.value)}>
+            {!plans.some((x) => x.key === plan) && <option value={plan}>{plan || '—'}</option>}
+            {plans.map((x) => <option key={x.key} value={x.key}>{x.name}</option>)}
+          </select>
+        </label>
+        <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Batch
+          <select className="gh-input w-full mt-1 text-sm" value={batchCode} onChange={(e) => setBatchCode(e.target.value)}>
+            {!batches.some((x) => x.code === batchCode) && <option value={batchCode}>{row.batch_name || batchCode || '—'}</option>}
+            {batches.map((x) => <option key={x.id} value={x.code}>{x.name}{x.status !== 'open' ? ` (${x.status})` : ''}</option>)}
+          </select>
+        </label>
+        <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Subscription start
+          <input type="date" className="gh-input w-full mt-1 text-sm" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+        </label>
+        <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Subscription expiry
+          <input type="date" className="gh-input w-full mt-1 text-sm" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+        </label>
+      </div>
+      {startDate > today && (
+        <p className="mt-2 text-xs" style={{ color: C.textSoft }}>
+          A start after today schedules the membership: the student can set a password now and reaches the dashboard on {formatCalendarDate(startDate)}.
+        </p>
+      )}
+    </MigrationReasonModal>
+  );
+}
+
+// A small "reason" dialog shared by promote, demote, discard and revert. Every one of
+// those is audited with the reason, so none of them is a one-click action.
+function MigrationReasonModal({ title, subtitle, confirmLabel, tone = 'primary', busy, onConfirm, onClose, children }) {
+  const [reason, setReason] = useState('');
+  const ok = reason.trim().length >= 5;
+  return (
+    <AccountModal title={title} subtitle={subtitle} icon={tone === 'danger' ? AlertTriangle : FileText}
+      tone={tone} canClose={!busy} onClose={onClose}>
+      {children}
+      <label className="block mt-3 text-xs font-semibold" style={{ color: C.textSoft }} htmlFor="migration-reason">
+        Reason (kept in the audit trail)
+      </label>
+      <textarea id="migration-reason" className="gh-input w-full mt-1.5 text-sm" rows={3} maxLength={300}
+        value={reason} onChange={(e) => setReason(e.target.value)} />
+      <div className="mt-4 flex justify-end gap-2">
+        <button type="button" onClick={onClose} disabled={busy} className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold">Cancel</button>
+        <button type="button" disabled={!ok || busy} onClick={() => onConfirm(reason.trim())}
+          className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 disabled:opacity-50"
+          style={tone === 'danger' ? ADMIN_BTN_DANGER : MIGRATION_PRIMARY_BTN}>
+          {busy && <Loader2 size={14} className="animate-spin" />} {confirmLabel}
+        </button>
+      </div>
+    </AccountModal>
+  );
+}
+
+// Plain words for the settings legacy_import_stage() compares when a roster is staged again.
+const LEGACY_SETTING_LABELS = {
+  date_format: 'the date format', column_mapping: 'the column matching', plan_mapping: 'the plan matching',
+  batch_mapping: 'the batch matching', eligible_batch_codes: 'the cohorts chosen for activation',
+};
+
+// ── Staging: file → mapping → preview → stage ─────────────────────────────────
+function MigrationStageWizard({ onStaged, onCancel }) {
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState('');
+  const [file, setFile] = useState(null);              // { name, sha256, headers, rows }
+  const [mapping, setMapping] = useState({});
+  const [dateFormat, setDateFormat] = useState('');     // ★ no default — it must be declared
+  const [plans, setPlans] = useState([]);
+  const [batches, setBatches] = useState([]);
+  const [planMapping, setPlanMapping] = useState({});
+  const [batchMapping, setBatchMapping] = useState({});
+  const [eligible, setEligible] = useState(null);       // null until the preview proposes it
+  const [confirmed, setConfirmed] = useState(false);
+  const [differ, setDiffer] = useState(null);           // { jobId, differs } — see stage()
+
+  useEffect(() => {
+    let alive = true;
+    Promise.all([
+      supabase.from('enrollment_plans').select('key,name,price_php,active').order('position', { ascending: true }),
+      supabase.from('batches').select('id,code,name,status').order('code', { ascending: true }),
+    ]).then(([p, b]) => {
+      if (!alive) return;
+      if (Array.isArray(p.data)) setPlans(p.data.filter((x) => x.active !== false));
+      if (Array.isArray(b.data)) setBatches(b.data);
+      if (p.error || b.error) setErr('Could not read the plan catalog or the batch registry. Refresh and try again.');
+    }, () => { if (alive) setErr('Could not read the plan catalog or the batch registry.'); });
+    return () => { alive = false; };
+  }, []);
+
+  const onFile = async (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = '';
+    if (!f) return;
+    setErr(''); setDiffer(null); setBusy('Reading the file…');
+    try {
+      if (f.size > IMPORT_LIMITS.maxBytes) throw new Error('That file is over 8 MB. Export a smaller range.');
+      const buf = await f.arrayBuffer();
+      const sha256 = await sha256Hex(buf);
+      let parsed;
+      if (/\.xlsx?$/i.test(f.name)) {
+        const XLSX = await import('xlsx');
+        const wb = XLSX.read(buf, { type: 'array', cellDates: false });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        // raw:false returns each cell's DISPLAYED text, so a date cell arrives in whatever
+        // format the workbook shows it (often m/d/yy). Declare the format that text uses; a
+        // two-digit year or a mismatch blocks the row rather than being guessed.
+        const arr = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' });
+        const hdr = (arr[0] || []).map((h) => String(h).trim());
+        const rows = arr.slice(1).filter((r) => r.some((c) => String(c).trim() !== '')).map((r) => {
+          const o = {}; hdr.forEach((h, i) => { o[h] = r[i] != null ? String(r[i]) : ''; }); return o;
+        });
+        parsed = { headers: hdr, rows };
+      } else {
+        parsed = parseCsv(new TextDecoder('utf-8').decode(buf));
+      }
+      if (!parsed.headers.length) throw new Error('No columns found. Is this a CSV or XLSX file with a header row?');
+      if (parsed.headers.length > IMPORT_LIMITS.maxCols) throw new Error(`Too many columns (${parsed.headers.length}).`);
+      if (parsed.rows.length > IMPORT_LIMITS.maxRows) throw new Error(`Too many rows (${parsed.rows.length}). Split the file.`);
+      if (!parsed.rows.length) throw new Error('The file has a header row but no students.');
+      setFile({ name: f.name, sha256, headers: parsed.headers, rows: parsed.rows });
+      setMapping(autoMapLegacyHeaders(parsed.headers));
+      setDateFormat(''); setPlanMapping({}); setBatchMapping({}); setEligible(null); setConfirmed(false);
+    } catch (e2) { setErr(e2.message || 'Could not read the file.'); }
+    finally { setBusy(''); }
+  };
+
+  const planLabels = useMemo(() => (file ? distinctLabels(file.rows, mapping, 'plan_label') : []), [file, mapping]);
+  const batchLabels = useMemo(() => (file ? distinctLabels(file.rows, mapping, 'batch_label') : []), [file, mapping]);
+
+  // Suggestions are PRE-FILLED but visible, and nothing stages until the admin ticks the
+  // confirmation below the tables.
+  useEffect(() => {
+    if (!plans.length) return;
+    setPlanMapping((m) => {
+      const next = { ...m };
+      for (const l of planLabels) if (!(l.normalized in next)) next[l.normalized] = suggestPlanForLabel(l.label, plans) || '';
+      return next;
+    });
+  }, [planLabels, plans]);
+  useEffect(() => {
+    if (!batches.length) return;
+    setBatchMapping((m) => {
+      const next = { ...m };
+      for (const l of batchLabels) if (!(l.normalized in next)) next[l.normalized] = suggestBatchForLabel(l.label, batches) || '';
+      return next;
+    });
+  }, [batchLabels, batches]);
+
+  const missing = missingRequiredFields(mapping);
+  const ready = file && !missing.length && DATE_FORMATS.includes(dateFormat);
+  const preview = useMemo(() => {
+    if (!ready) return null;
+    try {
+      const cleanPlan = Object.fromEntries(Object.entries(planMapping).filter(([, v]) => v));
+      const cleanBatch = Object.fromEntries(Object.entries(batchMapping).filter(([, v]) => v));
+      const base = { mapping, dateFormat, planMapping: cleanPlan, batchMapping: cleanBatch, plans, batches, nowMs: Date.now() };
+      const probe = normalizeLegacyRows(file.rows, { ...base, eligibleBatchCodes: [] });
+      const codes = eligible ?? defaultEligibleCodes(probe);
+      return { rows: normalizeLegacyRows(file.rows, { ...base, eligibleBatchCodes: codes }), codes, allCodes: cohortSummary(probe).map((c) => c.batch_code).filter(Boolean) };
+    } catch { return null; }
+  }, [ready, file, mapping, dateFormat, planMapping, batchMapping, plans, batches, eligible]);
+
+  const summary = preview ? cohortSummary(preview.rows) : [];
+  const blockedReasons = useMemo(() => {
+    if (!preview) return [];
+    const counts = new Map();
+    for (const r of preview.rows) for (const e of r.errors) counts.set(e, (counts.get(e) || 0) + 1);
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  }, [preview]);
+
+  const stage = async () => {
+    if (!preview || !confirmed) return;
+    setErr(''); setDiffer(null); setBusy('Staging the roster…');
+    try {
+      const cols = [...new Set(Object.values(mapping).filter(Boolean))];
+      const rows = file.rows.map((r) => Object.fromEntries(cols.map((c) => [c, r[c] ?? ''])));
+      const out = await migrationApi('stage', {
+        filename: file.name, fileSha256: file.sha256, rows, mapping, dateFormat,
+        planMapping: Object.fromEntries(Object.entries(planMapping).filter(([, v]) => v)),
+        batchMapping: Object.fromEntries(Object.entries(batchMapping).filter(([, v]) => v)),
+        eligibleBatchCodes: preview.codes,
+      });
+      onStaged(out.job_id, out.reopened);
+    } catch (e2) {
+      setErr(e2.message || 'The roster could not be staged.'); setBusy('');
+      // The same file already staged with different settings: offer the job, never re-stage.
+      setDiffer(e2.code === 'LEGACY_JOB_SETTINGS_DIFFER' && e2.context?.job_id
+        ? { jobId: e2.context.job_id, differs: Array.isArray(e2.context.differs) ? e2.context.differs : [] }
+        : null);
+    }
+  };
+
+  const downloadTemplate = () => {
+    const csv = toCsv([{
+      thinkific_user_id: '', first_name: 'Jane', last_name: 'Example', email: 'jane@example.test',
+      plan_key: 'VIP', membership_started_at: '10/12/2026', membership_ends_at: '4/12/2027',
+      payment_status: 'Paid', amount_paid: '15999', currency: 'PHP', legacy_enrollments: '', batch_code: 'October 2026',
+    }], IMPORT_TEMPLATE_COLUMNS);
+    downloadFile(csv, 'legacy-migration-template.csv', 'text/csv');
+  };
+
+  const stepTitle = (n, t) => (
+    <div className="flex items-center gap-2 mb-3">
+      <span className="inline-flex items-center justify-center rounded-full text-xs font-bold text-white" style={{ width: 22, height: 22, background: C.primarySolid }}>{n}</span>
+      <h3 style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 15, color: C.text }}>{t}</h3>
+    </div>
+  );
+
+  return (
+    <div className="space-y-5">
+      {err && <AdminNotice kind="danger" onDismiss={() => { setErr(''); setDiffer(null); }}>{err}</AdminNotice>}
+      {differ && (
+        <div className="rounded-xl p-3 text-sm flex flex-wrap items-center gap-2" role="note"
+          style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
+          <span className="flex-1 min-w-[12rem]">
+            Different here: {differ.differs.map((k) => LEGACY_SETTING_LABELS[k] || k).join(', ') || 'its settings'}.
+          </span>
+          <button type="button" onClick={() => onStaged(differ.jobId, true)}
+            className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold">Open the staged job</button>
+        </div>
+      )}
+
+      <section className="glass-card p-5">
+        {stepTitle(1, 'Choose the roster')}
+        <p className="text-sm" style={{ color: C.textSoft }}>
+          CSV or XLSX, one student per row. Nothing is created or sent at this step: the roster is only staged.
+        </p>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          {/* The input is visually hidden, so the LABEL shows its keyboard focus. */}
+          <label className="px-4 py-2 rounded-xl text-sm font-bold text-white cursor-pointer inline-flex items-center gap-2 focus-within:ring-2 focus-within:ring-offset-2"
+            style={{ ...MIGRATION_PRIMARY_BTN, '--tw-ring-color': 'var(--focus-ring)' }}>
+            <UploadCloud size={15} /> {file ? 'Choose a different file' : 'Choose a file'}
+            <input type="file" accept=".csv,.xlsx,.xls" className="sr-only" onChange={onFile} />
+          </label>
+          <button type="button" onClick={downloadTemplate} className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5">
+            <Download size={13} /> Template
+          </button>
+          <button type="button" onClick={onCancel} className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold">Back to jobs</button>
+        </div>
+        {busy && <p className="mt-3 text-sm flex items-center gap-2" role="status" style={{ color: C.textSoft }}><Loader2 size={14} className="animate-spin" /> {busy}</p>}
+        {file && (
+          <p className="mt-3 text-xs" style={{ color: C.textMute, fontFamily: fontMono }}>
+            {file.name} · {file.rows.length} rows · fingerprint {file.sha256.slice(0, 12)}…
+          </p>
+        )}
+      </section>
+
+      {file && (
+        <section className="glass-card p-5">
+          {stepTitle(2, 'Match the columns')}
+          <div className="iw-map-grid">
+            {LEGACY_FIELDS.map((f) => (
+              <label key={f.key} className="block">
+                <span className="text-xs font-semibold" style={{ color: missing.includes(f.key) ? C.red : C.textSoft }}>
+                  {f.label}{f.required ? ' *' : ''}
+                </span>
+                <select className="gh-input w-full mt-1 text-sm" value={mapping[f.key] || ''}
+                  onChange={(e) => setMapping((m) => ({ ...m, [f.key]: e.target.value || undefined }))}>
+                  <option value="">— not in this file —</option>
+                  {file.headers.map((h) => <option key={h} value={h}>{h}</option>)}
+                </select>
+              </label>
+            ))}
+          </div>
+          {missing.length > 0 && (
+            <p className="mt-3 text-xs" style={{ color: C.red }}>Still needed: {missing.map((k) => LEGACY_FIELDS.find((f) => f.key === k)?.label).join(', ')}.</p>
+          )}
+        </section>
+      )}
+
+      {file && !missing.length && (
+        <section className="glass-card p-5">
+          {stepTitle(3, 'Declare the date format')}
+          <p className="text-sm" style={{ color: C.textSoft }}>
+            Dates are read exactly as you declare them — never guessed. First values in this file:{' '}
+            <span style={{ fontFamily: fontMono, color: C.text }}>
+              {file.rows.slice(0, 3).map((r) => r[mapping.start_date]).filter(Boolean).join(' · ') || '—'}
+            </span>
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2" role="radiogroup" aria-label="Date format">
+            {DATE_FORMATS.map((f) => (
+              <label key={f} className="px-3 py-2 rounded-xl text-sm font-semibold cursor-pointer inline-flex items-center gap-2"
+                style={dateFormat === f ? { background: 'var(--primary-tint)', border: `1px solid ${C.primary}`, color: C.text } : { background: C.white, border: `1px solid ${C.border}`, color: C.textSoft }}>
+                <input type="radio" name="migration-date-format" value={f} checked={dateFormat === f} onChange={() => setDateFormat(f)} />
+                {f === 'M/D/YYYY' ? 'Month/Day/Year (10/12/2026 = October 12)' : f === 'D/M/YYYY' ? 'Day/Month/Year (12/10/2026 = October 12)' : 'Year-Month-Day (2026-10-12)'}
+              </label>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {ready && (
+        <section className="glass-card p-5">
+          {stepTitle(4, 'Confirm plans and batches')}
+          <div className="iw-two">
+            <div>
+              <div className="text-xs font-bold uppercase tracking-wide mb-2" style={{ color: C.textMute }}>Plan in the file → plan here</div>
+              {planLabels.map((l) => (
+                <label key={l.normalized} className="flex items-center gap-2 mb-2">
+                  <span className="text-sm flex-1 min-w-0" style={{ color: C.text }}>{l.label} <span style={{ color: C.textMute }}>({l.count})</span></span>
+                  <select className="gh-input text-sm" value={planMapping[l.normalized] || ''} aria-label={`Plan for ${l.label}`}
+                    onChange={(e) => { setPlanMapping((m) => ({ ...m, [l.normalized]: e.target.value })); setConfirmed(false); }}>
+                    <option value="">— leave unmapped (blocks) —</option>
+                    {plans.map((p) => <option key={p.key} value={p.key}>{p.name}</option>)}
+                  </select>
+                </label>
+              ))}
+            </div>
+            <div>
+              <div className="text-xs font-bold uppercase tracking-wide mb-2" style={{ color: C.textMute }}>Batch in the file → batch here</div>
+              {batchLabels.map((l) => (
+                <label key={l.normalized} className="flex items-center gap-2 mb-2">
+                  <span className="text-sm flex-1 min-w-0" style={{ color: C.text }}>{l.label} <span style={{ color: C.textMute }}>({l.count})</span></span>
+                  <select className="gh-input text-sm" value={batchMapping[l.normalized] || ''} aria-label={`Batch for ${l.label}`}
+                    onChange={(e) => { setBatchMapping((m) => ({ ...m, [l.normalized]: e.target.value })); setConfirmed(false); }}>
+                    <option value="">— leave unmapped (blocks) —</option>
+                    {batches.filter((b) => b.status !== 'archived').map((b) => <option key={b.code} value={b.code}>{b.name} ({b.code}, {b.status})</option>)}
+                  </select>
+                </label>
+              ))}
+            </div>
+          </div>
+          <p className="mt-2 text-xs" style={{ color: C.textMute }}>
+            A mapping must name the same month as its batch, and each start date must fall in or next to that month —
+            anything else stages as Blocked. The amount paid is kept as history only; today&rsquo;s prices are not changed
+            and no payment is recorded.
+          </p>
+        </section>
+      )}
+
+      {preview && (
+        <section className="glass-card p-5">
+          {stepTitle(5, 'Choose what can be activated')}
+          <p className="text-sm mb-3" style={{ color: C.textSoft }}>
+            Rows in a ticked batch stage as <strong>Ready to activate</strong>; every other valid row stages as <strong>Inactive</strong>
+            and gets no account, no membership and no email. Only the newest batch is ticked for you.
+          </p>
+          <div className="flex flex-wrap gap-2 mb-4">
+            {preview.allCodes.map((code) => (
+              <label key={code} className="px-3 py-1.5 rounded-xl text-sm font-semibold cursor-pointer inline-flex items-center gap-2"
+                style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text }}>
+                <input type="checkbox" checked={preview.codes.includes(code)}
+                  onChange={(e) => { setEligible(e.target.checked ? [...preview.codes, code] : preview.codes.filter((c) => c !== code)); setConfirmed(false); }} />
+                {batches.find((b) => b.code === code)?.name || code}
+              </label>
+            ))}
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead><tr style={{ color: C.textMute }}>
+                <th className="text-left py-1.5 pr-3 font-semibold">Batch</th><th className="text-right px-2 font-semibold">Rows</th>
+                <th className="text-right px-2 font-semibold">Ready</th><th className="text-right px-2 font-semibold">Inactive</th><th className="text-right pl-2 font-semibold">Blocked</th>
+              </tr></thead>
+              <tbody>
+                {summary.map((g) => (
+                  <tr key={g.batch_code || 'none'} style={{ borderTop: `1px solid ${C.border}` }}>
+                    <td className="py-1.5 pr-3" style={{ color: C.text }}>{g.batch_code ? (batches.find((b) => b.code === g.batch_code)?.name || g.batch_code) : 'No batch'}</td>
+                    <td className="text-right px-2">{g.total}</td><td className="text-right px-2">{g.ready}</td>
+                    <td className="text-right px-2">{g.inactive}</td><td className="text-right pl-2" style={{ color: g.blocked ? C.red : undefined }}>{g.blocked}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {blockedReasons.length > 0 && (
+            <div className="mt-4">
+              <div className="text-xs font-bold uppercase tracking-wide mb-1.5" style={{ color: C.textMute }}>Why rows are blocked</div>
+              <ul className="text-sm space-y-1" style={{ color: C.textSoft }}>
+                {blockedReasons.map(([code, n]) => <li key={code}>{n} × {labelOfError(code)}</li>)}
+              </ul>
+            </div>
+          )}
+          <label className="mt-4 flex items-start gap-2 text-sm" style={{ color: C.text }}>
+            <input type="checkbox" className="mt-1" checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)} />
+            <span>I have checked the date format, the plan and batch mappings and the batches that can be activated.</span>
+          </label>
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button type="button" onClick={stage} disabled={!confirmed || !!busy}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white inline-flex items-center gap-2 disabled:opacity-50" style={MIGRATION_PRIMARY_BTN}>
+              {busy ? <Loader2 size={14} className="animate-spin" /> : <Database size={14} />} Stage {preview.rows.length} rows
+            </button>
+          </div>
+          <p className="mt-2 text-xs" style={{ color: C.textMute }}>Staging creates no account and sends no email. The same file staged twice opens the first job.</p>
+        </section>
+      )}
+    </div>
+  );
+}
+
+// ── The activation workflow: 1) membership terms, 2) confirm ────────────────
+// ★ STEP 1 ASSIGNS, STEP 2 COMMITS. The Super Admin sees each group of the selection's
+//   terms — plan, batch, start, end — prefilled from the roster, and may change them.
+//   Changes go through legacy_import_set_terms() (audited, validated, the roster values
+//   kept beside them), THEN the preflight is re-read, so the confirmation always shows
+//   the terms that will actually be granted. Nothing is created until the typed phrase.
+// ★ OPEN ACCESS ON THE ACTIVATION DAY (owner decision, 2026-09-26): a group whose start is
+//   still ahead is offered "start today" pre-ticked; its end date — what was paid for —
+//   never moves unless the Super Admin changes it by hand.
+function MigrationActivateModal({ jobId, rowIds, onStarted, onClose }) {
+  const [pf, setPf] = useState(null);
+  const [err, setErr] = useState('');
+  const [typed, setTyped] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [step, setStep] = useState('terms');
+  const [plans, setPlans] = useState([]);
+  const [batches, setBatches] = useState([]);
+  const [edits, setEdits] = useState({});          // group key → { openNow, plan_key, batch_id, start_date, end_date }
+  const [editing, setEditing] = useState(null);    // group key whose fields are open
+  const keyRef = useRef(newClientKey());
+  const today = manilaTodayISO(Date.now());
+
+  const loadPreflight = useCallback(async () => {
+    const r = await migrationApi('preflight', { jobId, rowIds });
+    setPf(r);
+    return r;
+  }, [jobId, rowIds]);
+
+  useEffect(() => {
+    let alive = true;
+    loadPreflight().catch((e) => { if (alive) setErr(e.message); });
+    Promise.all([
+      supabase.from('enrollment_plans').select('key,name,active').order('position', { ascending: true }),
+      supabase.from('batches').select('id,code,name,status').order('code', { ascending: true }),
+    ]).then(([pl, bt]) => {
+      if (!alive) return;
+      setPlans((pl.data || []).filter((x) => x.active !== false));
+      setBatches((bt.data || []).filter((x) => x.status !== 'archived'));
+    }, () => { /* the selects fall back to the current values */ });
+    return () => { alive = false; };
+  }, [loadPreflight]);
+
+  const p = pf?.preflight;
+  const n = p?.to_activate || 0;
+  const readiness = pf?.readiness;
+  const canStart = step === 'confirm' && p && n > 0 && readiness?.canActivate && phraseMatches(typed, n)
+    && Array.isArray(p.row_ids) && p.row_ids.length === n;
+  const groupKey = (g) => `${g.plan_key}|${g.batch_id}|${g.start_date}|${g.end_date}`;
+  const groups = p?.terms || [];
+
+  // The edit a group will get: "start today" pre-ticked when its start is still ahead.
+  const editOf = (g) => {
+    const e = edits[groupKey(g)] || {};
+    return {
+      openNow: e.openNow ?? (g.start_date > today),
+      plan_key: e.plan_key ?? g.plan_key,
+      batch_id: e.batch_id ?? g.batch_id,
+      start_date: e.start_date ?? g.start_date,
+      end_date: e.end_date ?? g.end_date,
+    };
+  };
+  const setEdit = (g, patch) => setEdits((m) => ({ ...m, [groupKey(g)]: { ...editOf(g), ...patch } }));
+
+  const applyTerms = async () => {
+    setBusy(true); setErr('');
+    try {
+      for (const g of groups) {
+        const e = editOf(g);
+        const start = e.openNow && e.start_date > today ? today : e.start_date;
+        const change = {
+          p_plan_key: e.plan_key !== g.plan_key ? e.plan_key : null,
+          p_batch_id: e.batch_id !== g.batch_id ? e.batch_id : null,
+          p_start: start !== g.start_date ? start : null,
+          p_end: e.end_date !== g.end_date ? e.end_date : null,
+        };
+        if (!change.p_plan_key && !change.p_batch_id && !change.p_start && !change.p_end) continue;
+        await migrationRpc('legacy_import_set_terms', {
+          p_row_ids: g.row_ids || [], ...change,
+          p_reason: change.p_start === today && e.openNow
+            ? 'Start moved to the activation day ("Open access today", activation dialog)'
+            : 'Terms assigned in the activation dialog',
+        });
+      }
+      setEdits({}); setEditing(null);
+      await loadPreflight();
+      setStep('confirm');
+    } catch (e2) {
+      setErr(e2.message);
+      // A group applied before the one that failed IS saved: show the terms as they now are,
+      // so a retry neither repeats it nor shows the Super Admin a stale picture.
+      await loadPreflight().catch(() => {});
+    } finally { setBusy(false); }
+  };
+
+  // ★ THE IDS THE PREFLIGHT WILL ACTIVATE, never the raw selection. A selected row that has
+  //   since stopped being ready (made inactive in its panel, or still held by a paused run)
+  //   is left out HERE; sending it would refuse the whole run after the terms were saved.
+  const activateIds = Array.isArray(p?.row_ids) ? p.row_ids : [];
+
+  const start = async () => {
+    if (!canStart) return;
+    setBusy(true); setErr('');
+    try {
+      const out = await migrationApi('start-activation', { jobId, rowIds: activateIds, phrase: typed.trim(), clientKey: keyRef.current });
+      onStarted(out.run_id);
+    } catch (e) { setErr(e.message); setBusy(false); }
+  };
+
+  const Fact = ({ k, v, warn }) => (
+    <div className="flex items-baseline justify-between gap-3 py-1" style={{ borderBottom: `1px solid ${C.border}` }}>
+      <dt className="text-sm" style={{ color: C.textSoft }}>{k}</dt>
+      <dd className="text-sm font-bold text-right" style={{ color: warn ? C.red : C.text }}>{v}</dd>
+    </div>
+  );
+  const planName = (key) => plans.find((x) => x.key === key)?.name || key || '—';
+  const batchName = (id) => batches.find((x) => x.id === id)?.name || '—';
+
+  return (
+    <AccountModal title={step === 'terms' ? 'Activate students · 1 of 2' : 'Activate students · 2 of 2'}
+      subtitle={step === 'terms' ? 'Assign the batch, plan and dates. Continue saves them to these rows; nobody is activated until you confirm.' : 'Read this before anything is created.'}
+      icon={UserCheck} tone="ok" maxW="sm:max-w-lg" canClose={!busy} onClose={onClose}>
+      {err && <AdminNotice kind="danger">{err}</AdminNotice>}
+      {!p && !err && <p className="text-sm flex items-center gap-2" role="status" style={{ color: C.textSoft }}><Loader2 size={14} className="animate-spin" /> Checking the selection…</p>}
+
+      {p && step === 'terms' && (
+        <>
+          <p className="text-sm" style={{ color: C.textSoft }}>
+            {n} student{n === 1 ? '' : 's'} can be activated{p.excluded ? `; ${p.excluded} selected row${p.excluded === 1 ? ' is' : 's are'} not ready and will be left out` : ''}.
+            Terms come from the roster; change them here if they need to differ.
+          </p>
+          {groups.map((g) => {
+            const e = editOf(g);
+            const k = groupKey(g);
+            const later = g.start_date > today;
+            return (
+              <div key={k} className="mt-3 rounded-xl p-3 text-sm" style={{ background: 'var(--wash)', border: `1px solid ${C.border}` }}>
+                <div className="font-bold" style={{ color: C.text }}>{g.rows} student{g.rows === 1 ? '' : 's'} · {g.plan_name || g.plan_key} · {g.batch_name || 'No batch'}</div>
+                <div className="mt-1" style={{ color: C.textSoft }}>
+                  {formatCalendarDate(g.start_date)} – {formatCalendarDate(g.end_date)}
+                  {g.assigned ? ` (roster: ${formatCalendarDate(g.roster_start)} – ${formatCalendarDate(g.roster_end)})` : ''}
+                </div>
+                {later && (
+                  <label className="mt-2 flex items-start gap-2 cursor-pointer" style={{ color: C.text }}>
+                    <input type="checkbox" className="mt-0.5" checked={e.openNow} onChange={(ev) => setEdit(g, { openNow: ev.target.checked })} />
+                    <span>Open access today ({formatCalendarDate(today)}) instead of {formatCalendarDate(g.start_date)}. The end date stays {formatCalendarDate(e.end_date)}.</span>
+                  </label>
+                )}
+                {editing === k ? (
+                  <div className="mt-3 grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(11rem, 1fr))' }}>
+                    <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Plan
+                      <select className="gh-input w-full mt-1 text-sm" value={e.plan_key || ''} onChange={(ev) => setEdit(g, { plan_key: ev.target.value })}>
+                        {!plans.some((x) => x.key === e.plan_key) && <option value={e.plan_key || ''}>{planName(e.plan_key)}</option>}
+                        {plans.map((x) => <option key={x.key} value={x.key}>{x.name}</option>)}
+                      </select>
+                    </label>
+                    <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Batch
+                      <select className="gh-input w-full mt-1 text-sm" value={e.batch_id || ''} onChange={(ev) => setEdit(g, { batch_id: ev.target.value })}>
+                        {!batches.some((x) => x.id === e.batch_id) && <option value={e.batch_id || ''}>{batchName(e.batch_id)}</option>}
+                        {batches.map((x) => <option key={x.id} value={x.id}>{x.name}{x.status !== 'open' ? ` (${x.status})` : ''}</option>)}
+                      </select>
+                    </label>
+                    <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Subscription start
+                      <input type="date" className="gh-input w-full mt-1 text-sm" value={e.start_date || ''}
+                        onChange={(ev) => setEdit(g, { start_date: ev.target.value, openNow: false })} />
+                    </label>
+                    <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Subscription expiry
+                      <input type="date" className="gh-input w-full mt-1 text-sm" value={e.end_date || ''}
+                        onChange={(ev) => setEdit(g, { end_date: ev.target.value })} />
+                    </label>
+                  </div>
+                ) : (
+                  <button type="button" onClick={() => setEditing(k)} className="mt-2 gh-btn-ghost px-2.5 py-1 rounded-lg text-xs font-semibold">
+                    Change plan, batch or dates…
+                  </button>
+                )}
+              </div>
+            );
+          })}
+          <div className="mt-4 flex justify-end gap-2">
+            <button type="button" onClick={onClose} disabled={busy} className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold">Cancel</button>
+            <button type="button" onClick={applyTerms} disabled={busy || !n}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 disabled:opacity-50" style={MIGRATION_PRIMARY_BTN}>
+              {busy && <Loader2 size={14} className="animate-spin" />} Continue
+            </button>
+          </div>
+        </>
+      )}
+
+      {p && step === 'confirm' && (
+        <>
+          <dl>
+            <Fact k="Rows selected" v={p.requested} />
+            <Fact k="Will be activated" v={n} />
+            <Fact k="Excluded (not ready)" v={p.excluded} warn={p.excluded > 0} />
+            {p.retrying > 0 && <Fact k="Retrying after a failure" v={p.retrying} />}
+            <Fact k="New accounts to create" v={p.new_accounts} />
+            <Fact k="Existing accounts to link" v={p.existing_accounts} />
+            <Fact k="Activation emails" v={p.claim_emails} />
+            <Fact k="Sign-in notifications" v={p.notifications} />
+            <Fact k="Starting later (scheduled)" v={p.scheduled} />
+            <Fact k="Plan" v={(p.plans || []).map((x) => x.name).join(', ') || '—'} />
+            <Fact k="Subscription start" v={(p.starts || []).map(formatCalendarDate).join(', ') || '—'} />
+            <Fact k="Subscription expiry" v={(p.ends || []).map(formatCalendarDate).join(', ') || '—'} />
+          </dl>
+          {(p.cohorts || []).map((c) => (
+            <div key={`${c.code}-${c.plan_key}`} className="mt-3 rounded-xl p-3 text-sm" style={{ background: 'var(--wash)', border: `1px solid ${C.border}` }}>
+              <div className="font-bold" style={{ color: C.text }}>{c.name}{(p.plans || []).length > 1 && c.plan_name ? ` · ${c.plan_name}` : ''} · {c.rows} rows · batch {c.status}</div>
+              <div className="mt-1" style={{ color: C.textSoft }}>
+                Cohort seats: {(c.allocation?.codes || []).join(', ') || '—'}
+                {c.allocation?.queued ? ` + ${c.allocation.queued} for batches not created yet` : ''}.
+                Capacity {c.capacity ?? '—'}: {c.paid_holders} current holders, {c.scheduled_legacy} migrated students starting later.
+              </div>
+              {c.allocation?.missing_months?.length > 0 && (
+                <div className="mt-1.5" style={{ color: 'var(--status-warn-fg)' }}>
+                  No batch exists for {c.allocation.missing_months.join(', ')}. These students will skip that month, and a batch
+                  created for it later cannot be added to their run.
+                </div>
+              )}
+            </div>
+          ))}
+          <div className="mt-3 rounded-xl p-3 text-sm" role="note" style={{ background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)', color: 'var(--status-info-fg)' }}>
+            These are already-paid legacy memberships. No enrollment request, receipt or payment record is created, and nothing is
+            posted to Financial Management. Each student gets an activation email from support@alexsagun.com to create their password.
+          </div>
+          {!readiness?.canActivate && <AdminNotice kind="warn">{pf.readinessMessage}</AdminNotice>}
+          <label className="block mt-4 text-sm" htmlFor="migration-phrase" style={{ color: C.text }}>
+            Type <strong style={{ fontFamily: fontMono }}>{activationPhrase(n)}</strong> to confirm
+          </label>
+          <input id="migration-phrase" className="gh-input w-full mt-1.5 text-sm" autoComplete="off" value={typed}
+            onChange={(e) => setTyped(e.target.value)} disabled={busy || !n} />
+          <div className="mt-4 flex justify-end gap-2">
+            <button type="button" onClick={() => { setStep('terms'); setTyped(''); }} disabled={busy} className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold">Back to terms</button>
+            <button type="button" onClick={start} disabled={!canStart || busy}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2 disabled:opacity-50" style={ADMIN_BTN_OK}>
+              {busy && <Loader2 size={14} className="animate-spin" />} Activate {n}
+            </button>
+          </div>
+        </>
+      )}
+    </AccountModal>
+  );
+}
+
+// ── One row, in full ─────────────────────────────────────────────────────────
+function MigrationRowPanel({ jobId, row, onClose, onChanged }) {
+  const [events, setEvents] = useState(null);
   const [err, setErr] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
-  const [busyMsg, setBusyMsg] = useState('');
-
-  const [fileMeta, setFileMeta] = useState(null);         // { name, sha256, rows, cols }
-  const [headers, setHeaders] = useState([]);
-  const [rawRows, setRawRows] = useState([]);
-  const [mapping, setMapping] = useState({});
-  const [combos, setCombos] = useState([]);               // [{ key, count, courses, choice }]
-  const [defaultTermMode, setDefaultTermMode] = useState('preserve');
-  const [conflictPolicy, setConflictPolicy] = useState('keep_longer');
-  const [plans, setPlans] = useState([]);                 // live enrollment_plans
-
-  const [jobId, setJobId] = useState(null);
-  const [counts, setCounts] = useState(null);
-  // Latched when a dry-run couldn't persist every proposal — blocks Process until a
-  // clean dry-run replaces the staged rows (see runProcess).
-  const [staleDryRun, setStaleDryRun] = useState(false);
-  const [previewRows, setPreviewRows] = useState([]);
-  const [filter, setFilter] = useState('all');
-  const [search, setSearch] = useState('');
-  const [detailRow, setDetailRow] = useState(null);
-  const [confirmOpen, setConfirmOpen] = useState(false);
-
-  const [proc, setProc] = useState({ running: false, paused: false, done: false, tally: null });
-  const pausedRef = useRef(false);
+  const [confirm, setConfirm] = useState(null);   // 'revert' | 'promote' | 'demote'
 
   useEffect(() => {
-    if (!isAdmin) return;
-    supabase.from('enrollment_plans').select('key, name, price_php, access_days, active').order('position', { ascending: true })
-      .then(({ data }) => { if (Array.isArray(data)) setPlans(data.filter((p) => p.active !== false)); })
-      .catch(() => {});
-  }, [isAdmin]);
+    let alive = true;
+    migrationRpc('legacy_import_events', { p_job_id: jobId, p_row_id: row.id })
+      .then((d) => { if (alive) setEvents(d || []); }, (e) => { if (alive) setErr(e.message); });
+    return () => { alive = false; };
+  }, [jobId, row.id, row.activation_state, row.invite_state]);
 
-  if (!isAdmin) {
+  const act = async (fn) => {
+    setBusy(true); setErr(''); setNotice('');
+    try { const msg = await fn(); if (msg) setNotice(msg); setConfirm(null); onChanged(); }
+    catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const facts = [
+    ['Row', `#${row.source_row_number}`],
+    ['Email', row.email],
+    ['Name', [row.first_name, row.last_name].filter(Boolean).join(' ') || '—'],
+    ['Identity', row.identity_basis === 'external_id' ? `Thinkific id ${row.external_user_id}` : 'Email (no Thinkific id)'],
+    ['Plan', `${row.legacy_plan_label || '—'} → ${row.plan_key || 'unmapped'}`],
+    ['Batch', `${row.legacy_batch_label || '—'} → ${row.batch_name || 'unmapped'}`],
+    ['Membership', row.start_date && row.end_date ? `${formatCalendarDate(row.start_date)} – ${formatCalendarDate(row.end_date)}` : '—'],
+    ...(row.terms_assigned ? [['Roster said', `${row.roster_plan_key || '—'} · ${row.roster_batch_name || row.legacy_batch_label || '—'} · ${formatCalendarDate(row.roster_start_date)} – ${formatCalendarDate(row.roster_end_date)}`]] : []),
+    ['Source', `Thinkific · imported ${fmtEnrollDate(row.imported_at)}`],
+    ...(row.phone ? [['Phone', row.phone]] : []),
+    ['Paid (history)', row.amount_paid != null ? `${row.currency || ''} ${Number(row.amount_paid).toLocaleString('en-US')} · ${row.payment_status || '—'}` : (row.payment_status || '—')],
+    ['Account', row.matched_existing ? (row.existing_confirmed ? 'Existing account (keeps its password)' : 'Existing account, never confirmed') : (row.activation_state === 'activated' ? 'Created by this migration' : 'Will be created on activation')],
+    ['Invitation', row.invite_state ? `${row.invite_state}${row.invite_code ? ` (${row.invite_code})` : ''}${row.invite_sent_at ? ` · ${fmtEnrollDate(row.invite_sent_at)}` : ''}` : '—'],
+    ['Membership state', row.subscription_status || '—'],
+    ...(row.onboarding_completed_at ? [['Onboarded', fmtEnrollDate(row.onboarding_completed_at)]] : []),
+    ...(row.onboarding_notice_state ? [['Onboarding emails', { sent: 'Sent to the admin and the student', failed: 'Not sent yet — tried again the next time the student opens the app (five tries in all)', sending: 'Sending' }[row.onboarding_notice_state] || row.onboarding_notice_state]] : []),
+  ];
+  const canEditTerms = ['ready', 'inactive', 'failed'].includes(row.activation_state);
+  const canResend = row.activation_state === 'activated' && !row.claimed;
+  const canRevert = row.activation_state === 'activated' && (row.subscription_status === 'scheduled' || !row.claimed);
+
+  return (
+    <SidePanel title={[row.first_name, row.last_name].filter(Boolean).join(' ') || row.email || `Row ${row.source_row_number}`}
+      subtitle={rowDisplayState(row)} icon={Users} onClose={onClose} canClose={!busy} maxW="sm:max-w-lg">
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
+      <dl className="mt-2">
+        {facts.map(([k, v]) => (
+          <div key={k} className="flex items-baseline justify-between gap-3 py-1.5" style={{ borderBottom: `1px solid ${C.border}` }}>
+            <dt className="text-xs flex-shrink-0" style={{ color: C.textMute }}>{k}</dt>
+            <dd className="text-sm text-right break-words min-w-0" style={{ color: C.text }}>{v}</dd>
+          </div>
+        ))}
+      </dl>
+      {(row.errors?.length > 0 || row.blocked_reason || row.last_error) && (
+        <div className="mt-4">
+          <div className="text-xs font-bold uppercase tracking-wide mb-1" style={{ color: C.red }}>Needs attention</div>
+          <ul className="text-sm space-y-1" style={{ color: C.text }}>
+            {(row.errors || []).map((e) => <li key={e}>{labelOfError(e)}</li>)}
+            {row.blocked_reason && <li>{labelOfError(row.blocked_reason)}</li>}
+            {row.last_error && <li>Last attempt failed: {row.last_error}</li>}
+          </ul>
+        </div>
+      )}
+      {row.warnings?.length > 0 && (
+        <ul className="mt-3 text-xs space-y-1" style={{ color: C.textSoft }}>
+          {row.warnings.map((w) => <li key={w}>{labelOfWarning(w)}</li>)}
+        </ul>
+      )}
+      <div className="mt-4 flex flex-wrap gap-2">
+        {row.activation_state === 'inactive' && (
+          <button type="button" onClick={() => setConfirm('promote')} className="px-3 py-2 rounded-xl text-xs font-bold text-white" style={MIGRATION_PRIMARY_BTN}>Make ready to activate…</button>
+        )}
+        {row.activation_state === 'ready' && (
+          <button type="button" onClick={() => setConfirm('demote')} className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold">Make inactive…</button>
+        )}
+        {canEditTerms && (
+          <button type="button" onClick={() => setConfirm('terms')} className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold">Edit terms…</button>
+        )}
+        {canResend && (
+          <button type="button" disabled={busy}
+            onClick={() => act(async () => { const r = await migrationApi('resend', { rowId: row.id }); return r.state === 'sent' || r.state === 'notified' ? 'A new email is on its way. The previous link no longer works.' : `The email was not delivered (${r.code || r.state}).`; })}
+            className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5">
+            {busy && <Loader2 size={12} className="animate-spin" />} <Mail size={12} /> Resend email
+          </button>
+        )}
+        {canRevert && (
+          <button type="button" onClick={() => setConfirm('revert')} className="px-3 py-2 rounded-xl text-xs font-bold text-white" style={ADMIN_BTN_DANGER}>Revert activation…</button>
+        )}
+      </div>
+      <div className="mt-5">
+        <div className="text-xs font-bold uppercase tracking-wide mb-1.5" style={{ color: C.textMute }}>History</div>
+        {!events ? <p className="text-xs" style={{ color: C.textMute }}>Loading…</p> : events.length === 0 ? <p className="text-xs" style={{ color: C.textMute }}>Nothing yet.</p> : (
+          <ol className="space-y-1.5">
+            {events.map((e) => (
+              <li key={e.id} className="text-xs" style={{ color: C.textSoft }}>
+                <span style={{ color: C.text, fontWeight: 600 }}>{e.kind.replace(/_/g, ' ')}</span>
+                {e.status ? ` · ${e.status}` : ''} · {new Date(e.created_at).toLocaleString()}{e.actor_name ? ` · ${e.actor_name}` : ''}
+                {e.detail?.reason ? ` — “${e.detail.reason}”` : ''}
+              </li>
+            ))}
+          </ol>
+        )}
+      </div>
+      {confirm === 'revert' && (
+        <MigrationReasonModal title="Revert this activation?" tone="danger" busy={busy} confirmLabel="Revert"
+          subtitle="The membership is cancelled and its cohort seats are revoked. The account and its approval are kept, and a claim email already sent still signs the student in — they will then see the enrollment page, because they no longer hold a membership."
+          onClose={() => setConfirm(null)}
+          onConfirm={(reason) => act(async () => { await migrationRpc('legacy_import_revert', { p_row_id: row.id, p_reason: reason }); return 'Reverted. The student no longer has this membership.'; })} />
+      )}
+      {confirm === 'terms' && (
+        <MigrationTermsModal row={row} busy={busy} onClose={() => setConfirm(null)}
+          onSave={(change, reason) => act(async () => {
+            const r = await migrationRpc('legacy_import_set_terms', { p_row_ids: [row.id], ...change, p_reason: reason });
+            return r.changed ? 'Terms updated. They apply when the student is activated.' : 'Nothing changed.';
+          })} />
+      )}
+      {(confirm === 'promote' || confirm === 'demote') && (
+        <MigrationReasonModal busy={busy}
+          title={confirm === 'promote' ? 'Make this row ready to activate?' : 'Make this row inactive?'}
+          subtitle={confirm === 'promote' ? 'It keeps its original dates and batch. Nothing is activated until you confirm an activation.' : 'It will not be activated until it is made ready again.'}
+          confirmLabel={confirm === 'promote' ? 'Make ready' : 'Make inactive'}
+          onClose={() => setConfirm(null)}
+          onConfirm={(reason) => act(async () => { const r = await migrationRpc('legacy_import_set_eligibility', { p_row_ids: [row.id], p_eligible: confirm === 'promote', p_reason: reason }); return r.changed ? 'Updated.' : 'Nothing changed — the row is no longer in that state, or its term has ended.'; })} />
+      )}
+    </SidePanel>
+  );
+}
+
+// ── One job ───────────────────────────────────────────────────────────────────
+const MIGRATION_FILTERS = [
+  ['all', 'All'], ['ready', 'Pending activation'], ['inactive', 'Inactive'], ['blocked', 'Blocked'],
+  ['activated', 'Activated'], ['invite_problem', 'Invitation failed'], ['claimed', 'Onboarded'],
+  ['failed', 'Failed'], ['reverted', 'Reverted'],
+];
+
+function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
+  const [summary, setSummary] = useState(null);
+  const [rowsPage, setRowsPage] = useState({ total: 0, rows: [] });
+  const [filter, setFilter] = useState('all');
+  const [batchCode, setBatchCode] = useState('');
+  const [search, setSearch] = useState('');
+  const [page, setPage] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
+  const [selected, setSelected] = useState(() => new Map());   // id → activation_state
+  const [openRow, setOpenRow] = useState(null);
+  const [activateIds, setActivateIds] = useState(null);
+  const [reasonFor, setReasonFor] = useState(null);             // 'promote' | 'demote' | 'discard'
+  const [busy, setBusy] = useState(false);
+  const [runState, setRunState] = useState({ running: false, runId: null, last: null });
+  const pausedRef = useRef(false);
+  const deferredSearch = useDeferredValue(search);
+
+  // ★ ONLY THE NEWEST ANSWER IS SHOWN. A filter change, a keystroke in search and a chunk of
+  //   an activation each start a load; without a sequence number a slow earlier one could
+  //   land last and paint rows that contradict the filter above them.
+  const summarySeq = useRef(0);
+  const rowsSeq = useRef(0);
+  const loadSummary = useCallback(async () => {
+    const seq = ++summarySeq.current;
+    const s = await migrationRpc('legacy_import_job_summary', { p_job_id: jobId });
+    if (seq === summarySeq.current) setSummary(s);
+    return s;
+  }, [jobId]);
+
+  const loadRows = useCallback(async () => {
+    const seq = ++rowsSeq.current;
+    const out = await migrationRpc('legacy_import_rows_page', {
+      p_job_id: jobId, p_state: filter === 'all' ? null : filter, p_batch_code: batchCode || null,
+      p_search: deferredSearch.trim() || null, p_limit: IMPORT_PAGE_SIZE, p_offset: page * IMPORT_PAGE_SIZE,
+    });
+    if (seq === rowsSeq.current) setRowsPage(out || { total: 0, rows: [] });
+  }, [jobId, filter, batchCode, deferredSearch, page]);
+
+  const reload = useCallback(async () => {
+    setErr('');
+    try { await Promise.all([loadSummary(), loadRows()]); }
+    catch (e) { setErr(e.message); }
+    finally { setLoading(false); }
+    onCountChange?.();
+  }, [loadSummary, loadRows, onCountChange]);
+  // runLoop lives for minutes; it must reload with the filter showing NOW, not the one it began with.
+  const reloadRef = useRef(reload);
+  reloadRef.current = reload;
+
+  useEffect(() => { reload(); /* eslint-disable-next-line */ }, [jobId, filter, batchCode, deferredSearch, page]);
+  useEffect(() => { setPage(0); }, [filter, batchCode, deferredSearch]);
+
+  const job = summary?.job;
+  const openRun = (summary?.runs || []).find((r) => r.status === 'running' || r.status === 'paused');
+  const failedCount = (summary?.cohorts || []).reduce((n, c) => n + (c.failed || 0), 0);
+
+  const toggle = (row) => setSelected((m) => {
+    const next = new Map(m);
+    if (next.has(row.id)) next.delete(row.id); else next.set(row.id, row.activation_state);
+    return next;
+  });
+  const readySelected = [...selected.entries()].filter(([, s]) => s === 'ready').map(([id]) => id);
+  // What an activation takes: ready rows, and failed rows being retried (the server re-queues them).
+  const activatableSelected = [...selected.entries()].filter(([, s]) => s === 'ready' || s === 'failed').map(([id]) => id);
+  const inactiveSelected = [...selected.entries()].filter(([, s]) => s === 'inactive').map(([id]) => id);
+
+  const selectAllReady = async () => {
+    setBusy(true); setErr('');
+    try {
+      const ids = await migrationRpc('legacy_import_ready_ids', { p_job_id: jobId, p_batch_code: batchCode || null, p_search: deferredSearch.trim() || null });
+      setSelected((m) => {
+        const next = new Map(m);
+        for (const id of ids || []) if (next.size < MAX_ACTIVATION_RUN || next.has(id)) next.set(id, 'ready');
+        return next;
+      });
+      if ((ids || []).length >= MAX_ACTIVATION_RUN) setNotice(`Selected the first ${MAX_ACTIVATION_RUN} ready rows — one activation takes at most ${MAX_ACTIVATION_RUN}.`);
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  // ★ The runner. Each call is one bounded server request; the database holds every
+  //   state, so closing the tab mid-run loses nothing — Resume picks up the same run.
+  const runLoop = async (runId, { retryFailed = false } = {}) => {
+    pausedRef.current = false;
+    setRunState({ running: true, runId, last: null });
+    setErr('');
+    try {
+      for (let i = 0; i < 400; i += 1) {
+        if (pausedRef.current) { await migrationApi('pause-run', { runId }); break; }
+        const r = await migrationApi('activate-chunk', { runId, retryFailed });
+        setRunState({ running: true, runId, last: r });
+        await reloadRef.current();
+        const st = r?.run?.status;
+        if (!st || st === 'completed' || st === 'paused' || st === 'cancelled') break;
+        if (!r.results?.length) break;
+      }
+    } catch (e) { setErr(e.message); }
+    finally {
+      setRunState((s) => ({ ...s, running: false }));
+      await reloadRef.current();
+    }
+  };
+
+  // Failed rows from ANY run of this job go through a new, typed confirmation: the server
+  // re-queues them with fresh attempts, so neither an older run nor the per-run attempt cap
+  // can leave a row that no button reaches.
+  const retryFailedRows = async () => {
+    setBusy(true); setErr('');
+    try {
+      const ids = await migrationRpc('legacy_import_ready_ids', { p_job_id: jobId, p_state: 'failed' });
+      if ((ids || []).length) setActivateIds(ids);
+      else setNotice('No failed rows are left to retry.');
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const onStarted = (runId) => {
+    setActivateIds(null);
+    setSelected(new Map());
+    runLoop(runId);
+  };
+
+  const exportProblems = async () => {
+    setBusy(true); setErr('');
+    try {
+      const all = [];
+      for (const state of ['blocked', 'failed', 'invite_problem']) {
+        for (let off = 0; off < 5000; off += 200) {
+          const out = await migrationRpc('legacy_import_rows_page', { p_job_id: jobId, p_state: state, p_limit: 200, p_offset: off });
+          all.push(...(out?.rows || []));
+          if (!out || (out.rows || []).length < 200) break;
+        }
+      }
+      const csv = toCsv(all.map((r) => ({
+        row: r.source_row_number, email: r.email, batch: r.batch_name || r.legacy_batch_label || '',
+        state: rowDisplayState(r),
+        reasons: [...(r.errors || []), r.blocked_reason, r.last_error, r.invite_code].filter(Boolean).map(labelOfError).join('; '),
+      })), ['row', 'email', 'batch', 'state', 'reasons']);
+      downloadFile(csv, `migration-problems-${(job?.fingerprint || 'job')}.csv`, 'text/csv');
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const bulkEligibility = async (eligible, reason) => {
+    setBusy(true); setErr('');
+    try {
+      const ids = eligible ? inactiveSelected : readySelected;
+      const r = await migrationRpc('legacy_import_set_eligibility', { p_row_ids: ids, p_eligible: eligible, p_reason: reason });
+      setNotice(`${r.changed} row${r.changed === 1 ? '' : 's'} updated${r.skipped ? `; ${r.skipped} skipped (no longer in that state, or the term has ended)` : ''}.`);
+      setSelected(new Map());
+      setReasonFor(null);
+      await reload();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const discard = async (reason) => {
+    setBusy(true); setErr('');
+    try { await migrationRpc('legacy_import_discard_job', { p_job_id: jobId, p_reason: reason }); setReasonFor(null); await reload(); }
+    catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const purge = async () => {
+    setBusy(true); setErr('');
+    try { const r = await migrationRpc('legacy_import_purge_raw', { p_job_id: jobId }); setNotice(`Removed names and addresses from ${r.purged_rows} rows. The audit trail is kept.`); await reload(); }
+    catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const runDue = async () => {
+    setBusy(true); setErr('');
+    try { const r = await migrationRpc('admin_activate_due_memberships', {}); setNotice(`${r.activated} scheduled membership${r.activated === 1 ? '' : 's'} opened; ${r.conflicts} need review.`); await reload(); }
+    catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  if (loading && !summary) return <AdminListSkeleton rows={5} />;
+
+  const lastRun = runState.last?.run;
+  const progressRows = lastRun?.states || openRun?.counts || null;
+  const discarded = !!job?.discarded_at;
+  const totalPages = Math.max(1, Math.ceil((rowsPage.total || 0) / IMPORT_PAGE_SIZE));
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2">
+        {/* Leaving unmounts this workspace, and with it the only Pause control for a run that
+            keeps going on the server — so it waits until the run is paused or finished. */}
+        <button type="button" onClick={onBack} disabled={runState.running}
+          title={runState.running ? 'Pause the activation first' : undefined}
+          className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 disabled:opacity-50"><ArrowLeft size={13} /> All jobs</button>
+        <button type="button" onClick={reload} className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5"><RefreshCw size={13} /> Refresh</button>
+        <button type="button" onClick={exportProblems} disabled={busy} className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5"><Download size={13} /> Problems CSV</button>
+        <button type="button" onClick={runDue} disabled={busy} className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5"><Clock size={13} /> Open due memberships now</button>
+        <button type="button" onClick={purge} disabled={busy} className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold">Remove raw names and emails</button>
+        {!discarded && <button type="button" onClick={() => setReasonFor('discard')} className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold" style={{ color: C.red }}>Discard job…</button>}
+      </div>
+
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
+      {discarded && <AdminNotice kind="warn">This job was discarded{job.discard_reason ? ` — “${job.discard_reason}”` : ''}. Its rows can no longer be activated.</AdminNotice>}
+
+      <div className="iw-grid">
+        <section className="glass-card p-5 min-w-0">
+          <h3 style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 15, color: C.text }}>{job?.filename || 'Roster'}</h3>
+          <p className="mt-1 text-xs" style={{ color: C.textMute, fontFamily: fontMono }}>
+            fingerprint {job?.fingerprint}… · staged {fmtEnrollDate(job?.created_at)}{job?.created_by_name ? ` by ${job.created_by_name}` : ''} · dates {job?.date_format}
+          </p>
+          <div className="mt-3 overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead><tr style={{ color: C.textMute }}>
+                <th className="text-left py-1.5 pr-3 font-semibold">Batch</th><th className="text-right px-2 font-semibold">Ready</th>
+                <th className="text-right px-2 font-semibold">Inactive</th><th className="text-right px-2 font-semibold">Blocked</th>
+                <th className="text-right px-2 font-semibold">Activated</th><th className="text-right pl-2 font-semibold">Total</th>
+              </tr></thead>
+              <tbody>
+                {(summary?.cohorts || []).map((c) => (
+                  <tr key={c.batch_code || 'none'} style={{ borderTop: `1px solid ${C.border}` }}>
+                    <td className="py-1.5 pr-3" style={{ color: C.text }}>{c.batch_name || 'No batch'}{c.batch_status && c.batch_status !== 'open' ? ` (${c.batch_status})` : ''}</td>
+                    <td className="text-right px-2">{c.ready}</td><td className="text-right px-2">{c.inactive}</td>
+                    <td className="text-right px-2" style={{ color: c.blocked ? C.red : undefined }}>{c.blocked}</td>
+                    <td className="text-right px-2">{c.activated}</td><td className="text-right pl-2">{c.total}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="glass-card p-5 min-w-0">
+          <h3 style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 15, color: C.text }}>Activation</h3>
+          {/* Announces the run starting, pausing and finishing — not every chunk's counts. */}
+          <span role="status" aria-live="polite" className="sr-only">
+            {runState.running ? 'Activation running.'
+              : lastRun?.status === 'completed' ? 'Activation finished.'
+              : lastRun?.status === 'paused' ? 'Activation paused.' : ''}
+          </span>
+          <div className="mt-2"><MigrationReadiness readiness={readiness} /></div>
+          {summary?.invites && (
+            <p className="mt-3 text-sm" style={{ color: C.textSoft }}>
+              Emails: {summary.invites.sent} sent · {summary.invites.notified} notified · {summary.invites.claimed} claimed
+              {summary.invites.failed ? ` · ${summary.invites.failed} need a resend` : ''}{summary.invites.not_sent ? ` · ${summary.invites.not_sent} waiting` : ''}
+            </p>
+          )}
+          {(runState.running || openRun) && (
+            <div className="mt-3 rounded-xl p-3" style={{ background: 'var(--wash)', border: `1px solid ${C.border}` }}>
+              <div className="text-sm font-semibold" style={{ color: C.text }}>
+                {runState.running ? 'Activating…' : `Activation ${openRun?.status}`}{progressRows ? ` — ${Object.entries(progressRows).map(([k, v]) => `${v} ${k.replace(/_/g, ' ')}`).join(', ')}` : ''}
+              </div>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {runState.running
+                  ? <button type="button" onClick={() => { pausedRef.current = true; }} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5"><Pause size={12} /> Pause after this step</button>
+                  : openRun && <button type="button" onClick={() => runLoop(openRun.id)} className="px-3 py-1.5 rounded-lg text-xs font-bold text-white" style={MIGRATION_PRIMARY_BTN}>Resume activation</button>}
+              </div>
+            </div>
+          )}
+          {!runState.running && !openRun && failedCount > 0 && !discarded && (
+            <button type="button" onClick={retryFailedRows} disabled={busy} className="mt-3 gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold">
+              Retry {failedCount} failed row{failedCount === 1 ? '' : 's'}…
+            </button>
+          )}
+        </section>
+      </div>
+
+      <section className="glass-card p-4 min-w-0">
+        <div className="flex flex-wrap items-center gap-2">
+          <AdminFilterCaption>Show</AdminFilterCaption>
+          {MIGRATION_FILTERS.map(([k, label]) => (
+            <AdminFilterChip key={k} active={filter === k} label={label} onClick={() => setFilter(k)} />
+          ))}
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <select className="gh-input text-sm" value={batchCode} onChange={(e) => setBatchCode(e.target.value)} aria-label="Filter by batch">
+            <option value="">All batches</option>
+            {(summary?.cohorts || []).filter((c) => c.batch_code).map((c) => <option key={c.batch_code} value={c.batch_code}>{c.batch_name}</option>)}
+          </select>
+          <input className="gh-input text-sm flex-1 min-w-[12rem]" placeholder="Search name or email" value={search}
+            onChange={(e) => setSearch(e.target.value)} aria-label="Search rows" />
+        </div>
+
+        <div className="mt-3 flex flex-wrap items-center gap-2" role="toolbar" aria-label="Selection">
+          <span className="text-sm font-semibold" style={{ color: C.text }} aria-live="polite">
+            {selected.size} selected{activatableSelected.length !== selected.size ? ` (${activatableSelected.length} can be activated)` : ''}
+          </span>
+          <button type="button" onClick={selectAllReady} disabled={busy || discarded} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold">Select all ready in this view</button>
+          {selected.size > 0 && <button type="button" onClick={() => setSelected(new Map())} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold">Clear</button>}
+          {inactiveSelected.length > 0 && <button type="button" onClick={() => setReasonFor('promote')} disabled={discarded} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold">Make {inactiveSelected.length} ready…</button>}
+          {readySelected.length > 0 && <button type="button" onClick={() => setReasonFor('demote')} disabled={discarded} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold">Make {readySelected.length} inactive…</button>}
+          <button type="button" onClick={() => setActivateIds(activatableSelected)} disabled={!activatableSelected.length || runState.running || discarded}
+            className="ml-auto px-4 py-2 rounded-xl text-sm font-bold text-white inline-flex items-center gap-2 disabled:opacity-50" style={ADMIN_BTN_OK}>
+            <UserCheck size={14} /> Activate {activatableSelected.length || ''}
+          </button>
+        </div>
+
+        <div className="mt-3 overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead><tr style={{ color: C.textMute }}>
+              <th className="py-2 pr-2 w-8"><span className="sr-only">Select</span></th>
+              <th className="text-left py-2 pr-3 font-semibold">#</th>
+              <th className="text-left py-2 pr-3 font-semibold">Student</th>
+              <th className="text-left py-2 pr-3 font-semibold">Batch</th>
+              <th className="text-left py-2 pr-3 font-semibold">Membership</th>
+              <th className="text-left py-2 pr-3 font-semibold">Status</th>
+              <th className="py-2"><span className="sr-only">Details</span></th>
+            </tr></thead>
+            <tbody>
+              {rowsPage.rows.map((r) => {
+                const selectable = ['ready', 'inactive', 'failed'].includes(r.activation_state) && !discarded;
+                const name = [r.first_name, r.last_name].filter(Boolean).join(' ');
+                return (
+                  <tr key={r.id} style={{ borderTop: `1px solid ${C.border}` }}>
+                    <td className="py-2 pr-2">
+                      <input type="checkbox" disabled={!selectable} checked={selected.has(r.id)} onChange={() => toggle(r)}
+                        aria-label={`Select row ${r.source_row_number}`} />
+                    </td>
+                    <td className="py-2 pr-3" style={{ color: C.textMute, fontFamily: fontMono }}>{r.source_row_number}</td>
+                    <td className="py-2 pr-3 min-w-0">
+                      <div style={{ color: C.text, fontWeight: 600 }}>{name || '—'}</div>
+                      <div className="text-xs break-all" style={{ color: C.textMute }}>{r.email || '—'}</div>
+                      {r.phone && <div className="text-xs" style={{ color: C.textMute }}>{r.phone}</div>}
+                      <div className="text-xs" style={{ color: C.textMute }}>Thinkific · imported {fmtEnrollDate(r.imported_at)}</div>
+                    </td>
+                    <td className="py-2 pr-3 whitespace-nowrap" style={{ color: C.textSoft }}>{r.batch_name || r.legacy_batch_label || '—'}</td>
+                    <td className="py-2 pr-3 whitespace-nowrap text-xs" style={{ color: C.textSoft }}>
+                      {r.start_date ? `${formatCalendarDate(r.start_date)} – ${formatCalendarDate(r.end_date)}` : '—'}
+                    </td>
+                    <td className="py-2 pr-3">
+                      <MigrationStatePill row={r} />
+                      {(r.errors?.[0] || r.blocked_reason) && <div className="text-xs mt-1" style={{ color: C.red }}>{labelOfError(r.blocked_reason || r.errors[0])}</div>}
+                    </td>
+                    <td className="py-2 text-right">
+                      <button type="button" onClick={() => setOpenRow(r)} className="gh-btn-ghost px-2 py-1 rounded-lg text-xs font-semibold" aria-label={`Open row ${r.source_row_number}`}>
+                        <ChevronRight size={14} />
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {rowsPage.rows.length === 0 && <p className="py-6 text-center text-sm" style={{ color: C.textMute }}>No rows in this view.</p>}
+        </div>
+        <div className="mt-3 flex items-center justify-between gap-2 text-xs" style={{ color: C.textSoft }}>
+          <span>{rowsPage.total} rows · page {page + 1} of {totalPages}</span>
+          <span className="flex gap-2">
+            <button type="button" onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={page === 0} className="gh-btn-ghost px-3 py-1.5 rounded-lg font-semibold">Previous</button>
+            <button type="button" onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))} disabled={page + 1 >= totalPages} className="gh-btn-ghost px-3 py-1.5 rounded-lg font-semibold">Next</button>
+          </span>
+        </div>
+      </section>
+
+      {openRow && (
+        <MigrationRowPanel jobId={jobId} row={openRow} onClose={() => setOpenRow(null)}
+          onChanged={async () => { await reload(); setOpenRow(null); }} />
+      )}
+      {activateIds && (
+        <MigrationActivateModal jobId={jobId} rowIds={activateIds} onStarted={onStarted} onClose={() => setActivateIds(null)} />
+      )}
+      {reasonFor === 'discard' && (
+        <MigrationReasonModal title="Discard this job?" tone="danger" busy={busy} confirmLabel="Discard"
+          subtitle="Its rows can no longer be activated. Anything already activated stays activated; revert those row by row."
+          onClose={() => setReasonFor(null)} onConfirm={discard} />
+      )}
+      {(reasonFor === 'promote' || reasonFor === 'demote') && (
+        <MigrationReasonModal busy={busy}
+          title={reasonFor === 'promote' ? `Make ${inactiveSelected.length} rows ready to activate?` : `Make ${readySelected.length} rows inactive?`}
+          subtitle={reasonFor === 'promote' ? 'They keep their original dates and batch. Nothing is activated until you confirm an activation.' : 'They will not be activated until they are made ready again.'}
+          confirmLabel={reasonFor === 'promote' ? 'Make ready' : 'Make inactive'}
+          onClose={() => setReasonFor(null)} onConfirm={(reason) => bulkEligibility(reasonFor === 'promote', reason)} />
+      )}
+    </div>
+  );
+}
+
+// ── The tab ───────────────────────────────────────────────────────────────────
+function StudentImports({ onCountChange }) {
+  const { profile, can, staffReady, staffDegraded } = useAuth();
+  // #67: students.legacy_migrate — Super Admin only. api/admin/student-imports.js and every
+  // legacy_import_* function check the same key; this only decides what to render.
+  const allowed = staffDegraded ? !!profile?.is_admin : (staffReady && can('students.legacy_migrate'));
+  const [view, setView] = useState(() => (readImportJobParam() ? 'job' : 'jobs'));
+  const [jobId, setJobId] = useState(() => readImportJobParam());
+  const [jobs, setJobs] = useState(null);
+  const [readiness, setReadiness] = useState(null);
+  const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
+
+  const loadJobs = useCallback(async () => {
+    try { setJobs(await migrationRpc('legacy_import_jobs_list', {})); }
+    catch (e) { setErr(e.message); setJobs([]); }
+  }, []);
+
+  useEffect(() => {
+    if (!allowed) return;
+    loadJobs();
+    migrationApi('health', {}).then(setReadiness, () => setReadiness(null));
+  }, [allowed, loadJobs]);
+
+  if (!allowed) {
     return (
       <div className="max-w-2xl mx-auto mt-10">
         <div className="glass-card p-8 text-center" style={{ borderRadius: 20 }}>
           <ShieldCheck size={30} style={{ color: C.textMute, margin: '0 auto' }} />
-          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Admins only</div>
-          <div className="mt-1 text-sm" style={{ color: C.textSoft }}>The Student Imports tool is restricted to administrators.</div>
+          <div className="mt-3" style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Super Admin only</div>
+          <div className="mt-1 text-sm" style={{ color: C.textSoft }}>
+            Migrating legacy students creates paid access, so it is limited to Super Admins.
+          </div>
         </div>
       </div>
     );
   }
 
-  const planLabel = (key) => plans.find((p) => p.key === key)?.name || key;
-  const planKeys = plans.map((p) => p.key);
-
-  const downloadTemplate = () => {
-    const csv = toCsv([{
-      thinkific_user_id: '123456', first_name: 'Jane', last_name: 'Doe', email: 'jane@example.com',
-      plan_key: 'silver_self_paced', membership_started_at: '2026-01-15', membership_ends_at: '2026-03-16',
-      payment_status: 'paid', amount_paid: '2999', currency: 'PHP', legacy_enrollments: 'QuickBooks Online Mastery - Jan 2026',
-      batch_code: '',   // VIP only — e.g. 2026-08 (must be an existing OPEN batch)
-    }], IMPORT_TEMPLATE_COLUMNS);
-    downloadFile(csv, 'student-import-template.csv', 'text/csv');
+  const openJob = (id, reopened) => {
+    setJobId(id); setView('job'); writeImportJobParam(id);
+    setNotice(reopened ? 'This roster was already staged, so its existing job is open. Nothing was staged twice.' : '');
+    loadJobs(); onCountChange?.();
   };
-
-  const parseFile = async (file) => {
-    if (file.size > IMPORT_LIMITS.maxBytes) throw new Error('File is over 8 MB — export a smaller range.');
-    const buf = await file.arrayBuffer();
-    const sha256 = await sha256Hex(buf);
-    let parsed;
-    if (/\.xlsx?$/i.test(file.name)) {
-      const XLSX = await import('xlsx');
-      const wb = XLSX.read(buf, { type: 'array' });
-      const sheet = wb.Sheets[wb.SheetNames[0]];
-      const arr = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' });
-      const hdr = (arr[0] || []).map((h) => String(h).trim());
-      const rows = arr.slice(1).filter((r) => r.some((c) => String(c).trim() !== '')).map((r) => {
-        const o = {}; hdr.forEach((h, i) => { o[h] = r[i] != null ? String(r[i]) : ''; }); return o;
-      });
-      parsed = { headers: hdr, rows };
-    } else {
-      const text = new TextDecoder('utf-8').decode(buf);
-      parsed = parseCsv(text);
-    }
-    if (!parsed.headers.length) throw new Error('No columns detected — is this a CSV/XLSX with a header row?');
-    if (parsed.headers.length > IMPORT_LIMITS.maxCols) throw new Error(`Too many columns (${parsed.headers.length}).`);
-    if (parsed.rows.length > IMPORT_LIMITS.maxRows) throw new Error(`Too many rows (${parsed.rows.length}). Split the file.`);
-    return { ...parsed, sha256, name: file.name };
-  };
-
-  const onPrimaryFile = async (e) => {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    if (!file) return;
-    setErr(''); setBusy(true); setBusyMsg('Parsing file…');
-    try {
-      const p = await parseFile(file);
-      setHeaders(p.headers);
-      setRawRows(p.rows);
-      setFileMeta({ name: p.name, sha256: p.sha256, rows: p.rows.length, cols: p.headers.length });
-      setMapping(autoMapHeaders(p.headers));
-      setStep('map');
-    } catch (e2) { setErr(e2.message || 'Could not parse the file.'); }
-    finally { setBusy(false); setBusyMsg(''); }
-  };
-
-  // Merge a supplementary file (Orders/ledger/manual template) by thinkific id or email.
-  const onSupplementaryFile = async (e) => {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    if (!file) return;
-    setErr(''); setBusy(true); setBusyMsg('Reconciling…');
-    try {
-      const p = await parseFile(file);
-      const supMap = autoMapHeaders(p.headers);
-      const idCol = supMap.thinkific_user_id, emailCol = supMap.email;
-      const byId = new Map(), byEmail = new Map();
-      for (const r of p.rows) {
-        const id = idCol ? parseExternalId(r[idCol]) : '';
-        const em = emailCol ? normalizeEmail(r[emailCol]) : '';
-        if (id) byId.set(id, r);
-        if (em) byEmail.set(em, r);
-      }
-      // Enrich the primary rows in place (only fill blanks; the primary keeps precedence for ids).
-      const primaryIdCol = mapping.thinkific_user_id, primaryEmailCol = mapping.email;
-      let enriched = 0;
-      const merged = rawRows.map((row) => {
-        const id = primaryIdCol ? parseExternalId(row[primaryIdCol]) : '';
-        const em = primaryEmailCol ? normalizeEmail(row[primaryEmailCol]) : '';
-        const sup = (id && byId.get(id)) || (em && byEmail.get(em)) || null;
-        if (!sup) return row;
-        enriched++;
-        const out = { ...row };
-        for (const f of ['email', 'plan_key', 'membership_started_at', 'membership_ends_at', 'first_name', 'last_name']) {
-          const supCol = supMap[f];
-          if (supCol && String(sup[supCol] || '').trim() && (!mapping[f] || !String(row[mapping[f]] || '').trim())) {
-            // stash under a synthetic column so mapping can point at it
-            out[`__sup_${f}`] = sup[supCol];
-          }
-        }
-        return out;
-      });
-      // Point the mapping at the supplementary columns for fields the primary lacked.
-      const nextMapping = { ...mapping };
-      for (const f of ['email', 'plan_key', 'membership_started_at', 'membership_ends_at', 'first_name', 'last_name']) {
-        if (!nextMapping[f] && supMap[f]) nextMapping[f] = `__sup_${f}`;
-      }
-      setRawRows(merged);
-      setMapping(nextMapping);
-      setErr('');
-      setNotice(`Reconciled ${enriched} of ${merged.length} rows from the supplementary file.`);
-    } catch (e2) { setErr(e2.message || 'Could not reconcile the file.'); }
-    finally { setBusy(false); setBusyMsg(''); }
-  };
-
-  const buildCombos = () => {
-    const col = mapping.enrollments_list;
-    const grouped = new Map();
-    for (const row of rawRows) {
-      const courses = col ? parseEnrollmentsList(row[col]) : [];
-      const key = comboKeyOf(courses) || '(no courses)';
-      if (!grouped.has(key)) grouped.set(key, { key, count: 0, courses });
-      grouped.get(key).count++;
-    }
-    const list = [...grouped.values()].sort((a, b) => b.count - a.count).map((c) => {
-      const sug = suggestPlanForCombo(c.courses);
-      return { ...c, choice: '', suggested: sug.suggested, suggestReason: sug.reason };
-    });
-    setCombos(list);
-  };
-
-  const goToPlans = () => {
-    if (!mapping.thinkific_user_id) { setErr('Map the Thinkific user id column — it is the match key.'); return; }
-    setErr('');
-    buildCombos();
-    setStep('plans');
-  };
-
-  // Normalize a source row → the staged shape the endpoint expects.
-  const normalizeRow = (row, i) => {
-    const g = (f) => (mapping[f] ? String(row[mapping[f]] ?? '').trim() : '');
-    const externalId = parseExternalId(g('thinkific_user_id'));
-    const emailRaw = g('email');
-    const emailNorm = normalizeEmail(emailRaw);
-    const startD = parseStrictDate(g('membership_started_at'));
-    const endD = parseStrictDate(g('membership_ends_at'));
-    const courses = mapping.enrollments_list ? parseEnrollmentsList(row[mapping.enrollments_list]) : [];
-    const comboKey = comboKeyOf(courses) || '(no courses)';
-    const { warnings, errors } = validateRowFields({
-      hasEmail: !!emailNorm, emailRaw, hasExternalId: !!externalId,
-      startedAt: startD.valid ? startD.epochMs : null, endsAt: endD.valid ? endD.epochMs : null,
-    });
-    if (g('membership_started_at') && !startD.valid) errors.push('Start date is not a valid ISO/UTC date.');
-    if (g('membership_ends_at') && !endD.valid) errors.push('Expiry date is not a valid ISO/UTC date.');
-    return {
-      source_row_number: i + 1,
-      external_user_id: externalId || null,
-      email_normalized: emailNorm || null,
-      email_display: emailRaw || null,
-      proposed_started_at: startD.valid ? startD.iso : null,
-      proposed_ends_at: endD.valid ? endD.iso : null,
-      proposed_term_mode: defaultTermMode,
-      warnings, errors,
-      processing_status: 'pending',
-      mapped: {
-        first_name: g('first_name') || null, last_name: g('last_name') || null,
-        combo_key: comboKey, courses,
-        plan_key: g('plan_key') || null,
-        source_created_at: parseStrictDate(g('source_created_at')).iso || null,
-        last_sign_in_at: parseStrictDate(g('last_sign_in_at')).iso || null,
-        sign_in_count: g('sign_in_count') ? Number(g('sign_in_count')) || null : null,
-        legacy_enrollments: courses,
-        batch_code: g('batch_code') || null,   // #32: explicit batch for VIP rows
-      },
-    };
-  };
-
-  // Stage the job + rows to Supabase (admin RLS), then run the server dry-run.
-  const stageAndDryRun = async () => {
-    setErr(''); setBusy(true); setBusyMsg('Staging rows…');
-    try {
-      const combo_plan_map = {};
-      for (const c of combos) if (c.choice) combo_plan_map[c.key] = c.choice;
-      const settings = { combo_plan_map, default_term_mode: defaultTermMode, conflict_policy: conflictPolicy };
-
-      const { data: job, error: jErr } = await supabase.from('student_import_jobs').insert({
-        source: 'thinkific_users', filename: fileMeta?.name || null, file_sha256: fileMeta?.sha256 || null,
-        mapping, settings, status: 'validating', total_rows: rawRows.length, created_by: profile.id,
-      }).select('id').single();
-      if (jErr) throw jErr;
-      const newJobId = job.id;
-
-      const staged = rawRows.map(normalizeRow).map((r) => ({ ...r, job_id: newJobId }));
-      for (let i = 0; i < staged.length; i += 200) {
-        setBusyMsg(`Staging rows… ${Math.min(i + 200, staged.length)}/${staged.length}`);
-        const { error: rErr } = await supabase.from('student_import_rows').insert(staged.slice(i, i + 200));
-        if (rErr) throw rErr;
-      }
-
-      setBusyMsg('Running dry-run…');
-      const dry = await importApi('dry-run', { jobId: newJobId });
-      setJobId(newJobId);
-      setCounts(dry.counts || null);
-      await loadPreview(newJobId);
-      setStep('preview');
-      // Some proposals never reached the database, so the summary counts describe memory,
-      // not the rows Process will read. Latch it — a warning alone would be wiped by the
-      // next setErr('') and the admin could process against stale proposals.
-      setStaleDryRun(!!dry.persistFailures);
-      if (dry.persistFailures) {
-        setErr(`${dry.persistFailures} row${dry.persistFailures === 1 ? '' : 's'} could not be saved during the dry-run — the counts below may be out of date. Re-run “Stage & dry-run” before processing.`);
-      }
-      onCountChange?.();
-    } catch (e2) { setErr(e2.message || 'Could not stage the import.'); }
-    finally { setBusy(false); setBusyMsg(''); }
-  };
-
-  const loadPreview = async (jid = jobId) => {
-    const { data } = await supabase.from('student_import_rows').select('*').eq('job_id', jid)
-      .order('source_row_number', { ascending: true }).limit(2000);
-    setPreviewRows(Array.isArray(data) ? data : []);
-  };
-
-  const runProcess = async (retryFailed = false) => {
-    if (!jobId) return;
-    // Some proposals never reached the database, so the staged rows may still carry a
-    // PREVIOUS dry-run's plan/term — and processRow re-validates the batch but never the
-    // plan. Refuse until a clean dry-run replaces them.
-    if (staleDryRun) {
-      setErr('The last dry-run could not save every row, so the staged proposals may be out of date. Re-run “Stage & dry-run” before processing.');
-      return;
-    }
-    setErr(''); pausedRef.current = false;
-    setProc((p) => ({ ...p, running: true, paused: false, done: false }));
-    try {
-      let more = true;
-      while (more && !pausedRef.current) {
-        // eslint-disable-next-line no-await-in-loop
-        const r = await importApi('process', { jobId, batchSize: 10, retryFailed });
-        setProc((p) => ({ ...p, tally: r.tally || p.tally }));
-        more = !!r.more && !r.done;
-        // eslint-disable-next-line no-await-in-loop
-        await loadPreview();
-        onCountChange?.();
-        retryFailed = false; // only the first pass retries failed rows
-      }
-      setProc((p) => ({ ...p, running: false, done: !pausedRef.current, paused: pausedRef.current }));
-    } catch (e2) {
-      setErr(e2.message || 'Processing failed — you can resume.');
-      setProc((p) => ({ ...p, running: false }));
-    }
-  };
-
-  const pauseProcess = () => { pausedRef.current = true; setProc((p) => ({ ...p, paused: true, running: false })); };
-
-  const resendInvite = async (rowId) => {
-    try { await importApi('resend-invite', { rowId }); await loadPreview(); }
-    catch (e2) { setErr(e2.message || 'Could not resend the invite.'); }
-  };
-
-  const downloadErrorReport = () => {
-    const rows = previewRows.filter((r) => (r.errors && r.errors.length) || r.processing_status === 'failed' || r.processing_status === 'blocked')
-      .map((r) => ({
-        source_row: r.source_row_number, thinkific_user_id: r.external_user_id || '',
-        email: r.email_display || '', status: r.processing_status,
-        match: r.match_result || '', issues: [...(r.errors || []), ...(r.warnings || [])].join(' | '),
-      }));
-    const csv = toCsv(rows, ['source_row', 'thinkific_user_id', 'email', 'status', 'match', 'issues']);
-    downloadFile(csv, `student-import-issues-${jobId?.slice(0, 8) || 'report'}.csv`, 'text/csv');
-  };
-
-  // ── derived preview counts + filtered view ──
-  const pv = useMemo(() => {
-    const c = { total: previewRows.length, ready: 0, blocked: 0, newAcct: 0, existing: 0, conflicts: 0, done: 0, failed: 0, skipped: 0, invited: 0, expiredHist: 0 };
-    for (const r of previewRows) {
-      if (r.processing_status === 'ready') c.ready++;
-      if (r.processing_status === 'blocked') c.blocked++;
-      if (r.processing_status === 'done') c.done++;
-      if (r.processing_status === 'failed') c.failed++;
-      if (r.processing_status === 'skipped') c.skipped++;
-      if (r.match_result === 'new') c.newAcct++;
-      if (r.match_result === 'existing_by_source' || r.match_result === 'existing_by_email') c.existing++;
-      if (r.match_result === 'conflict' || r.match_result === 'ambiguous') c.conflicts++;
-      if (r.invite_status === 'sent' || r.invite_status === 'resent') c.invited++;
-    }
-    return c;
-  }, [previewRows]);
-
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return previewRows.filter((r) => {
-      if (filter !== 'all' && r.processing_status !== filter) return false;
-      if (!q) return true;
-      return (r.email_display || '').toLowerCase().includes(q) || (r.external_user_id || '').toLowerCase().includes(q)
-        || String(r.mapped?.first_name || '').toLowerCase().includes(q) || String(r.mapped?.last_name || '').toLowerCase().includes(q);
-    });
-  }, [previewRows, filter, search]);
-
-  const readyToProcess = pv.ready;
-
-  // ── stepper ──
-  const STEPS = [
-    { key: 'upload', label: 'Upload' }, { key: 'map', label: 'Map' },
-    { key: 'plans', label: 'Plans' }, { key: 'preview', label: 'Preview & run' }, { key: 'results', label: 'Results' },
-  ];
-  const stepIdx = STEPS.findIndex((s) => s.key === step);
-
-  const STAT = ({ label, value, tone }) => (
-    <div className="rounded-xl px-3 py-2.5" style={{ background: 'var(--wash)', border: `1px solid ${C.border}` }}>
-      <div style={{ fontSize: 18, fontWeight: 800, fontFamily: fontDisplay, color: tone || C.text }}>{value}</div>
-      <div style={{ fontSize: 10.5, color: C.textMute, textTransform: 'uppercase', letterSpacing: '0.04em' }}>{label}</div>
-    </div>
-  );
+  const back = () => { setView('jobs'); setJobId(null); writeImportJobParam(null); loadJobs(); };
 
   return (
-    <div>
-      <SectionHead eyebrow="Admin" gold title="Student Imports"
-        desc="Migrate legacy Thinkific students — validate, map course-combos to plans, dry-run, then import real accounts + dated memberships." />
+    <div className="import-workspace">
+      <SectionHead eyebrow="Admin" title="Student Imports"
+        desc="Stage legacy rosters, then activate already-paid memberships in controlled, audited steps." />
+      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
 
-      <div className="max-w-5xl mx-auto px-1 pb-16">
-        {/* Stepper */}
-        <div className="flex items-center gap-1.5 mb-5 flex-wrap">
-          {STEPS.map((s, i) => (
-            <div key={s.key} className="flex items-center gap-1.5">
-              <div className="px-3 py-1.5 rounded-full text-xs font-semibold flex items-center gap-1.5"
-                style={i <= stepIdx
-                  ? { background: 'var(--primary-tint)', color: C.primary, border: `1px solid var(--primary-glow)` }
-                  : { background: 'var(--wash)', color: C.textMute, border: `1px solid ${C.border}` }}>
-                {i < stepIdx ? <Check size={12} /> : <span style={{ fontWeight: 800 }}>{i + 1}</span>} {s.label}
-              </div>
-              {i < STEPS.length - 1 && <ChevronRight size={13} style={{ color: C.textMute }} />}
-            </div>
-          ))}
-        </div>
-
-        {err && <div className="mb-4"><AdminNotice kind="error" onDismiss={() => setErr('')}>{err}</AdminNotice></div>}
-        {notice && <div className="mb-4"><AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice></div>}
-        {busy && (
-          <div className="mb-4 flex items-center gap-2 text-sm" style={{ color: C.textSoft }}>
-            <Loader2 size={15} className="animate-spin" /> {busyMsg || 'Working…'}
-          </div>
-        )}
-
-        {/* STEP: UPLOAD */}
-        {step === 'upload' && (
-          <div className="space-y-4">
-            <div className="rounded-xl px-4 py-3.5 text-sm flex items-start gap-2.5"
-              style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
-              <AlertTriangle size={16} className="flex-shrink-0 mt-0.5" />
-              <div>
-                <strong>A Thinkific user export alone grants nothing.</strong> Emails are blank and course
-                titles are not proof of a purchased package. Every new-account row stays <em>blocked</em> until
-                you supply an <strong>email</strong> and an <strong>exact expiry</strong> — reconcile an
-                Orders/ledger export or the template below. No access is ever inferred from a course or a date.
-              </div>
-            </div>
-
-            <div className="glass-card p-6" style={{ borderRadius: 18 }}>
-              <div className="flex items-center justify-between flex-wrap gap-3">
-                <div>
-                  <div style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>Upload the student roster</div>
-                  <div className="text-sm mt-0.5" style={{ color: C.textSoft }}>CSV or XLSX with a header row. Max 8 MB / {IMPORT_LIMITS.maxRows} rows.</div>
-                </div>
-                <button onClick={downloadTemplate} className="text-sm font-semibold flex items-center gap-1.5 px-3 py-2 rounded-lg"
-                  style={{ color: C.primary, background: 'var(--primary-tint)', border: `1px solid var(--primary-glow)` }}>
-                  <Download size={14} /> Import template
-                </button>
-              </div>
-              <label className="mt-4 flex flex-col items-center justify-center gap-2 py-8 rounded-xl cursor-pointer transition"
-                style={{ border: `2px dashed ${C.border}`, background: 'var(--wash)' }}>
-                <UploadCloud size={26} style={{ color: C.primary }} />
-                <div className="text-sm font-semibold" style={{ color: C.text }}>Choose a CSV / XLSX file</div>
-                <input type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={onPrimaryFile} />
-              </label>
-            </div>
-          </div>
-        )}
-
-        {/* STEP: MAP */}
-        {step === 'map' && (
-          <div className="space-y-4">
-            <div className="glass-card p-5" style={{ borderRadius: 16 }}>
-              <div className="flex items-center gap-2 mb-1"><FileSpreadsheet size={16} style={{ color: C.primary }} />
-                <span style={{ fontWeight: 700, color: C.text }}>{fileMeta?.name}</span></div>
-              <div className="text-xs" style={{ color: C.textMute }}>{fileMeta?.rows} rows · {fileMeta?.cols} columns · fingerprint {fileMeta?.sha256?.slice(0, 12)}…</div>
-            </div>
-
-            <div className="glass-card p-5" style={{ borderRadius: 16 }}>
-              <div style={{ fontWeight: 700, color: C.text, marginBottom: 10 }}>Map columns</div>
-              <div className="grid gap-2.5 sm:grid-cols-2">
-                {IMPORT_CANON_FIELDS.map((f) => (
-                  <label key={f.key} className="flex items-center gap-2 text-sm">
-                    <span className="w-40 flex-shrink-0" style={{ color: C.textSoft }}>{f.label}
-                      {f.key === 'thinkific_user_id' && <span style={{ color: C.red }}> *</span>}</span>
-                    <select className="gh-input flex-1" value={mapping[f.key] || ''}
-                      onChange={(e) => setMapping((m) => ({ ...m, [f.key]: e.target.value }))}>
-                      <option value="">— none —</option>
-                      {headers.map((h) => <option key={h} value={h}>{h}</option>)}
-                    </select>
-                  </label>
-                ))}
-              </div>
-            </div>
-
-            <div className="glass-card p-5" style={{ borderRadius: 16 }}>
-              <div className="flex items-center justify-between flex-wrap gap-2">
-                <div>
-                  <div style={{ fontWeight: 700, color: C.text }}>Reconcile a second file (optional)</div>
-                  <div className="text-xs mt-0.5" style={{ color: C.textSoft }}>Orders/ledger/template — merged by Thinkific id or email to fill in missing emails + dates.</div>
-                </div>
-                <label className="text-sm font-semibold flex items-center gap-1.5 px-3 py-2 rounded-lg cursor-pointer"
-                  style={{ color: C.primary, background: 'var(--primary-tint)', border: `1px solid var(--primary-glow)` }}>
-                  <Upload size={14} /> Add file
-                  <input type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={onSupplementaryFile} />
-                </label>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between">
-              <button onClick={() => setStep('upload')} className="text-sm flex items-center gap-1.5" style={{ color: C.textSoft }}><ArrowLeft size={14} /> Back</button>
-              <button onClick={goToPlans} disabled={busy}
-                className="text-sm font-bold text-white px-4 py-2.5 rounded-xl flex items-center gap-1.5 disabled:opacity-60"
-                style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>Next: map plans <ArrowRight size={14} /></button>
-            </div>
-          </div>
-        )}
-
-        {/* STEP: PLANS */}
-        {step === 'plans' && (
-          <div className="space-y-4">
-            <div className="glass-card p-5" style={{ borderRadius: 16 }}>
-              <div style={{ fontWeight: 700, color: C.text, marginBottom: 4 }}>Map course-combinations to plans</div>
-              <div className="text-xs mb-3" style={{ color: C.textSoft }}>Suggestions are advisory — confirm each. Sampler and VIP can't be inferred from course history, and QBO-only history no longer maps to a plan.</div>
-              <div className="space-y-2">
-                {combos.map((c) => (
-                  <div key={c.key} className="rounded-xl px-3 py-2.5 flex items-center gap-3 flex-wrap" style={{ background: 'var(--wash)', border: `1px solid ${C.border}` }}>
-                    <div className="flex-1 min-w-[200px]">
-                      <div className="text-sm" style={{ color: C.text, fontWeight: 600 }}>{c.key}</div>
-                      <div className="text-xs" style={{ color: C.textMute }}>{c.count} student{c.count !== 1 ? 's' : ''}{c.suggested ? ` · suggested: ${planLabel(c.suggested)}` : ''}</div>
-                    </div>
-                    <select className="gh-input" style={{ minWidth: 200 }} value={c.choice}
-                      onChange={(e) => setCombos((list) => list.map((x) => x.key === c.key ? { ...x, choice: e.target.value } : x))}>
-                      <option value="">— choose —</option>
-                      {plans.map((p) => <option key={p.key} value={p.key}>{p.name}</option>)}
-                      {IMPORT_PLAN_CHOICES_EXTRA.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
-                    </select>
-                    {c.suggested && !c.choice && (
-                      <button onClick={() => setCombos((list) => list.map((x) => x.key === c.key ? { ...x, choice: c.suggested } : x))}
-                        className="text-xs px-2 py-1 rounded-lg" style={{ color: C.primary, background: 'var(--primary-tint)' }}>Use suggestion</button>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            <div className="glass-card p-5 grid gap-4 sm:grid-cols-2" style={{ borderRadius: 16 }}>
-              <label className="text-sm">
-                <div style={{ fontWeight: 700, color: C.text, marginBottom: 6 }}>Default term mode</div>
-                <select className="gh-input w-full" value={defaultTermMode} onChange={(e) => setDefaultTermMode(e.target.value)}>
-                  {IMPORT_TERM_MODES.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}
-                </select>
-                <div className="text-xs mt-1" style={{ color: C.textMute }}>{IMPORT_TERM_MODES.find((m) => m.key === defaultTermMode)?.desc}</div>
-              </label>
-              <label className="text-sm">
-                <div style={{ fontWeight: 700, color: C.text, marginBottom: 6 }}>Plan conflict policy</div>
-                <select className="gh-input w-full" value={conflictPolicy} onChange={(e) => setConflictPolicy(e.target.value)}>
-                  <option value="keep_longer">Keep the longer/active term (safe default)</option>
-                  <option value="overwrite">Overwrite with the imported plan</option>
-                </select>
-                <div className="text-xs mt-1" style={{ color: C.textMute }}>Existing active access is never silently shortened.</div>
-              </label>
-              <div className="sm:col-span-2 flex items-start gap-2 px-3 py-2.5 rounded-xl"
-                style={{ background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)', fontSize: 12, color: 'var(--status-info-fg)', lineHeight: 1.5 }}>
-                <AlertCircle size={14} className="flex-shrink-0 mt-px" />
-                <span>VIP rows need a confirmed <span style={{ fontFamily: fontMono }}>batch_code</span> (an existing OPEN batch, e.g. 2026-08) — rows without one are blocked for manual review and appear in Admin → Batches. A batch is never inferred from course history.</span>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between">
-              <button onClick={() => setStep('map')} className="text-sm flex items-center gap-1.5" style={{ color: C.textSoft }}><ArrowLeft size={14} /> Back</button>
-              <button onClick={stageAndDryRun} disabled={busy}
-                className="text-sm font-bold text-white px-4 py-2.5 rounded-xl flex items-center gap-1.5 disabled:opacity-60"
-                style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>Stage & dry-run <ArrowRight size={14} /></button>
-            </div>
-          </div>
-        )}
-
-        {/* STEP: PREVIEW & RUN */}
-        {(step === 'preview' || step === 'results') && (
-          <div className="space-y-4">
-            <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
-              <STAT label="Total" value={pv.total} />
-              <STAT label="Ready" value={pv.ready} tone={C.primary} />
-              <STAT label="Blocked" value={pv.blocked} tone={pv.blocked ? C.red : undefined} />
-              <STAT label="New" value={pv.newAcct} />
-              <STAT label="Existing" value={pv.existing} />
-              <STAT label="Conflicts" value={pv.conflicts} tone={pv.conflicts ? C.amber : undefined} />
-              <STAT label="Imported" value={pv.done} tone={pv.done ? C.green : undefined} />
-              <STAT label="Invited" value={pv.invited} />
-              <STAT label="Failed" value={pv.failed} tone={pv.failed ? C.red : undefined} />
-              <STAT label="Skipped" value={pv.skipped} />
-            </div>
-
-            {/* progress */}
-            {(proc.running || proc.done || proc.tally) && (
-              <div className="glass-card p-4" style={{ borderRadius: 14 }}>
-                <div className="flex items-center justify-between text-sm mb-2">
-                  <span style={{ color: C.textSoft }}>{proc.running ? 'Processing…' : proc.done ? 'Done.' : proc.paused ? 'Paused.' : 'Ready.'}</span>
-                  <span style={{ color: C.textMute }}>{pv.done + pv.failed + pv.skipped + pv.blocked}/{pv.total}</span>
-                </div>
-                <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--wash-strong)' }}>
-                  <div style={{ width: `${pv.total ? Math.round(((pv.done + pv.failed + pv.skipped + pv.blocked) / pv.total) * 100) : 0}%`, height: '100%', background: C.primary, transition: 'width .3s' }} />
-                </div>
-              </div>
-            )}
-
-            {/* actions */}
-            <div className="flex items-center gap-2 flex-wrap">
-              {!proc.running ? (
-                <button onClick={() => setConfirmOpen(true)} disabled={readyToProcess === 0}
-                  className="text-sm font-bold text-white px-4 py-2.5 rounded-xl flex items-center gap-1.5 disabled:opacity-50"
-                  style={{ ...ADMIN_BTN_OK }}>
-                  <Play size={14} /> Process {readyToProcess} ready
-                </button>
-              ) : (
-                <button onClick={pauseProcess} className="text-sm font-bold px-4 py-2.5 rounded-xl flex items-center gap-1.5"
-                  style={{ background: 'var(--wash-strong)', color: C.text, border: `1px solid ${C.border}` }}><Pause size={14} /> Pause</button>
-              )}
-              {pv.failed > 0 && !proc.running && (
-                <button onClick={() => runProcess(true)} className="text-sm font-semibold px-3 py-2.5 rounded-xl flex items-center gap-1.5"
-                  style={{ background: 'var(--wash)', color: C.text, border: `1px solid ${C.border}` }}><RefreshCw size={14} /> Retry failed ({pv.failed})</button>
-              )}
-              <button onClick={() => loadPreview()} className="text-sm px-3 py-2.5 rounded-xl flex items-center gap-1.5" style={{ color: C.textSoft }}><RefreshCw size={13} /> Refresh</button>
-              <button onClick={downloadErrorReport} className="text-sm px-3 py-2.5 rounded-xl flex items-center gap-1.5" style={{ color: C.textSoft }}><Download size={13} /> Issues report</button>
-            </div>
-
-            {/* filters + search */}
-            <div className="flex items-center gap-2 flex-wrap">
-              {['all', 'ready', 'blocked', 'done', 'failed', 'skipped'].map((f) => (
-                <AdminFilterChip key={f} active={filter === f} label={f[0].toUpperCase() + f.slice(1)}
-                  count={f === 'all' ? pv.total : previewRows.filter((r) => r.processing_status === f).length}
-                  onClick={() => setFilter(f)} />
-              ))}
-              <div className="relative flex-1 min-w-[160px]">
-                <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2" style={{ color: C.textMute }} />
-                <input className="gh-input w-full pl-8" placeholder="Search email / id / name" value={search} onChange={(e) => setSearch(e.target.value)} />
-              </div>
-            </div>
-
-            {/* table */}
-            <div className="glass-card overflow-hidden" style={{ borderRadius: 14 }}>
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm" style={{ minWidth: 640 }}>
-                  <thead><tr style={{ background: 'var(--table-sticky-bg)', color: C.textMute }}>
-                    {['#', 'Email', 'Thinkific id', 'Match', 'Plan', 'Status', ''].map((h) => (
-                      <th key={h} className="text-left px-3 py-2 text-xs font-semibold" style={{ whiteSpace: 'nowrap' }}>{h}</th>))}
-                  </tr></thead>
-                  <tbody>
-                    {filtered.slice(0, 300).map((r) => (
-                      <tr key={r.id} style={{ borderTop: `1px solid ${C.border}` }}>
-                        <td className="px-3 py-2" style={{ color: C.textMute }}>{r.source_row_number}</td>
-                        <td className="px-3 py-2" style={{ color: C.text }}>{r.email_display || <span style={{ color: C.red }}>— missing —</span>}</td>
-                        <td className="px-3 py-2" style={{ color: C.textSoft, fontFamily: fontMono, fontSize: 12 }}>{r.external_user_id || '—'}</td>
-                        <td className="px-3 py-2" style={{ color: C.textSoft }}>{r.match_result || '—'}</td>
-                        <td className="px-3 py-2" style={{ color: C.textSoft }}>{r.proposed_plan_key ? planLabel(r.proposed_plan_key) : '—'}</td>
-                        <td className="px-3 py-2"><ImportStatusPill status={r.processing_status} /></td>
-                        <td className="px-3 py-2 text-right">
-                          <button onClick={() => setDetailRow(r)} className="text-xs" style={{ color: C.primary }}>Details</button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              {filtered.length > 300 && <div className="px-3 py-2 text-xs" style={{ color: C.textMute }}>Showing first 300 of {filtered.length}. Use search/filters to narrow.</div>}
-              {!filtered.length && <div className="px-3 py-8 text-center text-sm" style={{ color: C.textMute }}>No rows match.</div>}
-            </div>
-
-            <div className="text-xs" style={{ color: C.textMute }}>
-              Job {jobId?.slice(0, 8)} · resumable — you can leave and come back; processing continues from where it stopped.
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* row detail */}
-      {detailRow && (
-        <AccountModal title={`Row ${detailRow.source_row_number}`} subtitle={detailRow.email_display || 'no email'} icon={<User size={16} />}
-          onClose={() => setDetailRow(null)} maxW="max-w-lg">
-          <div className="space-y-2 text-sm">
-            {[['Thinkific id', detailRow.external_user_id], ['Email', detailRow.email_display], ['Match', detailRow.match_result],
-              ['Intended', detailRow.intended_action], ['Plan', detailRow.proposed_plan_key && planLabel(detailRow.proposed_plan_key)],
-              ['Term mode', detailRow.proposed_term_mode], ['Start', detailRow.proposed_started_at], ['Expiry', detailRow.proposed_ends_at],
-              ['Status', detailRow.processing_status], ['Invite', detailRow.invite_status], ['Attempts', detailRow.attempts]].map(([k, v]) => (
-              <div key={k} className="flex gap-3"><span className="w-28 flex-shrink-0" style={{ color: C.textMute }}>{k}</span><span style={{ color: C.text }}>{v == null || v === '' ? '—' : String(v)}</span></div>
-            ))}
-            {!!(detailRow.errors && detailRow.errors.length) && (
-              <div className="rounded-lg px-3 py-2 text-xs" style={{ background: 'var(--status-danger-bg)', color: 'var(--status-danger-fg)', border: '1px solid var(--status-danger-bd)' }}>
-                {detailRow.errors.join(' · ')}</div>)}
-            {!!(detailRow.warnings && detailRow.warnings.length) && (
-              <div className="rounded-lg px-3 py-2 text-xs" style={{ background: 'var(--status-warn-bg)', color: 'var(--status-warn-fg)', border: '1px solid var(--status-warn-bd)' }}>
-                {detailRow.warnings.join(' · ')}</div>)}
-            {(detailRow.invite_status === 'failed' || detailRow.invite_status === 'sent') && detailRow.processing_status === 'done' && (
-              <button onClick={() => { resendInvite(detailRow.id); setDetailRow(null); }}
-                className="mt-1 text-sm font-semibold flex items-center gap-1.5 px-3 py-2 rounded-lg" style={{ color: C.primary, background: 'var(--primary-tint)' }}>
-                <Mail size={14} /> Resend invite</button>
-            )}
-          </div>
-        </AccountModal>
+      {view === 'new' && <MigrationStageWizard onStaged={openJob} onCancel={back} />}
+      {view === 'job' && jobId && (
+        <MigrationJobWorkspace key={jobId} jobId={jobId} readiness={readiness} onBack={back} onCountChange={onCountChange} />
       )}
-
-      {/* confirm */}
-      {confirmOpen && (
-        <AccountModal title="Confirm import" subtitle="This creates real accounts + memberships." icon={<ShieldCheck size={16} />} tone="ok"
-          onClose={() => setConfirmOpen(false)} maxW="max-w-md">
-          <div className="text-sm space-y-3" style={{ color: C.text }}>
-            <p>You are about to process <strong>{readyToProcess}</strong> ready row{readyToProcess !== 1 ? 's' : ''}:</p>
-            <ul className="text-sm space-y-1" style={{ color: C.textSoft }}>
-              <li>• New accounts (invited): <strong>{previewRows.filter((r) => r.processing_status === 'ready' && r.match_result === 'new').length}</strong></li>
-              <li>• Existing accounts merged: <strong>{previewRows.filter((r) => r.processing_status === 'ready' && (r.match_result === 'existing_by_source' || r.match_result === 'existing_by_email')).length}</strong></li>
-              <li>• Blocked (excluded): <strong>{pv.blocked}</strong></li>
-            </ul>
-            <p className="text-xs" style={{ color: C.textMute }}>Blocked rows are never processed. Imported members set their own password. Safe to re-run.</p>
-            <div className="flex gap-2 justify-end pt-1">
-              <button onClick={() => setConfirmOpen(false)} className="text-sm px-3 py-2 rounded-lg" style={{ color: C.textSoft, background: 'var(--wash)' }}>Cancel</button>
-              <button onClick={() => { setConfirmOpen(false); runProcess(false); }} className="text-sm font-bold text-white px-4 py-2 rounded-lg" style={{ ...ADMIN_BTN_OK }}>Start import</button>
-            </div>
+      {view === 'jobs' && (
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <button type="button" onClick={() => { setView('new'); setNotice(''); }}
+              className="px-4 py-2 rounded-xl text-sm font-bold text-white inline-flex items-center gap-2" style={MIGRATION_PRIMARY_BTN}>
+              <UploadCloud size={15} /> Stage a roster
+            </button>
+            <MigrationReadiness readiness={readiness} />
           </div>
-        </AccountModal>
+          {!jobs ? <AdminListSkeleton rows={3} /> : jobs.length === 0 ? (
+            <div className="glass-card p-6 text-sm" style={{ color: C.textSoft }}>No rosters have been staged yet.</div>
+          ) : (
+            <ul className="space-y-2.5">
+              {jobs.map((j) => {
+                const st = j.states || {};
+                return (
+                  <li key={j.id}>
+                    <button type="button" onClick={() => openJob(j.id)} className="glass-card w-full p-4 text-left transition hover:opacity-95"
+                      style={{ opacity: j.discarded_at ? 0.6 : 1 }}>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span style={{ fontFamily: fontDisplay, fontWeight: 700, color: C.text }}>{j.filename || 'Roster'}</span>
+                        {j.discarded_at && <span className="text-xs font-semibold" style={{ color: C.textMute }}>Discarded</span>}
+                        {j.run_open && <span className="text-xs font-semibold" style={{ color: C.primary }}>Activation unfinished</span>}
+                        {j.invite_problems > 0 && <span className="text-xs font-semibold" style={{ color: 'var(--status-warn-fg)' }}>{j.invite_problems} email{j.invite_problems === 1 ? '' : 's'} need a resend</span>}
+                      </div>
+                      <div className="mt-1 text-xs" style={{ color: C.textMute }}>
+                        {j.total_rows} rows · {st.ready || 0} ready · {st.inactive || 0} inactive · {st.blocked || 0} blocked · {st.activated || 0} activated
+                        · staged {fmtEnrollDate(j.created_at)}{j.created_by_name ? ` by ${j.created_by_name}` : ''} · <span style={{ fontFamily: fontMono }}>{j.fingerprint}…</span>
+                      </div>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
       )}
     </div>
   );
-}
-
-// Small status pill for the import preview table (reuses the semantic status tokens).
-function ImportStatusPill({ status }) {
-  const map = {
-    ready: { bg: 'var(--status-info-bg)', bd: 'var(--status-info-bd)', fg: 'var(--status-info-fg)', label: 'Ready' },
-    blocked: { bg: 'var(--status-danger-bg)', bd: 'var(--status-danger-bd)', fg: 'var(--status-danger-fg)', label: 'Blocked' },
-    done: { bg: 'var(--status-ok-bg)', bd: 'var(--status-ok-bd)', fg: 'var(--status-ok-fg)', label: 'Imported' },
-    failed: { bg: 'var(--status-danger-bg)', bd: 'var(--status-danger-bd)', fg: 'var(--status-danger-fg)', label: 'Failed' },
-    skipped: { bg: 'var(--status-neutral-bg)', bd: 'var(--status-neutral-bd)', fg: 'var(--status-neutral-fg)', label: 'Skipped' },
-    pending: { bg: 'var(--status-neutral-bg)', bd: 'var(--status-neutral-bd)', fg: 'var(--status-neutral-fg)', label: 'Pending' },
-    processing: { bg: 'var(--status-info-bg)', bd: 'var(--status-info-bd)', fg: 'var(--status-info-fg)', label: 'Processing' },
-  };
-  const s = map[status] || map.pending;
-  return <span className="px-2 py-0.5 rounded-full text-xs font-semibold" style={{ background: s.bg, border: `1px solid ${s.bd}`, color: s.fg }}>{s.label}</span>;
 }
 
 // ═══════════════════════════════════════════════════════════════════

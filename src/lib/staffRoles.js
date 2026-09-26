@@ -63,8 +63,11 @@ export const STAFF_PERMISSIONS = [
     description: 'Select which plan-eligible course programs an approval grants.' },
   { key: 'students.extend_access', category: 'Students', label: 'Grant special extensions',
     description: 'Extend a membership expiry outside the paid request flow. Always audited.' },
-  { key: 'students.import', category: 'Students', label: 'Import students',
-    description: 'Run the Thinkific migration wizard and issue invitations.' },
+  // #67: replaces `students.import`, which Operations Admin held. Activating a legacy
+  // student creates paid access with no payment in this system — the students.extend_access
+  // reasoning — so it is Super Admin only.
+  { key: 'students.legacy_migrate', category: 'Students', label: 'Migrate legacy students',
+    description: 'Stage legacy rosters, activate already-paid memberships and send their invitations. Creates paid access with no payment in this system, so it is Super Admin only.' },
   { key: 'batches.manage', category: 'Students', label: 'Manage cohort batches',
     description: 'Create, edit, close and archive batches, and assign members to them.' },
   { key: 'student_progress.read', category: 'Students', label: 'View student progress reports',
@@ -130,7 +133,7 @@ export const STAFF_ROLES = [
     label: 'Operations Admin',
     rank: 50,
     isProtected: false,
-    description: 'Reviews access requests and payment proofs, grants courses, runs batches and imports, and configures and moderates the community.',
+    description: 'Reviews access requests and payment proofs, grants courses, runs batches, and configures and moderates the community.',
   },
   {
     key: 'trainer',
@@ -150,6 +153,11 @@ export const SUPER_ADMIN_ROLE = 'super_admin';
  * communications.send and #62 meetings.manage, each held by super_admin alone).
  *
  * Two deliberate omissions, both of which a reader will want to challenge:
+ *
+ *   - operations_admin does NOT hold `students.legacy_migrate` (#67, which retired
+ *     `students.import`). Activating an already-paid legacy membership grants a real
+ *     subscription and cohort seats with no payment recorded here — the same reason as
+ *     the next bullet. 34 grants.
  *
  *   - operations_admin does NOT hold `students.extend_access`. A discretionary
  *     expiry extension creates paid access with no payment behind it, so it stays
@@ -184,7 +192,6 @@ export const ROLE_PERMISSIONS = {
     'access_requests.review',
     'enrollments.review',
     'students.assign_courses',
-    'students.import',
     'batches.manage',
     'student_progress.read',
     'community.manage',
@@ -543,7 +550,7 @@ export function canManageCourseClient(ctx, course) {
 export const ADMIN_TAB_PERMISSION = {
   accessrequests: 'access_requests.review',
   enrollments: 'enrollments.review',
-  studentimports: 'students.import',
+  studentimports: 'students.legacy_migrate',
   batches: 'batches.manage',
   staffroles: 'staff.manage',
   // Super Admin only. An Operations Admin reviews payment proofs — and CAUSES a

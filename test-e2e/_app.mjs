@@ -20,7 +20,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { spawn, execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { createClient } from '@supabase/supabase-js';
@@ -106,6 +106,9 @@ export async function startApp({ root = process.env.E2E_APP_ROOT || REPO_ROOT } 
   return {
     url,
     stop() {
+      // E2E_APP_LOG=<file> keeps the dev server's own output (the api/ handlers log there),
+      // which is otherwise lost with the process — the only record of a request that stalled.
+      if (process.env.E2E_APP_LOG) { try { writeFileSync(process.env.E2E_APP_LOG, out); } catch { /* best effort */ } }
       if (child.exitCode !== null) return;
       // Vite leaves an esbuild child; kill the tree on Windows or it outlives the run.
       if (process.platform === 'win32') {

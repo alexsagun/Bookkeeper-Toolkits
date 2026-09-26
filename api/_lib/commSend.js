@@ -46,6 +46,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { BRAND, emailConfigured, emailShell, sendEmail } from './email.js';
+import { supportAddress as sharedSupportAddress } from './supportAddress.js';
 import { renderMessage } from '../../src/lib/commTemplates.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -111,19 +112,10 @@ export function rpcError(error, fn) {
  * The support address replies go to: payment_settings.notify_email, then NOTIFY_ADMIN_EMAIL.
  * `ok: false` means the stored address could not be READ and there is no configured fallback —
  * the sender then stops rather than mailing students with nowhere for a reply to go.
+ * The implementation lives in ./supportAddress.js (#67), shared with the migration's claim emails.
  */
-async function supportAddress(admin) {
-  let stored = null;
-  let readOk = true;
-  try {
-    const { data, error } = await admin.from('payment_settings').select('value').eq('key', 'notify_email')
-      .abortSignal(AbortSignal.timeout(RPC_TIMEOUT_MS)).maybeSingle();
-    if (error) readOk = false; else stored = data?.value;
-  } catch { readOk = false; }
-  const valid = (c) => { const a = String(c || '').trim().toLowerCase(); return EMAIL_RE.test(a) ? a : null; };
-  const fallback = valid(process.env.NOTIFY_ADMIN_EMAIL);
-  if (!readOk) return fallback ? { ok: true, address: fallback } : { ok: false, address: null };
-  return { ok: true, address: valid(stored) || fallback };
+function supportAddress(admin) {
+  return sharedSupportAddress(admin, { timeoutMs: RPC_TIMEOUT_MS });
 }
 
 /** The payment block, built from the live settings. Throws 'payment_settings_unreadable'. */

@@ -60,6 +60,16 @@ export function parseExternalId(raw) {
 // exports are UTC). Rejects locale-ambiguous forms like MM/DD/YYYY. Returns a
 // stable shape so callers can display the timezone explicitly.
 //   { valid, epochMs, iso, display, tz }  (tz is always 'UTC')
+// ★ Every branch checks its components BEFORE building a date. Date.UTC() rolls an
+//   impossible date over silently — 2026-02-31 became March 3 and 2026-13-01 became
+//   January 2027 — so a typo in a roster used to stage as a different, valid-looking
+//   membership date. (#67)
+function componentsValid(y, mo, d, h = 0, mi = 0, se = 0) {
+  if (mo < 1 || mo > 12 || d < 1) return false;
+  if (d > new Date(Date.UTC(y, mo, 0)).getUTCDate()) return false;
+  return h >= 0 && h <= 23 && mi >= 0 && mi <= 59 && se >= 0 && se <= 59;
+}
+
 export function parseStrictDate(raw) {
   const invalid = { valid: false, epochMs: null, iso: null, display: '', tz: 'UTC' };
   if (raw == null) return invalid;
@@ -70,6 +80,7 @@ export function parseStrictDate(raw) {
 
   // ISO 8601 with time + explicit Z/offset, e.g. 2026-07-20T01:52:00Z
   let m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(Z|[+-]\d{2}:?\d{2})?$/.exec(s);
+  if (m && !componentsValid(+m[1], +m[2], +m[3], +m[4], +m[5], +(m[6] || 0))) return invalid;
   if (m) {
     const [, y, mo, d, h, mi, se, zone] = m;
     if (!zone || zone === 'Z') {
@@ -83,6 +94,7 @@ export function parseStrictDate(raw) {
   // Thinkific "2026-07-20 01:52:00 UTC"
   if (epochMs == null) {
     m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2}) UTC$/.exec(s);
+    if (m && !componentsValid(+m[1], +m[2], +m[3], +m[4], +m[5], +m[6])) return invalid;
     if (m) {
       const [, y, mo, d, h, mi, se] = m;
       epochMs = Date.UTC(+y, +mo - 1, +d, +h, +mi, +se);
@@ -92,6 +104,7 @@ export function parseStrictDate(raw) {
   // Date-only "2026-07-20" → UTC midnight.
   if (epochMs == null) {
     m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    if (m && !componentsValid(+m[1], +m[2], +m[3])) return invalid;
     if (m) {
       const [, y, mo, d] = m;
       epochMs = Date.UTC(+y, +mo - 1, +d, 0, 0, 0);
@@ -262,111 +275,12 @@ export function resolveMatchDecision({ hasEmail, emailValid }, matches) {
     reason: 'No existing account — will invite a new one.' };
 }
 
-// ── Membership term computation (the preserve/expired/fresh/lifetime decision) ──
-// Pure. All time inputs are epoch-ms (or null). Returns:
-//   { action, started_at, ends_at, grace_ends_at, status }
-// where *_at are epoch-ms|null and action ∈
-//   'grant' | 'skip_preserve_longer' | 'block_conflict' | 'block_missing_expiry' | 'noop_profile_only'
-// RULES: preserve exact source expiry; grace = ends + 3d; status active only while
-// valid. An existing ACTIVE term is NEVER silently shortened. Different-plan overlap
-// defaults to manual review. "fresh" / "lifetime" are explicit, non-default modes.
-export function computeImportTerm({
-  planKey,
-  accessDays = null,
-  startedAt = null,
-  endsAt = null,
-  mode = 'preserve',
-  existingActiveSub = null,   // { plan_key, ends_at(ms|null), grace_ends_at(ms|null) } | null
-  conflictPolicy = 'keep_longer', // 'keep_longer' | 'overwrite'
-  now,
-}) {
-  const nowMs = typeof now === 'number' ? now : null;
-  if (nowMs == null) throw new Error('computeImportTerm: now (epoch ms) is required');
-
-  if (mode === 'profile_only') {
-    return { action: 'noop_profile_only', started_at: null, ends_at: null, grace_ends_at: null, status: null };
-  }
-
-  // 1) Build the candidate term from the mode.
-  let started_at = null;
-  let ends_at = null;
-  let grace_ends_at = null;
-  let status = 'active';
-
-  if (mode === 'preserve') {
-    if (endsAt == null) {
-      return { action: 'block_missing_expiry', started_at: null, ends_at: null, grace_ends_at: null, status: null };
-    }
-    ends_at = endsAt;
-    grace_ends_at = endsAt + GRACE_DAYS * DAY_MS;
-    started_at = startedAt != null ? startedAt
-      : (accessDays != null ? endsAt - accessDays * DAY_MS : nowMs);
-    status = grace_ends_at > nowMs ? 'active' : 'expired';
-  } else if (mode === 'expired_history') {
-    ends_at = endsAt != null ? endsAt : nowMs;
-    grace_ends_at = ends_at + GRACE_DAYS * DAY_MS;
-    started_at = startedAt != null ? startedAt : null;
-    status = 'expired';
-  } else if (mode === 'fresh') {
-    started_at = nowMs;
-    ends_at = accessDays != null ? nowMs + accessDays * DAY_MS : null;
-    grace_ends_at = ends_at != null ? ends_at + GRACE_DAYS * DAY_MS : null;
-    status = 'active';
-  } else if (mode === 'lifetime') {
-    started_at = startedAt != null ? startedAt : nowMs;
-    ends_at = null;          // never expires (grandfathered)
-    grace_ends_at = null;
-    status = 'active';
-  } else {
-    return { action: 'block_conflict', started_at: null, ends_at: null, grace_ends_at: null, status: null,
-      reason: `Unknown term mode: ${mode}` };
-  }
-
-  // 2) Reconcile with an existing ACTIVE term (never shorten live access).
-  if (existingActiveSub) {
-    const existingEnd = existingActiveSub.ends_at == null
-      ? Infinity
-      : (existingActiveSub.grace_ends_at != null ? existingActiveSub.grace_ends_at : existingActiveSub.ends_at);
-    const existingActive = existingEnd > nowMs;
-
-    if (existingActive) {
-      // A non-active candidate must never disturb a live term.
-      if (status !== 'active') {
-        return { action: 'skip_preserve_longer', started_at, ends_at, grace_ends_at, status };
-      }
-      if (existingActiveSub.plan_key !== planKey) {
-        if (conflictPolicy !== 'overwrite') {
-          return { action: 'block_conflict', started_at, ends_at, grace_ends_at, status,
-            reason: 'A different active plan already exists — resolve manually.' };
-        }
-        // explicit overwrite → supersede + grant
-      } else {
-        const candidateEnd = ends_at == null ? Infinity : (grace_ends_at != null ? grace_ends_at : ends_at);
-        if (candidateEnd <= existingEnd) {
-          return { action: 'skip_preserve_longer', started_at, ends_at, grace_ends_at, status };
-        }
-        // candidate extends the same plan → supersede + grant
-      }
-    }
-  }
-
-  return { action: 'grant', started_at, ends_at, grace_ends_at, status };
-}
-
-// ── Onboarding step decision (retry-safe) ───────────────────────────────────────
-// Decides whether a processed row is an import-created stub that still needs the
-// account_origin/onboarding stamp + a set-password invite. MUST key off the DURABLE
-// row flag (authUserCreated), not just whether generateLink ran THIS pass
-// (createdThisPass): a retry after a mid-row failure resolves the user via link/email
-// (so generateLink never runs this pass) but MUST still stamp + invite — otherwise the
-// account exists with a granted subscription but no password and the forced set-password
-// gate (keyed on account_origin==='import') never fires. An already-sent/resent invite is
-// not re-sent.
-export function decideOnboardingStep({ createdThisPass = false, authUserCreated = false, inviteStatus = null } = {}) {
-  const isImportStub = createdThisPass === true || authUserCreated === true;
-  const inviteAlreadySent = inviteStatus === 'sent' || inviteStatus === 'resent';
-  return { isImportStub, shouldStamp: isImportStub, shouldInvite: isImportStub && !inviteAlreadySent };
-}
+// ── Membership terms ─────────────────────────────────────────────────────────────
+// computeImportTerm() and decideOnboardingStep() were the v1 grant path (fresh / lifetime /
+// overwrite terms, and the stamp-then-invite decision of the old process action). #67
+// removed both: a legacy term now comes only from the roster's own dates, computed in SQL
+// (legacy_import_term) and mirrored by manilaTerm() in src/lib/legacyMigration.js, and the
+// activation saga lives in api/admin/student-imports.js + legacy_import_activate_row().
 
 // ── Per-row field validation (cross-row dup detection is the caller's job) ──────
 // Returns { warnings: string[], errors: string[] } for a normalized staged row.

@@ -1937,3 +1937,29 @@ body.is-col-resizing iframe { pointer-events: none; }
     grid-template-areas: "date desc qty rate amount remove";
   }
 }
+
+/* ── Student Imports migration workspace (#67 — StudentImports in BookkeeperPro.jsx) ──
+   Laid out by the WORKSPACE, not the viewport: at 1024px the tab is 726px wide with the
+   sidebar open and 938px with it collapsed, and a viewport breakpoint cannot tell them apart.
+   Narrow is the base (everything stacks); the thresholds come from the content:
+     · summary | activation side by side at 900px: the cohort table's six columns need
+       ~480px at 14px text, the activation card ~340px for its readiness chips, plus a
+       16px gap and two 20px paddings each side — 480 + 340 + 16 + 80 ≈ 900.
+     · the column-mapping form goes two-up at 620px (two 280px selects + gap), three-up at
+       900px, and the plan|batch mapping tables go side by side at 720px (two ~340px lists).
+   The container is the wrapper INSIDE the TabPanel, never the TabPanel itself —
+   container-type would make that the containing block for every fixed overlay in the tab. */
+.import-workspace { container: import-ws / inline-size; }
+.iw-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+.iw-map-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+.iw-two { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
+@container import-ws (min-width: 620px) {
+  .iw-map-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container import-ws (min-width: 720px) {
+  .iw-two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container import-ws (min-width: 900px) {
+  .iw-grid { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); align-items: start; }
+  .iw-map-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}

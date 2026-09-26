@@ -384,7 +384,9 @@ export const OBJECT_CHECKS = [
       (to_regclass('public.staff_roles')), (to_regclass('public.staff_permissions')),
       (to_regclass('public.staff_role_permissions')), (to_regclass('public.staff_memberships')),
       (to_regclass('public.staff_role_events'))) as v(t)`],
-  ['#45/#58/#61/#62 role x permission matrix is seeded', `select count(*) = 35 as ok
+  // #67 replaced students.import (super_admin + operations_admin) with students.legacy_migrate
+  // (super_admin alone): 35 grants -> 34, still 22 permissions.
+  ['#45/#58/#61/#62/#67 role x permission matrix is seeded', `select count(*) = 34 as ok
       from public.staff_role_permissions`],
   ['#45/#58/#61/#62 all 22 permissions are seeded', `select count(*) = 22 as ok from public.staff_permissions`],
   // The caller-scoped helpers MUST be executable by authenticated: an RLS qual is
@@ -450,8 +452,9 @@ export const OBJECT_CHECKS = [
         qual ilike '%has_staff_permission%'), false) as ok
       from pg_policies where schemaname='public' and policyname in (
         'enroll_req_admin_all','subscriptions_admin_all','batches_admin_all',
-        'student_import_jobs_admin_all','student_import_rows_admin_all',
-        'student_external_accounts_admin_all','profiles_admin_select')`],
+        -- #67 replaced the three import *_admin_all policies with read-only *_migrate_read ones.
+        'student_import_jobs_migrate_read','student_import_rows_migrate_read',
+        'student_external_accounts_migrate_read','profiles_admin_select')`],
   // db:shadow:verify filters pg_policies to schemaname='public', so a STORAGE
   // policy is invisible to it. The migration's own comment (section 15c) says
   // this line is where enrollment_receipts_select gets pinned — so here it is.
@@ -1289,6 +1292,65 @@ export const OBJECT_CHECKS = [
       from pg_constraint where conname = 'enrollment_request_events_action_check'
         and conrelid = 'public.enrollment_request_events'::regclass and convalidated
         and pg_get_constraintdef(oid) like '%decision_reopened%'`],
+
+  // ── #67, legacy student migration ──────────────────────────────────────────
+  // ★ Every access predicate requires status = 'active', so a 'scheduled' term grants
+  //   nothing; these checks prove the status, its shape, its one-per-member index, its
+  //   named guard and the sweep that opens it all exist in the LIVE database.
+  ['#67    students.legacy_migrate is held by super_admin alone; students.import is gone', `select
+        (select array_agg(role_key order by role_key) from public.staff_role_permissions
+          where permission_key = 'students.legacy_migrate') = array['super_admin']::text[]
+    and not exists (select 1 from public.staff_permissions where key = 'students.import') as ok`],
+  ['#67    a scheduled status exists and both subscription CHECKs are VALID', `select count(*) = 2 as ok
+      from pg_constraint where conrelid = 'public.subscriptions'::regclass and convalidated
+       and ((conname = 'subscriptions_status_check' and pg_get_constraintdef(oid) like '%scheduled%')
+         or conname = 'subscriptions_scheduled_shape')`],
+  ['#67    one active-or-scheduled term per member, with the named guard armed', `select
+        exists (select 1 from pg_indexes where indexname = 'subscriptions_one_live_or_scheduled')
+    and exists (select 1 from pg_trigger where tgname = 'subscriptions_scheduled_guard'
+                  and tgrelid = 'public.subscriptions'::regclass and tgenabled = 'O') as ok`],
+  ['#67    the scheduled-term sweep is on pg_cron', `select count(*) = 1 as ok from cron.job
+      where jobname = 'activate-due-scheduled-subscriptions' and command like '%activate_due_scheduled_subscriptions%'`],
+  ['#67    the import tables have no client write path', `select coalesce(bool_and(
+        not has_table_privilege('authenticated', t, 'insert')
+        and not has_table_privilege('authenticated', t, 'update')
+        and not has_table_privilege('authenticated', t, 'delete')), false) as ok
+      from (values ('public.student_import_jobs'), ('public.student_import_rows'),
+                   ('public.student_import_events'), ('public.student_import_activation_runs'),
+                   ('public.student_external_accounts')) as v(t)`],
+  ['#67    each import table has one read policy and no write policy', `select
+        (select count(*) from pg_policies where schemaname = 'public' and right(policyname, 13) = '_migrate_read'
+            and cmd = 'SELECT' and qual ilike '%students.legacy_migrate%') = 5
+    and not exists (select 1 from pg_policies where schemaname = 'public'
+            and tablename in ('student_import_jobs','student_import_rows','student_import_events','student_import_activation_runs')
+            and cmd <> 'SELECT') as ok`],
+  ['#67    the audit trail is append-only', `select exists (select 1 from pg_trigger
+      where tgname = 'student_import_events_guard' and tgrelid = 'public.student_import_events'::regclass and tgenabled = 'O') as ok`],
+  ['#67    the activation functions are service-only; the Super Admin RPCs are not anon', `select
+        coalesce(bool_and(not has_function_privilege('authenticated', p.oid, 'execute')
+                          and not has_function_privilege('anon', p.oid, 'execute'))
+          filter (where p.proname in ('legacy_import_stage','legacy_import_activate_row','legacy_import_bind_user',
+            'legacy_import_claim_rows','legacy_import_begin_invite','legacy_import_record_delivery',
+            'legacy_import_find_auth_user','activate_due_scheduled_subscriptions','legacy_import_grant_closed_start_run',
+            -- A student must not record their own "you're in" outcome (the first version let them).
+            'legacy_import_onboarding_notice','legacy_import_fail_stale_claims')), false)
+    and coalesce(bool_and(has_function_privilege('authenticated', p.oid, 'execute')
+                          and not has_function_privilege('anon', p.oid, 'execute'))
+          filter (where p.proname in ('legacy_import_jobs_list','legacy_import_rows_page','legacy_import_revert',
+            'legacy_import_set_eligibility','activate_my_due_membership','legacy_import_set_terms',
+            'complete_import_onboarding','my_migration_summary')), false) as ok
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public'`],
+  ['#67    no staged row holds a token, and the discarded v1 jobs hold no student data', `select
+        not exists (select 1 from information_schema.columns where table_schema = 'public'
+                     and table_name like 'student_import%' and column_name ~ '(token|action_link)')
+    and not exists (select 1 from public.student_import_rows r join public.student_import_jobs j on j.id = r.job_id
+                     where j.pipeline = 'v1' and j.status = 'discarded'
+                       and (r.mapped <> '{}'::jsonb or r.email_normalized is not null)) as ok`],
+  ['#67    Access Requests excludes and refuses a pending import account', `select count(*) = 3 as ok
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public'
+       and ((p.proname in ('admin_access_request_queue','admin_access_request_pending_count')
+              and p.prosrc like '%account_origin = ''import'' and p.approval_status = ''pending''%')
+         or (p.proname = 'admin_review_access_request' and p.prosrc like '%ACCESS_REQUEST_IMPORT_TARGET%'))`],
 
 ];
 

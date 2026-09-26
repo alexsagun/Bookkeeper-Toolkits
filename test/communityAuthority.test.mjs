@@ -113,7 +113,7 @@ test('hasStaffAccess is the union, and a lone permission is enough', () => {
 test('a non-community permission never leaks into community authority', () => {
   const ops = normalizeStaffContext({
     is_staff: true, role_key: 'operations_admin', status: 'active',
-    permissions: ['enrollments.review', 'batches.manage', 'students.import'],
+    permissions: ['enrollments.review', 'batches.manage', 'students.assign_courses'],
   });
   assert.deepEqual(communityAuthority({ staff: ops, ...READY }),
     { canConfigure: false, canModerate: false, hasStaffAccess: false });

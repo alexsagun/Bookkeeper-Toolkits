@@ -59,10 +59,12 @@ running it.
 
 ## 3. The permission matrix
 
-Three fixed roles, 22 permissions, **35 grants**. #45 seeded 18 permissions and 26 grants; #52 added
+Three fixed roles, 22 permissions, **34 grants**. #45 seeded 18 permissions and 26 grants; #52 added
 `student_progress.read` for Super Admin and Operations Admin; **#56 gave both community
 permissions to Operations Admin AND Trainer**; **#58 added `finance.manage` and #61
-`communications.send`, and #62 `meetings.manage`, each for Super Admin alone**. Mirrored in
+`communications.send`, and #62 `meetings.manage`, each for Super Admin alone**; **#67 replaced
+`students.import` (Super Admin + Operations Admin) with `students.legacy_migrate` (Super Admin alone)**,
+because activating a legacy student creates paid access with no payment recorded here. Mirrored in
 [src/lib/staffRoles.js](src/lib/staffRoles.js); `test/staffRolesSql.test.mjs` fails if the two drift.
 
 | Permission | Super Admin | Operations Admin | Trainer |
@@ -73,7 +75,7 @@ permissions to Operations Admin AND Trainer**; **#58 added `finance.manage` and 
 | `enrollments.review` — review payment proofs | ✅ | ✅ | — |
 | `students.assign_courses` — choose granted courses | ✅ | ✅ | — |
 | `students.extend_access` — discretionary extensions | ✅ | — | — |
-| `students.import` — run the Thinkific migration | ✅ | ✅ | — |
+| `students.legacy_migrate` — stage legacy rosters and activate already-paid memberships | ✅ | — | — |
 | `batches.manage` — cohorts and seat assignment | ✅ | ✅ | — |
 | `student_progress.read` — operational progress reports | ✅ | ✅ | — |
 | `courses.create` — create and duplicate courses | ✅ | — | ✅ |
@@ -287,7 +289,7 @@ Then check it as a human, in two browser profiles:
 | Signed in as | Should see | Should NOT see |
 |---|---|---|
 | Super Admin | everything, incl. Team & Roles | — |
-| Operations Admin | Access Requests, Enrollments, Student Imports, Batches | Team & Roles, course builder controls |
+| Operations Admin | Access Requests, Enrollments, Batches | Team & Roles, Student Imports, course builder controls |
 | Trainer | the course catalogs + the builder for **assigned** courses | payments, students, batches, staff, Publish/Delete |
 | Student | the toolkit their plan entitles them to | every `/admin/*` route, by direct URL too |
 

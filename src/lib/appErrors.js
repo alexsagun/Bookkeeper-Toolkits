@@ -175,6 +175,20 @@ export const APP_ERROR_CODES = [
   'LESSON_ASSET_ALT_REQUIRED',
   'LESSON_ASSET_BAD_PATH',
   'LESSON_ASSET_UNKNOWN_REF',
+  // Legacy student migration (#67)
+  'MEMBERSHIP_SCHEDULED_CONFLICT',
+  'ACCESS_REQUEST_IMPORT_TARGET',
+  'LEGACY_JOB_NOT_FOUND',
+  'LEGACY_JOB_BUSY',
+  'LEGACY_JOB_SETTINGS_DIFFER',
+  'LEGACY_TERMS_INVALID',
+  'LEGACY_STAGE_INVALID',
+  'LEGACY_ROW_NOT_READY',
+  'LEGACY_CONFIRMATION_MISMATCH',
+  'LEGACY_RUN_NOT_FOUND',
+  'LEGACY_RUN_BUSY',
+  'LEGACY_IDENTITY_MISMATCH',
+  'LEGACY_REVERT_REFUSED',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -492,6 +506,44 @@ const COPY = {
   LESSON_ASSET_UNKNOWN_REF:
     'This lesson refers to an image that doesn’t exist, or that belongs to an unrelated course. '
     + 'Images can only be reused within the course they were uploaded to, or a copy of it.',
+  MEMBERSHIP_SCHEDULED_CONFLICT:
+    'This student has a migrated membership that has not started yet, so another term can’t be added '
+    + 'beside it. Review the student in Student Imports first. Nothing was changed.',
+  ACCESS_REQUEST_IMPORT_TARGET:
+    'This is a migrated student whose account is still being set up. Manage it from Student Imports '
+    + 'instead. Nothing was changed.',
+  LEGACY_JOB_NOT_FOUND:
+    'That migration job no longer exists. Refresh the list of jobs and open it again.',
+  LEGACY_JOB_BUSY:
+    'That job was discarded, or an activation is still running on it. Pause the activation first, '
+    + 'or open the job again to see its current state.',
+  LEGACY_JOB_SETTINGS_DIFFER:
+    'This roster is already staged, but with a different date format, column or label mapping, or '
+    + 'choice of cohorts. Open that job to check it; to stage the file again with these settings, '
+    + 'discard that job first.',
+  LEGACY_TERMS_INVALID:
+    'Those membership terms cannot be granted. Check that the plan is active, the batch is not '
+    + 'archived, a VIP membership has a batch, and the membership ends on or after it starts and has not already ended.',
+  LEGACY_STAGE_INVALID:
+    'Something required is missing: the declared date format, a reason, or the rows themselves. '
+    + 'Check the highlighted step and try again. Nothing was staged or changed.',
+  LEGACY_ROW_NOT_READY:
+    'Some of the rows you chose are not ready to activate. Refresh the list, keep only rows marked '
+    + 'Ready to activate, and try again. Nothing was activated.',
+  LEGACY_CONFIRMATION_MISMATCH:
+    'The confirmation you typed does not match the number of rows being activated. Type it exactly as '
+    + 'shown and try again. Nothing was activated.',
+  LEGACY_RUN_NOT_FOUND:
+    'That activation could not be found. Refresh the job to see which rows are already done.',
+  LEGACY_RUN_BUSY:
+    'Another window is already working on this activation, or these rows are part of an unfinished '
+    + 'one. Resume that activation instead of starting a new one.',
+  LEGACY_IDENTITY_MISMATCH:
+    'The account found for this row does not match its email or Thinkific id, so nothing was granted. '
+    + 'Review the row before trying again.',
+  LEGACY_REVERT_REFUSED:
+    'This activation can no longer be reverted here, because the student has started using the '
+    + 'membership. Change it from Enrollments instead.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };

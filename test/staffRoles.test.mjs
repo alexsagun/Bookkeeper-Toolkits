@@ -172,13 +172,15 @@ test('every permission is held by at least one role', () => {
 
 test('operations_admin runs student operations and the community, and nothing else', () => {
   const allowed = ['access_requests.review', 'enrollments.review', 'students.assign_courses',
-    'students.import', 'batches.manage', 'student_progress.read',
+    'batches.manage', 'student_progress.read',
     // #56. Granting these is what made the server-side re-gate mandatory: #45 left every
     // community RPC on is_admin() precisely BECAUSE only super_admin held them.
     'community.manage', 'community.moderate'];
   for (const key of allowed) assert.ok(staffCan(OPS, key), `Operations Admin must hold ${key}`);
 
   // The four that matter most, named individually so a regression says which one.
+  assert.equal(staffCan(OPS, 'students.legacy_migrate'), false,
+    'activating a legacy student creates paid access with no payment here — Super Admin only (#67)');
   assert.equal(staffCan(OPS, 'staff.manage'), false,
     'an Operations Admin who can manage staff can promote themselves to Super Admin');
   assert.equal(staffCan(OPS, 'students.extend_access'), false,
@@ -207,7 +209,7 @@ test('trainer authors courses, runs the community, and reaches nothing else', ()
   assert.equal(staffCan(TRAINER, 'student_progress.read'), false,
     'community moderation exposes community identities, not the private progress report');
   assert.equal(staffCan(TRAINER, 'access_requests.review'), false, 'a Trainer approves no signups');
-  assert.equal(staffCan(TRAINER, 'students.import'), false, 'a Trainer runs no migrations');
+  assert.equal(staffCan(TRAINER, 'students.legacy_migrate'), false, 'a Trainer runs no migrations');
   assert.equal(staffCan(TRAINER, 'sidebar.customize'), false, 'a Trainer renames nothing app-wide');
   assert.equal(staffCan(TRAINER, 'payment_settings.manage'), false, 'a Trainer touches no money');
 });
@@ -436,7 +438,7 @@ test('a student gets 403', () => {
 });
 
 test('an unavailable check denies — it never fails open', () => {
-  const v = staffAuthVerdict({ rpc: rpcBroken(), permission: 'students.import' });
+  const v = staffAuthVerdict({ rpc: rpcBroken(), permission: 'students.legacy_migrate' });
   assert.equal(v.allow, false,
     'the anthropic proxy fails OPEN on an indeterminate is_enrolled() (signed-url now fails '
     + 'closed — see voiceSessionVerdict); a STAFF check must not, because what it guards is '
@@ -586,10 +588,11 @@ test('no student and no Trainer can open an admin tab', () => {
   }
 });
 
-test('an Operations Admin opens exactly the four student-operations tabs', () => {
+test('an Operations Admin opens exactly the three student-operations tabs', () => {
   const open = Object.keys(ADMIN_TAB_PERMISSION).filter((t) => staffCan(OPS, ADMIN_TAB_PERMISSION[t]));
-  assert.deepEqual(open.sort(), ['accessrequests', 'batches', 'enrollments', 'studentimports'],
-    'and never staffroles — that is the self-promotion path');
+  assert.deepEqual(open.sort(), ['accessrequests', 'batches', 'enrollments'],
+    'and never staffroles — that is the self-promotion path — nor, since #67, studentimports: '
+    + 'activating a legacy student creates paid access with no payment in this system');
 });
 
 // ── Entitlement merging ──────────────────────────────────────────────────────

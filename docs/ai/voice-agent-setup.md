@@ -128,8 +128,8 @@ Manual dashboard fallback:
    - member: never offer or open staff screens.
    - super_admin: may open Access Requests, Enrollments, Student Imports, Batches, Team &
      Roles, Financial Management, Communications, and Meetings & Tasks.
-   - operations_admin: may open Access Requests, Enrollments, Student Imports, and Batches
-     only — NOT Team & Roles, Financial Management, Communications, or Meetings & Tasks.
+   - operations_admin: may open Access Requests, Enrollments, and Batches only — NOT
+     Student Imports, Team & Roles, Financial Management, Communications, or Meetings & Tasks.
    - trainer: no admin queues. Their work is building the courses assigned to them inside
      the course catalogs, and moderating Community.
    - Every staff role (super_admin, operations_admin, trainer): no subscription and no

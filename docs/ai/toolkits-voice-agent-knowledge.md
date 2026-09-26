@@ -1,5 +1,5 @@
 <!-- GENERATED FILE — do not hand-edit. Regenerate with `npm run ai:knowledge`
-     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-09-16 -->
+     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-09-26 -->
 
 # Toolkits by Alex — Voice Assistant Knowledge
 
@@ -101,7 +101,7 @@ paths never change.
 | Communications | `communications` | `/admin/communications` | Admin screen: send announcements and student emails, manage email automations, and read the delivery tracker. Super Admin only. |
 | Meetings & Tasks | `meetings` | `/admin/meetings` | Admin screen: schedule Zoom meetings, invite students, keep meeting templates, and use the shared staff to-do board. Super Admin only. |
 | Enrollments | `enrollments` | `/admin/enrollments` | Admin screen: review payment receipts, approve subscriptions, and manage renewals. |
-| Student Imports | `studentimports` | `/admin/student-imports` | Admin screen: migrate legacy Thinkific students — validate, map course-combos to plans, dry-run, and import accounts + memberships. |
+| Student Imports | `studentimports` | `/admin/student-imports` | Super Admin screen: stage legacy Thinkific rosters, then activate already-paid memberships in controlled, audited steps and send each student a set-password email. |
 | Team & Roles | `staffroles` | `/admin/team` | Admin screen: invite staff and manage who they are — assign the Super Admin, Operations Admin and Trainer roles, suspend or revoke access, and read the audit trail of every role change. Super Admin only. |
 | Batches | `batches` | `/admin/batches` | Admin screen: manage the VIP batches — create a monthly batch, edit its name, code, dates, timezone and seat capacities while the batch is current or upcoming, close or archive it, and assign members to their private batch communities. A batch closes automatically once its month ends, and a batch whose period has passed becomes read-only. |
 

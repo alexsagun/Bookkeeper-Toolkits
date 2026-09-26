@@ -68,3 +68,9 @@ bookkeeper-portfolio-generator.html
 
 # Screenshots from `npm run test:e2e` (test-e2e/). Review evidence, regenerated every run.
 test-e2e/.artifacts/
+
+# Real student rosters for the legacy Thinkific migration (#67). They hold names, emails and
+# payment amounts, so they must never be staged. Keep any future roster in private-imports/.
+# Automated tests use synthetic data only (test/legacyMigration.test.mjs).
+/CSV Per students*.csv
+/private-imports/

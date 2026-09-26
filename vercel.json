@@ -9,7 +9,8 @@
     "api/admin/staff.js": { "maxDuration": 30 },
     "api/admin/communications.js": { "maxDuration": 60 },
     "api/cron/communications.js": { "maxDuration": 60 },
-    "api/admin/meetings.js": { "maxDuration": 60 }
+    "api/admin/meetings.js": { "maxDuration": 60 },
+    "api/admin/student-imports.js": { "maxDuration": 60 }
   },
   "crons": [
     { "path": "/api/cron/communications", "schedule": "0 1 * * *" }

@@ -281,7 +281,7 @@ test('every role lands somewhere it may actually open — and never on pricing',
 
 test('an Ops Admin without the enrollments queue falls to the next one they hold', () => {
   assert.equal(staffLandingTab(ctx('operations_admin', ['batches.manage'])), 'batches');
-  assert.equal(staffLandingTab(ctx('operations_admin', ['students.import'])), 'studentimports');
+  assert.equal(staffLandingTab(ctx('operations_admin', ['access_requests.review'])), 'accessrequests');
 });
 
 test('a role with no landing surface still gets the app, not a refusal', () => {

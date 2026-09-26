@@ -153,7 +153,7 @@ test('adminScreensForRole is derived from the real permission matrix', () => {
   const all = Object.keys(ADMIN_TAB_PERMISSION);
   assert.deepEqual(adminScreensForRole('super_admin'), all);
   assert.deepEqual(adminScreensForRole('operations_admin'),
-    ['accessrequests', 'enrollments', 'studentimports', 'batches']);
+    ['accessrequests', 'enrollments', 'batches']);   // #67: Student Imports is Super Admin only
   // A Trainer holds courses.* and community.* — no admin-tab permission at all.
   assert.deepEqual(adminScreensForRole('trainer'), []);
   assert.deepEqual(adminScreensForRole('member'), []);
@@ -171,7 +171,7 @@ test('adminScreensForRole agrees with ROLE_PERMISSIONS for every non-super role'
 });
 
 test('adminScreensForRole accepts a live context and honours the SERVER permission list', () => {
-  assert.deepEqual(adminScreensForRole(OPS), ['accessrequests', 'enrollments', 'studentimports', 'batches']);
+  assert.deepEqual(adminScreensForRole(OPS), ['accessrequests', 'enrollments', 'batches']);
   assert.deepEqual(adminScreensForRole(EMPTY_STAFF_CONTEXT), []);
   // A Super Admin gets every key even for a permission no migration has created
   // yet — the adminTabVisible() isSuperAdmin arm, which is why Financial
@@ -462,7 +462,7 @@ test('the summary has no parameter that could carry a name or an address', () =>
 test('a staff summary names the role and the real screens', () => {
   const out = voiceMembershipSummary({
     role: 'operations_admin', hasBillingPanels: false,
-    adminScreenLabels: ['Access Requests', 'Enrollments', 'Student Imports', 'Batches'],
+    adminScreenLabels: ['Access Requests', 'Enrollments', 'Batches'],
   });
   assert.match(out, /Operations Admin/);
   assert.match(out, /Enrollments/);

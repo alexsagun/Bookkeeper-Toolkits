@@ -57,7 +57,8 @@ npm run ai:knowledge:check # rebuild the knowledge doc in memory + diff vs disk;
 npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge base
 npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
 npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, bootstrapFolds, courseVideo, courseVideoSql, courseVideoContent, mp4Faststart, studentProgress, studentProgressSql, uiSafety, coaIntegrity, portfolioGenerator,
-                           approveGrantSql, financeDailyIncome, financeDailyIncomeSql, lessonContent, lessonContentSql, lessonDocument, sidebarLayout, …)
+                           approveGrantSql, financeDailyIncome, financeDailyIncomeSql, lessonContent, lessonContentSql, lessonDocument, sidebarLayout,
+                           legacyMigration, legacyMigrationSql, legacyClaimEmail, importClaim, enrollGate, …)
 npm run test:e2e           # RENDERED suites (test-e2e/*.e2etest.mjs): the real app served by Vite against
                            # the SHADOW project, driven through Chrome by a zero-dependency CDP client.
                            # Measures geometry a source scan cannot see (enrollmentLayout, workspaceSweep).
@@ -224,6 +225,16 @@ The sanctioned exceptions to the single-file rule (same spirit as the `main.jsx`
   for the scheme-less input everybody actually types. **No `Date`, no `toLocaleString`** — the year
   and the filename date are parameters, so the same draft is byte-identical everywhere. See
   "Changing what the Portfolio Generator may emit".
+- `src/lib/legacyMigration.js` — the legacy Thinkific migration's rules (#67, pure; imports only
+  `studentImport.js`, the third sanctioned lib→lib import). Declared-format date parsing with
+  component checks, the Manila term mirror of `legacy_import_term()`, explicit plan/batch mapping
+  suggestions (a batch label must also name the batch's month), the record-key input the SQL hashes,
+  `normalizeLegacyRows()` (the preview AND the endpoint's staging), cohort defaults (only the newest
+  cohort is pre-selected), the activation state machine and the typed phrase. SQL is the authority.
+- `src/lib/importClaim.js` — the migrated-student claim link (#67): the `src/lib/staffInvite.js`
+  design with its own path and fragment key, so neither link can be read as the other.
+- `src/lib/enrollGate.js` — `subAccess()` + `enrollGateState()`, extracted by #67 so the `scheduled`
+  state is tested (`test/enrollGate.test.mjs`) rather than trusted to a comment.
 - `src/lib/financeDailyIncome.js` — the client half of Financial Management → Daily Income (#64)
   (pure, no imports, five exports). The SERVER computes every figure; this decides only which columns
   exist (from the response's `plans`, in its order — nothing here names a plan key), how a month is
@@ -650,8 +661,8 @@ feed load, the realtime subscription, the detail fetch, and every write.
 **Lockstep set when segment/batch rules change:** the `community_segment` seed ↔
 `PLAN_SEGMENT_FALLBACK`/`planSegment()` in [src/lib/communitySpaces.js](src/lib/communitySpaces.js)
 ↔ `user_community_space_ids()` ↔ `approvalBatchPreselect()` (the pure mirror of
-`admin_finalize_enrollment()`'s batch precedence) ↔ `batchGapForProcess()` (the import path's
-process-time re-validation) — all pinned by `test/communitySpaces.test.mjs`.
+`admin_finalize_enrollment()`'s batch precedence) ↔ `batchGapForProcess()` (the v1 import path's
+process-time re-validation; nothing calls it since #67 replaced that path) — all pinned by `test/communitySpaces.test.mjs`.
 Batch UI: paywall open-batch selector (VIP only), approve-modal picker, `AdminBatches` tab
 (`batches` route `/admin/batches`), import `batch_code` column. **Two batch facts that surprise
 people:** per-segment **capacity is enforced only on the two admin RPC paths** (approval +
@@ -762,60 +773,190 @@ seat-holder renew, and no entitlement, space or history is touched. Client mirro
   **[COMMUNITY_SETUP.md](COMMUNITY_SETUP.md)**. Community data is in Supabase — nothing
   goes in `LEGACY_KEYS`.
 
-### Student Imports (admin — Thinkific → Toolkit migration) — `StudentImports`
+### Student Imports (Super Admin — the legacy Thinkific migration) — `StudentImports`
 
-The admin-only migration system for moving legacy Thinkific students into the Toolkit's own
-membership. Tab id `studentimports`, route `/admin/student-imports`, an `isAdmin`-gated sidebar link
-beside Access Requests + Enrollments (**not** in `DEFAULT_STAGES` — the same standalone-link pattern
-as the other admin tabs). Migration **#26**
-([db/2026-07-23-student-imports.sql](db/2026-07-23-student-imports.sql), folded into the bootstrap
-§16). Full runbook: **[STUDENT_IMPORT_SETUP.md](STUDENT_IMPORT_SETUP.md)**.
+The migration workspace for moving legacy paid Thinkific students into the Toolkit. Tab id
+`studentimports`, route `/admin/student-imports` (+ `?job=<id>` to reopen a job), an admin-nav row
+gated on **`students.legacy_migrate`**. Built by **#67**
+([db/2026-09-25-legacy-student-migration.sql](db/2026-09-25-legacy-student-migration.sql), fold
+**§54**) on the #26 tables. Runbook: **[STUDENT_IMPORT_SETUP.md](STUDENT_IMPORT_SETUP.md)**.
 
-- **Core principle:** imports create **real** Supabase Auth accounts (students set their OWN password)
-  and grant **real dated `subscriptions` rows** that flow through `public.is_enrolled()` exactly like a
-  paid enrollment — **never** fake `enrollment_requests`/receipts/payments. Imported terms are marked
-  `subscriptions.grant_source='import'` + `source_import_row_id` (a **partial** `unique` index =
-  one grant per import row) so they're distinguishable + idempotent, and this is **additive** — the
-  existing `approve_subscription()`/`approve_extension()` signatures/bodies are untouched (their
-  inserts leave the new columns at defaults, which the partial index never covers).
-- **Non-negotiable data rule:** never infer paid access/plan/payment/start/expiry from a course title,
-  account-created date, last-sign-in, or amount-spent. Plan comes from the admin's explicit
-  course-combo mapping (read live from `enrollment_plans`); term dates come from a trustworthy source
-  (Orders/ledger/manual template). A bare Thinkific **User** export (blank emails) **stages** but
-  grants nothing — all new-account rows are **blocked** until email + exact expiry are supplied.
-- **Tables** (all RLS admin-only; `student_external_accounts` also self-read):
-  `student_import_jobs` (staged upload + `settings` combo→plan map + resumable `cursor`) →
-  `student_import_rows` (per-row `mapped` raw/normalized payload — purgeable — + `proposed_*` /
-  `match_result` / `intended_action` / `processing_status` / idempotency flags), `student_external_
-  accounts` (durable `unique(source, external_user_id)` link), `student_import_events` (immutable
-  audit — admin select+insert, **no** update/delete; IDs + safe codes only, never PII/links).
-  Plus `profiles.account_origin`/`onboarding_status`/`invited_at`/`onboarding_completed_at` +
-  the narrow `complete_import_onboarding()` SECURITY DEFINER RPC (the student's own onboarding write).
-- **Server** — [api/admin/student-imports.js](api/admin/student-imports.js) (Vercel + `npm run dev`
-  via the `studentImportDevApi` middleware in vite.config.js). Holds the **service-role** key
-  (`SUPABASE_SECRET_KEY`, legacy fallback `SUPABASE_SERVICE_ROLE_KEY`; never `VITE_`-prefixed / never
-  returned/logged). **Every action verifies the caller JWT + independently confirms
-  `profiles.is_admin` BEFORE the service client is constructed** (same `verifyCaller`/`callerIsAdmin`
-  idiom as the notify/proxy endpoints). Actions: `dry-run` (bulk-match staged rows by source link →
-  normalized email via `profiles.email`; **never by name**; write proposals back — no mutations),
-  `process` (bounded resumable batch from the cursor; per-row idempotent + partial-failure recoverable
-  — three idempotency keys: auth-email uniqueness + external-link unique + `source_import_row_id`
-  unique; never auto-deletes an Auth user), `resend-invite`, and a `GET` health check. Invites use
-  `admin.generateLink` (invite/recovery) → emailed via Resend → **link discarded**.
-- **Pure logic** — [src/lib/studentImport.js](src/lib/studentImport.js): dependency-free ESM shared by
-  the wizard, the endpoint, and `node --test` ([test/studentImport.test.mjs](test/studentImport.test.mjs)).
-  `normalizeEmail`/`parseExternalId`/`parseStrictDate` (strict UTC; rejects ambiguous),
-  `sanitizeCsvCell`/`toCsv` (formula-injection-safe exports), `parseCsv` (BOM/quoted commas),
-  `parseEnrollmentsList`/`comboKeyOf`/`suggestPlanForCombo` (advisory only — never auto-confirms;
-  never suggests sampler/vip, and since #39 gives QBO-only history no suggestion at all), `resolveMatchDecision`, and `computeImportTerm` (the
-  preserve/expired_history/fresh/lifetime + never-shorten-a-longer-active-term decision table).
-- **Onboarding gate:** an imported user (`profiles.account_origin='import'` + `onboarding_status !=
-  'completed'`) is forced onto `SetPasswordScreen` (reuses `updatePassword` +
-  `complete_import_onboarding()` RPC) via a new early-return in the auth gate **after** `profileReady`
-  and **before** the enrollment block. `PROFILE_SELECT` (AuthProvider.jsx) carries the two onboarding
-  columns; a pre-#26 DB drops them via the column fallback → the gate simply never triggers (safe
-  degrade). After completion the imported subscription flows through `useEnrollmentGate → is_enrolled`
-  with zero special-casing. Import state is server-side — nothing goes in `LEGACY_KEYS`.
+- ★ **SUPER ADMIN ONLY, AND THAT IS THE POINT.** `students.legacy_migrate` replaced `students.import`,
+  which Operations Admin held. Activating a legacy student creates a real subscription and cohort
+  seats with no payment recorded in this system — the `students.extend_access` reasoning (#47). The
+  old key is DELETED, not left dead. 22 permissions / **34 grants**.
+- ★ **STAGED IS NOT ACTIVATED.** A roster is staged once into a durable job; every row is then
+  `inactive`, `ready` or `blocked` (`validation_status` and `activation_state` are separate columns,
+  so a valid row can be deliberately inactive). Staging creates no Auth user, no subscription, no
+  approval and no email. Only cohorts the Super Admin ticks at staging are `ready` (the UI pre-ticks
+  the newest one); every other valid row is `inactive` until someone promotes it WITH A REASON.
+- ★ **NOTHING IS GUESSED.** The date format is declared (`M/D/YYYY` / `D/M/YYYY` / `YYYY-MM-DD`,
+  no default, four-digit years only, components range-checked). A plan comes from an explicit
+  label→plan mapping; a batch from an explicit label→code mapping that must ALSO name the batch's
+  month and fit the row's start date. The historical amount (₱15,999) is kept as history —
+  `legacy_amount_paid` — and never touches today's price or Financial Management.
+- ★ **THE BROWSER NEVER WRITES AN IMPORT TABLE.** Client INSERT/UPDATE/DELETE are revoked on all five
+  tables; each keeps ONE SELECT policy on the new permission (`student_external_accounts` also keeps
+  the member's own-row read). The browser sends parsed rows to `api/admin/student-imports.js`, which
+  re-normalizes them with the shared [src/lib/legacyMigration.js](src/lib/legacyMigration.js) and
+  calls `legacy_import_stage()`; SQL re-validates every row, recomputes the record key, and is the
+  authority. `student_import_events` is append-only by trigger (with the FK SET NULL exemption).
+- ★ **ONE LEGACY PURCHASE IS ACTIVATED ONCE.** `legacy_record_key` = sha256(`thinkific|` + external id
+  or `email:` + normalized email + `|plan|batch_code`), with a partial unique index over
+  `activating`/`activated` rows across EVERY job. The same roster staged twice reopens the first job
+  (unique content fingerprint); a corrected roster stages its already-staged people as `duplicate`,
+  and the remediation is discarding the old job — never a silent re-grant. A row whose purchase is
+  already live in another row is blocked at the CLAIM (`duplicate_staged`), because letting the
+  unique index abort the claim would wedge the whole run behind a bare `23505` on every retry.
+  ★ **THE SAME ROWS READ DIFFERENTLY ARE NOT THE SAME JOB.** The fingerprint covers the cells, not
+  how they were read, so re-staging to correct a date format or a mapping used to hand back the job
+  staged with the WRONG one — and 11/10 misread as 10/11 still lands inside the batch window, so
+  nothing downstream would notice. Staging compares the five settings and refuses with
+  `LEGACY_JOB_SETTINGS_DIFFER`, naming which differ and the job to open or discard. Its advisory
+  lock is keyed on the FUNCTION, not the content: two different files holding the same student could
+  otherwise stage at once, neither seeing the other's rows.
+- **Activation is a saga whose grant is one transaction.** `start-activation` takes selected READY
+  ids — or FAILED ones, to retry — (any other id refuses the whole run, `LEGACY_ROW_NOT_READY`), a
+  typed `ACTIVATE <n>` and a client
+  key (a double click returns the same run); runs cap at 200 rows. Each `activate-chunk` request:
+  claims a row (`for update skip locked`, a run lease, stale after 10 minutes > the 60 s
+  `maxDuration`) → finds or `admin.createUser`s the Auth user (no email sent) →
+  `legacy_import_bind_user` records it FIRST → `legacy_import_activate_row` does, in one transaction:
+  the refusals (rejected profile, staff, live/scheduled membership, identity mismatch, term ended,
+  archived batch), the subscription from the SOURCE dates in Asia/Manila (start 00:00, end the last
+  millisecond of the end date, +3-day grace), the cohort run from the live registry via
+  `grant_batch_run` (open start) or `legacy_import_grant_closed_start_run` (closed start — a two-edit
+  copy, line-diffed by the tests), profile approval + paid cache, and the audit event → then the
+  email. No enrollment request, no receipt, no finance posting. An Auth user is never deleted.
+- ★ **A FUTURE START IS A `scheduled` SUBSCRIPTION.** See "Scheduled memberships" below.
+- ★ **EVERY FAILURE HAS A WAY BACK, AND THAT TOOK THREE RULES.** A row is `activating` from its claim
+  until the grant commits or the endpoint marks it failed, and the grant is ONE transaction — so a
+  row still claimed after longer than any request can live was granted nothing.
+  `legacy_import_fail_stale_claims()` (called by `release_run` and by `discard_job`, before its
+  still-running check) turns it into a `failed` row; otherwise a killed function left a row that
+  blocked Discard for ever, with Resume — i.e. activating it — the only exit. Retrying is a **NEW
+  run with its own typed confirmation**, which re-queues the row at zero attempts (the 5-attempt cap
+  is per run) and logs `row_requeued`, so neither an older run nor the cap can strand a row. And a
+  run with nothing left to do is `completed` **even when Pause was asked for**: a run holds its rows
+  against another run while running or paused, and a failed row is not "remaining", so a paused run
+  whose only leftovers are failures would hold them beyond the reach of every button.
+- ★ **ONLY AN ACCOUNT THIS IMPORT CREATED IS MARKED BEFORE THE GRANT.** `legacy_import_bind_user`
+  stamps `account_origin='import'` + `onboarding_status='invited'` only when the import created the
+  account — recognised by the `app_metadata.legacy_import_row_id` the endpoint sets, so a
+  `createUser` that timed out yet succeeded is still known as ours on the retry. A PRE-EXISTING
+  unconfirmed account (a real student's own signup, an unaccepted staff invitee) is stamped only by
+  a SUCCESSFUL activation, in the grant's transaction. Marking it at bind time, ahead of
+  `activate_row`'s refusals, left a refused account hidden from Access Requests, undecidable there,
+  forced onto the set-password screen, and with nothing in Student Imports able to release it.
+- **The claim link** is the staff-invitation design with its own module
+  ([src/lib/importClaim.js](src/lib/importClaim.js)): `generateLink({ type: 'magiclink' })` →
+  `hashed_token` only → `/activate-account#claim=<token>&t=magiclink`, read once at module load and
+  stripped, redeemed by `verifyOtp` on a CLICK (single-flight ref lock) in `ImportClaimScreen`
+  ("Activate your account"), then `IMPORT_ONBOARDING` → `AccountSetupScreen` → `IMPORT_WELCOME` →
+  `ImportWelcomeScreen`. The token stays in the FRAGMENT, not the path the owner's brief sketched
+  (`/activate-account/{token}`): a path token lands in Vercel's logs and `Referer` headers, and a
+  mail scanner's prefetch would spend it. A confirmed existing account instead gets a
+  sign-in notification with no token. Every mint is a new `invite_generation` and a new Resend
+  idempotency key (`legacy-claim-<row>-<gen>`), because a fresh link can invalidate the old one.
+  `UpdatePasswordScreen` also completes import onboarding, so a student recovering an expired link
+  sets one password, not two. The email ([api/_lib/legacyClaimEmail.js](api/_lib/legacyClaimEmail.js))
+  follows the owner's wording — name, email, batch, plan, start, expiry, the link — and says
+  "already paid — nothing to buy".
+- ★ **EVERY MIGRATION EMAIL IS SENT FROM, AND ANSWERED AT, support@alexsagun.com** (owner requirement,
+  2026-09-26): `MIGRATION_SENDER_ADDRESS`, overridable by `MIGRATION_EMAIL_FROM`, passed through
+  `sendEmail`'s `from` option (every other flow still sends from `RESEND_FROM`). Resend refuses a
+  sender whose domain is not verified, so the workspace's **Send test email** (`send-test`) mails the
+  activation template — sample details, no token — to the calling Super Admin's OWN address, resolved
+  server-side, before any student is emailed.
+- ★ **THE SUPER ADMIN ASSIGNS THE TERMS AT ACTIVATION.** The dialog is two steps: (1) the selection's
+  terms grouped by plan, batch and dates, each changeable, then (2) the preflight and the typed phrase.
+  Changes go through `legacy_import_set_terms()` (audited `terms_set` with before/after, validated,
+  all-or-nothing) into `activation_plan_key`/`_batch_id`/`_start_date`/`_end_date`; the roster's own
+  `legacy_*`/`proposed_*` values are never overwritten, and an override equal to the roster is stored
+  as null. `legacy_import_activate_row`, the preflight and the rows page read
+  `coalesce(activation_*, roster)`; the invitation reads the SUBSCRIPTION the row granted (so a resend
+  after an extension quotes the new expiry, and a non-VIP plan names no batch). Continue saves the
+  terms to the rows — the step says so — and a row already inside a running or paused run is refused
+  (`LEGACY_RUN_BUSY`), because its typed confirmation showed the old terms; an unchanged row writes
+  no audit entry. ★ **The confirm step sends the preflight's `row_ids`, never the raw selection**:
+  the preflight excludes rows that stopped being ready or are held by an unfinished run, and a
+  dialog that promised "left out" while sending them hit a whole-run refusal after the terms were
+  saved. ★ **Open access on the activation day** (owner decision,
+  2026-09-26): a group whose start is still ahead is offered "Open access today" PRE-TICKED, which
+  moves only the start; the paid end date stays. The `scheduled` status remains for a start the
+  Super Admin explicitly sets in the future.
+- ★ **THE ACCOUNT PAGE AND THE SUMMARY.** `AccountSetupScreen`: name prefilled and editable, the email
+  prefilled and `readOnly` (the sign-in identity; changed through support), password ≥ 8 and a
+  matching confirmation. It calls `complete_import_onboarding(p_full_name)` — #26's no-argument form
+  is DROPPED and replaced, never overloaded, so the old call still resolves — then
+  `notifyImportOnboarded()`, then opens the one-time summary (`IMPORT_WELCOME`, root session state,
+  price-free): name, email, batch, plan, status and expiry from `my_migration_summary()` (own row),
+  and **Go To Dashboard**.
+- ★ **THE TWO "YOU'RE IN" EMAILS RING ONCE, AND ONLY THE SERVER SAYS SO.** `api/notify-enrollment.js`
+  action `import_onboarded` verifies the student's own JWT (the body carries nothing), then calls the
+  **service-only** `legacy_import_onboarding_notice(p_user)` with THAT uid, which reserves the send
+  (`sending`) and returns every fact; the endpoint emails the admin ("Student Successfully
+  Onboarded", to the `NOTIFY_ADMIN_EMAIL` chain) and the student (account ready, dashboard link,
+  subscription, support), both from the migration sender with keys
+  `legacy-onboarded-{admin,student}-<row>`, then records `sent` (final) or `failed`. ★ It was first
+  written as an own-row RPC granted to `authenticated` — which let a student call the RECORD half
+  directly: mark `sent` so the admin is never told, or loop reserve → `failed` into the append-only
+  event log. Revoked from every client role now; this is the one non-admin handler that builds
+  `service()`, and only after `callerUser()`. A failed notice is retried by the root, once per
+  session, for a migrated account whose setup is complete; at most five reservations per row. No new
+  function file: the count stays at 11.
+- **A phone is a hint, never an identity.** An optional roster column is stored (`legacy_phone`, digits)
+  and shown; a phone shared with another row or an earlier enrollment request under a DIFFERENT email
+  adds the non-blocking warning `phone_shared`. Accounts are matched by email only — linking by phone
+  would hand a paid term to whoever owns the other address's login.
+- **Activation refuses to start** unless email (`RESEND_API_KEY`), the app address (`APP_URL`) and a
+  valid migration sender are all configured. ★ `APP_URL` is required on **every** Vercel deployment, not just
+  production: the old sender fell back to `SUPABASE_URL` (links to the database host), and a
+  Host-header fallback on a PREVIEW deployment — which shares production's database — would email
+  real students links to a throwaway preview. The request's own origin is used only by `npm run dev`.
+- **Access Requests** excludes, and `admin_review_access_request()` refuses
+  (`ACCESS_REQUEST_IMPORT_TARGET`, no Super Admin exemption — the #51 rule), a profile that is
+  `account_origin='import'` and still `pending`: the window between the Auth user and the grant.
+- **Recovery:** `legacy_import_revert` (a scheduled term, or an unclaimed new account) cancels the
+  term and revokes the run through `revoke_batch_run`; after a claim, change it from Enrollments.
+  ★ It keeps the account, its approval and its import onboarding, so a claim link already sent still
+  signs the student in — they then meet the enrollment page, holding no membership. The dialog says so.
+  `legacy_import_purge_raw` removes names and emails from activated/reverted rows and from discarded
+  jobs; provenance stays. #67 discarded and purged the four v1 jobs that never granted anything.
+- The v1 grant path (`process`/`dry-run`, `computeImportTerm`'s fresh/lifetime modes, the private
+  HTML-only Resend sender) is GONE. `communitySpaces.js`'s `resolveBatchForImport`/`batchGapForProcess`
+  are no longer called by the importer.
+- Suites: `test/legacyMigration.test.mjs`, `test/legacyMigrationSql.test.mjs` (dated file + §54, incl.
+  the copied-body line-diffs and the "every live predicate requires `status='active'`" scan),
+  `test/legacyClaimEmail.test.mjs`, `test/importClaim.test.mjs`, `test/enrollGate.test.mjs`,
+  `test/gateMatrix.test.mjs`, `test/tokenLeakage.test.mjs`, `uiSafety` §27,
+  `test-db/legacyMigration.dbtest.mjs`, and the `#67` block of `scripts/audit-db.mjs`.
+
+### Scheduled memberships (#67)
+
+`subscriptions.status` gains **`scheduled`**: a paid term whose start is still ahead. It is
+import-only by CHECK (`grant_source='import'`, a `source_import_row_id`, a real `ends_at`), one per
+member together with any active term (`subscriptions_one_live_or_scheduled`), and
+`subscriptions_scheduled_guard` turns an approval beside it into the named
+`MEMBERSHIP_SCHEDULED_CONFLICT` instead of a raw 23505.
+
+- ★ **IT GRANTS NOTHING BECAUSE EVERY PREDICATE ALREADY REQUIRES `status = 'active'`** — and the
+  grandfather branch needs zero subscription rows. No access function was restated.
+  `test/legacyMigrationSql.test.mjs` scans the latest definition of every function that checks a
+  term's dates and FAILS if one does so without the status — that edit would let a scheduled term
+  through. **Never add a liveness check on dates alone.**
+- It becomes `active` through `activate_due_scheduled_subscriptions()`: pg_cron every 15 minutes
+  (no JWT guard, on purpose — #38's reasoning), `activate_my_due_membership()` (the student's own
+  screen, own rows only), and `admin_activate_due_memberships()`. A due row beside a live active term
+  is not flipped; it is logged once as a conflict.
+- Client: `subAccess()`/`enrollGateState()` now live in [src/lib/enrollGate.js](src/lib/enrollGate.js).
+  A scheduled term is neither valid nor expired, and `enrollGateState` returns `'scheduled'` BEFORE the
+  `is_paid` branch (otherwise a paid scheduled student resolved to `expired` and saw Renew prices).
+  `resolveGateScreen` maps it to `MEMBERSHIP_SCHEDULED` — not a pricing screen, so it never waits on
+  the staff context and never becomes `PROFILE_UNAVAILABLE`. `MembershipScheduledScreen` shows the
+  plan, batch and Manila dates, calls the self-heal on mount/focus/at the start, and shows no price.
+- Capacity: `batch_seat_holders` counts live `active` terms only, so a scheduled student is not in a
+  batch's occupancy until they start (imports are capacity-exempt anyway; the preflight shows both).
 
 ### [src/BookkeeperPro.jsx](src/BookkeeperPro.jsx) — the entire app (~36.8k lines)
 
@@ -1324,8 +1465,12 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   staff-activation-consistency (#50) → access-request-staff-target (#51) →
   student-progress-rankings (#52) → progress-rankings-followup (#53) →
   progress-course-family-scoping (#54) → approve-rpc-grant-revoke (#55) →
-  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61) → meetings-tasks (#62) → management-hardening (#63) → finance-daily-income (#64) → course-lesson-assets (#65) → enrollment-decision-lock (#66)** — see the Staff-authorization
-  and Progress & Rankings sections for what each does. **#66**
+  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61) → meetings-tasks (#62) → management-hardening (#63) → finance-daily-income (#64) → course-lesson-assets (#65) → enrollment-decision-lock (#66) → legacy-student-migration (#67)** — see the Staff-authorization
+  and Progress & Rankings sections for what each does. **#67**
+  ([db/2026-09-25-legacy-student-migration.sql](db/2026-09-25-legacy-student-migration.sql), fold **§54**)
+  is the legacy Thinkific migration and the `scheduled` subscription status — see the Student Imports
+  and Scheduled memberships sections. Restates the staff seed (`students.legacy_migrate` replaces
+  `students.import`; 22 permissions / 34 grants) and `app_error_catalog()` (132 codes). **#66**
   ([db/2026-09-24-enrollment-decision-lock.sql](db/2026-09-24-enrollment-decision-lock.sql), fold
   **§53**) makes a DECIDED enrollment request final: #48's column grant let every
   `enrollments.review` holder PATCH `status`, and both existing guards fire only on a move TO
@@ -1575,7 +1720,7 @@ That direction is the whole safety argument. **Never repair a missed check by ha
 role `is_admin = true`.**
 
 - **Tables** (`db/2026-08-25-staff-authorization.sql`, #45): `staff_roles` / `staff_permissions` /
-  `staff_role_permissions` (the 22 × 3 matrix, **35 grants** — #61 added `communications.send` and #62 `meetings.manage`, each to super_admin alone; #52 added `student_progress.read`, #56 the
+  `staff_role_permissions` (the 22 × 3 matrix, **34 grants** — #67 replaced `students.import` (super_admin + operations_admin) with `students.legacy_migrate` (super_admin alone); #61 added `communications.send` and #62 `meetings.manage`, each to super_admin alone; #52 added `student_progress.read`, #56 the
   two community keys to both non-super roles, #58 `finance.manage` to super_admin alone) → `staff_memberships` (ONE row per
   user, mutated in place; only `status='active'` confers authority, which is what makes a suspension
   take effect on the next *request* rather than the next token refresh) → `staff_role_events`
@@ -1940,7 +2085,7 @@ payee + account quick-picks, never an amount, seeded by category only).
   all lock their row before checking. Add, Match and status changes refuse inside a closed reconciliation.
 - Re-signs five #58 functions (each dropped first) and restates the catalog; #60 restates it again, so
   the catalog has been restated again since, so `CURRENT_CATALOG_MIGRATION` (communityStaffSql) and
-  `CATALOG_OWNER` (financeSql) both point at **#65** (119 codes; #66 adds none) — repoint them with every restatement. No permission changes.
+  `CATALOG_OWNER` (financeSql) both point at **#67** (132 codes) — repoint them with every restatement. No permission changes.
   Suite: `test/financeParitySql.test.mjs` (it pins every stage-review fix above).
 
 **Daily Income (#64, [db/2026-09-19-finance-daily-income.sql](db/2026-09-19-finance-daily-income.sql), fold §51)** —
@@ -2286,7 +2431,7 @@ deleted them silently.
 - ★ **`CATALOG_OWNER` in `test/financeSql.test.mjs` had been stale since #60.** The finance-code check read
   #59's catalog, which is a superseded definition — it kept passing only because no migration since added a
   `FINANCE_` code. Repoint it, and `CURRENT_CATALOG_MIGRATION` in `test/communityStaffSql.test.mjs`, whenever
-  a migration restates `app_error_catalog()`. Both now name #65 (119 codes; #66 adds none).
+  a migration restates `app_error_catalog()`. Both now name #67 (132 codes).
 - Suite: `test/managementHardeningSql.test.mjs` — every assertion runs against the dated file AND the §50
   fold, and all 40 guards are mutation-tested. ★ The mutation runner counts a run that did not finish as an
   ERROR, never as a passing guard: it once read a timeout as "SURVIVED".
@@ -2689,6 +2834,10 @@ explain/quiz/practice/recap the Supabase-hosted courses. Full setup:
   was ever attempted — which is why the enrollment confirmation email was repeatedly believed not
   to exist. It did; it just could not run outside Vercel. Restart the dev server after adding keys
   (Vite reads `.env` at startup). Diagnose from **Enrollments → "Test email"** or the GET health check.
+- **Migration sender (server-only, optional, #67):** `MIGRATION_EMAIL_FROM` overrides the sender of
+  the legacy-migration emails, which otherwise come from `support@alexsagun.com`. Either way that
+  domain must be verified in Resend; prove it with **Student Imports → Send test email** before
+  activating anyone.
 - **Voice assistant (server-only, optional):** `ELEVENLABS_API_KEY` + `ELEVENLABS_AGENT_ID` enable
   the in-app voice widget (`api/elevenlabs/signed-url.js` + the `ai:knowledge:push` / `ai:provision`
   scripts); optional `ELEVENLABS_SERVER_LOCATION` picks the ElevenLabs region, and `ELEVENLABS_VOICE_ID`
@@ -3317,6 +3466,32 @@ docs **in the same change**:
   label ↔ `test/enrollmentDecisionLockSql.test.mjs` + `test-db/enrollmentDecisionLock.dbtest.mjs`.
   ★ Never "fix" a stuck request by adding a client path that PATCHes a decided row back to pending —
   that path IS the hole #66 closed.
+- **Changing how a legacy student is staged or activated** → the rules live in ONE pure module and
+  are mirrored in SQL (#67). Moving together: `src/lib/legacyMigration.js` (date formats, the Manila
+  term, the record-key input, the state vocabularies, `MAX_ACTIVATION_RUN`, `STALE_CLAIM_MINUTES`) ↔
+  `legacy_import_stage()` / `legacy_import_term()` / `legacy_import_record_key()` /
+  `legacy_import_activate_row()` and the row CHECKs in `db/2026-09-25-legacy-student-migration.sql`
+  **and its fold §54** ↔ `api/admin/student-imports.js` ↔ the `StudentImports` workspace ↔
+  `test/legacyMigration.test.mjs` + `test/legacyMigrationSql.test.mjs` +
+  `test-db/legacyMigration.dbtest.mjs` ↔ the `#67` block in `scripts/audit-db.mjs`. The migration is
+  ASSEMBLED by a script that lifts `grant_batch_run` (#39), the access-request trio (#50/#51), the
+  staff seed (#62) and the catalog (#65) verbatim and edits them at anchors; the suite line-diffs
+  every one. ★ A future restatement of any of those copies #67's body, not the older one.
+  ★ `STALE_CLAIM_MINUTES` must stay longer than the endpoint's `maxDuration` in `vercel.json` (pinned).
+  ★ Never let the browser write an import table again, and never give `students.legacy_migrate` to a
+  non-super role: activating a legacy student creates paid access with no payment behind it here.
+- **Adding a subscription status, or a new check on whether a term is live** → every access
+  predicate must require `status = 'active'` (#67). That single fact is what makes a `scheduled`
+  term grant nothing without restating a function; `test/legacyMigrationSql.test.mjs` scans the
+  latest definition of every function and fails on a liveness check by dates alone. The client
+  mirror is `subAccess()` / `enrollGateState()` in `src/lib/enrollGate.js` (`scheduled` is checked
+  BEFORE `is_paid`) ↔ `resolveGateScreen()`'s `MEMBERSHIP_SCHEDULED` arm (NOT a pricing screen) ↔
+  `test/enrollGate.test.mjs` + `test/gateMatrix.test.mjs`.
+- **Changing the migrated-student claim link** → `buildClaimUrl()`/`parseClaimHash()` in
+  `src/lib/importClaim.js` ↔ `api/admin/student-imports.js` (mints `magiclink`, `hashed_token` only)
+  ↔ `readImportClaimFromUrl()` + `ImportClaimScreen` in the monolith ↔ `test/importClaim.test.mjs` +
+  `test/tokenLeakage.test.mjs`. `CLAIM_LINK_TTL_HOURS` mirrors the same Supabase `mailer_otp_exp`
+  setting as `INVITE_LINK_TTL_HOURS`; the test pins them equal.
 - **Adding an error code** → `app_error_catalog()` ↔ `APP_ERROR_CODES` **and `APP_ERROR_COPY`** in
   `src/lib/appErrors.js`. Clients branch on `error.hint`, never on the HTTP status.
 - **Changing when a batch locks, or what an admin may edit on it** → four places move together:
