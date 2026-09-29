@@ -23,17 +23,22 @@ import {
   AGREEMENT_VERSION,
   AGREEMENT_TIERS,
   tierForPlanKey,
+  tierLabelFor,
   accessLabel,
   agreementModel,
   agreementSnapshot,
 } from '../src/lib/trainingAgreement.js';
 import { ENROLLMENT_PLANS_FALLBACK } from '../src/lib/planCatalog.js';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+const readRepo = (rel) => readFileSync(fileURLToPath(new URL(`../${rel}`, import.meta.url)), 'utf8');
 
 // Shaped like public.enrollment_plans, with the live catalog's values.
 const PLANS = Object.freeze([
-  { key: 'sampler', name: 'Sampler Session', price_php: 1499, access_days: 60, support_days: 60 },
-  { key: 'silver_self_paced', name: 'QBO + Resume Combo', price_php: 2999, access_days: 60 },
-  { key: 'vip', name: 'Personalized Coaching Program', price_php: 16999, access_days: 180 },
+  { key: 'sampler', name: 'Essentials', tagline: 'Sampler Session', price_php: 1499, access_days: 60, support_days: 60 },
+  { key: 'silver_self_paced', name: 'Silver · Self-Paced', tagline: 'QBO + Resume Combo', price_php: 2999, access_days: 60 },
+  { key: 'vip', name: 'VIP Package', tagline: 'Personalized Coaching Program', price_php: 16999, access_days: 180 },
 ]);
 
 const model = (planKey = 'vip', opts = {}) => agreementModel(planKey, PLANS, opts);
@@ -45,6 +50,73 @@ test('the agreement carries a version so a signature maps to the text that was s
   assert.equal(typeof AGREEMENT_VERSION, 'string');
   assert.ok(AGREEMENT_VERSION.length > 0);
   assert.equal(model().version, AGREEMENT_VERSION);
+});
+
+// ★ #68 changed the tier headings, which are part of the signed text. The version must
+//   move with them, or every signature under "SAMPLER / SILVER / VIP" would appear to
+//   endorse a document headed with the new package titles.
+test('the version moved past the last wording change (#68 headings)', () => {
+  assert.match(AGREEMENT_VERSION, /^\d{4}-\d{2}-\d{2}$/);
+  assert.ok(AGREEMENT_VERSION >= '2026-09-28', `${AGREEMENT_VERSION} predates the #68 heading change`);
+});
+
+// ── Tier headings are the package titles (#68) ──────────────────────────────
+
+test('each tier column is headed with its package title, the same words as the pricing card', () => {
+  assert.deepEqual(model().columns.map((c) => c.label), ['Essentials', 'Silver · Self-Paced', 'VIP Package']);
+  // Pinned to the catalog, not to this file: a renamed package cannot leave the signed
+  // document heading its column with the old title.
+  for (const col of model().columns) {
+    const plan = ENROLLMENT_PLANS_FALLBACK.find((p) => tierForPlanKey(p.key) === col.key);
+    assert.equal(col.label, plan.name, `${col.key}: heading and catalog title disagree`);
+  }
+  assert.equal(model('silver_self_paced').tierLabel, 'Silver · Self-Paced');
+});
+
+test('no heading uses a retired product name or a bare tier key', () => {
+  const headings = [...model().columns.map((c) => c.label),
+    ...ENROLLMENT_PLANS_FALLBACK.map((p) => model(p.key).tierLabel)];
+  for (const retired of ['Sampler Session', 'QBO + Resume Combo', 'Personalized Coaching Program', 'SAMPLER', 'SILVER', 'VIP']) {
+    assert.ok(!headings.includes(retired), `"${retired}" must not head a column`);
+  }
+  // The body prose names the package too — "Sampler:" was the last trace of the old title.
+  const s5 = asText(model().sections.find((s) => s.n === 5));
+  assert.match(s5, /Essentials: for the length of your term/);
+  assert.doesNotMatch(s5, /Sampler/);
+});
+
+// ── A STORED tier key is shown as its heading (#68 review, L3) ──────────────
+// enrollment_requests.agreement_tier stores the key. The Enrollments card and the admin
+// alert email printed it uppercased — "Signed as SAMPLER · v2026-09-28" — naming the retired
+// product beside a version whose column heading reads "Essentials".
+
+test('tierLabelFor() returns the column heading the student signed under', () => {
+  assert.equal(tierLabelFor('sampler'), 'Essentials');
+  assert.equal(tierLabelFor('silver'), 'Silver · Self-Paced');
+  assert.equal(tierLabelFor('vip'), 'VIP Package');
+  // The same source as the document's headings, for every tier.
+  for (const col of model().columns) assert.equal(tierLabelFor(col.key), col.label, col.key);
+  for (const p of ENROLLMENT_PLANS_FALLBACK) {
+    assert.equal(tierLabelFor(tierForPlanKey(p.key)), model(p.key).tierLabel, p.key);
+  }
+  assert.equal(tierLabelFor(' VIP '), 'VIP Package', 'a hand-edited key in another case still reads as the heading');
+});
+
+test('tierLabelFor() fails closed: an unknown key, a plan key or nothing gives null, never a raw key', () => {
+  for (const k of ['gold', 'silver_self_paced', 'toString', '__proto__', 'constructor', '', null, undefined, 3, {}]) {
+    assert.equal(tierLabelFor(k), null, `${JSON.stringify(k)} must not become a heading`);
+  }
+});
+
+test('no screen or email prints a stored agreement tier key', () => {
+  const app = readRepo('src/BookkeeperPro.jsx');
+  const notify = readRepo('api/notify-enrollment.js');
+  for (const [name, src] of [['BookkeeperPro.jsx', app], ['api/notify-enrollment.js', notify]]) {
+    assert.ok(!/agreement_tier\.toUpperCase\(\)/.test(src), `${name} prints the raw tier key`);
+    assert.ok(/\btierLabelFor\(/.test(src), `${name} names the tier through tierLabelFor()`);
+  }
+  assert.ok(app.includes('Signed {tierLabelFor(r.agreement_tier) ? `as ${tierLabelFor(r.agreement_tier)} ` : \'\'}· v{r.agreement_version}'),
+    'the Enrollments card reads "Signed as Essentials · v…"');
 });
 
 // ── Tier resolution ──────────────────────────────────────────────────────────
@@ -99,7 +171,7 @@ test('the snapshot records who signed what, when, and as which tier', () => {
   assert.equal(snap.version, AGREEMENT_VERSION);
   assert.equal(snap.tier, 'vip');
   assert.equal(snap.plan_key, 'vip');
-  assert.equal(snap.plan_name, 'Personalized Coaching Program');
+  assert.equal(snap.plan_name, 'VIP Package', 'the package title the student chose (#68)');
   assert.equal(snap.student_name, 'Juan dela Cruz');
   assert.equal(snap.signed_on, 'August 20, 2026');
 });

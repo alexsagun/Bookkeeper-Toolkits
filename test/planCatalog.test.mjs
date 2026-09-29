@@ -11,6 +11,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import {
   ENROLLMENT_PLANS_FALLBACK,
@@ -34,6 +35,50 @@ test('the catalog is exactly three plans, in card order', () => {
   assert.deepEqual(ENROLLMENT_PLANS_FALLBACK.map((p) => p.key),
     ['sampler', 'silver_self_paced', 'vip']);
   assert.deepEqual(ENROLLMENT_PLANS_FALLBACK.map((p) => p.position), [1, 2, 3]);
+});
+
+// ★ #68 (owner decision 2026-09-28): the NAME is the package title everywhere in the app,
+//   and the TAGLINE is the product line shown small above it. They were the other way
+//   round. The #68 migration renames the live rows and the bootstrap §9 seed to match;
+//   keys never change.
+test('the package title is the name, and the product line is the tagline', () => {
+  assert.deepEqual(ENROLLMENT_PLANS_FALLBACK.map((p) => [p.key, p.name, p.tagline]), [
+    ['sampler', 'Essentials', 'Sampler Session'],
+    ['silver_self_paced', 'Silver · Self-Paced', 'QBO + Resume Combo'],
+    ['vip', 'VIP Package', 'Personalized Coaching Program'],
+  ]);
+  // One U+00B7 MIDDLE DOT with a single space each side — the exact bytes the SQL writes,
+  // so a label typed from the screen matches the catalog.
+  assert.equal(byKey.silver_self_paced.name, 'Silver · Self-Paced');
+  assert.ok(!/[•⋅‧]/.test(byKey.silver_self_paced.name), 'not a bullet or dot operator');
+});
+
+test('PLAN_LABELS is derived from the catalog names, never hand-typed', () => {
+  assert.deepEqual(PLAN_LABELS, { sampler: 'Essentials', silver_self_paced: 'Silver · Self-Paced', vip: 'VIP Package' });
+  for (const p of ENROLLMENT_PLANS_FALLBACK) assert.equal(PLAN_LABELS[p.key], p.name);
+  assert.equal(planEntitlement('vip').label, 'VIP Package', 'the entitlement label is the package title');
+  assert.equal(planEntitlement('sampler').label, 'Essentials');
+});
+
+test('no plan still carries its old product name as its title', () => {
+  const titles = ENROLLMENT_PLANS_FALLBACK.map((p) => p.name);
+  for (const old of ['Sampler Session', 'QBO + Resume Combo', 'Personalized Coaching Program']) {
+    assert.ok(!titles.includes(old), `"${old}" is a product line now, not a package title`);
+  }
+});
+
+// The header of src/lib/planCatalog.js and the bootstrap §9 comment both say this suite
+// keeps the fallback in lockstep with the §9 seed. Until #68 nothing here read the seed,
+// so a fresh install and a failed catalog fetch could title the same plan differently.
+test('the fallback matches the bootstrap §9 seed: key, title, product line, price', () => {
+  const sql = readFileSync(new URL('../db/000_full_database_bootstrap.sql', import.meta.url), 'utf8')
+    .replace(/\r\n/g, '\n');
+  const at = sql.indexOf('insert into public.enrollment_plans\n  (key, name, tagline, price_php');
+  assert.ok(at > 0, 'the §9 plan seed was not found');
+  const stmt = sql.slice(at, sql.indexOf('on conflict (key) do nothing;', at));
+  const seed = [...stmt.matchAll(/\('([a-z_]+)', '([^']*)', '([^']*)', (\d+),/g)]
+    .map((m) => [m[1], m[2], m[3], Number(m[4])]);
+  assert.deepEqual(seed, ENROLLMENT_PLANS_FALLBACK.map((p) => [p.key, p.name, p.tagline, p.price_php]));
 });
 
 test('prices are the agreed ₱ amounts', () => {

@@ -23,12 +23,14 @@ import {
 import { createPortal } from 'react-dom';
 import { useAuth } from './auth/AuthProvider.jsx';
 import { supabase } from './lib/supabase';
-import { toCsv, parseCsv, IMPORT_TEMPLATE_COLUMNS } from './lib/studentImport';
+import { toCsv, parseCsv, CSV_DUPLICATE_HEADER, IMPORT_TEMPLATE_COLUMNS } from './lib/studentImport';
 import {
   DATE_FORMATS, LEGACY_ERROR_LABELS, LEGACY_FIELDS, LEGACY_WARNING_LABELS, MAX_ACTIVATION_RUN, MAX_STAGE_ROWS,
   activationPhrase, autoMapLegacyHeaders, cohortSummary, defaultEligibleCodes, distinctLabels,
   formatCalendarDate, missingRequiredFields, normalizeLegacyRows, phraseMatches, rowDisplayState,
-  suggestBatchForLabel, suggestPlanForLabel, manilaTodayISO,
+  suggestBatchForLabel, suggestPlanForLabel, manilaTodayISO, normalizeLabel, parseLegacyAmount, STALE_CLAIM_MINUTES,
+  // #68: a batch is a VIP-only fact, and a self-paced plan is made ready by its own tick.
+  defaultEligiblePlanKeys, isVipPlan, planSummary,
 } from './lib/legacyMigration';
 import {
   planSegment, isPremiumSegment, isValidBatchCode, normalizeBatchCode,
@@ -122,7 +124,7 @@ import {
   validateIntake, parseAmountPaid, normalizePhone, MAX_INTAKE_AMOUNT,
   blankIntake, intakeField, fileTypeAllowed, contentTypeFor, intakeValuesFromRequest, intakePayload, ENROLLMENT_PROCESSING_NOTE,
 } from './lib/enrollmentIntake';
-import { AGREEMENT_VERSION, agreementModel, agreementSnapshot } from './lib/trainingAgreement';
+import { AGREEMENT_VERSION, agreementModel, agreementSnapshot, tierLabelFor } from './lib/trainingAgreement';
 import {
   LEADERBOARD_SCOPES, STUDENT_PROGRESS_TRACKS, progressScopeOptions,
 } from './lib/studentProgress';
@@ -2102,16 +2104,45 @@ function AuthScreen({ themePref, onCycleTheme } = {}) {
 // Lets them set a new password — then clearRecovery() drops them into the toolkit
 // (they're already signed in via the recovery session).
 function UpdatePasswordScreen() {
-  const { updatePassword, clearRecovery, profile, refreshProfile } = useAuth();
+  const { updatePassword, clearRecovery, profile, profileReady, refreshProfile } = useAuth();
   const [password, setPassword] = useState('');
   const [showPw, setShowPw] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [done, setDone] = useState(false);
+  // #68 (D7): the password was saved but completing the migrated account was not. Only that
+  // step is retried — Supabase refuses to "change" a password to the one it already has.
+  const [onboardingFailed, setOnboardingFailed] = useState(false);
+  const passwordSetRef = useRef(null);
   // #67: for a migrated student this screen IS their account setup, so it asks for the
   // same 8 characters AccountSetupScreen does; everyone else keeps Supabase's minimum.
   const importSetup = profile?.account_origin === 'import' && profile?.onboarding_status !== 'completed';
   const minLength = importSetup ? 8 : 6;
+
+  // #67: a migrated student whose claim link expired recovers through "Forgot password".
+  // Setting a password here IS finishing onboarding — without this they would be asked for
+  // a second password by AccountSetupScreen straight after.
+  // ★ #68: A FAILURE HERE IS SHOWN, NOT SWALLOWED. #67 dropped the error and said "Password
+  //   updated", and the student then met AccountSetupScreen and set a password twice.
+  const finishOnboarding = async () => {
+    const { error: obErr } = await supabase.rpc('complete_import_onboarding');
+    if (obErr) {
+      setOnboardingFailed(true);
+      setErr('Your password is saved, but we could not finish setting up your account. Press "Finish setting up" to try that step again.');
+      return false;
+    }
+    setOnboardingFailed(false);
+    await notifyImportOnboarded();
+    await refreshProfile?.();
+    return true;
+  };
+
+  const retryOnboarding = async () => {
+    setErr(''); setBusy(true);
+    try { if (await finishOnboarding()) setDone(true); }
+    catch (e2) { setErr(e2?.message || 'Could not finish setting up your account. Please try again.'); }
+    finally { setBusy(false); }
+  };
 
   const submit = async (e) => {
     e.preventDefault();
@@ -2119,15 +2150,12 @@ function UpdatePasswordScreen() {
     if (password.length < minLength) { setErr(`Use at least ${minLength} characters for your password.`); return; }
     setBusy(true);
     try {
-      const { error } = await updatePassword(password);
-      if (error) throw error;
-      // #67: a migrated student whose claim link expired recovers through "Forgot
-      // password". Setting a password here IS finishing onboarding — without this they
-      // would be asked for a second password by AccountSetupScreen straight after.
-      if (importSetup) {
-        const { error: obErr } = await supabase.rpc('complete_import_onboarding');
-        if (!obErr) { await notifyImportOnboarded(); await refreshProfile?.(); }
+      if (passwordSetRef.current !== password) {
+        const { error } = await updatePassword(password);
+        if (error) throw error;
+        passwordSetRef.current = password;
       }
+      if (importSetup && !(await finishOnboarding())) return;
       setDone(true);
     } catch (e2) {
       setErr(e2?.message || 'Could not update your password. Please try again.');
@@ -2178,16 +2206,26 @@ function UpdatePasswordScreen() {
             </div>
 
             {err && (
-              <div className="flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs" style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: `1px solid rgba(208,35,35,0.18)` }}>
+              <div role="alert" className="flex items-start gap-2 px-3 py-2.5 rounded-xl text-xs" style={{ background: 'rgba(208,35,35,0.08)', color: C.red, border: `1px solid rgba(208,35,35,0.18)` }}>
                 <AlertTriangle size={14} className="flex-shrink-0 mt-px" /> <span>{err}</span>
               </div>
             )}
 
-            <button type="submit" disabled={busy}
-              className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
-              style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
-              {busy && <Loader2 size={15} className="animate-spin" />} Update password
-            </button>
+            {onboardingFailed ? (
+              <button type="button" onClick={retryOnboarding} disabled={busy}
+                className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+                style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
+                {busy && <Loader2 size={15} className="animate-spin" />} Finish setting up
+              </button>
+            ) : (
+              // Held until the profile has loaded: whether this is a migrated account's setup
+              // (8 characters, and the onboarding step) is decided from it.
+              <button type="submit" disabled={busy || !profileReady}
+                className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+                style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `inset 0 1px 0 rgba(255,255,255,0.35), 0 6px 16px -4px var(--primary-glow)` }}>
+                {(busy || !profileReady) && <Loader2 size={15} className="animate-spin" />} Update password
+              </button>
+            )}
           </form>
         )}
       </div>
@@ -2385,11 +2423,14 @@ function ImportWelcomeScreen({ onContinue, onSignOut }) {
   const status = s?.status === 'active' ? 'Active'
     : s?.status === 'scheduled' ? `Starts ${fmtManilaDate(s.started_at)}`
     : s?.status ? s.status.charAt(0).toUpperCase() + s.status.slice(1) : '—';
+  // ★ #68: "Package" and the package's name — the same word the pricing cards, the emails and
+  //   the scheduled screen use. A self-paced package holds no cohort, so once the summary has
+  //   loaded without a batch the row is left out rather than printed as "—".
   const rows = [
     ['Name', name || '—'],
     ['Email', s?.email || user?.email || '—'],
-    ['Batch', s?.batch_name || '—'],
-    ['Membership plan', s?.plan_name || '—'],
+    ...(s && !s.batch_name ? [] : [['Batch', s?.batch_name || '—']]),
+    ['Package', s?.plan_name || PLAN_LABELS[s?.plan_key] || '—'],
     ['Subscription status', status],
     ['Subscription expiry', s?.ends_at ? fmtManilaDate(s.ends_at) : '—'],
   ];
@@ -2649,12 +2690,17 @@ function MembershipScheduledScreen({ sub, profile, email, onSignOut, onRefresh }
     return () => { alive = false; };
   }, [sub?.batch_id]);
 
+  // ★ #68 (D5): REFRESH AFTER EVERY ANSWER, NOT ONLY WHEN THIS CALL OPENED IT. Every import
+  //   start is 00:00 Manila — exactly a tick of the 15-minute cron — so the cron usually opens
+  //   the membership first, this call answers `activated: 0`, and #67 then refreshed nothing:
+  //   "Check again" was a button that did not check. The refetch is cheap and it is the only
+  //   thing that moves the gate.
   const checkStart = useCallback(async () => {
     if (!startMs || Date.now() < startMs) return;
     setChecking(true);
     try {
-      const { data, error } = await supabase.rpc('activate_my_due_membership');
-      if (!error && data?.activated > 0) await onRefresh?.();
+      const { error } = await supabase.rpc('activate_my_due_membership');
+      if (!error) await onRefresh?.();
     } catch { /* the cron sweep will still open it */ }
     setChecking(false);
   }, [startMs, onRefresh]);
@@ -2670,7 +2716,7 @@ function MembershipScheduledScreen({ sub, profile, email, onSignOut, onRefresh }
   }, [checkStart, startMs]);
 
   const rows = [
-    ['Program', planName],
+    ['Package', planName],
     ['Batch', batchName || null],
     ['Access starts', fmtManilaDate(sub?.started_at)],
     ['Access until', fmtManilaDate(sub?.ends_at)],
@@ -2690,9 +2736,10 @@ function MembershipScheduledScreen({ sub, profile, email, onSignOut, onRefresh }
           </div>
         ))}
       </dl>
+      {/* #68: only a VIP membership has a batch, so only it is promised a batch community. */}
       <p style={{ fontSize: 13.5, lineHeight: 1.6, color: C.textSoft }}>
-        Your courses and your batch community open on your start date. Come back then and sign in with the same
-        email — this page will take you straight in.
+        {sub?.batch_id ? 'Your courses and your batch community' : 'Your courses and the member community'} open on your start
+        date. Come back then and sign in with the same email — this page will take you straight in.
       </p>
       <p style={{ fontSize: 12.5, lineHeight: 1.6, color: C.textMute }}>
         Questions? Reply to the email we sent you, and our team will help.
@@ -2706,6 +2753,72 @@ function MembershipScheduledScreen({ sub, profile, email, onSignOut, onRefresh }
         </button>
         <button type="button" onClick={onSignOut} className="w-full py-2 text-xs font-semibold" style={{ color: C.textMute }}>
           Signed in as {email} · Sign out
+        </button>
+      </div>
+    </MigrationGateCard>
+  );
+}
+
+// The migration support mailbox. Mirrors MIGRATION_SUPPORT_ADDRESS in
+// api/_lib/legacyClaimEmail.js — the Reply-To of every migration email — so a student held
+// below writes to the same monitored inbox their emails do. uiSafety §27 pins the two equal.
+const MIGRATION_SUPPORT_EMAIL = 'support@alexsagun.com';
+
+/**
+ * #68 — a migrated account whose setup is COMPLETE but which holds no live or scheduled
+ * membership: its activation failed or was refused after the account was made, or it was
+ * reverted. The gate used to hand this student the PAYWALL — asking someone who had already
+ * paid, and had just been told so, to buy the package again.
+ *
+ * ★ NO PRICE, NO PLAN PICKER. It is a hold, like PROFILE_UNAVAILABLE: a way to check again,
+ *   the support address, and Sign out. A ban still outranks it and staff still bypass it —
+ *   that ordering lives in resolveGateScreen(), pinned by test/gateMatrix.test.mjs.
+ */
+function ImportMembershipPendingScreen({ email, onRefresh, onSignOut }) {
+  const [checking, setChecking] = useState(false);
+  const busyRef = useRef(false);
+  // The root passes a fresh closure every render; the listeners below read the latest one.
+  const refreshRef = useRef(onRefresh);
+  refreshRef.current = onRefresh;
+  const check = useCallback(async () => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setChecking(true);
+    try { await refreshRef.current?.(); } catch { /* the screen stays; nothing was lost */ }
+    busyRef.current = false;
+    setChecking(false);
+  }, []);
+  // ★ THE GATE READS profiles.is_paid, WHICH NOTHING PUSHES. A membership granted while this
+  //   card is open changes the subscription, but the cached profile still says unpaid, so the
+  //   card would stay up until a reload. Returning to the tab asks again — the same idiom as
+  //   the scheduled screen — and "Check again" does it by hand. No promise of an email is
+  //   made here: a reverted row may never be activated again.
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === 'visible') check(); };
+    window.addEventListener('focus', check);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { window.removeEventListener('focus', check); document.removeEventListener('visibilitychange', onVisible); };
+  }, [check]);
+  return (
+    <MigrationGateCard title="Your migrated membership is being set up"
+      subtitle="Your account is ready. The membership you already paid for is still being moved across.">
+      <div className="rounded-2xl px-4 py-3" role="note" style={{ background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)', color: 'var(--status-info-fg)', fontSize: 13, lineHeight: 1.55 }}>
+        There is nothing to buy. When your membership is ready, this page opens your dashboard — press Check again, or
+        come back to this tab. You will not need a new link.
+      </div>
+      <p style={{ fontSize: 13.5, lineHeight: 1.6, color: C.textSoft }}>
+        If this is still here tomorrow, write to{' '}
+        <a href={`mailto:${MIGRATION_SUPPORT_EMAIL}`} className="font-semibold underline" style={{ color: C.primary }}>{MIGRATION_SUPPORT_EMAIL}</a>{' '}
+        from the email address you sign in with, and we will sort it out.
+      </p>
+      <div className="flex flex-col gap-2">
+        <button type="button" onClick={check} disabled={checking}
+          className="w-full py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 transition disabled:opacity-60"
+          style={{ background: GLASS.card, border: `1px solid ${GLASS.border}`, color: C.text }}>
+          {checking ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />} Check again
+        </button>
+        <button type="button" onClick={onSignOut} className="w-full py-2 text-xs font-semibold" style={{ color: C.textMute }}>
+          {email ? `Signed in as ${email} · Sign out` : 'Sign out'}
         </button>
       </div>
     </MigrationGateCard>
@@ -3729,6 +3842,18 @@ const fmtEnrollDate = (s) => {
   return isNaN(d) ? '—' : d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 };
 
+// ★ #68 (D2): A MEMBERSHIP'S DATES ARE BUSINESS-CALENDAR DATES. A term starts at 00:00 and
+//   ends at 23:59:59.999 in Manila (legacy_import_term; approve_subscription's day math), so
+//   formatting it in the VIEWER's timezone showed a student outside the Philippines a start
+//   one day early, or an end one day late — while the summary, the scheduled screen and the
+//   emails (fmtManilaDate) said otherwise. Same short format as fmtEnrollDate; use this for a
+//   subscription's started_at / ends_at / grace_ends_at on student-facing surfaces.
+const fmtTermDate = (s) => {
+  if (!s) return '—';
+  const d = new Date(s);
+  return isNaN(d) ? '—' : d.toLocaleDateString(undefined, { timeZone: 'Asia/Manila', year: 'numeric', month: 'short', day: 'numeric' });
+};
+
 // subAccess() and enrollGateState() live in src/lib/enrollGate.js since #67, which added
 // the `scheduled` state (a paid migrated membership whose start is still ahead) and pinned
 // both with test/enrollGate.test.mjs. A scheduled term is neither valid nor expired, and it
@@ -4565,6 +4690,14 @@ function AgreementDocInner({ model, signatureDataUrl, docRef }) {
   // toDataURL here would hand it a new src string every time and defeat that.
   const coachSignature = useMemo(() => typedSignatureDataUrl(model.coachName), [model.coachName]);
 
+  // ★ #68: THE PACKAGE IS NAMED ONCE. The pill used to carry the tier ("VIP") beside a product
+  //   name ("Personalized Coaching Program"); since the rename both are the package title, so
+  //   the signed line read "VIP Package VIP PACKAGE". The pill stays only when the catalog
+  //   name and the tier heading genuinely differ (a later rename in the catalog).
+  const packageName = model.planName || model.tierLabel || '—';
+  const sameName = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+  const showTierPill = !!model.tierKey && !!model.tierLabel && !sameName(model.tierLabel, packageName);
+
   const cell = (v) => {
     if (v === true) return <span style={{ color: DOC.ok, fontWeight: 700 }}>✓</span>;
     if (v === false) return <span style={{ color: DOC.off, fontWeight: 700 }}>—</span>;
@@ -4778,8 +4911,8 @@ function AgreementDocInner({ model, signatureDataUrl, docRef }) {
         <div style={{ background: DOC.wash, borderLeft: `4px solid ${DOC.blueLo}`, borderRadius: 6, padding: '10px 13px', marginBottom: 18 }}>
           <p style={{ margin: 0, fontSize: 12, color: DOC.body, lineHeight: 1.6 }}>
             <strong style={{ color: DOC.ink }}>Student:</strong> {model.studentName || '________________'}
-            {'  '}<strong style={{ color: DOC.ink }}>· Selected program:</strong> {model.planName || '—'}
-            {model.tierKey && (
+            {'  '}<strong style={{ color: DOC.ink }}>· Selected package:</strong> {packageName}
+            {showTierPill && (
               <span style={{ display: 'inline-block', borderRadius: 999, color: '#fff', fontWeight: 700,
                 textTransform: 'uppercase', fontSize: 10, letterSpacing: '0.05em', padding: '2px 9px',
                 marginLeft: 6, background: TIER_PILL_BG[model.tierKey] }}>
@@ -5501,13 +5634,13 @@ function EnrollmentPaywall({ user, profile, priorRequest, prefillFrom, overdue, 
                 </div>
                 {planName && <>Current plan: <span style={{ fontWeight: 600, color: C.text }}>{planName}</span>. </>}
                 {acc.valid && !acc.legacy && (
-                  <>Your access runs until <span style={{ fontWeight: 600, color: C.text }}>{fmtEnrollDate(currentSub.ends_at)}</span> ({acc.daysLeft} day{acc.daysLeft === 1 ? '' : 's'} left). Renewing now <span style={{ fontWeight: 600, color: C.text }}>extends from that date</span> — you never lose days.</>
+                  <>Your access runs until <span style={{ fontWeight: 600, color: C.text }}>{fmtTermDate(currentSub.ends_at)}</span> ({acc.daysLeft} day{acc.daysLeft === 1 ? '' : 's'} left). Renewing now <span style={{ fontWeight: 600, color: C.text }}>extends from that date</span> — you never lose days.</>
                 )}
                 {acc.valid && acc.legacy && (
                   <>Your current membership has no expiry date; approving a renewal starts a dated term from its approval.</>
                 )}
                 {!acc.valid && acc.has && (
-                  <>Your access ended {currentSub?.ends_at ? <>on <span style={{ fontWeight: 600, color: C.text }}>{fmtEnrollDate(currentSub.ends_at)}</span></> : 'recently'}. Pick a package below to get back in — access restarts as soon as your payment is verified.</>
+                  <>Your access ended {currentSub?.ends_at ? <>on <span style={{ fontWeight: 600, color: C.text }}>{fmtTermDate(currentSub.ends_at)}</span></> : 'recently'}. Pick a package below to get back in — access restarts as soon as your payment is verified.</>
                 )}
               </div>
             </div>
@@ -5590,10 +5723,19 @@ function EnrollmentPaywall({ user, profile, priorRequest, prefillFrom, overdue, 
                     ? `0 24px 60px -16px rgba(10,132,255,0.28), inset 0 1px 0 rgba(255,255,255,0.6)`
                     : cardStyle.boxShadow,
                 }}>
-                  <div className="flex items-center justify-between gap-2">
-                    <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: C.textMute }}>{p.tagline || ' '}</div>
+                  {/* #68: the PACKAGE is the title (`name`: "VIP Package", "Silver · Self-Paced",
+                      "Essentials"); the product it contains is the small eyebrow (`tagline`). */}
+                  {/* ★ THE BADGE NEVER SHRINKS (#68 review, U8). The rename put the long product
+                      name ("PERSONALIZED COACHING PROGRAM", ~245px in this tracking) in the eyebrow
+                      of the ~262px-wide featured card, beside a ~100px pill. Neither item could
+                      refuse to shrink, so BOTH wrapped — the pill's "BEST SELLER" broke across two
+                      lines. The pill is fixed (flex-shrink-0 + nowrap); the eyebrow takes what is
+                      left (min-w-0) and wraps between words, top-aligned beside the pill. One
+                      render site serves the enrollment, renewal and upgrade paywalls alike. */}
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0" style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.12em', lineHeight: 1.35, textTransform: 'uppercase', color: C.textMute, overflowWrap: 'break-word' }}>{p.tagline || ' '}</div>
                     {p.badge && (
-                      <span className="px-2.5 py-1 rounded-full text-[10px] font-bold text-white inline-flex items-center gap-1"
+                      <span className="flex-shrink-0 whitespace-nowrap px-2.5 py-1 rounded-full text-[10px] font-bold text-white inline-flex items-center gap-1"
                         style={{ background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})`, boxShadow: `0 4px 10px -2px var(--primary-glow-soft)` }}>
                         <Sparkles size={10} /> {p.badge}
                       </span>
@@ -6697,11 +6839,15 @@ function ProfileSettingsBody({ user, profile, sub, latestReq, entitlement, plan,
               <FactRow k="Plan" v={planLabel} />
               {sub?.batch_id && <BatchFactRow batchId={sub.batch_id} />}
               <FactRow k="Status" v={<MembershipPill label={status.label} tone={status.tone} />} />
-              {plan?.price_php != null && <FactRow k="Price" v={phpFmt(plan.price_php)} />}
-              <FactRow k="Started" v={fmtEnrollDate(sub?.started_at)} />
-              <FactRow k="Expires" v={a.legacy ? 'No expiry' : fmtEnrollDate(a.ends)} />
+              {/* ★ #68 (D6): a migrated term was paid on the old platform, at an old price, for
+                  roster dates — today's catalog price is not a fact about it. */}
+              {sub?.grant_source === 'import'
+                ? <FactRow k="Payment" v="Migrated membership — already paid" />
+                : plan?.price_php != null && <FactRow k="Price" v={phpFmt(plan.price_php)} />}
+              <FactRow k="Started" v={fmtTermDate(sub?.started_at)} />
+              <FactRow k="Expires" v={a.legacy ? 'No expiry' : fmtTermDate(a.ends)} />
               {!a.legacy && <FactRow k={a.inGrace ? 'Grace ends in' : 'Days remaining'} v={a.daysLeft != null ? `${a.daysLeft} day${a.daysLeft === 1 ? '' : 's'}` : '—'} />}
-              {a.inGrace && <FactRow k="Grace ends" v={fmtEnrollDate(a.graceEnds)} />}
+              {a.inGrace && <FactRow k="Grace ends" v={fmtTermDate(a.graceEnds)} />}
             </div>
           )}
 
@@ -6882,12 +7028,20 @@ function MembershipPlanModal({ user, profile, sub, latestReq, entitlement, onOpe
           </div>
 
           <div className="mt-4 rounded-xl px-3.5 py-1" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
-            {plan?.price_php != null && <FactRow k="Price" v={phpFmt(plan.price_php)} />}
-            {Number(plan?.access_days) > 0 && <FactRow k="Duration" v={`${plan.access_days} days`} />}
-            <FactRow k="Started" v={fmtEnrollDate(sub?.started_at)} />
-            <FactRow k="Expires" v={a.legacy ? 'No expiry' : fmtEnrollDate(a.ends)} />
+            {/* ★ #68 (D6): neither today's price nor the plan's standard duration describes a
+                migrated term — its dates came from the roster and it was paid elsewhere. */}
+            {sub?.grant_source === 'import' ? (
+              <FactRow k="Payment" v="Migrated membership — already paid" />
+            ) : (
+              <>
+                {plan?.price_php != null && <FactRow k="Price" v={phpFmt(plan.price_php)} />}
+                {Number(plan?.access_days) > 0 && <FactRow k="Duration" v={`${plan.access_days} days`} />}
+              </>
+            )}
+            <FactRow k="Started" v={fmtTermDate(sub?.started_at)} />
+            <FactRow k="Expires" v={a.legacy ? 'No expiry' : fmtTermDate(a.ends)} />
             {!a.legacy && <FactRow k={a.inGrace ? 'Grace ends in' : 'Days remaining'} v={a.daysLeft != null ? `${a.daysLeft} day${a.daysLeft === 1 ? '' : 's'}` : '—'} />}
-            {a.inGrace && <FactRow k="Grace ends" v={fmtEnrollDate(a.graceEnds)} />}
+            {a.inGrace && <FactRow k="Grace ends" v={fmtTermDate(a.graceEnds)} />}
           </div>
 
           {chips.length > 0 && (
@@ -7076,7 +7230,7 @@ function ExtendAccessModal({ user, profile, sub, latestReq, onClose, onSubmitted
           {/* Current term */}
           <div className="rounded-xl px-3.5 py-1" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
             <FactRow k="Current plan" v={planLabel} />
-            <FactRow k="Current expiry" v={a.legacy ? 'No expiry' : fmtEnrollDate(a.ends)} />
+            <FactRow k="Current expiry" v={a.legacy ? 'No expiry' : fmtTermDate(a.ends)} />
           </div>
 
           {/* Duration */}
@@ -7501,7 +7655,7 @@ function MembershipExpiredScreen({ user, profile, sub, latestReq, email, uid, on
 
           <p className="mt-5 text-center" style={{ fontSize: 13.5, color: C.textSoft, lineHeight: 1.6 }}>
             {planName
-              ? <>Your <span style={{ fontWeight: 600, color: C.text }}>{planName}</span> access{acc.ends ? <> ended on <span style={{ fontWeight: 600, color: C.text }}>{fmtEnrollDate(sub.ends_at)}</span></> : ' has ended'}{acc.graceEnds ? <>, and the 3-day grace period ended on <span style={{ fontWeight: 600, color: C.text }}>{fmtEnrollDate(sub.grace_ends_at)}</span></> : ''}{endedDaysAgo != null && endedDaysAgo > 0 ? ` (${endedDaysAgo} day${endedDaysAgo === 1 ? '' : 's'} ago)` : ''}.</>
+              ? <>Your <span style={{ fontWeight: 600, color: C.text }}>{planName}</span> access{acc.ends ? <> ended on <span style={{ fontWeight: 600, color: C.text }}>{fmtTermDate(sub.ends_at)}</span></> : ' has ended'}{acc.graceEnds ? <>, and the 3-day grace period ended on <span style={{ fontWeight: 600, color: C.text }}>{fmtTermDate(sub.grace_ends_at)}</span></> : ''}{endedDaysAgo != null && endedDaysAgo > 0 ? ` (${endedDaysAgo} day${endedDaysAgo === 1 ? '' : 's'} ago)` : ''}.</>
               : 'Your membership access has ended.'}
             {' '}Renew or upgrade your subscription to continue — all your progress and data are safe.
           </p>
@@ -7519,9 +7673,9 @@ function MembershipExpiredScreen({ user, profile, sub, latestReq, email, uid, on
           {sub && (
             <div className="mt-4 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
               {[['Plan', planName],
-                ['Started', fmtEnrollDate(sub.started_at)],
-                ['Ended', sub.ends_at ? fmtEnrollDate(sub.ends_at) : '—'],
-                ...(acc.graceEnds ? [['Grace ended', fmtEnrollDate(sub.grace_ends_at)]] : [])].map(([k, v]) => (
+                ['Started', fmtTermDate(sub.started_at)],
+                ['Ended', sub.ends_at ? fmtTermDate(sub.ends_at) : '—'],
+                ...(acc.graceEnds ? [['Grace ended', fmtTermDate(sub.grace_ends_at)]] : [])].map(([k, v]) => (
                 <div key={k} className="flex items-center justify-between gap-3 py-1" style={{ fontSize: 12.5 }}>
                   <span style={{ color: C.textMute }}>{k}</span>
                   <span className="text-right" style={{ color: C.text, fontWeight: 600 }}>{v}</span>
@@ -9534,6 +9688,11 @@ export default function BookkeeperProToolkit() {
       return <MembershipScheduledScreen sub={enroll.sub} profile={profile} email={user?.email}
         onSignOut={signOut} onRefresh={enroll.refresh} />;
 
+    // #68: a migrated account set up but holding no membership — never the paywall.
+    case GATE_SCREENS.IMPORT_MEMBERSHIP_PENDING:
+      return <ImportMembershipPendingScreen email={user?.email} onSignOut={signOut}
+        onRefresh={async () => { await refreshProfile?.(); await enroll.refresh?.(); }} />;
+
     // #49: both entry paths land here — arriving from the email link (a token in
     // `staffInvite`), and signing in normally with a pending membership waiting,
     // which is what repairs someone who accepted an old-style invitation and was
@@ -9717,7 +9876,7 @@ export default function BookkeeperProToolkit() {
             return (
               <div className="mt-2 flex items-center gap-1.5 px-2.5" style={{ fontSize: 10.5, color: C.textMute }}>
                 <CalendarClock size={12} style={{ color: tone, flexShrink: 0 }} />
-                <span className="truncate">Access until <span style={{ fontWeight: 600, color: C.textSoft }}>{fmtEnrollDate(a.ends)}</span>{a.daysLeft != null ? <span style={{ color: tone }}> · {a.daysLeft}d left</span> : ''}</span>
+                <span className="truncate">Access until <span style={{ fontWeight: 600, color: C.textSoft }}>{fmtTermDate(a.ends)}</span>{a.daysLeft != null ? <span style={{ color: tone }}> · {a.daysLeft}d left</span> : ''}</span>
               </div>
             );
           })()}
@@ -15071,14 +15230,25 @@ function FinanceBankImportCard({ call, onChanged, version }) {
         table = { headers: hdr, rows: arr.slice(1).filter((r) => r.some((c) => String(c).trim() !== ''))
           .map((r) => Object.fromEntries(hdr.map((h, i) => [h, r[i] != null ? String(r[i]) : '']))) };
       } else {
-        table = parseCsv(new TextDecoder('utf-8').decode(buf));
-        // The CSV reader keys rows by heading, so a repeat has ALREADY overwritten a column.
-        // Refuse rather than stage amounts from the wrong one.
-        const bad = table.headers.filter((h, i) => !String(h).trim() || table.headers.indexOf(h) !== i);
-        if (bad.length) {
-          throw new Error('This CSV has a blank or repeated column heading, so its columns cannot be told apart. '
-            + 'Give every column a unique heading and export it again (or upload it as Excel).');
+        // A bank statement's own advice for a blank or repeated heading. ★ parseCsv refuses a
+        //   REPEATED one itself (#68) — by code, CSV_DUPLICATE_HEADER — and its generic wording
+        //   ("export the file again") dropped the Excel route, which is the real fix for a bank
+        //   whose export cannot rename columns: the XLSX branch above renames repeats. Mapped
+        //   by the code, never by the message text (#68 review, L4).
+        const headingAdvice = 'This CSV has a blank or repeated column heading, so its columns cannot be told apart. '
+          + 'Give every column a unique heading and export it again (or upload it as Excel).';
+        try {
+          table = parseCsv(new TextDecoder('utf-8').decode(buf));
+        } catch (csvErr) {
+          if (csvErr?.code === CSV_DUPLICATE_HEADER) {
+            throw new Error(`${headingAdvice} Repeated heading: "${csvErr.heading}".`);
+          }
+          throw csvErr;
         }
+        // A BLANK heading is still this caller's to refuse: parseCsv allows it (a roster's
+        // trailing comma), but a statement column with no name cannot be told apart.
+        const bad = table.headers.filter((h, i) => !String(h).trim() || table.headers.indexOf(h) !== i);
+        if (bad.length) throw new Error(headingAdvice);
       }
       if (!table.headers.length) throw new Error('No columns found. Is there a header row?');
       if (table.rows.length > 5000) throw new Error(`That file has ${table.rows.length} rows. Split it into files of 5,000 or fewer.`);
@@ -19808,6 +19978,9 @@ function AdminEnrollments({ onCountChange }) {
   // adds its OWN extension_days; every other kind adds the plan's access_days. null = no
   // duration (a lifetime plan).
   const extDaysOf = (r) => (r.request_kind === 'extension' && Number(r.extension_days) > 0 ? Number(r.extension_days) : 0);
+  // ★ #68 (F8): a package is named, never keyed. The request's own snapshot name first, then
+  //   the catalog's, then the in-code fallback — 'plan: silver_self_paced' is not a sentence.
+  const planTitleOf = (key, snapshotName) => snapshotName || plansByKey[key]?.name || PLAN_LABELS[key] || 'this package';
   const projectedEnd = (r) => {
     const days = extDaysOf(r) || Number(plansByKey[r.plan_key]?.access_days);
     if (!days) return null;
@@ -20435,7 +20608,7 @@ function AdminEnrollments({ onCountChange }) {
                               {r.agreement_version && (
                                 <span className="inline-flex items-center gap-1" style={{ fontSize: 10.5, color: C.textMute }}>
                                   <ShieldCheck size={11} style={{ color: 'var(--status-ok-fg)' }} />
-                                  Signed {r.agreement_tier ? `as ${r.agreement_tier.toUpperCase()} ` : ''}· v{r.agreement_version}
+                                  Signed {tierLabelFor(r.agreement_tier) ? `as ${tierLabelFor(r.agreement_tier)} ` : ''}· v{r.agreement_version}
                                 </span>
                               )}
                             </div>
@@ -20670,7 +20843,7 @@ function AdminEnrollments({ onCountChange }) {
           title={kindOf(approveFor) === 'extension' ? 'Approve this extension?' : kindOf(approveFor) === 'upgrade' ? 'Approve this upgrade?' : 'Approve this enrollment?'}
           canClose={busyId == null} onClose={() => setApproveFor(null)}>
           <div className="rounded-xl px-3.5 py-2.5" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
-            {[['Package', approveFor.plan_name || approveFor.plan_key],
+            {[['Package', planTitleOf(approveFor.plan_key, approveFor.plan_name)],
               ['Access scope', planEntitlement(approveFor.plan_key).scopeLabel],
               ['Amount sent', phpFmt(approveFor.amount_paid)],
               ['Expected', phpFmt(approveFor.amount_expected)],
@@ -20708,7 +20881,7 @@ function AdminEnrollments({ onCountChange }) {
                 <div className="mt-3 flex items-start gap-2.5 px-3.5 py-2.5 rounded-xl" style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)' }}>
                   <AlertTriangle size={15} className="flex-shrink-0 mt-px" style={{ color: 'var(--status-warn-fg)' }} />
                   <div style={{ fontSize: 12.5, color: 'var(--status-warn-strong-fg)', lineHeight: 1.5 }}>
-                    {approveFor.plan_name || effKey} needs a <span style={{ fontWeight: 700 }}>batch</span>, but migration #32
+                    {planTitleOf(effKey, approveFor.plan_name)} needs a <span style={{ fontWeight: 700 }}>batch</span>, but migration #32
                     (db/2026-07-28-community-spaces-batches.sql) isn’t applied yet — run it first, then approve.
                   </div>
                 </div>
@@ -20788,8 +20961,8 @@ function AdminEnrollments({ onCountChange }) {
           })()}
           <p className="mt-3.5" style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
             {kindOf(approveFor) === 'extension'
-              ? <>This marks their payment verified and <span style={{ fontWeight: 600, color: C.text }}>adds the purchased time</span> to their current plan ({approveFor.plan_key}).</>
-              : <>This marks their payment verified and <span style={{ fontWeight: 600, color: C.text }}>unlocks the toolkit</span> for their account immediately (plan: {approveFor.plan_key}).</>}
+              ? <>This marks their payment verified and <span style={{ fontWeight: 600, color: C.text }}>adds the purchased time</span> to their current package ({planTitleOf(approveFor.plan_key, approveFor.plan_name)}).</>
+              : <>This marks their payment verified and <span style={{ fontWeight: 600, color: C.text }}>unlocks the toolkit</span> for their account immediately (package: {planTitleOf(approveFor.plan_key, approveFor.plan_name)}).</>}
           </p>
           <div className="mt-5 flex items-center justify-end gap-2.5">
             <button onClick={() => setApproveFor(null)} disabled={busyId != null}
@@ -20916,6 +21089,8 @@ async function migrationApi(action, payload) {
     const e = new Error((json?.code && APP_ERROR_COPY[json.code]) || json?.error || `Request failed (${res.status}).`);
     e.code = json?.code || null;
     e.context = json?.context || null;
+    // #68: a run held by an earlier step's lease says until when, so the page can too.
+    e.busyUntil = json?.busyUntil || json?.context?.lease_until || null;
     throw e;
   }
   return json;
@@ -20929,6 +21104,17 @@ async function migrationRpc(fn, args) {
     throw e;
   }
   return data;
+}
+
+// ONE row of a job, read on its own — for the open panel when a reload no longer holds it
+// (#68 review, U2). rows_page has no id filter, so the row is found by its own email (the
+// search matches the normalized address), across every state, and picked out by id. No
+// email, or no match, is null: the caller keeps what it has.
+async function readMigrationRow(jobId, row) {
+  const q = String(row?.email || '').trim();
+  if (!jobId || !row?.id || !q) return null;
+  const out = await migrationRpc('legacy_import_rows_page', { p_job_id: jobId, p_search: q, p_limit: 200, p_offset: 0 });
+  return (out?.rows || []).find((x) => x.id === row.id) || null;
 }
 
 // Admin AI-trainer indexing/transcription endpoint. Used by the CourseAiTrainerPanel and
@@ -20986,10 +21172,198 @@ function writeImportJobParam(id) {
 
 const labelOfError = (code) => LEGACY_ERROR_LABELS[code] || String(code || '').replace(/_/g, ' ');
 const labelOfWarning = (code) => LEGACY_WARNING_LABELS[code] || String(code || '').replace(/_/g, ' ');
+// ★ KEYED BY WHAT rowDisplayState() RETURNS, WORD FOR WORD. The #67 keys were 'Ready to
+//   activate' and 'Claimed' — labels the function never produced — so both pills fell
+//   through to neutral and a ready row looked exactly like an inactive one.
+//   uiSafety §27 checks every label the function can return has a tone here.
 const MIGRATION_TONES = {
-  'Ready to activate': 'info', Inactive: 'neutral', Blocked: 'danger', Activating: 'info',
-  Activated: 'ok', 'Invitation failed': 'warn', Claimed: 'ok', Failed: 'danger', Reverted: 'neutral', Staged: 'neutral',
+  'Pending activation': 'info', Inactive: 'neutral', Blocked: 'danger', Activating: 'info',
+  Activated: 'ok', 'Invitation failed': 'warn', Onboarded: 'ok', Failed: 'danger', Reverted: 'neutral', Staged: 'neutral',
 };
+
+// ── Package titles (#68) ──────────────────────────────────────────────────────
+// Since #68 `enrollment_plans.name` IS the package title ("VIP Package", "Silver · Self-Paced",
+// "Essentials") and `tagline` is the product line printed under it. The loaded catalog wins;
+// the server's own name comes next; PLAN_LABELS (derived from the in-code fallback) covers a
+// failed catalog read. ★ A RAW PLAN KEY IS NEVER THE ANSWER — 'silver_self_paced' in a dialog
+// is exactly what the owner asked to have removed. An unknown key is described instead.
+function migrationPlanTitle(key, plans, serverName) {
+  const row = (plans || []).find((p) => p.key === key);
+  return (row?.name || serverName || PLAN_LABELS[key] || (key ? 'A plan no longer sold' : '—'));
+}
+/** The one label a plan PICKER shows: the package, then the product it contains. */
+function migrationPlanOption(p) {
+  return p?.tagline ? `${p.name} — ${p.tagline}` : (p?.name || migrationPlanTitle(p?.key));
+}
+/** Is this plan key a VIP (cohort) plan? Unknown until the catalog has loaded → false. */
+function migrationPlanIsVip(key, plans) {
+  const row = (plans || []).find((p) => p.key === key);
+  return row ? isVipPlan(row) : false;
+}
+
+// The address inside "Name <addr>", or the address itself; '' for nothing.
+const migrationBareAddress = (s) => { const t = String(s || '').trim(); const m = /<([^>]+)>/.exec(t); return (m ? m[1] : t).trim().toLowerCase(); };
+const migrationDomainOf = (s) => { const a = migrationBareAddress(s); const at = a.lastIndexOf('@'); return at > 0 ? a.slice(at + 1) : ''; };
+
+// ★ NO DOMAIN IS WRITTEN INTO THIS COPY. The #67 text told the owner to verify one fixed
+//   domain whatever the server was actually sending from, which is how they were sent to fix
+//   a domain that was never the problem. The server's own per-code message is preferred; this
+//   is only the fallback, and it names the domain the server reported.
+function migrationSendFailText(code, sender, what = 'The test email') {
+  const domain = migrationDomainOf(sender);
+  switch (code) {
+    case 'resend_401': return 'Resend rejected the API key (401). Check RESEND_API_KEY on the server, then try again.';
+    case 'resend_403': return `Resend refused to send from ${domain || 'this sender'} (403): the domain is not verified in Resend, or the API key may not send from it.`;
+    case 'resend_422': return `Resend refused the request as malformed (422) — usually the From address${sender ? ` (${sender})` : ''} itself.`;
+    case 'resend_429': return 'Resend’s rate or daily limit was reached (429). Wait, then try again.';
+    case 'resend_timeout': return `Resend did not answer in time. ${what} may still arrive — check the inbox before sending another.`;
+    case 'link_failed': return 'The sign-in link could not be created, so nothing was sent. Try again.';
+    case 'app_url_missing': return 'The app address (APP_URL) is not configured on the server, so nothing was sent.';
+    case 'email_not_configured': return 'Email sending is not configured on the server (RESEND_API_KEY).';
+    case 'email_from_not_configured': return 'No sender is configured on the server: set MIGRATION_EMAIL_FROM, or RESEND_FROM on a verified domain.';
+    default: return `${what} was not sent (${code || 'unknown'}).`;
+  }
+}
+
+// A refused per-row resend, in the words of a RESEND — not LEGACY_ROW_NOT_READY's
+// activation copy ("…Nothing was activated"), which is what #67 showed for it.
+// ★ #68's begin_invite no longer refuses an onboarded account (it sends a sign-in notice),
+//   so "already claimed" named a cause that no longer exists. What is left: the row is not
+//   activated any more (reverted, perhaps in another tab), or it hit the generation cap.
+function migrationResendRefusal(e) {
+  if (e?.code === 'LEGACY_ROW_NOT_READY') return 'No new email can be sent for this row: it is no longer activated (it may have been reverted), or it has been sent the maximum number of times.';
+  if (e?.code === 'LEGACY_IDENTITY_MISMATCH') return 'The account this row was activated for no longer exists, so there is nothing to send.';
+  return e?.message || 'The email could not be resent.';
+}
+
+// The row panel's "Onboarding emails" line. ★ #68: an EXHAUSTED notice and a send that never
+// recorded an answer are their own states. #67 printed "tried again the next time the student
+// opens the app (five tries in all)" at five tries out of five, and "Sending" for ever for a
+// reservation that died — promising retries that the database had already stopped making.
+function migrationNoticeState(row, nowMs) {
+  const s = row?.onboarding_notice_state;
+  if (!s) return null;
+  const tries = row.onboarding_notice_attempts == null ? null : Number(row.onboarding_notice_attempts);
+  const at = row.onboarding_notice_at ? new Date(row.onboarding_notice_at).getTime() : null;
+  if (s === 'sent') return { text: 'Sent to the admin and the student', resettable: false };
+  if (s === 'sending') {
+    if (at == null) return { text: 'Sending — if this still shows after a few minutes, the send stopped; use Resend onboarding emails.', resettable: true };
+    return nowMs - at > 2 * 60 * 1000
+      ? { text: 'Stopped while sending: no answer was recorded. Use Resend onboarding emails.', resettable: true }
+      : { text: 'Sending', resettable: false };
+  }
+  if (s === 'failed') {
+    if (tries != null && tries >= 5) {
+      return { text: 'Not sent — all five tries are used, and it will not be tried again on its own. Use Resend onboarding emails.', resettable: true };
+    }
+    return {
+      text: `Not sent yet — tried again the next time the student opens the app (${tries != null ? `${tries} of 5 tries used` : 'five tries in all'})`,
+      resettable: true,
+    };
+  }
+  return { text: s, resettable: false };
+}
+
+// Invitation codes no resend can fix: the account is gone, or the invitation has been sent
+// the maximum number of times (legacy_import_begin_invite, #68). Mirrors NEVER_SUCCEEDS in
+// api/admin/student-imports.js, which leaves these rows out of `resend-failed` — uiSafety §27
+// pins the two equal, so the dialog never promises an email the endpoint will not send.
+const MIGRATION_INVITE_UNRECOVERABLE = new Set(['account_missing', 'invite_cap']);
+// ★ …AND THE GENERATION CAP, WHATEVER CODE THE LAST TRY LEFT (#68 review, U5). A row sent for
+//   the 20th time through a RESEND keeps that send's provider code (resend_403, say) rather
+//   than invite_cap, and the endpoint drops it by `invite_generation >= 20` alone — so a
+//   dialog that read only the code promised an email the button could never send. Mirrors
+//   MAX_INVITE_GENERATION in api/admin/student-imports.js; uiSafety §27 pins the two equal.
+const MIGRATION_MAX_INVITE_GENERATION = 20;
+const migrationInviteUnrecoverable = (r) => MIGRATION_INVITE_UNRECOVERABLE.has(r?.invite_code) || Number(r?.invite_generation) >= MIGRATION_MAX_INVITE_GENERATION;
+
+// The row panel's "Invitation" line, in words. A `not_sent` row carrying a code was HANDED
+// BACK (#68): the provider or the configuration proved nothing went out, and Resume sends it.
+function migrationInviteText(row) {
+  if (!row?.invite_state) return '—';
+  const code = row.invite_code ? ` (${row.invite_code})` : '';
+  const when = row.invite_sent_at ? ` · ${fmtEnrollDate(row.invite_sent_at)}` : '';
+  switch (row.invite_state) {
+    case 'not_sent': return row.invite_code ? `Not sent — handed back${code}; it goes out again on Resume` : 'Waiting to be sent';
+    case 'sending': return 'Sending';
+    case 'sent': return `Activation email sent${when}`;
+    case 'notified': return `Sign-in notice sent${when}`;
+    case 'uncertain': return `No answer from the provider${code} — it may have arrived`;
+    case 'failed':
+      if (row.invite_code === 'account_missing') return 'Not delivered — the account no longer exists, so no email can be sent';
+      if (row.invite_code === 'invite_cap' || Number(row.invite_generation) >= MIGRATION_MAX_INVITE_GENERATION) {
+        return `Not delivered${row.invite_code && row.invite_code !== 'invite_cap' ? code : ''} — sent the maximum number of times; no further email can be sent`;
+      }
+      return `Not delivered${code}`;
+    default: return `${row.invite_state}${code}${when}`;
+  }
+}
+
+// The row as a per-row Resend left it, from the endpoint's own answer ({ state, code }), so
+// the open panel never shows the pre-send row while the workspace re-reads it (#68 review,
+// U2). Only the invitation fields move; a `skipped` answer (nothing was attempted) moves
+// nothing. The generation is NOT guessed — a refused begin_invite does not mint one — and
+// the fresh read supplies it.
+function migrationResendPatch(row, r, nowIso) {
+  const state = r?.state;
+  if (!row?.id || !['sent', 'notified', 'uncertain', 'failed', 'not_sent'].includes(state)) return null;
+  const patch = { id: row.id, invite_state: state, invite_code: r.code || null };
+  if (state === 'sent' || state === 'notified') patch.invite_sent_at = nowIso || null;
+  return patch;
+}
+
+// What set_eligibility skipped, and why (#68 returns the reasons; #67 blamed an ended term).
+function migrationSkippedText(r) {
+  const why = r?.skipped_reasons || {};
+  const parts = [
+    [why.wrong_state, 'no longer in that state'],
+    [why.not_valid, 'blocked'],
+    [why.term_ended, 'with a term that has ended'],
+    [why.batch_archived, 'in an archived batch'],
+  ].filter(([n]) => Number(n) > 0).map(([n, t]) => `${n} ${t}`);
+  if (!Number(r?.skipped)) return '';
+  return parts.length ? `; ${r.skipped} skipped (${parts.join(', ')})` : `; ${r.skipped} skipped`;
+}
+
+/**
+ * Is the migration sender proven? The server says so when the From domain is the one the
+ * app's other emails already send from (`senderProven`); otherwise a test that succeeded in
+ * THIS session for THIS sender proves it. Neither blocks activation — the circuit breaker in
+ * the endpoint does that — but the chip and the confirm step say which is true.
+ */
+function migrationSenderProven(readiness, test) {
+  if (readiness?.senderProven) return true;
+  if (!test?.ok || test.busy) return false;
+  const tested = test.from || test.sender;
+  return !tested || !readiness?.sender || migrationBareAddress(tested) === migrationBareAddress(readiness.sender);
+}
+
+// What the run loop says when the endpoint stopped claiming rows (its circuit breaker).
+// ★ ONE REASON, ONE INSTRUCTION. A per-second rate limit and a spent daily allowance are both
+//   a 429, and #68's first copy called every 429 "Daily email limit reached … after the limit
+//   resets" — so an owner who could have pressed Resume a minute later waited until the next
+//   day. The endpoint now names them apart ('email_rate_limited' / 'email_quota'), and a link
+//   Supabase Auth could not mint ('auth_unavailable') stops the run instead of granting on
+//   with nobody told. uiSafety §27 runs this function for every reason.
+function migrationStopText(stopped, code) {
+  const c = code ? ` (${code})` : '';
+  switch (stopped) {
+    case 'sender_refused': return `Resend refused the sender${c}. The run is paused, and the email that was refused goes back in the queue. Fix the sender and send a test email, then press Resume.`;
+    case 'email_quota': return `Resend’s daily sending allowance is used up${c}. The run is paused; the refused email goes back in the queue. Press Resume after the allowance resets tomorrow, activate the rest in smaller daily groups, or upgrade the Resend plan for a larger daily allowance.`;
+    case 'email_rate_limited': return `Resend is rate-limiting${c}. The run is paused; the refused email goes back in the queue. Wait a minute, then press Resume.`;
+    case 'auth_unavailable': return `Supabase could not create sign-in links${c}. Nothing more was granted: the run is paused, and the emails it could not send go back in the queue. Press Resume once Auth is healthy.`;
+    case 'email_unconfigured': return `Email sending is not configured on the server${c}. The run is paused. Set it up, send a test email, then press Resume.`;
+    case 'invalid_request': return `Resend refused two emails in a row as malformed${c}. The run is paused. Check the sender address, send a test email, then press Resume.`;
+    default: return `The run stopped${c}. Press Resume when the cause is fixed.`;
+  }
+}
+// A lease held by a step that is still running — or died mid-way — until `until`.
+function migrationBusyText(until) {
+  const at = new Date(until);
+  if (isNaN(at)) return 'An earlier step, or another window, is still holding this run. Try Resume in a minute.';
+  const secs = Math.max(0, Math.ceil((at.getTime() - Date.now()) / 1000));
+  return `An earlier step, or another window, holds this run until ${at.toLocaleTimeString()} (about ${secs}s). Nothing is lost — press Resume after that.`;
+}
 
 function MigrationStatePill({ row }) {
   const label = rowDisplayState(row);
@@ -21002,33 +21376,42 @@ function MigrationStatePill({ row }) {
   );
 }
 
-function MigrationReadiness({ readiness }) {
-  const [test, setTest] = useState(null);   // null | { busy } | { ok, code, sender }
+// ★ THE TEST RESULT BELONGS TO THE SESSION, NOT TO ONE CHIP. #67 kept it in this
+//   component's own state, which nothing else read: the workspace's copy of the strip, the
+//   activation dialog and a reload all forgot a refused test, and the Sender chip stayed
+//   green from an address FORMAT alone. StudentImports now owns it (`senderTest`) and hands
+//   it to every strip and to the confirm step. A caller that passes nothing keeps its own.
+function MigrationReadiness({ readiness, senderTest, onSenderTest }) {
+  const [localTest, setLocalTest] = useState(null);   // null | { busy } | send-test's answer
+  const test = onSenderTest ? senderTest : localTest;
+  const setTest = onSenderTest || setLocalTest;
   if (!readiness) return null;
+  const proven = migrationSenderProven(readiness, test);
   const items = [
-    ['Email sending', readiness.email],
-    ['App address', readiness.appUrl],
-    ['Sender', readiness.support],
+    ['Email sending', readiness.email, 'missing'],
+    ['App address', readiness.appUrl, 'missing'],
+    // Green only when the server proved the domain, or a test succeeded this session — and
+    // never while the From or Reply-To is malformed (`support`), which blocks activation.
+    ['Sender', proven && readiness.support !== false,
+      !readiness.sender ? 'missing' : readiness.support === false ? 'address malformed' : 'unverified — send a test'],
   ];
-  // ★ PROVE THE SENDER FIRST. Migration mail comes from support@alexsagun.com, and Resend
-  //   refuses a sender whose domain is not verified — with a 403 on the first STUDENT's
-  //   email if nobody checks. This sends the activation email, with sample details and no
-  //   link that does anything, to the Super Admin's own inbox.
+  // ★ PROVE THE SENDER FIRST. Resend refuses a sender whose domain it has not verified —
+  //   with a 403 on the first STUDENT's email if nobody checks. This sends the activation
+  //   email, with sample details and no link that does anything, to the Super Admin's own
+  //   inbox, from the same From and Reply-To the students will get.
   const sendTest = async () => {
     setTest({ busy: true });
     try { setTest(await migrationApi('send-test', {})); }
-    catch (e) { setTest({ ok: false, code: e.message }); }
+    catch (e) { setTest({ ok: false, code: e.code || null, message: e.message }); }
   };
-  const failText = (code) => (code === 'resend_403' || code === 'resend_422'
-    ? 'Resend refused the sender. Verify the alexsagun.com domain in Resend, then send the test again.'
-    : `The test email was not sent (${code || 'unknown'}).`);
+  const testFrom = test?.from || test?.sender || readiness.sender;
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2" aria-label="Activation readiness">
-        {items.map(([label, ok]) => (
+        {items.map(([label, ok, missingText]) => (
           <span key={label} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold"
             style={{ background: `var(--status-${ok ? 'ok' : 'warn'}-bg)`, border: `1px solid var(--status-${ok ? 'ok' : 'warn'}-bd)`, color: `var(--status-${ok ? 'ok' : 'warn'}-fg)` }}>
-            {ok ? <CheckCircle2 size={12} /> : <AlertCircle size={12} />} {label}{ok ? '' : ' missing'}
+            {ok ? <CheckCircle2 size={12} /> : <AlertCircle size={12} />} {label}{ok ? '' : ` ${missingText}`}
           </span>
         ))}
         <button type="button" onClick={sendTest} disabled={!!test?.busy || !readiness.email}
@@ -21036,11 +21419,36 @@ function MigrationReadiness({ readiness }) {
           {test?.busy ? <Loader2 size={12} className="animate-spin" /> : <Mail size={12} />} Send test email
         </button>
       </div>
-      {readiness.sender && <p className="text-xs" style={{ color: C.textMute }}>Emails are sent from {readiness.sender}.</p>}
-      {test && !test.busy && (
-        <p className="text-xs" role="status" style={{ color: test.ok ? 'var(--status-ok-fg)' : 'var(--status-warn-fg)' }}>
-          {test.ok ? `Sent from ${test.sender} to your own inbox. Check it arrived, and not in spam, before activating anyone.` : failText(test.code)}
+      {readiness.sender && (
+        <p className="text-xs" style={{ color: C.textMute }}>
+          Emails are sent from {readiness.sender}{readiness.replyTo ? <>; replies go to {readiness.replyTo}</> : ''}.
         </p>
+      )}
+      {test && !test.busy && (
+        <div className="space-y-1" role="status">
+          <p className="text-xs" style={{ color: test.ok ? 'var(--status-ok-fg)' : 'var(--status-danger-fg)' }}>
+            {test.ok
+              ? `Sent from ${testFrom} to your own inbox${test.replyTo ? `; replies go to ${test.replyTo}` : ''}. Check it arrived, and not in spam, before activating anyone.`
+              : (test.message || migrationSendFailText(test.code, testFrom))}
+          </p>
+          {/* ★ A TRACKED LINK CARRIES THE ONE-TIME TOKEN THROUGH RESEND'S REDIRECT HOST. The
+              claim link keeps its token in the fragment so no server ever logs it; click
+              tracking rewrites the whole URL, fragment included. */}
+          {test.clickTracking === 'on' && (
+            <p className="text-xs" style={{ color: 'var(--status-warn-fg)' }}>
+              Click tracking is ON for this sending domain in Resend. Turn it off before activating anyone:
+              a tracked link carries each student&rsquo;s one-time sign-in link through Resend&rsquo;s redirect.
+            </p>
+          )}
+          {test.clickTracking === 'unknown' && (
+            <p className="text-xs" style={{ color: C.textMute }}>
+              The click-tracking setting could not be read. Confirm in Resend that it is off for this sending domain.
+            </p>
+          )}
+          {test.clickTracking === 'off' && (
+            <p className="text-xs" style={{ color: C.textMute }}>Click tracking is off for this sending domain.</p>
+          )}
+        </div>
       )}
     </div>
   );
@@ -21058,7 +21466,7 @@ function MigrationTermsModal({ row, busy, onSave, onClose }) {
   useEffect(() => {
     let alive = true;
     Promise.all([
-      supabase.from('enrollment_plans').select('key,name,active').order('position', { ascending: true }),
+      supabase.from('enrollment_plans').select('key,name,tagline,community_segment,access_days,active').order('position', { ascending: true }),
       supabase.from('batches').select('id,code,name,status').order('code', { ascending: true }),
     ]).then(([pl, bt]) => {
       if (!alive) return;
@@ -21067,10 +21475,14 @@ function MigrationTermsModal({ row, busy, onSave, onClose }) {
     }, () => {});
     return () => { alive = false; };
   }, []);
+  // ★ A BATCH IS A VIP-ONLY FACT (#68). A self-paced package holds no cohort seat, so its
+  //   picker is replaced by a sentence rather than offering a choice that grants nothing.
+  //   Until the catalog has loaded the segment is unknown, so the picker stays.
+  const planIsVip = !plans.length || migrationPlanIsVip(plan, plans);
   const batchId = batches.find((b) => b.code === batchCode)?.id || null;
   const change = {
     p_plan_key: plan && plan !== row.plan_key ? plan : null,
-    p_batch_id: batchCode && batchCode !== row.batch_code ? batchId : null,
+    p_batch_id: planIsVip && batchCode && batchCode !== row.batch_code ? batchId : null,
     p_start: startDate && startDate !== row.start_date ? startDate : null,
     p_end: endDate && endDate !== row.end_date ? endDate : null,
   };
@@ -21081,18 +21493,25 @@ function MigrationTermsModal({ row, busy, onSave, onClose }) {
       subtitle="The roster's own values are kept on the row. These apply when the student is activated."
       onClose={onClose} onConfirm={(reason) => (changed ? onSave(change, reason) : onClose())}>
       <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(11rem, 1fr))' }}>
-        <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Plan
+        <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Package
           <select className="gh-input w-full mt-1 text-sm" value={plan} onChange={(e) => setPlan(e.target.value)}>
-            {!plans.some((x) => x.key === plan) && <option value={plan}>{plan || '—'}</option>}
-            {plans.map((x) => <option key={x.key} value={x.key}>{x.name}</option>)}
+            {!plans.some((x) => x.key === plan) && <option value={plan}>{migrationPlanTitle(plan, plans, row.plan_name)}</option>}
+            {plans.map((x) => <option key={x.key} value={x.key}>{migrationPlanOption(x)}</option>)}
           </select>
         </label>
-        <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Batch
-          <select className="gh-input w-full mt-1 text-sm" value={batchCode} onChange={(e) => setBatchCode(e.target.value)}>
-            {!batches.some((x) => x.code === batchCode) && <option value={batchCode}>{row.batch_name || batchCode || '—'}</option>}
-            {batches.map((x) => <option key={x.id} value={x.code}>{x.name}{x.status !== 'open' ? ` (${x.status})` : ''}</option>)}
-          </select>
-        </label>
+        {planIsVip ? (
+          <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Batch
+            <select className="gh-input w-full mt-1 text-sm" value={batchCode} onChange={(e) => setBatchCode(e.target.value)}>
+              {!batches.some((x) => x.code === batchCode) && <option value={batchCode}>{row.batch_name || batchCode || '—'}</option>}
+              {batches.map((x) => <option key={x.id} value={x.code}>{x.name}{x.status !== 'open' ? ` (${x.status})` : ''}</option>)}
+            </select>
+          </label>
+        ) : (
+          <div className="text-xs" style={{ color: C.textSoft }}>
+            <div className="font-semibold">Batch</div>
+            <div className="mt-2">None — this package is self-paced and holds no cohort seat.</div>
+          </div>
+        )}
         <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Subscription start
           <input type="date" className="gh-input w-full mt-1 text-sm" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
         </label>
@@ -21111,6 +21530,81 @@ function MigrationTermsModal({ row, busy, onSave, onClose }) {
 
 // A small "reason" dialog shared by promote, demote, discard and revert. Every one of
 // those is audited with the reason, so none of them is a one-click action.
+// ★ BULK TERMS (#68). A whole selection can be given a batch, package or dates in one audited
+//   call — the September 2026 cohort is archived, so its 65 rows have to move to October before
+//   they can be promoted. Unlike MigrationTermsModal there is no single row to diff against, so
+//   every field starts EMPTY and only the fields the Super Admin sets are sent; legacy_import_set_terms
+//   keeps each row's other values (a null argument means "keep"), validates the batch against the
+//   registry (an archived batch is refused there too), and writes one terms_set event per row.
+function MigrationBulkTermsModal({ count, busy, onSave, onClose }) {
+  const [plans, setPlans] = useState([]);
+  const [batches, setBatches] = useState([]);
+  const [plan, setPlan] = useState('');
+  const [batchCode, setBatchCode] = useState('');
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+  useEffect(() => {
+    let alive = true;
+    Promise.all([
+      supabase.from('enrollment_plans').select('key,name,tagline,community_segment,access_days,active').order('position', { ascending: true }),
+      supabase.from('batches').select('id,code,name,status').order('code', { ascending: true }),
+    ]).then(([pl, bt]) => {
+      if (!alive) return;
+      setPlans((pl.data || []).filter((x) => x.active !== false));
+      setBatches((bt.data || []).filter((x) => x.status !== 'archived'));
+    }, () => {});
+    return () => { alive = false; };
+  }, []);
+  // A batch is a VIP-only fact: once a self-paced package is chosen the picker gives way.
+  const planIsVip = !plan || !plans.length || migrationPlanIsVip(plan, plans);
+  const batchId = batches.find((b) => b.code === batchCode)?.id || null;
+  const change = {
+    p_plan_key: plan || null,
+    p_batch_id: planIsVip && batchId ? batchId : null,
+    p_start: startDate || null,
+    p_end: endDate || null,
+  };
+  const changed = Object.values(change).some(Boolean);
+  const today = manilaTodayISO(Date.now());
+  return (
+    <MigrationReasonModal title={`Change terms for ${count} row${count === 1 ? '' : 's'}`} busy={busy} confirmLabel="Save terms"
+      subtitle="Only the fields you set change; everything else stays as each row has it. The roster's own values are kept."
+      onClose={onClose} onConfirm={(reason) => (changed ? onSave(change, reason) : onClose())}>
+      <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(11rem, 1fr))' }}>
+        <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Package
+          <select className="gh-input w-full mt-1 text-sm" value={plan} onChange={(e) => setPlan(e.target.value)}>
+            <option value="">Keep each row's package</option>
+            {plans.map((x) => <option key={x.key} value={x.key}>{migrationPlanOption(x)}</option>)}
+          </select>
+        </label>
+        {planIsVip ? (
+          <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Batch
+            <select className="gh-input w-full mt-1 text-sm" value={batchCode} onChange={(e) => setBatchCode(e.target.value)}>
+              <option value="">Keep each row's batch</option>
+              {batches.map((x) => <option key={x.id} value={x.code}>{x.name}{x.status !== 'open' ? ` (${x.status})` : ''}</option>)}
+            </select>
+          </label>
+        ) : (
+          <div className="text-xs" style={{ color: C.textSoft }}>
+            <div className="font-semibold">Batch</div>
+            <div className="mt-2">None — this package is self-paced and holds no cohort seat.</div>
+          </div>
+        )}
+        <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Subscription start
+          <input type="date" className="gh-input w-full mt-1 text-sm" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+        </label>
+        <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Subscription expiry
+          <input type="date" className="gh-input w-full mt-1 text-sm" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+        </label>
+      </div>
+      <p className="mt-2 text-xs" style={{ color: C.textSoft }}>
+        Rows already activated are left alone (their membership is changed from Enrollments), and a row inside an unfinished activation is refused.
+        {startDate > today ? ` A start after today schedules the membership: it opens on ${formatCalendarDate(startDate)}.` : ''}
+      </p>
+    </MigrationReasonModal>
+  );
+}
+
 function MigrationReasonModal({ title, subtitle, confirmLabel, tone = 'primary', busy, onConfirm, onClose, children }) {
   const [reason, setReason] = useState('');
   const ok = reason.trim().length >= 5;
@@ -21139,6 +21633,7 @@ function MigrationReasonModal({ title, subtitle, confirmLabel, tone = 'primary',
 const LEGACY_SETTING_LABELS = {
   date_format: 'the date format', column_mapping: 'the column matching', plan_mapping: 'the plan matching',
   batch_mapping: 'the batch matching', eligible_batch_codes: 'the cohorts chosen for activation',
+  eligible_plan_keys: 'the self-paced packages chosen for activation',
 };
 
 // ── Staging: file → mapping → preview → stage ─────────────────────────────────
@@ -21153,13 +21648,18 @@ function MigrationStageWizard({ onStaged, onCancel }) {
   const [planMapping, setPlanMapping] = useState({});
   const [batchMapping, setBatchMapping] = useState({});
   const [eligible, setEligible] = useState(null);       // null until the preview proposes it
+  // #68: the self-paced packages whose valid rows stage as Ready. Null until the preview
+  //   proposes it (every self-paced package in the file — a running paid term is owed).
+  const [eligiblePlans, setEligiblePlans] = useState(null);
   const [confirmed, setConfirmed] = useState(false);
   const [differ, setDiffer] = useState(null);           // { jobId, differs } — see stage()
 
   useEffect(() => {
     let alive = true;
     Promise.all([
-      supabase.from('enrollment_plans').select('key,name,price_php,active').order('position', { ascending: true }),
+      // ★ community_segment decides whether a row takes a batch at all (#68), and tagline /
+      //   access_days are what the admin needs to SEE to pick the right package.
+      supabase.from('enrollment_plans').select('key,name,tagline,price_php,active,access_days,community_segment').order('position', { ascending: true }),
       supabase.from('batches').select('id,code,name,status').order('code', { ascending: true }),
     ]).then(([p, b]) => {
       if (!alive) return;
@@ -21189,6 +21689,15 @@ function MigrationStageWizard({ onStaged, onCancel }) {
         // two-digit year or a mismatch blocks the row rather than being guessed.
         const arr = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' });
         const hdr = (arr[0] || []).map((h) => String(h).trim());
+        // The CSV reader's rule (#68, parseCsv): a repeated heading would let the later
+        // column silently overwrite the earlier one, so the roster could be read from the
+        // wrong one. Blank headings are left alone — they can never be chosen in a mapping.
+        const seenHdr = new Set();
+        for (const h of hdr) {
+          if (!h) continue;
+          if (seenHdr.has(h)) throw new Error(`Duplicate column heading "${h}". Give every column a different heading and export the file again.`);
+          seenHdr.add(h);
+        }
         const rows = arr.slice(1).filter((r) => r.some((c) => String(c).trim() !== '')).map((r) => {
           const o = {}; hdr.forEach((h, i) => { o[h] = r[i] != null ? String(r[i]) : ''; }); return o;
         });
@@ -21202,7 +21711,7 @@ function MigrationStageWizard({ onStaged, onCancel }) {
       if (!parsed.rows.length) throw new Error('The file has a header row but no students.');
       setFile({ name: f.name, sha256, headers: parsed.headers, rows: parsed.rows });
       setMapping(autoMapLegacyHeaders(parsed.headers));
-      setDateFormat(''); setPlanMapping({}); setBatchMapping({}); setEligible(null); setConfirmed(false);
+      setDateFormat(''); setPlanMapping({}); setBatchMapping({}); setEligible(null); setEligiblePlans(null); setConfirmed(false);
     } catch (e2) { setErr(e2.message || 'Could not read the file.'); }
     finally { setBusy(''); }
   };
@@ -21237,19 +21746,58 @@ function MigrationStageWizard({ onStaged, onCancel }) {
       const cleanPlan = Object.fromEntries(Object.entries(planMapping).filter(([, v]) => v));
       const cleanBatch = Object.fromEntries(Object.entries(batchMapping).filter(([, v]) => v));
       const base = { mapping, dateFormat, planMapping: cleanPlan, batchMapping: cleanBatch, plans, batches, nowMs: Date.now() };
-      const probe = normalizeLegacyRows(file.rows, { ...base, eligibleBatchCodes: [] });
+      const probe = normalizeLegacyRows(file.rows, { ...base, eligibleBatchCodes: [], eligiblePlanKeys: [] });
       const codes = eligible ?? defaultEligibleCodes(probe);
-      return { rows: normalizeLegacyRows(file.rows, { ...base, eligibleBatchCodes: codes }), codes, allCodes: cohortSummary(probe).map((c) => c.batch_code).filter(Boolean) };
+      const planKeys = eligiblePlans ?? defaultEligiblePlanKeys(probe, plans);
+      return {
+        rows: normalizeLegacyRows(file.rows, { ...base, eligibleBatchCodes: codes, eligiblePlanKeys: planKeys }),
+        codes, planKeys, allCodes: cohortSummary(probe, plans).map((c) => c.batch_code).filter(Boolean),
+      };
     } catch { return null; }
-  }, [ready, file, mapping, dateFormat, planMapping, batchMapping, plans, batches, eligible]);
+  }, [ready, file, mapping, dateFormat, planMapping, batchMapping, plans, batches, eligible, eligiblePlans]);
 
-  const summary = preview ? cohortSummary(preview.rows) : [];
+  // ★ TWO TABLES, BECAUSE THERE ARE TWO RULES. A VIP row is Ready by its cohort; a
+  //   self-paced row (Silver, Essentials) holds no cohort and is Ready by its package.
+  //   cohortSummary(…, plans) also skips a known self-paced row by itself; the rows are
+  //   narrowed to VIP first so a row with NO package (blocked) is not shown as a VIP
+  //   "No batch" cohort either — it is counted in the note below the tables instead.
+  const vipRows = preview ? preview.rows.filter((r) => migrationPlanIsVip(r.plan_key, plans)) : [];
+  const summary = cohortSummary(vipRows, plans);
+  const selfPaced = preview ? planSummary(preview.rows, plans).filter((g) => g.plan_key && g.segment !== 'vip') : [];
+  const unplannedRows = preview ? preview.rows.filter((r) => !r.plan_key).length : 0;
   const blockedReasons = useMemo(() => {
     if (!preview) return [];
     const counts = new Map();
     for (const r of preview.rows) for (const e of r.errors) counts.set(e, (counts.get(e) || 0) + 1);
     return [...counts.entries()].sort((a, b) => b[1] - a[1]);
   }, [preview]);
+  // #68: the preview listed only errors, so a price mismatch or an ignored batch label was
+  // invisible at the one moment the mapping is decided. Warnings never block.
+  const warningReasons = useMemo(() => {
+    if (!preview) return [];
+    const counts = new Map();
+    for (const r of preview.rows) for (const w of r.warnings || []) counts.set(w, (counts.get(w) || 0) + 1);
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  }, [preview]);
+
+  // Step 4's per-package table: every label in the file, the package it maps to, and the
+  // facts that make a wrong mapping visible — today's price, what the file says was paid,
+  // and what the package opens. An Essentials label mapped to the full-access Silver plan
+  // is a one-click mistake; this is where it shows.
+  const planRowsByLabel = useMemo(() => {
+    const out = new Map();
+    if (!file) return out;
+    for (const raw of file.rows) {
+      const lab = normalizeLabel(mapping.plan_label ? raw[mapping.plan_label] : '');
+      if (!lab) continue;
+      if (!out.has(lab)) out.set(lab, new Set());
+      const amt = parseLegacyAmount(mapping.amount_paid ? raw[mapping.amount_paid] : '');
+      if (amt.valid && amt.amount != null) out.get(lab).add(amt.amount);
+    }
+    return out;
+  }, [file, mapping]);
+  const mapsToVip = Object.values(planMapping).some((k) => k && migrationPlanIsVip(k, plans));
+  const mapsToSelfPaced = Object.values(planMapping).some((k) => k && plans.some((p) => p.key === k) && !migrationPlanIsVip(k, plans));
 
   const stage = async () => {
     if (!preview || !confirmed) return;
@@ -21262,6 +21810,7 @@ function MigrationStageWizard({ onStaged, onCancel }) {
         planMapping: Object.fromEntries(Object.entries(planMapping).filter(([, v]) => v)),
         batchMapping: Object.fromEntries(Object.entries(batchMapping).filter(([, v]) => v)),
         eligibleBatchCodes: preview.codes,
+        eligiblePlanKeys: preview.planKeys,
       });
       onStaged(out.job_id, out.reopened);
     } catch (e2) {
@@ -21335,7 +21884,7 @@ function MigrationStageWizard({ onStaged, onCancel }) {
             {LEGACY_FIELDS.map((f) => (
               <label key={f.key} className="block">
                 <span className="text-xs font-semibold" style={{ color: missing.includes(f.key) ? C.red : C.textSoft }}>
-                  {f.label}{f.required ? ' *' : ''}
+                  {f.label}{f.required ? ' *' : ''}{f.key === 'batch_label' ? ' (VIP rows only)' : ''}
                 </span>
                 <select className="gh-input w-full mt-1 text-sm" value={mapping[f.key] || ''}
                   onChange={(e) => setMapping((m) => ({ ...m, [f.key]: e.target.value || undefined }))}>
@@ -21374,39 +21923,79 @@ function MigrationStageWizard({ onStaged, onCancel }) {
 
       {ready && (
         <section className="glass-card p-5">
-          {stepTitle(4, 'Confirm plans and batches')}
-          <div className="iw-two">
-            <div>
-              <div className="text-xs font-bold uppercase tracking-wide mb-2" style={{ color: C.textMute }}>Plan in the file → plan here</div>
-              {planLabels.map((l) => (
-                <label key={l.normalized} className="flex items-center gap-2 mb-2">
-                  <span className="text-sm flex-1 min-w-0" style={{ color: C.text }}>{l.label} <span style={{ color: C.textMute }}>({l.count})</span></span>
-                  <select className="gh-input text-sm" value={planMapping[l.normalized] || ''} aria-label={`Plan for ${l.label}`}
-                    onChange={(e) => { setPlanMapping((m) => ({ ...m, [l.normalized]: e.target.value })); setConfirmed(false); }}>
-                    <option value="">— leave unmapped (blocks) —</option>
-                    {plans.map((p) => <option key={p.key} value={p.key}>{p.name}</option>)}
-                  </select>
-                </label>
-              ))}
-            </div>
-            <div>
-              <div className="text-xs font-bold uppercase tracking-wide mb-2" style={{ color: C.textMute }}>Batch in the file → batch here</div>
-              {batchLabels.map((l) => (
-                <label key={l.normalized} className="flex items-center gap-2 mb-2">
-                  <span className="text-sm flex-1 min-w-0" style={{ color: C.text }}>{l.label} <span style={{ color: C.textMute }}>({l.count})</span></span>
-                  <select className="gh-input text-sm" value={batchMapping[l.normalized] || ''} aria-label={`Batch for ${l.label}`}
-                    onChange={(e) => { setBatchMapping((m) => ({ ...m, [l.normalized]: e.target.value })); setConfirmed(false); }}>
-                    <option value="">— leave unmapped (blocks) —</option>
-                    {batches.filter((b) => b.status !== 'archived').map((b) => <option key={b.code} value={b.code}>{b.name} ({b.code}, {b.status})</option>)}
-                  </select>
-                </label>
-              ))}
-            </div>
+          {stepTitle(4, 'Confirm packages and batches')}
+          <div className="text-xs font-bold uppercase tracking-wide mb-2" style={{ color: C.textMute }}>Plan in the file → package here</div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead><tr style={{ color: C.textMute }}>
+                <th className="text-left py-1.5 pr-3 font-semibold">In the file</th>
+                <th className="text-left py-1.5 pr-3 font-semibold">Package</th>
+                <th className="text-right px-2 font-semibold">Rows</th>
+                <th className="text-right px-2 font-semibold whitespace-nowrap">Today&rsquo;s price</th>
+                <th className="text-left px-2 font-semibold whitespace-nowrap">Paid in the file</th>
+                <th className="text-left pl-2 font-semibold">Opens</th>
+              </tr></thead>
+              <tbody>
+                {planLabels.map((l) => {
+                  const key = planMapping[l.normalized] || '';
+                  const p = plans.find((x) => x.key === key) || null;
+                  const amounts = [...(planRowsByLabel.get(l.normalized) || [])].sort((a, b) => a - b);
+                  return (
+                    <tr key={l.normalized} style={{ borderTop: `1px solid ${C.border}` }}>
+                      <td className="py-1.5 pr-3" style={{ color: C.text }}>{l.label}</td>
+                      <td className="py-1.5 pr-3">
+                        <select className="gh-input text-sm max-w-[18rem]" value={key} aria-label={`Plan for ${l.label}`}
+                          onChange={(e) => { setPlanMapping((m) => ({ ...m, [l.normalized]: e.target.value })); setConfirmed(false); }}>
+                          <option value="">— leave unmapped (blocks) —</option>
+                          {plans.map((x) => <option key={x.key} value={x.key}>{migrationPlanOption(x)}</option>)}
+                        </select>
+                      </td>
+                      <td className="text-right px-2">{l.count}</td>
+                      <td className="text-right px-2 whitespace-nowrap">{p?.price_php != null ? phpFmt(p.price_php) : '—'}</td>
+                      <td className="px-2 text-xs" style={{ color: C.textSoft }}>
+                        {amounts.length ? amounts.slice(0, 4).map((a) => a.toLocaleString('en-US')).join(', ') + (amounts.length > 4 ? ` +${amounts.length - 4} more` : '') : '—'}
+                      </td>
+                      <td className="pl-2 text-xs" style={{ color: C.textSoft }}>
+                        {p ? `${planEntitlement(p.key).scopeLabel}${Number(p.access_days) > 0 ? ` · ${p.access_days} days` : ''}${isVipPlan(p) ? ' · cohort' : ' · no cohort'}` : '—'}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
+          {mapsToVip && !mapping.batch_label && (
+            <p className="mt-2 text-xs" role="note" style={{ color: 'var(--status-warn-fg)' }}>
+              Some labels map to a VIP package, which needs a batch, but no Batch column is matched in step 2. Those rows
+              will stage as Blocked (batch missing) — match the column, or map the label to a self-paced package.
+            </p>
+          )}
+          {batchLabels.length > 0 && mapsToVip && (
+            <div className="mt-4">
+              <div className="text-xs font-bold uppercase tracking-wide mb-2" style={{ color: C.textMute }}>Batch in the file → batch here (VIP rows)</div>
+              <div className="iw-two">
+                {batchLabels.map((l) => (
+                  <label key={l.normalized} className="flex items-center gap-2">
+                    <span className="text-sm flex-1 min-w-0" style={{ color: C.text }}>{l.label} <span style={{ color: C.textMute }}>({l.count})</span></span>
+                    <select className="gh-input text-sm" value={batchMapping[l.normalized] || ''} aria-label={`Batch for ${l.label}`}
+                      onChange={(e) => { setBatchMapping((m) => ({ ...m, [l.normalized]: e.target.value })); setConfirmed(false); }}>
+                      <option value="">— leave unmapped (blocks) —</option>
+                      {batches.filter((b) => b.status !== 'archived').map((b) => <option key={b.code} value={b.code}>{b.name} ({b.code}, {b.status})</option>)}
+                    </select>
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
+          {batchLabels.length > 0 && mapsToSelfPaced && (
+            <p className="mt-2 text-xs" style={{ color: C.textMute }}>
+              Self-paced packages hold no cohort: a batch named for their rows is kept on the row as history and grants nothing.
+            </p>
+          )}
           <p className="mt-2 text-xs" style={{ color: C.textMute }}>
-            A mapping must name the same month as its batch, and each start date must fall in or next to that month —
-            anything else stages as Blocked. The amount paid is kept as history only; today&rsquo;s prices are not changed
-            and no payment is recorded.
+            For a VIP row, the batch mapping must name the same month as its batch, and each start date must fall in or next to
+            that month — anything else stages as Blocked. The amount paid is kept as history only; today&rsquo;s prices are not
+            changed and no payment is recorded.
           </p>
         </section>
       )}
@@ -21415,36 +22004,78 @@ function MigrationStageWizard({ onStaged, onCancel }) {
         <section className="glass-card p-5">
           {stepTitle(5, 'Choose what can be activated')}
           <p className="text-sm mb-3" style={{ color: C.textSoft }}>
-            Rows in a ticked batch stage as <strong>Ready to activate</strong>; every other valid row stages as <strong>Inactive</strong>
-            and gets no account, no membership and no email. Only the newest batch is ticked for you.
+            Rows in a ticked VIP batch, or in a ticked self-paced package, stage as <strong>Pending activation</strong>; every
+            other valid row stages as <strong>Inactive</strong> and gets no account, no membership and no email. Only the
+            newest VIP batch is ticked for you; every self-paced package is, because its paid terms are still running.
           </p>
-          <div className="flex flex-wrap gap-2 mb-4">
-            {preview.allCodes.map((code) => (
-              <label key={code} className="px-3 py-1.5 rounded-xl text-sm font-semibold cursor-pointer inline-flex items-center gap-2"
-                style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text }}>
-                <input type="checkbox" checked={preview.codes.includes(code)}
-                  onChange={(e) => { setEligible(e.target.checked ? [...preview.codes, code] : preview.codes.filter((c) => c !== code)); setConfirmed(false); }} />
-                {batches.find((b) => b.code === code)?.name || code}
-              </label>
-            ))}
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead><tr style={{ color: C.textMute }}>
-                <th className="text-left py-1.5 pr-3 font-semibold">Batch</th><th className="text-right px-2 font-semibold">Rows</th>
-                <th className="text-right px-2 font-semibold">Ready</th><th className="text-right px-2 font-semibold">Inactive</th><th className="text-right pl-2 font-semibold">Blocked</th>
-              </tr></thead>
-              <tbody>
-                {summary.map((g) => (
-                  <tr key={g.batch_code || 'none'} style={{ borderTop: `1px solid ${C.border}` }}>
-                    <td className="py-1.5 pr-3" style={{ color: C.text }}>{g.batch_code ? (batches.find((b) => b.code === g.batch_code)?.name || g.batch_code) : 'No batch'}</td>
-                    <td className="text-right px-2">{g.total}</td><td className="text-right px-2">{g.ready}</td>
-                    <td className="text-right px-2">{g.inactive}</td><td className="text-right pl-2" style={{ color: g.blocked ? C.red : undefined }}>{g.blocked}</td>
-                  </tr>
+          {vipRows.length > 0 && (
+            <>
+              <div className="text-xs font-bold uppercase tracking-wide mb-2" style={{ color: C.textMute }}>VIP cohorts</div>
+              <div className="flex flex-wrap gap-2 mb-4">
+                {preview.allCodes.map((code) => (
+                  <label key={code} className="px-3 py-1.5 rounded-xl text-sm font-semibold cursor-pointer inline-flex items-center gap-2"
+                    style={{ background: C.white, border: `1px solid ${C.border}`, color: C.text }}>
+                    <input type="checkbox" checked={preview.codes.includes(code)}
+                      onChange={(e) => { setEligible(e.target.checked ? [...preview.codes, code] : preview.codes.filter((c) => c !== code)); setConfirmed(false); }} />
+                    {batches.find((b) => b.code === code)?.name || code}
+                  </label>
                 ))}
-              </tbody>
-            </table>
-          </div>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead><tr style={{ color: C.textMute }}>
+                    <th className="text-left py-1.5 pr-3 font-semibold">Batch</th><th className="text-right px-2 font-semibold">Rows</th>
+                    <th className="text-right px-2 font-semibold">Ready</th><th className="text-right px-2 font-semibold">Inactive</th><th className="text-right pl-2 font-semibold">Blocked</th>
+                  </tr></thead>
+                  <tbody>
+                    {summary.map((g) => (
+                      <tr key={g.batch_code || 'none'} style={{ borderTop: `1px solid ${C.border}` }}>
+                        <td className="py-1.5 pr-3" style={{ color: C.text }}>{g.batch_code ? (batches.find((b) => b.code === g.batch_code)?.name || g.batch_code) : 'No batch'}</td>
+                        <td className="text-right px-2">{g.total}</td><td className="text-right px-2">{g.ready}</td>
+                        <td className="text-right px-2">{g.inactive}</td><td className="text-right pl-2" style={{ color: g.blocked ? C.red : undefined }}>{g.blocked}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+          {selfPaced.length > 0 && (
+            <div className={vipRows.length > 0 ? 'mt-5' : ''}>
+              <div className="text-xs font-bold uppercase tracking-wide mb-2" style={{ color: C.textMute }}>Self-paced packages</div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead><tr style={{ color: C.textMute }}>
+                    <th className="py-1.5 pr-2 w-8"><span className="sr-only">Ready to activate</span></th>
+                    <th className="text-left py-1.5 pr-3 font-semibold">Package</th><th className="text-right px-2 font-semibold">Rows</th>
+                    <th className="text-right px-2 font-semibold">Ready</th><th className="text-right px-2 font-semibold">Inactive</th><th className="text-right pl-2 font-semibold">Blocked</th>
+                  </tr></thead>
+                  <tbody>
+                    {selfPaced.map((g) => (
+                      <tr key={g.plan_key} style={{ borderTop: `1px solid ${C.border}` }}>
+                        <td className="py-1.5 pr-2">
+                          <input type="checkbox" checked={preview.planKeys.includes(g.plan_key)}
+                            aria-label={`Rows of ${g.name || migrationPlanTitle(g.plan_key, plans)} can be activated`}
+                            onChange={(e) => { setEligiblePlans(e.target.checked ? [...preview.planKeys, g.plan_key] : preview.planKeys.filter((k) => k !== g.plan_key)); setConfirmed(false); }} />
+                        </td>
+                        <td className="py-1.5 pr-3" style={{ color: C.text }}>
+                          {g.name || migrationPlanTitle(g.plan_key, plans)}
+                          {g.tagline && <span className="text-xs" style={{ color: C.textMute }}> · {g.tagline}</span>}
+                        </td>
+                        <td className="text-right px-2">{g.total}</td><td className="text-right px-2">{g.ready}</td>
+                        <td className="text-right px-2">{g.inactive}</td><td className="text-right pl-2" style={{ color: g.blocked ? C.red : undefined }}>{g.blocked}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+          {unplannedRows > 0 && (
+            <p className="mt-3 text-xs" style={{ color: C.textSoft }}>
+              {unplannedRows} row{unplannedRows === 1 ? ' has' : 's have'} no confirmed package and will stage as Blocked — see why below.
+            </p>
+          )}
           {blockedReasons.length > 0 && (
             <div className="mt-4">
               <div className="text-xs font-bold uppercase tracking-wide mb-1.5" style={{ color: C.textMute }}>Why rows are blocked</div>
@@ -21453,9 +22084,17 @@ function MigrationStageWizard({ onStaged, onCancel }) {
               </ul>
             </div>
           )}
+          {warningReasons.length > 0 && (
+            <div className="mt-4">
+              <div className="text-xs font-bold uppercase tracking-wide mb-1.5" style={{ color: C.textMute }}>Worth checking (does not block)</div>
+              <ul className="text-sm space-y-1" style={{ color: C.textSoft }}>
+                {warningReasons.map(([code, n]) => <li key={code}>{n} × {labelOfWarning(code)}</li>)}
+              </ul>
+            </div>
+          )}
           <label className="mt-4 flex items-start gap-2 text-sm" style={{ color: C.text }}>
             <input type="checkbox" className="mt-1" checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)} />
-            <span>I have checked the date format, the plan and batch mappings and the batches that can be activated.</span>
+            <span>I have checked the date format, the package and batch mappings, and what can be activated.</span>
           </label>
           <div className="mt-4 flex flex-wrap gap-2">
             <button type="button" onClick={stage} disabled={!confirmed || !!busy}
@@ -21479,7 +22118,11 @@ function MigrationStageWizard({ onStaged, onCancel }) {
 // ★ OPEN ACCESS ON THE ACTIVATION DAY (owner decision, 2026-09-26): a group whose start is
 //   still ahead is offered "start today" pre-ticked; its end date — what was paid for —
 //   never moves unless the Super Admin changes it by hand.
-function MigrationActivateModal({ jobId, rowIds, onStarted, onClose }) {
+// ★ #68: A MONTH WITH NO BATCH UNDER A LATER BATCH IS A BLOCK, NOT A WARNING. The cohort
+//   allocator only moves forward, so a VIP run that starts before a missing month skips it for
+//   good. The preflight names every such month (`batch_gaps`), Activate stays disabled while
+//   any exist, and legacy_import_start_run refuses the same thing (LEGACY_BATCH_GAP).
+function MigrationActivateModal({ jobId, rowIds, senderTest, onStarted, onClose }) {
   const [pf, setPf] = useState(null);
   const [err, setErr] = useState('');
   const [typed, setTyped] = useState('');
@@ -21502,7 +22145,7 @@ function MigrationActivateModal({ jobId, rowIds, onStarted, onClose }) {
     let alive = true;
     loadPreflight().catch((e) => { if (alive) setErr(e.message); });
     Promise.all([
-      supabase.from('enrollment_plans').select('key,name,active').order('position', { ascending: true }),
+      supabase.from('enrollment_plans').select('key,name,tagline,community_segment,access_days,active').order('position', { ascending: true }),
       supabase.from('batches').select('id,code,name,status').order('code', { ascending: true }),
     ]).then(([pl, bt]) => {
       if (!alive) return;
@@ -21515,8 +22158,20 @@ function MigrationActivateModal({ jobId, rowIds, onStarted, onClose }) {
   const p = pf?.preflight;
   const n = p?.to_activate || 0;
   const readiness = pf?.readiness;
+  const gaps = Array.isArray(p?.batch_gaps) ? p.batch_gaps : [];
   const canStart = step === 'confirm' && p && n > 0 && readiness?.canActivate && phraseMatches(typed, n)
-    && Array.isArray(p.row_ids) && p.row_ids.length === n;
+    && Array.isArray(p.row_ids) && p.row_ids.length === n && gaps.length === 0;
+  const senderProven = migrationSenderProven(readiness, senderTest);
+  const dailyCap = Number(readiness?.dailyCap) > 0 ? Number(readiness.dailyCap) : null;
+  // Every row of the run sends exactly one email: a claim link, or a sign-in notice to an
+  // account that already works. The larger of the server's `emails` and that sum, so the
+  // daily-limit warning can never under-count what the provider will be asked to send.
+  const emails = Math.max(Number(p?.emails) || 0, (Number(p?.claim_emails) || 0) + (Number(p?.notifications) || 0));
+  // ★ ROWS THE CLAIM WILL HOLD, NAMED BEFORE THE RUN (#68 review, S1). A selected row whose
+  //   student has a higher package waiting in another roster is claimed and set Failed
+  //   (higher_plan_pending) instead of activated. The preflight lists them as held_row_ids;
+  //   a database that does not send the key yet shows nothing extra, never a wrong count.
+  const held = Array.isArray(p?.held_row_ids) ? new Set(p.held_row_ids).size : 0;
   const groupKey = (g) => `${g.plan_key}|${g.batch_id}|${g.start_date}|${g.end_date}`;
   const groups = p?.terms || [];
 
@@ -21534,6 +22189,17 @@ function MigrationActivateModal({ jobId, rowIds, onStarted, onClose }) {
   const setEdit = (g, patch) => setEdits((m) => ({ ...m, [groupKey(g)]: { ...editOf(g), ...patch } }));
 
   const applyTerms = async () => {
+    // A group moved ONTO a VIP package needs a cohort. The server refuses it too ("A VIP
+    // membership needs a batch"), but only when it reaches that group — after any group
+    // before it has been saved. Asked here first, nothing is saved half-way.
+    const needsBatch = groups.filter((g) => {
+      const e = editOf(g);
+      return e.plan_key !== g.plan_key && !e.batch_id && migrationPlanIsVip(e.plan_key, plans);
+    });
+    if (needsBatch.length) {
+      setErr(`Choose a batch for ${needsBatch.length === 1 ? 'the group' : `the ${needsBatch.length} groups`} moved to ${migrationPlanTitle(editOf(needsBatch[0]).plan_key, plans)}: a VIP package holds a cohort seat. Nothing was saved.`);
+      return;
+    }
     setBusy(true); setErr('');
     try {
       for (const g of groups) {
@@ -21575,7 +22241,14 @@ function MigrationActivateModal({ jobId, rowIds, onStarted, onClose }) {
     try {
       const out = await migrationApi('start-activation', { jobId, rowIds: activateIds, phrase: typed.trim(), clientKey: keyRef.current });
       onStarted(out.run_id);
-    } catch (e) { setErr(e.message); setBusy(false); }
+    } catch (e) {
+      // A batch deleted, or a later one created, since the preflight: the server names the
+      // months, and a fresh preflight puts them in the block above so Activate disables.
+      const missing = e.code === 'LEGACY_BATCH_GAP' && Array.isArray(e.context?.missing) ? e.context.missing : null;
+      setErr(missing ? `${e.message} Missing: ${missing.join(', ')}.` : e.message);
+      if (missing) await loadPreflight().catch(() => {});
+      setBusy(false);
+    }
   };
 
   const Fact = ({ k, v, warn }) => (
@@ -21584,12 +22257,16 @@ function MigrationActivateModal({ jobId, rowIds, onStarted, onClose }) {
       <dd className="text-sm font-bold text-right" style={{ color: warn ? C.red : C.text }}>{v}</dd>
     </div>
   );
-  const planName = (key) => plans.find((x) => x.key === key)?.name || key || '—';
+  const planName = (key, serverName) => migrationPlanTitle(key, plans, serverName);
   const batchName = (id) => batches.find((x) => x.id === id)?.name || '—';
+  // The segment the SERVER reported for a group wins; the loaded catalog answers for an edit.
+  const groupIsVip = (g, key) => (key && key !== g.plan_key
+    ? migrationPlanIsVip(key, plans)
+    : (g.plan_segment ? g.plan_segment === 'vip' : migrationPlanIsVip(g.plan_key, plans)));
 
   return (
     <AccountModal title={step === 'terms' ? 'Activate students · 1 of 2' : 'Activate students · 2 of 2'}
-      subtitle={step === 'terms' ? 'Assign the batch, plan and dates. Continue saves them to these rows; nobody is activated until you confirm.' : 'Read this before anything is created.'}
+      subtitle={step === 'terms' ? 'Assign the package, batch and dates. Continue saves them to these rows; nobody is activated until you confirm.' : 'Read this before anything is created.'}
       icon={UserCheck} tone="ok" maxW="sm:max-w-lg" canClose={!busy} onClose={onClose}>
       {err && <AdminNotice kind="danger">{err}</AdminNotice>}
       {!p && !err && <p className="text-sm flex items-center gap-2" role="status" style={{ color: C.textSoft }}><Loader2 size={14} className="animate-spin" /> Checking the selection…</p>}
@@ -21604,9 +22281,20 @@ function MigrationActivateModal({ jobId, rowIds, onStarted, onClose }) {
             const e = editOf(g);
             const k = groupKey(g);
             const later = g.start_date > today;
+            const vip = groupIsVip(g);
+            const editVip = groupIsVip(g, e.plan_key);
+            const seats = Number(g.seats) || 0;
             return (
               <div key={k} className="mt-3 rounded-xl p-3 text-sm" style={{ background: 'var(--wash)', border: `1px solid ${C.border}` }}>
-                <div className="font-bold" style={{ color: C.text }}>{g.rows} student{g.rows === 1 ? '' : 's'} · {g.plan_name || g.plan_key} · {g.batch_name || 'No batch'}</div>
+                <div className="font-bold" style={{ color: C.text }}>
+                  {g.rows} student{g.rows === 1 ? '' : 's'} · {planName(g.plan_key, g.plan_name)} · {vip ? (g.batch_name || 'No batch') : 'Self-paced, no cohort'}
+                </div>
+                {/* ★ SEATS FOLLOW THE PAID TERM (#68): one month paid is one cohort seat, capped by the plan. */}
+                {vip && seats > 0 && (
+                  <div className="mt-0.5 text-xs font-semibold" style={{ color: C.textSoft }}>
+                    {seats} cohort seat{seats === 1 ? '' : 's'}, from {g.batch_name || 'its batch'} onwards
+                  </div>
+                )}
                 <div className="mt-1" style={{ color: C.textSoft }}>
                   {formatCalendarDate(g.start_date)} – {formatCalendarDate(g.end_date)}
                   {g.assigned ? ` (roster: ${formatCalendarDate(g.roster_start)} – ${formatCalendarDate(g.roster_end)})` : ''}
@@ -21619,18 +22307,25 @@ function MigrationActivateModal({ jobId, rowIds, onStarted, onClose }) {
                 )}
                 {editing === k ? (
                   <div className="mt-3 grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(11rem, 1fr))' }}>
-                    <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Plan
+                    <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Package
                       <select className="gh-input w-full mt-1 text-sm" value={e.plan_key || ''} onChange={(ev) => setEdit(g, { plan_key: ev.target.value })}>
-                        {!plans.some((x) => x.key === e.plan_key) && <option value={e.plan_key || ''}>{planName(e.plan_key)}</option>}
-                        {plans.map((x) => <option key={x.key} value={x.key}>{x.name}</option>)}
+                        {!plans.some((x) => x.key === e.plan_key) && <option value={e.plan_key || ''}>{planName(e.plan_key, g.plan_name)}</option>}
+                        {plans.map((x) => <option key={x.key} value={x.key}>{migrationPlanOption(x)}</option>)}
                       </select>
                     </label>
-                    <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Batch
-                      <select className="gh-input w-full mt-1 text-sm" value={e.batch_id || ''} onChange={(ev) => setEdit(g, { batch_id: ev.target.value })}>
-                        {!batches.some((x) => x.id === e.batch_id) && <option value={e.batch_id || ''}>{batchName(e.batch_id)}</option>}
-                        {batches.map((x) => <option key={x.id} value={x.id}>{x.name}{x.status !== 'open' ? ` (${x.status})` : ''}</option>)}
-                      </select>
-                    </label>
+                    {editVip || !plans.length ? (
+                      <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Batch
+                        <select className="gh-input w-full mt-1 text-sm" value={e.batch_id || ''} onChange={(ev) => setEdit(g, { batch_id: ev.target.value })}>
+                          {!batches.some((x) => x.id === e.batch_id) && <option value={e.batch_id || ''}>{e.batch_id ? batchName(e.batch_id) : 'Choose a batch…'}</option>}
+                          {batches.map((x) => <option key={x.id} value={x.id}>{x.name}{x.status !== 'open' ? ` (${x.status})` : ''}</option>)}
+                        </select>
+                      </label>
+                    ) : (
+                      <div className="text-xs" style={{ color: C.textSoft }}>
+                        <div className="font-semibold">Batch</div>
+                        <div className="mt-2">None — a self-paced package holds no cohort seat.</div>
+                      </div>
+                    )}
                     <label className="block text-xs font-semibold" style={{ color: C.textSoft }}>Subscription start
                       <input type="date" className="gh-input w-full mt-1 text-sm" value={e.start_date || ''}
                         onChange={(ev) => setEdit(g, { start_date: ev.target.value, openNow: false })} />
@@ -21642,7 +22337,7 @@ function MigrationActivateModal({ jobId, rowIds, onStarted, onClose }) {
                   </div>
                 ) : (
                   <button type="button" onClick={() => setEditing(k)} className="mt-2 gh-btn-ghost px-2.5 py-1 rounded-lg text-xs font-semibold">
-                    Change plan, batch or dates…
+                    Change package, batch or dates…
                   </button>
                 )}
               </div>
@@ -21662,21 +22357,84 @@ function MigrationActivateModal({ jobId, rowIds, onStarted, onClose }) {
         <>
           <dl>
             <Fact k="Rows selected" v={p.requested} />
-            <Fact k="Will be activated" v={n} />
+            <Fact k="Will be activated" v={held > 0 ? Math.max(0, n - held) : n} />
+            {held > 0 && <Fact k="Held back (higher package waiting)" v={held} warn />}
             <Fact k="Excluded (not ready)" v={p.excluded} warn={p.excluded > 0} />
             {p.retrying > 0 && <Fact k="Retrying after a failure" v={p.retrying} />}
             <Fact k="New accounts to create" v={p.new_accounts} />
             <Fact k="Existing accounts to link" v={p.existing_accounts} />
             <Fact k="Activation emails" v={p.claim_emails} />
             <Fact k="Sign-in notifications" v={p.notifications} />
+            {/* ★ THIS RUN'S EMAILS, NOT TODAY'S (#68 review, U6/R2). It was labelled "Emails today
+                (daily limit)" but counts only this selection: earlier runs, resends and every other
+                email the app sends share the same provider allowance. The note below says so. */}
+            {dailyCap != null && <Fact k="Emails in this run" v={`${emails} · daily allowance ${dailyCap}`} warn={emails > dailyCap} />}
             <Fact k="Starting later (scheduled)" v={p.scheduled} />
-            <Fact k="Plan" v={(p.plans || []).map((x) => x.name).join(', ') || '—'} />
+            <Fact k="Package" v={(p.plans || []).map((x) => planName(x.key, x.name)).join(', ') || '—'} />
             <Fact k="Subscription start" v={(p.starts || []).map(formatCalendarDate).join(', ') || '—'} />
             <Fact k="Subscription expiry" v={(p.ends || []).map(formatCalendarDate).join(', ') || '—'} />
           </dl>
+          {dailyCap != null && (
+            <p className="mt-2 text-xs" style={{ color: C.textMute }}>
+              The daily allowance is shared: emails already sent today, the app&rsquo;s other emails (enrollment alerts,
+              communications, staff invitations) and the two onboarding emails each student triggers when they finish
+              setting up all count against it.
+            </p>
+          )}
+          {held > 0 && (
+            <AdminNotice kind="warn">
+              {held} of the {n} selected row{n === 1 ? '' : 's'} will be held back as Failed rather than activated: the same
+              person has a higher package waiting in another roster. Activate that row first, or change its terms, then
+              retry {held === 1 ? 'this one' : 'these'}. The run still takes all {n}.
+            </AdminNotice>
+          )}
+          {gaps.length > 0 && (
+            <div className="mt-3 rounded-xl p-3 text-sm" role="alert"
+              style={{ background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)', color: 'var(--status-danger-fg)' }}>
+              <div className="font-bold">No batch exists yet for {gaps.join(', ')}.</div>
+              <div className="mt-1">
+                A later batch already exists, and a VIP run only moves forward — these students would skip
+                {gaps.length === 1 ? ' that month' : ' those months'} for good. Create {gaps.length === 1 ? 'it' : 'them'} in{' '}
+                <a href={tabHref('batches')} target="_blank" rel="noopener noreferrer" className="font-bold underline">Admin → Batches</a>,
+                then come back and continue. Activation stays disabled until then.
+              </div>
+            </div>
+          )}
+          {Number(p.grandfathered) > 0 && (
+            <div className="mt-3 rounded-xl p-3 text-sm" role="note"
+              style={{ background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)', color: 'var(--status-danger-fg)' }}>
+              {p.grandfathered} matching account{p.grandfathered === 1 ? ' is a' : 's are'} grandfathered paid member{p.grandfathered === 1 ? '' : 's'}:
+              paid before dated memberships, with no expiry. {p.grandfathered === 1 ? 'It' : 'They'} will be refused rather than
+              narrowed to a dated term. Handle {p.grandfathered === 1 ? 'it' : 'them'} by hand.
+            </div>
+          )}
+          {Number(p.overlaps?.total) > 0 && (
+            <div className="mt-3 rounded-xl p-3 text-sm" role="note"
+              style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
+              <div className="font-bold">
+                {p.overlaps.total} of these student{p.overlaps.total === 1 ? ' is' : 's are'} also in another roster, with a different package:
+              </div>
+              <ul className="mt-1 space-y-0.5">
+                {(p.overlaps.by_plan || []).map((o) => (
+                  <li key={`${o.plan_key}-${o.state}`}>{o.rows} × {planName(o.plan_key, o.plan_name)} ({o.state})</li>
+                ))}
+              </ul>
+              <div className="mt-1">
+                The higher package wins (VIP, then Silver, then Essentials). A row whose other roster holds a higher package
+                that is not activated yet is held back as Failed (&ldquo;{labelOfError('higher_plan_pending')}&rdquo;) and can be retried once that one is resolved.
+              </div>
+            </div>
+          )}
+          {dailyCap != null && emails > dailyCap && (
+            <AdminNotice kind="warn">
+              This run sends {emails} emails and the sender&rsquo;s daily allowance is {dailyCap}, shared with everything else
+              the app emails today. When the allowance is used up the run pauses, and the rest wait until you press Resume the
+              next day. Activating in daily groups of about {Math.max(1, Math.floor(dailyCap / 2))} leaves room for the rest.
+            </AdminNotice>
+          )}
           {(p.cohorts || []).map((c) => (
             <div key={`${c.code}-${c.plan_key}`} className="mt-3 rounded-xl p-3 text-sm" style={{ background: 'var(--wash)', border: `1px solid ${C.border}` }}>
-              <div className="font-bold" style={{ color: C.text }}>{c.name}{(p.plans || []).length > 1 && c.plan_name ? ` · ${c.plan_name}` : ''} · {c.rows} rows · batch {c.status}</div>
+              <div className="font-bold" style={{ color: C.text }}>{c.name}{(p.plans || []).length > 1 ? ` · ${planName(c.plan_key, c.plan_name)}` : ''} · {c.rows} rows · batch {c.status}</div>
               <div className="mt-1" style={{ color: C.textSoft }}>
                 Cohort seats: {(c.allocation?.codes || []).join(', ') || '—'}
                 {c.allocation?.queued ? ` + ${c.allocation.queued} for batches not created yet` : ''}.
@@ -21692,8 +22450,16 @@ function MigrationActivateModal({ jobId, rowIds, onStarted, onClose }) {
           ))}
           <div className="mt-3 rounded-xl p-3 text-sm" role="note" style={{ background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)', color: 'var(--status-info-fg)' }}>
             These are already-paid legacy memberships. No enrollment request, receipt or payment record is created, and nothing is
-            posted to Financial Management. Each student gets an activation email from support@alexsagun.com to create their password.
+            posted to Financial Management. A new or never-confirmed account gets an activation email to create its password; an
+            existing account gets a sign-in notice instead.
+            {readiness?.sender && <> Emails come from <strong>{readiness.sender}</strong>{readiness.replyTo ? <>, and replies go to <strong>{readiness.replyTo}</strong></> : ''}.</>}
           </div>
+          {readiness?.sender && !senderProven && (
+            <AdminNotice kind="warn">
+              The sender has not been proven: its domain is not the one the app&rsquo;s other emails use, and no test email has
+              succeeded in this session. Close this, press <strong>Send test email</strong>, and check it arrives before activating.
+            </AdminNotice>
+          )}
           {!readiness?.canActivate && <AdminNotice kind="warn">{pf.readinessMessage}</AdminNotice>}
           <label className="block mt-4 text-sm" htmlFor="migration-phrase" style={{ color: C.text }}>
             Type <strong style={{ fontFamily: fontMono }}>{activationPhrase(n)}</strong> to confirm
@@ -21714,11 +22480,13 @@ function MigrationActivateModal({ jobId, rowIds, onStarted, onClose }) {
 }
 
 // ── One row, in full ─────────────────────────────────────────────────────────
-function MigrationRowPanel({ jobId, row, onClose, onChanged }) {
+function MigrationRowPanel({ jobId, row, plans, onClose, onChanged }) {
   const [events, setEvents] = useState(null);
   const [err, setErr] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);                  // the single-flight lock; `busy` only paints
+  const [historyTick, setHistoryTick] = useState(0);
   const [confirm, setConfirm] = useState(null);   // 'revert' | 'promote' | 'demote'
 
   useEffect(() => {
@@ -21726,42 +22494,86 @@ function MigrationRowPanel({ jobId, row, onClose, onChanged }) {
     migrationRpc('legacy_import_events', { p_job_id: jobId, p_row_id: row.id })
       .then((d) => { if (alive) setEvents(d || []); }, (e) => { if (alive) setErr(e.message); });
     return () => { alive = false; };
-  }, [jobId, row.id, row.activation_state, row.invite_state]);
+  }, [jobId, row.id, row.activation_state, row.invite_state, row.invite_generation, row.onboarding_notice_state, historyTick]);
 
-  const act = async (fn) => {
+  // ★ A BUTTON THAT HIDES ITSELF TAKES FOCUS WITH IT. "Resend onboarding emails" disappears
+  //   once its reset lands (the notice has nothing left to reset), and Resend disappears at the
+  //   generation cap — and an unmounted element drops focus to <body>, where SidePanel's trap
+  //   cannot reach it. After a keep-open action the result line takes focus instead.
+  const statusRef = useRef(null);
+  useEffect(() => {
+    if (!historyTick) return;
+    const a = document.activeElement;
+    if (!a || a === document.body) statusRef.current?.focus({ preventScroll: true });
+  }, [historyTick, row]);
+
+  // ★ A RESULT THE ADMIN CANNOT SEE IS NO RESULT (B7). #67 closed the panel after every action,
+  //   so a Resend's outcome lived only for the reload — and a failure was RETURNED as text and
+  //   shown in the success colour. `keepOpen` reloads underneath the open panel (the workspace
+  //   swaps in the fresh row), and a failure is thrown, so it lands in the error tone.
+  // ★ THE PANEL NEVER KEEPS THE PRE-SEND ROW (#68 review, U2). A resend moves a row OUT of
+  //   "Invitation failed", so the reload no longer holds it and the panel went on reading
+  //   "Not delivered" beside the green "on its way". An action may return `{ notice, patch }`
+  //   (or throw an error carrying `.patch`): the endpoint's own answer, merged into the open
+  //   row at once, before the workspace re-reads the row itself. The History reads again too.
+  const act = async (fn, { keepOpen = false } = {}) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true); setErr(''); setNotice('');
-    try { const msg = await fn(); if (msg) setNotice(msg); setConfirm(null); onChanged(); }
-    catch (e) { setErr(e.message); }
-    finally { setBusy(false); }
+    try {
+      const out = await fn();
+      const msg = typeof out === 'string' ? out : out?.notice;
+      if (msg) setNotice(msg);
+      setConfirm(null);
+      onChanged({ keepOpen, patch: (out && typeof out === 'object' && out.patch) || null });
+    } catch (e) {
+      setErr(e.message);
+      // A resend that failed still spent a link and changed the row: show that as well.
+      if (keepOpen && e?.patch) onChanged({ keepOpen, patch: e.patch });
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+      if (keepOpen) setHistoryTick((t) => t + 1);
+    }
   };
 
+  const isVip = migrationPlanIsVip(row.plan_key, plans);
+  const notice68 = migrationNoticeState(row, Date.now());
   const facts = [
     ['Row', `#${row.source_row_number}`],
     ['Email', row.email],
     ['Name', [row.first_name, row.last_name].filter(Boolean).join(' ') || '—'],
     ['Identity', row.identity_basis === 'external_id' ? `Thinkific id ${row.external_user_id}` : 'Email (no Thinkific id)'],
-    ['Plan', `${row.legacy_plan_label || '—'} → ${row.plan_key || 'unmapped'}`],
-    ['Batch', `${row.legacy_batch_label || '—'} → ${row.batch_name || 'unmapped'}`],
+    ['Package', `${row.legacy_plan_label || '—'} → ${row.plan_key ? migrationPlanTitle(row.plan_key, plans, row.plan_name) : 'unmapped'}`],
+    ['Batch', `${row.legacy_batch_label || '—'} → ${row.batch_name || (row.plan_key && !isVip && plans?.length ? 'none (self-paced)' : 'unmapped')}`],
     ['Membership', row.start_date && row.end_date ? `${formatCalendarDate(row.start_date)} – ${formatCalendarDate(row.end_date)}` : '—'],
-    ...(row.terms_assigned ? [['Roster said', `${row.roster_plan_key || '—'} · ${row.roster_batch_name || row.legacy_batch_label || '—'} · ${formatCalendarDate(row.roster_start_date)} – ${formatCalendarDate(row.roster_end_date)}`]] : []),
+    ...(row.terms_assigned ? [['Roster said', `${row.roster_plan_key ? migrationPlanTitle(row.roster_plan_key, plans) : '—'} · ${row.roster_batch_name || row.legacy_batch_label || '—'} · ${formatCalendarDate(row.roster_start_date)} – ${formatCalendarDate(row.roster_end_date)}`]] : []),
     ['Source', `Thinkific · imported ${fmtEnrollDate(row.imported_at)}`],
     ...(row.phone ? [['Phone', row.phone]] : []),
     ['Paid (history)', row.amount_paid != null ? `${row.currency || ''} ${Number(row.amount_paid).toLocaleString('en-US')} · ${row.payment_status || '—'}` : (row.payment_status || '—')],
     ['Account', row.matched_existing ? (row.existing_confirmed ? 'Existing account (keeps its password)' : 'Existing account, never confirmed') : (row.activation_state === 'activated' ? 'Created by this migration' : 'Will be created on activation')],
-    ['Invitation', row.invite_state ? `${row.invite_state}${row.invite_code ? ` (${row.invite_code})` : ''}${row.invite_sent_at ? ` · ${fmtEnrollDate(row.invite_sent_at)}` : ''}` : '—'],
+    ['Invitation', migrationInviteText(row)],
     ['Membership state', row.subscription_status || '—'],
     ...(row.onboarding_completed_at ? [['Onboarded', fmtEnrollDate(row.onboarding_completed_at)]] : []),
-    ...(row.onboarding_notice_state ? [['Onboarding emails', { sent: 'Sent to the admin and the student', failed: 'Not sent yet — tried again the next time the student opens the app (five tries in all)', sending: 'Sending' }[row.onboarding_notice_state] || row.onboarding_notice_state]] : []),
+    ...(notice68 ? [['Onboarding emails', notice68.text]] : []),
   ];
   const canEditTerms = ['ready', 'inactive', 'failed'].includes(row.activation_state);
-  const canResend = row.activation_state === 'activated' && !row.claimed;
+  // At the generation cap begin_invite refuses every resend (LEGACY_ROW_NOT_READY), so the
+  // button is not offered; the Invitation line says why.
+  const canResend = row.activation_state === 'activated' && !row.claimed
+    && !(Number(row.invite_generation) >= MIGRATION_MAX_INVITE_GENERATION);
   const canRevert = row.activation_state === 'activated' && (row.subscription_status === 'scheduled' || !row.claimed);
+  // #68: a Super Admin reset of the two "you're in" emails, audited server-side. It clears the
+  // tries; the emails go out the next time the student opens the app.
+  const canResetNotice = row.activation_state === 'activated' && row.claimed && !!notice68?.resettable;
 
   return (
     <SidePanel title={[row.first_name, row.last_name].filter(Boolean).join(' ') || row.email || `Row ${row.source_row_number}`}
       subtitle={rowDisplayState(row)} icon={Users} onClose={onClose} canClose={!busy} maxW="sm:max-w-lg">
-      {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
-      {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
+      <div ref={statusRef} tabIndex={-1} className="outline-none">
+        {err && <AdminNotice kind="danger" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+        {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
+      </div>
       <dl className="mt-2">
         {facts.map(([k, v]) => (
           <div key={k} className="flex items-baseline justify-between gap-3 py-1.5" style={{ borderBottom: `1px solid ${C.border}` }}>
@@ -21776,7 +22588,7 @@ function MigrationRowPanel({ jobId, row, onClose, onChanged }) {
           <ul className="text-sm space-y-1" style={{ color: C.text }}>
             {(row.errors || []).map((e) => <li key={e}>{labelOfError(e)}</li>)}
             {row.blocked_reason && <li>{labelOfError(row.blocked_reason)}</li>}
-            {row.last_error && <li>Last attempt failed: {row.last_error}</li>}
+            {row.last_error && <li>Last attempt failed: {labelOfError(row.last_error)}</li>}
           </ul>
         </div>
       )}
@@ -21795,11 +22607,47 @@ function MigrationRowPanel({ jobId, row, onClose, onChanged }) {
         {canEditTerms && (
           <button type="button" onClick={() => setConfirm('terms')} className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold">Edit terms…</button>
         )}
+        {/* ★ aria-disabled, NEVER disabled, on the two buttons that keep the panel open (#68
+            review, U1). A browser blurs a focused element the moment it becomes `disabled`, and
+            SidePanel's Tab trap cannot recover a focus that fell to <body> — so a keyboard user
+            who pressed Resend was left walking the page behind the aria-modal scrim. The press
+            is refused by the early return (and by act's own lock), not by the DOM attribute. */}
         {canResend && (
-          <button type="button" disabled={busy}
-            onClick={() => act(async () => { const r = await migrationApi('resend', { rowId: row.id }); return r.state === 'sent' || r.state === 'notified' ? 'A new email is on its way. The previous link no longer works.' : `The email was not delivered (${r.code || r.state}).`; })}
-            className="gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5">
+          <button type="button" aria-disabled={busy || undefined}
+            onClick={() => {
+              if (busy) return;
+              act(async () => {
+                let r;
+                try { r = await migrationApi('resend', { rowId: row.id }); }
+                catch (e) { throw new Error(migrationResendRefusal(e)); }
+                const patch = migrationResendPatch(row, r, new Date().toISOString());
+                if (r.state === 'sent' || r.state === 'notified') return { notice: 'A new email is on its way. The previous link no longer works.', patch };
+                // ★ Anything else is thrown, so it renders in the ERROR tone — and "uncertain" is
+                //   said as what it is: the provider did not answer, so it may have arrived.
+                const failure = (message) => Object.assign(new Error(message), { patch });
+                if (r.state === 'uncertain') throw failure(`The provider did not confirm the email (${r.code || 'no answer'}). It may still arrive — check with the student before sending another.`);
+                throw failure(`The email was not delivered. ${migrationSendFailText(r.code, null, 'The email')}`);
+              }, { keepOpen: true });
+            }}
+            className={`gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5${busy ? ' opacity-60 cursor-wait' : ''}`}>
             {busy && <Loader2 size={12} className="animate-spin" />} <Mail size={12} /> Resend email
+          </button>
+        )}
+        {canResetNotice && (
+          <button type="button" aria-disabled={busy || undefined}
+            onClick={() => {
+              if (busy) return;
+              act(async () => {
+                await migrationApi('reset-onboarding-notice', { rowId: row.id });
+                // legacy_import_reset_onboarding_notice clears the state and the tries.
+                return {
+                  notice: 'Reset. The two onboarding emails go out again the next time the student opens the app.',
+                  patch: { id: row.id, onboarding_notice_state: null, onboarding_notice_attempts: 0 },
+                };
+              }, { keepOpen: true });
+            }}
+            className={`gh-btn-ghost px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5${busy ? ' opacity-60 cursor-wait' : ''}`}>
+            {busy && <Loader2 size={12} className="animate-spin" />} <RotateCcw size={12} /> Resend onboarding emails
           </button>
         )}
         {canRevert && (
@@ -21822,7 +22670,7 @@ function MigrationRowPanel({ jobId, row, onClose, onChanged }) {
       </div>
       {confirm === 'revert' && (
         <MigrationReasonModal title="Revert this activation?" tone="danger" busy={busy} confirmLabel="Revert"
-          subtitle="The membership is cancelled and its cohort seats are revoked. The account and its approval are kept, and a claim email already sent still signs the student in — they will then see the enrollment page, because they no longer hold a membership."
+          subtitle="The membership is cancelled, its cohort seats are revoked and the row's Thinkific-id link is removed, so a corrected row can be activated later. The account and its approval are kept, and a claim email already sent still signs the student in — they are then held on a “your migrated membership is being set up” page, with no price and the support address, until a corrected row is activated."
           onClose={() => setConfirm(null)}
           onConfirm={(reason) => act(async () => { await migrationRpc('legacy_import_revert', { p_row_id: row.id, p_reason: reason }); return 'Reverted. The student no longer has this membership.'; })} />
       )}
@@ -21839,9 +22687,145 @@ function MigrationRowPanel({ jobId, row, onClose, onChanged }) {
           subtitle={confirm === 'promote' ? 'It keeps its original dates and batch. Nothing is activated until you confirm an activation.' : 'It will not be activated until it is made ready again.'}
           confirmLabel={confirm === 'promote' ? 'Make ready' : 'Make inactive'}
           onClose={() => setConfirm(null)}
-          onConfirm={(reason) => act(async () => { const r = await migrationRpc('legacy_import_set_eligibility', { p_row_ids: [row.id], p_eligible: confirm === 'promote', p_reason: reason }); return r.changed ? 'Updated.' : 'Nothing changed — the row is no longer in that state, or its term has ended.'; })} />
+          onConfirm={(reason) => act(async () => {
+            const r = await migrationRpc('legacy_import_set_eligibility', { p_row_ids: [row.id], p_eligible: confirm === 'promote', p_reason: reason });
+            return r.changed ? 'Updated.' : `Nothing changed${migrationSkippedText(r) || ' — the row is no longer in that state'}.`;
+          })} />
       )}
     </SidePanel>
+  );
+}
+
+// ── Resend every refused invitation of a job (#68) ───────────────────────────
+// ★ ONE SERVER-SIDE PASS, WITH THE SAME BRAKES AS AN ACTIVATION. `resend-failed` walks the
+//   job's activated rows whose invitation was refused, inside the endpoint's time budget, at
+//   the provider's pace, and stops on the same circuit breaker — so a sender that is still
+//   refused costs one email, not the whole list. #67 offered one Resend click per row.
+// ★ "MAY ALREADY HAVE ARRIVED" IS OPT-IN. An `uncertain` row got no answer from the provider;
+//   a fresh link replaces the one the student may be reading, so it is sent only when ticked.
+// ★ THE LOOP STOPS WHEN A PASS DELIVERED NOTHING: a row the provider keeps refusing would
+//   otherwise be sent again on every pass, spending its invitation generations.
+// ★ EACH ROW IS TRIED ONCE PER RUN OF THIS DIALOG. Every pass hands back the ids it tried as
+//   `exclude`, the endpoint's own contract: a failed resend stays `failed`, so without it the
+//   next pass would pick the same row again instead of the ones behind it.
+function MigrationResendFailedModal({ jobId, onClose, onChanged }) {
+  const [split, setSplit] = useState(null);           // { failed, uncertain, unrecoverable } once counted
+  const [includeUncertain, setIncludeUncertain] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [out, setOut] = useState(null);               // running totals of this dialog's passes
+  const stopRef = useRef(false);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        let failed = 0; let uncertain = 0; let unrecoverable = 0;
+        for (let off = 0; off < 5000; off += 200) {
+          const pg = await migrationRpc('legacy_import_rows_page', { p_job_id: jobId, p_state: 'invite_problem', p_limit: 200, p_offset: off });
+          for (const r of pg?.rows || []) {
+            // The endpoint leaves these out: no resend can succeed. Counting them would
+            // promise emails the button can never send — by code, or at the generation cap.
+            if (migrationInviteUnrecoverable(r)) unrecoverable += 1;
+            else if (r.invite_state === 'uncertain') uncertain += 1;
+            else failed += 1;
+          }
+          if (!pg || (pg.rows || []).length < 200) break;
+        }
+        if (alive) setSplit({ failed, uncertain, unrecoverable });
+      } catch (e) { if (alive) setErr(e.message); }
+    })();
+    return () => { alive = false; };
+  }, [jobId]);
+
+  const target = split ? split.failed + (includeUncertain ? split.uncertain : 0) : 0;
+
+  // ★ aria-disabled on Resend, not disabled (#68 review, U1): the pressed button keeps its
+  //   focus inside the aria-modal dialog. runningRef is the lock; `busy` only paints.
+  const runningRef = useRef(false);
+  const run = async () => {
+    if (runningRef.current || !target) return;
+    runningRef.current = true;
+    stopRef.current = false;
+    setBusy(true); setErr('');
+    const acc = { passes: 0, delivered: 0, notDelivered: 0, remaining: null, stopped: null, code: null };
+    const tried = [];
+    setOut({ ...acc });
+    try {
+      for (let i = 0; i < 100 && !stopRef.current; i += 1) {
+        const r = await migrationApi('resend-failed', { jobId, includeUncertain, exclude: tried });
+        const results = Array.isArray(r?.results) ? r.results : [];
+        for (const id of Array.isArray(r?.tried) ? r.tried : results.map((x) => x.row_id)) if (id && !tried.includes(id)) tried.push(id);
+        let deliveredNow = 0;
+        for (const x of results) {
+          const st = x.invite || x.state;
+          if (st === 'sent' || st === 'notified') deliveredNow += 1; else acc.notDelivered += 1;
+        }
+        acc.passes += 1; acc.delivered += deliveredNow;
+        acc.remaining = r?.remaining ?? null; acc.stopped = r?.stopped || null; acc.code = r?.code || null;
+        setOut({ ...acc });
+        if (acc.stopped || !results.length || !deliveredNow || !Number(acc.remaining)) break;
+      }
+    } catch (e) { setErr(e.message); }
+    finally { runningRef.current = false; setBusy(false); onChanged?.(); }
+  };
+
+  return (
+    <AccountModal title="Resend failed invitations" subtitle="Each student gets a fresh link; any earlier link stops working."
+      icon={Mail} tone="primary" maxW="sm:max-w-lg" canClose={!busy} onClose={onClose}>
+      {err && <AdminNotice kind="danger">{err}</AdminNotice>}
+      {!split && !err && <p className="text-sm flex items-center gap-2" role="status" style={{ color: C.textSoft }}><Loader2 size={14} className="animate-spin" /> Counting…</p>}
+      {split && (
+        <div className="space-y-3 text-sm" style={{ color: C.textSoft }}>
+          <p>
+            <strong style={{ color: C.text }}>{split.failed}</strong> invitation{split.failed === 1 ? ' was' : 's were'} refused and
+            can be sent again. If the sender was the problem, send a test email first — this stops at the first refusal of the
+            same kind rather than working through the list.
+          </p>
+          {split.uncertain > 0 && (
+            <label className="flex items-start gap-2 cursor-pointer" style={{ color: C.text }}>
+              <input type="checkbox" className="mt-1" checked={includeUncertain} disabled={busy} onChange={(e) => setIncludeUncertain(e.target.checked)} />
+              <span>
+                Also resend the {split.uncertain} that may already have been delivered (the provider did not answer). A new
+                link replaces the one the student may already have.
+              </span>
+            </label>
+          )}
+          {split.unrecoverable > 0 && (
+            <p style={{ color: C.textMute }}>
+              {split.unrecoverable} more cannot be resent from here: the account no longer exists, or the invitation has already
+              been sent the maximum number of times. Open the row to see which.
+            </p>
+          )}
+        </div>
+      )}
+      {out && (
+        <div className="mt-3 rounded-xl p-3 text-sm" role="status" style={{ background: 'var(--wash)', border: `1px solid ${C.border}`, color: C.text }}>
+          {busy && <Loader2 size={13} className="inline animate-spin mr-1.5" />}
+          {out.delivered} sent · {out.notDelivered} not delivered{out.remaining != null ? ` · ${out.remaining} still to go` : ''}
+        </div>
+      )}
+      {out?.stopped && <AdminNotice kind="danger">{migrationStopText(out.stopped, out.code)}</AdminNotice>}
+      {out && !busy && !out.stopped && Number(out.remaining) > 0 && (
+        <AdminNotice kind="warn">
+          {out.remaining} invitation{Number(out.remaining) === 1 ? '' : 's'} still need{Number(out.remaining) === 1 ? 's' : ''} a resend. Open a row
+          to see the provider&rsquo;s answer for it, or run this again.
+        </AdminNotice>
+      )}
+      <div className="mt-4 flex justify-end gap-2">
+        {busy ? (
+          <button type="button" onClick={() => { stopRef.current = true; }} className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold inline-flex items-center gap-1.5">
+            <Pause size={13} /> Stop after this step
+          </button>
+        ) : (
+          <button type="button" onClick={onClose} className="gh-btn-ghost px-4 py-2 rounded-xl text-sm font-semibold">{out ? 'Close' : 'Cancel'}</button>
+        )}
+        <button type="button" onClick={run} aria-disabled={busy || !target || undefined}
+          className={`px-4 py-2 rounded-xl text-sm font-bold text-white flex items-center gap-2${busy || !target ? ' opacity-50' : ''}`} style={MIGRATION_PRIMARY_BTN}>
+          {busy && <Loader2 size={14} className="animate-spin" />} Resend {target || ''}
+        </button>
+      </div>
+    </AccountModal>
   );
 }
 
@@ -21852,11 +22836,15 @@ const MIGRATION_FILTERS = [
   ['failed', 'Failed'], ['reverted', 'Reverted'],
 ];
 
-function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
+function MigrationJobWorkspace({ jobId, readiness, senderTest, onSenderTest, onBack, onCountChange }) {
   const [summary, setSummary] = useState(null);
   const [rowsPage, setRowsPage] = useState({ total: 0, rows: [] });
   const [filter, setFilter] = useState('all');
   const [batchCode, setBatchCode] = useState('');
+  const [planKey, setPlanKey] = useState('');                  // #68: the Package filter
+  const [plans, setPlans] = useState([]);                      // titles + segments, retired plans included
+  const [runNote, setRunNote] = useState(null);                // { kind, text } — why a run stopped
+  const [resendOpen, setResendOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -21885,12 +22873,17 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
 
   const loadRows = useCallback(async () => {
     const seq = ++rowsSeq.current;
-    const out = await migrationRpc('legacy_import_rows_page', {
+    const args = {
       p_job_id: jobId, p_state: filter === 'all' ? null : filter, p_batch_code: batchCode || null,
       p_search: deferredSearch.trim() || null, p_limit: IMPORT_PAGE_SIZE, p_offset: page * IMPORT_PAGE_SIZE,
-    });
+    };
+    // ★ #68: THE PACKAGE FILTER IS THE SERVER'S, like the batch filter beside it — so the
+    //   total, the pages and "Select all … in this view" all describe the same set. Sent only
+    //   when set, the ready_ids idiom: an unfiltered read never names the new argument.
+    if (planKey) args.p_plan_key = planKey;
+    const out = await migrationRpc('legacy_import_rows_page', args);
     if (seq === rowsSeq.current) setRowsPage(out || { total: 0, rows: [] });
-  }, [jobId, filter, batchCode, deferredSearch, page]);
+  }, [jobId, filter, batchCode, planKey, deferredSearch, page]);
 
   const reload = useCallback(async () => {
     setErr('');
@@ -21903,8 +22896,41 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
   const reloadRef = useRef(reload);
   reloadRef.current = reload;
 
-  useEffect(() => { reload(); /* eslint-disable-next-line */ }, [jobId, filter, batchCode, deferredSearch, page]);
-  useEffect(() => { setPage(0); }, [filter, batchCode, deferredSearch]);
+  useEffect(() => { reload(); /* eslint-disable-next-line */ }, [jobId, filter, batchCode, planKey, deferredSearch, page]);
+  useEffect(() => { setPage(0); }, [filter, batchCode, planKey, deferredSearch]);
+
+  // The catalog, for package titles and segments. Retired plans are kept: a row staged under
+  // one still needs a title. A failed read leaves PLAN_LABELS to answer.
+  useEffect(() => {
+    let alive = true;
+    supabase.from('enrollment_plans').select('key,name,tagline,community_segment,access_days,active').order('position', { ascending: true })
+      .then(({ data }) => { if (alive && Array.isArray(data)) setPlans(data); }, () => {});
+    return () => { alive = false; };
+  }, []);
+
+  // ★ THE OPEN PANEL FOLLOWS THE RELOAD. It used to hold the row object it was opened with, so
+  //   it had to close to show anything new; now a reload swaps in the same row's fresh copy.
+  // ★ AND A ROW THE RELOAD NO LONGER HOLDS IS READ ON ITS OWN (#68 review, U2). A resend moves
+  //   a row out of "Invitation failed"; `|| cur` then kept the PRE-send object — "Not
+  //   delivered" beside the green "on its way", and a Resend that looked needed. The panel's
+  //   action has already merged the endpoint's answer (mergeOpenRow); this replaces it with
+  //   the row as the database now has it. Only the newest read may land.
+  const openRowRef = useRef(null);
+  openRowRef.current = openRow;
+  const openRowSeq = useRef(0);
+  useEffect(() => {
+    const cur = openRowRef.current;
+    if (!cur) return;
+    const fresh = rowsPage.rows.find((x) => x.id === cur.id);
+    const seq = ++openRowSeq.current;
+    if (fresh) { setOpenRow((c) => (c && c.id === fresh.id ? fresh : c)); return; }
+    readMigrationRow(jobId, cur).then((row) => {
+      if (row && seq === openRowSeq.current) setOpenRow((c) => (c && c.id === row.id ? row : c));
+    }, () => { /* the merged answer stays; the next reload tries again */ });
+  }, [rowsPage, jobId]);
+  const mergeOpenRow = useCallback((patch) => {
+    if (patch?.id) setOpenRow((c) => (c && c.id === patch.id ? { ...c, ...patch } : c));
+  }, []);
 
   const job = summary?.job;
   const openRun = (summary?.runs || []).find((r) => r.status === 'running' || r.status === 'paused');
@@ -21920,38 +22946,70 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
   const activatableSelected = [...selected.entries()].filter(([, s]) => s === 'ready' || s === 'failed').map(([id]) => id);
   const inactiveSelected = [...selected.entries()].filter(([, s]) => s === 'inactive').map(([id]) => id);
 
-  const selectAllReady = async () => {
+  // "Select all … in this view": the server's ids for the batch, search and package showing.
+  // p_plan_key is sent only when the Package filter is set, so a database without #68 keeps
+  // answering the unfiltered form. #68 also accepts p_state 'inactive' — the only way to
+  // promote a self-paced package's rows in bulk.
+  const selectAllInView = async (state) => {
     setBusy(true); setErr('');
     try {
-      const ids = await migrationRpc('legacy_import_ready_ids', { p_job_id: jobId, p_batch_code: batchCode || null, p_search: deferredSearch.trim() || null });
+      const args = { p_job_id: jobId, p_batch_code: batchCode || null, p_search: deferredSearch.trim() || null };
+      if (state !== 'ready') args.p_state = state;
+      if (planKey) args.p_plan_key = planKey;
+      const ids = await migrationRpc('legacy_import_ready_ids', args);
       setSelected((m) => {
         const next = new Map(m);
-        for (const id of ids || []) if (next.size < MAX_ACTIVATION_RUN || next.has(id)) next.set(id, 'ready');
+        for (const id of ids || []) if (next.size < MAX_ACTIVATION_RUN || next.has(id)) next.set(id, state);
         return next;
       });
-      if ((ids || []).length >= MAX_ACTIVATION_RUN) setNotice(`Selected the first ${MAX_ACTIVATION_RUN} ready rows — one activation takes at most ${MAX_ACTIVATION_RUN}.`);
+      if ((ids || []).length >= MAX_ACTIVATION_RUN) setNotice(`Selected the first ${MAX_ACTIVATION_RUN} ${state} rows — one activation takes at most ${MAX_ACTIVATION_RUN}.`);
+      else if (!(ids || []).length) setNotice(`No ${state === 'ready' ? 'pending' : state} rows in this view.`);
     } catch (e) { setErr(e.message); }
     finally { setBusy(false); }
   };
+  const selectAllReady = () => selectAllInView('ready');
+  const selectAllInactive = () => selectAllInView('inactive');
 
   // ★ The runner. Each call is one bounded server request; the database holds every
   //   state, so closing the tab mid-run loses nothing — Resume picks up the same run.
+  // ★ #68: THE LOOP STOPS FOR A REASON, AND SAYS IT. Three ways out that #67 did not have:
+  //   · the endpoint's circuit breaker (`stopped`) — the provider refused the sender or the
+  //     daily limit was hit; the server has already paused the run, and at most one row was
+  //     granted without its email (that email went back in the queue);
+  //   · a lease held by an earlier step (`busyUntil`) — said with its time, never "another window";
+  //   · a step that changed NOTHING — the same counts twice, or no rows touched — which used to
+  //     either end silently or spin until the 60-a-minute limiter refused it.
   const runLoop = async (runId, { retryFailed = false } = {}) => {
     pausedRef.current = false;
     setRunState({ running: true, runId, last: null });
-    setErr('');
+    setErr(''); setRunNote(null);
+    let prevSig = null;
     try {
       for (let i = 0; i < 400; i += 1) {
         if (pausedRef.current) { await migrationApi('pause-run', { runId }); break; }
         const r = await migrationApi('activate-chunk', { runId, retryFailed });
         setRunState({ running: true, runId, last: r });
         await reloadRef.current();
+        if (r?.stopped) { setRunNote({ kind: 'danger', text: migrationStopText(r.stopped, r.code) }); break; }
+        if (r?.busyUntil) { setRunNote({ kind: 'warn', text: migrationBusyText(r.busyUntil) }); break; }
         const st = r?.run?.status;
         if (!st || st === 'completed' || st === 'paused' || st === 'cancelled') break;
-        if (!r.results?.length) break;
+        const sig = JSON.stringify([r.run.states || null, r.run.remaining ?? null]);
+        if (!r.results?.length || sig === prevSig) {
+          const left = Number(r.run.remaining) || 0;
+          setRunNote({
+            kind: 'warn',
+            text: `The last step changed nothing, so the run is waiting. ${left} row${left === 1 ? ' is' : 's are'} still activating or waiting for an email. `
+              + `A step that stopped part-way is recovered automatically after ${STALE_CLAIM_MINUTES} minutes; press Resume then.`,
+          });
+          break;
+        }
+        prevSig = sig;
       }
-    } catch (e) { setErr(e.message); }
-    finally {
+    } catch (e) {
+      if (e.busyUntil || e.code === 'LEGACY_RUN_BUSY') setRunNote({ kind: 'warn', text: migrationBusyText(e.busyUntil || e.context?.lease_until) });
+      else setErr(e.message);
+    } finally {
       setRunState((s) => ({ ...s, running: false }));
       await reloadRef.current();
     }
@@ -21988,10 +23046,12 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
         }
       }
       const csv = toCsv(all.map((r) => ({
-        row: r.source_row_number, email: r.email, batch: r.batch_name || r.legacy_batch_label || '',
+        row: r.source_row_number, email: r.email,
+        package: r.plan_key ? migrationPlanTitle(r.plan_key, plans, r.plan_name) : '',
+        batch: r.batch_name || r.legacy_batch_label || '',
         state: rowDisplayState(r),
         reasons: [...(r.errors || []), r.blocked_reason, r.last_error, r.invite_code].filter(Boolean).map(labelOfError).join('; '),
-      })), ['row', 'email', 'batch', 'state', 'reasons']);
+      })), ['row', 'email', 'package', 'batch', 'state', 'reasons']);
       downloadFile(csv, `migration-problems-${(job?.fingerprint || 'job')}.csv`, 'text/csv');
     } catch (e) { setErr(e.message); }
     finally { setBusy(false); }
@@ -22002,7 +23062,23 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
     try {
       const ids = eligible ? inactiveSelected : readySelected;
       const r = await migrationRpc('legacy_import_set_eligibility', { p_row_ids: ids, p_eligible: eligible, p_reason: reason });
-      setNotice(`${r.changed} row${r.changed === 1 ? '' : 's'} updated${r.skipped ? `; ${r.skipped} skipped (no longer in that state, or the term has ended)` : ''}.`);
+      setNotice(`${r.changed} row${r.changed === 1 ? '' : 's'} updated${migrationSkippedText(r)}.`);
+      setSelected(new Map());
+      setReasonFor(null);
+      await reload();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  // Bulk terms: the selection's inactive, ready and failed rows in ONE call. set_terms skips any
+  // other state itself (it reports them as skipped), so the count promised is what it can change.
+  const bulkTerms = async (change, reason) => {
+    const ids = [...selected.entries()].filter(([, s]) => s === 'ready' || s === 'inactive' || s === 'failed').map(([id]) => id);
+    setBusy(true); setErr('');
+    try {
+      const r = await migrationRpc('legacy_import_set_terms', { p_row_ids: ids, ...change, p_reason: reason });
+      const skipped = Math.max(0, (r.found ?? ids.length) - (r.changed ?? 0));
+      setNotice(`Terms changed on ${r.changed} row${r.changed === 1 ? '' : 's'}${skipped ? ` (${skipped} left as they were)` : ''}.`);
       setSelected(new Map());
       setReasonFor(null);
       await reload();
@@ -22037,6 +23113,16 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
   const progressRows = lastRun?.states || openRun?.counts || null;
   const discarded = !!job?.discarded_at;
   const totalPages = Math.max(1, Math.ceil((rowsPage.total || 0) / IMPORT_PAGE_SIZE));
+  // The packages this job can hold: what its labels were mapped to, the packages ticked at
+  // staging, and any on this page (a term reassigned to another package). The filter shows
+  // only when there is a choice to make.
+  const jobPlanKeys = [...new Set([...Object.values(job?.plan_mapping || {}), ...(job?.eligible_plan_keys || []),
+    ...rowsPage.rows.map((r) => r.plan_key), planKey].filter(Boolean))];
+  // The job summary groups by batch alone, and a self-paced row has none by design — so its
+  // "no batch" line is really the self-paced packages (plus any VIP row blocked for want of a
+  // batch). Say so rather than print "No batch" as if every such row were missing one.
+  const jobHasSelfPaced = plans.length > 0 && jobPlanKeys.some((k) => plans.some((p) => p.key === k) && !migrationPlanIsVip(k, plans));
+  const inviteProblems = Number(summary?.invites?.failed) || 0;
 
   return (
     <div className="space-y-4">
@@ -22073,7 +23159,7 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
               <tbody>
                 {(summary?.cohorts || []).map((c) => (
                   <tr key={c.batch_code || 'none'} style={{ borderTop: `1px solid ${C.border}` }}>
-                    <td className="py-1.5 pr-3" style={{ color: C.text }}>{c.batch_name || 'No batch'}{c.batch_status && c.batch_status !== 'open' ? ` (${c.batch_status})` : ''}</td>
+                    <td className="py-1.5 pr-3" style={{ color: C.text }}>{c.batch_name || (jobHasSelfPaced ? 'Self-paced (no cohort)' : 'No batch')}{c.batch_status && c.batch_status !== 'open' ? ` (${c.batch_status})` : ''}</td>
                     <td className="text-right px-2">{c.ready}</td><td className="text-right px-2">{c.inactive}</td>
                     <td className="text-right px-2" style={{ color: c.blocked ? C.red : undefined }}>{c.blocked}</td>
                     <td className="text-right px-2">{c.activated}</td><td className="text-right pl-2">{c.total}</td>
@@ -22092,7 +23178,8 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
               : lastRun?.status === 'completed' ? 'Activation finished.'
               : lastRun?.status === 'paused' ? 'Activation paused.' : ''}
           </span>
-          <div className="mt-2"><MigrationReadiness readiness={readiness} /></div>
+          <div className="mt-2"><MigrationReadiness readiness={readiness} senderTest={senderTest} onSenderTest={onSenderTest} /></div>
+          {runNote && <AdminNotice kind={runNote.kind} onDismiss={() => setRunNote(null)}>{runNote.text}</AdminNotice>}
           {summary?.invites && (
             <p className="mt-3 text-sm" style={{ color: C.textSoft }}>
               Emails: {summary.invites.sent} sent · {summary.invites.notified} notified · {summary.invites.claimed} claimed
@@ -22112,8 +23199,15 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
             </div>
           )}
           {!runState.running && !openRun && failedCount > 0 && !discarded && (
-            <button type="button" onClick={retryFailedRows} disabled={busy} className="mt-3 gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold">
+            <button type="button" onClick={retryFailedRows} disabled={busy} className="mt-3 mr-2 gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold">
               Retry {failedCount} failed row{failedCount === 1 ? '' : 's'}…
+            </button>
+          )}
+          {/* #68: every refused invitation of the job, in one paced, breaker-guarded pass —
+              rather than one Resend click per row. */}
+          {!runState.running && !openRun && inviteProblems > 0 && !discarded && (
+            <button type="button" onClick={() => setResendOpen(true)} disabled={busy} className="mt-3 gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5">
+              <Mail size={12} /> Resend {inviteProblems} failed invitation{inviteProblems === 1 ? '' : 's'}…
             </button>
           )}
         </section>
@@ -22131,6 +23225,12 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
             <option value="">All batches</option>
             {(summary?.cohorts || []).filter((c) => c.batch_code).map((c) => <option key={c.batch_code} value={c.batch_code}>{c.batch_name}</option>)}
           </select>
+          {jobPlanKeys.length > 1 && (
+            <select className="gh-input text-sm" value={planKey} onChange={(e) => setPlanKey(e.target.value)} aria-label="Filter by package">
+              <option value="">All packages</option>
+              {jobPlanKeys.map((k) => <option key={k} value={k}>{migrationPlanTitle(k, plans)}</option>)}
+            </select>
+          )}
           <input className="gh-input text-sm flex-1 min-w-[12rem]" placeholder="Search name or email" value={search}
             onChange={(e) => setSearch(e.target.value)} aria-label="Search rows" />
         </div>
@@ -22140,9 +23240,11 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
             {selected.size} selected{activatableSelected.length !== selected.size ? ` (${activatableSelected.length} can be activated)` : ''}
           </span>
           <button type="button" onClick={selectAllReady} disabled={busy || discarded} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold">Select all ready in this view</button>
+          <button type="button" onClick={selectAllInactive} disabled={busy || discarded} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold">Select all inactive in this view</button>
           {selected.size > 0 && <button type="button" onClick={() => setSelected(new Map())} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold">Clear</button>}
           {inactiveSelected.length > 0 && <button type="button" onClick={() => setReasonFor('promote')} disabled={discarded} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold">Make {inactiveSelected.length} ready…</button>}
           {readySelected.length > 0 && <button type="button" onClick={() => setReasonFor('demote')} disabled={discarded} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold">Make {readySelected.length} inactive…</button>}
+          {(inactiveSelected.length + readySelected.length) > 0 && <button type="button" onClick={() => setReasonFor('terms')} disabled={discarded || runState.running} className="gh-btn-ghost px-3 py-1.5 rounded-lg text-xs font-semibold">Change terms for {inactiveSelected.length + readySelected.length}…</button>}
           <button type="button" onClick={() => setActivateIds(activatableSelected)} disabled={!activatableSelected.length || runState.running || discarded}
             className="ml-auto px-4 py-2 rounded-xl text-sm font-bold text-white inline-flex items-center gap-2 disabled:opacity-50" style={ADMIN_BTN_OK}>
             <UserCheck size={14} /> Activate {activatableSelected.length || ''}
@@ -22155,6 +23257,7 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
               <th className="py-2 pr-2 w-8"><span className="sr-only">Select</span></th>
               <th className="text-left py-2 pr-3 font-semibold">#</th>
               <th className="text-left py-2 pr-3 font-semibold">Student</th>
+              <th className="text-left py-2 pr-3 font-semibold">Package</th>
               <th className="text-left py-2 pr-3 font-semibold">Batch</th>
               <th className="text-left py-2 pr-3 font-semibold">Membership</th>
               <th className="text-left py-2 pr-3 font-semibold">Status</th>
@@ -22177,7 +23280,10 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
                       {r.phone && <div className="text-xs" style={{ color: C.textMute }}>{r.phone}</div>}
                       <div className="text-xs" style={{ color: C.textMute }}>Thinkific · imported {fmtEnrollDate(r.imported_at)}</div>
                     </td>
-                    <td className="py-2 pr-3 whitespace-nowrap" style={{ color: C.textSoft }}>{r.batch_name || r.legacy_batch_label || '—'}</td>
+                    <td className="py-2 pr-3 whitespace-nowrap" style={{ color: C.text }}>{r.plan_key ? migrationPlanTitle(r.plan_key, plans, r.plan_name) : '—'}</td>
+                    <td className="py-2 pr-3 whitespace-nowrap" style={{ color: C.textSoft }}>
+                      {r.batch_name || (r.plan_key && plans.length && !migrationPlanIsVip(r.plan_key, plans) ? 'Self-paced' : (r.legacy_batch_label || '—'))}
+                    </td>
                     <td className="py-2 pr-3 whitespace-nowrap text-xs" style={{ color: C.textSoft }}>
                       {r.start_date ? `${formatCalendarDate(r.start_date)} – ${formatCalendarDate(r.end_date)}` : '—'}
                     </td>
@@ -22198,7 +23304,9 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
           {rowsPage.rows.length === 0 && <p className="py-6 text-center text-sm" style={{ color: C.textMute }}>No rows in this view.</p>}
         </div>
         <div className="mt-3 flex items-center justify-between gap-2 text-xs" style={{ color: C.textSoft }}>
-          <span>{rowsPage.total} rows · page {page + 1} of {totalPages}</span>
+          <span>
+            {rowsPage.total} rows{planKey ? ` · ${migrationPlanTitle(planKey, plans)}` : ''} · page {page + 1} of {totalPages}
+          </span>
           <span className="flex gap-2">
             <button type="button" onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={page === 0} className="gh-btn-ghost px-3 py-1.5 rounded-lg font-semibold">Previous</button>
             <button type="button" onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))} disabled={page + 1 >= totalPages} className="gh-btn-ghost px-3 py-1.5 rounded-lg font-semibold">Next</button>
@@ -22207,11 +23315,14 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
       </section>
 
       {openRow && (
-        <MigrationRowPanel jobId={jobId} row={openRow} onClose={() => setOpenRow(null)}
-          onChanged={async () => { await reload(); setOpenRow(null); }} />
+        <MigrationRowPanel jobId={jobId} row={openRow} plans={plans} onClose={() => setOpenRow(null)}
+          onChanged={async ({ keepOpen = false, patch = null } = {}) => { if (keepOpen) mergeOpenRow(patch); await reload(); if (!keepOpen) setOpenRow(null); }} />
       )}
       {activateIds && (
-        <MigrationActivateModal jobId={jobId} rowIds={activateIds} onStarted={onStarted} onClose={() => setActivateIds(null)} />
+        <MigrationActivateModal jobId={jobId} rowIds={activateIds} senderTest={senderTest} onStarted={onStarted} onClose={() => setActivateIds(null)} />
+      )}
+      {resendOpen && (
+        <MigrationResendFailedModal jobId={jobId} onClose={() => setResendOpen(false)} onChanged={() => reloadRef.current()} />
       )}
       {reasonFor === 'discard' && (
         <MigrationReasonModal title="Discard this job?" tone="danger" busy={busy} confirmLabel="Discard"
@@ -22224,6 +23335,10 @@ function MigrationJobWorkspace({ jobId, readiness, onBack, onCountChange }) {
           subtitle={reasonFor === 'promote' ? 'They keep their original dates and batch. Nothing is activated until you confirm an activation.' : 'They will not be activated until they are made ready again.'}
           confirmLabel={reasonFor === 'promote' ? 'Make ready' : 'Make inactive'}
           onClose={() => setReasonFor(null)} onConfirm={(reason) => bulkEligibility(reasonFor === 'promote', reason)} />
+      )}
+      {reasonFor === 'terms' && (
+        <MigrationBulkTermsModal busy={busy} count={inactiveSelected.length + readySelected.length}
+          onClose={() => setReasonFor(null)} onSave={bulkTerms} />
       )}
     </div>
   );
@@ -22239,6 +23354,10 @@ function StudentImports({ onCountChange }) {
   const [jobId, setJobId] = useState(() => readImportJobParam());
   const [jobs, setJobs] = useState(null);
   const [readiness, setReadiness] = useState(null);
+  // #68: the send-test answer for THIS session, shared by every readiness strip and the
+  // activation dialog (see MigrationReadiness). Lost on reload, deliberately — a test proves
+  // the sender as it was configured when it ran.
+  const [senderTest, setSenderTest] = useState(null);
   const [err, setErr] = useState('');
   const [notice, setNotice] = useState('');
 
@@ -22283,7 +23402,8 @@ function StudentImports({ onCountChange }) {
 
       {view === 'new' && <MigrationStageWizard onStaged={openJob} onCancel={back} />}
       {view === 'job' && jobId && (
-        <MigrationJobWorkspace key={jobId} jobId={jobId} readiness={readiness} onBack={back} onCountChange={onCountChange} />
+        <MigrationJobWorkspace key={jobId} jobId={jobId} readiness={readiness} senderTest={senderTest} onSenderTest={setSenderTest}
+          onBack={back} onCountChange={onCountChange} />
       )}
       {view === 'jobs' && (
         <div className="space-y-4">
@@ -22292,7 +23412,7 @@ function StudentImports({ onCountChange }) {
               className="px-4 py-2 rounded-xl text-sm font-bold text-white inline-flex items-center gap-2" style={MIGRATION_PRIMARY_BTN}>
               <UploadCloud size={15} /> Stage a roster
             </button>
-            <MigrationReadiness readiness={readiness} />
+            <MigrationReadiness readiness={readiness} senderTest={senderTest} onSenderTest={setSenderTest} />
           </div>
           {!jobs ? <AdminListSkeleton rows={3} /> : jobs.length === 0 ? (
             <div className="glass-card p-6 text-sm" style={{ color: C.textSoft }}>No rosters have been staged yet.</div>
@@ -22613,10 +23733,11 @@ function MembershipPanel() {
     ['Plan', planName],
     ['Access', scopeLabel],
     ...(batchRow ? [['Batch', `${batchRow.name} (${batchRow.code})`]] : []),
-    ['Started', sub?.started_at ? fmtEnrollDate(sub.started_at) : latestApproved ? fmtEnrollDate(latestApproved.reviewed_at || latestApproved.created_at) : '—'],
-    ['Expires', acc.has ? (acc.legacy ? 'No expiry' : fmtEnrollDate(sub.ends_at)) : 'No expiry'],
-    ...(inGrace ? [['Grace ends', fmtEnrollDate(sub.grace_ends_at)]] : []),
-    ['Amount paid', latestApproved ? phpFmt(latestApproved.amount_paid) : '—'],
+    ['Started', sub?.started_at ? fmtTermDate(sub.started_at) : latestApproved ? fmtTermDate(latestApproved.reviewed_at || latestApproved.created_at) : '—'],
+    ['Expires', acc.has ? (acc.legacy ? 'No expiry' : fmtTermDate(sub.ends_at)) : 'No expiry'],
+    ...(inGrace ? [['Grace ends', fmtTermDate(sub.grace_ends_at)]] : []),
+    // A migrated term has no request here to read an amount from; say what is true of it.
+    ['Amount paid', sub?.grant_source === 'import' ? 'Migrated — already paid' : latestApproved ? phpFmt(latestApproved.amount_paid) : '—'],
   ];
 
   return (
@@ -22692,7 +23813,7 @@ function MembershipPanel() {
           <AlertTriangle size={15} className="flex-shrink-0 mt-px" style={{ color: warnTier === 'amber' ? C.amber : C.red }} />
           <div style={{ fontSize: 12.5, color: C.text, lineHeight: 1.5 }}>
             {warnTier === 'grace'
-              ? <><span style={{ fontWeight: 700 }}>Grace period: renew now to avoid losing access.</span> Your access ended{acc.ends ? <> on <span style={{ fontWeight: 600 }}>{fmtEnrollDate(sub.ends_at)}</span></> : ''}. You have until <span style={{ fontWeight: 600 }}>{fmtEnrollDate(sub.grace_ends_at)}</span>{graceDaysLeft != null ? <> ({graceDaysLeft} day{graceDaysLeft === 1 ? '' : 's'})</> : ''} before your account locks.</>
+              ? <><span style={{ fontWeight: 700 }}>Grace period: renew now to avoid losing access.</span> Your access ended{acc.ends ? <> on <span style={{ fontWeight: 600 }}>{fmtTermDate(sub.ends_at)}</span></> : ''}. You have until <span style={{ fontWeight: 600 }}>{fmtTermDate(sub.grace_ends_at)}</span>{graceDaysLeft != null ? <> ({graceDaysLeft} day{graceDaysLeft === 1 ? '' : 's'})</> : ''} before your account locks.</>
               : warnTier === 'red'
               ? <><span style={{ fontWeight: 700 }}>Your membership expires soon.</span> Your access ends {daysLeft === 1 ? 'tomorrow' : `in ${daysLeft} days`} — renew or upgrade now to keep access. Renewing early extends from your current expiry, so you never lose days.</>
               : <><span style={{ fontWeight: 700 }}>Your membership expires soon.</span> Renew or upgrade now to keep access — early renewals extend from your current expiry date ({daysLeft} day{daysLeft === 1 ? '' : 's'} left).</>}
@@ -29549,7 +30670,7 @@ function CourseCatalog({
                           <button role="menuitemcheckbox" aria-checked={c.access_tier === 'essentials'} disabled={busy}
                             onClick={() => setCourseTier(c, c.access_tier === 'essentials' ? 'standard' : 'essentials')}
                             className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2 disabled:opacity-50">
-                            {c.access_tier === 'essentials' ? <CheckCircle2 size={14} style={{ color: C.primary }} /> : <Circle size={14} />} Sampler tier (Essentials)
+                            {c.access_tier === 'essentials' ? <CheckCircle2 size={14} style={{ color: C.primary }} /> : <Circle size={14} />} Included in the Essentials package
                           </button>
                           <div className="h-px bg-slate-100 my-1" />
                           <button role="menuitem" disabled={idx === 0 || busy} onClick={() => reorderCourse(idx, -1)} className="w-full text-left px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 inline-flex items-center gap-2 disabled:opacity-30"><ChevronUp size={14} /> Move up</button>
@@ -29568,7 +30689,7 @@ function CourseCatalog({
                   <button onClick={() => openCourse(c.id)} className="text-left flex-1">
                     <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
                       {(c.course_date || c.month) && <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full" style={{ background: 'var(--status-info-bg)', color: 'var(--status-info-fg)' }}><CalendarClock size={11} /> {c.course_date ? batchRunLabel(c.course_date) : c.month}</span>}
-                      {isAdmin && c.access_tier === 'essentials' && <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full" style={{ background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)' }}><Sparkles size={11} /> Essentials · Sampler</span>}
+                      {isAdmin && c.access_tier === 'essentials' && <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full" style={{ background: 'var(--status-ok-bg)', color: 'var(--status-ok-fg)' }}><Sparkles size={11} /> Essentials package</span>}
                     </div>
                     <div style={{ fontFamily: fontDisplay, color: NAVY }} className="font-bold text-[15px] leading-tight">{c.title}</div>
                     {c.subtitle && <div className="text-xs text-slate-500 mt-1 line-clamp-2">{c.subtitle}</div>}

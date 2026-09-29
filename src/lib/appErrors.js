@@ -189,6 +189,8 @@ export const APP_ERROR_CODES = [
   'LEGACY_RUN_BUSY',
   'LEGACY_IDENTITY_MISMATCH',
   'LEGACY_REVERT_REFUSED',
+  // Legacy student migration, round 2 (#68)
+  'LEGACY_BATCH_GAP',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -535,15 +537,28 @@ const COPY = {
     + 'shown and try again. Nothing was activated.',
   LEGACY_RUN_NOT_FOUND:
     'That activation could not be found. Refresh the job to see which rows are already done.',
+  // #68 (B5): a request that died mid-chunk also holds the run, until its 10-minute lease
+  // lapses. Blaming "another window" sent the Super Admin looking for one that never existed.
   LEGACY_RUN_BUSY:
-    'Another window is already working on this activation, or these rows are part of an unfinished '
-    + 'one. Resume that activation instead of starting a new one.',
+    'This activation is already being worked on: in another window, or by an earlier request '
+    + 'that stopped part-way, whose hold lifts by itself within 10 minutes. Or these rows are part '
+    + 'of an unfinished activation. Resume that activation instead of starting a new one.',
   LEGACY_IDENTITY_MISMATCH:
     'The account found for this row does not match its email or Thinkific id, so nothing was granted. '
     + 'Review the row before trying again.',
+  // #68: this used to end "Change it from Enrollments instead." Enrollments cannot change a
+  // plan or a term's dates, so it sent the Super Admin to a screen with no way to act. It
+  // also covers all three refusals legacy_import_revert() raises under this one code (a
+  // short reason, a row that is not activated, a student already set up), because this
+  // copy is shown in place of the database's own sentence.
   LEGACY_REVERT_REFUSED:
-    'This activation can no longer be reverted here, because the student has started using the '
-    + 'membership. Change it from Enrollments instead.',
+    'This activation was not reverted, and nothing was changed. A revert needs a reason of at '
+    + 'least five characters, and works only on an activated row whose student has not yet set '
+    + 'up their account. Once they have, correcting their plan or dates is a manual fix that no '
+    + 'screen in the app can make.',
+  LEGACY_BATCH_GAP:
+    'A month in this cohort run has no batch yet, while a later batch exists. Create the missing '
+    + 'batch in Admin → Batches before activating, or those students will skip that month for good.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };

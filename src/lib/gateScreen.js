@@ -67,6 +67,10 @@ export const GATE_SCREENS = Object.freeze({
   // The profile READ failed (not "there is no profile"). Every membership fact is
   // unknown, so no price may be quoted — see the PROFILE_UNAVAILABLE arm below.
   PROFILE_UNAVAILABLE: 'profile_unavailable',
+  // #68: a migrated account that has set its password but holds no live or scheduled
+  // term (its activation failed, was blocked, or is still to come). They paid in the
+  // old system, so the cold paywall is the wrong answer. Never a price.
+  IMPORT_MEMBERSHIP_PENDING: 'import_membership_pending',
   APPROVAL_PENDING: 'approval_pending',
   APP: 'app',
 });
@@ -314,6 +318,32 @@ export function resolveGateScreen(state) {
         if (profileFailed && decided.screen === GATE_SCREENS.PAYWALL) {
           return { screen: GATE_SCREENS.PROFILE_UNAVAILABLE, reason: 'profile_unavailable' };
         }
+        // ★ D8 (#68): A SCHEDULED TERM IS NOT PROOF THE ACCOUNT IS SET UP. The scheduled
+        //   verdict comes from the subscription alone, but whether a migrated student has
+        //   created a password lives on the profile — the one row we failed to read — so
+        //   the IMPORT_ONBOARDING arm above could not fire, and MEMBERSHIP_SCHEDULED told
+        //   someone with no password to "come back then and sign in". Hold instead. The
+        //   hold is price-free and self-clearing, exactly like the PAYWALL case.
+        //   (#67 pinned the opposite on the reasoning that the scheduled screen shows no
+        //   price. True, but it does make a claim the profile would have contradicted.)
+        if (profileFailed && decided.screen === GATE_SCREENS.MEMBERSHIP_SCHEDULED) {
+          return { screen: GATE_SCREENS.PROFILE_UNAVAILABLE, reason: 'profile_unavailable_scheduled' };
+        }
+        // ★ D1 (#68): A MIGRATED STUDENT IS NEVER SHOWN THE SHOP WINDOW. An account the
+        //   import created can finish setting its password even when its activation then
+        //   failed or was blocked (a password recovery confirms the mailbox), and with no
+        //   term enrollGateState() bottoms out at 'paywall' — pricing cards for a course
+        //   they already paid for, in a system they were told had nothing to buy. Hold them
+        //   on a price-free "being set up" card instead. Only in PLACE of PAYWALL, after
+        //   the ban and the staff bypass (both above), and only once onboarding is really
+        //   complete — before that, IMPORT_ONBOARDING has already claimed them. (So the
+        //   `completed` test below is a deliberate second line: no state reaches here
+        //   without it, and a mutation that drops it survives the matrix by design.)
+        if (decided.screen === GATE_SCREENS.PAYWALL
+          && profile?.account_origin === 'import'
+          && profile?.onboarding_status === 'completed') {
+          return { screen: GATE_SCREENS.IMPORT_MEMBERSHIP_PENDING, reason: 'import_membership_pending' };
+        }
         return decided;
       }
     }
@@ -350,7 +380,8 @@ function enrollmentScreen(enroll, renewNow) {
       return { screen: GATE_SCREENS.PAYWALL, reason: `enroll_${enroll.state}` };
     case 'scheduled':
       // #67: paid, not started. Deliberately NOT in PRICING_SCREENS, so it never waits
-      // on the staff context and never becomes PROFILE_UNAVAILABLE.
+      // on the staff context. It DOES become PROFILE_UNAVAILABLE when the profile read
+      // failed (#68, D8) — see resolveGateScreen().
       return { screen: GATE_SCREENS.MEMBERSHIP_SCHEDULED, reason: 'enroll_scheduled' };
     case 'pass':
     default:

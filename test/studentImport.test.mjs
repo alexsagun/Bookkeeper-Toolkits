@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {
   DAY_MS,
   isValidEmail, normalizeEmail, parseExternalId, parseStrictDate,
-  sanitizeCsvCell, csvField, toCsv, parseCsv,
+  sanitizeCsvCell, csvField, toCsv, parseCsv, CSV_DUPLICATE_HEADER,
   parseEnrollmentsList, comboKeyOf, classifyCourse, suggestPlanForCombo,
   resolveMatchDecision, validateRowFields,
 } from '../src/lib/studentImport.js';
@@ -32,6 +32,82 @@ test('parseCsv tolerates a trailing newline and empty input', () => {
   const { rows } = parseCsv('a,b\n1,2\n');
   assert.equal(rows.length, 1);
   assert.deepEqual(rows[0], { a: '1', b: '2' });
+});
+
+// ── #68 (E11): the parser refuses what it cannot read ──────────────────────────
+// Each of these used to SUCCEED quietly — and each one loses or invents students.
+
+test('parseCsv throws on an unclosed quote, naming the line it opened on', () => {
+  // A stray quote swallowed every later student into one field: 4 rows instead of 141.
+  const csv = 'email,name\na@example.test,Ann\n"b@example.test,Bea\nc@example.test,Cy\n';
+  assert.throws(() => parseCsv(csv), { message: 'Unclosed quote starting on line 3' });
+  assert.throws(() => parseCsv('a\r\n1\r\n2\r\n"x'), { message: 'Unclosed quote starting on line 4' });
+  // A quoted field with a newline inside it moves the line count on correctly.
+  assert.throws(() => parseCsv('a,b\n"x\ny",1\n"open'), { message: 'Unclosed quote starting on line 4' });
+  assert.throws(() => parseCsv('"never closed'), /Unclosed quote starting on line 1/);
+  // A lone \r (old Mac line endings) is a line break too, inside a quote and out.
+  assert.throws(() => parseCsv('a\r1\r"x'), { message: 'Unclosed quote starting on line 3' });
+  assert.throws(() => parseCsv('a,b\r"x\ry",1\r"open'), { message: 'Unclosed quote starting on line 4' });
+});
+
+test('parseCsv reads a quote in the MIDDLE of a field as a character, like Excel', () => {
+  // Two stray quotes used to merge every row between them, silently.
+  const csv = 'email,name\na@example.test,Juan "JR" Cruz\nb@example.test,Bea\n';
+  const { rows } = parseCsv(csv);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].name, 'Juan "JR" Cruz');
+  assert.equal(rows[1].email, 'b@example.test');
+  const one = parseCsv('email,name\na@example.test,Juan "JR Cruz\nb@example.test,Bea\n');
+  assert.equal(one.rows.length, 2, 'a single stray quote mid-field no longer eats the file');
+  assert.equal(one.rows[0].name, 'Juan "JR Cruz');
+  assert.equal(parseCsv('a,b\n5" monitor,x\n').rows[0].a, '5" monitor');
+  // A field that STARTS with a quote is still a quoted field (leading spaces tolerated).
+  assert.equal(parseCsv('a,b\n "x, y",z\n').rows[0].a.trim(), 'x, y');
+});
+
+test('parseCsv drops rows whose cells are all blank, wherever they are', () => {
+  const csv = '\nemail,name\n,,\na@example.test,Ann\n\n   ,  \nb@example.test,Bea\n,\n';
+  const { headers, rows } = parseCsv(csv);
+  assert.deepEqual(headers, ['email', 'name'], 'a blank line before the header is not the header');
+  assert.deepEqual(rows.map((r) => r.email), ['a@example.test', 'b@example.test']);
+  // A row with ONE real cell is kept — it is a student with missing data, which staging reports.
+  assert.equal(parseCsv('email,name\n,Ann\n').rows.length, 1);
+  assert.deepEqual(parseCsv(',,\n,,\n'), { headers: [], rows: [] });
+});
+
+// #68 review, L4: callers map the refusal by CODE, never by the message text — the bank
+// importer turns it back into its own "…or upload it as Excel" advice.
+test('parseCsv\'s repeated-heading refusal carries a stable code and the heading', () => {
+  assert.equal(CSV_DUPLICATE_HEADER, 'DUPLICATE_HEADER');
+  let caught = null;
+  try { parseCsv('Date,Description,Description,Amount\n2026-09-01,a,b,1\n'); } catch (e) { caught = e; }
+  assert.ok(caught instanceof Error, 'it throws');
+  assert.equal(caught.code, 'DUPLICATE_HEADER');
+  assert.equal(caught.heading, 'Description');
+  assert.match(caught.message, /Duplicate column heading "Description"/, 'the default wording is unchanged');
+  // The other refusal keeps no such code, so a caller cannot mistake one for the other.
+  let unclosed = null;
+  try { parseCsv('a\n"x'); } catch (e) { unclosed = e; }
+  assert.notEqual(unclosed?.code, 'DUPLICATE_HEADER');
+});
+
+test('parseCsv refuses a repeated heading, naming it', () => {
+  // The later column silently overwrote the earlier one, so the roster could be read
+  // from the wrong one.
+  assert.throws(() => parseCsv('email,start,start\na@example.test,1,2\n'), /Duplicate column heading "start"/);
+  assert.throws(() => parseCsv(' email ,email\nx,y\n'), /"email"/, 'headings are compared after trimming');
+  // Blank headings (a trailing comma on the header row) are not a duplicate of anything.
+  const { headers, rows } = parseCsv('email,name,,\na@example.test,Ann,,\n');
+  assert.deepEqual(headers, ['email', 'name', '', '']);
+  assert.equal(rows[0].email, 'a@example.test');
+  // Different case is a different heading, not a collision in the parsed rows.
+  assert.deepEqual(parseCsv('Email,email\nx,y\n').rows[0], { Email: 'x', email: 'y' });
+});
+
+test('parseCsv keeps its return shape', () => {
+  const out = parseCsv('a,b\n1,2\n');
+  assert.deepEqual(Object.keys(out).sort(), ['headers', 'rows']);
+  assert.ok(Array.isArray(out.headers) && Array.isArray(out.rows));
 });
 
 // ── Email ───────────────────────────────────────────────────────────────────────

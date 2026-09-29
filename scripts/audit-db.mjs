@@ -1352,6 +1352,95 @@ export const OBJECT_CHECKS = [
               and p.prosrc like '%account_origin = ''import'' and p.approval_status = ''pending''%')
          or (p.proname = 'admin_review_access_request' and p.prosrc like '%ACCESS_REQUEST_IMPORT_TARGET%'))`],
 
+  // ── #68, legacy migration round 2 ──────────────────────────────────────────
+  // ★ #68 restates fifteen #67 functions. A later migration that restates one of them from
+  //   the #67 text would silently drop a #68 rule, and db:shadow:verify never compares
+  //   prosrc — these prosrc probes are the live tripwire.
+  ['#68    the round-2 migration is recorded', `select count(*) = 1 as ok from public.schema_migrations
+      where filename = '2026-09-28-legacy-migration-round2.sql'`],
+  ['#68    student_import_jobs.eligible_plan_keys exists, NOT NULL, default empty', `select count(*) = 1 as ok
+      from information_schema.columns
+     where table_schema = 'public' and table_name = 'student_import_jobs' and column_name = 'eligible_plan_keys'
+       and is_nullable = 'NO' and data_type = 'ARRAY' and column_default like '''{}''%'`],
+  ['#68    the new helpers and the re-signed saga functions are service-only', `select count(*) = 7
+        and bool_and(not has_function_privilege('authenticated', p.oid, 'execute')
+                     and not has_function_privilege('anon', p.oid, 'execute')
+                     and has_function_privilege('service_role', p.oid, 'execute')) as ok
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'public'
+       and p.oid::regprocedure::text in (
+         'legacy_import_plan_rank(text)', 'legacy_import_seat_count(date,date,text)',
+         'legacy_import_batch_gaps(uuid,uuid[])', 'legacy_import_reset_onboarding_notice(uuid,uuid)',
+         'legacy_import_higher_plan_pending(uuid)',
+         'legacy_import_pending_invites(uuid,uuid,integer,uuid[])', 'legacy_import_onboarding_notice(uuid,text,text)')`],
+  // ★ #68 review (S2): #68 refunds a notice's try when the provider or configuration refused
+  //   it, so the five tries alone bound nothing. The reservation count is the bound a refund
+  //   cannot lower, and nothing resets it — if a later migration drops the column, its CHECK,
+  //   or the reserve-branch increment, the notice can again be re-sent without limit.
+  ['#68    onboarding_notice_reservations exists, NOT NULL, default 0, VALID CHECK 0..20, never below the attempts', `select
+        exists (select 1 from information_schema.columns
+                 where table_schema = 'public' and table_name = 'student_import_rows'
+                   and column_name = 'onboarding_notice_reservations' and data_type = 'smallint'
+                   and is_nullable = 'NO' and column_default = '0')
+    and exists (select 1 from pg_constraint
+                 where conname = 'student_import_rows_notice_reservations'
+                   and conrelid = 'public.student_import_rows'::regclass and convalidated
+                   and pg_get_constraintdef(oid) like '%onboarding_notice_reservations >= 0%'
+                   and pg_get_constraintdef(oid) like '%onboarding_notice_reservations <= 20%')
+    and not exists (select 1 from public.student_import_rows
+                     where onboarding_notice_reservations < onboarding_notice_attempts) as ok`],
+  ['#68    the notice ceiling, the refund list and the reset hold (prosrc)', `select count(*) = 2 as ok
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public'
+       and ((p.proname = 'legacy_import_onboarding_notice'
+              and p.prosrc like '%onboarding_notice_reservations = onboarding_notice_reservations + 1%'
+              and p.prosrc like '%or v_row.onboarding_notice_reservations >= 20 then%'
+              and p.prosrc not like '%''resend_422''%')
+         or (p.proname = 'legacy_import_reset_onboarding_notice'
+              and p.prosrc like '%if v_row.onboarding_notice_reservations >= 20 then%'
+              and p.prosrc not like '%onboarding_notice_reservations =%'))`],
+  // ★ #68 review (S1, S4, L1): the hold asks whether the higher row can still become a grant;
+  //   a hand-back that never reached the provider keeps its generation; a copy with no plan is
+  //   not a different plan.
+  ['#68    the higher-plan hold, the generation reuse and the plan-less copy rule hold (prosrc)', `select count(*) = 4 as ok
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public'
+       and ((p.proname = 'legacy_import_higher_plan_pending'
+              and p.prosrc like '%grace_ends_at%' and p.prosrc like '%ob.status <> ''archived''%')
+         or (p.proname in ('legacy_import_claim_rows', 'legacy_import_preflight')
+              and p.prosrc like '%legacy_import_higher_plan_pending(%')
+         or (p.proname = 'legacy_import_begin_invite' and p.prosrc like '%v_reuse := coalesce(%'
+              and p.prosrc not like '%v_gen := v_row.invite_generation + 1;%'))`],
+  ['#68    multiple_plans_in_file ignores a copy with no plan (prosrc)', `select count(*) = 1 as ok
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public'
+       and p.proname = 'legacy_import_stage'
+       and p.prosrc like '%count(distinct o.proposed_plan_key)%'
+       and p.prosrc not like '%o.proposed_plan_key is distinct from sr.proposed_plan_key%'`],
+  ['#68    the re-signed Super Admin RPCs are callable by authenticated, never anon; no old overload is left', `select
+        (select count(*) = 2 and bool_and(has_function_privilege('authenticated', p.oid, 'execute')
+                                          and not has_function_privilege('anon', p.oid, 'execute'))
+           from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+          where n.nspname = 'public' and p.oid::regprocedure::text in (
+            'legacy_import_ready_ids(uuid,text,text,text,text)',
+            'legacy_import_rows_page(uuid,text,text,text,integer,integer,text)'))
+    and (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+          where n.nspname = 'public'
+            and p.proname in ('legacy_import_ready_ids', 'legacy_import_rows_page',
+                              'legacy_import_pending_invites', 'legacy_import_onboarding_notice')) = 4 as ok`],
+  ['#68    a batch is VIP-only, seats come from the paid term, a gap refuses the start', `select count(*) = 5 as ok
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public'
+       and ((p.proname = 'legacy_import_stage' and p.prosrc like '%else ''none'' end%'
+              and p.prosrc like '%eligible_plan_keys%' and p.prosrc like '%grandfathered_member%')
+         or (p.proname = 'legacy_import_activate_row' and p.prosrc like '%legacy_import_seat_count(v_sd, v_ed, v_plan.key)%'
+              and p.prosrc not like '%plan_eligible_batch_count%' and p.prosrc like '%import_marks_cleared%')
+         or (p.proname = 'legacy_import_start_run' and p.prosrc like '%LEGACY_BATCH_GAP%')
+         or (p.proname = 'legacy_import_claim_rows' and p.prosrc like '%higher_plan_pending%')
+         or (p.proname = 'legacy_import_record_delivery' and p.prosrc like '%invite_handed_back%'))`],
+  ['#68    the error catalog holds 133 codes, LEGACY_BATCH_GAP included', `select count(*) = 133
+        and bool_or(code = 'LEGACY_BATCH_GAP') as ok from public.app_error_catalog()`],
+  ['#68    the three plans carry their package titles', `select count(*) = 3 as ok from public.enrollment_plans
+      where (key, name, tagline) in (('vip', 'VIP Package', 'Personalized Coaching Program'),
+                                     ('silver_self_paced', 'Silver · Self-Paced', 'QBO + Resume Combo'),
+                                     ('sampler', 'Essentials', 'Sampler Session'))`],
+
 ];
 
 async function main() {

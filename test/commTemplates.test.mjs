@@ -7,6 +7,7 @@ import {
   renderMessage, parseManualEmails, COMM_MANUAL_EMAIL_LIMIT, COMM_PREVIEW_VARS,
   renderPreviewDocument, subjectHasPaymentTag,
 } from '../src/lib/commTemplates.js';
+import { ENROLLMENT_PLANS_FALLBACK } from '../src/lib/planCatalog.js';
 
 test('a subject never carries payment details', () => {
   assert.equal(subjectHasPaymentTag('Pay via {{ payment_instructions }}'), true);
@@ -102,6 +103,16 @@ test('payment instructions render as their own block, and vanish when empty', ()
 
 test('the preview never carries real payment values', () => {
   assert.match(COMM_PREVIEW_VARS.payment_instructions, /^\[.*\]$/);
+});
+
+test('the sample {{plan}} is a package title from the live catalog (#68)', () => {
+  // Since #68 enrollment_plans.name is the package title, so that is what {{plan}} renders
+  // for a real recipient. A sample reading "QBO + Resume Combo" beside {{batch}} previewed
+  // a product line no student sees and a batch the Silver plan never takes.
+  const titles = ENROLLMENT_PLANS_FALLBACK.map((p) => p.name);
+  assert.ok(titles.includes(COMM_PREVIEW_VARS.plan), `${COMM_PREVIEW_VARS.plan} is not a package title`);
+  assert.equal(COMM_PREVIEW_VARS.plan, 'VIP Package');
+  assert.ok(COMM_PREVIEW_VARS.batch, 'a VIP sample, so {{batch}} has something true to show');
 });
 
 test('a pasted address list is cleaned, deduplicated and capped', () => {

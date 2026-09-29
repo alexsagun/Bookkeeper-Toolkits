@@ -59,12 +59,20 @@ export function phpAmount(n, fallback = '₱0') {
   return `${v < 0 ? '-₱' : '₱'}${grouped}${dec}`;
 }
 
+// ★ THE NAME IS THE PACKAGE TITLE; THE TAGLINE IS THE PRODUCT LINE (#68, owner decision
+//   2026-09-28). They were the other way round, so every screen, email and picker that
+//   read `name` said "Sampler Session" / "QBO + Resume Combo" / "Personalized Coaching
+//   Program" where the owner and the students say Essentials / Silver / VIP — and an
+//   Essentials roster was easy to map onto the full-access Silver plan. On a pricing card
+//   the name is the big title and the tagline the small line above it. KEYS NEVER
+//   CHANGE: every predicate, foreign key and record key reads `key`. #68 renames the live
+//   rows and corrects the bootstrap §9 seed in place, so all three stay in lockstep.
 export const ENROLLMENT_PLANS_FALLBACK = [
-  { key: 'sampler', name: 'Sampler Session', tagline: 'Essentials', price_php: 1499, compare_at_php: null, badge: null, limit_note: 'Limited offer', position: 1, access_days: 60, support_days: 60,
+  { key: 'sampler', name: 'Essentials', tagline: 'Sampler Session', price_php: 1499, compare_at_php: null, badge: null, limit_note: 'Limited offer', position: 1, access_days: 60, support_days: 60,
     features: ['1 Live Zoom Session (4 hours)', '60-day course access', '60-day group chat support'] },
-  { key: 'silver_self_paced', name: 'QBO + Resume Combo', tagline: 'Silver · Self-Paced', price_php: 2999, compare_at_php: null, badge: null, limit_note: null, position: 2, access_days: 60, support_days: null,
+  { key: 'silver_self_paced', name: 'Silver · Self-Paced', tagline: 'QBO + Resume Combo', price_php: 2999, compare_at_php: null, badge: null, limit_note: null, position: 2, access_days: 60, support_days: null,
     features: ['Simulated annual bookkeeping project for an NY-based construction company', '60-day QBO Mastery course access', '60-day Resume & Interview course access', 'Weekly Community chat (Thu)'] },
-  { key: 'vip', name: 'Personalized Coaching Program', tagline: 'VIP Package', price_php: 16999, compare_at_php: 35000, badge: 'BEST SELLER', limit_note: 'Limited to 10 slots per month', position: 3, access_days: 180, support_days: null, community_segment: 'vip',
+  { key: 'vip', name: 'VIP Package', tagline: 'Personalized Coaching Program', price_php: 16999, compare_at_php: 35000, badge: 'BEST SELLER', limit_note: 'Limited to 10 slots per month', position: 3, access_days: 180, support_days: null, community_segment: 'vip',
     features: ['Simulated annual bookkeeping project for an NY-based construction company', '12 Live Group Zoom Trainings (MWF 9am to 11am PH Time)', '4 Live Group Resume & Interview Coaching Sessions', 'Weekly group consult until hired', 'Community chat support until and after hired'] },
 ];
 
@@ -88,13 +96,14 @@ export function extensionPrice(plan, months) {
 // added to the catalog without an entry here would be locked out of its own toolkit.
 // test/planCatalog.test.mjs pins catalog ↔ entitlement parity.
 //
-//   • `sampler` (Sampler Session, ₱1,499 / 60 days) — Home + the QuickBooks catalog
-//     (`qbomastery`, but only its `access_tier='essentials'` course, i.e. QuickBooks
-//     Online Essentials — NOT Mastery) + the two 1-on-1 booking tabs (`linkedinopt`,
-//     `coachalex`). The ₱1,499 buys the coaching session, not more course content, so
-//     the cheapest plan is also the most scoped — never assume price ⇒ scope.
-//   • `silver_self_paced` (QBO + Resume Combo, ₱2,999 / 60 days) and `vip`
-//     (Personalized Coaching Program, ₱16,999 / 180 days) — FULL non-admin toolkit.
+//   • `sampler` (Essentials — the Sampler Session, ₱1,499 / 60 days) — Home + the
+//     QuickBooks catalog (`qbomastery`, but only its `access_tier='essentials'` course,
+//     i.e. QuickBooks Online Essentials — NOT Mastery) + the two 1-on-1 booking tabs
+//     (`linkedinopt`, `coachalex`). The ₱1,499 buys the coaching session, not more course
+//     content, so the cheapest plan is also the most scoped — never assume price ⇒ scope.
+//   • `silver_self_paced` (Silver · Self-Paced — QBO + Resume Combo, ₱2,999 / 60 days)
+//     and `vip` (VIP Package — Personalized Coaching Program, ₱16,999 / 180 days) —
+//     FULL non-admin toolkit.
 //
 // This is the CLIENT half of the plan-access model. The SERVER half lives in
 // db/2026-07-11-sampler-essentials-access.sql (sampler → qbo-* AND

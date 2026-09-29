@@ -61,14 +61,58 @@ export function displayFrom(from) {
 }
 
 /**
+ * Which limit a Resend 429 describes: 'rate' (the per-second request rate — a Resume a
+ * minute later works) or 'quota' (a daily or monthly sending allowance — it does not).
+ *
+ * ★ #68 (V5/R3): every 429 used to read as the daily quota, so a per-second hit — easy
+ *   when a claimed student's two onboarding emails land in the same second as a run's send —
+ *   told the owner to wait until tomorrow. Resend names the cause in the error body:
+ *   `rate_limit_exceeded` for the rate, `daily_quota_exceeded` / `monthly_quota_exceeded`
+ *   for an allowance.
+ * ★ ANYTHING UNRECOGNISED IS 'quota'. Saying "wait for the reset" about a rate limit costs a
+ *   day; saying "try again in a minute" about a spent quota costs one more refused email.
+ *   Only a body that names the rate, and nothing that names an allowance, reads as 'rate'.
+ *   A retry-after of more than a minute is not a per-second limit, whatever the body says.
+ *
+ * Pure: it sees only the error's `name`, its `message` and the retry-after seconds, and
+ * returns one of two words — never the body.
+ *
+ * @param {{ name?: unknown, message?: unknown, retryAfter?: unknown }} [o]
+ * @returns {'rate'|'quota'}
+ */
+export function resendLimitKind({ name, message, retryAfter } = {}) {
+  const n = typeof name === 'string' ? name.trim().toLowerCase() : '';
+  const m = typeof message === 'string' ? message.toLowerCase() : '';
+  if (/quota/.test(n) || /quota|daily|monthly|allowance/.test(m)) return 'quota';
+  const after = Number(retryAfter);
+  if (Number.isFinite(after) && after > 60) return 'quota';
+  if (/^rate_limit(_exceeded)?$/.test(n)) return 'rate';
+  if (!n && /rate limit|too many requests/.test(m)) return 'rate';
+  return 'quota';
+}
+
+/** Read a 429's error name and message — only to classify it; the body goes nowhere else. */
+async function limitKindOf(r) {
+  let name = '';
+  let message = '';
+  try {
+    const body = JSON.parse(String(await r.text()).slice(0, 4000));
+    name = body?.name;
+    message = body?.message;
+  } catch { /* unreadable: classified as the quota below */ }
+  return resendLimitKind({ name, message, retryAfter: r.headers?.get?.('retry-after') });
+}
+
+/**
  * POST one message to Resend, honouring 429/Retry-After with a bounded backoff.
  *
  * `replyTo` (#50): where a human's reply actually lands. Without it, replies go
  * to the (typically unwatched) From address while the message says "contact our
  * team" — a support address the reader has no way to reach.
  *
- * @returns {{ ok: true, id?: string } | { ok: false, code: string }}
+ * @returns {{ ok: true, id?: string } | { ok: false, code: string, limit?: 'rate'|'quota' }}
  *   `code` is always a short slug safe to store and render. Never a message.
+ *   `limit` rides only on a 'resend_429', and only when `classify429` asks (resendLimitKind).
  */
 export async function sendEmail({
   to, subject, html, text, replyTo, headers, tag = 'email', idempotencyKey: stableKey,
@@ -82,10 +126,17 @@ export async function sendEmail({
   //   invitation mid-flight and repeating it under the same key draws a 409 while the first is
   //   still being processed, which it reports as "not sent" — and the admin invites again.
   timeoutMs = null, retry429 = true, maxAttempts = 3,
-  // #67: a flow may send from its own address (the migration sends from
-  // support@alexsagun.com). Omitted, it is RESEND_FROM exactly as before. The domain must
-  // be verified in Resend, or the provider refuses the message with a 403.
+  // #67: a flow may send from its own address (since #68 the migration sends from
+  // support@<RESEND_FROM's domain>, or MIGRATION_EMAIL_FROM — see api/_lib/legacyClaimEmail.js).
+  // Omitted, it is RESEND_FROM exactly as before. The domain must be verified in Resend, or
+  // the provider refuses the message with a 403 — and a verified SUBDOMAIN does not cover
+  // its parent. A caller that must never fall back to RESEND_FROM's own address checks for
+  // a sender before calling: an empty override falls through to it here.
   from: fromOverride = null,
+  // #68: `classify429: true` adds `limit: 'rate' | 'quota'` to a returned 'resend_429' — read
+  //   from the error body by resendLimitKind(), the body itself going nowhere. Opt-in, so every
+  //   other caller keeps the exact answer shape it had.
+  classify429 = false,
 }) {
   const apiKey = process.env.RESEND_API_KEY;
   const from = (typeof fromOverride === 'string' && fromOverride.trim()) || process.env.RESEND_FROM;
@@ -114,6 +165,14 @@ export async function sendEmail({
   const ATTEMPTS = Math.max(1, Math.min(3, Math.floor(Number(maxAttempts)) || 3));
   const limitMs = Number(timeoutMs) > 0 && Number.isFinite(Number(timeoutMs)) ? Number(timeoutMs) : null;
   let timedOut = false;
+  // ★ #68 (V4): AN ATTEMPT THAT GOT NO ANSWER MAY HAVE BEEN DELIVERED, AND A LATER REFUSAL
+  //   DOES NOT UNDO THAT. A request aborted at the time limit (or dropped in transit) can
+  //   already have been accepted; the retry under the same key can then be rate-limited, or
+  //   refused, while the first one went out. Callers read a 429 or 4xx as PROOF nothing was
+  //   sent — the migration hands such a row back and mints a new link, killing the one in
+  //   the inbox — so once any attempt went unanswered, a later 429/4xx is reported as the
+  //   unclear answer it is ('resend_timeout', or 'resend_failed' for a dropped connection).
+  let unanswered = null;
   for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
     const last = attempt === ATTEMPTS - 1;
     let r;
@@ -132,6 +191,7 @@ export async function sendEmail({
     } catch (e) {
       r = null;
       timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+      unanswered = timedOut || unanswered === 'resend_timeout' ? 'resend_timeout' : 'resend_failed';
     }
 
     if (r && r.ok) {
@@ -140,7 +200,10 @@ export async function sendEmail({
       return { ok: true, id };
     }
     if (r && r.status === 429) {
-      if (!retry429 || last) return { ok: false, code: 'resend_429' };
+      if (!retry429 || last) {
+        if (unanswered) return { ok: false, code: unanswered };
+        return classify429 ? { ok: false, code: 'resend_429', limit: await limitKindOf(r) } : { ok: false, code: 'resend_429' };
+      }
       const retryAfter = Number(r.headers.get('retry-after')) || (2 ** attempt);
       await new Promise((res) => setTimeout(res, Math.min(retryAfter, 5) * 1000));
       continue;
@@ -148,6 +211,7 @@ export async function sendEmail({
     if (r) {
       // Status only. The body can echo the recipient and is not ours to log.
       console.error(`[${tag}] resend ${r.status}`);
+      if (unanswered && r.status >= 400 && r.status < 500) return { ok: false, code: unanswered };
       return { ok: false, code: `resend_${r.status}` };
     }
     // No sleep after the final attempt: it would only spend the caller's time budget.

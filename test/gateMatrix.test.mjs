@@ -686,8 +686,28 @@ test('the scheduled screen does not wait on the staff context — it quotes no p
   assert.equal(screenOf(scheduled({ staffReady: false })), GATE_SCREENS.MEMBERSHIP_SCHEDULED);
 });
 
-test('a failed profile read does not replace the scheduled screen', () => {
-  assert.equal(screenOf(scheduled({ profileFailed: true })), GATE_SCREENS.MEMBERSHIP_SCHEDULED);
+// ★ D8 (#68) REVERSES WHAT #67 PINNED HERE. #67 let the scheduled screen stand through a
+//   failed profile read because it quotes no price. But it DOES tell the student "come
+//   back then and sign in with the same email", and whether they have a password lives on
+//   the profile we failed to read: a migrated student who had not yet set one closed the
+//   tab believing they were done. profileFailed means profile === null in AuthProvider.
+test('a failed profile read holds a scheduled student instead of saying "you are all set" (D8)', () => {
+  const s = scheduled({ profileFailed: true, profile: null });
+  assert.equal(screenOf(s), GATE_SCREENS.PROFILE_UNAVAILABLE);
+  assert.equal(resolveGateScreen(s).reason, 'profile_unavailable_scheduled');
+  assert.equal(screenOf(scheduled({ profileFailed: false })), GATE_SCREENS.MEMBERSHIP_SCHEDULED,
+    'a profile that loaded changes nothing');
+});
+
+test('the scheduled hold keeps the same outranking rules as the paywall hold', () => {
+  assert.equal(screenOf(scheduled({ profileFailed: true, profile: null,
+    enroll: { active: true, ready: false, configured: true, state: 'scheduled' } })), GATE_SCREENS.SPLASH,
+  'still loading the enrollment rows — that splash is correct');
+  assert.equal(screenOf(scheduled({ profileFailed: true, profile: null,
+    staff: { isStaff: true, status: 'active', roleKey: 'trainer', permissions: ['courses.create'] } })), GATE_SCREENS.APP,
+  'active staff were never held on the scheduled screen');
+  assert.equal(screenOf(scheduled({ profileFailed: true, profile: null, staffReady: false })),
+    GATE_SCREENS.PROFILE_UNAVAILABLE, 'and it waits on nobody: it shows no price either');
 });
 
 test('imported onboarding (set a password) comes before the scheduled screen', () => {
@@ -775,4 +795,74 @@ test('a student who opens access on the activation day reaches the dashboard, a 
   assert.equal(screenOf(onboarded({ importWelcomePending: false })), GATE_SCREENS.APP);
   assert.equal(screenOf(onboarded({ importWelcomePending: false,
     enroll: { active: true, ready: true, configured: true, state: 'scheduled' } })), GATE_SCREENS.MEMBERSHIP_SCHEDULED);
+});
+
+// ── #68 (D1): a migrated student with no term is held, never priced ─────────
+// An account the import created can finish setting its password even when its
+// activation failed or was blocked — a password recovery confirms the mailbox. With no
+// term and is_paid false, enrollGateState() says 'paywall', and the student who already
+// paid in Thinkific was shown ₱1,499 / ₱2,999 / ₱16,999 pricing cards.
+
+const migratedNoTerm = (over = {}) => student({
+  profile: { is_admin: false, approval_status: 'approved', is_paid: false,
+    account_origin: 'import', onboarding_status: 'completed' },
+  enroll: { active: true, ready: true, configured: true, state: 'paywall' },
+  ...over,
+});
+
+test('an onboarded migrated account with no term gets the "being set up" hold, not the paywall', () => {
+  const s = migratedNoTerm();
+  assert.equal(screenOf(s), GATE_SCREENS.IMPORT_MEMBERSHIP_PENDING);
+  assert.equal(resolveGateScreen(s).reason, 'import_membership_pending');
+  assert.equal(screenOf(migratedNoTerm({ enroll: { active: true, ready: true, configured: true, state: 'paywall_notice' } })),
+    GATE_SCREENS.IMPORT_MEMBERSHIP_PENDING, 'a rejected earlier request is still the paywall arm');
+  assert.ok(new Set(Object.values(GATE_SCREENS)).has(GATE_SCREENS.IMPORT_MEMBERSHIP_PENDING));
+  assert.equal(GATE_SCREENS.IMPORT_MEMBERSHIP_PENDING, 'import_membership_pending');
+});
+
+test('the hold replaces ONLY the paywall; every other membership screen is untouched', () => {
+  const at = (state, profile = {}) => screenOf(migratedNoTerm({
+    profile: { is_admin: false, approval_status: 'approved', account_origin: 'import', onboarding_status: 'completed', ...profile },
+    enroll: { active: true, ready: true, configured: true, state },
+  }));
+  assert.equal(at('pass', { is_paid: true }), GATE_SCREENS.APP);
+  assert.equal(at('scheduled', { is_paid: true }), GATE_SCREENS.MEMBERSHIP_SCHEDULED);
+  assert.equal(at('pending'), GATE_SCREENS.ENROLL_PENDING);
+  assert.equal(at('finalizing'), GATE_SCREENS.ENROLL_PENDING);
+  assert.equal(at('expired', { is_paid: true }), GATE_SCREENS.MEMBERSHIP_EXPIRED,
+    'a lapsed migrated member keeps Renew / Extend / Upgrade');
+});
+
+test('the hold is for onboarded MIGRATED accounts only', () => {
+  // Not yet set up: the password screen claims them first.
+  assert.equal(screenOf(migratedNoTerm({ profile: { is_admin: false, approval_status: 'approved',
+    account_origin: 'import', onboarding_status: 'invited' } })), GATE_SCREENS.IMPORT_ONBOARDING);
+  // An ordinary signup is shown the paywall, exactly as before.
+  assert.equal(screenOf(migratedNoTerm({ profile: { is_admin: false, approval_status: 'approved' } })),
+    GATE_SCREENS.PAYWALL);
+  // An account whose import marks were cleared after a refused activation (E7) is an
+  // ordinary signup again.
+  assert.equal(screenOf(migratedNoTerm({ profile: { is_admin: false, approval_status: 'approved',
+    account_origin: null, onboarding_status: null } })), GATE_SCREENS.PAYWALL);
+});
+
+test('a ban still wins over the hold, and active staff still bypass it', () => {
+  assert.equal(screenOf(migratedNoTerm({ profile: { is_admin: false, approval_status: 'rejected',
+    account_origin: 'import', onboarding_status: 'completed' } })), GATE_SCREENS.REJECTED);
+  assert.equal(screenOf(migratedNoTerm({ staff: staffCtx('operations_admin'),
+    staffMembership: membership('operations_admin', 'active') })), GATE_SCREENS.APP);
+  assert.equal(screenOf(migratedNoTerm({ profile: { is_admin: true, approval_status: 'approved',
+    account_origin: 'import', onboarding_status: 'completed' } })), GATE_SCREENS.APP, 'a Super Admin passes everything');
+});
+
+test('the hold never flashes ahead of the staff answer, and an unread profile is held as unknown', () => {
+  assert.equal(screenOf(migratedNoTerm({ staffReady: false })), GATE_SCREENS.SPLASH,
+    'the narrow staffReady wait still runs first, so a migrated staff member sees no card at all');
+  assert.equal(screenOf(migratedNoTerm({ profileFailed: true, profile: null })), GATE_SCREENS.PROFILE_UNAVAILABLE);
+});
+
+test('the enrollment flag off, or an unconfigured gate, still holds nobody', () => {
+  assert.equal(screenOf(migratedNoTerm({ requireEnrollment: false })), GATE_SCREENS.APP);
+  assert.equal(screenOf(migratedNoTerm({ enroll: { active: true, ready: true, configured: false, state: 'paywall' } })),
+    GATE_SCREENS.APP);
 });

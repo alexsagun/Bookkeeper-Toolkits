@@ -192,7 +192,9 @@ export function renderPreviewDocument({ subject, body, vars, brand = 'Toolkits b
 
 /** A sample recipient for previews. Payment details are a placeholder, never the real values. */
 export const COMM_PREVIEW_VARS = Object.freeze({
-  name: 'Maria Santos', plan: 'QBO + Resume Combo', batch: '2026-10', days: 5,
+  // The package title, as enrollment_plans.name reads since #68. A VIP sample, because
+  // it is the one plan that also fills {{batch}}.
+  name: 'Maria Santos', plan: 'VIP Package', batch: '2026-10', days: 5,
   expiry: 'Oct 20, 2026', week: 3, amount_due: '₱2,000.00',
   payment_instructions: '[Your payment details from Enrollments → Payment details appear here]',
 });

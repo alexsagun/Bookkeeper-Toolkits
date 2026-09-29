@@ -43,8 +43,12 @@
 
 import { phpAmount } from './planCatalog.js';
 
-/** Bump on any wording change. Recorded against every signature. */
-export const AGREEMENT_VERSION = '2026-08-22';
+/**
+ * Bump on any wording change. Recorded against every signature.
+ * 2026-09-28 (#68): the tier headings became the package titles (Essentials,
+ * Silver · Self-Paced, VIP Package) and Section 5 names Essentials, not Sampler.
+ */
+export const AGREEMENT_VERSION = '2026-09-28';
 
 /** Comparison columns, cheapest first — the order the pricing page uses. */
 export const AGREEMENT_TIERS = Object.freeze(['sampler', 'silver', 'vip']);
@@ -72,11 +76,36 @@ export function tierForPlanKey(planKey) {
   return TIER_BY_PLAN_KEY[planKey] || null;
 }
 
+// ★ The tier headings ARE the package titles (#68) — the words on the pricing card a
+//   student chose from, so the column they sign under names what they bought. They are
+//   part of the signed text, which is why changing them bumped AGREEMENT_VERSION, and
+//   test/trainingAgreement.test.mjs pins them equal to ENROLLMENT_PLANS_FALLBACK's names.
+//   The tier KEYS (sampler / silver / vip) are internal: they are what
+//   enrollment_requests.agreement_tier STORES, and anything that shows a stored tier goes
+//   through tierLabelFor() below. The Enrollments card and the admin alert email printed
+//   the key uppercased ("Signed as SAMPLER") beside a version whose heading says
+//   "Essentials"; test/trainingAgreement.test.mjs pins both sites to it.
 const TIER_META = Object.freeze({
-  sampler: { label: 'SAMPLER', pill: 'p-sampler', format: '1 Live Session' },
-  silver: { label: 'SILVER', pill: 'p-silver', format: 'Self-paced' },
-  vip: { label: 'VIP', pill: 'p-vip', format: 'LIVE + Group' },
+  sampler: { label: 'Essentials', pill: 'p-sampler', format: '1 Live Session' },
+  silver: { label: 'Silver · Self-Paced', pill: 'p-silver', format: 'Self-paced' },
+  vip: { label: 'VIP Package', pill: 'p-vip', format: 'LIVE + Group' },
 });
+
+/**
+ * The column heading for a STORED agreement tier key — the words a student signed under
+ * ("Essentials", "Silver · Self-Paced", "VIP Package"). Read from TIER_META, the table the
+ * document's own headings come from, so the two can never disagree.
+ *
+ * ★ Fails closed like tierForPlanKey(): an unknown, empty or retired key returns null, so
+ *   a caller omits the tier rather than printing a raw key. Accepts the key in any case
+ *   (a hand-edited 'VIP' still reads as the heading); it takes no plan key — map one with
+ *   tierForPlanKey() first.
+ */
+export function tierLabelFor(tierKey) {
+  if (typeof tierKey !== 'string') return null;
+  const key = tierKey.trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(TIER_META, key) ? TIER_META[key].label : null;
+}
 
 /**
  * Peso formatting for the signed document.
@@ -209,7 +238,7 @@ function buildSections() {
     ] }] },
     { n: 5, title: 'Post-Training Support', blocks: [{ type: 'callouts', items: [
       callout('Weekly Zoom Consultation', 'Every Wednesday 6–7PM PHT until hired (VIP).'),
-      callout('Community Support', 'VIP: weekdays 11AM–1PM until hired. Silver: Thursdays 9–10AM. Sampler: for the length of your term.'),
+      callout('Community Support', 'VIP: weekdays 11AM–1PM until hired. Silver: Thursdays 9–10AM. Essentials: for the length of your term.'),
     ] }] },
     { n: 6, title: 'Course Access & Validity', blocks: [
       { type: 'p', text: 'Course access is granted per tier as shown in Section 1 and expires automatically at the end of the stated validity period. Each term also carries a 3-day grace period after its end date, during which access continues.' },
@@ -247,7 +276,7 @@ export function agreementModel(planKey, plans = [], opts = {}) {
 
   const columns = AGREEMENT_TIERS.map(tier => ({
     key: tier,
-    label: TIER_META[tier].label,
+    label: tierLabelFor(tier),
     pill: TIER_META[tier].pill,
     format: TIER_META[tier].format,
     pricePhp: priceOf(tier),
@@ -261,7 +290,7 @@ export function agreementModel(planKey, plans = [], opts = {}) {
     version: AGREEMENT_VERSION,
     variant,
     tierKey,
-    tierLabel: tierKey ? TIER_META[tierKey].label : null,
+    tierLabel: tierLabelFor(tierKey),
     planKey: planKey || null,
     planName: tierKey ? planForTier(tierKey)?.name || null : null,
     studentName: typeof opts.studentName === 'string' ? opts.studentName : '',

@@ -236,10 +236,11 @@ ${plansTable}
 **What each plan can open (entitlement scope):**
 
 ${scopeSection}
-Important nuance: the **Sampler Session is the only plan with limited course access** —
-its ₱ price buys a live Zoom session and a 1-on-1 coaching booking, not the full course
-library. It opens QuickBooks Online **Essentials** only, not Mastery. Both other plans
-open every student tool.
+Important nuance: the **Essentials package (the Sampler Session) is the only plan with
+limited course access** — its ₱ price buys a live Zoom session and a 1-on-1 coaching
+booking, not the full course library. It opens QuickBooks Online **Essentials** only, not
+Mastery. Both other plans (**Silver · Self-Paced** and the **VIP Package**) open every
+student tool.
 
 A tool outside the user's plan still shows a polite upgrade page if opened — nothing
 breaks. The assistant may navigate there and then suggest upgrading.
@@ -292,7 +293,7 @@ to the support email shown on the payment screen or to Coach Alex.
   tracked — only "Mark complete" moves progress or unlocks the certificate. Not every
   lesson has one. The assistant cannot list, open, or read out replay links (it has none
   of them) — direct the member to open the lesson and look for the replay card.
-- The QuickBooks catalog has two tiers: **Essentials** (available to Sampler members) and
+- The QuickBooks catalog has two tiers: **Essentials** (available to Essentials-package members) and
   **Mastery** (standard tier). Other plans with QuickBooks access read both.
 - **Accounting 101** (\`course\`) is the free-form foundational course with 8 modules.
 - **AI course trainer:** enrolled members can ask the assistant to **teach, explain, quiz,

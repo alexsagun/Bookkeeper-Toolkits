@@ -18,20 +18,30 @@ Built by migration **#67** (`db/2026-09-25-legacy-student-migration.sql`), on th
 |---|---|---|
 | `SUPABASE_SECRET_KEY` | Vercel (server only) | The endpoint creates Auth accounts |
 | `RESEND_API_KEY` | Vercel (server only) | Every migration email |
-| The sender, **support@alexsagun.com** | Resend → Domains: **alexsagun.com must be verified** | Every migration email comes from, and is answered at, this address. `MIGRATION_EMAIL_FROM` (optional) overrides it |
+| The sender | Resend → Domains | Migration emails come **from support@toolkits.alexsagun.com** (the domain verified in Resend) and are **answered at support@alexsagun.com**. `MIGRATION_EMAIL_FROM` changes the From, `MIGRATION_REPLY_TO` the reply address. They are independent. |
+| `MIGRATION_DAILY_EMAIL_CAP` | Vercel (optional, default 100) | Your Resend daily allowance. The activation dialog warns when a run would send more |
 | `APP_URL` | Vercel (server only) | The activation link points here. **Required on every Vercel deployment.** |
 | `NOTIFY_ADMIN_EMAIL` | Vercel (server only) | Where "Student Successfully Onboarded" goes (else Payment settings → "Proof / support email") |
 
 Activation refuses to start until email, `APP_URL` and the sender are all configured. Staging
 works without them. The tab shows all three as readiness chips.
 
-**Before activating anyone, press Send test email.** It sends the activation email — sample details,
-a link that does nothing — from support@alexsagun.com to your own inbox. If Resend refuses the
-sender, the chip says so: verify alexsagun.com in Resend and send the test again. Check the test did
-not land in spam.
+**Before activating anyone, press Send test email.** It sends the activation email (sample details,
+a link that does nothing) to your own inbox, and shows the From and Reply-To it used. Then:
 
-Migration #67 must be applied (it follows #66). Run `npm run db:audit` afterwards; the `#67` block
-checks the permission, the scheduled status, the cron job, the read-only tables and the audit guard.
+1. Check it arrived from **support@toolkits.alexsagun.com**, and not in spam.
+2. **Reply to it**, and check that the reply reaches **support@alexsagun.com**.
+3. If the result says **click tracking is on**, turn it off in Resend → Domains →
+   toolkits.alexsagun.com. A tracked link routes the one-time activation link through Resend.
+
+If Resend refuses the sender, the message says why (key, domain, or limit). Fix it and test again.
+**Why not support@alexsagun.com as the sender?** Resend only sends from a domain it has verified,
+and your account verifies toolkits.alexsagun.com, not alexsagun.com. If you verify alexsagun.com
+later, set `MIGRATION_EMAIL_FROM=support@alexsagun.com`. No code change is needed.
+
+Migrations #67 and #68 must be applied. Run `npm run db:audit` afterwards; the `#67` and `#68` blocks
+check the permission, the scheduled status, the cron job, the read-only tables, the audit guard, and
+#68's functions, error codes and plan names.
 
 ---
 
@@ -44,11 +54,15 @@ membership_ends_at, payment_status, amount_paid, currency, legacy_enrollments, b
 
 - **Dates:** you declare the format — `M/D/YYYY`, `D/M/YYYY` or `YYYY-MM-DD`. Nothing is guessed.
   Two-digit years and impossible dates (2/31/2026) block the row.
-- **Plan:** each distinct label (for example `VIP`) is mapped to a plan explicitly. The screen
-  suggests an exact match and you confirm it.
-- **Batch:** each distinct label (for example `October 2026`) is mapped to a registry batch. The
-  label must name the same month as the batch, and each start date must fall in or next to that
-  month. Otherwise the row is blocked.
+- **Plan:** each distinct label is mapped to a package explicitly: **VIP Package**, **Silver ·
+  Self-Paced** or **Essentials**. The screen suggests a match from the package title or the old product
+  name (`VIP`, `Personalized Coaching Program`, `Silver`, `QBO + Resume Combo`, `Essentials`, `Sampler
+  Session`), and you confirm it. Check it twice: Silver is full access, Essentials is not.
+- **Batch (VIP only):** each distinct label (for example `October 2026`) on a **VIP** row is mapped to
+  a registry batch. The label must name the same month as the batch, and each start date must fall in
+  or next to that month. Otherwise the row is blocked.
+  - Silver and Essentials have no cohort, so their rows need **no** batch column. If the file has one
+    anyway, it is kept as history and ignored, with a warning.
 - **Payment:** only `Paid` is paid. The amount is kept as history only. It does not change today's
   price and nothing is posted to Financial Management.
 - **Identity:** a real Thinkific id is used when present. Otherwise the normalized email is the
@@ -65,8 +79,11 @@ any future roster in `private-imports/`, which is also ignored. Tests use synthe
 2. Match the columns (required fields are marked).
 3. Declare the date format.
 4. Confirm the plan and batch mappings.
-5. Tick the batches that may be activated. Only the newest batch in the file is pre-ticked. Every
-   other valid row stages as **Inactive**.
+5. Tick what may be activated. There are two lists:
+   - **VIP cohorts:** only the newest batch in the file is pre-ticked.
+   - **Self-paced plans** (Silver, Essentials): pre-ticked, because a still-running paid term is owed.
+
+   Every other valid row stages as **Inactive**.
 6. Tick the confirmation and press **Stage**.
 
 The same roster staged twice opens the first job; nothing is staged twice. A corrected roster
@@ -143,7 +160,7 @@ reopened. An archived batch blocks the row.
 ## 5. The email and the claim
 
 - **New account, or one that never confirmed its email:** "Your learning account has moved —
-  activate it now", from support@alexsagun.com. It lists their name, email, batch, plan,
+  activate it now", from support@toolkits.alexsagun.com (replies go to support@alexsagun.com). It lists their name, email, batch (VIP only), package,
   subscription start and expiry, says the membership is already paid, and has a one-time link to
   `/activate-account`. The link works for 24 hours; a resend replaces it.
 - **Existing account with a password:** a notification with a plain sign-in link. No password reset.
@@ -153,7 +170,7 @@ they can correct) and their email (locked — it is how they sign in), and asks 
 twice. Then a summary shows their name, email, batch, plan, subscription status and expiry, with
 **Go To Dashboard**. No price appears anywhere on the way.
 
-When they finish, two emails go out once, from support@alexsagun.com: **"Student Successfully
+When they finish, two emails go out once, from the same sender: **"Student Successfully
 Onboarded"** to you, and a confirmation to the student with their subscription details, a link to
 their dashboard and the support address. The row then shows **Onboarded**, and its panel says whether
 those emails were sent. If sending failed (Resend down, say), the app tries again the next time the
@@ -166,18 +183,50 @@ also finishes the setup and sends the same two emails.
 
 ---
 
-## 6. Later cohorts (August, September)
+## 6. Silver and Essentials rosters, and people in more than one roster
+
+Stage **every** roster (VIP, Silver, Essentials) **before** activating any Silver or Essentials row.
+Overlaps are then visible:
+
+- **The same person in two rosters:** the row is warned *Also in another roster*, and the activation
+  dialog lists overlaps.
+  - The **higher package wins**: VIP beats Silver, and Silver beats Essentials.
+  - A lower row is held back as **Failed — higher plan pending** while the higher one is still waiting.
+    Activate the higher one first; retry the lower one only if it should still apply.
+- **A member who paid before July 2026** and has unlimited access (no dated term) is **blocked** as
+  *grandfathered*. Activating them would shorten what they have. Handle them by hand.
+- **Cohort seats come from what was paid:** a six-month VIP term gets six monthly cohorts, and a
+  one-month payer gets one.
+- **Every month needs a batch.** If a month inside someone's cohort run has no batch while a later one
+  exists (for example, no November 2026 but December 2026 exists), activation refuses and names the
+  month. Create it in **Admin → Batches**, then activate.
+
+---
+
+## 7. Later cohorts (August, September)
 
 Inactive rows stay staged. To activate some later:
 
 1. select them, **Make ready…** (with a reason);
 2. activate them as above.
 
-They keep their original dates and batch. They are never moved into October.
+They keep their original dates and batch unless you change them.
+
+**When a cohort's batch has been archived** (September 2026 was archived on 28 Sep 2026), its rows cannot
+be made ready as they are: an archived batch is refused. Move them first:
+
+1. Filter the job to that batch (September 2026) and press **Select all inactive in this view**.
+2. Press **Change terms for 65…**, choose the batch to move them to (October 2026), leave every other
+   field alone, give a reason, and save. Their paid start and expiry dates do not change; only the
+   cohort does, and every row records who changed it and what it was before.
+3. With the same rows selected, press **Make 65 ready…**, then activate them as above.
+
+Their cohort seats still come from what they paid for: a six-month term gets six monthly cohorts
+starting from the new batch.
 
 ---
 
-## 7. Recovery
+## 8. Recovery
 
 - **Revert** (row → Revert activation, with a reason) undoes an activation the student has not
   used: a scheduled membership, or a new account that has not been claimed. The membership is
@@ -189,7 +238,7 @@ They keep their original dates and batch. They are never moved into October.
 
 ---
 
-## 8. Privacy and retention
+## 9. Privacy and retention
 
 - The audit trail stores ids and short codes only, and it cannot be edited or deleted.
 - **Remove raw names and emails** (job toolbar) clears names and addresses from activated and
@@ -200,7 +249,7 @@ They keep their original dates and batch. They are never moved into October.
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 - **"Activation is paused until the server has …"** — set the missing `RESEND_*`, `APP_URL` or
   support address, then redeploy. `APP_URL` is needed on preview deployments too, not just
@@ -216,5 +265,14 @@ They keep their original dates and batch. They are never moved into October.
 - **"No batch exists for …"** in the confirmation — the cohort run skips that month, and a batch
   created for it later cannot join the run. Create the batch **before** activating if it should
   count.
-- **An email shows "Invitation failed"** — press Resend on the row.
+- **An activation stopped with "Resend refused the sender" or "Daily email limit reached"** — the
+  run pauses on the first refusal, so at most one student was activated without an email. That
+  student's invitation goes back in the queue. Fix the sender (or wait for tomorrow's allowance, or
+  upgrade Resend), then press **Resume**.
+- **Several emails show "Invitation failed"** — press **Resend N failed invitations…** once, or
+  Resend on a single row.
+- **"A month in this cohort run has no batch yet"** — create that batch in Admin → Batches, then
+  activate.
+- **A row is Failed — higher plan pending** — the same person has a higher package waiting in another
+  roster. Activate that one first.
 - **A student says the link expired** — they use Forgot password with the same email, or you resend.

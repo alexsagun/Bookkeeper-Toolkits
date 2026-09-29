@@ -21,8 +21,11 @@
 //                 account is ready). Auth: the student's own JWT, verified here. The body
 //                 carries NOTHING: the service-only legacy_import_onboarding_notice(uid)
 //                 reads every fact from that student's own import row, and 'sent' is final,
-//                 so the admin inbox rings once per student.
-//                 Both emails come from support@alexsagun.com (MIGRATION_EMAIL_FROM).
+//                 so the admin inbox rings once per student. A failed try is handed back
+//                 only when NEITHER email was delivered (#68, see onboardingFailure).
+//                 Both emails use the migration addresses (#68, legacyClaimEmail.js's
+//                 migrationAddresses): From MIGRATION_EMAIL_FROM, else support@<RESEND_FROM's
+//                 domain>; Reply-To MIGRATION_REPLY_TO, else support@alexsagun.com.
 //
 // Admin-recipient resolution ('submitted' + 'test'), first valid email wins:
 //   NOTIFY_ADMIN_EMAIL → payment_settings.notify_email → address inside RESEND_FROM.
@@ -46,9 +49,10 @@
 
 import { phpAmount } from '../src/lib/planCatalog.js';
 import { intakeSelectColumns, ENROLLMENT_PROCESSING_NOTE } from '../src/lib/enrollmentIntake.js';
+import { tierLabelFor } from '../src/lib/trainingAgreement.js';
 import { requireStaff, service, serviceConfigured } from './_lib/staffAuth.js';
 import { sendEmail } from './_lib/email.js';
-import { MIGRATION_SENDER_ADDRESS, onboardedAdminEmail, onboardedStudentEmail } from './_lib/legacyClaimEmail.js';
+import { isAddress, migrationAddresses, onboardedAdminEmail, onboardedStudentEmail } from './_lib/legacyClaimEmail.js';
 
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
 const SUPABASE_ANON = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
@@ -291,15 +295,25 @@ const fromAddress = (from) => (from ? (from.match(/<([^>]+)>/)?.[1] ?? from).tri
 //      passes. Best-effort: any failure/missing table just falls through.)
 //   3. address inside RESEND_FROM      → source 'from'
 // Returns { to, source }; { to:null, source:null } if nothing resolves to a valid email.
-async function resolveAdminRecipient(token) {
+//
+// `timeoutMs` bounds the payment_settings read. ★ ONLY 'import_onboarded' passes one (#68,
+// R6): it asks AFTER reserving the student's notice, so a hung read would hold the
+// reservation until the function is killed. 'submitted' and 'test' keep their unbounded read:
+// on an abort the catch below falls through to RESEND_FROM's (typically no-reply) address,
+// and a student's "new enrollment" alert delivered there reads as sent while nobody sees it.
+async function resolveAdminRecipient(token, { timeoutMs = null } = {}) {
   const envTo = process.env.NOTIFY_ADMIN_EMAIL;
   if (isEmail(envTo)) return { to: envTo, source: 'env' };
 
   if (token && SUPABASE_URL && SUPABASE_ANON) {
     try {
+      const limit = Number(timeoutMs) > 0 ? Number(timeoutMs) : null;
       const r = await fetch(
         `${SUPABASE_URL}/rest/v1/payment_settings?key=eq.notify_email&select=value`,
-        { headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}` } }
+        {
+          headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}` },
+          ...(limit ? { signal: AbortSignal.timeout(limit) } : {}),
+        }
       );
       if (r.ok) {
         const rows = await r.json();
@@ -313,6 +327,43 @@ async function resolveAdminRecipient(token) {
   if (isEmail(fromTo)) return { to: fromTo, source: 'from' };
 
   return { to: null, source: null };
+}
+
+// 'import_onboarded' only: its payment_settings read happens while a notice is reserved.
+const ADMIN_RECIPIENT_TIMEOUT_MS = 3_000;
+
+// An onboarding-notice email that PROVES it was not delivered: the provider refused this
+// request outright (any 4xx but 409, which can mean the same key is still being processed),
+// or it never left this server. sendEmail reports a refusal that follows an unanswered
+// attempt as 'resend_timeout' (#68, V4), so a 4xx here is the only answer there was.
+const NOT_DELIVERED_CODES = new Set(['email_not_configured', 'email_from_not_configured', 'email_incomplete', 'recipient_invalid']);
+const provenNotDelivered = (code) =>
+  NOT_DELIVERED_CODES.has(code) || (/^resend_4\d\d$/.test(String(code || '')) && code !== 'resend_409');
+
+/**
+ * What to record when the two onboarding emails did not both go out (#68, V2 + S2).
+ *
+ * ★ A TRY IS HANDED BACK ONLY WHEN NEITHER EMAIL WAS DELIVERED. legacy_import_onboarding_notice
+ *   refunds the reservation for a refusal that says nothing about the student (key, sender,
+ *   quota, configuration) — but when one of the two emails WAS delivered, a refund lets every
+ *   later session send both again, and once Resend's 24-hour idempotency window has passed the
+ *   delivered one rings again: the owner's "Student Successfully Onboarded", or the student's
+ *   "account ready", about once a day for as long as the other half keeps failing. So:
+ *     • one delivered, one not      → 'failed' with NO code: the try is consumed, as in #67,
+ *                                     and the five-try cap bounds the repeats;
+ *     • neither delivered, and both
+ *       answers prove it            → 'failed' with the admin email's code, which the database
+ *                                     may refund;
+ *     • neither delivered, but one
+ *       may have gone out anyway    → 'failed' with THAT unclear code (a timeout, a 5xx, a
+ *                                     409), which the database never refunds.
+ */
+function onboardingFailure(adminOut, studentOut) {
+  if (adminOut.ok || studentOut.ok) return { p_result: 'failed' };
+  if (provenNotDelivered(adminOut.code) && provenNotDelivered(studentOut.code)) {
+    return { p_result: 'failed', p_code: adminOut.code };
+  }
+  return { p_result: 'failed', p_code: provenNotDelivered(adminOut.code) ? studentOut.code : adminOut.code };
 }
 
 function decisionEmail(status, fullName, planName, reason) {
@@ -444,6 +495,10 @@ export default async function handler(req, res) {
     const appUrl = (process.env.APP_URL || '').replace(/\/+$/, '') ||
       (req.headers?.host ? `https://${req.headers.host}` : '');
     const isRenewal = await callerHasSubscription(row.user_id, u.token);
+    // The tier's HEADING — the package title the student signed under — never its internal
+    // key: "Signed as SAMPLER" named the retired product beside the new agreement version
+    // (#68, L3). An unknown key prints no tier at all rather than the raw key.
+    const agreementTier = row.agreement_tier ? (tierLabelFor(row.agreement_tier) || null) : null;
 
     const { subject, html } = {
       subject: `${isRenewal ? 'Renewal' : 'New enrollment'} submitted — ${row.full_name} · ${row.plan_name}`,
@@ -477,7 +532,7 @@ export default async function handler(req, res) {
           ...(row.intake?.facebook_link ? [['Facebook', row.intake.facebook_link]] : []),
           ...(row.intake?.struggles ? [['Three struggles', row.intake.struggles]] : []),
           ...(row.agreement_version
-            ? [['Agreement', `Signed${row.agreement_tier ? ` as ${row.agreement_tier.toUpperCase()}` : ''} · v${row.agreement_version}`]]
+            ? [['Agreement', `Signed${agreementTier ? ` as ${agreementTier}` : ''} · v${row.agreement_version}`]]
             : []),
           ...(row.resume_path ? [['Resume', 'Attached — open it from Enrollments']] : []),
         ],
@@ -601,6 +656,22 @@ export default async function handler(req, res) {
     }
     if (!apiKey) return res.status(200).json({ ok: false, skipped: 'email_not_configured' });
     if (!serviceConfigured()) return res.status(503).json({ ok: false, error: 'The server is not configured for this.' });
+    // ★ FROM A VERIFIED DOMAIN, ANSWERED AT THE SUPPORT MAILBOX — the same two addresses the
+    //   activation email uses, from one helper. Checked BEFORE the reservation: with no sender
+    //   there is nothing to send, and asking would spend one of the student's five tries.
+    const addr = migrationAddresses({
+      migrationFrom: process.env.MIGRATION_EMAIL_FROM,
+      resendFrom: process.env.RESEND_FROM,
+      replyTo: process.env.MIGRATION_REPLY_TO,
+    });
+    if (!addr.from) return res.status(200).json({ ok: false, skipped: 'email_from_not_configured' });
+    // ★ WELL-FORMED, TOO (#68, V2) — the same test readiness() applies before a run. A
+    //   malformed MIGRATION_EMAIL_FROM or MIGRATION_REPLY_TO is refused by Resend on both
+    //   emails, every time; checked here it spends none of the student's tries on a send that
+    //   cannot work.
+    if (!isAddress(addr.from) || !isAddress(addr.replyTo)) {
+      return res.status(200).json({ ok: false, skipped: 'email_address_invalid' });
+    }
 
     // ★ SERVICE-ONLY, AND ONLY EVER WITH THE uid callerUser() VERIFIED. The notice RPC is
     //   revoked from every client role: while it was the student's own call, a student could
@@ -623,26 +694,24 @@ export default async function handler(req, res) {
     if (!claim) return res.status(503).json({ ok: false, error: 'Could not reach the database. Try again.' });
     if (!claim.ok) return res.status(200).json({ ok: false, skipped: claim.skip || 'not_eligible' });
 
-    const sender = String(process.env.MIGRATION_EMAIL_FROM || '').trim() || MIGRATION_SENDER_ADDRESS;
-    const support = fromAddress(sender);
     // The request's own host only under `npm run dev`: on Vercel a preview shares
     // production's database, so without APP_URL the email carries no dashboard link at all.
     const appUrl = (process.env.APP_URL || '').replace(/\/+$/, '') ||
       (!process.env.VERCEL_ENV && req.headers?.host ? `http://${req.headers.host}` : '');
     const facts = {
       fullName: claim.full_name, email: claim.email, batchName: claim.batch_name,
-      planName: claim.plan_name, planKey: claim.plan_key, startDate: claim.started_at,
+      planName: claim.plan_name, startDate: claim.started_at,
       endDate: claim.ends_at, status: claim.status,
     };
 
-    const { to: adminTo } = await resolveAdminRecipient(u.token);
+    const { to: adminTo } = await resolveAdminRecipient(u.token, { timeoutMs: ADMIN_RECIPIENT_TIMEOUT_MS });
     const adminMsg = onboardedAdminEmail({ ...facts, onboardedAt: claim.onboarded_at,
       dashboardUrl: appUrl ? `${appUrl}/admin/student-imports` : null });
     const studentMsg = onboardedStudentEmail({ ...facts, dashboardUrl: appUrl ? `${appUrl}/` : null,
-      supportEmail: support, nowMs: Date.now() });
+      supportEmail: addr.replyTo, nowMs: Date.now() });
 
     const send = (to, msg, who) => (isEmail(to)
-      ? sendEmail({ to, subject: msg.subject, html: msg.html, text: msg.text, from: sender, replyTo: support,
+      ? sendEmail({ to, subject: msg.subject, html: msg.html, text: msg.text, from: addr.from, replyTo: addr.replyTo,
           idempotencyKey: `legacy-onboarded-${who}-${claim.row_id}`, tag: 'student-onboarded',
           timeoutMs: 10_000, maxAttempts: 2, retry429: false })
       : Promise.resolve({ ok: false, code: 'recipient_invalid' }));
@@ -653,8 +722,8 @@ export default async function handler(req, res) {
     const ok = adminOut.ok && studentOut.ok;
     // 'failed' is retryable (the app asks again the next time the student opens it, at most
     // five reservations in all), and the idempotency keys stop the one that already went out
-    // from going twice.
-    await notice({ p_result: ok ? 'sent' : 'failed' });
+    // from going twice — for 24 hours, which is all Resend promises.
+    await notice(ok ? { p_result: 'sent' } : onboardingFailure(adminOut, studentOut));
     if (!ok) console.error(`[notify-enrollment] onboarded notice: admin ${adminOut.ok ? 'ok' : adminOut.code}, student ${studentOut.ok ? 'ok' : studentOut.code}`);
     return res.status(200).json({ ok, admin: adminOut.ok ? 'sent' : adminOut.code, student: studentOut.ok ? 'sent' : studentOut.code });
   }
@@ -704,3 +773,6 @@ export default async function handler(req, res) {
 
   return res.status(400).json({ error: "action must be 'submitted', 'decision', 'test' or 'import_onboarded'." });
 }
+
+// Exported for test/notifyImportOnboarded.test.mjs.
+export { onboardingFailure };

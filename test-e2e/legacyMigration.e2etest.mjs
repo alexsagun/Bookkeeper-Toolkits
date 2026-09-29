@@ -2,8 +2,10 @@
 // test-e2e/legacyMigration.e2etest.mjs — the legacy migration, driven in a real browser (#67).
 // ─────────────────────────────────────────────────────────────────────────────
 // The real app, served by Vite against the SHADOW project, with every mail/AI/Zoom key
-// pinned dead by _app.mjs — so an "invitation" here is refused by the provider and the
-// row ends as "Invitation failed", which is itself one of the states this suite checks.
+// pinned dead by _app.mjs — so an "invitation" here is refused by the provider with a 401.
+// ★ #68: A 401 PROVES NOTHING WAS SENT, so the endpoint's circuit breaker hands that email
+//   back to the queue and PAUSES the run: at most one student is ever granted without an
+//   invitation. #67 carried on through all three rows; this suite now checks the brake.
 //
 //   1. A Super Admin uploads a SYNTHETIC roster (6 rows, two cohorts), declares the date
 //      format, confirms the mappings and stages it. Only the newest cohort is ready.
@@ -11,13 +13,17 @@
 //   3. "Select all ready" selects the ready rows only. Step 1 of the dialog assigns the
 //      terms — a start still ahead is opened TODAY, the paid end kept — and step 2 needs
 //      the typed phrase.
-//   4. The run completes; every activated row shows its (failed) invitation, and every
-//      membership is ACTIVE, not scheduled.
+//   4. The refused sender stops the run after ONE grant: the page says why, the run is
+//      paused, the email is back in the queue, and that membership is ACTIVE, not
+//      scheduled. Resume sends the owed email first — refused again — and grants nobody new.
 //   5. A student activates their account through a link minted here: their name is
 //      prefilled, their email locked, a mismatched confirmation refused. The summary shows
 //      their membership, and Go To Dashboard reaches the dashboard — never a price.
 //   6. An Operations Admin and a student get "Super Admin only" and fire no migration RPC.
 //   7. The workspace never scrolls sideways at a phone width or with the sidebar open.
+//   8. (#68) An ESSENTIALS roster with NO batch column stages: nothing asks for a batch, its
+//      rows are Ready through the self-paced package tick, and activation grants a sampler
+//      term with no cohort seat (and, the sender being refused, stops after that one).
 // ─────────────────────────────────────────────────────────────────────────────
 
 import test, { before, after } from 'node:test';
@@ -37,7 +43,17 @@ const ART = join(REPO_ROOT, 'test-e2e', '.artifacts', 'legacy-migration');
 const tick = (ms = 150) => new Promise((r) => setTimeout(r, ms));
 const email = (n) => `e2e-lm-${NONCE}-r${n}@shadow.test`;
 
-let app; let browser; let people; let csvPath; let jobUrl;
+let app; let browser; let people; let csvPath; let jobUrl; let essPath;
+const essEmail = (n) => `e2e-lm-${NONCE}-ess${n}@shadow.test`;
+
+// #68: the shape a Silver/Essentials export may take — no batch column at all. A 60-day term,
+// so the plan's own length raises no term_length_unusual warning.
+function essentialsRoster() {
+  const head = 'thinkific_user_id,first_name,last_name,email,plan_key,membership_started_at,membership_ends_at,payment_status,amount_paid,currency';
+  const rows = [];
+  for (let n = 1; n <= 2; n += 1) rows.push(`,Ess${n},Synthetic,${essEmail(n)},Essentials,5/10/2035,7/8/2035,Paid,1499,PHP`);
+  return [head, ...rows].join('\n');
+}
 
 function roster() {
   const head = 'thinkific_user_id,first_name,last_name,email,plan_key,membership_started_at,membership_ends_at,payment_status,amount_paid,currency,legacy_enrollments,batch_code';
@@ -58,11 +74,19 @@ before(async () => {
       (${lit(people['lm-super'].id)}::uuid, 'super_admin', 'active', now(), now()),
       (${lit(people['lm-ops'].id)}::uuid, 'operations_admin', 'active', now(), now())
     on conflict (user_id) do update set role_key = excluded.role_key, status = 'active', activated_at = now();
-    insert into public.batches (code, name, status) values ('2035-04', 'April 2035', 'open'), ('2035-05', 'May 2035', 'open')
+    insert into public.batches (code, name, status) values ('2035-04', 'April 2035', 'open'), ('2035-05', 'May 2035', 'open'),
+      ('2035-06', 'June 2035', 'open'), ('2035-07', 'July 2035', 'open'), ('2035-08', 'August 2035', 'open'),
+      ('2035-09', 'September 2035', 'open'), ('2035-10', 'October 2035', 'open')
     on conflict (code) do nothing;`);
+  // ★ #68: every month of the May cohort's six-seat run (2035-05 … 2035-10) exists. Were one
+  //   missing while any later batch existed — another suite's, say — the preflight would
+  //   name it as a batch gap and Activate would stay disabled, which is correct behaviour
+  //   and not what this test is about.
   mkdirSync(ART, { recursive: true });
   csvPath = join(ART, `synthetic-roster-${NONCE}.csv`);
   writeFileSync(csvPath, roster());
+  essPath = join(ART, `essentials-roster-${NONCE}.csv`);
+  writeFileSync(essPath, essentialsRoster());
   app = await startApp();
   browser = await launchChrome();
 });
@@ -118,7 +142,7 @@ test('a Super Admin stages, assigns terms and activates; the student sets up, se
     assert.equal(await page.evaluate(() => !!document.querySelector('input[name="migration-date-format"]:checked')), false,
       'no date format may be pre-selected');
     await page.evaluate(() => document.querySelector('input[name="migration-date-format"][value="M/D/YYYY"]').click());
-    await page.waitFor(() => document.body.textContent.includes('Confirm plans and batches'), [], { what: 'the mapping step' });
+    await page.waitFor(() => document.body.textContent.includes('Confirm packages and batches'), [], { what: 'the mapping step' });
     // The suggestions are visible and pre-filled: VIP → vip, and each month label → its batch.
     // They fill as soon as the plan catalog and the batch registry have loaded, which on a
     // cold dev server can land after the file does — so wait for them rather than read once.
@@ -159,6 +183,8 @@ test('a Super Admin stages, assigns terms and activates; the student sets up, se
       'opening access today is the default for a start still ahead');
     assert.equal(await page.evaluate(() => !!document.getElementById('migration-phrase')), false,
       'no typed phrase on the terms step — nothing can be created from it');
+    // #68: seats follow the PAID term — May 10 → Nov 10 is six months, so six cohort seats.
+    assert.ok(await bodyHas(page, '6 cohort seats, from May 2035 onwards'), 'the seat count is shown for a VIP group');
     assert.ok(await clickText(page, 'Continue'));
     await page.waitFor(() => !!document.getElementById('migration-phrase'), [], { timeoutMs: 60000, what: 'the confirmation' });
     await page.waitFor(() => document.body.textContent.includes('Will be activated'), [], { timeoutMs: 60000, what: 'the preflight counts' });
@@ -168,32 +194,56 @@ test('a Super Admin stages, assigns terms and activates; the student sets up, se
     await typeInto(page, '#migration-phrase', 'ACTIVATE 3');
     await page.evaluate(() => [...document.querySelectorAll('[role="dialog"] button')].find((b) => b.textContent.trim() === 'Activate 3').click());
 
-    // ── 4. The run completes; the dead mail key makes every invitation fail, visibly ──
+    // ── 4. The refused sender stops the run after ONE grant (#68's circuit breaker) ──
     // ★ Wait on the DATABASE, then look at the page. "Invitation failed" is also the label of
-    //   a filter chip, so counting that text finished one row early and read the
-    //   subscriptions while the third was still being granted.
-    const activatedCount = () => scalar(`select count(*) from public.student_import_rows r
+    //   a filter chip, so counting page text is not evidence of anything.
+    const FILE = `synthetic-roster-${NONCE}.csv`;
+    const countIn = (state) => scalar(`select count(*) from public.student_import_rows r
       join public.student_import_jobs j on j.id = r.job_id
-      where j.filename = ${lit(`synthetic-roster-${NONCE}.csv`)} and r.activation_state = 'activated'`).then(Number);
+      where j.filename = ${lit(FILE)} and r.activation_state = ${lit(state)}`).then(Number);
+    const runStatus = () => scalar(`select r.status from public.student_import_activation_runs r
+      join public.student_import_jobs j on j.id = r.job_id where j.filename = ${lit(FILE)}
+      order by r.created_at desc limit 1`);
     const until = Date.now() + 240000;
-    for (let done = await activatedCount(); done < 3; done = await activatedCount()) {
-      assert.ok(Date.now() < until, `only ${done} of 3 rows were activated within 240s`);
+    for (let done = await countIn('activated'); done < 1; done = await countIn('activated')) {
+      assert.ok(Date.now() < until, 'no row was activated within 240s');
       await tick(3000);
     }
-    await page.waitFor(() => !/Activating/.test(document.body.textContent)
-      && (document.body.textContent.match(/Invitation failed/g) || []).length >= 3, [],
-    { timeoutMs: 120000, what: 'the finished run on screen' });
-    const inactiveStill = Number(await scalar(`select count(*) from public.student_import_rows r join public.student_import_jobs j on j.id = r.job_id
-      where j.filename = ${lit(`synthetic-roster-${NONCE}.csv`)} and r.activation_state = 'inactive'`));
-    assert.equal(inactiveStill, 3, 'the April rows were never touched');
+    await page.waitFor(() => document.body.textContent.includes('Resend refused the sender')
+      && [...document.querySelectorAll('button')].some((b) => b.textContent.trim() === 'Resume activation'), [],
+    { timeoutMs: 120000, what: 'the stopped run, and why, on screen' });
+    await tick(3000);
+    assert.equal(await countIn('activated'), 1, 'the breaker grants at most one student without an email');
+    assert.equal(await countIn('ready'), 2, 'the other May rows were never claimed');
+    assert.equal(await countIn('inactive'), 3, 'the April rows were never touched');
+    assert.equal(await runStatus(), 'paused', 'the server paused the run');
+    const owed = (await runSql(`select r.invite_state, r.invite_code, r.invite_generation from public.student_import_rows r
+      join public.student_import_jobs j on j.id = r.job_id where j.filename = ${lit(FILE)} and r.activation_state = 'activated'`))[0];
+    assert.equal(owed.invite_state, 'not_sent', 'a 401 proves nothing went out, so the email goes back in the queue');
+    assert.equal(owed.invite_code, 'resend_401');
     const statuses = await runSql(`select s.status, to_char(s.ends_at at time zone 'Asia/Manila', 'YYYY-MM-DD') as ends
       from public.subscriptions s join public.student_import_rows r on r.id = s.source_import_row_id
-      join public.student_import_jobs j on j.id = r.job_id where j.filename = ${lit(`synthetic-roster-${NONCE}.csv`)}`);
-    assert.equal(statuses.length, 3);
-    for (const s of statuses) {
-      assert.equal(s.status, 'active', 'access opens on the activation day');
-      assert.equal(s.ends, '2035-11-10', 'the paid end date never moves');
+      join public.student_import_jobs j on j.id = r.job_id where j.filename = ${lit(FILE)}`);
+    assert.equal(statuses.length, 1);
+    assert.equal(statuses[0].status, 'active', 'access opens on the activation day');
+    assert.equal(statuses[0].ends, '2035-11-10', 'the paid end date never moves');
+
+    // Resume: the OWED email goes first. Still refused, so the run stops again having
+    // granted nobody new — pressing Resume while the sender is being fixed costs nothing.
+    assert.ok(await clickText(page, 'Resume activation'));
+    const untilResend = Date.now() + 120000;
+    while (Number(await scalar(`select r.invite_generation from public.student_import_rows r
+      join public.student_import_jobs j on j.id = r.job_id where j.filename = ${lit(FILE)} and r.activation_state = 'activated'`)) <= Number(owed.invite_generation)) {
+      assert.ok(Date.now() < untilResend, 'Resume did not try the owed email');
+      await tick(2000);
     }
+    await page.waitFor(() => document.body.textContent.includes('Resend refused the sender')
+      && [...document.querySelectorAll('button')].some((b) => b.textContent.trim() === 'Resume activation'), [],
+    { timeoutMs: 120000, what: 'the run stopped again' });
+    await tick(2000);
+    assert.equal(await countIn('activated'), 1, 'Resume granted nobody new while the sender is refused');
+    assert.equal(await countIn('ready'), 2);
+    assert.equal(await runStatus(), 'paused');
     await page.screenshot(join(ART, `job-${NONCE}.png`));
     assert.deepEqual(pageErrors(page), [], 'the workspace raised errors');
     await page.close();
@@ -226,7 +276,7 @@ test('a Super Admin stages, assigns terms and activates; the student sets up, se
     await claim.waitFor(() => document.body.textContent.includes('Go To Dashboard'), [], { timeoutMs: 60000, what: 'the onboarding summary' });
     await claim.waitFor(() => document.body.textContent.includes('May 2035') && document.body.textContent.includes('Active'),
       [], { timeoutMs: 30000, what: 'the summary facts' });
-    for (const label of ['Membership plan', 'Subscription status', 'Subscription expiry']) assert.ok(await bodyHas(claim, label), label);
+    for (const label of ['Package', 'Subscription status', 'Subscription expiry']) assert.ok(await bodyHas(claim, label), label);
     assert.ok(await bodyHas(claim, 'November 10, 2035'), 'the expiry is the paid end date');
     assert.ok(!(await bodyHas(claim, '₱')), 'no price on the summary');
     assert.ok(await noHorizontalScroll(claim), 'the summary scrolls sideways on a phone');
@@ -241,6 +291,100 @@ test('a Super Admin stages, assigns terms and activates; the student sets up, se
     await claim.screenshot(join(ART, `dashboard-${NONCE}.png`));
     assert.deepEqual(pageErrors(claim), [], 'the activation flow raised errors');
     await claim.close();
+  });
+
+// #68: a Silver or Essentials export has no cohort, and #67 demanded a batch at every layer —
+// the wizard stopped at step 2, and a row that got past it had a NULL purchase key.
+test('(#68) an Essentials roster with no batch column stages Ready by its package and activates with no cohort seat',
+  { skip: SKIP || false, timeout: 12 * 60 * 1000 }, async () => {
+    const FILE = `essentials-roster-${NONCE}.csv`;
+    const page = await openAs(people['lm-super'], '/admin/student-imports');
+    await page.waitFor(() => [...document.querySelectorAll('button')].some((b) => b.textContent.includes('Stage a roster')), [],
+      { timeoutMs: 180000, what: 'the workspace' });
+
+    // ── Stage: nothing asks for a batch ──
+    assert.ok(await clickText(page, 'Stage a roster'));
+    await page.waitFor(() => !!document.querySelector('input[type=file]'), [], { what: 'the file picker' });
+    const { root } = await page.send('DOM.getDocument', { depth: 1 });
+    const { nodeId } = await page.send('DOM.querySelector', { nodeId: root.nodeId, selector: 'input[type=file]' });
+    await page.send('DOM.setFileInputFiles', { nodeId, files: [essPath] });
+    // Step 3 renders only once step 2 has nothing missing: with no batch column, that is
+    // the proof the batch is not a required column any more.
+    await page.waitFor(() => document.body.textContent.includes('Declare the date format'), [], { timeoutMs: 30000, what: 'the date-format step' });
+    await page.evaluate(() => document.querySelector('input[name="migration-date-format"][value="M/D/YYYY"]').click());
+    await page.waitFor(() => document.body.textContent.includes('Confirm packages and batches'), [], { what: 'the mapping step' });
+    await page.waitFor(() => document.querySelector('select[aria-label="Plan for Essentials"]')?.value === 'sampler', [],
+      { timeoutMs: 30000, what: 'the Essentials label suggested as the sampler package' });
+    assert.equal(await page.evaluate(() => document.querySelectorAll('select[aria-label^="Batch for"]').length), 0,
+      'no batch mapping is asked for');
+    assert.ok(!(await bodyHas(page, 'which needs a batch')), 'no VIP batch warning for a self-paced roster');
+
+    // ── Step 5: Ready by the package tick, pre-ticked ──
+    await page.waitFor(() => document.body.textContent.includes('Choose what can be activated'), [], { what: 'the activation step' });
+    assert.ok(await bodyHas(page, 'Self-paced packages'));
+    assert.ok(!(await bodyHas(page, 'VIP cohorts')), 'no cohort table for a roster with no VIP rows');
+    assert.equal(await page.evaluate(() => document.querySelector('input[aria-label="Rows of Essentials can be activated"]')?.checked), true,
+      'every self-paced package in the file is pre-ticked');
+    assert.ok(!(await bodyHas(page, 'Why rows are blocked')), 'nothing is blocked');
+    await page.evaluate(() => [...document.querySelectorAll('label')].find((l) => l.textContent.includes('I have checked the date format')).querySelector('input').click());
+    assert.ok(await clickText(page, 'Stage 2 rows'));
+    await page.waitFor(() => document.body.textContent.includes('Select all ready in this view'), [], { timeoutMs: 60000, what: 'the staged job' });
+
+    const staged = await runSql(`select r.validation_status, r.activation_state, r.proposed_plan_key, r.proposed_batch_id,
+        r.legacy_record_key is not null as keyed, array_to_string(j.eligible_plan_keys, ',') as plan_ticks
+      from public.student_import_rows r join public.student_import_jobs j on j.id = r.job_id where j.filename = ${lit(FILE)}`);
+    assert.equal(staged.length, 2);
+    for (const r of staged) {
+      assert.equal(r.validation_status, 'valid');
+      assert.equal(r.activation_state, 'ready', 'Ready through the package tick, not a cohort');
+      assert.equal(r.proposed_plan_key, 'sampler');
+      assert.equal(r.proposed_batch_id, null, 'a self-paced row holds no batch');
+      assert.equal(r.keyed, true, 'a valid row always carries its purchase key');
+    }
+    assert.equal(staged[0].plan_ticks, 'sampler', 'the tick is stored on the job');
+    await page.waitFor(() => document.body.textContent.includes('Self-paced (no cohort)'), [], { timeoutMs: 60000, what: 'the job summary' });
+
+    // ── Activate: one grant, no cohort seat, and the refused sender stops the run ──
+    assert.ok(await clickText(page, 'Select all ready in this view'));
+    await page.waitFor(() => /2 selected/.test(document.body.textContent), [], { what: 'two selected' });
+    assert.ok(await clickText(page, 'Activate 2'));
+    await page.waitFor(() => document.body.textContent.includes('Activate students · 1 of 2')
+      && document.body.textContent.includes('Self-paced, no cohort'), [], { timeoutMs: 60000, what: 'the terms step' });
+    assert.equal(await page.evaluate(() => /\d+ cohort seats?, from/.test(document.body.textContent)), false,
+      'no cohort seats are promised to a self-paced package');
+    assert.ok(await clickText(page, 'Continue'));
+    await page.waitFor(() => !!document.getElementById('migration-phrase'), [], { timeoutMs: 60000, what: 'the confirmation' });
+    await page.waitFor(() => document.body.textContent.includes('Will be activated'), [], { timeoutMs: 60000, what: 'the preflight counts' });
+    assert.ok(!(await bodyHas(page, 'No batch exists yet for')), 'a self-paced run can never have a batch gap');
+    await typeInto(page, '#migration-phrase', 'ACTIVATE 2');
+    await page.evaluate(() => [...document.querySelectorAll('[role="dialog"] button')].find((b) => b.textContent.trim() === 'Activate 2').click());
+
+    const activated = () => scalar(`select count(*) from public.student_import_rows r join public.student_import_jobs j on j.id = r.job_id
+      where j.filename = ${lit(FILE)} and r.activation_state = 'activated'`).then(Number);
+    const until = Date.now() + 240000;
+    while (await activated() < 1) {
+      assert.ok(Date.now() < until, 'no Essentials row was activated within 240s');
+      await tick(3000);
+    }
+    await page.waitFor(() => document.body.textContent.includes('Resend refused the sender'), [],
+      { timeoutMs: 120000, what: 'the stopped run on screen' });
+    await tick(2000);
+    assert.equal(await activated(), 1, 'the breaker stops a self-paced run after one grant too');
+    const subs = await runSql(`select s.plan_key, s.batch_id, s.status, s.grant_source,
+        to_char(s.ends_at at time zone 'Asia/Manila', 'YYYY-MM-DD') as ends,
+        (select count(*) from public.batch_entitlements be where be.user_id = s.user_id) as seats
+      from public.subscriptions s join public.student_import_rows r on r.id = s.source_import_row_id
+      join public.student_import_jobs j on j.id = r.job_id where j.filename = ${lit(FILE)}`);
+    assert.equal(subs.length, 1);
+    assert.equal(subs[0].plan_key, 'sampler');
+    assert.equal(subs[0].batch_id, null, 'no batch on a self-paced term');
+    assert.equal(Number(subs[0].seats), 0, 'no cohort seat is granted');
+    assert.equal(subs[0].status, 'active', 'access opens on the activation day');
+    assert.equal(subs[0].grant_source, 'import');
+    assert.equal(subs[0].ends, '2035-07-08', 'the paid end date never moves');
+    await page.screenshot(join(ART, `essentials-${NONCE}.png`));
+    assert.deepEqual(pageErrors(page), [], 'the workspace raised errors');
+    await page.close();
   });
 
 test('an Operations Admin and a student are refused, and fire no migration RPC', { skip: SKIP || false, timeout: 5 * 60 * 1000 }, async () => {

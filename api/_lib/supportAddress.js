@@ -2,8 +2,10 @@
 // api/_lib/supportAddress.js — where a student's reply goes. Server only.
 // ─────────────────────────────────────────────────────────────────────────────
 // payment_settings.notify_email (the admin-editable "Proof / support email"), then
-// NOTIFY_ADMIN_EMAIL. Moved out of api/_lib/commSend.js by #67 so the migration's
-// claim emails and #61's student emails answer "who do I reply to" identically.
+// NOTIFY_ADMIN_EMAIL. Moved out of api/_lib/commSend.js by #67 to be shared; its caller
+// today is #61's student emails (commSend.js). The legacy MIGRATION emails do NOT use it:
+// since #68 they reply to MIGRATION_REPLY_TO, else support@alexsagun.com (the owner's
+// monitored mailbox) — see migrationAddresses() in api/_lib/legacyClaimEmail.js.
 //
 // `ok: false` means the stored address could not be READ and there is no configured
 // fallback. Callers stop rather than mail students with nowhere for a reply to go.

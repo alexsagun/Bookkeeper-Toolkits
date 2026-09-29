@@ -150,6 +150,28 @@ export function toCsv(rows, headers) {
 // Handles a leading BOM, quoted fields with embedded commas/newlines, and doubled
 // quotes. Returns { headers, rows } where each row is an object keyed by header.
 // (The wizard uses lazy-loaded xlsx for .xlsx; this covers .csv + the test fixtures.)
+//
+// ★ IT REFUSES WHAT IT CANNOT READ, RATHER THAN READING SOMETHING ELSE (#68). Every
+//   one of these used to succeed quietly, and each loses or invents students:
+//   • An UNCLOSED quote swallowed the rest of the file into one field — a stray `"` in
+//     row 5 of a 141-row roster staged 4 students and said nothing. It now throws,
+//     naming the line the quote opened on.
+//   • A quote in the MIDDLE of an unquoted field (`Juan "JR" Cruz`) opened a quoted
+//     section, so two stray quotes merged every row between them. Like RFC 4180 and
+//     Excel, a quote now opens a quoted field only at the START of one; elsewhere it
+//     is an ordinary character.
+//   • A row of empty cells (`,,,,` — Excel keeps them after a formatted range) became
+//     a student with no email. All-blank rows are dropped, as the XLSX path does.
+//   • A REPEATED heading silently overwrote the earlier column, so the roster could
+//     be read from the wrong one. It now throws, naming the heading. Blank headings
+//     are left alone: a trailing comma on the header row is common, and a blank
+//     heading can never be chosen in a mapping, so it cannot be misread.
+//     ★ That error carries a stable `code` (CSV_DUPLICATE_HEADER) and the `heading`, so
+//     each caller can say it in its own words WITHOUT matching on this message. The
+//     bank-statement importer is also a caller, and its own advice — "or upload it as
+//     Excel", whose reader renames repeats — was unreachable once this throw came first.
+export const CSV_DUPLICATE_HEADER = 'DUPLICATE_HEADER';
+
 export function parseCsv(text) {
   let src = String(text == null ? '' : text);
   if (src.charCodeAt(0) === 0xfeff) src = src.slice(1); // strip BOM
@@ -158,35 +180,53 @@ export function parseCsv(text) {
   let field = '';
   let record = [];
   let inQuotes = false;
+  let line = 1;            // the physical line being read, for error messages
+  let quoteLine = 0;       // the line the currently open quote started on
   for (let i = 0; i < src.length; i++) {
     const c = src[i];
     if (inQuotes) {
       if (c === '"') {
         if (src[i + 1] === '"') { field += '"'; i++; }
         else inQuotes = false;
-      } else field += c;
-    } else if (c === '"') {
+      } else {
+        if (c === '\n' || (c === '\r' && src[i + 1] !== '\n')) line += 1;
+        field += c;
+      }
+    } else if (c === '"' && field.trim() === '') {
+      // Only at the start of a field (leading spaces tolerated, as before).
       inQuotes = true;
+      quoteLine = line;
     } else if (c === ',') {
       record.push(field); field = '';
     } else if (c === '\n') {
       record.push(field); field = '';
       records.push(record); record = [];
+      line += 1;
     } else if (c === '\r') {
       // swallow — \r\n handled by the \n branch; a lone \r also ends the row
-      if (src[i + 1] !== '\n') { record.push(field); field = ''; records.push(record); record = []; }
+      if (src[i + 1] !== '\n') { record.push(field); field = ''; records.push(record); record = []; line += 1; }
     } else field += c;
   }
+  if (inQuotes) throw new Error(`Unclosed quote starting on line ${quoteLine}`);
   if (field.length || record.length) { record.push(field); records.push(record); }
 
-  // Drop a trailing empty record (file ended with a newline).
-  while (records.length && records[records.length - 1].length === 1 && records[records.length - 1][0] === '') {
-    records.pop();
-  }
-  if (!records.length) return { headers: [], rows: [] };
+  // Drop every record whose cells are all blank — a blank line, or `,,,,` — wherever it is.
+  const kept = records.filter((rec) => rec.some((v) => String(v).trim() !== ''));
+  if (!kept.length) return { headers: [], rows: [] };
 
-  const headers = records[0].map((h) => h.trim());
-  const rows = records.slice(1).map((rec) => {
+  const headers = kept[0].map((h) => h.trim());
+  const seen = new Set();
+  for (const h of headers) {
+    if (!h) continue;
+    if (seen.has(h)) {
+      const err = new Error(`Duplicate column heading "${h}". Give every column a different heading and export the file again.`);
+      err.code = CSV_DUPLICATE_HEADER;
+      err.heading = h;
+      throw err;
+    }
+    seen.add(h);
+  }
+  const rows = kept.slice(1).map((rec) => {
     const obj = {};
     headers.forEach((h, idx) => { obj[h] = rec[idx] != null ? rec[idx] : ''; });
     return obj;

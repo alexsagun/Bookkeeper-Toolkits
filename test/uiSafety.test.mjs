@@ -10,6 +10,9 @@ import assert from 'node:assert/strict';
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { rowDisplayState } from '../src/lib/legacyMigration.js';
+import { agreementModel } from '../src/lib/trainingAgreement.js';
+import { ENROLLMENT_PLANS_FALLBACK } from '../src/lib/planCatalog.js';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const app = () => readFileSync(join(REPO, 'src/BookkeeperPro.jsx'), 'utf8');
@@ -2472,7 +2475,10 @@ test('§27 activation requires the typed phrase the server will check', () => {
   //   already been saved — a dead end the dialog itself had promised would not happen.
   assert.ok(region.includes("migrationApi('start-activation', { jobId, rowIds: activateIds, phrase: typed.trim(), clientKey: keyRef.current })"));
   assert.ok(region.includes('const activateIds = Array.isArray(p?.row_ids) ? p.row_ids : [];'));
-  assert.ok(region.includes('&& Array.isArray(p.row_ids) && p.row_ids.length === n;'), 'confirm stays disabled unless the ids and the phrase agree');
+  // #68 adds the batch-gap block to the same condition: confirm stays disabled while any
+  // month in a VIP seat run has no batch under a later one.
+  assert.ok(region.includes('&& Array.isArray(p.row_ids) && p.row_ids.length === n && gaps.length === 0;'),
+    'confirm stays disabled unless the ids and the phrase agree, and no batch month is missing');
   assert.ok(!region.includes("migrationApi('start-activation', { jobId, rowIds,"), 'never the raw selection');
   assert.ok(region.includes('const keyRef = useRef(newClientKey());'), 'one key per dialog, so a double click reuses the same run');
 });
@@ -2551,7 +2557,8 @@ test('§27 the onboarding summary shows the membership and leads to the dashboar
   const at = src.indexOf('function ImportWelcomeScreen(');
   const screen = src.slice(at, at + 5000);
   assert.ok(screen.includes("supabase.rpc('my_migration_summary')"), 'facts come from the student\'s own row');
-  for (const label of ['Name', 'Email', 'Batch', 'Membership plan', 'Subscription status', 'Subscription expiry']) {
+  // #68: the plan row is labelled "Package" — the owner's word, used on every surface.
+  for (const label of ['Name', 'Email', 'Batch', 'Package', 'Subscription status', 'Subscription expiry']) {
     assert.ok(screen.includes(`['${label}',`), `${label} is shown`);
   }
   assert.ok(screen.includes('Go To Dashboard'));
@@ -2588,4 +2595,615 @@ test('§27 the sender can be proven before any student is emailed', () => {
   assert.ok(block.includes('admin.auth.admin.getUserById(actorId)'), 'the test goes to the caller\'s own address');
   assert.ok(!/body\?\.(to|email)/.test(block), 'never to an address the request names');
   assert.ok(!block.includes('generateLink'), 'the test mints no token');
+});
+
+// ─── §27 (#68) Round two: package titles, self-paced rosters, bulk activation you can trust ──
+//
+// Each test names a finding of the 2026-09-28 review of #67 (review_synthesis.md). Several
+// helpers are pure functions at module scope in the monolith; they are lifted out and RUN
+// here, so the assertions are about behaviour rather than spelling.
+
+/** A top-level `function NAME(` of the monolith, up to its column-0 closing brace. */
+function moduleFn(src, name) {
+  const start = src.indexOf(`\nfunction ${name}(`);
+  assert.ok(start >= 0, `function ${name} must exist at module scope`);
+  const end = src.indexOf('\n}', start + 1);
+  assert.ok(end > start, `function ${name} must close at column 0`);
+  return src.slice(start + 1, end + 2);
+}
+/** A one-line top-level `const NAME = …;` of the monolith. */
+function moduleConst(src, name) {
+  const start = src.indexOf(`\nconst ${name} = `);
+  assert.ok(start >= 0, `const ${name} must exist at module scope`);
+  return src.slice(start + 1, src.indexOf('\n', start + 1));
+}
+const HELPER_NAMES = ['migrationPlanTitle', 'migrationPlanOption', 'migrationPlanIsVip', 'migrationSendFailText',
+  'migrationResendRefusal', 'migrationSenderProven', 'migrationStopText', 'migrationBusyText',
+  'migrationNoticeState', 'migrationInviteText', 'migrationSkippedText', 'migrationResendPatch'];
+function migrationHelpers() {
+  const src = app();
+  const body = [moduleConst(src, 'migrationBareAddress'), moduleConst(src, 'migrationDomainOf'),
+    moduleConst(src, 'MIGRATION_INVITE_UNRECOVERABLE'), moduleConst(src, 'MIGRATION_MAX_INVITE_GENERATION'),
+    moduleConst(src, 'migrationInviteUnrecoverable'),
+    ...HELPER_NAMES.map((n) => moduleFn(src, n))].join('\n')
+    + `\nreturn { ${HELPER_NAMES.join(', ')}, migrationInviteUnrecoverable, MIGRATION_MAX_INVITE_GENERATION };`;
+  // eslint-disable-next-line no-new-func
+  return new Function('PLAN_LABELS', 'isVipPlan', 'fmtEnrollDate', body)(
+    { vip: 'VIP Package', sampler: 'Essentials' },
+    (p) => p?.community_segment === 'vip',
+    (s) => `D(${s})`);
+}
+const CATALOG = [
+  { key: 'vip', name: 'VIP Package', tagline: 'Personalized Coaching Program', community_segment: 'vip' },
+  { key: 'silver_self_paced', name: 'Silver · Self-Paced', tagline: 'QBO + Resume Combo', community_segment: 'general' },
+  { key: 'sampler', name: 'Essentials', tagline: 'Sampler Session', community_segment: 'general' },
+];
+/** From `function NAME(` to the next top-level function, for component-level scans. */
+function componentSource(name) {
+  return moduleFn(app(), name);
+}
+
+// The #67 tone table was keyed 'Ready to activate' and 'Claimed' — labels rowDisplayState()
+// never returns — so a ready row and an onboarded row both rendered as neutral pills.
+test('§27 #68 every state pill label rowDisplayState returns has a tone', () => {
+  const src = app();
+  const block = src.slice(src.indexOf('const MIGRATION_TONES = {'), src.indexOf('};', src.indexOf('const MIGRATION_TONES = {')));
+  const tones = {};
+  for (const m of block.matchAll(/(?:'([^']+)'|([A-Za-z]+)):\s*'(\w+)'/g)) tones[m[1] || m[2]] = m[3];
+  const labels = new Set([
+    ...['inactive', 'ready', 'activating', 'failed', 'blocked', 'reverted', 'unknown'].map((s) => rowDisplayState({ activation_state: s })),
+    rowDisplayState({ activation_state: 'activated' }),
+    rowDisplayState({ activation_state: 'activated', claimed: true }),
+    rowDisplayState({ activation_state: 'activated', invite_state: 'failed' }),
+  ]);
+  for (const label of labels) assert.ok(label in tones, `no tone for the pill label "${label}"`);
+  assert.equal(tones['Pending activation'], 'info');
+  assert.equal(tones.Onboarded, 'ok');
+  assert.equal(tones['Invitation failed'], 'warn');
+  assert.equal(tones.Blocked, 'danger');
+  assert.ok(!('Ready to activate' in tones) && !('Claimed' in tones), 'the dead #67 keys are gone');
+});
+
+// The owner's request: package titles, never product names or keys (F3/F4/F8).
+test('§27 #68 a package is named by its title, never by its raw key', () => {
+  const h = migrationHelpers();
+  assert.equal(h.migrationPlanTitle('vip', CATALOG), 'VIP Package', 'the loaded catalog wins');
+  assert.equal(h.migrationPlanTitle('vip', [], 'Server Name'), 'Server Name', 'then the server\'s own name');
+  assert.equal(h.migrationPlanTitle('sampler', null), 'Essentials', 'then the in-code fallback');
+  assert.equal(h.migrationPlanTitle('gold_live', []), 'A plan no longer sold', 'an unknown key is described, never printed');
+  assert.equal(h.migrationPlanOption(CATALOG[1]), 'Silver · Self-Paced — QBO + Resume Combo', 'pickers read "package — product"');
+  assert.equal(h.migrationPlanIsVip('vip', CATALOG), true);
+  assert.equal(h.migrationPlanIsVip('sampler', CATALOG), false);
+
+  const region = migrationRegion();
+  assert.ok(!region.includes("?.name || key || '—'"), 'the #67 planName fell back to the raw key');
+  assert.ok(!region.includes("→ ${row.plan_key || 'unmapped'}"), 'the row panel printed "VIP → vip"');
+  assert.ok(region.includes('{plans.map((x) => <option key={x.key} value={x.key}>{migrationPlanOption(x)}</option>)}'),
+    'the wizard mapping lists every plan as "package — product"');
+  // F8: the Enrollments approve dialog, outside this region.
+  const src = app();
+  assert.ok(!src.includes('approveFor.plan_name || approveFor.plan_key'));
+  assert.ok(!src.includes('({approveFor.plan_key})') && !src.includes('(plan: {approveFor.plan_key})'),
+    'the approve dialog printed "plan: silver_self_paced"');
+  assert.ok(src.includes("const planTitleOf = (key, snapshotName) => snapshotName || plansByKey[key]?.name || PLAN_LABELS[key] || 'this package';"));
+});
+
+test('§27 #68 every migration read of the plan catalog loads its segment, tagline and days', () => {
+  const region = migrationRegion();
+  const selects = [...region.matchAll(/from\('enrollment_plans'\)\.select\('([^']+)'\)/g)].map((m) => m[1].split(','));
+  assert.ok(selects.length >= 4, 'the wizard, the terms dialog, the activation dialog and the workspace each read it');
+  for (const cols of selects) {
+    for (const c of ['key', 'name', 'tagline', 'community_segment', 'access_days']) {
+      assert.ok(cols.includes(c), `a plan read is missing ${c}: ${cols.join(',')}`);
+    }
+  }
+  const wizard = componentSource('MigrationStageWizard');
+  assert.ok(/select\('[^']*price_php[^']*'\)/.test(wizard), 'the wizard shows today\'s price per package');
+});
+
+// P0-2: a Silver or Essentials roster could not be staged at all.
+test('§27 #68 a self-paced roster stages Ready by its package tick, with or without a batch column', () => {
+  const wizard = componentSource('MigrationStageWizard');
+  assert.ok(wizard.includes('const planKeys = eligiblePlans ?? defaultEligiblePlanKeys(probe, plans);'),
+    'the self-paced ticks start from every package in the file');
+  assert.ok(wizard.includes('eligibleBatchCodes: codes, eligiblePlanKeys: planKeys'), 'the preview is computed with them');
+  assert.ok(wizard.includes('eligiblePlanKeys: preview.planKeys,'), 'and the server is sent them');
+  assert.ok(wizard.includes("planSummary(preview.rows, plans).filter((g) => g.plan_key && g.segment !== 'vip')"),
+    'the self-paced table lists non-VIP packages only');
+  assert.ok(wizard.includes('Self-paced packages') && wizard.includes('VIP cohorts'), 'two tables for two rules');
+  assert.ok(wizard.includes('{mapsToVip && !mapping.batch_label && ('), 'a VIP mapping with no batch column is called out');
+  assert.ok(wizard.includes('Worth checking (does not block)'), 'warnings are shown before staging, not only errors');
+  assert.ok(app().includes("eligible_plan_keys: 'the self-paced packages chosen for activation',"),
+    'a re-stage that differs only in the ticked packages says so');
+});
+
+// C8/F5: "Verify the alexsagun.com domain" was printed whatever the server sent from.
+test('§27 #68 the sender copy names no domain of its own, and the chip is proven, not formatted', () => {
+  const region = migrationRegion();
+  assert.ok(!region.includes('alexsagun.com'), 'no domain is written into the migration workspace');
+  const h = migrationHelpers();
+  const t403 = h.migrationSendFailText('resend_403', 'Toolkits Support <support@toolkits.example.test>');
+  assert.ok(t403.includes('toolkits.example.test'), 'a 403 names the domain the server actually used');
+  assert.ok(!/alexsagun/.test(t403));
+  const texts = ['resend_401', 'resend_403', 'resend_422', 'resend_429', 'resend_timeout'].map((c) => h.migrationSendFailText(c, 'a@b.test'));
+  assert.equal(new Set(texts).size, texts.length, 'each provider refusal has its own words');
+  assert.match(h.migrationSendFailText('resend_timeout', 'a@b.test'), /may still arrive/, 'a timeout may have been delivered');
+
+  assert.equal(h.migrationSenderProven({ senderProven: true }, null), true, 'the server proved the domain');
+  assert.equal(h.migrationSenderProven({ sender: 'S <s@x.test>' }, { ok: true, from: 's@x.test' }), true, 'a session test for this sender');
+  assert.equal(h.migrationSenderProven({ sender: 's@x.test' }, { ok: true, from: 'other@y.test' }), false, 'a test of a different sender proves nothing');
+  assert.equal(h.migrationSenderProven({ sender: 's@x.test' }, { ok: false, code: 'resend_403' }), false, 'a refused test');
+  assert.equal(h.migrationSenderProven({ sender: 's@x.test' }, { busy: true }), false);
+  assert.equal(h.migrationSenderProven({ sender: 's@x.test', support: true }, null), false, 'an address FORMAT is not proof');
+
+  const readinessSrc = componentSource('MigrationReadiness');
+  assert.ok(readinessSrc.includes("['Sender', proven && readiness.support !== false,"),
+    'the chip is green only when the sender is proven, and never while an address is malformed');
+  assert.ok(readinessSrc.includes("!readiness.sender ? 'missing' : readiness.support === false ? 'address malformed' : 'unverified — send a test'"),
+    'the chip says which: no sender, a malformed address, or one not yet proven');
+  assert.ok(!readinessSrc.includes('readiness.support]'), 'never from the #67 format check');
+  assert.ok(readinessSrc.includes("test.clickTracking === 'on'"), 'click tracking on is called out');
+  assert.ok(readinessSrc.includes('readiness.replyTo'), 'the Reply-To is shown beside the From');
+  // One session answer, shared: both strips and the activation dialog.
+  const tab = componentSource('StudentImports');
+  assert.equal((tab.match(/onSenderTest=\{setSenderTest\}/g) || []).length, 2, 'the jobs list and the workspace share it');
+  assert.ok(region.includes('senderTest={senderTest} onStarted={onStarted}'), 'the activation dialog reads it');
+});
+
+// Owner decision: no missing month under a later batch (the allocator only moves forward).
+test('§27 #68 the confirmation blocks on a missing batch month and says what will be emailed', () => {
+  const modal = componentSource('MigrationActivateModal');
+  assert.ok(modal.includes('const gaps = Array.isArray(p?.batch_gaps) ? p.batch_gaps : [];'));
+  assert.ok(modal.includes("href={tabHref('batches')}"), 'the block links to Admin → Batches');
+  assert.ok(modal.includes("e.code === 'LEGACY_BATCH_GAP' && Array.isArray(e.context?.missing)"),
+    'a gap that appears after the preflight is named, and the preflight re-read');
+  assert.ok(modal.includes('Number(p.overlaps?.total) > 0') && modal.includes('Number(p.grandfathered) > 0'));
+  assert.ok(modal.includes('dailyCap != null && emails > dailyCap'), 'a run above the daily email limit is warned about');
+  assert.ok(modal.includes('readiness.sender') && modal.includes('readiness.replyTo'), 'From and Reply-To come from the server');
+  assert.ok(!modal.includes('support@alexsagun.com'), 'never a hard-coded sender');
+  assert.ok(/an\s+existing account gets a sign-in notice instead/.test(modal), 'existing accounts are not promised a claim link');
+  assert.ok(modal.includes("{vip && seats > 0 && ("), 'cohort seats are shown for VIP groups only');
+});
+
+// P1-1 / B5 / B6: a refused sender kept granting, a stale lease blamed "another window",
+// and a step that changed nothing either ended silently or spun into the rate limit.
+test('§27 #68 the run loop stops for a reason, and says which', () => {
+  const region = migrationRegion();
+  const loop = region.slice(region.indexOf('const runLoop = async'), region.indexOf('const retryFailedRows ='));
+  assert.ok(loop.includes('if (r?.stopped) { setRunNote({ kind: \'danger\', text: migrationStopText(r.stopped, r.code) }); break; }'));
+  assert.ok(loop.includes('if (r?.busyUntil)'), 'a held lease is shown with its time');
+  assert.ok(loop.includes('if (!r.results?.length || sig === prevSig) {'), 'a step that changed nothing stops the loop');
+  assert.ok(!/if \(!r\.results\?\.length\) break;/.test(loop), 'and never silently');
+  assert.ok(app().includes('e.busyUntil = json?.busyUntil || json?.context?.lease_until || null;'));
+  const h = migrationHelpers();
+  assert.match(h.migrationStopText('sender_refused', 'resend_403'), /^Resend refused the sender \(resend_403\)/);
+  assert.match(h.migrationStopText('email_quota', 'resend_429'), /^Resend’s daily sending allowance is used up \(resend_429\)/);
+  assert.match(h.migrationBusyText(new Date(Date.now() + 45_000).toISOString()), /about \d+s/);
+  assert.ok(!/another window is already working/i.test(h.migrationBusyText('not a date')));
+});
+
+// P1-2: failed invitations could only be resent one click per row.
+test('§27 #68 failed invitations resend in bulk, and "may already have arrived" is opt-in', () => {
+  const modal = componentSource('MigrationResendFailedModal');
+  assert.ok(modal.includes("migrationApi('resend-failed', { jobId, includeUncertain, exclude: tried })"),
+    'each pass hands back the rows already tried, so no row is sent twice in one run of the dialog');
+  assert.ok(modal.includes('const [includeUncertain, setIncludeUncertain] = useState(false);'), 'uncertain rows are never included by default');
+  assert.ok(modal.includes('if (acc.stopped || !results.length || !deliveredNow || !Number(acc.remaining)) break;'),
+    'a pass that delivered nothing ends the loop instead of spending invitation generations');
+  assert.ok(migrationRegion().includes('Resend {inviteProblems} failed invitation'));
+});
+
+// B7: the panel closed during the reload, and a failure was RETURNED and shown in green.
+test('§27 #68 a row\'s Resend keeps its panel open and fails in the error tone', () => {
+  const panel = componentSource('MigrationRowPanel');
+  assert.ok(panel.includes('const act = async (fn, { keepOpen = false } = {}) => {'));
+  const resend = panel.slice(panel.indexOf("migrationApi('resend', { rowId: row.id })"), panel.indexOf('Resend email'));
+  assert.ok(resend.includes('}, { keepOpen: true })'), 'Resend reloads under the open panel');
+  assert.ok(resend.includes('throw new Error(migrationResendRefusal(e));'), 'a refused resend is thrown');
+  assert.ok((resend.match(/throw failure\(/g) || []).length >= 2, 'uncertain and undelivered are thrown too');
+  assert.ok(!resend.includes('return `The email was not delivered'), 'a failure is never returned as a success notice');
+  assert.ok(!/return \{ notice: `?'?The (email|provider)/.test(resend), 'and never as a notice object');
+  const region = migrationRegion();
+  assert.ok(region.includes('if (!keepOpen) setOpenRow(null);'));
+  assert.ok(region.includes('const fresh = rowsPage.rows.find((x) => x.id === cur.id);'),
+    'the open panel shows the reloaded row');
+  const h = migrationHelpers();
+  assert.ok(!/Nothing was activated/.test(h.migrationResendRefusal({ code: 'LEGACY_ROW_NOT_READY', message: 'x' })),
+    'a refused resend is not described as a refused activation');
+});
+
+// #68 review, U2: a resend moves a row out of "Invitation failed", so the reload no longer
+// held it and `|| cur` kept the PRE-send object — "Not delivered" beside a green "on its way".
+test('§27 #68 review: the open panel never keeps the pre-send row when a resend moves it out of view', () => {
+  const ws = componentSource('MigrationJobWorkspace');
+  const sync = ws.slice(ws.indexOf('const openRowRef = useRef(null);'), ws.indexOf('const mergeOpenRow = useCallback('));
+  assert.ok(sync.length > 0, 'the open-row sync exists');
+  assert.ok(!ws.includes('|| cur) : cur));'), 'the stale-object fallback is gone');
+  assert.ok(sync.includes('readMigrationRow(jobId, cur).then((row) => {'), 'a row the reload no longer holds is read on its own');
+  assert.ok(sync.includes('if (row && seq === openRowSeq.current)'), 'only the newest read may land');
+  assert.ok(ws.includes('onChanged={async ({ keepOpen = false, patch = null } = {}) => { if (keepOpen) mergeOpenRow(patch); await reload(); if (!keepOpen) setOpenRow(null); }} />'),
+    'the endpoint\'s answer is merged into the open row before the reload');
+  // The single-row read picks its row out by id, never the first search match.
+  const src = app();
+  const readAt = src.indexOf('\nasync function readMigrationRow(');
+  assert.ok(readAt > 0, 'readMigrationRow exists at module scope');
+  const read = src.slice(readAt, src.indexOf('\n}', readAt + 1));
+  assert.ok(read.includes("migrationRpc('legacy_import_rows_page', { p_job_id: jobId, p_search: q, p_limit: 200, p_offset: 0 })"));
+  assert.ok(read.includes('.find((x) => x.id === row.id) || null'));
+  // The panel hands both outcomes up: a success returns the patch, a failure carries it.
+  const panel = componentSource('MigrationRowPanel');
+  assert.ok(panel.includes('const patch = migrationResendPatch(row, r, new Date().toISOString());'));
+  assert.ok(panel.includes("return { notice: 'A new email is on its way. The previous link no longer works.', patch };"));
+  assert.ok(panel.includes('if (keepOpen && e?.patch) onChanged({ keepOpen, patch: e.patch });'), 'a failed resend changed the row too');
+  assert.ok(panel.includes('if (keepOpen) setHistoryTick((t) => t + 1);'), 'the History reads again after a keep-open action');
+  assert.ok(panel.includes("patch: { id: row.id, onboarding_notice_state: null, onboarding_notice_attempts: 0 },"),
+    'a reset clears the notice in the panel at once');
+  // Behaviour of the patch itself.
+  const h = migrationHelpers();
+  const now = '2026-10-01T01:02:03.000Z';
+  const stale = { id: 'r1', invite_state: 'failed', invite_code: 'resend_403', invite_generation: 3 };
+  assert.deepEqual(h.migrationResendPatch(stale, { state: 'sent', code: null }, now),
+    { id: 'r1', invite_state: 'sent', invite_code: null, invite_sent_at: now });
+  assert.deepEqual(h.migrationResendPatch(stale, { state: 'notified' }, now),
+    { id: 'r1', invite_state: 'notified', invite_code: null, invite_sent_at: now });
+  assert.deepEqual(h.migrationResendPatch(stale, { state: 'uncertain', code: 'resend_timeout' }, now),
+    { id: 'r1', invite_state: 'uncertain', invite_code: 'resend_timeout' }, 'no sent time for an unconfirmed send');
+  assert.equal(h.migrationResendPatch(stale, { state: 'skipped' }, now), null, 'nothing was attempted, nothing moves');
+  assert.equal(h.migrationResendPatch(stale, null, now), null);
+  assert.equal(h.migrationResendPatch({}, { state: 'sent' }, now), null, 'a row with no id is never patched');
+  assert.ok(!('invite_generation' in (h.migrationResendPatch(stale, { state: 'sent' }, now) || {})),
+    'the generation is read back, never guessed');
+  // With the patch applied, the panel no longer reads "Not delivered".
+  assert.match(h.migrationInviteText({ ...stale, ...h.migrationResendPatch(stale, { state: 'sent' }, now) }), /^Activation email sent/);
+});
+
+// #68 review, U1: the two keep-open buttons were `disabled={busy}`. A browser blurs a focused
+// element the moment it becomes disabled, and SidePanel's trap cannot recover <body>.
+test('§27 #68 review: keep-open actions stay focusable while busy, and focus never falls to <body>', () => {
+  const panel = componentSource('MigrationRowPanel');
+  for (const label of ['Resend email', 'Resend onboarding emails']) {
+    const end = panel.indexOf(`/> ${label}`);
+    const start = panel.lastIndexOf('<button type="button"', end);
+    assert.ok(start > 0 && end > start, `the ${label} button exists`);
+    const btn = panel.slice(start, end);
+    assert.ok(btn.includes('aria-disabled={busy || undefined}'), `${label}: aria-disabled while busy`);
+    assert.ok(!/\bdisabled=\{/.test(btn.replace(/aria-disabled=\{/g, '')), `${label}: never a native disabled`);
+    assert.ok(btn.includes('if (busy) return;'), `${label}: the press is refused by an early return`);
+  }
+  assert.ok(panel.includes('if (busyRef.current) return;'), 'act is single-flight on a ref, not on state');
+  assert.ok(panel.includes('<div ref={statusRef} tabIndex={-1} className="outline-none">'), 'the result line can take focus');
+  assert.ok(panel.includes("if (!a || a === document.body) statusRef.current?.focus({ preventScroll: true });"),
+    'a button that hid itself hands focus to the result, not to <body>');
+  const modal = componentSource('MigrationResendFailedModal');
+  assert.ok(modal.includes('<button type="button" onClick={run} aria-disabled={busy || !target || undefined}'),
+    'the bulk Resend keeps its focus too');
+  assert.ok(!modal.includes('onClick={run} disabled='));
+  assert.ok(modal.includes('if (runningRef.current || !target) return;'));
+});
+
+// C6/D4: an exhausted notice promised retries; a dead reservation said "Sending" for ever.
+test('§27 #68 the onboarding notice shows exhausted and stopped sends, and a Super Admin can reset it', () => {
+  const h = migrationHelpers();
+  const now = Date.parse('2026-10-01T00:00:00Z');
+  const ex = h.migrationNoticeState({ onboarding_notice_state: 'failed', onboarding_notice_attempts: 5 }, now);
+  assert.match(ex.text, /all five tries are used/); assert.equal(ex.resettable, true);
+  assert.match(h.migrationNoticeState({ onboarding_notice_state: 'failed', onboarding_notice_attempts: 2 }, now).text, /2 of 5 tries used/);
+  const stuck = h.migrationNoticeState({ onboarding_notice_state: 'sending', onboarding_notice_at: '2026-09-30T23:50:00Z' }, now);
+  assert.match(stuck.text, /Stopped while sending/); assert.equal(stuck.resettable, true);
+  const live = h.migrationNoticeState({ onboarding_notice_state: 'sending', onboarding_notice_at: '2026-09-30T23:59:30Z' }, now);
+  assert.equal(live.text, 'Sending'); assert.equal(live.resettable, false, 'a send in flight is not reset under itself');
+  assert.equal(h.migrationNoticeState({ onboarding_notice_state: 'sent' }, now).resettable, false);
+  assert.equal(h.migrationNoticeState({}, now), null);
+  const panel = componentSource('MigrationRowPanel');
+  assert.ok(panel.includes("migrationApi('reset-onboarding-notice', { rowId: row.id })"));
+  assert.ok(panel.includes("const canResetNotice = row.activation_state === 'activated' && row.claimed && !!notice68?.resettable;"));
+  // A handed-back invitation reads as what it is.
+  assert.match(h.migrationInviteText({ invite_state: 'not_sent', invite_code: 'resend_403' }), /handed back \(resend_403\).*Resume/);
+});
+
+test('§27 #68 eligibility notices say why rows were skipped', () => {
+  const h = migrationHelpers();
+  const t = h.migrationSkippedText({ skipped: 3, skipped_reasons: { wrong_state: 2, term_ended: 1, not_valid: 0, batch_archived: 0 } });
+  assert.equal(t, '; 3 skipped (2 no longer in that state, 1 with a term that has ended)');
+  assert.equal(h.migrationSkippedText({ skipped: 0, skipped_reasons: {} }), '');
+  assert.ok(!migrationRegion().includes('or the term has ended)'), 'the #67 notice blamed an ended term for every skip');
+});
+
+// F7 and the self-paced promote path.
+test('§27 #68 the workspace has a Package column, a package filter, and selects inactive rows by view', () => {
+  const region = migrationRegion();
+  assert.ok(region.includes('<th className="text-left py-2 pr-3 font-semibold">Package</th>'));
+  assert.ok(region.includes('aria-label="Filter by package"'));
+  assert.ok(region.includes("if (state !== 'ready') args.p_state = state;"), 'ready_ids is asked for inactive rows by name');
+  assert.ok(region.includes('if (planKey) args.p_plan_key = planKey;'), 'and for one package only when the filter is set');
+  assert.ok(region.includes('onClick={selectAllInactive}') && region.includes('Select all inactive in this view'));
+});
+
+// D1: a migrated account with its setup complete and no term was handed the PAYWALL.
+test('§27 #68 a migrated student waiting on their membership is held on a card with no price', () => {
+  const src = app();
+  assert.ok(/case GATE_SCREENS\.IMPORT_MEMBERSHIP_PENDING:\s+return <ImportMembershipPendingScreen /.test(src),
+    'an unhandled screen falls through to the app');
+  const screen = componentSource('ImportMembershipPendingScreen');
+  assert.ok(!/EnrollmentPaywall|price_php|phpFmt|Renew|setPanelParam/.test(screen), 'no price and no purchase path');
+  assert.ok(screen.includes('<MigrationGateCard title="Your migrated membership is being set up"'));
+  assert.ok(screen.includes('MIGRATION_SUPPORT_EMAIL') && screen.includes('onSignOut'), 'a support address and a way out');
+  // The address a held student writes to is the Reply-To of every migration email.
+  const server = readFileSync(join(REPO, 'api/_lib/legacyClaimEmail.js'), 'utf8');
+  const serverAddr = /export const MIGRATION_SUPPORT_ADDRESS = '([^']+)'/.exec(server)?.[1];
+  const clientAddr = /const MIGRATION_SUPPORT_EMAIL = '([^']+)'/.exec(src)?.[1];
+  assert.ok(serverAddr && clientAddr, 'both addresses are declared');
+  assert.equal(clientAddr, serverAddr, 'the held student and the emails name the same support mailbox');
+});
+
+test('§27 #68 student screens say "Package" and promise a batch community only to a batch', () => {
+  const welcome = componentSource('ImportWelcomeScreen');
+  assert.ok(welcome.includes("['Package', s?.plan_name || PLAN_LABELS[s?.plan_key] || '—'],"));
+  assert.ok(!welcome.includes("'Membership plan'"));
+  const scheduled = componentSource('MembershipScheduledScreen');
+  assert.ok(scheduled.includes("['Package', planName],") && !scheduled.includes("['Program',"));
+  assert.ok(scheduled.includes("{sub?.batch_id ? 'Your courses and your batch community' : 'Your courses and the member community'}"));
+  // D5: the cron opens a 00:00-Manila start first, so "only if THIS call opened it" never refreshed.
+  assert.ok(scheduled.includes('if (!error) await onRefresh?.();'));
+  assert.ok(!scheduled.includes('data?.activated > 0'));
+});
+
+// D2: dates showed one day off for a viewer outside Manila.
+test('§27 #68 membership dates are Manila calendar dates on every student surface', () => {
+  const src = app();
+  assert.ok(moduleConst(src, 'fmtTermDate').length > 0);
+  assert.ok(/const fmtTermDate = \(s\) => \{[\s\S]{0,200}timeZone: 'Asia\/Manila'/.test(src));
+  assert.ok(!/fmtEnrollDate\((sub|a|currentSub)[.?]/.test(src), 'a subscription date formatted in the viewer\'s timezone');
+  assert.ok(src.includes("['Expires', acc.has ? (acc.legacy ? 'No expiry' : fmtTermDate(sub.ends_at)) : 'No expiry'],"), 'the Dashboard panel');
+  assert.ok(src.includes('Access until <span style={{ fontWeight: 600, color: C.textSoft }}>{fmtTermDate(a.ends)}</span>'), 'the sidebar');
+  assert.ok(componentSource('ProfileSettingsBody').includes('fmtTermDate(a.ends)'), 'the account drawer');
+});
+
+// D6: today's catalog price was shown as a fact of a migrated membership.
+test('§27 #68 a migrated term shows no catalog price or duration', () => {
+  const drawer = componentSource('ProfileSettingsBody');
+  assert.ok(/sub\?\.grant_source === 'import'\s+\? <FactRow k="Payment" v="Migrated membership — already paid" \/>\s+: plan\?\.price_php != null/.test(drawer));
+  const modal = componentSource('MembershipPlanModal');
+  assert.ok(/sub\?\.grant_source === 'import' \? \(\s+<FactRow k="Payment" v="Migrated membership — already paid" \/>\s+\) : \(\s+<>[\s\S]{0,200}k="Price"[\s\S]{0,200}k="Duration"/.test(modal),
+    'both Price and Duration sit in the non-import branch');
+});
+
+// D7: a failed complete_import_onboarding was dropped, and "Password updated" shown anyway.
+test('§27 #68 a failed onboarding step after a password recovery is shown and retried alone', () => {
+  const screen = componentSource('UpdatePasswordScreen');
+  assert.ok(screen.includes('setOnboardingFailed(true);'));
+  assert.ok(!screen.includes('if (!obErr) {'), 'the #67 silent branch');
+  const retry = screen.slice(screen.indexOf('const retryOnboarding = async'), screen.indexOf('const submit = async'));
+  assert.ok(retry.includes('finishOnboarding()') && !retry.includes('updatePassword'), 'the retry calls only the RPC');
+  assert.ok(screen.includes('if (passwordSetRef.current !== password) {'), 'the password is not "changed" to itself');
+});
+
+test('§27 #68 a pricing card is titled by the package, with the product as its eyebrow', () => {
+  const paywall = componentSource('EnrollmentPaywall');
+  const card = paywall.slice(paywall.indexOf("{step === 'plans' && ("), paywall.indexOf('Save {phpFmt(save)}'));
+  assert.ok(card.indexOf("{p.tagline || ' '}") > 0 && card.indexOf("{p.tagline || ' '}") < card.indexOf('{p.name}</div>'),
+    'the tagline is the small line ABOVE the name');
+  assert.ok(/fontSize: 17, letterSpacing: '-0\.01em', color: C\.text \}\}>\{p\.name\}<\/div>/.test(card), 'the name is the title');
+});
+
+// F7: the Package filter narrowed only the page in hand, so the total, the pages and "Select
+// all … in this view" each described a different set. #68's rows_page takes p_plan_key.
+test('§27 #68 the Package filter is the server\'s, like the batch filter beside it', () => {
+  const ws = componentSource('MigrationJobWorkspace');
+  const load = ws.slice(ws.indexOf('const loadRows = useCallback('), ws.indexOf('const reload = useCallback('));
+  assert.ok(load.includes('if (planKey) args.p_plan_key = planKey;'), 'rows_page is asked for one package only when the filter is set');
+  assert.ok(load.includes('}, [jobId, filter, batchCode, planKey, deferredSearch, page]);'), 'a filter change reloads');
+  assert.ok(ws.includes('useEffect(() => { setPage(0); }, [filter, batchCode, planKey, deferredSearch]);'), 'and returns to page one');
+  assert.ok(!ws.includes('visibleRows'), 'no client-side narrowing of the page in hand');
+  assert.ok(ws.includes('{rowsPage.rows.map((r) => {'));
+  // The job summary groups by batch only; a self-paced job's "no batch" line is its packages.
+  assert.ok(ws.includes("c.batch_name || (jobHasSelfPaced ? 'Self-paced (no cohort)' : 'No batch')"));
+});
+
+// P1-2: the bulk resend must not promise, or retry, what the endpoint will never send.
+test('§27 #68 the bulk resend tries each row once and never counts an unrecoverable invitation', () => {
+  const src = app();
+  const server = readFileSync(join(REPO, 'api/admin/student-imports.js'), 'utf8');
+  const setOf = (text, name) => {
+    const m = new RegExp(`const ${name} = new Set\\(\\[([^\\]]*)\\]\\)`).exec(text);
+    assert.ok(m, `${name} must be declared as a Set literal`);
+    return [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]).sort();
+  };
+  assert.deepEqual(setOf(src, 'MIGRATION_INVITE_UNRECOVERABLE'), setOf(server, 'NEVER_SUCCEEDS'),
+    'the dialog and the endpoint agree on which invitations no resend can fix');
+  const modal = componentSource('MigrationResendFailedModal');
+  // #68 review, U5: by code AND by the generation cap (migrationInviteUnrecoverable).
+  assert.ok(modal.includes('if (migrationInviteUnrecoverable(r)) unrecoverable += 1;'),
+    'an unrecoverable row is counted on its own, never in the Resend button');
+  assert.ok(app().includes('const migrationInviteUnrecoverable = (r) => MIGRATION_INVITE_UNRECOVERABLE.has(r?.invite_code) || '),
+    'the code set is still what the rule reads first');
+  assert.ok(modal.includes("for (const id of Array.isArray(r?.tried) ? r.tried : results.map((x) => x.row_id)) if (id && !tried.includes(id)) tried.push(id);"),
+    'the ids a pass tried are carried into the next pass');
+  const h = migrationHelpers();
+  assert.match(h.migrationInviteText({ invite_state: 'failed', invite_code: 'account_missing' }), /no longer exists/);
+  assert.match(h.migrationInviteText({ invite_state: 'failed', invite_code: 'invite_cap' }), /maximum number of times/);
+  assert.equal(h.migrationInviteText({ invite_state: 'failed', invite_code: 'resend_422' }), 'Not delivered (resend_422)');
+});
+
+// Lib contract issue: since the rename the catalog name and the tier heading are the same
+// words, and the signed line read "Selected program: VIP Package  VIP PACKAGE".
+test('§27 #68 the Training Agreement names the package once', () => {
+  const doc = componentSource('AgreementDocInner');
+  assert.ok(doc.includes('· Selected package:</strong> {packageName}') && !doc.includes('Selected program'));
+  assert.ok(doc.includes('const showTierPill = !!model.tierKey && !!model.tierLabel && !sameName(model.tierLabel, packageName);'));
+  assert.ok(doc.includes('{showTierPill && ('), 'the pill is conditional');
+  // With today's catalog every package's name IS its tier heading, so no pill is drawn.
+  const sameName = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+  for (const p of ENROLLMENT_PLANS_FALLBACK) {
+    const m = agreementModel(p.key, ENROLLMENT_PLANS_FALLBACK);
+    if (!m.tierKey) continue;
+    assert.ok(sameName(m.tierLabel, m.planName || m.tierLabel), `${p.key}: the pill would repeat "${m.planName}"`);
+  }
+});
+
+// D1 follow-through: a reverted student is now held on the "being set up" card, not sent to
+// the enrollment page — so the revert dialog and the card must say what actually happens.
+test('§27 #68 revert and the migration hold describe the hold, and the hold notices a new membership', () => {
+  const panel = componentSource('MigrationRowPanel');
+  assert.ok(!panel.includes('they will then see the enrollment page'), 'the #67 revert copy is no longer true');
+  assert.ok(panel.includes('your migrated membership is being set up'), 'the revert dialog names the hold');
+  const hold = componentSource('ImportMembershipPendingScreen');
+  assert.ok(!/We will email you/.test(hold), 'no email is promised: a reverted row may never be activated again');
+  assert.ok(hold.includes("window.addEventListener('focus', check);"), 'returning to the tab asks again');
+  assert.ok(hold.includes('if (busyRef.current) return;'), 'one check at a time');
+});
+
+// A5: one picker label everywhere — the package, then the product it contains.
+test('§27 #68 every package picker reads "package — product", and a VIP move needs its batch first', () => {
+  const region = migrationRegion();
+  assert.ok(!region.includes('value={x.key}>{x.name}</option>'), 'a picker listing product-less names');
+  assert.ok((region.match(/\{migrationPlanOption\(x\)\}<\/option>/g) || []).length >= 3, 'the wizard, the terms dialog and the activation dialog');
+  const modal = componentSource('MigrationActivateModal');
+  const apply = modal.slice(modal.indexOf('const applyTerms = async'), modal.indexOf('setBusy(true); setErr(\'\');', modal.indexOf('const applyTerms = async')));
+  assert.ok(apply.includes('!e.batch_id && migrationPlanIsVip(e.plan_key, plans)') && apply.includes('Nothing was saved.'),
+    'a group moved onto a VIP package without a batch is refused before any group is saved');
+  assert.ok(/if \(needsBatch\.length\) \{\s+setErr\([\s\S]*?\);\s+return;\s+\}/.test(apply), 'and the refusal returns before anything is written');
+});
+
+// The owner's rename, outside the migration: the course card's tier toggle named the plan by
+// its retired product name, beside a package now itself called "Essentials".
+test('§27 #68 the course tier toggle names the Essentials package, not the retired Sampler name', () => {
+  const src = app();
+  assert.ok(!src.includes('Sampler tier (Essentials)') && !src.includes('Essentials · Sampler</span>'));
+  assert.ok(src.includes('Included in the Essentials package') && src.includes('<Sparkles size={11} /> Essentials package</span>'));
+});
+
+// E11 on the XLSX path: parseCsv refuses a repeated heading; the workbook reader must too.
+test('§27 #68 a workbook with a repeated column heading is refused, as a CSV is', () => {
+  const wizard = componentSource('MigrationStageWizard');
+  const xlsx = wizard.slice(wizard.indexOf("if (/\\.xlsx?$/i.test(f.name)) {"), wizard.indexOf('parsed = parseCsv('));
+  assert.ok(xlsx.includes('if (seenHdr.has(h)) throw new Error(`Duplicate column heading "${h}".'), 'the XLSX path refuses duplicates');
+  assert.ok(xlsx.includes('if (!h) continue;'), 'blank headings stay allowed, as in parseCsv');
+});
+
+// ─── §27 (#68 review fixes) — what the 2026-09-29 review of #68 found in the client ──────
+
+// V1 / V5 / R3: two new breaker reasons, and a 429 that is not always the daily allowance.
+test('§27 #68 review: every breaker reason has its own instruction', () => {
+  const h = migrationHelpers();
+  const auth = h.migrationStopText('auth_unavailable', 'link_failed');
+  assert.match(auth, /^Supabase could not create sign-in links \(link_failed\)\./);
+  assert.match(auth, /Nothing more was granted/, 'the owner is told the run stopped granting');
+  assert.match(auth, /Press Resume once Auth is healthy\.$/);
+  const rate = h.migrationStopText('email_rate_limited', 'resend_429');
+  assert.match(rate, /^Resend is rate-limiting \(resend_429\)\./);
+  assert.match(rate, /Wait a minute, then press Resume\.$/, 'a rate limit is a minute, not a day');
+  const quota = h.migrationStopText('email_quota', 'resend_429');
+  assert.match(quota, /daily sending allowance/, 'the quota names the daily allowance');
+  assert.match(quota, /upgrade the Resend plan/, 'and the way to raise it');
+  assert.doesNotMatch(quota, /Daily email limit reached/, 'the #68 wording that sent a rate limit to wait a day');
+  // Every reason the endpoint can return has its own words; none falls to the default.
+  const reasons = ['sender_refused', 'email_quota', 'email_rate_limited', 'email_unconfigured', 'invalid_request', 'auth_unavailable'];
+  const fallback = h.migrationStopText('something_new', 'x');
+  const texts = reasons.map((r) => h.migrationStopText(r, 'x'));
+  for (const [i, t] of texts.entries()) assert.notEqual(t, fallback, `${reasons[i]} falls through to the generic stop text`);
+  assert.equal(new Set(texts).size, texts.length, 'each reason reads differently');
+  // Both screens that show a stop use the one function.
+  assert.ok(componentSource('MigrationResendFailedModal').includes('migrationStopText(out.stopped, out.code)'));
+});
+
+// S1: the held-back rows are named before the run, and the copy offers only real exits.
+test('§27 #68 review: the confirm step names the rows the claim will hold back', () => {
+  const modal = componentSource('MigrationActivateModal');
+  assert.ok(modal.includes('const held = Array.isArray(p?.held_row_ids) ? new Set(p.held_row_ids).size : 0;'),
+    'read from the preflight; a database without the key shows nothing extra');
+  assert.ok(modal.includes('{held > 0 && <Fact k="Held back (higher package waiting)" v={held} warn />}'));
+  assert.ok(modal.includes('<Fact k="Will be activated" v={held > 0 ? Math.max(0, n - held) : n} />'),
+    'held rows are not counted as activated');
+  const start = modal.indexOf('{held > 0 && (');
+  const notice = modal.slice(start, modal.indexOf('{gaps.length > 0 && (', start));
+  assert.ok(start > 0 && notice.length > 0, 'the held notice exists');
+  assert.ok(/will be held back as Failed rather than activated/.test(notice));
+  assert.ok(/Activate that row first, or change its terms/.test(notice));
+  assert.doesNotMatch(notice, /discard/i, 'there is no per-row discard');
+});
+
+// U6 / R2: the count is this run's, and the allowance is shared.
+test('§27 #68 review: the email count says it is this run\'s, and that the allowance is shared', () => {
+  const modal = componentSource('MigrationActivateModal');
+  assert.ok(!modal.includes('Emails today (daily limit)'), 'the label claimed a day\'s total it never counted');
+  assert.ok(modal.includes('<Fact k="Emails in this run" v={`${emails} · daily allowance ${dailyCap}`} warn={emails > dailyCap} />'));
+  assert.ok(/The daily allowance is shared: emails already sent today, the app&rsquo;s other emails \(enrollment alerts,\s+communications, staff invitations\) and the two onboarding emails each student triggers/.test(modal),
+    'the shared allowance and the later onboarding emails are named');
+  assert.ok(modal.includes('Activating in daily groups of about {Math.max(1, Math.floor(dailyCap / 2))} leaves room for the rest.'),
+    'the advice leaves headroom rather than filling the allowance');
+});
+
+// U5: the dialog mirrors the endpoint's generation cap, not only its codes.
+test('§27 #68 review: the bulk resend never promises a row at the generation cap', () => {
+  const server = readFileSync(join(REPO, 'api/admin/student-imports.js'), 'utf8');
+  const serverCap = Number(/const MAX_INVITE_GENERATION = (\d+);/.exec(server)?.[1]);
+  const h = migrationHelpers();
+  assert.ok(serverCap > 0, 'the endpoint declares its cap');
+  assert.equal(h.MIGRATION_MAX_INVITE_GENERATION, serverCap, 'the dialog and the endpoint agree on the cap');
+  const modal = componentSource('MigrationResendFailedModal');
+  assert.ok(modal.includes('if (migrationInviteUnrecoverable(r)) unrecoverable += 1;'), 'the count reads code AND cap');
+  assert.equal(h.migrationInviteUnrecoverable({ invite_code: 'resend_403', invite_generation: serverCap }), true,
+    'a row at the cap whose last try left a provider code');
+  assert.equal(h.migrationInviteUnrecoverable({ invite_code: 'resend_403', invite_generation: serverCap - 1 }), false);
+  assert.equal(h.migrationInviteUnrecoverable({ invite_code: 'invite_cap', invite_generation: 3 }), true);
+  assert.equal(h.migrationInviteUnrecoverable({ invite_code: 'account_missing' }), true);
+  assert.equal(h.migrationInviteUnrecoverable({ invite_code: 'resend_429' }), false);
+  // The row panel says so, and does not offer a Resend that begin_invite would refuse.
+  assert.match(h.migrationInviteText({ invite_state: 'failed', invite_code: 'resend_403', invite_generation: serverCap }),
+    /^Not delivered \(resend_403\) — sent the maximum number of times/);
+  assert.ok(componentSource('MigrationRowPanel').includes('&& !(Number(row.invite_generation) >= MIGRATION_MAX_INVITE_GENERATION);'));
+  // A refused resend names the causes that still exist.
+  const t = h.migrationResendRefusal({ code: 'LEGACY_ROW_NOT_READY' });
+  assert.doesNotMatch(t, /already claimed/, 'begin_invite sends a notice to an onboarded account since #68');
+  assert.match(t, /no longer activated/);
+  assert.match(t, /maximum number of times/);
+});
+
+// U8: the featured card's pill must not shrink under the renamed eyebrow.
+test('§27 #68 review: the BEST SELLER pill never wraps beside a long eyebrow', () => {
+  const paywall = componentSource('EnrollmentPaywall');
+  const card = paywall.slice(paywall.indexOf("{step === 'plans' && ("), paywall.indexOf('Save {phpFmt(save)}'));
+  const eyebrowAt = card.indexOf("{p.tagline || ' '}");
+  const row = card.slice(card.lastIndexOf('<div className="flex', eyebrowAt), card.indexOf('{p.badge}'));
+  assert.ok(row.startsWith('<div className="flex items-start justify-between gap-2">'), 'the eyebrow and pill share a top-aligned row');
+  assert.ok(/<div className="min-w-0" style=\{\{[^}]*\}\}>\{p\.tagline \|\| ' '\}<\/div>/.test(row), 'the eyebrow may shrink and wrap');
+  const pill = row.slice(row.indexOf('{p.badge && ('));
+  assert.ok(/<span className="flex-shrink-0 whitespace-nowrap /.test(pill), 'the pill is fixed on one line');
+  // One render site serves the enrollment, renewal and upgrade paywalls.
+  assert.equal((app().match(/\{p\.badge && \(/g) || []).length, 1, 'no second pricing-card copy to drift');
+});
+
+// L4: the bank importer's Excel advice was unreachable once parseCsv refused a repeat first.
+test('§27 #68 review: the bank CSV importer maps a repeated heading back to its own advice, by code', () => {
+  const card = componentSource('FinanceBankImportCard');
+  assert.ok(app().includes("import { toCsv, parseCsv, CSV_DUPLICATE_HEADER, IMPORT_TEMPLATE_COLUMNS } from './lib/studentImport';"));
+  assert.ok(card.includes('if (csvErr?.code === CSV_DUPLICATE_HEADER) {'), 'mapped by the code');
+  assert.ok(!/Duplicate column heading/.test(card), 'never by matching the message text');
+  assert.ok(card.includes("+ 'Give every column a unique heading and export it again (or upload it as Excel).';"),
+    'the Excel route is offered again');
+  assert.ok(card.includes('throw new Error(`${headingAdvice} Repeated heading: "${csvErr.heading}".`);'), 'naming the heading');
+  assert.ok(card.includes('throw csvErr;'), 'any other refusal passes through unchanged');
+});
+
+// ★ BULK TERMS (#68). September 2026 was archived on the owner's instruction, so its 65 staged VIP
+//   rows must be re-batched into October before promotion — one audited call for the selection,
+//   not 65 row panels. The modal sends ONLY the fields the Super Admin set (a null means "keep"),
+//   the batch picker gives way for a self-paced package, and the action is offered for exactly
+//   the rows set_terms can change (inactive + ready).
+test('§27 #68: a selection can be given a batch, package or dates in one audited call', () => {
+  const region = migrationRegion();
+  const at = region.indexOf('function MigrationBulkTermsModal(');
+  assert.ok(at > 0, 'the bulk terms modal exists');
+  const modal = region.slice(at, region.indexOf('function MigrationReasonModal(', at));
+  assert.ok(modal.includes("const [plan, setPlan] = useState('');"), 'every field starts empty: there is no single row to diff against');
+  assert.ok(modal.includes('p_plan_key: plan || null,') && modal.includes('p_start: startDate || null,'), 'only what was set is sent');
+  assert.ok(modal.includes('p_batch_id: planIsVip && batchId ? batchId : null,'), 'a batch is sent only for a VIP package');
+  assert.ok(modal.includes("<option value=\"\">Keep each row's batch</option>"), 'the empty choice keeps each row\'s own batch');
+  assert.ok(modal.includes("filter((x) => x.status !== 'archived')"), 'an archived batch is never offered');
+  assert.ok(modal.includes('(changed ? onSave(change, reason) : onClose())'), 'no change means no call');
+  assert.ok(region.includes("migrationRpc('legacy_import_set_terms', { p_row_ids: ids, ...change, p_reason: reason })"), 'one audited call for the selection');
+  assert.ok(/filter\(\(\[, s\]\) => s === 'ready' \|\| s === 'inactive' \|\| s === 'failed'\)/.test(region), 'the rows set_terms accepts');
+  assert.ok(region.includes("setReasonFor('terms')"), 'offered from the selection bar');
+  assert.ok(region.includes("{reasonFor === 'terms' && ("), 'and rendered from the same reason state as the other bulk actions');
 });

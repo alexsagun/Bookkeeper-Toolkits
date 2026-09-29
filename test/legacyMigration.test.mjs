@@ -20,6 +20,9 @@ import {
   parseDateByFormat, parseLegacyAmount, phraseMatches, rowDisplayState, startDateFitsBatch,
   suggestBatchForLabel, suggestPlanForLabel, termStatusAt,
   defaultActivationStart, effectiveTerms, manilaTodayISO, normalizePhone,
+  // #68
+  NON_VIP_BATCH_TOKEN, TERM_LENGTH_TOLERANCE_DAYS, defaultEligiblePlanKeys, isVipPlan, legacySeatCount,
+  planRank, planSummary, termDays,
 } from '../src/lib/legacyMigration.js';
 import { parseCsv, parseStrictDate } from '../src/lib/studentImport.js';
 
@@ -64,10 +67,15 @@ function misplacedRoster() {
   }));
 }
 
+// The catalog as #68 leaves it: the package title is the NAME, the product line the
+// TAGLINE, and community_segment is what decides whether a row takes a batch.
 const PLANS = [
-  { key: 'sampler', name: 'Sampler Session', price_php: 1499, active: true },
-  { key: 'silver_self_paced', name: 'QBO + Resume Combo', price_php: 2999, active: true },
-  { key: 'vip', name: 'Personalized Coaching Program', price_php: 16999, active: true },
+  { key: 'sampler', name: 'Essentials', tagline: 'Sampler Session', price_php: 1499, active: true,
+    access_days: 60, community_segment: 'general' },
+  { key: 'silver_self_paced', name: 'Silver · Self-Paced', tagline: 'QBO + Resume Combo', price_php: 2999, active: true,
+    access_days: 60, community_segment: 'general' },
+  { key: 'vip', name: 'VIP Package', tagline: 'Personalized Coaching Program', price_php: 16999, active: true,
+    access_days: 180, community_segment: 'vip' },
 ];
 const BATCHES = [
   { id: 'b08', code: '2026-08', name: 'August 2026', status: 'closed' },
@@ -107,13 +115,52 @@ test('a roster without the dates reports the required fields it lacks', () => {
 });
 
 test('every required field is named, and the labels cover every code', () => {
-  assert.ok(LEGACY_FIELDS.filter((f) => f.required).length >= 6);
+  // #68: the batch is NOT required — a Silver or Essentials export has no cohort column.
+  assert.deepEqual(LEGACY_FIELDS.filter((f) => f.required).map((f) => f.key).sort(),
+    ['email', 'end_date', 'payment_status', 'plan_label', 'start_date']);
   for (const code of ['email_missing', 'plan_unmapped', 'batch_label_mismatch', 'payment_not_paid',
     'term_ended', 'duplicate_in_file', 'duplicate_staged', 'profile_rejected', 'staff_account',
-    'membership_conflict', 'identity_mismatch']) {
+    'membership_conflict', 'identity_mismatch',
+    // #68
+    'multiple_plans_in_file', 'grandfathered_member', 'higher_plan_pending', 'record_key_missing']) {
     assert.ok(LEGACY_ERROR_LABELS[code], `${code} needs a label`);
   }
-  assert.ok(LEGACY_WARNING_LABELS.external_id_missing);
+  for (const code of ['external_id_missing', 'phone_shared', 'existing_account', 'amount_differs_from_price',
+    'batch_ignored_for_plan', 'term_length_unusual', 'other_legacy_row']) {
+    assert.ok(LEGACY_WARNING_LABELS[code], `${code} needs a label`);
+  }
+  // A code is an error OR a warning, never both — the workspace would not know which to show.
+  for (const code of Object.keys(LEGACY_WARNING_LABELS)) {
+    assert.equal(LEGACY_ERROR_LABELS[code], undefined, `${code} is labelled as both`);
+  }
+});
+
+// #68 review, S1: a held lower-package row was told to "Activate or discard that row first" —
+// but no per-row discard exists (only a whole job's), so the copy sent the owner looking for
+// a button that is not there. It names the two exits that are real.
+test('the higher-package hold names only exits that exist', () => {
+  const t = LEGACY_ERROR_LABELS.higher_plan_pending;
+  assert.equal(t, 'The same person has a higher package waiting in another roster. Activate that row first, or change its terms.');
+  assert.doesNotMatch(t, /discard/i, 'there is no per-row discard');
+  assert.doesNotMatch(t, /\bplan\b/i, 'the owner reads "package", as everywhere else in #68');
+});
+
+test('a roster with no batch column is not missing anything required (#68)', () => {
+  const m = autoMapLegacyHeaders(['email', 'plan', 'start_date', 'end_date', 'payment_status']);
+  assert.equal(m.batch_label, undefined);
+  assert.deepEqual(missingRequiredFields(m), []);
+  assert.equal(LEGACY_FIELDS.find((f) => f.key === 'batch_label').required, false);
+});
+
+test('a bare "ID" column is never auto-mapped as the Thinkific user id (#68)', () => {
+  // An Orders export's order number and a hand-built roster's row counter are both "ID".
+  const f = LEGACY_FIELDS.find((x) => x.key === 'external_user_id');
+  assert.ok(!f.aliases.includes('id'));
+  for (const h of ['id', 'ID', ' Id ']) {
+    assert.equal(autoMapLegacyHeaders([h, 'email']).external_user_id, undefined, `${JSON.stringify(h)} must not map`);
+  }
+  assert.equal(autoMapLegacyHeaders(['user_id', 'email']).external_user_id, 'user_id');
+  assert.equal(autoMapLegacyHeaders(['ID', 'thinkific_user_id']).external_user_id, 'thinkific_user_id');
 });
 
 // ── Dates ────────────────────────────────────────────────────────────────────
@@ -173,6 +220,57 @@ test('VIP is only SUGGESTED as vip; staging needs the confirmed mapping', () => 
   assert.equal(suggestPlanForLabel('15999', PLANS), null, 'a price is never a plan');
   const rows = normalizeLegacyRows(syntheticRoster().slice(0, 3), baseOpts({ planMapping: {} }));
   assert.ok(rows.every((r) => r.errors.includes('plan_unmapped') && r.activation_state === 'blocked'));
+});
+
+// ★ #68: "Essentials" and "Silver" used to match nothing, and the picker listed product
+//   names only, so an Essentials roster was one plausible click from full-access Silver.
+test('package titles, product lines and their short forms all suggest the right plan', () => {
+  const expect = {
+    vip: ['VIP', 'VIP Package', 'vip package', 'Personalized Coaching Program', '  personalized   coaching program '],
+    silver_self_paced: ['Silver', 'Silver · Self-Paced', 'SILVER · SELF-PACED', 'QBO + Resume Combo', 'silver_self_paced'],
+    sampler: ['Essentials', 'Sampler Session', 'Sampler', 'sampler'],
+  };
+  for (const [key, labels] of Object.entries(expect)) {
+    for (const label of labels) assert.equal(suggestPlanForLabel(label, PLANS), key, `${JSON.stringify(label)} → ${key}`);
+  }
+});
+
+test('plan suggestions stay exact: no substring, no price, no guess', () => {
+  for (const label of ['Self-Paced', 'Package', 'Coaching', 'QBO', 'Resume', 'Sampler Sessions', 'VIP 2026',
+    'Silver Package', '1499', '₱16,999', '', '   ', null, undefined]) {
+    assert.equal(suggestPlanForLabel(label, PLANS), null, `${JSON.stringify(label)} must suggest nothing`);
+  }
+  assert.equal(suggestPlanForLabel('VIP', []), null);
+  assert.equal(suggestPlanForLabel('VIP', undefined), null);
+});
+
+test('a label two plans both claim suggests nothing rather than the first one', () => {
+  const clash = [
+    { key: 'a_plan', name: 'Starter · Monthly', tagline: 'One' },
+    { key: 'b_plan', name: 'Starter Package', tagline: 'Two' },
+  ];
+  assert.equal(suggestPlanForLabel('Starter', clash), null, '"starter" is the short form of both');
+  assert.equal(suggestPlanForLabel('Starter Package', clash), 'b_plan', 'the full title is still unique');
+  assert.equal(suggestPlanForLabel('One', clash), 'a_plan');
+});
+
+test('isVipPlan reads the community segment and nothing else', () => {
+  assert.equal(isVipPlan(PLANS[2]), true);
+  assert.equal(isVipPlan(PLANS[0]), false);
+  assert.equal(isVipPlan(PLANS[1]), false);
+  assert.equal(isVipPlan({ key: 'vip' }), false, 'the key is not the segment');
+  assert.equal(isVipPlan(null), false);
+  assert.equal(isVipPlan(undefined), false);
+});
+
+test('plan rank is an explicit order, never a price', () => {
+  assert.equal(planRank('vip'), 3);
+  assert.equal(planRank('silver_self_paced'), 2);
+  assert.equal(planRank('sampler'), 1);
+  for (const k of ['gold_live', 'core_self_paced', '', null, undefined, 'toString', '__proto__', 'constructor']) {
+    assert.equal(planRank(k), 0, `${String(k)} ranks nothing`);
+  }
+  assert.ok(planRank('vip') > planRank('silver_self_paced') && planRank('silver_self_paced') > planRank('sampler'));
 });
 
 test('only an explicit Paid is paid', () => {
@@ -268,8 +366,20 @@ test('the misplaced-column roster blocks every row instead of guessing', () => {
   }));
   assert.equal(rows.length, 141);
   assert.ok(rows.every((r) => r.activation_state === 'blocked'), 'not one row may stage as ready or inactive');
-  assert.ok(rows.every((r) => r.errors.includes('start_date_invalid') && r.errors.includes('plan_unmapped')
-    && r.errors.includes('batch_unmapped')));
+  assert.ok(rows.every((r) => r.errors.includes('start_date_invalid') && r.errors.includes('plan_unmapped')));
+  // #68: with no confirmed plan there is no segment to ask, so the batch rules are
+  // skipped — the row is already blocked, and SQL (which asks the segment) agrees.
+  assert.ok(rows.every((r) => !r.errors.some((e) => e.startsWith('batch_')) && r.batch_code === null));
+  assert.ok(rows.every((r) => !r.warnings.includes('batch_ignored_for_plan')),
+    'an unknown plan is not a non-VIP plan — nothing is said about its batch');
+});
+
+test('a VIP roster that maps its plan still gets every batch check', () => {
+  const rows = normalizeLegacyRows(misplacedRoster().slice(0, 3), baseOpts({
+    planMapping: { 'sep-26': 'vip', 'oct-26': 'vip' },
+    batchMapping: {},
+  }));
+  assert.ok(rows.every((r) => r.errors.includes('batch_unmapped') && r.activation_state === 'blocked'));
 });
 
 test('the same email twice in one file is a duplicate on both rows', () => {
@@ -279,6 +389,7 @@ test('the same email twice in one file is a duplicate on both rows', () => {
   assert.equal(rows[0].validation_status, 'duplicate');
   assert.equal(rows[2].validation_status, 'duplicate');
   assert.equal(rows[1].validation_status, 'valid');
+  assert.ok(!rows[0].errors.includes('multiple_plans_in_file'), 'the same plan twice is a plain duplicate');
 });
 
 test('an ended term, a missing email and an unpaid row are blocked', () => {
@@ -422,4 +533,274 @@ test('effective terms are what the Super Admin assigned, else what the roster sa
   assert.deepEqual(effectiveTerms({ ...roster, activation_start_date: '2026-09-26' }),
     { plan_key: 'vip', batch_id: 'b1', start_date: '2026-09-26', end_date: '2027-04-12' },
     'only the assigned term changes; the paid end stays');
+});
+
+// ── #68: Silver, Essentials and mixed rosters ────────────────────────────────
+// A batch is a VIP-only fact. Before #68 every layer demanded one, so a Silver or
+// Essentials roster could not be staged at all, and a batch-less row would have had a
+// NULL record key — which the unique index and both duplicate checks skip.
+
+const SELF_PACED_HEADERS = ['first_name', 'last_name', 'email', 'plan', 'start_date', 'end_date',
+  'payment_status', 'amount_paid'];
+
+function selfPacedRoster({ label = 'Essentials', n = 4, start = '9/20/2026', end = '11/18/2026', prefix = 'ess' } = {}) {
+  return Array.from({ length: n }, (_, k) => ({
+    first_name: `Self${k + 1}`, last_name: 'Paced', email: `${prefix}${String(k + 1).padStart(3, '0')}@example.test`,
+    plan: label, start_date: start, end_date: end, payment_status: 'Paid', amount_paid: '1499',
+  }));
+}
+
+const selfPacedOpts = (extra = {}) => ({
+  mapping: autoMapLegacyHeaders(SELF_PACED_HEADERS),
+  dateFormat: 'M/D/YYYY',
+  planMapping: { essentials: 'sampler', silver: 'silver_self_paced' },
+  batchMapping: {},
+  plans: PLANS,
+  batches: BATCHES,
+  eligibleBatchCodes: [],
+  eligiblePlanKeys: ['sampler', 'silver_self_paced'],
+  nowMs: NOW,
+  ...extra,
+});
+
+test('an Essentials roster with NO batch column stages valid, with no batch and no batch error', () => {
+  const mapping = autoMapLegacyHeaders(SELF_PACED_HEADERS);
+  assert.deepEqual(missingRequiredFields(mapping), [], 'the wizard must not stop at "Still needed: Batch"');
+  const rows = normalizeLegacyRows(selfPacedRoster(), selfPacedOpts());
+  assert.equal(rows.length, 4);
+  for (const r of rows) {
+    assert.deepEqual(r.errors, []);
+    assert.equal(r.validation_status, 'valid');
+    assert.equal(r.activation_state, 'ready', 'ready because its plan is ticked');
+    assert.equal(r.plan_key, 'sampler');
+    assert.equal(r.batch_code, null);
+    assert.equal(r.legacy_batch_label, null);
+    assert.ok(!r.warnings.includes('batch_ignored_for_plan'), 'no label in the file, so nothing was ignored');
+  }
+});
+
+test('a non-VIP record key uses the "none" token, never a NULL batch', () => {
+  assert.equal(NON_VIP_BATCH_TOKEN, 'none');
+  assert.doesNotMatch(NON_VIP_BATCH_TOKEN, /^\d{4}-\d{2}$/, 'it can never collide with a batch code');
+  const [ess] = normalizeLegacyRows(selfPacedRoster(), selfPacedOpts());
+  assert.equal(ess.record_key_input, 'thinkific|email:ess001@example.test|sampler|none');
+  const [silver] = normalizeLegacyRows(selfPacedRoster({ label: 'Silver', prefix: 'sil' }), selfPacedOpts());
+  assert.equal(silver.record_key_input, 'thinkific|email:sil001@example.test|silver_self_paced|none');
+  assert.equal(legacyRecordKeyInput({ externalId: '', email: 'a@example.test', planKey: 'sampler', batchCode: NON_VIP_BATCH_TOKEN }),
+    'thinkific|email:a@example.test|sampler|none');
+  // The VIP key is unchanged, so the rows already staged in production keep their keys.
+  const [vip] = normalizeLegacyRows(syntheticRoster().slice(0, 1), baseOpts());
+  assert.equal(vip.record_key_input, 'thinkific|email:student001@example.test|vip|2026-09');
+});
+
+test('no valid row, VIP or not, is ever left without a record key', () => {
+  const mixed = [...normalizeLegacyRows(syntheticRoster(), baseOpts()),
+    ...normalizeLegacyRows(selfPacedRoster({ n: 3 }), selfPacedOpts()),
+    ...normalizeLegacyRows(selfPacedRoster({ label: 'Silver', prefix: 'sil', n: 3 }), selfPacedOpts())];
+  for (const r of mixed.filter((x) => x.validation_status === 'valid')) {
+    assert.ok(r.record_key_input, `row ${r.source_row_number} (${r.plan_key}) has no key`);
+  }
+});
+
+test('a self-paced row is Ready only when its PLAN is ticked, never by a cohort', () => {
+  const none = normalizeLegacyRows(selfPacedRoster(), selfPacedOpts({ eligiblePlanKeys: [] }));
+  assert.ok(none.every((r) => r.validation_status === 'valid' && r.activation_state === 'inactive'));
+  const otherPlan = normalizeLegacyRows(selfPacedRoster(), selfPacedOpts({ eligiblePlanKeys: ['silver_self_paced'] }));
+  assert.ok(otherPlan.every((r) => r.activation_state === 'inactive'), 'ticking Silver does not ready Essentials');
+  const byCohort = normalizeLegacyRows(selfPacedRoster(), selfPacedOpts({ eligiblePlanKeys: [], eligibleBatchCodes: ['2026-09', '2026-10'] }));
+  assert.ok(byCohort.every((r) => r.activation_state === 'inactive'), 'a cohort tick means nothing to a self-paced row');
+});
+
+test('a batch label on a Silver row is kept as history, ignored, and warned about', () => {
+  const headers = [...SELF_PACED_HEADERS, 'batch'];
+  for (const label of ['October 2026', 'July 2026', 'VIP', 'Batch 7']) {
+    const src = selfPacedRoster({ label: 'Silver', prefix: 'sil', n: 2 }).map((r) => ({ ...r, batch: label }));
+    const rows = normalizeLegacyRows(src, selfPacedOpts({
+      mapping: autoMapLegacyHeaders(headers),
+      batchMapping: { 'october 2026': '2026-10' },
+    }));
+    for (const r of rows) {
+      assert.deepEqual(r.errors, [], `${label}: a Silver row runs no batch rule`);
+      assert.equal(r.batch_code, null, `${label}: and stores no batch`);
+      assert.equal(r.legacy_batch_label, label, `${label}: the file's label stays as history`);
+      assert.ok(r.warnings.includes('batch_ignored_for_plan'));
+      assert.equal(r.activation_state, 'ready');
+      assert.equal(r.record_key_input, `thinkific|email:${r.email_normalized}|silver_self_paced|none`,
+        'a batch label never reaches a non-VIP key, so a corrected label cannot split one purchase in two');
+    }
+  }
+});
+
+test('a VIP row with no batch is still blocked, per row', () => {
+  const noBatch = syntheticRoster().slice(0, 2).map(({ batch_code, ...rest }) => rest);
+  const rows = normalizeLegacyRows(noBatch, baseOpts({ mapping: autoMapLegacyHeaders(HEADERS.filter((h) => h !== 'batch_code')) }));
+  for (const r of rows) {
+    assert.ok(r.errors.includes('batch_missing'));
+    assert.equal(r.activation_state, 'blocked');
+    assert.equal(r.record_key_input, null);
+  }
+  const blank = normalizeLegacyRows(syntheticRoster().slice(0, 1).map((r) => ({ ...r, batch_code: '' })), baseOpts());
+  assert.ok(blank[0].errors.includes('batch_missing'));
+});
+
+function mixedRoster() {
+  const vip = syntheticRoster().filter((r) => r.batch_code !== 'August 2026').slice(60);   // Sep tail + all Oct
+  const silver = selfPacedRoster({ label: 'Silver', prefix: 'sil', n: 3 }).map((r) => ({
+    thinkific_user_id: '', first_name: r.first_name, last_name: r.last_name, email: r.email, plan_key: r.plan,
+    membership_started_at: r.start_date, membership_ends_at: r.end_date, payment_status: 'Paid',
+    amount_paid: '2999', currency: 'PHP', legacy_enrollments: '', batch_code: '',
+  }));
+  return [...vip, ...silver];
+}
+
+test('a mixed roster: VIP is Ready by cohort, self-paced by plan, each by its own tick only', () => {
+  const opts = baseOpts({ planMapping: { vip: 'vip', silver: 'silver_self_paced' } });
+  const rows = normalizeLegacyRows(mixedRoster(), { ...opts, eligiblePlanKeys: ['silver_self_paced'] });
+  const vip = rows.filter((r) => r.plan_key === 'vip');
+  const silver = rows.filter((r) => r.plan_key === 'silver_self_paced');
+  assert.equal(silver.length, 3);
+  assert.ok(silver.every((r) => r.validation_status === 'valid' && r.activation_state === 'ready' && r.batch_code === null));
+  assert.ok(vip.filter((r) => r.batch_code === '2026-10').every((r) => r.activation_state === 'ready'));
+  assert.ok(vip.filter((r) => r.batch_code === '2026-09').every((r) => r.activation_state === 'inactive'));
+  // A VIP plan key among the plan ticks readies no VIP row: VIP is chosen by cohort alone.
+  const vipTick = normalizeLegacyRows(mixedRoster(), { ...opts, eligibleBatchCodes: [], eligiblePlanKeys: ['vip'] });
+  assert.ok(vipTick.filter((r) => r.plan_key === 'vip').every((r) => r.activation_state === 'inactive'));
+});
+
+test('the same email under DIFFERENT plans is multiple_plans_in_file, and both copies stay blocked', () => {
+  const src = mixedRoster();
+  const silverAt = src.findIndex((r) => r.plan_key === 'Silver');
+  src[silverAt] = { ...src[silverAt], email: src[0].email.toUpperCase() };   // an upgrade: VIP and Silver
+  const rows = normalizeLegacyRows(src, baseOpts({ planMapping: { vip: 'vip', silver: 'silver_self_paced' },
+    eligiblePlanKeys: ['silver_self_paced'] }));
+  for (const r of [rows[0], rows[silverAt]]) {
+    assert.ok(r.errors.includes('duplicate_in_file'), 'it keeps duplicate_in_file');
+    assert.ok(r.errors.includes('multiple_plans_in_file'));
+    assert.equal(r.validation_status, 'duplicate');
+    assert.equal(r.activation_state, 'blocked', 'nothing decides which purchase to grant');
+  }
+  assert.ok(rows.filter((r, i) => i !== 0 && i !== silverAt).every((r) => !r.errors.includes('multiple_plans_in_file')));
+});
+
+test('one purchase listed twice under two labels of the SAME plan is a plain duplicate', () => {
+  // A per-course export of the Silver bundle: one row for the QBO course, one for Resume.
+  const src = selfPacedRoster({ label: 'QBO Course', prefix: 'sil', n: 1 });
+  src.push({ ...src[0], plan: 'Resume Course' });
+  const rows = normalizeLegacyRows(src, selfPacedOpts({
+    planMapping: { 'qbo course': 'silver_self_paced', 'resume course': 'silver_self_paced' } }));
+  for (const r of rows) {
+    assert.ok(r.errors.includes('duplicate_in_file'));
+    assert.ok(!r.errors.includes('multiple_plans_in_file'));
+    assert.equal(r.activation_state, 'blocked');
+  }
+});
+
+test('a term far from the plan\'s length is a warning, never a block', () => {
+  assert.equal(TERM_LENGTH_TOLERANCE_DAYS, 31);
+  assert.equal(termDays('2026-10-12', '2026-10-12'), 1, 'both ends count');
+  assert.equal(termDays('2026-09-20', '2026-11-18'), 60);
+  assert.equal(termDays('2026-10-12', '2027-04-12'), 183);
+  assert.equal(termDays('2028-02-01', '2028-03-01'), 30, 'a leap February');
+  // A 180-day VIP end left on the 60-day Essentials plan.
+  const [long] = normalizeLegacyRows(selfPacedRoster({ n: 1, start: '9/20/2026', end: '3/18/2027' }), selfPacedOpts());
+  assert.ok(long.warnings.includes('term_length_unusual'));
+  assert.equal(long.validation_status, 'valid');
+  assert.equal(long.activation_state, 'ready');
+  // Exactly 31 days off is inside the tolerance; 32 is not. (60 + 31 = 91 days, 60 + 32 = 92.)
+  const at = (end) => normalizeLegacyRows(selfPacedRoster({ n: 1, start: '9/20/2026', end }), selfPacedOpts())[0];
+  assert.equal(termDays('2026-09-20', '2026-12-19'), 91);
+  assert.ok(!at('12/19/2026').warnings.includes('term_length_unusual'));
+  assert.ok(at('12/20/2026').warnings.includes('term_length_unusual'));
+  assert.ok(at('9/30/2026').warnings.includes('term_length_unusual'), '11 days on a 60-day plan');
+  // The real VIP roster is within a few days of 180 on every row.
+  assert.ok(normalizeLegacyRows(syntheticRoster(), baseOpts()).every((r) => !r.warnings.includes('term_length_unusual')));
+  // With no access_days to compare against, nothing is said.
+  const noDays = PLANS.map(({ access_days, ...p }) => p);
+  assert.ok(!normalizeLegacyRows(selfPacedRoster({ n: 1, end: '3/18/2027' }), selfPacedOpts({ plans: noDays }))[0]
+    .warnings.includes('term_length_unusual'));
+});
+
+test('self-paced plans are pre-ticked in catalog order; VIP never is', () => {
+  const opts = baseOpts({ planMapping: { vip: 'vip', silver: 'silver_self_paced', essentials: 'sampler' } });
+  const src = [...mixedRoster(), ...selfPacedRoster({ n: 2 }).map((r) => ({
+    thinkific_user_id: '', first_name: r.first_name, last_name: r.last_name, email: r.email, plan_key: r.plan,
+    membership_started_at: r.start_date, membership_ends_at: r.end_date, payment_status: 'Paid',
+    amount_paid: '1499', currency: 'PHP', legacy_enrollments: '', batch_code: '' }))];
+  const probe = normalizeLegacyRows(src, opts);
+  assert.deepEqual(defaultEligiblePlanKeys(probe, PLANS), ['sampler', 'silver_self_paced']);
+  // Only plans with a VALID row are offered.
+  const blocked = probe.map((r) => (r.plan_key === 'sampler' ? { ...r, validation_status: 'blocked' } : r));
+  assert.deepEqual(defaultEligiblePlanKeys(blocked, PLANS), ['silver_self_paced']);
+  assert.deepEqual(defaultEligiblePlanKeys(normalizeLegacyRows(syntheticRoster(), baseOpts()), PLANS), []);
+  assert.deepEqual(defaultEligiblePlanKeys([], PLANS), []);
+  assert.deepEqual(defaultEligiblePlanKeys(probe, []), [], 'without the catalog nothing can be shown to be self-paced');
+});
+
+test('plan summary counts rows per package, in catalog order', () => {
+  const opts = baseOpts({ planMapping: { vip: 'vip', silver: 'silver_self_paced' } });
+  const rows = normalizeLegacyRows(mixedRoster(), { ...opts, eligiblePlanKeys: [] });
+  const s = planSummary(rows, PLANS);
+  assert.deepEqual(s.map((g) => [g.plan_key, g.name, g.tagline, g.segment, g.total, g.ready, g.inactive, g.blocked]), [
+    ['silver_self_paced', 'Silver · Self-Paced', 'QBO + Resume Combo', 'general', 3, 0, 3, 0],
+    ['vip', 'VIP Package', 'Personalized Coaching Program', 'vip', 23, 18, 5, 0],
+  ]);
+  // A row with no plan has no package to show, and is not offered as a tick.
+  const unmapped = normalizeLegacyRows(mixedRoster(), { ...opts, planMapping: { vip: 'vip' } });
+  assert.ok(planSummary(unmapped, PLANS).every((g) => g.plan_key));
+  assert.deepEqual(planSummary([], PLANS), []);
+});
+
+test('the cohort table counts VIP rows only when given the catalog', () => {
+  const opts = baseOpts({ planMapping: { vip: 'vip', silver: 'silver_self_paced' } });
+  const rows = normalizeLegacyRows(mixedRoster(), { ...opts, eligiblePlanKeys: ['silver_self_paced'] });
+  assert.deepEqual(cohortSummary(rows, PLANS).map((g) => [g.batch_code, g.total, g.ready]),
+    [['2026-09', 5, 0], ['2026-10', 18, 18]], 'Silver rows are not a "No batch" line of the cohort table');
+  assert.deepEqual(cohortSummary(rows).map((g) => [g.batch_code, g.total]),
+    [['2026-09', 5], ['2026-10', 18], [null, 3]], 'without the catalog it cannot tell, and says so under null');
+});
+
+test('cohort seats follow the months paid for, from 1 up to the plan\'s six', () => {
+  // The contract's worked examples.
+  assert.equal(legacySeatCount('2026-10-12', '2027-04-12', 6), 6);
+  assert.equal(legacySeatCount('2026-10-12', '2026-11-11', 6), 1);
+  assert.equal(legacySeatCount('2026-10-12', '2026-11-10', 6), 1, 'short of a month is still one seat');
+  assert.equal(legacySeatCount('2026-10-12', '2027-10-11', 6), 6, 'twelve months, capped at the plan');
+  // The live cohorts.
+  assert.equal(legacySeatCount('2026-09-02', '2027-03-02', 6), 6);
+  assert.equal(legacySeatCount('2026-08-03', '2027-02-03', 6), 6);
+  // Month and year boundaries, computed like Postgres age(end + 1, start).
+  assert.equal(legacySeatCount('2026-10-12', '2026-12-11', 6), 2);
+  assert.equal(legacySeatCount('2026-12-15', '2027-06-14', 6), 6);
+  assert.equal(legacySeatCount('2026-12-15', '2027-03-13', 6), 2, 'age(Mar 14, Dec 15) is 2 months 27 days');
+  assert.equal(legacySeatCount('2026-12-31', '2026-12-31', 6), 1);
+  assert.equal(legacySeatCount('2027-01-31', '2027-02-27', 6), 1, 'age(Feb 28, Jan 31) is 28 days: 0 months, floored to 1');
+  assert.equal(legacySeatCount('2027-01-31', '2027-02-28', 6), 1, 'age(Mar 1, Jan 31) is 1 month 1 day');
+  assert.equal(legacySeatCount('2027-01-31', '2027-03-30', 6), 2, 'age(Mar 31, Jan 31) is exactly 2 months');
+  assert.equal(legacySeatCount('2027-01-31', '2027-03-31', 6), 2, 'age(Apr 1, Jan 31) is 2 months 1 day');
+  assert.equal(legacySeatCount('2028-01-15', '2028-03-14', 6), 2, 'across a leap February');
+  // A plan's own batch count is the ceiling, whatever it is.
+  assert.equal(legacySeatCount('2026-10-12', '2027-10-11', 3), 3);
+  assert.equal(legacySeatCount('2026-10-12', '2026-11-11', 1), 1);
+});
+
+test('a plan with no cohort gets no seats, and unreadable dates never guess some', () => {
+  for (const count of [0, null, undefined, -1, 'six', NaN]) {
+    assert.equal(legacySeatCount('2026-10-12', '2027-04-12', count), 0, `batch count ${String(count)}`);
+  }
+  for (const [s, e] of [[null, '2027-04-12'], ['2026-10-12', ''], ['10/12/2026', '2027-04-12'], ['2026-10-12', undefined]]) {
+    assert.equal(legacySeatCount(s, e, 6), 0);
+  }
+});
+
+// #68 review, L2. legacy_import_seat_count() returns NULL for `p_end < p_start` BEFORE its
+// greatest(1, …) — "no term, no count" — and this mirror's spelling of that is 0, as it is
+// for a missing date. It used to answer 1, pinned here by a message that misread the SQL.
+test('an end before its start buys no seats, as in SQL; an end ON its start buys one', () => {
+  assert.equal(legacySeatCount('2026-10-12', '2026-10-01', 6), 0, 'SQL: p_end < p_start → NULL, before greatest(1, …)');
+  assert.equal(legacySeatCount('2026-10-12', '2026-10-11', 6), 0, 'one day short is still before the start');
+  assert.equal(legacySeatCount('2027-01-01', '2026-12-31', 6), 0, 'across a year boundary');
+  assert.equal(legacySeatCount('2027-04-12', '2026-10-12', 6), 0, 'a whole term swapped is not six seats');
+  assert.equal(legacySeatCount('2026-10-12', '2026-10-12', 6), 1, 'a one-day term: age(Oct 13, Oct 12) is 0 months, floored to 1');
+  // The guard reads the dates, not the cap: a non-VIP plan was 0 already and stays 0.
+  assert.equal(legacySeatCount('2026-10-12', '2026-10-01', 0), 0);
 });

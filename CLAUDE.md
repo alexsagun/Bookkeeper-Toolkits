@@ -575,7 +575,7 @@ full-access plans, so they pass by default), and the **server gate is `is_approv
 `is_enrolled()` RLS** (term + 3-day grace, mirroring course reads), so access ends with the
 membership automatically — **expired members are fully blocked — reads _and writes_** (#28 closed
 the own-update gap on posts/comments that #25 had left). The
-Sampler Session's **60-day group chat support** == its 60-day `access_days` window.
+Essentials (`sampler`) plan's **60-day group chat support** == its 60-day `access_days` window.
 
 **Spaces & batches (#32, [db/2026-07-28-community-spaces-batches.sql](db/2026-07-28-community-spaces-batches.sql)):**
 the forum is segmented into **community_spaces** — one **General** space (every active plan) plus
@@ -862,12 +862,105 @@ gated on **`students.legacy_migrate`**. Built by **#67**
   sets one password, not two. The email ([api/_lib/legacyClaimEmail.js](api/_lib/legacyClaimEmail.js))
   follows the owner's wording — name, email, batch, plan, start, expiry, the link — and says
   "already paid — nothing to buy".
-- ★ **EVERY MIGRATION EMAIL IS SENT FROM, AND ANSWERED AT, support@alexsagun.com** (owner requirement,
-  2026-09-26): `MIGRATION_SENDER_ADDRESS`, overridable by `MIGRATION_EMAIL_FROM`, passed through
-  `sendEmail`'s `from` option (every other flow still sends from `RESEND_FROM`). Resend refuses a
-  sender whose domain is not verified, so the workspace's **Send test email** (`send-test`) mails the
-  activation template — sample details, no token — to the calling Super Admin's OWN address, resolved
-  server-side, before any student is emailed.
+- ★ **MIGRATION EMAIL IS SENT FROM THE VERIFIED DOMAIN AND ANSWERED AT support@alexsagun.com** (#68,
+  owner decision 2026-09-28). The owner's Resend account verifies only the SUBDOMAIN
+  `toolkits.alexsagun.com`, and Resend authorizes a From address against its exact domain, so #67's
+  `support@alexsagun.com` sender was refused (403) for every email. `migrationAddresses()` in
+  [api/_lib/legacyClaimEmail.js](api/_lib/legacyClaimEmail.js) now resolves two SEPARATE addresses:
+  - **From:** `MIGRATION_EMAIL_FROM`, else `support@<the domain of RESEND_FROM>`, which today is
+    `support@toolkits.alexsagun.com`.
+  - **Reply-To and the printed support line:** `MIGRATION_REPLY_TO`, else `MIGRATION_SUPPORT_ADDRESS`
+    (`support@alexsagun.com`, a monitored mailbox).
+
+  ★ **They were one value in #67**, which meant the "obvious" env-only fix of pointing the sender at
+  the subdomain would have moved every student reply onto a mailbox that does not exist. Every other
+  flow still sends from `RESEND_FROM`.
+
+  **Send test email** (`send-test`) mails the activation template (sample details, no token) to the
+  calling Super Admin's OWN address, resolved server-side. It reports both addresses, a message per
+  provider code, and whether Resend click tracking is on. Click tracking must be OFF: a tracked link
+  carries the fragment token through Resend's redirect host. Readiness reports `senderProven`, which
+  is true when the From domain equals `RESEND_FROM`'s domain, the one the other flows prove every day.
+- ★ **SILVER AND ESSENTIALS ROSTERS (#68): A BATCH IS A VIP-ONLY FACT, AT EVERY LAYER.** #67 demanded a
+  batch for every row in the browser, in `legacy_import_stage` and in the record key. Only activation
+  knew better, so a Silver or Essentials roster could not be staged at all, and a batch-less row would
+  have had a NULL record key, which the double-grant unique index and both duplicate checks skip.
+  - Every rule now asks the mapped plan's `community_segment` first. A non-VIP row stores no batch;
+    a batch label in its file is kept as history, with the warning `batch_ignored_for_plan`.
+  - Its record key uses the literal `'none'` as the batch part (`NON_VIP_BATCH_TOKEN`). That cannot
+    collide with a `YYYY-MM` code, and it keeps "one legacy grant per person per plan".
+  - Ready is chosen per COHORT for VIP rows (`eligible_batch_codes`) and per PLAN for the rest
+    (`student_import_jobs.eligible_plan_keys`). Both are staging settings the reopen comparison checks.
+- ★ **COHORT SEATS ARE WHAT THE STUDENT PAID FOR, AND NO MONTH MAY BE MISSING (#68).** The owner runs
+  this as a SaaS: some students pay months ahead, some renew monthly.
+  - `legacy_import_seat_count(start, end, plan)` gives a VIP row one seat per whole month of its term,
+    at least 1 and at most the plan's count. So a one-month payer no longer receives six cohorts.
+    `legacySeatCount()` is the JS mirror.
+  - The allocator only moves forward. So a month with no batch, sitting under a later batch that
+    exists, would be skipped for good by every run that crosses it. The preflight names such months
+    (`batch_gaps`), and `start_run` refuses with `LEGACY_BATCH_GAP` until the batch exists.
+- ★ **BULK ACTIVATION STOPS ON THE FIRST SIGN THE EMAIL CANNOT GO (#68).** In #67 a refused sender,
+  a bad key or a quota error was recorded as a failed invitation, and the run kept granting access.
+  A whole cohort could be activated with no email delivered, and recovery was one click per row.
+  - **The breaker.** `doActivateChunk` stops claiming on `email_not_configured`,
+    `email_from_not_configured`, `resend_401`, `resend_403` or `resend_429`, or on two consecutive
+    `resend_422`. It pauses the run and reports `stopped` and `code`.
+  - **Hand-back.** Codes that prove nothing was sent return the row to `not_sent` through
+    `legacy_import_record_delivery`, so Resume re-sends it.
+  - **Bulk resend.** `resend-failed` re-sends a job's failed invitations; possibly-delivered rows go
+    only when explicitly asked for.
+  - **Daily allowance.** The preflight compares its email count with `MIGRATION_DAILY_EMAIL_CAP`
+    (default 100, Resend's free plan).
+  - **Permanent refusals.** An invitation `begin_invite` can never send (the account is gone, or the
+    cap is reached) is recorded as failed instead of stalling the run. An account that already
+    finished onboarding gets a sign-in notice.
+- ★ **ACROSS ROSTERS THE HIGHER PLAN WINS, AND A GRANDFATHERED MEMBER IS NEVER TOUCHED (#68).**
+  - `legacy_import_plan_rank()` (vip 3 > silver_self_paced 2 > sampler 1; mirror `planRank()`) holds
+    back a lower-ranked row, as failed `higher_plan_pending`, while the same person has a higher one
+    unactivated in a live job. Staging warns `other_legacy_row`, and the preflight lists overlaps.
+  - A profile with `is_paid` and no subscription row (the pre-lifecycle grandfather) is blocked as
+    `grandfathered_member`. Activating it would narrow unlimited access to a dated term, and Revert
+    would then lock the member out, because the grandfather rule needs zero rows.
+  - Revert deletes the row's Thinkific-id link. Purge also clears phones.
+  - An account the import created whose activation is refused has its import marks cleared, so it
+    becomes an ordinary pending signup rather than a hidden one.
+  - An onboarded migrated account with no live term sees `IMPORT_MEMBERSHIP_PENDING`, a price-free
+    hold, instead of the paywall.
+- ★ **WHAT THE #68 ADVERSARIAL REVIEW CHANGED BEFORE PRODUCTION** (2026-09-29; 27 findings confirmed,
+  none critical, two must-fix):
+  - **Auth failures trip the breaker too.** Two consecutive `link_failed` (or `rotation_failed`)
+    results stop the run as `auth_unavailable`. Without it, a broken `generateLink` granted terms with
+    no email and spent an invite generation on the same rows every chunk until the cap of 20 made
+    them uninvitable. A hand-back whose code proves NO provider request was made (`link_failed`,
+    `app_url_missing`, the two not-configured codes) REUSES its generation; 401/403/429 never do,
+    because a provider may replay a refused response under the same idempotency key.
+  - **The onboarding notice keeps #67's bound.** A refund happens only when NEITHER email was
+    delivered, `resend_422` is never refunded (it can be about one recipient), and
+    `onboarding_notice_reservations` (0..20) is a ceiling a refund cannot touch and the Super Admin
+    reset does not clear. Otherwise a malformed admin address re-sent the delivered half to the
+    student every day after the 24 h idempotency window.
+  - **A higher-ranked row holds a lower one only while it can still become a grant**
+    (`legacy_import_higher_plan_pending()`: grace still ahead, and for VIP a live batch); the
+    preflight returns `held_row_ids` so the confirm step says how many will be held.
+  - **E8 is durable:** the password of a matched pre-existing unconfirmed account is rotated INSIDE
+    `sendInvite` before the claim email; a failed rotation records `rotation_failed` and sends nothing.
+  - **A 429 is classified** (`sendEmail`'s `classify429`: `limit: 'rate' | 'quota'` from the error's
+    name/retry-after, never the body) so a per-second limit reads "Resume in a minute", not "wait for
+    tomorrow"; and a 4xx on a RETRY after a timed-out attempt reports `resend_timeout` (ambiguous),
+    never "nothing was sent".
+  - `resend-failed` skips students who already onboarded (`skipped_onboarded`); the row panel and the
+    bulk dialog never promise a row at the generation cap; keep-open buttons are `aria-disabled`.
+  - **Bulk terms** (`MigrationBulkTermsModal`): a selection's inactive/ready/failed rows get a batch,
+    package or dates in ONE audited `legacy_import_set_terms` call, sending only the fields set. This
+    is how the 65 September 2026 rows move to October after that batch was archived.
+  - `tierLabelFor(tierKey)` (`trainingAgreement.js`) is the only way a tier is printed; `parseCsv`'s
+    duplicate-heading error carries `code: 'DUPLICATE_HEADER'` (`CSV_DUPLICATE_HEADER`) so the bank
+    importer keeps its own "upload it as Excel" advice.
+  - ★ **A matched PRE-EXISTING unconfirmed account the import did NOT create** (E8) gets a random
+    password, but only AFTER a successful `activate_row`, which refuses staff. Doing it before binding
+    would silently skip an unaccepted staff invitee's own password step, because
+    `staff_invitation_state()` reads `has_password` from the stored password. The claim link then
+    sets the student's real password.
 - ★ **THE SUPER ADMIN ASSIGNS THE TERMS AT ACTIVATION.** The dialog is two steps: (1) the selection's
   terms grouped by plan, batch and dates, each changeable, then (2) the preflight and the typed phrase.
   Changes go through `legacy_import_set_terms()` (audited `terms_set` with before/after, validated,
@@ -920,7 +1013,9 @@ gated on **`students.legacy_migrate`**. Built by **#67**
 - **Recovery:** `legacy_import_revert` (a scheduled term, or an unclaimed new account) cancels the
   term and revokes the run through `revoke_batch_run`; after a claim, change it from Enrollments.
   ★ It keeps the account, its approval and its import onboarding, so a claim link already sent still
-  signs the student in — they then meet the enrollment page, holding no membership. The dialog says so.
+  signs the student in. Since #68 an onboarded migrated account with no live or scheduled term is held on
+  the price-free `IMPORT_MEMBERSHIP_PENDING` card ("your migrated membership is being set up"), never the
+  paywall. The card re-checks on focus, because nothing pushes `profiles.is_paid`. The revert dialog says so.
   `legacy_import_purge_raw` removes names and emails from activated/reverted rows and from discarded
   jobs; provenance stays. #67 discarded and purged the four v1 jobs that never granted anything.
 - The v1 grant path (`process`/`dry-run`, `computeImportTerm`'s fresh/lifetime modes, the private
@@ -1465,12 +1560,17 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   staff-activation-consistency (#50) → access-request-staff-target (#51) →
   student-progress-rankings (#52) → progress-rankings-followup (#53) →
   progress-course-family-scoping (#54) → approve-rpc-grant-revoke (#55) →
-  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61) → meetings-tasks (#62) → management-hardening (#63) → finance-daily-income (#64) → course-lesson-assets (#65) → enrollment-decision-lock (#66) → legacy-student-migration (#67)** — see the Staff-authorization
+  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61) → meetings-tasks (#62) → management-hardening (#63) → finance-daily-income (#64) → course-lesson-assets (#65) → enrollment-decision-lock (#66) → legacy-student-migration (#67) → legacy-migration-round2 (#68)** — see the Staff-authorization
   and Progress & Rankings sections for what each does. **#67**
   ([db/2026-09-25-legacy-student-migration.sql](db/2026-09-25-legacy-student-migration.sql), fold **§54**)
   is the legacy Thinkific migration and the `scheduled` subscription status — see the Student Imports
   and Scheduled memberships sections. Restates the staff seed (`students.legacy_migrate` replaces
-  `students.import`; 22 permissions / 34 grants) and `app_error_catalog()` (132 codes). **#66**
+  `students.import`; 22 permissions / 34 grants) and `app_error_catalog()` (132 codes). **#68**
+  ([db/2026-09-28-legacy-migration-round2.sql](db/2026-09-28-legacy-migration-round2.sql), fold **§55**)
+  is its second round: Silver and Essentials rosters, seats from the paid term, the batch-gap refusal,
+  the higher-plan-wins rule, the grandfathered block, the sender/reply-to split, and the plan RENAME
+  (`vip` → VIP Package, `silver_self_paced` → Silver · Self-Paced, `sampler` → Essentials; the old product
+  names move to `tagline`). It restates `app_error_catalog()` (133 codes, + `LEGACY_BATCH_GAP`). **#66**
   ([db/2026-09-24-enrollment-decision-lock.sql](db/2026-09-24-enrollment-decision-lock.sql), fold
   **§53**) makes a DECIDED enrollment request final: #48's column grant let every
   `enrollments.review` holder PATCH `status`, and both existing guards fire only on a move TO
@@ -1604,12 +1704,14 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   (`<img>` with initials fallback; `resolveAvatarUrl` maps storage paths vs legacy OAuth
   URLs) — never hand-roll the initials circle again.
 - **Plan-based access (per-plan entitlements):** membership is no longer all-or-nothing. There are
-  **exactly three plans** (#39): `sampler` (Sampler Session, ₱1,499 / 60 days) is the ONE scoped
+  **exactly three plans** (#39; renamed by #68 — keys unchanged): `sampler` (**Essentials**, product line
+  "Sampler Session", ₱1,499 / 60 days) is the ONE scoped
   plan — Home + the QuickBooks catalog (`qbomastery`) but only its **Essentials** course
   (`access_tier='essentials'`, NOT Mastery) + both 1-on-1 booking tabs (`linkedinopt`, `coachalex`)
   + `community`. Its ₱1,499 buys the coaching session, not more course content, so the CHEAPEST
-  plan is also the most scoped — **never assume price ⇒ scope.** `silver_self_paced` (QBO + Resume
-  Combo, ₱2,999 / 60 days) and `vip` (Personalized Coaching Program, ₱16,999 / 180 days) are both
+  plan is also the most scoped — **never assume price ⇒ scope.** `silver_self_paced` (**Silver · Self-Paced**,
+  "QBO + Resume Combo", ₱2,999 / 60 days) and `vip` (**VIP Package**, "Personalized Coaching Program",
+  ₱16,999 / 180 days) are both
   listed **explicitly as full access** (`{ full: true }`). VIP is additionally the only plan with a
   cohort batch + private community. **The `community` tab is in EVERY plan's allowlist** — all plans
   include group chat, and its real gate is the `is_enrolled()` RLS on the `community_*` tables (see
@@ -1663,7 +1765,7 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   existed only for `core_self_paced` and was **dropped by #39** along with its conjunct in the four
   course-read policies and `course_object_allowed()`.) It scopes course/lesson reads + the private
   `course-videos` bucket via direct Supabase query. Admins set a course's tier in-app via the course
-  card **⋮ menu → "Sampler tier (Essentials)"**. **Keep the client tab-allowlist + `courseTier` and the
+  card **⋮ menu → "Included in the Essentials package"** (#68 renamed the label). **Keep the client tab-allowlist + `courseTier` and the
   SQL `qbo-%` / `access_tier` rules in sync** when entitlements change. An admin's plan change (upgrade
   approval) applies live via `useEnrollmentGate`'s realtime/focus refetch. Residuals (documented, not
   enforced): `feature_guides` + the AI proxy stay `is_enrolled()`-gated.
@@ -2085,7 +2187,7 @@ payee + account quick-picks, never an amount, seeded by category only).
   all lock their row before checking. Add, Match and status changes refuse inside a closed reconciliation.
 - Re-signs five #58 functions (each dropped first) and restates the catalog; #60 restates it again, so
   the catalog has been restated again since, so `CURRENT_CATALOG_MIGRATION` (communityStaffSql) and
-  `CATALOG_OWNER` (financeSql) both point at **#67** (132 codes) — repoint them with every restatement. No permission changes.
+  `CATALOG_OWNER` (financeSql) both point at **#68** (133 codes) — repoint them with every restatement. No permission changes.
   Suite: `test/financeParitySql.test.mjs` (it pins every stage-review fix above).
 
 **Daily Income (#64, [db/2026-09-19-finance-daily-income.sql](db/2026-09-19-finance-daily-income.sql), fold §51)** —
@@ -2431,7 +2533,7 @@ deleted them silently.
 - ★ **`CATALOG_OWNER` in `test/financeSql.test.mjs` had been stale since #60.** The finance-code check read
   #59's catalog, which is a superseded definition — it kept passing only because no migration since added a
   `FINANCE_` code. Repoint it, and `CURRENT_CATALOG_MIGRATION` in `test/communityStaffSql.test.mjs`, whenever
-  a migration restates `app_error_catalog()`. Both now name #67 (132 codes).
+  a migration restates `app_error_catalog()`. Both now name #68 (133 codes).
 - Suite: `test/managementHardeningSql.test.mjs` — every assertion runs against the dated file AND the §50
   fold, and all 40 guards are mutation-tested. ★ The mutation runner counts a run that did not finish as an
   ERROR, never as a passing guard: it once read a timeout as "SURVIVED".
@@ -2834,10 +2936,13 @@ explain/quiz/practice/recap the Supabase-hosted courses. Full setup:
   was ever attempted — which is why the enrollment confirmation email was repeatedly believed not
   to exist. It did; it just could not run outside Vercel. Restart the dev server after adding keys
   (Vite reads `.env` at startup). Diagnose from **Enrollments → "Test email"** or the GET health check.
-- **Migration sender (server-only, optional, #67):** `MIGRATION_EMAIL_FROM` overrides the sender of
-  the legacy-migration emails, which otherwise come from `support@alexsagun.com`. Either way that
-  domain must be verified in Resend; prove it with **Student Imports → Send test email** before
-  activating anyone.
+- **Migration email (server-only, optional, #67/#68):** `MIGRATION_EMAIL_FROM` overrides the From of the
+  legacy-migration emails, which otherwise come from `support@<RESEND_FROM's domain>`
+  (`support@toolkits.alexsagun.com`, the domain verified in Resend). `MIGRATION_REPLY_TO` overrides the
+  Reply-To and printed support address, otherwise `support@alexsagun.com`; the From never moves it.
+  `MIGRATION_DAILY_EMAIL_CAP` (default 100, Resend's free plan) is the allowance the activation preflight
+  warns against. Whatever the From, its domain must be verified in Resend: prove it with
+  **Student Imports → Send test email** before activating anyone.
 - **Voice assistant (server-only, optional):** `ELEVENLABS_API_KEY` + `ELEVENLABS_AGENT_ID` enable
   the in-app voice widget (`api/elevenlabs/signed-url.js` + the `ai:knowledge:push` / `ai:provision`
   scripts); optional `ELEVENLABS_SERVER_LOCATION` picks the ElevenLabs region, and `ELEVENLABS_VOICE_ID`
@@ -3478,6 +3583,10 @@ docs **in the same change**:
   staff seed (#62) and the catalog (#65) verbatim and edits them at anchors; the suite line-diffs
   every one. ★ A future restatement of any of those copies #67's body, not the older one.
   ★ `STALE_CLAIM_MINUTES` must stay longer than the endpoint's `maxDuration` in `vercel.json` (pinned).
+  ★ Since #68 there are two more SQL↔JS pairs that must move together: `legacy_import_plan_rank()` ↔
+  `planRank()` (which of two rosters wins), and `legacy_import_seat_count()` ↔ `legacySeatCount()`
+  (cohort seats from the paid term). A plan is VIP when its `community_segment = 'vip'` — never
+  test the key, and never let a batch rule run for a non-VIP row.
   ★ Never let the browser write an import table again, and never give `students.legacy_migrate` to a
   non-super role: activating a legacy student creates paid access with no payment behind it here.
 - **Adding a subscription status, or a new check on whether a term is live** → every access

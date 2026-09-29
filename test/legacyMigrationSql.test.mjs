@@ -27,7 +27,14 @@ const FOLD_BANNER = '-- §54) FOLDED VERBATIM — 2026-09-25-legacy-student-migr
 const dated = read(DATED);
 const boot = read(BOOT);
 const foldAt = boot.indexOf(FOLD_BANNER);
-const fold = foldAt >= 0 ? boot.slice(foldAt) : '';
+// ★ BOUNDED AT THE NEXT FOLD. §55 (#68) restates fifteen of these functions after §54; sliced
+//   to end-of-file, body() — which takes the LAST definition — would read #68's bodies and
+//   assert them as #67's (test/legacyMigrationRound2Sql.test.mjs owns §55).
+const fold = (() => {
+  if (foldAt < 0) return '';
+  const next = boot.slice(foldAt + 1).search(/^--\s*§\d+\) FOLDED VERBATIM/m);
+  return next < 0 ? boot.slice(foldAt) : boot.slice(foldAt, foldAt + 1 + next);
+})();
 const FILES = [[DATED, dated], ['§54 fold', fold]];
 
 /** Executable SQL: comment lines removed. */
@@ -444,9 +451,13 @@ for (const [name, sql] of FILES) {
     const codes = cat.match(/\('[A-Z_]+',/g) || [];
     assert.equal(codes.length, 132);
     for (const c of NEW_CODES) assert.ok(cat.includes(`('${c}',`), `${c} missing`);
-    for (const c of APP_ERROR_CODES) {
-      if (c === 'MIGRATION_MISSING') continue;
-      assert.ok(cat.includes(`('${c}',`), `${c} was dropped from the catalog`);
+    // ★ #67 is frozen history: "drops no existing code" is checked against the catalog it
+    //   REPLACED (#65's), not against today's client list, which gains codes added after it
+    //   (LEGACY_BATCH_GAP, #68). The current owner is checked against APP_ERROR_CODES by
+    //   communityStaffSql, financeSql and legacyMigrationRound2Sql.
+    const before = body(read('db/2026-09-20-course-lesson-assets.sql'), 'app_error_catalog').join('\n');
+    for (const c of before.match(/\('[A-Z_]+',/g)) {
+      assert.ok(cat.includes(c), `${c} was dropped from the catalog`);
     }
   });
 
@@ -503,8 +514,13 @@ test('the endpoint is gated on the new permission before the service client exis
   const svcAt = api.indexOf('const admin = service();');
   assert.ok(api.includes("const PERMISSION = 'students.legacy_migrate';"));
   assert.ok(gateAt > 0 && svcAt > gateAt, 'requireStaff must run before service()');
-  assert.ok(!/\.from\('student_import|\.from\('subscriptions'\)|\.from\([^)]*\)\s*\.(insert|update|delete|upsert)\(/.test(api),
+  assert.ok(!/\.from\('subscriptions'\)|\.from\([^)]*\)\s*\.(insert|update|delete|upsert)\(/.test(api),
     'the endpoint writes nothing directly; every write is a SECURITY DEFINER function');
+  // ★ #68: `resend-failed` READS a job's failed invitations with the service client, after
+  //   requireStaff() — a SELECT only. Every import-table access in the endpoint must stay one.
+  for (const m of api.matchAll(/\.from\('student_import[a-z_]*'\)\s*\.(\w+)\(/g)) {
+    assert.equal(m[1], 'select', `an import table is touched with .${m[1]}() — only a SELECT is allowed`);
+  }
 });
 
 test('the stale-claim window outlives the function that holds the claim', () => {

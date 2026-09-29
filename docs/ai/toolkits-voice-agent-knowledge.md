@@ -1,5 +1,5 @@
 <!-- GENERATED FILE — do not hand-edit. Regenerate with `npm run ai:knowledge`
-     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-09-26 -->
+     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-09-29 -->
 
 # Toolkits by Alex — Voice Assistant Knowledge
 
@@ -117,22 +117,23 @@ to USD.
 
 | Plan | Key | Price (PHP) | Access | Highlights |
 |---|---|---|---|---|
-| Sampler Session (Essentials) | `sampler` | ₱1,499 | 60 days | 1 Live Zoom Session (4 hours); 60-day course access; 60-day group chat support; Limited offer · 60-day support |
-| QBO + Resume Combo (Silver · Self-Paced) | `silver_self_paced` | ₱2,999 | 60 days | Simulated annual bookkeeping project for an NY-based construction company; 60-day QBO Mastery course access; 60-day Resume & Interview course access; Weekly Community chat (Thu) |
-| Personalized Coaching Program (VIP Package) | `vip` | ₱16,999 (was ₱35,000) | 180 days | Simulated annual bookkeeping project for an NY-based construction company; 12 Live Group Zoom Trainings (MWF 9am to 11am PH Time); 4 Live Group Resume & Interview Coaching Sessions; Weekly group consult until hired; Community chat support until and after hired; BEST SELLER · Limited to 10 slots per month |
+| Essentials (Sampler Session) | `sampler` | ₱1,499 | 60 days | 1 Live Zoom Session (4 hours); 60-day course access; 60-day group chat support; Limited offer · 60-day support |
+| Silver · Self-Paced (QBO + Resume Combo) | `silver_self_paced` | ₱2,999 | 60 days | Simulated annual bookkeeping project for an NY-based construction company; 60-day QBO Mastery course access; 60-day Resume & Interview course access; Weekly Community chat (Thu) |
+| VIP Package (Personalized Coaching Program) | `vip` | ₱16,999 (was ₱35,000) | 180 days | Simulated annual bookkeeping project for an NY-based construction company; 12 Live Group Zoom Trainings (MWF 9am to 11am PH Time); 4 Live Group Resume & Interview Coaching Sessions; Weekly group consult until hired; Community chat support until and after hired; BEST SELLER · Limited to 10 slots per month |
 
 **What each plan can open (entitlement scope):**
 
-- **Sampler Session** (`sampler`): Essentials + 1-on-1 coaching. Can open: Dashboard, Progress & Rankings, QuickBooks Online Mastery, Book 1-on-1 with Alex, Personalized Coaching With Alex, Community. Within the QuickBooks catalog it can only open **essentials-tier** courses (QuickBooks Online Essentials — NOT Mastery).
-- **QBO + Resume Combo** (`silver_self_paced`): **Full toolkit access** — every student tool in the toolkit.
-- **Personalized Coaching Program** (`vip`): **Full toolkit access** — every student tool in the toolkit.
+- **Essentials** (`sampler`): Essentials + 1-on-1 coaching. Can open: Dashboard, Progress & Rankings, QuickBooks Online Mastery, Book 1-on-1 with Alex, Personalized Coaching With Alex, Community. Within the QuickBooks catalog it can only open **essentials-tier** courses (QuickBooks Online Essentials — NOT Mastery).
+- **Silver · Self-Paced** (`silver_self_paced`): **Full toolkit access** — every student tool in the toolkit.
+- **VIP Package** (`vip`): **Full toolkit access** — every student tool in the toolkit.
 - **Admins, and legacy members with no plan key on file**: full toolkit access.
 - **A retired or unrecognized plan key** (e.g. a membership that is no longer sold): Home only. The member keeps their Dashboard and membership panel and is asked to renew or upgrade — it does NOT grant the full toolkit.
 
-Important nuance: the **Sampler Session is the only plan with limited course access** —
-its ₱ price buys a live Zoom session and a 1-on-1 coaching booking, not the full course
-library. It opens QuickBooks Online **Essentials** only, not Mastery. Both other plans
-open every student tool.
+Important nuance: the **Essentials package (the Sampler Session) is the only plan with
+limited course access** — its ₱ price buys a live Zoom session and a 1-on-1 coaching
+booking, not the full course library. It opens QuickBooks Online **Essentials** only, not
+Mastery. Both other plans (**Silver · Self-Paced** and the **VIP Package**) open every
+student tool.
 
 A tool outside the user's plan still shows a polite upgrade page if opened — nothing
 breaks. The assistant may navigate there and then suggest upgrading.
@@ -185,7 +186,7 @@ to the support email shown on the payment screen or to Coach Alex.
   tracked — only "Mark complete" moves progress or unlocks the certificate. Not every
   lesson has one. The assistant cannot list, open, or read out replay links (it has none
   of them) — direct the member to open the lesson and look for the replay card.
-- The QuickBooks catalog has two tiers: **Essentials** (available to Sampler members) and
+- The QuickBooks catalog has two tiers: **Essentials** (available to Essentials-package members) and
   **Mastery** (standard tier). Other plans with QuickBooks access read both.
 - **Accounting 101** (`course`) is the free-form foundational course with 8 modules.
 - **AI course trainer:** enrolled members can ask the assistant to **teach, explain, quiz,

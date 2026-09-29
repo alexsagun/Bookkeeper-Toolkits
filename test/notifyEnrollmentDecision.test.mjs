@@ -29,7 +29,7 @@ const STUDENT = '66666666-7777-4888-9999-aaaaaaaaaaaa';
 // on profiles. They differ here on purpose: only the account address may ever be mailed.
 const ROW = {
   id: REQ, user_id: STUDENT, email: 'typed-on-the-request@third-party.test', full_name: 'Real Student',
-  plan_name: 'Sampler Session', status: 'approved', rejection_reason: null,
+  plan_name: 'Essentials', status: 'approved', rejection_reason: null,
 };
 const PROFILE = { email: 'real.student@example.test', full_name: 'Real Student' };
 const OPS = {
@@ -110,7 +110,7 @@ test('nothing the reviewer puts in the body reaches the email: not an address, a
   assert.equal(sent.length, 1);
   assert.deepEqual(sent[0].to, [PROFILE.email], 'the address the reviewer typed must be ignored');
   assert.match(sent[0].html, /Real Student/);
-  assert.match(sent[0].html, /Sampler Session/);
+  assert.match(sent[0].html, /Essentials/);
   assert.ok(!/attacker|Click Here Friend|Free iPhone/.test(JSON.stringify(sent[0])),
     'no body-supplied text may reach the email');
 });

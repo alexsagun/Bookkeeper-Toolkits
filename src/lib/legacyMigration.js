@@ -16,6 +16,12 @@
 //   the stored DATES. The functions here mirror them so the preview shows what the
 //   database will do; test/legacyMigrationSql.test.mjs pins the two against each
 //   other.
+//
+// ★ A BATCH IS A VIP-ONLY FACT (#68). Silver and Essentials are not cohort
+//   products: their rows skip every batch rule, store no batch, and are made Ready
+//   per PLAN (eligiblePlanKeys) instead of per cohort. Every layer asks the mapped
+//   plan's community_segment first — isVipPlan() here, the same test in
+//   legacy_import_stage(), and legacy_import_activate_row() already did.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { normalizeEmail, parseExternalId } from './studentImport.js';
@@ -44,8 +50,19 @@ export const DATE_FORMATS = ['M/D/YYYY', 'D/M/YYYY', 'YYYY-MM-DD'];
 
 // The canonical fields a roster can supply. `aliases` are the header spellings the
 // auto-mapper recognises; the admin can always override a mapping.
+//
+// ★ NO BARE `id` ALIAS FOR THE THINKIFIC ID (#68). An Orders export's order number, or
+//   a hand-built roster's 1..N row counter, is also called "ID". Auto-mapping it made
+//   the identity `ext:<that number>`, so the same purchase keyed differently in two
+//   rosters (duplicate detection missed it) and a row counter that equalled another
+//   student's stored id blocked the row for good with external_id_conflict.
+//
+// ★ THE BATCH IS NOT A REQUIRED COLUMN (#68). A Silver or Essentials export has no
+//   cohort, and demanding one stopped the wizard at step 2. A VIP row with no batch
+//   is still blocked — per row, with batch_missing — so nothing VIP gets through
+//   without its cohort.
 export const LEGACY_FIELDS = [
-  { key: 'external_user_id', label: 'Thinkific user id', required: false, aliases: ['thinkific_user_id', 'user_id', 'id'] },
+  { key: 'external_user_id', label: 'Thinkific user id', required: false, aliases: ['thinkific_user_id', 'user_id'] },
   { key: 'first_name', label: 'First name', required: false, aliases: ['first_name', 'firstname', 'first name'] },
   { key: 'last_name', label: 'Last name', required: false, aliases: ['last_name', 'lastname', 'last name'] },
   { key: 'email', label: 'Email', required: true, aliases: ['email', 'email_address', 'e-mail'] },
@@ -55,7 +72,7 @@ export const LEGACY_FIELDS = [
   { key: 'payment_status', label: 'Payment status', required: true, aliases: ['payment_status', 'payment'] },
   { key: 'amount_paid', label: 'Amount paid', required: false, aliases: ['amount_paid', 'amount'] },
   { key: 'currency', label: 'Currency', required: false, aliases: ['currency'] },
-  { key: 'batch_label', label: 'Batch', required: true, aliases: ['batch_code', 'batch', 'cohort'] },
+  { key: 'batch_label', label: 'Batch', required: false, aliases: ['batch_code', 'batch', 'cohort'] },
   // Optional. Shown to the Super Admin and used for an advisory "shared phone" warning only —
   // an account is never linked by phone, because Auth identity is the email.
   { key: 'phone', label: 'Phone', required: false,
@@ -68,6 +85,9 @@ export const LEGACY_ERROR_LABELS = {
   email_missing: 'Email is missing.',
   email_invalid: 'Email is not a valid address.',
   duplicate_in_file: 'This email appears more than once in the file.',
+  // #68: the repeated email maps to DIFFERENT plans — an upgrade, not a bundle export.
+  // Every copy stays blocked; nothing decides which purchase to grant.
+  multiple_plans_in_file: 'This email appears more than once in the file, under different plans. Keep one row per student and stage the file again.',
   duplicate_staged: 'This membership is already staged in another job.',
   plan_missing: 'Plan is missing.',
   plan_unmapped: 'This plan label has no confirmed mapping.',
@@ -93,6 +113,18 @@ export const LEGACY_ERROR_LABELS = {
   identity_mismatch: 'The account found does not match this email.',
   plan_inactive: 'The plan is no longer active in the catalog.',
   external_id_conflict: 'This Thinkific id is already linked to a different account.',
+  // #68. Staging and activation (legacy_import_stage / legacy_import_activate_row): a paid
+  // member from before dated terms, with unlimited access and no subscription row. An
+  // import would narrow that access, and a Revert would then remove it for good.
+  grandfathered_member: 'The matching account is a paid member from before dated memberships, with unlimited access. Handle this student by hand; an import would replace that access.',
+  // #68. Set at claim time as a failed row's last_error, so it can be retried later.
+  // ★ It names only exits that exist: there is no per-row discard (only a whole job's), and
+  //   the #68 review found the old "Activate or discard that row" sent the owner looking for
+  //   one. Changing the higher row's terms (legacy_import_set_terms) is audited and real.
+  higher_plan_pending: 'The same person has a higher package waiting in another roster. Activate that row first, or change its terms.',
+  // #68. Defensive: a valid row must always carry a record key, or nothing stops it being
+  // granted twice (the unique index and both duplicate checks skip NULL keys).
+  record_key_missing: 'This row has no purchase key, so it could be granted twice. It was blocked instead.',
 };
 
 export const LEGACY_WARNING_LABELS = {
@@ -100,6 +132,10 @@ export const LEGACY_WARNING_LABELS = {
   external_id_missing: 'No Thinkific id: the account is matched by email.',
   existing_account: 'An account with this email already exists; it will be linked, not duplicated.',
   amount_differs_from_price: 'The amount paid differs from today\'s price. It is kept as history only.',
+  // #68
+  batch_ignored_for_plan: 'This plan has no cohort, so the batch in the file is kept as history only.',
+  term_length_unusual: 'The membership length is very different from what this plan sells today. Check the dates and the plan.',
+  other_legacy_row: 'This student is also in another roster under a different plan. Check which purchase to activate.',
 };
 
 // ── Header mapping ───────────────────────────────────────────────────────────
@@ -160,6 +196,20 @@ const isoParts = (iso) => {
   const [y, m, d] = String(iso).split('-').map(Number);
   return { y, m, d };
 };
+
+/** Calendar days in [start, end], both ends counted: Oct 12 → Oct 12 is 1 day. */
+export function termDays(startIso, endIso) {
+  const s = isoParts(startIso);
+  const e = isoParts(endIso);
+  return Math.round((Date.UTC(e.y, e.m - 1, e.d) - Date.UTC(s.y, s.m - 1, s.d)) / 86_400_000) + 1;
+}
+
+/**
+ * term_length_unusual fires when |term days − the plan's access_days| exceeds this.
+ * A month either way absorbs how rosters round a term (Oct 12 → Apr 12 is 183 days on a
+ * 180-day plan); a swapped D/M date or a VIP end left on a 60-day plan is far outside it.
+ */
+export const TERM_LENGTH_TOLERANCE_DAYS = 31;
 
 /** 00:00 in Manila on a calendar date, as epoch ms. */
 export function manilaStartMs(isoDate) {
@@ -232,16 +282,61 @@ export function normalizeCurrency(raw) {
 // ── Plans ────────────────────────────────────────────────────────────────────
 export const normalizeLabel = (raw) => String(raw == null ? '' : raw).trim().replace(/\s+/g, ' ').toLowerCase();
 
+/** The spellings of one plan that a roster label may use, all normalized (#68). */
+function planLabelCandidates(p) {
+  const out = new Set();
+  const add = (s) => { const n = normalizeLabel(s); if (n) out.add(n); };
+  add(p?.key);
+  for (const text of [p?.name, p?.tagline]) {
+    const n = normalizeLabel(text);
+    if (!n) continue;
+    add(n);
+    // "Silver · Self-Paced" is written "Silver" in a roster; "VIP Package" is "VIP".
+    add(n.split('·')[0]);
+    add(n.replace(/\s+package$/, ''));
+  }
+  return out;
+}
+
 /**
- * A SUGGESTION for an unmapped plan label: an exact match on a plan key or plan
- * name, nothing looser. The admin still has to confirm it — `VIP` suggests `vip`,
- * but it is the confirmed mapping, not this function, that stages the row.
+ * A SUGGESTION for an unmapped plan label: an EXACT normalized match on the plan's
+ * key, its name (the package title), its tagline (the product line), or the first
+ * part of either — before a `·`, or without a trailing " package". Nothing looser:
+ * no substring, no fuzzy match, and a price is never a plan.
+ *
+ * ★ #68: before this, "Essentials" and "Silver" matched nothing, and the picker listed
+ *   product names only, so an Essentials roster was one plausible click away from the
+ *   full-access Silver plan. A label two plans both claim suggests NOTHING rather than
+ *   the first of them. The admin still confirms every mapping; this only pre-fills it.
  */
 export function suggestPlanForLabel(label, plans) {
   const n = normalizeLabel(label);
   if (!n) return null;
-  const hit = (plans || []).find((p) => normalizeLabel(p.key) === n || normalizeLabel(p.name) === n);
-  return hit ? hit.key : null;
+  const keys = new Set();
+  for (const p of plans || []) if (p?.key && planLabelCandidates(p).has(n)) keys.add(p.key);
+  return keys.size === 1 ? [...keys][0] : null;
+}
+
+/** Does this plan take a cohort? `community_segment` is the one fact every layer asks. */
+export const isVipPlan = (plan) => plan?.community_segment === 'vip';
+
+/**
+ * The batch component of a non-VIP plan's record key (#68). A batch code is forced to
+ * `YYYY-MM` by a CHECK constraint, so 'none' can never collide with one. It keeps "one
+ * legacy grant per person per plan" for Silver and Essentials, whose rows used to get a
+ * NULL key — and a NULL key escapes the unique index and both duplicate checks.
+ */
+export const NON_VIP_BATCH_TOKEN = 'none';
+
+/**
+ * Which plan wins when one person is in two rosters: the higher rank. An EXPLICIT order,
+ * never a price or a catalog position — the cheapest plan is also the most scoped, so
+ * price says nothing about scope. legacy_import_plan_rank() in SQL is the authority;
+ * test/legacyMigration.test.mjs pins this mirror.
+ */
+const PLAN_RANK = Object.freeze({ vip: 3, silver_self_paced: 2, sampler: 1 });
+export function planRank(key) {
+  return Object.prototype.hasOwnProperty.call(PLAN_RANK, key) ? PLAN_RANK[key] : 0;
 }
 
 // ── Batches ──────────────────────────────────────────────────────────────────
@@ -287,11 +382,54 @@ export function startDateFitsBatch(startIso, batchCode) {
   return Math.abs((y * 12 + (m - 1)) - b) <= 1;
 }
 
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * How many cohort seats a VIP legacy term buys (#68): the whole months in
+ * [start, end], at least 1 and at most the plan's own batch count.
+ *
+ *   months = (ey-sy)*12 + (em-sm) - (ed' < sd ? 1 : 0), on start and end' = end + 1 day
+ *   seats  = max(1, min(planBatchCount, months))
+ *
+ * So Oct 12 → Apr 12 is 6 seats, and a student who paid for one month gets 1 — never
+ * the plan's full six, which was what #67 granted every VIP row whatever it had bought.
+ * SQL's legacy_import_seat_count() is the authority; it computes the same months with
+ * `extract(year from age(p_end + 1, p_start))*12 + extract(month from age(...))`.
+ *
+ * `planBatchCount` is plan_eligible_batch_count() for the plan — 6 for VIP. A non-VIP
+ * plan takes no cohort: pass 0 (or nothing) and the answer is 0, as it is in SQL.
+ * Unreadable dates also give 0, never a guessed number of seats.
+ *
+ * ★ NO TERM, NO COUNT — AND THAT INCLUDES AN END BEFORE ITS START. SQL returns NULL for a
+ *   missing date and for `p_end < p_start`, BEFORE its greatest(1, …) runs; this mirror
+ *   answers 0 for both (its one spelling of "no seats"). It used to fall through to
+ *   max(1, …) and report 1 seat for swapped dates — and the test pinned that 1 with a
+ *   message that described the SQL wrongly. An end equal to the start is a real one-day
+ *   term and still buys its one seat, on both sides.
+ */
+export function legacySeatCount(startIso, endIso, planBatchCount) {
+  const cap = Math.trunc(Number(planBatchCount));
+  if (!Number.isFinite(cap) || cap < 1) return 0;
+  if (!ISO_DATE_RE.test(String(startIso || '')) || !ISO_DATE_RE.test(String(endIso || ''))) return 0;
+  // Zero-padded ISO dates order as strings; the regex above guarantees the padding.
+  if (String(endIso) < String(startIso)) return 0;
+  const s = isoParts(startIso);
+  const e = isoParts(endIso);
+  // end + 1 day, through Date.UTC so a month or year boundary rolls over correctly.
+  const next = new Date(Date.UTC(e.y, e.m - 1, e.d + 1));
+  const ey = next.getUTCFullYear(); const em = next.getUTCMonth() + 1; const ed = next.getUTCDate();
+  const months = (ey - s.y) * 12 + (em - s.m) - (ed < s.d ? 1 : 0);
+  return Math.max(1, Math.min(cap, months));
+}
+
 // ── Identity and idempotency ─────────────────────────────────────────────────
 /**
  * The string whose SHA-256 is the row's legacy_record_key. One legacy purchase =
  * one identity + plan + cohort. SQL builds the SAME string in legacy_import_stage()
  * and hashes it with sha256(); the database value is the authority.
+ *
+ * For a non-VIP plan the caller passes NON_VIP_BATCH_TOKEN as `batchCode` (#68), so
+ * the key reads `thinkific|email:x|silver_self_paced|none`, exactly as SQL builds it.
  */
 export function legacyRecordKeyInput({ externalId, email, planKey, batchCode }) {
   const identity = externalId ? `ext:${externalId}` : `email:${email}`;
@@ -315,15 +453,19 @@ const cell = (raw, mapping, key) => {
  * @param opts.dateFormat one of DATE_FORMATS — REQUIRED, never inferred
  * @param opts.planMapping  { normalizedLabel: planKey }   (admin-confirmed)
  * @param opts.batchMapping { normalizedLabel: batchCode } (admin-confirmed)
- * @param opts.plans      [{ key, name, active, price_php }]
+ * @param opts.plans      [{ key, name, tagline, active, price_php, access_days, community_segment }]
+ *                        — ★ community_segment is what decides whether a row takes a batch;
+ *                        a plan read without it is treated as non-VIP here, and SQL (which
+ *                        reads the live catalog) then blocks any VIP row that lost its batch.
  * @param opts.batches    [{ id, code, name, status }]
- * @param opts.eligibleBatchCodes  cohorts chosen for activation
+ * @param opts.eligibleBatchCodes  cohorts chosen for activation (VIP rows)
+ * @param opts.eligiblePlanKeys    non-VIP plans chosen for activation (#68)
  * @param opts.nowMs      epoch ms
  */
 export function normalizeLegacyRows(rows, opts) {
   const {
     mapping = {}, dateFormat, planMapping = {}, batchMapping = {},
-    plans = [], batches = [], eligibleBatchCodes = [], nowMs,
+    plans = [], batches = [], eligibleBatchCodes = [], eligiblePlanKeys = [], nowMs,
   } = opts || {};
   if (!DATE_FORMATS.includes(dateFormat)) throw new Error('normalizeLegacyRows: a declared date format is required');
   if (typeof nowMs !== 'number') throw new Error('normalizeLegacyRows: nowMs is required');
@@ -331,6 +473,7 @@ export function normalizeLegacyRows(rows, opts) {
   const planByKey = new Map(plans.map((p) => [p.key, p]));
   const batchByCode = new Map(batches.map((b) => [b.code, b]));
   const eligible = new Set(eligibleBatchCodes);
+  const eligiblePlans = new Set(eligiblePlanKeys);
 
   const out = (rows || []).map((raw, i) => {
     const errors = [];
@@ -357,14 +500,32 @@ export function normalizeLegacyRows(rows, opts) {
     const end = parseDateByFormat(cell(raw, mapping, 'end_date'), dateFormat);
     if (!start.valid) errors.push('start_date_invalid');
     if (!end.valid) errors.push('end_date_invalid');
+    const plan = planKey ? planByKey.get(planKey) : null;
+    const vip = isVipPlan(plan);
     if (start.valid && end.valid) {
       if (end.iso < start.iso) errors.push('date_order');
-      else if (termStatusAt(start.iso, end.iso, nowMs) === 'ended') errors.push('term_ended');
+      else {
+        if (termStatusAt(start.iso, end.iso, nowMs) === 'ended') errors.push('term_ended');
+        // #68: a warning, never a block — a legacy term may legitimately differ from what
+        // the plan sells today. It catches a swapped D/M format on a plan with no batch
+        // month to check it against, and a 180-day VIP end left on a 60-day plan.
+        const accessDays = Number(plan?.access_days);
+        if (Number.isFinite(accessDays) && accessDays > 0
+          && Math.abs(termDays(start.iso, end.iso) - accessDays) > TERM_LENGTH_TOLERANCE_DAYS) {
+          warnings.push('term_length_unusual');
+        }
+      }
     }
 
+    // ★ THE BATCH RULES ARE VIP-ONLY (#68). A Silver or Essentials row runs none of them
+    //   and stores no batch; a label in the file is kept as history, with a warning. A
+    //   row whose plan is unmapped or unknown skips them too — it is already blocked by
+    //   plan_*, and legacy_import_stage() (which reads the plan's segment) does the same.
     const batchLabel = cell(raw, mapping, 'batch_label');
     let batchCode = null;
-    if (!batchLabel) errors.push('batch_missing');
+    if (!vip) {
+      if (batchLabel && planKey) warnings.push('batch_ignored_for_plan');
+    } else if (!batchLabel) errors.push('batch_missing');
     else {
       batchCode = batchMapping[normalizeLabel(batchLabel)] || null;
       const batch = batchCode ? batchByCode.get(batchCode) : null;
@@ -409,8 +570,10 @@ export function normalizeLegacyRows(rows, opts) {
       currency: currency.valid ? currency.currency : null,
       phone: normalizePhone(cell(raw, mapping, 'phone')),
       identity_basis: externalId ? 'external_id' : 'email',
-      record_key_input: email && planKey && batchCode
-        ? legacyRecordKeyInput({ externalId, email, planKey, batchCode }) : null,
+      // ★ Non-VIP rows key on NON_VIP_BATCH_TOKEN, never on a NULL batch (#68).
+      record_key_input: email && planKey && (vip ? batchCode : true)
+        ? legacyRecordKeyInput({ externalId, email, planKey, batchCode: vip ? batchCode : NON_VIP_BATCH_TOKEN })
+        : null,
       errors,
       warnings,
     };
@@ -420,10 +583,19 @@ export function normalizeLegacyRows(rows, opts) {
   const byEmail = new Map();
   for (const r of out) {
     if (!r.email_normalized) continue;
-    byEmail.set(r.email_normalized, (byEmail.get(r.email_normalized) || 0) + 1);
+    if (!byEmail.has(r.email_normalized)) byEmail.set(r.email_normalized, []);
+    byEmail.get(r.email_normalized).push(r);
   }
-  for (const r of out) {
-    if (r.email_normalized && byEmail.get(r.email_normalized) > 1) r.errors.push('duplicate_in_file');
+  for (const group of byEmail.values()) {
+    if (group.length < 2) continue;
+    // #68: under DIFFERENT mapped plans the copies are an upgrade, not a bundle export
+    // listing one purchase twice. Still blocked either way — nothing picks a winner —
+    // but the reason says which case it is, so the owner knows what to fix in the file.
+    const plansSeen = new Set(group.map((r) => r.plan_key).filter(Boolean));
+    for (const r of group) {
+      r.errors.push('duplicate_in_file');
+      if (plansSeen.size > 1) r.errors.push('multiple_plans_in_file');
+    }
   }
 
   // A phone shared by two DIFFERENT emails is a hint, never an identity (see LEGACY_FIELDS).
@@ -438,10 +610,18 @@ export function normalizeLegacyRows(rows, opts) {
   }
 
   for (const r of out) {
+    // Unreachable today (a valid row has an email, a known plan and, for VIP, a batch),
+    // and kept that way on purpose: SQL adds the same error, because a keyless row escapes
+    // every guard against granting one purchase twice.
+    if (r.errors.length === 0 && !r.record_key_input) r.errors.push('record_key_missing');
     const dup = r.errors.includes('duplicate_in_file');
     r.validation_status = r.errors.length === 0 ? 'valid' : (dup ? 'duplicate' : 'blocked');
-    r.activation_state = r.validation_status !== 'valid' ? 'blocked'
-      : (eligible.has(r.batch_code) ? 'ready' : 'inactive');
+    // ★ READY IS CHOSEN PER COHORT FOR VIP AND PER PLAN FOR EVERYTHING ELSE (#68). A
+    //   non-VIP row has no batch, so the cohort test alone left every one of them
+    //   inactive for good. legacy_import_stage() applies the same two tests.
+    const vip = isVipPlan(planByKey.get(r.plan_key));
+    const chosen = vip ? eligible.has(r.batch_code) : eligiblePlans.has(r.plan_key);
+    r.activation_state = r.validation_status !== 'valid' ? 'blocked' : (chosen ? 'ready' : 'inactive');
   }
   return out;
 }
@@ -470,10 +650,64 @@ export function defaultEligibleCodes(stagedRows) {
   return codes.length ? [codes[codes.length - 1]] : [];
 }
 
-/** Per-cohort counts, sorted by code; blocked rows with no batch land under null. */
-export function cohortSummary(stagedRows) {
+/**
+ * The non-VIP plans pre-selected for activation (#68): every one that has a valid row,
+ * in catalog order. Unlike a cohort, a self-paced purchase has no "newest" to prefer —
+ * a still-running paid term is owed — and activation still needs the typed
+ * confirmation (owner decision, 2026-09-28).
+ */
+export function defaultEligiblePlanKeys(stagedRows, plans) {
+  const withValid = new Set((stagedRows || [])
+    .filter((r) => r.validation_status === 'valid' && r.plan_key)
+    .map((r) => r.plan_key));
+  return (plans || [])
+    .filter((p) => p?.key && withValid.has(p.key) && !isVipPlan(p))
+    .map((p) => p.key);
+}
+
+/**
+ * Per-plan counts (#68), in catalog order, for the wizard's plan tables: which
+ * package each row became, and whether it is ready. A row with no mapped plan is
+ * blocked by plan_* and is left out — it has no package to show, and a table built
+ * for ticking plans must not offer a tick for "no plan".
+ */
+export function planSummary(stagedRows, plans) {
   const by = new Map();
   for (const r of stagedRows || []) {
+    if (!r.plan_key) continue;
+    if (!by.has(r.plan_key)) by.set(r.plan_key, { total: 0, ready: 0, inactive: 0, blocked: 0 });
+    const g = by.get(r.plan_key);
+    g.total += 1;
+    if (r.activation_state === 'ready') g.ready += 1;
+    else if (r.activation_state === 'inactive') g.inactive += 1;
+    else g.blocked += 1;
+  }
+  const catalog = (plans || []).filter((p) => p?.key);
+  const known = new Set(catalog.map((p) => p.key));
+  const order = [...catalog.map((p) => p.key).filter((k) => by.has(k)),
+    ...[...by.keys()].filter((k) => !known.has(k)).sort()];
+  return order.map((key) => {
+    const p = catalog.find((x) => x.key === key) || null;
+    return {
+      plan_key: key,
+      name: p?.name || null,
+      tagline: p?.tagline || null,
+      segment: p?.community_segment || null,
+      ...by.get(key),
+    };
+  });
+}
+
+/**
+ * Per-cohort counts, sorted by code; blocked rows with no batch land under null.
+ * Pass `plans` (#68) to count VIP rows only: a Silver or Essentials row has no batch
+ * by design and belongs in planSummary(), not in a "No batch" line of this table.
+ */
+export function cohortSummary(stagedRows, plans) {
+  const planByKey = plans ? new Map(plans.filter((p) => p?.key).map((p) => [p.key, p])) : null;
+  const by = new Map();
+  for (const r of stagedRows || []) {
+    if (planByKey && r.plan_key && planByKey.has(r.plan_key) && !isVipPlan(planByKey.get(r.plan_key))) continue;
     const k = r.batch_code || null;
     if (!by.has(k)) by.set(k, { batch_code: k, label: r.legacy_batch_label || null, total: 0, ready: 0, inactive: 0, blocked: 0 });
     const g = by.get(k);
@@ -482,7 +716,14 @@ export function cohortSummary(stagedRows) {
     else if (r.activation_state === 'inactive') g.inactive += 1;
     else g.blocked += 1;
   }
-  return [...by.values()].sort((a, b) => String(a.batch_code || '~').localeCompare(String(b.batch_code || '~')));
+  // Null LAST. The old `localeCompare` on a '~' stand-in meant to do this, but a locale
+  // collation sorts punctuation before digits, so "No batch" always came first.
+  return [...by.values()].sort((a, b) => {
+    if (a.batch_code === b.batch_code) return 0;
+    if (a.batch_code == null) return 1;
+    if (b.batch_code == null) return -1;
+    return a.batch_code < b.batch_code ? -1 : 1;
+  });
 }
 
 // ── Phone ────────────────────────────────────────────────────────────────────

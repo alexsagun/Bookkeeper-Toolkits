@@ -182,3 +182,33 @@ test('the catalog has no duplicates and every code matches the wire shape', () =
     assert.match(c, /^[A-Z][A-Z0-9_]{2,39}$/, `${c} cannot survive the hint validator`);
   }
 });
+
+// ── #68: the legacy migration, round 2 ──────────────────────────────────────
+
+test('LEGACY_BATCH_GAP is a known code, read off the hint, with its missing months', () => {
+  assert.ok(APP_ERROR_CODES.includes('LEGACY_BATCH_GAP'));
+  // 133 SQL codes in app_error_catalog() after #68, plus the one client-synthesised code.
+  assert.equal(APP_ERROR_CODES.filter((c) => c !== 'MIGRATION_MISSING').length, 133);
+  const e = pgErr({ hint: 'LEGACY_BATCH_GAP', code: 'PT409', context: { missing: ['2026-11'] } });
+  assert.equal(appErrorCode(e), 'LEGACY_BATCH_GAP');
+  assert.deepEqual(appErrorContext(e), { missing: ['2026-11'] });
+  const msg = appErrorMessage(e);
+  assert.match(msg, /no batch yet/);
+  assert.match(msg, /Admin → Batches/, 'it names the screen that fixes it');
+  assert.match(msg, /skip that month for good/, 'and why it matters: the allocator only moves forward');
+});
+
+test('the revert refusal no longer sends the Super Admin to Enrollments', () => {
+  // Enrollments cannot change a plan or a term's dates — the old copy pointed at a screen
+  // with no way to act.
+  const copy = APP_ERROR_COPY.LEGACY_REVERT_REFUSED;
+  assert.doesNotMatch(copy, /Enrollments/);
+  assert.match(copy, /nothing was changed/i);
+  assert.match(copy, /five characters/, 'it covers the short-reason refusal too — this copy replaces the database sentence');
+});
+
+test('a busy run no longer blames a window that may not exist', () => {
+  const copy = APP_ERROR_COPY.LEGACY_RUN_BUSY;
+  assert.match(copy, /stopped part-way/);
+  assert.match(copy, /10 minutes/);
+});
