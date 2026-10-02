@@ -38,6 +38,7 @@ import {
   staffRole,
   staffStatusLabel,
 } from '../src/lib/staffRoles.js';
+import { planEntitlement } from '../src/lib/planCatalog.js';
 
 const ctxFor = (roleKey, extra = {}) =>
   normalizeStaffContext({ role_key: roleKey, status: 'active', ...extra });
@@ -140,7 +141,7 @@ test('role ranks are unique and strictly descending', () => {
 
 // ── The matrix ───────────────────────────────────────────────────────────────
 
-test('the matrix covers 3 roles x 22 permissions with no unknown keys', () => {
+test('the matrix covers 3 roles x 23 permissions with no unknown keys', () => {
   let cells = 0;
   for (const roleKey of STAFF_ROLE_KEYS) {
     const held = ROLE_PERMISSIONS[roleKey];
@@ -153,8 +154,8 @@ test('the matrix covers 3 roles x 22 permissions with no unknown keys', () => {
     for (const key of STAFF_PERMISSION_KEYS) cells += 1;
   }
   assert.equal(cells, STAFF_ROLE_KEYS.length * STAFF_PERMISSION_KEYS.length,
-    'the matrix must cover 3 roles x 22 permissions');
-  assert.equal(cells, 66, 'a changed cell count means a permission or role was added without updating this sweep');
+    'the matrix must cover 3 roles x 23 permissions');
+  assert.equal(cells, 69, 'a changed cell count means a permission or role was added without updating this sweep');
 });
 
 test('super_admin holds every permission', () => {
@@ -735,6 +736,80 @@ test('staffBypassesPaywall is true only for active staff', () => {
   assert.ok(staffBypassesPaywall(TRAINER));
   assert.equal(staffBypassesPaywall(EMPTY_STAFF_CONTEXT), false);
   assert.equal(staffBypassesPaywall(null), false);
+});
+
+// ── The Getting Started video (#69) ──────────────────────────────────────────
+//
+// Two tab ids, different on purpose. `gettingstartedadmin` is the Super Admin screen, gated
+// on onboarding.manage. `gettingstarted` is the STUDENT replay page, left to the plan
+// entitlement. Neither is `onboarding`, which is the Client Onboarding tool.
+
+test('onboarding.manage is the 23rd and last permission, held by super_admin alone (#69)', () => {
+  assert.equal(STAFF_PERMISSION_KEYS.length, 23);
+  assert.equal(STAFF_PERMISSION_KEYS.at(-1), 'onboarding.manage',
+    'the SQL seed lists it last, and test/staffRolesSql.test.mjs diffs the ORDER, not the set');
+  const p = STAFF_PERMISSIONS.find((x) => x.key === 'onboarding.manage');
+  assert.ok(p, 'onboarding.manage is missing from STAFF_PERMISSIONS');
+  assert.equal(p.category, 'Onboarding', 'its own group in the role-capability preview');
+  assert.match(p.label, /Getting Started video/, 'named for the surface it opens');
+  const holders = STAFF_ROLE_KEYS.filter((r) => permissionsForRole(r).includes('onboarding.manage'));
+  assert.deepEqual(holders, [SUPER_ADMIN_ROLE],
+    'publishing or replacing the video changes the first screen every newly approved student sees, '
+    + `a product-wide change, so it is Super Admin only; found ${holders.join(', ')}`);
+  assert.ok(staffCan(SUPER, 'onboarding.manage'));
+  assert.equal(staffCan(OPS, 'onboarding.manage'), false, 'an Operations Admin reviews payments, not the video');
+  assert.equal(staffCan(TRAINER, 'onboarding.manage'), false, 'a Trainer authors courses, not the video');
+});
+
+test('the Getting Started Video screen opens for a Super Admin and nobody else (#69)', () => {
+  assert.equal(ADMIN_TAB_PERMISSION.gettingstartedadmin, 'onboarding.manage');
+  assert.equal(adminTabVisible(SUPER, READY, 'gettingstartedadmin'), true);
+  assert.equal(adminTabVisible(OPS, READY, 'gettingstartedadmin'), false, 'an Operations Admin');
+  assert.equal(adminTabVisible(TRAINER, READY, 'gettingstartedadmin'), false, 'a Trainer');
+  assert.equal(adminTabVisible(EMPTY_STAFF_CONTEXT, READY, 'gettingstartedadmin'), false, 'a student');
+  assert.equal(adminTabVisible(SUPER, { ...READY, staffReady: false }, 'gettingstartedadmin'), false,
+    'absent permission data means "no", even for the role that will hold it');
+  assert.equal(adminTabVisible(OPS, { ...READY, staffDegraded: true }, 'gettingstartedadmin'), false,
+    'a degraded lookup falls back to the is_admin cache, which an Operations Admin never carries');
+  assert.equal(adminTabVisible(EMPTY_STAFF_CONTEXT, { staffReady: false, staffDegraded: true, profileIsAdmin: true },
+    'gettingstartedadmin'), true, 'degraded + is_admin (= active Super Admin since #45)');
+});
+
+test('a Super Admin still sees the Getting Started Video row before #69 creates onboarding.manage', () => {
+  // The Financial Management lesson (2026-09-14): the live permission list has no Super
+  // Admin shortcut, so on a database without #69 the key is missing even for the role that
+  // will hold it. The row must stay, so the screen can say "finish database setup".
+  const pre69 = STAFF_PERMISSION_KEYS.filter((k) => k !== 'onboarding.manage');
+  const superPre69 = ctxFor('super_admin', { permissions: pre69 });
+  assert.equal(staffCan(superPre69, 'onboarding.manage'), false, 'precondition: the pre-#69 list lacks the key');
+  assert.equal(adminTabVisible(superPre69, READY, 'gettingstartedadmin'), true);
+});
+
+test('the student replay tab is left to the plan entitlement (#69)', () => {
+  // Mapping `gettingstarted` here would make the chokepoint refuse it to students, who are
+  // exactly who it is for (the Community tab's reasoning, #56).
+  assert.equal(ADMIN_TAB_PERMISSION.gettingstarted, undefined);
+  assert.equal(adminTabVisible(EMPTY_STAFF_CONTEXT, { staffReady: false }, 'gettingstarted'), true,
+    'a student must never wait on the staff lookup to reach it');
+  assert.equal(ADMIN_TAB_PERMISSION.onboarding, undefined,
+    '`onboarding` is the Client Onboarding tool, an ordinary student tool');
+});
+
+test('staff reach adds neither Getting Started tab to an Operations Admin or a Trainer (#69)', () => {
+  // Staff are never learners (#52): the gate never holds them, the replay page is a student
+  // surface, and the admin screen is Super Admin only.
+  for (const [label, ctx] of [['ops', OPS], ['trainer', TRAINER]]) {
+    for (const base of [null, undefined, scopedBase]) {
+      const ent = staffEntitlement(ctx, base);
+      assert.equal(ent.allowsTab('gettingstartedadmin'), false, `${label} must not reach the admin screen`);
+      assert.equal(ent.allowsTab('gettingstarted'), false, `${label} gains no replay page from staff reach alone`);
+    }
+    // The union still keeps what their own plan pays for, and adds nothing to it.
+    const ent = staffEntitlement(ctx, planEntitlement('sampler'));
+    assert.equal(ent.allowsTab('gettingstarted'), true, `${label} who bought Essentials keeps its replay page`);
+    assert.equal(ent.allowsTab('gettingstartedadmin'), false);
+  }
+  assert.ok(staffEntitlement(SUPER, null).allowsTab('gettingstartedadmin'), 'a Super Admin resolves FULL');
 });
 
 // ── The last-Super-Admin guard ───────────────────────────────────────────────

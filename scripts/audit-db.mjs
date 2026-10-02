@@ -37,6 +37,8 @@ import { LESSON_VIDEO_MAX_BYTES, LESSON_VIDEO_UPLOAD_MIMES } from '../src/lib/co
 // Same rule for lesson IMAGES (#65): the bucket's ceiling and type list are the client's
 // own, imported so raising one moves the check with it.
 import { LESSON_ASSET_BUCKET, LESSON_IMAGE_MAX_BYTES, LESSON_IMAGE_MIMES } from '../src/lib/lessonContent.js';
+// The Getting Started bucket (#69) takes the lesson-video limits above; only its NAME is its own.
+import { ONBOARDING_VIDEO_BUCKET } from '../src/lib/gettingStarted.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..');
@@ -385,10 +387,11 @@ export const OBJECT_CHECKS = [
       (to_regclass('public.staff_role_permissions')), (to_regclass('public.staff_memberships')),
       (to_regclass('public.staff_role_events'))) as v(t)`],
   // #67 replaced students.import (super_admin + operations_admin) with students.legacy_migrate
-  // (super_admin alone): 35 grants -> 34, still 22 permissions.
-  ['#45/#58/#61/#62/#67 role x permission matrix is seeded', `select count(*) = 34 as ok
+  // (super_admin alone): 35 grants -> 34, still 22 permissions. #69 adds onboarding.manage
+  // (super_admin alone): 34 -> 35 grants, 23 permissions.
+  ['#45/#58/#61/#62/#67/#69 role x permission matrix is seeded', `select count(*) = 35 as ok
       from public.staff_role_permissions`],
-  ['#45/#58/#61/#62 all 22 permissions are seeded', `select count(*) = 22 as ok from public.staff_permissions`],
+  ['#45/#58/#61/#62/#69 all 23 permissions are seeded', `select count(*) = 23 as ok from public.staff_permissions`],
   // The caller-scoped helpers MUST be executable by authenticated: an RLS qual is
   // evaluated AS THE QUERYING ROLE, so without the grant every gated read fails
   // with "permission denied for function" instead of a clean authorization denial.
@@ -1434,12 +1437,227 @@ export const OBJECT_CHECKS = [
          or (p.proname = 'legacy_import_start_run' and p.prosrc like '%LEGACY_BATCH_GAP%')
          or (p.proname = 'legacy_import_claim_rows' and p.prosrc like '%higher_plan_pending%')
          or (p.proname = 'legacy_import_record_delivery' and p.prosrc like '%invite_handed_back%'))`],
-  ['#68    the error catalog holds 133 codes, LEGACY_BATCH_GAP included', `select count(*) = 133
+  // #69 restated the catalog (141 codes), so the EXACT count belongs to its block below; this
+  // line asks only that #68's code survived every later restatement.
+  ['#68    the error catalog keeps LEGACY_BATCH_GAP (and at least the 133 codes of #68)', `select count(*) >= 133
         and bool_or(code = 'LEGACY_BATCH_GAP') as ok from public.app_error_catalog()`],
   ['#68    the three plans carry their package titles', `select count(*) = 3 as ok from public.enrollment_plans
       where (key, name, tagline) in (('vip', 'VIP Package', 'Personalized Coaching Program'),
                                      ('silver_self_paced', 'Silver · Self-Paced', 'QBO + Resume Combo'),
                                      ('sampler', 'Essentials', 'Sampler Session'))`],
+
+  // ── #69, the Getting Started onboarding video ─────────────────────────────
+  // ★ A second private bucket read by REFERENCE and written by PATH — #65's inversion. Storage
+  //   policies are invisible to db:shadow:verify (it filters pg_policies to schemaname='public',
+  //   and never compares a qual, an ACL or prosrc), so these lines are the only live guard on
+  //   the read/write split, on the three function-ACL classes and on the gate rule.
+  ['#69    the Getting Started migration is recorded', `select count(*) = 1 as ok from public.schema_migrations
+      where filename = '2026-09-30-getting-started-video.sql'`],
+  ['#69    onboarding.manage is held by super_admin alone: 23 permissions / 35 grants', `select
+        (select array_agg(role_key order by role_key) from public.staff_role_permissions
+          where permission_key = 'onboarding.manage') = array['super_admin']::text[]
+    and (select count(*) from public.staff_permissions) = 23
+    and (select count(*) from public.staff_role_permissions) = 35 as ok`],
+  // ★ The finance rule: every write is a SECURITY DEFINER function, so each table keeps exactly
+  //   ONE policy, a SELECT, and no client DML — TRUNCATE included, since row triggers do not fire
+  //   on it and the trail is meant to be permanent. Never FORCE row level security here: the
+  //   guards and the RPCs run as the table owner.
+  ['#69    the three tables have RLS (not forced), one SELECT policy each, and no client write path', `select
+        count(*) = 3 and coalesce(bool_and(ok), false) as ok from (
+      select c.relrowsecurity and not c.relforcerowsecurity
+         and (select count(*) from pg_policies p
+               where p.schemaname = 'public' and p.tablename = c.relname) = 1
+         and (select count(*) from pg_policies p
+               where p.schemaname = 'public' and p.tablename = c.relname
+                 and p.cmd = 'SELECT' and p.qual ilike '%onboarding.manage%') = 1
+         and not has_table_privilege('authenticated', c.oid, 'insert')
+         and not has_table_privilege('authenticated', c.oid, 'update')
+         and not has_table_privilege('authenticated', c.oid, 'delete')
+         and not has_table_privilege('authenticated', c.oid, 'truncate') as ok
+        from pg_class c join pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = 'public' and c.relkind = 'r'
+         and c.relname in ('onboarding_videos', 'student_onboarding_progress', 'onboarding_video_events')
+    ) t`],
+  // ★ The upload takes the lesson uploader's limits, so both are built from the client's own
+  //   LESSON_VIDEO_MAX_BYTES / LESSON_VIDEO_UPLOAD_MIMES — never retyped (the #57 lesson).
+  ['#69    the onboarding-videos bucket is private, at the lesson-video cap and types', `select coalesce(bool_and(
+        not public and file_size_limit = ${LESSON_VIDEO_MAX_BYTES}
+        and allowed_mime_types = array[${LESSON_VIDEO_UPLOAD_MIMES.map((m) => `'${m}'`).join(', ')}]), false) as ok
+      from storage.buckets where id='${ONBOARDING_VIDEO_BUCKET}'`],
+  // ★ Reads resolve a REFERENCE (the path the published row cites) and never parse a path — the
+  //   #44 regression; writes parse the PATH into a DRAFT's folder, Super Admin only; and a delete
+  //   without its NOT would let the live file, and only it, be removed. Each arm is coalesced, so
+  //   a NULL clause cannot slip through bool_and; `count(*) = 4` so a dropped policy fails; and
+  //   exactly four policies may name the bucket at all. Quals are matched by name only: the
+  //   catalog renders the permission as 'onboarding.manage'::text and may schema-qualify a call.
+  // ★ …AND EACH POLICY WHOLE, OPERATORS INCLUDED (TDR-2). A probe per TERM passes `and` → `or`:
+  //   `bucket and staff OR upload_allowed` lets a Super Admin overwrite the LIVE object, and a read
+  //   policy whose top-level `and` became `or` serves every object in the bucket to anyone signed
+  //   in. So each arm also compares the whole expression as Postgres DEPARSES it — read on the
+  //   shadow project, PostgreSQL 17.6 — with `public.` removed, since the catalog qualifies a
+  //   call only when the reading session's search_path cannot see it. Each expected text is
+  //   checked against the policy the migration creates by test/gettingStartedSql.test.mjs.
+  ['#69    onboarding-video READS are by reference, WRITES by path, and the live file cannot be deleted', `select
+        count(*) = 4 and coalesce(bool_and(ok), false)
+    and (select count(*) from pg_policies where schemaname = 'storage'
+          and (coalesce(qual, '') || ' ' || coalesce(with_check, '')) ilike '%${ONBOARDING_VIDEO_BUCKET}%') = 4 as ok
+      from (
+      select coalesce(qual ilike '%onboarding_video_object_readable(%'
+               and qual not ilike '%onboarding_video_upload_allowed%'
+               and qual not ilike '%onboarding_video_path_version_id%'
+               and replace(qual, 'public.', '') = '((bucket_id = ''${ONBOARDING_VIDEO_BUCKET}''::text) AND (( SELECT has_staff_permission(''onboarding.manage''::text) AS has_staff_permission) OR onboarding_video_object_readable(name)))'
+               and with_check is null, false) as ok
+        from pg_policies where schemaname = 'storage' and policyname = 'onboarding_videos_object_read' and cmd = 'SELECT'
+      union all
+      select coalesce(with_check ilike '%has_staff_permission(''onboarding.manage''%'
+               and with_check ilike '%onboarding_video_upload_allowed(%'
+               and replace(with_check, 'public.', '') = '((bucket_id = ''${ONBOARDING_VIDEO_BUCKET}''::text) AND ( SELECT has_staff_permission(''onboarding.manage''::text) AS has_staff_permission) AND onboarding_video_upload_allowed(name))'
+               and qual is null, false)
+        from pg_policies where schemaname = 'storage' and policyname = 'onboarding_videos_object_insert' and cmd = 'INSERT'
+      union all
+      select coalesce(qual ilike '%has_staff_permission(''onboarding.manage''%'
+               and qual ilike '%onboarding_video_upload_allowed(%'
+               and replace(qual, 'public.', '') = '((bucket_id = ''${ONBOARDING_VIDEO_BUCKET}''::text) AND ( SELECT has_staff_permission(''onboarding.manage''::text) AS has_staff_permission) AND onboarding_video_upload_allowed(name))'
+               and (with_check is null
+                    or (with_check ilike '%has_staff_permission(''onboarding.manage''%'
+                        and with_check ilike '%onboarding_video_upload_allowed(%'
+                        and with_check not ilike '% or %')), false)
+        from pg_policies where schemaname = 'storage' and policyname = 'onboarding_videos_object_update' and cmd = 'UPDATE'
+      union all
+      select coalesce(qual ilike '%has_staff_permission(''onboarding.manage''%'
+               and (qual ilike '%(not onboarding_video_object_is_live(%'
+                    or qual ilike '%(not public.onboarding_video_object_is_live(%')
+               and replace(qual, 'public.', '') = '((bucket_id = ''${ONBOARDING_VIDEO_BUCKET}''::text) AND ( SELECT has_staff_permission(''onboarding.manage''::text) AS has_staff_permission) AND (NOT onboarding_video_object_is_live(name)))'
+               and with_check is null, false)
+        from pg_policies where schemaname = 'storage' and policyname = 'onboarding_videos_object_delete' and cmd = 'DELETE'
+    ) t`],
+  // ★ THREE ACL CLASSES, by exact signature, so a re-signed overload cannot pass by name. A
+  //   storage-policy helper without EXECUTE for authenticated fails EVERY storage.objects
+  //   statement, in every bucket, with "permission denied for function"; an internal function
+  //   with it answers about ANY user (user_onboarding_video_state) or runs a guard out of
+  //   context. anon executes none of the 19; every one pins search_path, and all but the
+  //   immutable path parser are SECURITY DEFINER.
+  // ★ ONE SIGNATURE PER NAME (DBSEC-1). #69 re-signed admin_onboarding_video_publish with a third
+  //   argument, p_expected_live_id, and CREATE OR REPLACE with a new parameter ADDS an overload
+  //   instead of replacing the old one: PostgREST then refuses every call as ambiguous (PGRST203)
+  //   and a two-argument SQL call is "not unique". The file drops the two-argument form first;
+  //   this proves no #69 name has a second signature beside the one checked here.
+  ['#69    12 client RPCs + 3 policy helpers callable by authenticated, the 4 internal functions not; anon none; one signature each', `select
+        count(p.oid) = 19
+    and coalesce(bool_and(
+          case v.cls when 'internal' then not has_function_privilege('authenticated', p.oid, 'execute')
+                     else has_function_privilege('authenticated', p.oid, 'execute') end
+          and not has_function_privilege('anon', p.oid, 'execute')
+          and coalesce(array_to_string(p.proconfig, ','), '') like '%search_path=public, pg_temp%'
+          and (p.prosecdef or v.sig = 'onboarding_video_path_version_id(text)')
+          and (select count(*) from pg_proc p2 join pg_namespace n2 on n2.oid = p2.pronamespace
+                where n2.nspname = 'public' and p2.proname = split_part(v.sig, '(', 1)) = 1), false)
+    and to_regprocedure('public.admin_onboarding_video_publish(uuid,boolean)') is null as ok
+      from (values
+        ('my_onboarding_video()', 'client'), ('start_onboarding_video()', 'client'),
+        ('complete_onboarding_video()', 'client'), ('report_onboarding_video_problem(text)', 'client'),
+        ('admin_onboarding_video_overview()', 'client'),
+        ('admin_onboarding_video_create_draft(text,text,text)', 'client'),
+        ('admin_onboarding_video_update_details(uuid,text,text,text)', 'client'),
+        ('admin_onboarding_video_attach_media(uuid,text,bigint,text,numeric,text)', 'client'),
+        ('admin_onboarding_video_publish(uuid,boolean,uuid)', 'client'),
+        ('admin_onboarding_video_unpublish(uuid)', 'client'), ('admin_onboarding_video_delete(uuid)', 'client'),
+        ('enrollment_decision_email_facts(uuid)', 'client'),
+        ('onboarding_video_object_readable(text)', 'policy'), ('onboarding_video_upload_allowed(text)', 'policy'),
+        ('onboarding_video_object_is_live(text)', 'policy'),
+        ('onboarding_video_path_version_id(text)', 'internal'), ('user_onboarding_video_state(uuid)', 'internal'),
+        ('onboarding_videos_guard()', 'internal'), ('onboarding_video_events_guard()', 'internal')) as v(sig, cls)
+      left join pg_proc p on p.oid = to_regprocedure('public.' || v.sig)::oid`],
+  // #69 owns the EXACT catalog count; the #68 line above only asks that LEGACY_BATCH_GAP survived.
+  ['#69    the error catalog holds exactly 141 codes, the eight ONBOARDING_VIDEO_* included', `select count(*) = 141
+        and count(*) filter (where code in ('ONBOARDING_VIDEO_NOT_FOUND', 'ONBOARDING_VIDEO_UNAVAILABLE',
+          'ONBOARDING_VIDEO_NOT_ELIGIBLE', 'ONBOARDING_VIDEO_NOT_FINISHED', 'ONBOARDING_VIDEO_STATE_INVALID',
+          'ONBOARDING_VIDEO_MEDIA_INVALID', 'ONBOARDING_VIDEO_REPLACE_CONFIRM', 'ONBOARDING_VIDEO_TEXT_INVALID')) = 8 as ok
+      from public.app_error_catalog()`],
+  // ★ HISTORY IS PERMANENT, and at most one version is live by INDEX rather than by trust. The
+  //   events are matched separately because pg_get_triggerdef prints them in a fixed order
+  //   (BEFORE DELETE OR UPDATE), not the order the file declares them in.
+  ['#69    the version and trail guards are armed, and one live version is enforced by index', `select
+        (select count(*) from pg_trigger t
+          where not t.tgisinternal and t.tgenabled = 'O'
+            and ((t.tgname = 'onboarding_videos_guard'
+                  and t.tgrelid = to_regclass('public.onboarding_videos'))
+              or (t.tgname = 'onboarding_video_events_guard'
+                  and t.tgrelid = to_regclass('public.onboarding_video_events')))
+            and pg_get_triggerdef(t.oid) ilike '% BEFORE %'
+            and pg_get_triggerdef(t.oid) ilike '%DELETE%'
+            and pg_get_triggerdef(t.oid) ilike '%UPDATE%'
+            and pg_get_triggerdef(t.oid) ilike '%FOR EACH ROW%') = 2
+    and exists (select 1 from pg_indexes
+                 where schemaname = 'public' and tablename = 'onboarding_videos'
+                   and indexname = 'onboarding_videos_one_live'
+                   and indexdef ilike '%UNIQUE%' and indexdef ilike '%where%published%') as ok`],
+  // ★ The gate rule's load-bearing clauses and the completion rule, as prosrc tripwires: staff
+  //   are never learners (invited + active), the live file must really be in storage, `required`
+  //   is coalesced to a boolean and ends on the first-publish cutoff (`v_first >= v_since`,
+  //   matched as its own clause: a prefix of the expression survives its deletion), and a
+  //   finished version of ANY kind counts (scoped to the live one, publishing V2 would ask every
+  //   V1 finisher again). A completion reads the live row TWICE, both locked for share (SEM-1: the
+  //   second read finds a version published mid-statement), waits the whole elapsed guard (the
+  //   assignment up to its `;`, the comparator the right way round) and is never re-stamped. And every progress write names the CALLER's row: without `user_id = v_uid` one
+  //   student's problem report rewrites every student's, and a completion names every row of the
+  //   live version. A restatement from an older text would drop one of them silently.
+  // ★ THE GATE RULE IS COMPARED WHOLE, OPERATORS INCLUDED (TDR-2): `required` and the three inputs
+  //   it reads, each as one whitespace-collapsed statement. A probe per term — or a prefix of the
+  //   expression — passes `and` → `or`, which holds every student who joined after the cutoff and
+  //   finished nothing, with nothing live, a missing file, a lapsed term or a staff membership.
+  //   So are the two completion lookups: `user_id = p_user or video_id = <live>` in the one for
+  //   the live version reads ANOTHER student's row, and `completed_current` then says this student
+  //   finished a version they never opened.
+  //   `[[:space:]]+` rather than a backslash class: a `\s` typed into this JS template would
+  //   reach Postgres as a bare `s`. test/gettingStartedSql.test.mjs derives each statement from
+  //   the dated file and requires it here verbatim, every probe a conjunct of its branch.
+  ['#69    the gate rule, the completion rule and the problem report hold (prosrc)', `select count(*) = 3 as ok
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public'
+       and ((p.proname = 'user_onboarding_video_state'
+              and regexp_replace(p.prosrc, '[[:space:]]+', ' ', 'g') like '%v_staff := coalesce((select p.is_admin from public.profiles p where p.id = p_user), false) or exists (select 1 from public.staff_memberships m where m.user_id = p_user and m.status in (''invited'', ''active''));%'
+              and regexp_replace(p.prosrc, '[[:space:]]+', ' ', 'g') like '%v_eligible := coalesce(public.user_is_approved(p_user) and public.user_is_enrolled(p_user), false);%'
+              and regexp_replace(p.prosrc, '[[:space:]]+', ' ', 'g') like '%v_media := v_video.id is not null and exists ( select 1 from storage.objects o where o.bucket_id = ''${ONBOARDING_VIDEO_BUCKET}'' and o.name = v_video.storage_path);%'
+              and regexp_replace(p.prosrc, '[[:space:]]+', ' ', 'g') like '%''required'', coalesce(v_video.id is not null and v_media and v_eligible and not v_staff and v_done is null and v_since is not null and v_first is not null and v_first >= v_since, false))%'
+              and regexp_replace(p.prosrc, '[[:space:]]+', ' ', 'g') not like '%''required'',%''required'',%'
+              and p.prosrc like '%and v_first >= v_since, false)%'
+              and regexp_replace(p.prosrc, '[[:space:]]+', ' ', 'g') like '%select min(g.completed_at) into v_done from public.student_onboarding_progress g where g.user_id = p_user and g.completed_at is not null;%'
+              and regexp_replace(p.prosrc, '[[:space:]]+', ' ', 'g') like '%select g.completed_at into v_done_cur from public.student_onboarding_progress g where g.user_id = p_user and g.video_id = v_video.id;%')
+         or (p.proname = 'complete_onboarding_video'
+              and (length(p.prosrc) - length(replace(p.prosrc, 'from public.onboarding_videos where status = ''published'' for share;', '')))
+                  = 2 * length('from public.onboarding_videos where status = ''published'' for share;')
+              and p.prosrc like '%v_min_secs := greatest(coalesce(v_video.duration_seconds, 60) * 0.4, 5);%'
+              and p.prosrc like '%if now() < v_ready_at then%'
+              and p.prosrc like '%set completed_at = coalesce(completed_at, now()),%where user_id = v_uid and video_id = v_video.id%returning completed_at into v_done_at;%'
+              and p.prosrc not like '%completed_at = now()%')
+         or (p.proname = 'report_onboarding_video_problem'
+              and p.prosrc like '%set last_problem_at = now(),%where user_id = v_uid%and video_id = (v_state->>''video_id'')::uuid%and (last_problem_at is null or last_problem_at <= now() - interval ''1 minute'');%'))`],
+  // ★ The three storage helpers answer what the policies ask: the read helper resolves the
+  //   PUBLISHED row's path for an approved, enrolled caller and never parses a path; the two
+  //   write-side helpers check onboarding.manage themselves, which is why granting them to
+  //   authenticated is no oracle.
+  // ★ …AND EACH BODY WHOLE, BY EQUALITY (TDR-2). The probes per term pass `and` → `or` inside a
+  //   body: `staff OR a draft's folder` lets a Super Admin write over the LIVE object, `signed in
+  //   OR …` serves every object to anyone signed in, and an is_live that answers true for every
+  //   name blocks every delete. Equality rather than LIKE, because each body is ONE statement and a
+  //   SQL function answers with its LAST: a `select true;` after the real one would be the answer.
+  //   test/gettingStartedSql.test.mjs requires each body here verbatim, as the dated file writes it.
+  ['#69    the storage helpers, each body WHOLE: reads by reference, writes into a draft, both write helpers gated (prosrc)', `select count(*) = 3 as ok
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public'
+       and ((p.proname = 'onboarding_video_object_readable'
+              and p.prosrc like '%v.status = ''published'' and v.storage_path = p_name%'
+              and p.prosrc like '%user_is_approved(%' and p.prosrc like '%user_is_enrolled(%'
+              and p.prosrc not like '%onboarding_video_path_version_id%'
+              and btrim(regexp_replace(p.prosrc, '[[:space:]]+', ' ', 'g')) = 'select (select auth.uid()) is not null and exists (select 1 from public.onboarding_videos v where v.status = ''published'' and v.storage_path = p_name) and public.user_is_approved((select auth.uid())) and public.user_is_enrolled((select auth.uid()));')
+         or (p.proname = 'onboarding_video_upload_allowed'
+              and p.prosrc like '%has_staff_permission(''onboarding.manage'')%'
+              and p.prosrc like '%v.status = ''draft''%'
+              and p.prosrc like '%onboarding_video_path_version_id(p_name)%'
+              and btrim(regexp_replace(p.prosrc, '[[:space:]]+', ' ', 'g')) = 'select public.has_staff_permission(''onboarding.manage'') and exists (select 1 from public.onboarding_videos v where v.status = ''draft'' and v.id = public.onboarding_video_path_version_id(p_name));')
+         or (p.proname = 'onboarding_video_object_is_live'
+              and p.prosrc like '%has_staff_permission(''onboarding.manage'')%'
+              and p.prosrc like '%v.status = ''published'' and v.storage_path = p_name%'
+              and btrim(regexp_replace(p.prosrc, '[[:space:]]+', ' ', 'g')) = 'select public.has_staff_permission(''onboarding.manage'') and exists (select 1 from public.onboarding_videos v where v.status = ''published'' and v.storage_path = p_name);'))`],
 
 ];
 

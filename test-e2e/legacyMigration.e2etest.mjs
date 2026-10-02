@@ -35,6 +35,7 @@ import { createClient } from '@supabase/supabase-js';
 
 import { launchChrome } from './_cdp.mjs';
 import { ensureUsers, injectSession, lit, runSql, scalar, shadowEnv, signIn, skipReason, startApp } from './_app.mjs';
+import { assertNoLiveOnboardingVideo } from './_onboarding.mjs';
 import { REPO_ROOT } from '../scripts/_shadow.mjs';
 
 const SKIP = skipReason();
@@ -65,6 +66,11 @@ function roster() {
 
 before(async () => {
   if (SKIP) return;
+  // ★ #69: a Getting Started video left PUBLISHED on shadow (a gettingStarted or onboardingVideo
+  //   run that never reached its cleanup) would hold the student below on the Getting Started
+  //   screen after "Go To Dashboard", and this suite would time out on a dashboard it never
+  //   reaches. Refuse up front, and say why.
+  await assertNoLiveOnboardingVideo('legacyMigration.e2etest.mjs');
   people = await ensureUsers([
     { label: 'lm-super', fullName: 'LM Super' }, { label: 'lm-ops', fullName: 'LM Ops' }, { label: 'lm-student', fullName: 'LM Student' },
   ]);

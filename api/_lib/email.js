@@ -11,6 +11,9 @@
 //   its own risk, and it is not what this change is for. This module exists so
 //   the STAFF invitation can be branded and testable; when a fourth sender needs
 //   it, that is the moment to migrate the other two.
+//   #69 moved the two notify handlers' SENDING here (sendEmail: one idempotency key,
+//   a text part, a Reply-To) and gave them plainTextEmail() and studentReplyTo()
+//   below. Their HTML is still their own: the look of those emails did not change.
 //
 // ★ WHY PLAIN TEXT MATTERS HERE. Every sender in this repo posts { from, to,
 //   subject, html } and nothing else. A message with no text/plain part is a
@@ -104,15 +107,51 @@ async function limitKindOf(r) {
 }
 
 /**
+ * Which conflict a Resend 409 describes (#69, EMAIL-2) — Resend names it in the error body
+ * (docs: idempotency keys, "Possible responses"):
+ *   'in_flight' — concurrent_idempotent_requests: a request with this key is still being
+ *                 processed. THAT request owns the email; it may well be delivered.
+ *   'payload'   — invalid_idempotent_request: this key was already used, within the 24 hours
+ *                 the provider keeps it, with a DIFFERENT payload. Nobody is sending this one,
+ *                 and nothing more will arrive for it.
+ *   'unknown'   — anything else, or a body that cannot be read.
+ *
+ * ★ ONLY THE PROVIDER'S OWN WORDS EARN 'in_flight'. Every 409 used to read as "the same email is
+ *   already on its way", which is false for the second kind: a decision made again under an old
+ *   key was refused, and the reviewer was told it was being delivered.
+ *
+ * Pure: it sees only the error's `name`, and returns one of three words — never the body.
+ *
+ * @param {{ name?: unknown }} [o]
+ * @returns {'in_flight'|'payload'|'unknown'}
+ */
+export function resendConflictKind({ name } = {}) {
+  const n = typeof name === 'string' ? name.trim().toLowerCase() : '';
+  if (n === 'concurrent_idempotent_requests') return 'in_flight';
+  if (n === 'invalid_idempotent_request') return 'payload';
+  return 'unknown';
+}
+
+/** Read a 409's error name — only to classify it; the body goes nowhere else. */
+async function conflictKindOf(r) {
+  let name = '';
+  try {
+    name = JSON.parse(String(await r.text()).slice(0, 4000))?.name;
+  } catch { /* unreadable: 'unknown' */ }
+  return resendConflictKind({ name });
+}
+
+/**
  * POST one message to Resend, honouring 429/Retry-After with a bounded backoff.
  *
  * `replyTo` (#50): where a human's reply actually lands. Without it, replies go
  * to the (typically unwatched) From address while the message says "contact our
  * team" — a support address the reader has no way to reach.
  *
- * @returns {{ ok: true, id?: string } | { ok: false, code: string, limit?: 'rate'|'quota' }}
+ * @returns {{ ok: true, id?: string } | { ok: false, code: string, limit?: 'rate'|'quota', conflict?: 'in_flight'|'payload'|'unknown' }}
  *   `code` is always a short slug safe to store and render. Never a message.
  *   `limit` rides only on a 'resend_429', and only when `classify429` asks (resendLimitKind).
+ *   `conflict` rides only on a 'resend_409', and only when `classify409` asks (resendConflictKind).
  */
 export async function sendEmail({
   to, subject, html, text, replyTo, headers, tag = 'email', idempotencyKey: stableKey,
@@ -137,6 +176,11 @@ export async function sendEmail({
   //   from the error body by resendLimitKind(), the body itself going nowhere. Opt-in, so every
   //   other caller keeps the exact answer shape it had.
   classify429 = false,
+  // #69 (EMAIL-2): `classify409: true` adds `conflict: 'in_flight' | 'payload' | 'unknown'` to a
+  //   returned 'resend_409' — read from the error body by resendConflictKind(). Opt-in for the
+  //   same reason: the queue (commSend.js), the migration and the onboarding notice each decide on
+  //   the bare 'resend_409' themselves, and keep exactly the answer they had.
+  classify409 = false,
 }) {
   const apiKey = process.env.RESEND_API_KEY;
   const from = (typeof fromOverride === 'string' && fromOverride.trim()) || process.env.RESEND_FROM;
@@ -212,6 +256,7 @@ export async function sendEmail({
       // Status only. The body can echo the recipient and is not ours to log.
       console.error(`[${tag}] resend ${r.status}`);
       if (unanswered && r.status >= 400 && r.status < 500) return { ok: false, code: unanswered };
+      if (classify409 && r.status === 409) return { ok: false, code: 'resend_409', conflict: await conflictKindOf(r) };
       return { ok: false, code: `resend_${r.status}` };
     }
     // No sleep after the final attempt: it would only spend the caller's time budget.
@@ -360,4 +405,123 @@ export function plainText(blocks) {
     if (b.bullet) { lines.push(`  * ${b.bullet}`); continue; }
   }
   return `${lines.join('\n').replace(/\n{3,}/g, '\n\n').trim()}\n`;
+}
+
+// Every MANDATORY line break in Unicode (UAX #14: BK = VT, FF, LINE SEPARATOR, PARAGRAPH SEPARATOR;
+// CR; LF; NL = NEL), with the whitespace on either side: one run becomes one space. A renderer
+// that honours them starts a new line at each, so folding only CR and LF left five ways for a
+// typed value to forge a row of the text part (EMAIL-3). NEL is named in the run's class on purpose:
+// it is not in JS's \s, so a run of them would not be swallowed otherwise.
+// ★ LINEAR, NOT ONE PATTERN (EMAIL3-PERF). The single regex this replaces —
+//   /[\s\u0085]*[\r\n\v\f\u0085\u2028\u2029][\s\u0085]*/g — backtracked quadratically on a long run of
+//   whitespace holding no break: its leading class swallowed the run and gave it back one character at
+//   a time looking for one, from every starting point (80,000 spaces: 18 s). What is folded here
+//   includes columns a student types with no length CHECK (city_country, phone, the intake answers).
+//   Finding each whitespace run once and testing it once is the same fold, in linear time — a run that
+//   holds a break becomes one space, a run that holds none is left as typed.
+const WHITESPACE_RUN = /[\s\u0085]+/g;
+const MANDATORY_BREAK = /[\r\n\v\f\u0085\u2028\u2029]/;
+const foldLineBreaks = (v) => String(v).replace(WHITESPACE_RUN, (run) => (MANDATORY_BREAK.test(run) ? ' ' : run));
+
+/**
+ * The text/plain twin of the notify handlers' emailHtml() (#69): the SAME object in, the
+ * same blocks in the same order out, so a sender builds both parts from one set of facts
+ * and the two cannot say different things.
+ *
+ * ★ EVERY LINK THE HTML PART CARRIES IS SPELLED OUT. The video is a thumbnail inside an
+ *   <a> there, and the button is an <a> too; a text part can show neither, so each address
+ *   is written in full after its label. A reader whose client shows only this part finds the
+ *   same destinations in both.
+ *
+ * ★ A ROW IS ONE LINE. In the HTML part a value sits inside one table cell whatever it
+ *   contains; here a line break inside a value would START A LINE — and a value a student
+ *   typed ("Manila⏎  * Paid / sent: ₱99,999") would read as a row of its own. Line breaks in
+ *   a label or a value are folded into a space — EVERY mandatory one (foldLineBreaks), not
+ *   only CR and LF (EMAIL-3), in linear time (EMAIL3-PERF).
+ *
+ * @param {object} [o]
+ * @param {string} [o.heading]
+ * @param {string|string[]} [o.intro]   one paragraph, or several (each its own block)
+ * @param {Array<[string, string|number|null|undefined]>} [o.rows]  a row with no value is dropped
+ * @param {string|null} [o.reason]
+ * @param {{ href?: string, label?: string }|null} [o.cta]
+ * @param {string|string[]|null} [o.note]   a string, or an array printed one line per line
+ * @param {{ id?: string, label?: string }|null} [o.video]  a YouTube video id
+ * @returns {string}
+ */
+export function plainTextEmail({ heading, intro, rows, reason, cta, note, video } = {}) {
+  const filled = (v) => v != null && String(v).trim() !== '';
+  const oneLine = (v) => foldLineBreaks(v).trim();
+  const facts = (Array.isArray(rows) ? rows : []).filter((r) => Array.isArray(r) && filled(r[1]));
+  const noteLines = (Array.isArray(note) ? note : [note]).filter(filled).map(String);
+  return plainText([
+    heading,
+    ...(Array.isArray(intro) ? intro : [intro]),
+    video?.id ? `${video.label || 'Watch this first'}: https://www.youtube.com/watch?v=${video.id}` : null,
+    ...(facts.length
+      ? [{ rule: true }, ...facts.map(([k, v]) => ({ bullet: `${oneLine(k)}: ${oneLine(v)}` })), { rule: true }]
+      : []),
+    reason ? `Reason: ${reason}` : null,
+    cta?.href ? `${cta.label || 'Open the app'}: ${cta.href}` : null,
+    noteLines.length ? noteLines.join('\n') : null,
+    `Thank you,\nThe ${BRAND} team`,
+  ]);
+}
+
+// One bare address. A Reply-To that carries a comma, a bracket or a space is read by a mail
+// client as several addresses, or refused by the provider for the whole message.
+const REPLY_ADDRESS_RE = /^[^\s@<>,;]+@[^\s@<>,;]+\.[^\s@<>,;]+$/;
+
+/**
+ * Where a student's reply to one of our emails lands (#69) — the Reply-To of every
+ * student-facing notification (the enrollment confirmation, the enrollment decision, the
+ * access decision): the admin-editable payment_settings.notify_email ("Proof / support
+ * email"), then NOTIFY_ADMIN_EMAIL, else null.
+ *
+ * ★ NEVER RESEND_FROM. The admin ALERT falls back to that address because an alert with no
+ *   recipient is not sent at all. A reply is different: RESEND_FROM is typically a no-reply
+ *   mailbox, and "just reply to this email" pointed at one is a promise the email breaks.
+ *   On null the caller leaves the header out AND drops the sentence that invites a reply.
+ *
+ * ★ THE CALLER'S OWN JWT, NEVER THE SERVICE KEY. payment_settings_read admits every
+ *   signed-in account, so a student's token and a reviewer's both work, and neither notify
+ *   handler has to build a service-role client to address an email. (The service-client
+ *   form of the same chain is ./supportAddress.js, for senders that already hold one.)
+ *
+ * ★ `stored` IS HOW A CALLER AVOIDS A SECOND READ. api/notify-enrollment.js's 'submitted'
+ *   already reads this row once to find the admin recipient; it passes what that read found
+ *   (the address, or null) and nothing is fetched here. Left undefined, the row is read
+ *   once, with a time limit: a reply address is not worth holding a send for.
+ *
+ * The Supabase settings are read when called, not when this module loads: the builders
+ * here are imported by tests and scripts that set no environment at all.
+ *
+ * @param {string} token  the caller's Supabase access token
+ * @param {{ stored?: string|null, timeoutMs?: number }} [opts]
+ * @returns {Promise<string|null>}
+ */
+export async function studentReplyTo(token, { stored, timeoutMs = 3_000 } = {}) {
+  const usable = (v) => {
+    const address = typeof v === 'string' ? v.trim() : '';
+    return REPLY_ADDRESS_RE.test(address) ? address : null;
+  };
+  let value = stored;
+  if (value === undefined) {
+    value = null;
+    const base = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
+    const anon = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
+    if (token && base && anon) {
+      try {
+        const r = await fetch(`${base}/rest/v1/payment_settings?key=eq.notify_email&select=value`, {
+          headers: { apikey: anon, Authorization: `Bearer ${token}` },
+          signal: AbortSignal.timeout(Number(timeoutMs) > 0 ? Number(timeoutMs) : 3_000),
+        });
+        if (r.ok) {
+          const rows = await r.json();
+          value = Array.isArray(rows) ? rows[0]?.value : null;
+        }
+      } catch { /* best-effort: fall through to the configured address */ }
+    }
+  }
+  return usable(value) || usable(process.env.NOTIFY_ADMIN_EMAIL);
 }

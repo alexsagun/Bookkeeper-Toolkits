@@ -72,6 +72,10 @@ export const GATE_SCREENS = Object.freeze({
   // old system, so the cold paywall is the wrong answer. Never a price.
   IMPORT_MEMBERSHIP_PENDING: 'import_membership_pending',
   APPROVAL_PENDING: 'approval_pending',
+  // #69: the Getting Started video a newly approved student watches once before their
+  // first dashboard. Never a price. No staffReady wait: the server's `required` already
+  // excludes staff (see the last arm of resolveGateScreen()).
+  GETTING_STARTED: 'getting_started',
   APP: 'app',
 });
 
@@ -130,6 +134,7 @@ export function resolveGateScreen(state) {
     inviteDeferred = false, profileFailed = false,
     hasClaimToken = false, claimDismissed = false, importWelcomePending = false,
     requireApproval = true, requireEnrollment = true,
+    gettingStarted = null, gettingStartedDeferred = false, appShellShown = false,
   } = s;
 
   if (loading) return { screen: GATE_SCREENS.SPLASH, reason: 'auth_loading' };
@@ -358,6 +363,55 @@ export function resolveGateScreen(state) {
     return { screen: GATE_SCREENS.APPROVAL_PENDING, reason: 'approval_pending' };
   }
 
+  // ── Getting Started (#69) ─────────────────────────────────────────────────
+  // LAST, so every rule above has already passed. Presentation only: it grants nothing.
+  // Only where a membership exists to onboard into (the paywall is enforced and set up).
+  // (It sits even below the legacy approval gate the header calls LAST: that rule
+  // orders the holds that decide access, and this arm decides none.)
+  //
+  // ★ "SET UP" IS enroll.migrated, NEVER enroll.configured (GF-2). useEnrollmentGate sets
+  //   `configured` false on ANY error of the enrollment_requests read and true again on the next
+  //   good one, and it reads again on every focus, visibilitychange and realtime event. The arm
+  //   used to read it, so one 502 flipped GETTING_STARTED → APP → GETTING_STARTED: the gate
+  //   unmounted mid-video, taking the <video>, the watch record and the place with it — and a
+  //   required student let in at sign-in by an error was pulled OUT of a working session by the
+  //   next focus. `migrated` is false only when a table is MISSING — by the error's CODE
+  //   (isEnrollmentTableMissingErr), never its message, which a schema-cache reload or a permission
+  //   error can share (V-MIGRATED-PREDICATE). The enrollment arm above keeps reading `configured`,
+  //   its fail-open unchanged.
+  // ★ ONCE A MEMBER'S APP IS RUNNING, THIS ARM NEVER TAKES IT OVER (GF-2). `appShellShown` is the
+  //   root's latch — set when the app renders on a SETTLED pass for THIS account, ended by any hold
+  //   screen and at sign-out. The enrollment arm's own fail-open app (a read error, for a student
+  //   who is not a member yet) is never latched: latching it skipped the video for an enrollment
+  //   approved later in that session (V-GF2-LATCH). A required answer that arrives while it stands (a
+  //   replay page's "Try again", a refresh) is shown on the page and the card; the gate asks again
+  //   at the next load, as a deferral does. Only the literal true latches, and only this arm: every
+  //   rule above that decides access still applies.
+  //
+  // ★ 'loading' HOLDS THE SPLASH, NEVER THE APP. When an approval lands while the
+  //   student sits on the pending screen, the cached answer says "not eligible" until
+  //   one re-ask returns (gettingStartedStatus() in src/lib/gettingStarted.js), and the
+  //   app rendered in that window would flash the dashboard the video must come before.
+  // ★ EVERYTHING ELSE FAILS OPEN. An 'unavailable' answer (an RPC error, a pre-#69
+  //   database, the 7 s timeout) renders the app, and `required` is trusted only on a
+  //   'ready' answer: membership RLS still protects paid content, so failing open costs
+  //   one orientation video, never access. The deferral ("Continue to dashboard for
+  //   now", after the video would not play) is session-only and records nothing.
+  // ★ NO staffReady WAIT: the server's `required` already excludes staff. The client's
+  //   own exclusion is a second line for 'ready', and the only one for 'loading' —
+  //   without it every staff member would sit on the splash until the fetch lands.
+  //   (`!isAdmin` is implied by `!staffPasses`, since passesAsStaff() admits is_admin in
+  //   both branches, so a mutation that drops it survives the matrix by design.)
+  if (requireEnrollment && enroll?.migrated !== false
+    && !isAdmin && !staffPasses && gettingStarted && !gettingStartedDeferred && appShellShown !== true) {
+    if (gettingStarted.status === 'loading') {
+      return { screen: GATE_SCREENS.SPLASH, reason: 'getting_started_loading' };
+    }
+    // The boolean true only: a 'ready' answer with any other `required` is malformed.
+    if (gettingStarted.status === 'ready' && gettingStarted.required === true) {
+      return { screen: GATE_SCREENS.GETTING_STARTED, reason: 'getting_started' };
+    }
+  }
   return { screen: GATE_SCREENS.APP, reason: 'ok' };
 }
 

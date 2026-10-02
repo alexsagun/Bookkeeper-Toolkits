@@ -166,6 +166,21 @@ test('silver and VIP open the whole student toolkit', () => {
   }
 });
 
+// ★ #69. The Getting Started gate is a GATE SCREEN, not a tab, so no plan needs a tab to be
+//   shown it; this is only the REPLAY page. Essentials is the one scoped plan, so it lists the
+//   tab; Silver and VIP are full access. The Super Admin screen belongs to no plan.
+test('every paid plan can open the Getting Started replay page (#69)', () => {
+  assert.ok(PLAN_ENTITLEMENTS.sampler.tabIds.includes('gettingstarted'));
+  for (const key of ['sampler', 'silver_self_paced', 'vip']) {
+    assert.equal(planEntitlement(key).allowsTab('gettingstarted'), true, key);
+  }
+  assert.equal(planEntitlement('sampler').allowsTab('gettingstartedadmin'), false,
+    'the admin screen is gated by role at the chokepoint, and no plan lists it');
+  for (const cfg of Object.values(PLAN_ENTITLEMENTS)) {
+    assert.ok(!(cfg.tabIds || []).includes('gettingstartedadmin'), 'no plan lists the admin screen');
+  }
+});
+
 test('a deleted or unknown plan key FAILS CLOSED, not open', () => {
   // The behaviour this change exists to fix: an unrecognised key used to inherit
   // the full toolkit through the default branch.
@@ -174,6 +189,7 @@ test('a deleted or unknown plan key FAILS CLOSED, not open', () => {
     assert.equal(ent.full, false, `${key} must not resolve to full access`);
     assert.equal(ent.allowsTab('proposal'), false);
     assert.equal(ent.allowsTab('qbomastery'), false);
+    assert.equal(ent.allowsTab('gettingstarted'), false, 'the Getting Started replay is a paid page (#69)');
     assert.equal(ent.allowsStage('training'), false);
     // No catalog tab is reachable, so this should be unreachable — but it says no
     // explicitly rather than relying on that argument holding forever.
@@ -363,7 +379,8 @@ test('numeric strings are accepted, because price_php is a numeric column', () =
 test('NO_ACCESS_ENTITLEMENT grants Home and nothing else', () => {
   assert.equal(NO_ACCESS_ENTITLEMENT.full, false, 'it must never be a full entitlement');
   assert.equal(NO_ACCESS_ENTITLEMENT.allowsTab('dashboard'), true, 'Home must never dead-end');
-  for (const tab of ['bankfeed', 'invoice', 'community', 'qbomastery', 'enrollments']) {
+  for (const tab of ['bankfeed', 'invoice', 'community', 'qbomastery', 'enrollments',
+    'gettingstarted', 'gettingstartedadmin']) {
     assert.equal(NO_ACCESS_ENTITLEMENT.allowsTab(tab), false, `${tab} must be refused`);
   }
   assert.equal(NO_ACCESS_ENTITLEMENT.allowsCourse({ access_tier: 'essentials' }), false);

@@ -282,6 +282,41 @@ test('a newly-shipped tab is inserted at its default position, not appended', ()
     'qbomastery belongs after course, where DEFAULT_STAGES puts it');
 });
 
+test('a new FLAT-stage default tab at index 0 lands at index 0 of a saved layout', () => {
+  // #69 shipped Getting Started FIRST in Home with no SIDEBAR_VERSION bump. That rests on
+  // the flat-stage merge inserting a default the saved layout predates where the defaults
+  // put it — and at index 0 there is no earlier neighbour to anchor on, so the insertion
+  // point has to fall back to the very start rather than to the end. Proved, not assumed.
+  const HOME = [{
+    id: 'home', label: 'Home', number: '', desc: 'Start here',
+    tabs: [
+      { id: 'gettingstarted', label: 'Getting Started', icon: ICON },
+      { id: 'dashboard', label: 'Dashboard', icon: ICON },
+      { id: 'progress', label: 'Progress & Rankings', icon: ICON },
+      { id: 'community', label: 'Community', icon: ICON },
+    ],
+  }];
+  const saved = [{
+    id: 'home', label: 'Home', number: '', desc: 'Start here',
+    tabs: [{ id: 'dashboard', label: 'Dashboard' }, { id: 'progress', label: 'Progress & Rankings' }, { id: 'community', label: 'Community' }],
+  }];
+  const home = mergeStoredWithDefaults(saved, HOME, FALLBACK).find((s) => s.id === 'home');
+  assert.deepEqual(home.tabs.map((t) => t.id), ['gettingstarted', 'dashboard', 'progress', 'community']);
+  assert.equal(home.tabs[0].icon, ICON, 'with its icon from the defaults');
+
+  // A student who REORDERED Home gets the new tab first, and keeps their own order after it.
+  const reordered = [{ ...saved[0], tabs: [{ id: 'community' }, { id: 'dashboard' }, { id: 'progress' }] }];
+  const mine = mergeStoredWithDefaults(reordered, HOME, FALLBACK).find((s) => s.id === 'home');
+  assert.deepEqual(mine.tabs.map((t) => t.id), ['gettingstarted', 'community', 'dashboard', 'progress']);
+
+  // And the real DEFAULT_STAGES does put it first — the fixture above is not a wish.
+  const src = readFileSync(fileURLToPath(new URL('../src/BookkeeperPro.jsx', import.meta.url)), 'utf8');
+  const at = src.indexOf("id: 'home',");
+  assert.ok(at > 0, 'the Home stage moved');
+  assert.match(src.slice(at, at + 600),
+    /tabs: \[\s*\{ id: 'gettingstarted', label: 'Getting Started', icon: PlayCircle \},\s*\{ id: 'dashboard'/);
+});
+
 test('a new tab in a GROUPED stage joins its group at the default position', () => {
   // The v5 form of the old "no SIDEBAR_VERSION bump needed" test. The mechanism changed
   // — the tab now arrives through reconcileGroup rather than through the tabs-insertion

@@ -275,7 +275,9 @@ test('a provider rejection is recorded as a code, never as the provider sentence
   // notify_detail is stored on the student's OWN request row, which they can read.
   assert.ok(!/recordNotify\([^)]*out\.detail/.test(src),
     'the provider body reaches a row the student can read');
-  assert.match(src, /recordNotify\(requestId, u\.token, 'provider_error', `resend_\$\{out\.status\}`\)/,
+  // #69: the alert goes through the shared sendEmail(), which answers { ok: false, code } — a
+  // slug such as 'resend_422' or 'resend_timeout' — and never a status or a body.
+  assert.match(src, /recordNotify\(requestId, u\.token, 'provider_error', out\.code\)/,
     'the stable code is not what gets recorded');
   assert.ok(!/console\.error\(`\[notify-enrollment\] resend \$\{r\.status\}: \$\{text/.test(src),
     'the provider body is still logged');

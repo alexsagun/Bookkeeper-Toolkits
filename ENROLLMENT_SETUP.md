@@ -441,8 +441,29 @@ Sidebar → **Enrollments** (admin-only, with a pending-count badge; also at `/a
   renew early). Their "Under Review" screen advances into the toolkit **live** (Realtime) or
   within ~30s. Any failure rolls the WHOLE approval back (the request stays pending — Approve
   again is safe/idempotent); a missing #32 migration shows setup guidance instead of granting.
+- **Getting Started comes next for a NEW student (#69).** When a Getting Started video is live and
+  this approval created the student's FIRST membership term after that video was first published,
+  the student watches it once — on its own screen, before the Dashboard — and then lands on the
+  Dashboard. Renewals, upgrades and extensions of an existing member do not trigger it (their first
+  term predates the cutoff; a grandfathered member with no dated term is the one exception, once),
+  nobody is held while no video is live or its file is missing, and staff are never held. The video is
+  managed by a Super Admin under **Admin → Getting Started Video**; the decision email tells the
+  student it is coming only when the server says so. If the student's first check fails while they
+  wait for approval, it is asked again when the approval lands. A student already using the toolkit as
+  a member is never pulled out into it mid-session (they are asked at the next visit, or after a hold
+  screen such as a lapsed term). If the video will not play they can continue to the Dashboard for that
+  visit, and it asks again next time. Details: CLAUDE.md → "Getting Started onboarding video (#69)".
 - **Reject** (with a reason shown to the student) or **Mark expired** → the student stays locked
   out, sees the notice, and can **resubmit** new proof (a fresh request row — history is kept).
+- **What became of each decision email.** After an approval, a rejection or a Mark expired, the
+  notice ends with the email's outcome: *email sent*, *email already on its way*, *email may not have
+  been sent* (no clear answer — it may have been delivered, so check the student's inbox or Resend
+  before sending anything by hand), *email not sent*, or *email not configured* — the same endings, by
+  the same rule, as Access Requests. A **bulk approve or reject** lists each student's email outcome under their row, followed
+  by an "Emails: …" tally. It waits out the **server's** own "not now" (a 429: one decision's email
+  asked for more than 10 times in a minute, or one reviewer past 60 decision emails in a minute) and
+  asks again after 20 s, then 40 s, saying whose email it is waiting on. Every other answer — a
+  provider refusal (its 429 included) and an unclear 502/504 — is recorded as it came.
 - **Payment details** (collapsible section at the top) edits the account name / BPI /
   Security Bank / GCash / support email shown on the student paywall — saved for everyone, no SQL.
 - **Sound alert** (🔔 toggle) — opt-in, clearly-audible **3-tone chime (played twice)** when a
@@ -460,9 +481,13 @@ it. To enable it, set these server-side env vars in **Vercel → Settings → En
 
 - `RESEND_API_KEY` — your Resend key (`re_…`) — **server-only; do NOT `VITE_`-prefix it.**
 - `RESEND_FROM` — a verified sender, e.g. `Toolkits by Alex <noreply@yourdomain.com>`
-- `NOTIFY_ADMIN_EMAIL` — *(optional)* where "new enrollment submitted" alerts go.
-- `APP_URL` — *(optional)* absolute origin (e.g. `https://toolkits.alexsagun.com`) for the
-  **"Review in Enrollments"** button in admin alerts; defaults to the request's own host.
+- `NOTIFY_ADMIN_EMAIL` — *(optional)* where "new enrollment submitted" alerts go — and, since #69, the
+  second choice for the **Reply-To** of the emails students receive (see "Where replies go" below).
+- `APP_URL` — absolute origin (e.g. `https://toolkits.alexsagun.com`) for every link these emails
+  carry: the admin alert's **"Review in Enrollments"** button and the students' sign-in buttons. **On
+  Vercel there is no fallback** — without it the emails carry no link at all, because a preview
+  deployment shares production's database and must never email a link to itself. Only `npm run dev`
+  uses the request's own host.
 
 > ⚠️ **Supabase Auth's email/SMTP/Resend settings do NOT power this.** Those only send Supabase
 > *Auth* emails (signup confirmation, password reset). This custom admin alert is a separate Vercel
@@ -511,7 +536,7 @@ Then restart the dev server — Vite reads `.env` at startup, so a key added whi
 no effect. Submit an enrollment and both emails send for real: the admin alert first (its outcome is
 what gets stamped onto `notify_status`), then the student confirmation.
 
-With no keys set the endpoint responds `{ ok: false, skipped: 'not-configured' }` and the student
+With no keys set the endpoint responds `{ ok: false, skipped: 'email_not_configured' }` and the student
 still enrolls normally — the send is best-effort and never blocks a submission.
 
 **Prove it works (≈2 minutes, after the vars are set + a redeploy):**
@@ -527,35 +552,93 @@ If step 2 says *"not configured"* → a var is missing/misnamed in Vercel (or yo
 Resend shows the send but it's not **Delivered** → the sender isn't verified (see the Resend-sender
 callout above) or the recipient's mail provider filtered it.
 
-The admin alert includes the student's name, email, phone, location, package, expected vs paid
-amounts, payment reference, submitted date/time, a **Type: Renewal / New enrollment** row, and a
-direct link to `/admin/enrollments`. Receipts are **never** attached (they're private financial
-docs) — the email links the admin to the dashboard to review them.
+### What each email says, and to whom (#69)
+
+Every fact these emails state is read from the **database** on the server — never from what the
+browser sends — and every email to a student goes to their **account** address (`profiles.email`),
+never to an address typed on a request (the admin alert goes to the admin recipient above). Every date
+is the **Manila** calendar day (an `ends_at` read in UTC would print access that runs through
+November 30 as "November 29").
+
+- **The admin alert** (on submit, to the admin recipient above): Type — *New enrollment*, *Renewal*,
+  *Upgrade* or *Extension: N days* (from the request's `request_kind`; a request recorded as new from
+  a student who has held a term before reads as a renewal); the student's **account** name and email,
+  plus what was typed on the form, labelled "on form", only when it differs; phone and location; the
+  **package as the catalog names it** — name and tagline from `enrollment_plans` by `plan_key`, with
+  its price, length and *Program access* scope (those three omitted for an extension, which is priced
+  by its days); only when that catalog read fails does the request row's own snapshot of the name
+  stand in, and every line only the catalog can supply, the cohort's included, is then left out; the
+  **cohort** for a VIP package (the batch the student picked, to be confirmed at approval; the current
+  cohort continuing, for a renewal or extension; or none chosen yet, to be assigned at approval) and
+  "No batch cohort" for the others; expected vs paid amounts; the reference when there is one; the
+  Manila date and time submitted; the intake answers and the agreement version; and a button that
+  opens **that request** — `/admin/enrollments?request=<id>` selects its filter, clears the search,
+  and brings its card into view. Receipts are **never** attached (they're private financial docs) —
+  the email links the admin to the dashboard to review them.
+- **The student confirmation** (on submit, sent only after the admin alert succeeded, only to the
+  account address — with no readable account address there is no student copy, and the alert still
+  goes): the package, the extension days if any, the amount sent, whether the Training Agreement is on
+  file, the processing-hours note the pending screen also shows (`ENROLLMENT_PROCESSING_NOTE`), and —
+  for a new enrollment only — the onboarding video link (a YouTube video; not the in-app Getting
+  Started video).
+- **The decision email** (when a reviewer approves, rejects or expires a request; to the account
+  address): on approval, the catalog's package name, "active until {Manila day}" for a term that is
+  live, or "your access opens on {day}" (and no sign-in button) for one that starts later, the cohort
+  for VIP, and — only when the server says this student will be asked to watch it, and never before the
+  term opens — that **Getting Started** comes next. It never says "everything is unlocked" (the
+  Essentials package opens one course). A rejection or expiry states no term at all, carries the
+  recorded reason, and (with `APP_URL` set) a sign-in link to resubmit. These facts come from
+  `enrollment_decision_email_facts()` (#69), read with the reviewer's own session; if that read fails
+  — before #69 is applied, a timeout, an error — the email still goes, with the generic wording.
+
+**Where replies go.** A student's reply goes to the Reply-To: the **"Proof / support email"**
+(`payment_settings.notify_email`), else `NOTIFY_ADMIN_EMAIL`. The Reply-To is **never** set to
+`RESEND_FROM`, which is usually a no-reply sender. With neither address set there is no Reply-To, so a
+reply would reach that sender — which is why the rejection email then drops its "just reply to this
+email" sentence.
+
+**One email per event.** Each send carries a plain-text part beside the HTML and a stable
+idempotency key — `enrollment-submitted-admin-<id>`, `enrollment-submitted-student-<id>`,
+`enrollment-decision-<id>-<status>-<epoch ms of the request's reviewed_at>` — so a double click or a
+retry is delivered once, while a decision made **again** (a request a Super Admin reopened and decided
+anew) is a new email. A second send of the same key while the first is still in progress is reported
+as `{ ok:false, skipped:'in_flight' }` — but only when the email provider names its 409
+`concurrent_idempotent_requests` — and is not stamped onto the request, so it can never overwrite an
+earlier "sent". The same key with a different payload (a 409 named `invalid_idempotent_request`) is a
+refusal: a decision email answers `502 resend_409` ("email not sent"), and the admin alert is recorded
+as `provider_unclear`, because under the request's own key it means an alert for that request already
+went out.
 
 Emails are sent by [`api/notify-enrollment.js`](api/notify-enrollment.js) (same pattern as
-`api/notify-access.js`): the student-triggered `submitted` alert verifies the caller **owns** the
-request (via their own JWT + RLS) and builds the email from the database row; `decision` and `test`
-require an admin caller. Enrollment submission is never blocked by email — the client fires it
-best-effort and logs any skip/error to the browser console (`[enroll] admin email: …`). Until the
-vars are set, the panel shows "email not configured" (harmless). **Note:** `npm run dev` doesn't
-run serverless functions — email only works on a Vercel deploy.
+`api/notify-access.js`): the student-triggered `submitted` action verifies the caller **owns** the
+request (it re-reads the row with their own JWT, under RLS) and builds both emails from the database;
+`decision` and `test` require a caller holding `enrollments.review`, and `decision` sends only when the
+status it is told is the one recorded on the request. Enrollment submission is never blocked by
+email — the client fires it best-effort and logs any skip/error to the browser console
+(`[enroll] admin email: …`). Until the vars are set, the panel shows "email not configured"
+(harmless). `npm run dev` runs these handlers too (see "Testing email locally" above).
 
 **Audit trail (visible in the Enrollments tab).** The `submitted` handler stamps the send outcome
 onto the request row via the `record_enrollment_notification()` RPC (added by
 [`db/2026-07-08-enrollment-notify-status.sql`](db/2026-07-08-enrollment-notify-status.sql) — run it
 on existing installs; the fresh-install bootstrap already includes it). Each request card then shows
-a small badge: a green **"Admin emailed"** when the alert sent, or an amber/red **"Email not
-sent — …"** (no key / no sender / no recipient / provider error) when it didn't — so a
-silently-misconfigured admin email is no longer invisible (it doesn't rely on the student's browser
-console). The badge only appears once an alert has been attempted; older rows and installs without
-the migration simply show no badge (the RPC call is best-effort and never blocks the email).
+a small badge about the **review alert** (the email sent to the administrator, not to the student): a
+green **"Review alert sent"**; an amber/red **"Review alert not sent — …"** (no key / no sender / no
+recipient / provider) when it was refused; or an amber **"Review alert may not have been sent"**
+(`provider_unclear`: the email provider gave no clear answer — a timeout, a dropped connection, a
+provider failure, or that key already used — so the alert may have arrived; check the inbox or Resend
+before re-sending by hand). A silently-misconfigured admin email is no longer invisible (it doesn't
+rely on the student's browser console). The badge only appears once an alert has been attempted;
+older rows and installs without the migration simply show no badge (the RPC call is best-effort and
+never blocks the email). `provider_unclear` needed no SQL change: the column has no CHECK.
 
 The `sent` stamp doubles as a **replay guard**: once a request row is marked `notify_status='sent'`,
 re-POSTing `action:'submitted'` for the same `requestId` returns `{ ok:false, skipped:
 'already_notified' }` instead of sending again — so the alert can't be replayed into the admin inbox
-or burn Resend quota. Failure states (`provider_error`, `email_not_configured`, `admin_email_invalid`)
-stay retryable, and every **new** row (resubmit / renewal / upgrade / extension) starts with a null
-`notify_status`, so legitimate flows always alert.
+or burn Resend quota. Failure states (`provider_error`, `provider_unclear`, `email_not_configured`,
+`admin_email_invalid`) stay retryable — only `sent` stops a re-POST, and a retry under the request's
+own key is de-duplicated by the provider if the alert did go out — and every **new** row (resubmit /
+renewal / upgrade / extension) starts with a null `notify_status`, so legitimate flows always alert.
 
 **Not on Vercel?** Reimplement the same `submitted` / `decision` / `test` workflow as a **Supabase
 Edge Function** and store `RESEND_API_KEY` / `RESEND_FROM` / `NOTIFY_ADMIN_EMAIL` / `APP_URL` as
@@ -611,7 +694,9 @@ already use the Supabase REST API, so they port directly.
 - **Receipt preview fails** — check Step 2 (bucket exists, is private, policies from the
   migration applied). A signed-URL error usually means the storage policies weren't created.
 - **"email not configured / not sent" in a notice** — the review action still succeeded; email
-  is best-effort (Step 4; remember `npm run dev` never sends email).
+  is best-effort (Step 4; under `npm run dev` the keys must be in `.env` before the dev server starts).
+  **"email may not have been sent"** means no clear answer came back, so it may have been delivered —
+  check the student's inbox or Resend before sending anything by hand (see Step 3).
 - **A grandfathered user got locked out** — they weren't `approved` when Step 1 first ran. Fix:
   `update public.profiles set is_paid = true, plan = 'silver_self_paced' where email = '…';`
   (or just approve their next in-app submission).

@@ -19,6 +19,16 @@ import { ensureUsers, lit, runSql } from './_app.mjs';
 
 export const BATCH_CODE = '2031-01';
 
+// "Today" for a hold's follow-up is the BROWSER's calendar date: the app decides "Follow-up due"
+// with todayISODate() in BookkeeperPro.jsx (the local date of the browser), and the suites' Chrome
+// runs on this machine, in its timezone. Manila's date (what this used to stamp) is a different day
+// for hours every day west of Manila — on a UTC+1 machine from 16:00Z to 23:00Z — and the seeded
+// hold was then not yet due, so "Follow-up due" rendered no card at all. Same expression as the app.
+function browserLocalDate() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 const LONG = {
   name: 'Maria Concepcion Evangelista-Villanueva de los Santos Bartolome',
   email: 'maria.concepcion.evangelista.villanueva.delossantos@verylongdomain-example.test',
@@ -158,7 +168,7 @@ export async function seedEnrollmentFixtures(personas) {
 
     if (r.hold) {
       stmts.push(`insert into public.enrollment_request_holds (request_id, reason, follow_up_on, held_by, held_by_email)
-        select id, ${lit(r.hold.reason)}, ${r.hold.followUpToday ? `(now() at time zone 'Asia/Manila')::date` : 'null'},
+        select id, ${lit(r.hold.reason)}, ${r.hold.followUpToday ? `${lit(browserLocalDate())}::date` : 'null'},
                '${staff.ops.id}', ${lit(staff.ops.email)}
           from public.enrollment_requests where user_id = '${u.id}' and status = 'pending_review';`);
     }

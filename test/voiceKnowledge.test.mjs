@@ -22,11 +22,15 @@
 // This file deliberately asserts NOTHING about the committed
 // docs/ai/toolkits-voice-agent-knowledge.md — that half lands after the document is
 // regenerated. The monolith is read only for STRUCTURAL facts (shapes and
-// subset relations, never counts another session may change).
+// subset relations, never counts another session may change). Section 6 runs the real generator
+// in a throwaway directory and holds the tool count it states to the app's own TOOL_COUNT
+// expression — a relation between two derivations, never a number typed here.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, copyFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -832,4 +836,41 @@ test('knowledgeInvariantFailures: formats failures only, in order', () => {
   ]), ['  - [b] first', '  - [c] second']);
   const lines = knowledgeInvariantFailures(run(BASE_BODY, {}, { embed: false }));
   assert.deepEqual(lines, ['  - [fingerprint-present] the document carries no fingerprint']);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. The generator states the APP'S tool count
+// ═════════════════════════════════════════════════════════════════════════════
+
+test('generator (real): the document states the app\'s own tool count — TAB_ROUTES minus NON_TOOL_TAB_IDS', () => {
+  // ★ The generator used to subtract only dashboard, accessrequests and enrollments, so the
+  //   document called every other Home and admin screen a tool — 38 at #68, 40 after #69 — while
+  //   the app's own Dashboard said 30. `npm run ai:knowledge:check` cannot see that: it compares
+  //   the generator with itself. This runs the UNMODIFIED generator in a throwaway copy of the
+  //   three files it reads (nothing in the repository is written, and the committed document's
+  //   freshness is ai:knowledge:check's question, not this one's) and holds the number it states to
+  //   the app's own expression, evaluated as the app evaluates it.
+  const src = app();
+  const decl = /^const TOOL_COUNT = (.+);\r?$/m.exec(src);
+  assert.ok(decl, 'the app\'s TOOL_COUNT declaration was not found');
+  // eslint-disable-next-line no-new-func
+  const appCount = new Function('TAB_ROUTES', 'NON_TOOL_TAB_IDS', `return (${decl[1]});`)(
+    extractPureLiteral(src, 'TAB_ROUTES'), new Set(extractPureLiteral(src, 'NON_TOOL_TAB_IDS')));
+  assert.ok(Number.isInteger(appCount) && appCount > 0, `the app's count must be a count, got ${appCount}`);
+  const tmp = mkdtempSync(join(tmpdir(), 'kb-generator-'));
+  try {
+    for (const rel of ['scripts/generate-voice-agent-knowledge.mjs', 'src/BookkeeperPro.jsx', 'src/lib/planCatalog.js']) {
+      mkdirSync(dirname(join(tmp, rel)), { recursive: true });
+      copyFileSync(join(REPO, rel), join(tmp, rel));
+    }
+    writeFileSync(join(tmp, 'package.json'), '{ "type": "module" }\n');
+    execFileSync(process.execPath, [join(tmp, 'scripts/generate-voice-agent-knowledge.mjs')], { stdio: 'pipe' });
+    const doc = readFileSync(join(tmp, 'docs/ai/toolkits-voice-agent-knowledge.md'), 'utf8');
+    const counts = knowledgeInvariants({ doc, toolCount: appCount }).filter((r) => r.id.startsWith('tool-count'));
+    assert.deepEqual(counts.map((r) => r.id), ['tool-count-once', 'tool-count-derived'],
+      'the document states one count, and it is checked against the app\'s');
+    for (const r of counts) assert.ok(r.ok, r.message);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 });

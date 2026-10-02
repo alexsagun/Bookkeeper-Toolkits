@@ -90,10 +90,46 @@ vars in **Vercel → Settings → Environment Variables** (Production + Preview)
   AUTH_SETUP.md §4c)
 - `RESEND_FROM` — a verified sender, e.g. `Toolkits by Alex <noreply@yourdomain.com>`
 
+Optionally, `NOTIFY_ADMIN_EMAIL` is where a user's **reply** goes when the in-app "Proof / support
+email" (`payment_settings.notify_email`, in Enrollments → Payment details) is not set. The Reply-To is
+never set to `RESEND_FROM`. With neither address set, the email carries no Reply-To — a reply would
+then reach the sender itself, typically a no-reply mailbox — so a rejection asks the user to contact
+the admin team instead of inviting a reply.
+
 The email is sent by the serverless function [`api/notify-access.js`](api/notify-access.js); the key
-never reaches the browser. The function refuses non-admin callers. Until both vars are set, the admin
-panel shows "email not configured" (harmless). **Note:** `npm run dev` doesn't run serverless
-functions — email only works on a Vercel deploy.
+never reaches the browser. **What the browser sends is only `{ userId, status }`** (since #69), and
+only after the decision has been recorded by `admin_review_access_request()`. The function then:
+
+- refuses a caller without the `access_requests.review` permission;
+- reads that account's own `profiles` row **with the reviewer's own session** (row-level security
+  decides whether they may see it) — so the address, the name and a rejection's reason all come from
+  the row, never from the request. It used to take all three from the browser, which let any reviewer
+  send the business's "your access has been approved" email to any address;
+- refuses (409) unless the row's `approval_status` is the decision being announced, refuses a migrated
+  student the import is still setting up (409, `ACCESS_REQUEST_IMPORT_TARGET`), answers 404 when the
+  account cannot be seen and 503 when the read itself failed, and sends nothing (422) when the account
+  has no valid address;
+- sends one email per decision: a plain-text part beside the HTML, and an idempotency key built from
+  the account, the decision and the moment it was recorded, so a double click is delivered once and a
+  decision recorded again later is a new email;
+- refuses a request with **no `userId`** that names a decision as `400 { code: 'stale_client' }`: that
+  is what a page opened before the #69 update sends (it posted the address, name and reason instead).
+  The address in such a body is never read. The function logs `[notify-access] refused a decision with
+  no userId …`, with no address in it;
+- limits sends with two guards, each per warm server instance: the same decision's email at most 10
+  times a minute, and one reviewer's decision emails at most 60 a minute, every account together. An
+  ordinary run of approvals never reaches either.
+
+**After deploying the #69 update, reload every open Access Requests tab** (in practice, every admin
+tab). A tab loaded before the deploy keeps the old page, which sends the old request: the function
+refuses it as `stale_client`, so the decision is still recorded but its email is not sent, and that tab
+shows ` · email not sent`. A reload fixes it. A decision made from a stale tab is **not** re-emailed
+automatically, so tell that person another way if it matters.
+
+The approved email says the account is approved and that, if they have not enrolled yet, signing in
+will ask them to choose a plan — it no longer promises a dashboard. Until both vars are set, the admin
+panel shows "email not configured" (harmless). `npm run dev` runs this function too (`vite.config.js`
+registers it); the keys must be in `.env` before the dev server starts.
 
 ---
 
@@ -143,8 +179,20 @@ functions — email only works on a Vercel deploy.
   `update public.profiles set approval_status='approved' where email='…';`.
 - **Approve/reject fails with a permissions error (42501)** — you're not flagged `is_admin` for this
   session. Re-check Step 2 and re-sign-in.
-- **The panel says "Approved … · email not sent" (or "email not configured").** Approval still
-  succeeded — email is best-effort. `email not sent` means the `/api/notify-access` function wasn't
-  reachable (you're on `npm run dev`, which doesn't run serverless functions — email only works on a
-  Vercel deploy). `email not configured` means it ran on Vercel but `RESEND_API_KEY` / `RESEND_FROM`
-  aren't set (Step 4). Neither blocks access.
+- **The panel says "Approved … · email not sent" (or "email may not have been sent", "email not
+  configured", or "email already on its way").** Approval still succeeded — email is best-effort.
+  `email not sent` means a clear no, so nothing went out: the decision on the account no longer matches
+  (it was changed again), the account could not be found or read, it has no valid address, the
+  reviewer was refused or rate-limited, the page was opened before an update (`stale_client` — reload
+  it; see Step 4), or the email provider refused the send — including when an email for this same
+  decision already went out with different content (a provider 409 named `invalid_idempotent_request`).
+  "Rate-limited" means the same decision's email was asked for more than 10 times in a minute, or one
+  reviewer asked for more than 60 decision emails in a minute (every decision together, per warm server
+  instance); an ordinary run of approvals never reaches either. `email may not have been sent` means no
+  clear answer came back — the function could not be reached, ran out of time or failed mid-send, or
+  the provider timed out, dropped the connection or failed on its own side — so the email may still
+  have been delivered. That ending comes from the one shared rule (`emailOutcomeUnclear()`) that Access
+  Requests and Enrollments both use. `email not configured` means `RESEND_API_KEY` / `RESEND_FROM`
+  aren't set where it ran (Step 4). `email already on its way` means another request is already sending
+  that same decision's email, as the email provider itself reported (a 409 named
+  `concurrent_idempotent_requests`). None of them blocks access.

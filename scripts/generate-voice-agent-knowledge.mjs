@@ -103,6 +103,8 @@ const src = readFileSync(SOURCE, 'utf8');
 const TAB_ROUTES = extractLiteral(src, 'TAB_ROUTES');
 const VOICE_TAB_INFO = extractLiteral(src, 'VOICE_TAB_INFO');
 const TIPS = extractLiteral(src, 'TIPS');
+// `const NON_TOOL_TAB_IDS = new Set([...])` — the scan lands on the array inside the Set.
+const NON_TOOL_TAB_IDS = new Set(extractLiteral(src, 'NON_TOOL_TAB_IDS'));
 // ENROLLMENT_PLANS_FALLBACK + PLAN_ENTITLEMENTS are imported from src/lib/planCatalog.js
 // at the top of this file — they are a real module, so there is nothing to extract.
 
@@ -114,6 +116,9 @@ for (const id of routeIds) {
 }
 for (const id of infoIds) {
   if (!TAB_ROUTES[id]) fail(`Tab "${id}" is in VOICE_TAB_INFO but not in TAB_ROUTES — remove it or add the route.`);
+}
+for (const id of NON_TOOL_TAB_IDS) {
+  if (!TAB_ROUTES[id]) fail(`Tab "${id}" is in NON_TOOL_TAB_IDS but not in TAB_ROUTES — remove it, or the tool count is wrong.`);
 }
 
 softAssert(src, 'daysLeft <= 3', 'red expiry warning threshold (≤3 days)');
@@ -178,7 +183,13 @@ scopeSection += '- **A retired or unrecognized plan key** (e.g. a membership tha
 
 const tipsSection = TIPS.map((t) => `- ${t}`).join('\n');
 
-const TOOL_COUNT = routeIds.filter((id) => !['dashboard', 'accessrequests', 'enrollments'].includes(id)).length;
+// ★ THE APP'S OWN COUNT — the expression behind the Dashboard's "Pro Tools" figure: every route
+//   minus NON_TOOL_TAB_IDS (mockinterview included: it is an alias, and the set names it). This
+//   used to subtract only dashboard, accessrequests and enrollments, so the document called every
+//   other Home and admin screen a tool — 38 at #68, 40 after #69, while the app said 30.
+//   test/voiceKnowledge.test.mjs runs this script and holds the number to the app's expression;
+//   --check below cannot see it, because it compares this script with itself.
+const TOOL_COUNT = Object.keys(TAB_ROUTES).filter((id) => !NON_TOOL_TAB_IDS.has(id)).length;
 const generatedOn = new Date().toISOString().slice(0, 10);
 
 const doc = `<!-- GENERATED FILE — do not hand-edit. Regenerate with \`npm run ai:knowledge\`

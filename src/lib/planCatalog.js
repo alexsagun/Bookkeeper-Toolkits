@@ -114,11 +114,14 @@ export const PLAN_ENTITLEMENTS = {
   // Essentials + 1-on-1 coaching: Home, the QuickBooks catalog (Essentials course only),
   // and both Alex booking pages. `courseTier` scopes courses WITHIN an allowed catalog
   // (matches courses.access_tier + the SQL sampler rule). `community`: every paid plan
-  // includes the member feed (server gate = is_enrolled() RLS).
+  // includes the member feed (server gate = is_enrolled() RLS). `gettingstarted` (#69): the
+  // Getting Started REPLAY page, which every paid plan includes. The first watch is a gate
+  // screen, not a tab, so it needs no entry; silver and vip reach the page through full access,
+  // and the fail-closed entitlement below deliberately does not.
   sampler: {
     scopeLabel: 'Essentials + 1-on-1 coaching',
     stageIds: ['home', 'training', 'jobsearch'],
-    tabIds: ['dashboard', 'progress', 'qbomastery', 'linkedinopt', 'coachalex', 'community'],
+    tabIds: ['gettingstarted', 'dashboard', 'progress', 'qbomastery', 'linkedinopt', 'coachalex', 'community'],
     courseTier: 'essentials',
   },
   // Premium self-paced: full non-admin toolkit.

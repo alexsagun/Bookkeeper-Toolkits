@@ -59,13 +59,15 @@ running it.
 
 ## 3. The permission matrix
 
-Three fixed roles, 22 permissions, **34 grants**. #45 seeded 18 permissions and 26 grants; #52 added
+Three fixed roles, 23 permissions, **35 grants**. #45 seeded 18 permissions and 26 grants; #52 added
 `student_progress.read` for Super Admin and Operations Admin; **#56 gave both community
 permissions to Operations Admin AND Trainer**; **#58 added `finance.manage` and #61
 `communications.send`, and #62 `meetings.manage`, each for Super Admin alone**; **#67 replaced
 `students.import` (Super Admin + Operations Admin) with `students.legacy_migrate` (Super Admin alone)**,
-because activating a legacy student creates paid access with no payment recorded here. Mirrored in
-[src/lib/staffRoles.js](src/lib/staffRoles.js); `test/staffRolesSql.test.mjs` fails if the two drift.
+because activating a legacy student creates paid access with no payment recorded here; **#69 added
+`onboarding.manage`, for Super Admin alone** (category *Onboarding*, appended last to the seed). Mirrored in
+[src/lib/staffRoles.js](src/lib/staffRoles.js); `test/staffRolesSql.test.mjs` fails if the two drift
+(it diffs the order, not just the set, against the current seed — since #69, the #69 file).
 
 | Permission | Super Admin | Operations Admin | Trainer |
 |---|:--:|:--:|:--:|
@@ -91,8 +93,9 @@ because activating a legacy student creates paid access with no payment recorded
 | `finance.manage` — Financial Management (the business books) | ✅ | — | — |
 | `communications.send` — Communications (announcements, student emails, automations, the tracker) | ✅ | — | — |
 | `meetings.manage` — Meetings & Tasks (Zoom meetings, invitations, templates, the to-do board) | ✅ | — | — |
+| `onboarding.manage` — Getting Started Video (upload, preview, publish, replace and remove the video newly approved students watch first) | ✅ | — | — |
 
-**Three omissions people ask about, all deliberate:**
+**Four omissions people ask about, all deliberate:**
 
 - **Neither Operations Admin nor Trainer holds `finance.manage`.** An Operations Admin approves
   payment proofs, and each approval *posts* a collection to the ledger through a trigger. But
@@ -106,9 +109,16 @@ because activating a legacy student creates paid access with no payment recorded
   acts: publishing exposes content to every paying student, and deleting removes storage objects a
   *duplicated* course may still reference by path (duplication reuses files by reference — no copy is
   made).
+- **Neither Operations Admin nor Trainer holds `onboarding.manage` (#69).** Publishing or replacing the
+  Getting Started video changes the first screen every newly approved student sees, and the live file
+  is served to every paying member — a product-wide change, like the global settings. Neither role sees
+  the Getting Started Video row, the direct URL (`/admin/getting-started-video`) renders the restricted
+  screen, every `admin_onboarding_video_*` RPC refuses them, the versions and their audit trail are
+  unreadable to them, and the bucket refuses their writes. Nor are staff ever asked to watch it: the
+  gate excludes every `invited`/`active` membership, and a staff replay records nothing.
 
-Both are additive later: insert a `staff_role_permissions` row. Neither can be worked around from the
-client, because RLS reads the table, not the JS mirror.
+All of them are additive later: insert a `staff_role_permissions` row. None can be worked around from
+the client, because RLS reads the table, not the JS mirror.
 
 **Why the two Community rows are not a footnote (#56).** They were Super-Admin-only from #45 until
 #56, and #45 left every community RPC and policy on `is_admin()` **because of that** — with one
@@ -289,9 +299,17 @@ Then check it as a human, in two browser profiles:
 | Signed in as | Should see | Should NOT see |
 |---|---|---|
 | Super Admin | everything, incl. Team & Roles | — |
-| Operations Admin | Access Requests, Enrollments, Batches | Team & Roles, Student Imports, course builder controls |
+| Operations Admin | Access Requests, Enrollments, Batches | Team & Roles, Student Imports, Getting Started Video, course builder controls |
 | Trainer | the course catalogs + the builder for **assigned** courses | payments, students, batches, staff, Publish/Delete |
 | Student | the toolkit their plan entitles them to | every `/admin/*` route, by direct URL too |
 
 The last row is the one to actually test by typing the URL. Hiding a link is a courtesy; the
 chokepoint and RLS are the boundary.
+
+**What a refused admin address looks like (#69, T12B-D1).** An Operations Admin or Trainer who types
+an admin address their role lacks sees **"Your account can’t open this screen"**, naming their role
+("…your role — Trainer — doesn’t include it. If you need it, ask a Super Admin.") with only *Back to
+Dashboard* — never a plan upsell, because no membership plan includes an admin screen. A student sees
+the same screen, saying it is an admin screen no membership plan includes. Any admin address first
+shows **"Checking your access…"** for up to 8 s while `my_staff_context()` answers, so a Super Admin
+who deep-links one never sees a refusal flash before their screen opens.

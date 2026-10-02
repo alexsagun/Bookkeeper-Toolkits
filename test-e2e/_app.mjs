@@ -185,13 +185,18 @@ export async function signIn(email) {
  * Put a session (and the per-user "welcome already seen" flag) into localStorage
  * before any app script runs. The storage key is the one supabase-js derives from
  * the project URL; the welcome flag uses main.jsx's `u:<uid>:` namespace.
+ *
+ * `welcomed: false` leaves that flag out, so the persona arrives as a brand-new account
+ * whose first-login welcome (WelcomeOverlay) is still unseen — the #69 suite needs it to
+ * prove the Getting Started gate closes the welcome instead of stacking it on the
+ * Dashboard. The default writes exactly what every existing caller has always had.
  */
-export async function injectSession(page, session, { railCollapsed = null } = {}) {
+export async function injectSession(page, session, { railCollapsed = null, welcomed = true } = {}) {
   const ref = new URL(shadowEnv().SHADOW_SUPABASE_URL).hostname.split('.')[0];
   const uid = session.user.id;
   const entries = {
     [`sb-${ref}-auth-token`]: JSON.stringify(session),
-    [`u:${uid}:onboarding:welcomed`]: '1',
+    ...(welcomed ? { [`u:${uid}:onboarding:welcomed`]: '1' } : {}),
     [`u:${uid}:sidebar:adminExpanded`]: 'true',
   };
   if (railCollapsed !== null) entries[`u:${uid}:sidebar:railCollapsed`] = String(railCollapsed);

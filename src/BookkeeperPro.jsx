@@ -12,13 +12,13 @@ import {
   ArrowUp, ArrowDown, ArrowUpDown, X, Copy, Check, ImageOff, List,
   TrendingUp as Growth, BookMarked, Globe, Coins, GraduationCap,
   LogOut, Lock, Mail, KeyRound, Menu,
-  Plus, Trash2, Save, Play, Video, ArrowRight, ArrowLeft, ChevronUp, MoreVertical,
+  Plus, Trash2, Save, Play, PlayCircle, Video, ArrowRight, ArrowLeft, ChevronUp, MoreVertical,
   PanelLeftClose, PanelLeftOpen, RefreshCw, UserCheck, UserX, ShieldCheck, Hourglass, Bell, BellOff, Volume2,
   Sun, Moon, Monitor, CreditCard, ArrowUpCircle, CalendarPlus,
   MessagesSquare, ThumbsUp, PartyPopper, EyeOff,
   Pin, AtSign, Megaphone, Link2, Unlock, CheckCheck, Camera, Paperclip, Info,
   UploadCloud, Users, Database, Filter, Pause, CircleOff,
-  Hash, Settings, Archive, RotateCcw, Pencil
+  Hash, Settings, Archive, RotateCcw, Pencil, Clapperboard
 } from 'lucide-react';
 import { createPortal } from 'react-dom';
 import { useAuth } from './auth/AuthProvider.jsx';
@@ -50,7 +50,7 @@ import {
   formatBatchDate, hasUpcomingOpenBatch, isPastBatch, monthBounds, periodProgress,
   validateBatchEdit,
 } from './lib/batchLifecycle';
-import { APP_ERROR_COPY, appErrorCode, appErrorMessage, isMigrationMissing } from './lib/appErrors';
+import { APP_ERROR_COPY, appErrorCode, appErrorContext, appErrorMessage, isMigrationMissing } from './lib/appErrors';
 import {
   ADMIN_TAB_PERMISSION, STAFF_PERMISSIONS, STAFF_ROLES, STAFF_STATUSES,
   adminTabVisible, canManageCourseClient, communityAuthority, lastSuperAdminGuard, permissionsForRole,
@@ -119,6 +119,19 @@ import {
   inspectLessonVideo, describeVideoContent, describeVideoWeight, parseObjectTotalBytes,
 } from './lib/courseVideo';
 import { planFaststartRemux } from './lib/mp4Faststart';
+// #69: the Getting Started video has a private bucket of its own — see signOnboardingVideo() —
+// and every rule of the student flow that needs no React (the watch rule, the gate's status,
+// the problem codes) lives in the pure module, pinned by test/gettingStarted.test.mjs.
+import {
+  ONBOARDING_VIDEO_BUCKET, ONBOARDING_STATE_TIMEOUT_MS, ONBOARDING_LOAD_TIMEOUT_MS, ONBOARDING_COMPLETE_TIMEOUT_MS,
+  formatVideoDuration, gettingStartedEnrollPhase, gettingStartedFailedBeforePass, gettingStartedGateInput,
+  gettingStartedStatus, gettingStartedNeedsReask,
+  holdWatchVerdict, mergeRanges, onboardingProblemCode, resumeAt, watchRecordFor, watchVerdict,
+  // What a student is told: why the video gave up, and where they stand with it (the card and the page).
+  gettingStartedGiveUpCopy, gettingStartedStanding,
+  // The Super Admin screen (#69): the draft's object name, and the ONE reader of the overview.
+  buildOnboardingVideoPath, onboardingVideoPathVideoId, onboardingHealth, publishImpact,
+} from './lib/gettingStarted';
 import {
   INTAKE_FIELDS, INTAKE_SECTIONS,
   validateIntake, parseAmountPaid, normalizePhone, MAX_INTAKE_AMOUNT,
@@ -176,8 +189,10 @@ const PAYMENT_SETTINGS_FALLBACK = {
 
 const TAB_ROUTES = {
   dashboard: '/',
+  gettingstarted: '/getting-started',
   progress: '/progress-rankings',
   community: '/community',
+  gettingstartedadmin: '/admin/getting-started-video',
   accessrequests: '/admin/access-requests',
   enrollments: '/admin/enrollments',
   studentimports: '/admin/student-imports',
@@ -228,14 +243,16 @@ const ROUTE_TO_TAB = Object.entries(TAB_ROUTES).reduce((acc, [tab, href]) => {
   '/quickbooks-online-mastery': { tab: 'qbomastery' },
   '/resume-winning-strategy': { tab: 'resumestrategy' },
   '/mock-interview-simulator': { tab: 'interview', interviewSub: 'mock' },
+  // #69: a short address for the Getting Started page, for an email or a support reply.
+  '/welcome': { tab: 'gettingstarted' },
 });
 
 const VALID_APP_TABS = new Set(Object.keys(TAB_ROUTES));
-// Real tool count for the Dashboard stat strip — every routed tab except Home, the two
-// admin-only screens, the member community (a space, not a tool), and the legacy
-// mockinterview alias (a redirect, not a tool). Derived so the number can never drift
-// from the actual toolkit again.
-const NON_TOOL_TAB_IDS = new Set(['dashboard', 'progress', 'community', 'accessrequests', 'enrollments', 'studentimports', 'batches', 'staffroles', 'meetings', 'financialmanagement', 'communications', 'mockinterview']);
+// Real tool count for the Dashboard stat strip — every routed tab except Home, the admin-only
+// screens, the member community (a space, not a tool), the Getting Started replay page and its
+// Super Admin screen (#69 — a welcome video, not a tool), and the legacy mockinterview alias (a
+// redirect, not a tool). Derived so the number can never drift from the actual toolkit again.
+const NON_TOOL_TAB_IDS = new Set(['gettingstarted', 'dashboard', 'progress', 'community', 'gettingstartedadmin', 'accessrequests', 'enrollments', 'studentimports', 'batches', 'staffroles', 'meetings', 'financialmanagement', 'communications', 'mockinterview']);
 const TOOL_COUNT = Object.keys(TAB_ROUTES).filter((id) => !NON_TOOL_TAB_IDS.has(id)).length;
 const INTERVIEW_SUBTAB_IDS = new Set(['winstrat', 'mock', 'common', 'accounting', 'body', 'jdgen', 'salary']);
 const APP_ROUTE_CHANGE_EVENT = 'bookkeeper:route-change';
@@ -443,6 +460,7 @@ function shouldHandleInAppClick(e) {
 // When a tool is added/renamed, update this map and regenerate the knowledge doc in the
 // same change (see "Keeping docs current" in CLAUDE.md).
 const VOICE_TAB_INFO = {
+  gettingstarted: { label: 'Getting Started', stage: 'Home', desc: 'Replay the Getting Started welcome video and see whether you have finished it.' },
   dashboard:    { label: 'Dashboard', stage: 'Home', desc: 'Progress overview with career-stage tiles, membership status, and quick links to every tool.' },
   progress:     { label: 'Progress & Rankings', stage: 'Home', desc: 'Private learning report with completion-based Accounting Foundations, QuickBooks Mastery, Profile Optimization and Interview Readiness progress, daily trends, fair plan and VIP batch leaderboards, and privacy controls.' },
   community:    { label: 'Community', stage: 'Home', desc: 'Member forum organised into channels grouped by category, like a chat community. Text channels for discussion and announcement channels that are read-and-react only. Every member sees #announcements plus general channels for QuickBooks help, the job search and client work; VIP members also get their own private cohort channels. Channels can be limited to particular plans or batches, and members only ever see the channels they may open. Includes per-channel unread markers, search within a channel or across all of them, free-form tags, image/video/link attachments, @mentions, reactions, pinned posts and a notification bell. Admins create and organise channels from Manage community. Access follows the membership automatically.' },
@@ -476,6 +494,8 @@ const VOICE_TAB_INFO = {
   salestax:     { label: 'Sales Tax', stage: 'Client Management & Delivery', desc: 'US sales-tax reference and calculator.' },
   yearendcheck: { label: 'Year-End Checklist', stage: 'Client Management & Delivery', desc: 'Year-end close checklist.' },
   form1099:     { label: '1099 Prep', stage: 'Client Management & Delivery', desc: '1099 contractor prep tracker for year-end filing.' },
+  // Navigation only: nothing about who has watched it, and no file or storage detail.
+  gettingstartedadmin: { label: 'Getting Started Video', stage: 'Admin', desc: 'Admin screen: upload, preview, publish, replace or remove the Getting Started video that newly approved students watch before their first dashboard. Super Admin only.', adminOnly: true },
   accessrequests: { label: 'Access Requests', stage: 'Admin', desc: 'Admin screen: approve or reject new signups.', adminOnly: true },
   // Navigation only. No amounts, balances, customer details or financial facts may
   // ever appear here — this literal is published to the ElevenLabs knowledge base.
@@ -494,6 +514,13 @@ const VOICE_TAB_INFO = {
 // navigate_to_tool — we do the right thing instead of failing).
 const VOICE_TOOL_ALIASES = {
   'home': { tab: 'dashboard' },
+  // #69. Never a bare 'onboarding' alias: that is the Client Onboarding tool id, and an exact
+  // tab id wins before any alias is read.
+  'getting started': { tab: 'gettingstarted' },
+  'getting started video': { tab: 'gettingstarted' },
+  'welcome video': { tab: 'gettingstarted' },
+  'onboarding video': { tab: 'gettingstarted' },
+  'intro video': { tab: 'gettingstarted' },
   'progress': { tab: 'progress' },
   'my progress': { tab: 'progress' },
   'rankings': { tab: 'progress' },
@@ -2404,7 +2431,9 @@ function AccountSetupScreen({ onFinished }) {
 // #67: the one-time onboarding summary, straight after the account is created. What the
 // student now has, read from my_migration_summary() — their own row, nothing typed — and
 // a single way on. It shows no price: the membership is already paid.
-function ImportWelcomeScreen({ onContinue, onSignOut }) {
+// #69: `continueLabel` — the root passes "Continue" when the gate shows the Getting Started
+// video next, because the dashboard is not what this button opens then.
+function ImportWelcomeScreen({ onContinue, onSignOut, continueLabel = 'Go To Dashboard' }) {
   const { user, profile } = useAuth();
   const [s, setS] = useState(null);
   const [failed, setFailed] = useState(false);
@@ -2469,7 +2498,7 @@ function ImportWelcomeScreen({ onContinue, onSignOut }) {
       <button type="button" onClick={onContinue}
         className="w-full py-2.5 rounded-xl text-white text-sm font-bold flex items-center justify-center gap-2 transition"
         style={MIGRATION_PRIMARY_BTN}>
-        Go To Dashboard
+        {continueLabel}
       </button>
       <button type="button" onClick={onSignOut} className="w-full py-2 text-xs font-semibold" style={{ color: C.textMute }}>
         Sign out
@@ -3462,6 +3491,15 @@ function StaffInvitationSetup({ invite, deferred, onAccepted, onDecline, onDismi
   }
 }
 
+// The three career stages, in the words the first-login welcome has always used. ONE list,
+// which WelcomeOverlay and the Getting Started screen (#69) both render, so the toolkit's two
+// introductions cannot describe the journey differently.
+const WELCOME_JOURNEY_STAGES = Object.freeze([
+  { n: '01', label: 'Training & Skills', desc: 'Master the accounting foundations and the tools US clients expect.' },
+  { n: '02', label: 'Job Application', desc: 'Build authentic branding and ace interviews & discovery calls.' },
+  { n: '03', label: 'Client Management', desc: 'Run engagements, deliver the books, and grow your practice.' },
+]);
+
 // First-login welcome. Shown once per user (gated on the namespaced
 // `onboarding:welcomed` storage flag) so a brand-new account is greeted and
 // oriented to the three career stages instead of landing on a blank dashboard.
@@ -3499,11 +3537,6 @@ function WelcomeOverlay({ name, onClose }) {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
-  const stages = [
-    { n: '01', label: 'Training & Skills', desc: 'Master the accounting foundations and the tools US clients expect.' },
-    { n: '02', label: 'Job Application', desc: 'Build authentic branding and ace interviews & discovery calls.' },
-    { n: '03', label: 'Client Management', desc: 'Run engagements, deliver the books, and grow your practice.' },
-  ];
   return (
     <OverlayPortal>
     <div className="fixed inset-0 z-50 flex items-center justify-center p-6"
@@ -3525,7 +3558,7 @@ function WelcomeOverlay({ name, onClose }) {
           </div>
         </div>
         <div className="px-8 py-6 space-y-3">
-          {stages.map(s => (
+          {WELCOME_JOURNEY_STAGES.map(s => (
             <div key={s.n} className="flex items-start gap-3 p-3 rounded-2xl" style={{ background: GLASS.card, border: `1px solid ${GLASS.borderSoft}` }}>
               <div className="flex items-center justify-center flex-shrink-0 rounded-xl text-white text-xs font-bold"
                 style={{ width: 34, height: 34, background: `linear-gradient(180deg, ${C.primaryHi}, ${C.primary})` }}>{s.n}</div>
@@ -3830,10 +3863,25 @@ const ENROLLMENT_SETUP_HINT =
   "The enrollment workflow isn’t set up in the database yet — run db/2026-07-04-enrollment.sql in your Supabase SQL Editor (see ENROLLMENT_SETUP.md), then refresh.";
 
 // A "column / table doesn't exist" PostgREST error → the enrollment migration hasn't run.
+// ★ BROAD ON PURPOSE, AND ONLY FOR WHAT IS WORTH A console.error: it also matches MESSAGES that name a
+//   table or a cache. Whether the workflow is MIGRATED is isEnrollmentTableMissingErr() below.
 function isEnrollmentNotConfiguredErr(e) {
   const code = e?.code || '';
   return code === 'PGRST204' || code === 'PGRST205' || code === '42703' || code === '42P01' ||
     /enrollment_requests|enrollment_plans|payment_settings|does not exist|schema cache|could not find|relation/i.test(e?.message || '');
+}
+
+// A MISSING enrollment table or column — decided by the error's CODE, never its message (#69,
+// V-MIGRATED-PREDICATE). This is useEnrollmentGate's `migrated`, which the Getting Started arm reads
+// and only a good read turns back on. The message test above also matched a schema-cache reload that
+// outlasted postgrest-js's retries (PGRST002, "…query the database for the schema cache"), a permission
+// error naming the table (42501, "permission denied for table enrollment_requests") and any error whose
+// text says "relation", "does not exist" or "could not find" — and each of those, mid-video, switched the
+// arm off and unmounted the gate (the GF-2 flap, by another door).
+//   PGRST205 / 42P01: the table is missing.   PGRST204 / 42703: a column is missing.
+function isEnrollmentTableMissingErr(e) {
+  const code = e?.code || '';
+  return code === 'PGRST205' || code === '42P01' || code === 'PGRST204' || code === '42703';
 }
 
 const fmtEnrollDate = (s) => {
@@ -3909,21 +3957,50 @@ function useEnrollmentGate(user, profile, profileReady, staff) {
   const staffPasses = staffBypassesPaywall(staff) || !!profile?.is_admin;
   const active = REQUIRE_ENROLLMENT && !!user && profileReady && !staffPasses;
   const uid = user?.id;
-  const [ready, setReady] = useState(false);
-  const [configured, setConfigured] = useState(true);
+  // ★ #69 (K3R-GATE-DIRECT-SWITCH): THE READS IN HAND BELONG TO ONE ACCOUNT, AND SAY WHICH. `loadedFor`
+  //   is the uid the last LANDED reads were made for, set in the same commit as their data; it
+  //   replaces the old `ready` flag. The effect below re-runs on a new uid without clearing what it
+  //   holds — and must not clear on reloadKey, or every focus and realtime refetch would flash the
+  //   splash — so on a DIRECT account switch (a sign-in to another account with no signed-out render
+  //   between, e.g. two auth events batched into one render on a resumed tab) the previous account's
+  //   request and term stayed in hand and were reported, READY, as the new account's: the gate could
+  //   judge B by A's term, and Getting Started spent B's one re-ask on A's pass. So everything this
+  //   hook reports from its reads is derived DURING RENDER, and only while `loadedFor` is the current
+  //   uid (below, at the return); until then it reports what a fresh mount reports — not ready, no
+  //   request, no term, configured and migrated at their defaults. The same account's refetches keep
+  //   `loadedFor`, so they never show a splash.
+  const [loadedFor, setLoadedFor] = useState(null);
+  // ★ #69 (K3RV-CONFIGURED-CARRYOVER): `configured` IS ONE ACCOUNT'S FACT TOO, so it is kept WITH the uid
+  //   it was read for — { uid, ok }, or null before an enrollment_requests read for anyone has answered —
+  //   and reported only for that account (at the return); a sign-out forgets it with the reads. `loadedFor`
+  //   alone did not cover it: the 7-s timeout leaves `configured` as it was (the fail-open, right for the
+  //   SAME account) and sets `loadedFor`, so after a direct switch or a sign-out the NEXT account whose
+  //   reads stalled was handed the previous account's failed read — and an unpaid student was passed by the
+  //   legacy approval gate into the app instead of the paywall a fresh mount's timeout shows.
+  const [configuredRead, setConfiguredRead] = useState(null);
+  // ★ #69 (GF-2): MIGRATED IS A FACT OF ITS OWN, NOT `configured`. `configured` follows the LAST
+  //   read — false on any error, true again on the next good one — which is right for this gate's
+  //   own fail-open and wrong for anything that asks "is the enrollment workflow set up?": the
+  //   Getting Started arm read it, and one 502 on a focus refetch unmounted the video gate mid-watch.
+  //   `migrated` turns false only when a table is MISSING (isEnrollmentTableMissingErr — by the code,
+  //   never the message), and true on any good read; a transient error, a thrown call or the timeout
+  //   leaves it as it was. ★ It describes the DATABASE, not an account, so it is deliberately NOT kept per
+  //   uid like `configured`: a table the previous account's read found missing is missing for the next one.
+  const [migrated, setMigrated] = useState(true);
   const [latestReq, setLatestReq] = useState(null);
   const [sub, setSub] = useState(null);
   const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
-    if (!REQUIRE_ENROLLMENT || !uid) { setReady(false); setLatestReq(null); setSub(null); return; }
+    if (!REQUIRE_ENROLLMENT || !uid) { setLoadedFor(null); setConfiguredRead(null); setLatestReq(null); setSub(null); return; }
     let cancelled = false;
     (async () => {
       try {
         // The two gate queries now block the app shell for every non-admin, so a
         // STALLED (never-resolving) fetch must not trap the user on AuthSplash
         // forever. Race against a timeout that fails OPEN: ready=true, configured
-        // stays true, sub stays null → a paid member passes (RLS still enforces
+        // stays what THIS account last read (true on its first load — see
+        // configuredRead), sub stays null → a paid member passes (RLS still enforces
         // expiry on content), an unpaid user hits the paywall as usual.
         const TIMEOUT = Symbol('enroll-gate-timeout');
         const raced = await Promise.race([
@@ -3939,15 +4016,18 @@ function useEnrollmentGate(user, profile, profileReady, staff) {
         if (raced === TIMEOUT) {
           console.warn('[enroll] gate load timed out — failing open');
           setLatestReq(null); setSub(null);
-          return;   // finally sets ready=true; configured unchanged (fail-open)
+          return;   // finally marks the reads landed; this account's configured unchanged (fail-open)
         }
         const [reqRes, subRes] = raced;
         if (reqRes.error) {
           if (!isEnrollmentNotConfiguredErr(reqRes.error)) console.error('[enroll] gate load failed', reqRes.error);
-          setConfigured(false);   // fail-open → legacy gate
+          // A MISSING table, by its code — never a read that merely failed (GF-2), whatever its text says.
+          if (isEnrollmentTableMissingErr(reqRes.error)) setMigrated(false);
+          setConfiguredRead({ uid, ok: false });   // fail-open → legacy gate
           setLatestReq(null);
         } else {
-          setConfigured(true);
+          setConfiguredRead({ uid, ok: true });
+          setMigrated(true);
           setLatestReq(reqRes.data || null);
         }
         // A subscription error NEVER unconfigures the gate: on an old-schema deploy
@@ -3960,9 +4040,9 @@ function useEnrollmentGate(user, profile, profileReady, staff) {
           setSub(subRes.data || null);
         }
       } catch (e) {
-        if (!cancelled) { console.error('[enroll] gate load failed', e); setConfigured(false); setLatestReq(null); setSub(null); }
+        if (!cancelled) { console.error('[enroll] gate load failed', e); setConfiguredRead({ uid, ok: false }); setLatestReq(null); setSub(null); }
       } finally {
-        if (!cancelled) setReady(true);
+        if (!cancelled) setLoadedFor(uid);   // the same commit as the data above
       }
     })();
     return () => { cancelled = true; };
@@ -3995,8 +4075,2803 @@ function useEnrollmentGate(user, profile, profileReady, staff) {
     };
   }, [uid, profile?.is_admin, refresh]);
 
-  const state = enrollGateState({ profile, latestReq, sub });
-  return { active, ready: active ? ready : true, configured, latestReq, sub, state, refresh };
+  // Only the signed-in account's reads (see `loadedFor` above); anything else is what a fresh mount reports.
+  const loaded = !!uid && loadedFor === uid;
+  const ownReq = loaded ? latestReq : null;
+  const ownSub = loaded ? sub : null;
+  const state = enrollGateState({ profile, latestReq: ownReq, sub: ownSub });
+  return {
+    active, ready: active ? loaded : true,
+    configured: loaded && configuredRead?.uid === uid ? configuredRead.ok : true,
+    migrated: loaded ? migrated : true,
+    latestReq: ownReq, sub: ownSub, state, refresh,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// GETTING STARTED (#69) — the student surfaces
+// ═══════════════════════════════════════════════════════════════════
+// A newly approved student watches one Super-Admin-managed video before their first
+// dashboard, then replays it whenever they like from the sidebar (the `gettingstarted` tab)
+// or the Dashboard card. Every rule that needs no React lives in src/lib/gettingStarted.js
+// and is tested there; this is the React half:
+//
+//   GettingStartedContext / useGettingStarted — the root's question ("does this student watch
+//       it first?"), asked once per account and answered DURING RENDER;
+//   recordOnboardingCompletion — the ONE call site of the completion RPC;
+//   usePauseWhenHidden — a replay in a hidden keep-alive tab stops talking;
+//   GettingStartedPlayer — SignedLessonVideo plus the watch rule, in four modes;
+//   GettingStartedBody — what the student sees (the Super Admin's preview reuses it);
+//   GettingStartedScreen — the gate · GettingStartedPage — the tab · GettingStartedCard —
+//       the Dashboard card · useReplayRecorder — how a replay records a completion.
+//
+// ★ PRESENTATION ONLY. Nothing here grants anything, and the gate fails OPEN: membership RLS
+//   still protects paid content. What refuses a forged completion is the server's elapsed
+//   guard in the completion RPC, not the watch rule in the player.
+// ★ THE LIVE OBJECT'S NAME GOES TO THE SIGNER AND NOWHERE ELSE. start_onboarding_video()
+//   hands it to the player so SignedLessonVideo can sign it; it is never logged, rendered, or
+//   put into an address of ours.
+// ★ NEVER A PRICE. The gate screen is a welcome, not a shop window.
+// Pinned by test/uiSafety.test.mjs §28b.
+
+/**
+ * The Getting Started answer for everything inside the app shell — the tab and the card.
+ * ★ ITS DEFAULT FAILS SAFE, as EntitlementContext's does: a reader outside the provider sees
+ *   'unavailable', which the gate reads as "render the app" and the tab and the card read as
+ *   "nothing to show". The gate screens render BEFORE the shell (outside the provider), so the
+ *   gate is handed the root's value as a prop instead.
+ */
+const GettingStartedContext = React.createContext(Object.freeze({
+  status: 'unavailable', data: null, missing: false, uid: null, markCompleted() { return false; }, refresh() {},
+}));
+
+/**
+ * useGettingStarted(uid, enrollPhase) → { status, data, missing, uid, markCompleted(result, uid), refresh() }
+ *
+ * `enrollPhase` is gettingStartedEnrollPhase(): 'pass' (a SETTLED pass — the hook's enrollPass),
+ * 'hold' (settled, not passing: a hold screen) or 'unknown' (the profile or the enrollment reads are
+ * still out). Only the literal 'pass' passes.
+ *
+ * The root's question: does this signed-in account watch the Getting Started video before
+ * its first dashboard? The value is MEMOIZED, and is the GettingStartedContext value.
+ *
+ * ★ ONE PIECE OF STATE, AND THE ANSWER IS DERIVED FROM IT DURING RENDER. `fetched` is
+ *   { uid, data, failed, timedOut, reaskedAfterPass }, and { status, data } is
+ *   gettingStartedStatus() of it — never a status an effect sets. An effect-set status leaves
+ *   one frame in which the gate has no answer and renders the app (a flash of the dashboard
+ *   the video must come before), and could show the previous account's answer after a
+ *   sign-in switch.
+ * ★ ASKED THE MOMENT A UID EXISTS, KEYED ON THE UID ALONE — in parallel with the profile and
+ *   enrollment reads, never after them, so no student waits on an extra round trip. Every
+ *   request carries its own ONBOARDING_STATE_TIMEOUT_MS, counted from its start.
+ * ★ ANY FAILURE FAILS OPEN. An RPC error (a pre-#69 database answers MIGRATION_MISSING), a
+ *   thrown call or the timeout is 'unavailable', and the gate renders the app.
+ * ★ A LATE ANSWER IS DISCARDED — one that lands after its own timeout, after a newer request,
+ *   or for an account that is no longer the signed-in one. Taking it would drop a session that
+ *   already failed open into the gate in the middle of using the app; the student is asked
+ *   again at the next sign-in instead.
+ * ★ ONE RE-ASK PER ACCOUNT, ON A STATE, NEVER AN EDGE (gettingStartedNeedsReask(), the twin of
+ *   gettingStartedStatus()'s hold). A student approved while waiting on the pending screen holds an
+ *   eligible:false answer when enrollPass turns true; the gate holds its splash until the one
+ *   re-ask lands. An edge would be lost whenever the enrollment read beat the first answer.
+ *   ★ A FAILURE THAT LANDED WHILE NOTHING WAITED ON IT IS RE-ASKED THE SAME WAY (GF-1): an error
+ *   or timeout that came back while the student was still on the pending screen decided nothing,
+ *   and failing open on it when the approval landed — hours later — sent a newly approved student
+ *   to the dashboard, past the video, for the whole session. `failedBeforePass` records it, by the
+ *   phase the failure LANDED in (gettingStartedFailedBeforePass()): on a hold it decided nothing and is
+ *   re-asked at the pass; on the pass it IS the gate's answer, and fails open at once; while the reads
+ *   are still out it is undecided (null) until they land, and is then settled by THAT phase — so a
+ *   sign-in whose reads land on a pass fails open there, 7 s from the uid, never 7 s twice
+ *   (V-GF1-DOUBLE-BOUND: handed a boolean, the hook read "still loading" as "held", and re-asked).
+ * ★ A DATABASE WITHOUT #69 IS `missing` (GF-8): the tab says Getting Started is not set up rather
+ *   than offering a "try again" that can never succeed, and nothing re-asks it.
+ * ★ markCompleted(result, uid) merges a recorded completion into this account's answer, so the
+ *   gate passes at once, with no round trip — and it returns whether it did. It takes the account
+ *   the completion was REQUESTED for (`uid` below, captured before the call), and refuses — false,
+ *   making nothing stale — unless that is still the signed-in account and its answer is there to
+ *   merge into (GF-7). signOut() does not reload the page, so a completion can outlive one: taken
+ *   for whoever had signed in since, it either merged into THEIR answer or left their first
+ *   question stale and the splash with nothing to end it.
+ * ★ refresh() asks again. A successful answer replaces the current one — and so does a failure:
+ *   the gate's rule for a question it cannot answer is to fail open. refresh({ keep: true }) is
+ *   for a COSMETIC refresh (a replaced video's title and transcript): its failure or timeout
+ *   leaves the current answer in place, because it must never be what opens the gate. A keep
+ *   answer that DOES land is the newest word (RV8-K1): in flight it shares the newest request's
+ *   number, so without that an older plain question still out — or its own timeout — landed
+ *   after it and put the older answer, or 'unavailable', back, and the gate failed open under a
+ *   replaced video the student had not watched.
+ */
+function useGettingStarted(uid, enrollPhase) {
+  const [fetched, setFetched] = useState(null);
+  const enrollPass = enrollPhase === 'pass';
+  // The latest values, for the async continuations below to READ. Nothing depends on them.
+  const uidRef = useRef(uid);
+  uidRef.current = uid;
+  const passRef = useRef(enrollPass);
+  passRef.current = enrollPass;
+  const phaseRef = useRef(enrollPhase);
+  phaseRef.current = enrollPhase;
+  const fetchedRef = useRef(fetched);   // the answer as last RENDERED: what markCompleted may merge into
+  fetchedRef.current = fetched;
+  const seqRef = useRef(0);             // the newest request; an older one's answer is dropped
+  const askedForRef = useRef(null);     // the account the first question has been sent for
+  const reaskedForRef = useRef(null);   // the account whose one re-ask has been sent
+
+  const ask = useCallback((forUid, keep = false) => {
+    // A keep-refresh shares the newest request's number instead of taking a new one: a cosmetic
+    // question must never make a real one in flight stale — the approval re-ask would be
+    // dropped, and a failed keep-refresh then leaves nothing to end the splash.
+    const seq = keep ? seqRef.current : ++seqRef.current;
+    // "Requested while enrollPass was already true" — the first request included.
+    const reaskedAfterPass = passRef.current === true;
+    let settled = false;
+    let timer = null;
+    const settle = (answer) => {
+      if (settled || seq !== seqRef.current || uidRef.current !== forUid) return;
+      settled = true;
+      clearTimeout(timer);
+      // refresh({ keep: true }) that failed or timed out: the answer it was to update stands.
+      if (keep && !answer.data) return;
+      // …and one that LANDED supersedes every question asked before it (RV8-K1).
+      if (keep) seqRef.current += 1;
+      setFetched({
+        uid: forUid, data: null, failed: false, timedOut: false, missing: false, reaskedAfterPass,
+        // GF-1: a failure that LANDED on a hold decided nothing — no gate waited on it — so the pass,
+        // when it comes, asks once more (gettingStartedNeedsReask()); one that landed on the pass is
+        // the gate's answer; one that landed while the profile or the enrollment reads were still out
+        // waits for them (null — V-GF1-DOUBLE-BOUND, settled below).
+        failedBeforePass: answer.data ? false : gettingStartedFailedBeforePass(phaseRef.current),
+        ...answer,
+      });
+    };
+    timer = setTimeout(() => settle({ timedOut: true }), ONBOARDING_STATE_TIMEOUT_MS);
+    Promise.resolve()
+      .then(() => supabase.rpc('my_onboarding_video'))
+      .then(({ data, error }) => {
+        if (error || !data || typeof data !== 'object') {
+          // GF-8: a database without #69 has no such function. Said apart from a failure, so the tab
+          // can say Getting Started is not set up — and no answer can ever come, so nothing re-asks.
+          const missing = !!error && isMigrationMissing(error);
+          if (error && !missing) {
+            console.warn('[getting-started] the video state could not be read; the gate fails open',
+              appErrorCode(error) || error.code || 'error');
+          }
+          settle({ failed: true, missing });
+          return;
+        }
+        settle({ data });
+      })
+      .catch(() => settle({ failed: true }));
+  }, []);
+
+  useEffect(() => {
+    if (uid) {
+      // Once per account: <React.StrictMode> runs this twice on mount, and the second run
+      // would only discard the first answer and wait for another.
+      if (askedForRef.current === uid) return;
+      askedForRef.current = uid;
+      ask(uid);
+    } else {
+      // Signed out: forget this session's answer, so the SAME account signing in again is
+      // asked afresh rather than shown what was true an hour ago.
+      askedForRef.current = null;
+      setFetched(null);
+      reaskedForRef.current = null;
+    }
+  }, [uid, ask]);
+
+  // V-GF1-DOUBLE-BOUND: a failure that landed while the profile or the enrollment reads were still
+  // out (null) is decided by the first settled phase they land in — gettingStartedFailedBeforePass()
+  // again: a hold makes it one nobody decided on (true: re-asked at the pass), the pass makes it the
+  // gate's answer (false). Until then it holds nothing, because only the literal true holds: at
+  // sign-in the gate fails open on it the moment the profile and the reads land on a pass.
+  const undecided = !!fetched && fetched.uid === uid && fetched.failedBeforePass === null;
+  const decidedAs = gettingStartedFailedBeforePass(enrollPhase);
+  useEffect(() => {
+    if (!undecided || decidedAs === null) return;
+    setFetched((p) => (p && p.uid === uid && p.failedBeforePass === null ? { ...p, failedBeforePass: decidedAs } : p));
+  }, [undecided, decidedAs, uid]);
+
+  // The ONE rule for asking again, shared with the status's hold (src/lib/gettingStarted.js).
+  const needsReask = gettingStartedNeedsReask({ uid, enrollPass, fetched });
+  useEffect(() => {
+    if (!needsReask || reaskedForRef.current === uid) return;
+    reaskedForRef.current = uid;          // at most once per account
+    ask(uid);
+  }, [needsReask, uid, ask]);
+
+  // GF-7: only the account the completion was requested for, only while it is still the signed-in
+  // one, and only into an answer that is there — otherwise nothing changes and NOTHING goes stale.
+  const markCompleted = useCallback((result, forUid) => {
+    const prev = fetchedRef.current;
+    if (!forUid || forUid !== uidRef.current || !prev || prev.uid !== forUid || !prev.data) return false;
+    seqRef.current += 1;                  // an answer asked for before this completion is stale
+    setFetched((p) => (p && p.uid === forUid && p.data
+      ? {
+        ...p,
+        data: {
+          ...p.data,
+          required: false,
+          completed: true,
+          completed_current: true,
+          completed_at: result?.completed_at || p.data.completed_at || null,
+        },
+      }
+      : p));
+    return true;
+  }, []);
+
+  const refresh = useCallback((options) => {
+    if (uidRef.current) ask(uidRef.current, options?.keep === true);
+  }, [ask]);
+
+  const { status, data, missing = false } = gettingStartedStatus({ uid, enrollPass, fetched });
+  // `uid` names the account this answer is for — what a caller captures before a completion and
+  // hands back to markCompleted (GF-7).
+  return useMemo(() => ({ status, data, missing, uid: uid || null, markCompleted, refresh }),
+    [status, data, missing, uid, markCompleted, refresh]);
+}
+
+/**
+ * Record that this student finished the live Getting Started video
+ *   → { ok, data, code, context, error }. Never throws.
+ *
+ * ★ THE ONE CALL SITE of the completion RPC in this file: the gate screen, the tab and the card
+ *   all come through here, so a refusal reads the same everywhere. `code` and `context` are
+ *   appErrorCode() / appErrorContext() — the code rides in the error's hint, the context
+ *   (current_video_id, started, seconds_remaining) in its details.
+ * ★ The server keeps the FIRST completed_at, so a replay never re-stamps it, and a staff
+ *   viewer's call records nothing ({ ok: true, recorded: false }): staff are never learners.
+ * ★ BOUNDED (S4): a call that has not answered after ONBOARDING_COMPLETE_TIMEOUT_MS is
+ *   { ok: false, code: 'timeout' } — the inline error and Retry. postgrest-js never times out a
+ *   POST, so a stalled one held "Go to dashboard" busy for good, every further press was swallowed,
+ *   and only a reload got out — which forgot the watch record. A Retry after a slow success is
+ *   safe: the server keeps the first completed_at. 'timeout' is no app error code, so the screens
+ *   say their own connection message.
+ */
+async function recordOnboardingCompletion() {
+  let timer = null;
+  try {
+    const answer = await Promise.race([
+      Promise.resolve().then(() => supabase.rpc('complete_onboarding_video')),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), ONBOARDING_COMPLETE_TIMEOUT_MS); }),
+    ]);
+    if (answer === null) return { ok: false, data: null, code: 'timeout', context: {}, error: null };
+    const { data, error } = answer;
+    if (error) return { ok: false, data: null, code: appErrorCode(error), context: appErrorContext(error), error };
+    return { ok: true, data: data && typeof data === 'object' ? data : null, code: null, context: {}, error: null };
+  } catch (e) {
+    return { ok: false, data: null, code: appErrorCode(e), context: appErrorContext(e), error: e };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Pause a replay whose keep-alive tab has been HIDDEN — not one merely scrolled out of view.
+ *
+ * ★ IT OBSERVES THE FRAME, NEVER THE <video>. SignedLessonVideo mounts the element only once a
+ *   URL is signed and REPLACES it on a re-sign or "Try again", so an observer on the first
+ *   element would be watching a detached node. The .gs-stage frame is mounted for the player's
+ *   whole life, and mediaRef always names the current <video>, or null.
+ * ★ offsetParent === null is what tells hidden from scrolled away: a TabPanel is hidden with the
+ *   `hidden` attribute (display: none), which takes every descendant's box with it, while a
+ *   frame scrolled off screen still has one. A student who scrolls down to read the transcript
+ *   keeps listening.
+ * ★ AND A RESIZE OBSERVER ON THE SAME FRAME, because the intersection observer alone misses one
+ *   case: a frame ALREADY scrolled out of view reports nothing when its panel is then hidden —
+ *   it was not intersecting before and is not now — and the video played on in the hidden tab
+ *   (measured in Chrome). A box that goes to display: none is a size change whatever the scroll
+ *   position; showing it again is one too, and passes the same offsetParent test untouched.
+ */
+function usePauseWhenHidden(frameRef, mediaRef) {
+  useEffect(() => {
+    const frame = frameRef.current;
+    if (!frame) return undefined;
+    const observers = [];
+    if (typeof IntersectionObserver === 'function') {
+      const observer = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting && frameRef.current?.offsetParent === null) mediaRef.current?.pause();
+        }
+      });
+      observer.observe(frame);
+      observers.push(observer);
+    }
+    if (typeof ResizeObserver === 'function') {
+      const sizes = new ResizeObserver(() => {
+        if (frameRef.current?.offsetParent === null) mediaRef.current?.pause();
+      });
+      sizes.observe(frame);
+      observers.push(sizes);
+    }
+    return () => { for (const o of observers) o.disconnect(); };
+  }, [frameRef, mediaRef]);
+}
+
+/** useRecheckOnReturn's patience: one question per return, at most every 10 seconds. */
+const GS_RECHECK_MIN_MS = 10_000;
+
+/**
+ * Call check() whenever the student comes BACK to this tab — the window regains focus, or the page
+ * turns visible — at most once per `minIntervalMs`, and never in the first `minIntervalMs` after
+ * mounting (the answer on screen was just read). check is read through a ref, so a caller's inline
+ * closure re-registers nothing.
+ * ★ GF-4: THE GATE ASKS AGAIN WHEN THE STUDENT RETURNS TO IT. The approval email's "Sign in to
+ *   Toolkits" opens a NEW tab while the pending tab is still open, and realtime moves that one to
+ *   the gate too. A student who watches in one tab came back to the other still held, with "Go to
+ *   dashboard" locked, and had to watch again or reload. The house pattern for hold screens is to
+ *   re-check on focus (MembershipScheduledScreen, the pending screens).
+ * ★ A tab switch fires visibilitychange AND focus: one question, not two.
+ */
+function useRecheckOnReturn(check, minIntervalMs = GS_RECHECK_MIN_MS) {
+  const checkRef = useRef(check);
+  checkRef.current = check;
+  useEffect(() => {
+    let last = Date.now();
+    const onReturn = () => {
+      if (document.visibilityState === 'hidden') return;
+      const now = Date.now();
+      if (now - last < minIntervalMs) return;
+      last = now;
+      checkRef.current?.();
+    };
+    window.addEventListener('focus', onReturn);
+    document.addEventListener('visibilitychange', onReturn);
+    return () => {
+      window.removeEventListener('focus', onReturn);
+      document.removeEventListener('visibilitychange', onReturn);
+    };
+  }, [minIntervalMs]);
+}
+
+// Flat --primary-solid behind white text (4.78:1, WCAG AA) — never the accent blue — and the
+// glass secondary. Shared by the gate, the tab and the card.
+const GS_PRIMARY_BTN = Object.freeze({
+  background: C.primarySolid, color: '#fff', border: '1px solid transparent',
+  boxShadow: '0 6px 16px -4px var(--primary-glow)',
+});
+const GS_SECONDARY_BTN = Object.freeze({ background: GLASS.card, color: C.text, border: `1px solid ${GLASS.border}` });
+
+/**
+ * Put focus back on `ref`'s element after a control REMOVED ITSELF — a Retry inside the very
+ * panel its press clears, or the whole Getting Started gate handing over to the app. The browser
+ * drops focus to <body> then, and a keyboard user starts again from the top of the page (WCAG
+ * 2.4.3). Only when focus really was lost, and two frames on, once the commit that removed the
+ * control has landed: refocusAfterDecision()'s idiom in the Enrollments list. `options` is handed
+ * to focus() as it is ({ preventScroll: true } for the gate's hand-over).
+ */
+function refocusIfLost(ref, options) {
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const active = document.activeElement;
+    if (active && active !== document.body) return;
+    ref?.current?.focus?.(options);
+  }));
+}
+
+/**
+ * A refocusIfLost() target for a CONTAINER that is not focusable at rest — <main>, when the Getting Started
+ * gate hands over to the app (K3R-FOCUS-HANDOVER). Its focus() gives the container tabindex="-1" for AT MOST
+ * as long as it holds THAT focus: the attribute goes again on the first blur, or on the first pointer press
+ * anywhere (before the press can move focus), and at once if the focus did not land. A STATIC tabIndex={-1}
+ * made <main> CLICK-focusable for its whole life: a mouse click on plain text focused it, and the next Tab
+ * went to the first control at the TOP of the page and scrolled there — on every tab, for anyone who mixes
+ * the mouse and the keyboard (K3RV-MAIN-CLICK-FOCUS). The ref is read when refocusIfLost() acts, two frames
+ * on. An element that already carries a tabindex is focused and left as it is: that attribute is not ours.
+ */
+function transientFocusTarget(ref) {
+  return {
+    get current() {
+      const el = ref?.current;
+      if (!el) return null;
+      return {
+        focus(options) {
+          if (el.hasAttribute('tabindex')) { el.focus(options); return; }
+          const doc = el.ownerDocument;
+          const drop = () => {
+            el.removeAttribute('tabindex');
+            el.removeEventListener('blur', drop);
+            doc.removeEventListener('pointerdown', drop, { capture: true });
+          };
+          el.setAttribute('tabindex', '-1');
+          el.addEventListener('blur', drop, { once: true });
+          doc.addEventListener('pointerdown', drop, { capture: true, once: true });
+          el.focus(options);
+          if (doc.activeElement !== el) drop();
+        },
+      };
+    },
+  };
+}
+
+/**
+ * The Getting Started video: SignedLessonVideo, signing against the PRIVATE onboarding-videos
+ * bucket, with the watch rule on top.
+ *
+ *   mode     'gate' | 'page' | 'card' | 'preview' — where it sits; the rules are identical
+ *   source   'live' — ask start_onboarding_video() for the live version, ONCE per mount (the
+ *            only call site in this file; it also records when the student first opened it,
+ *            which the server's elapsed guard counts from) — or
+ *            { video_id, storage_path, duration_seconds? } — one given version, for the Super
+ *            Admin's preview: no RPC at all, and nothing recorded or reported
+ *   watchRef  the CALLER's ref for what was watched — { videoId, ranges, position } — so it
+ *             outlives this player: a Retry remounts it, a closed card unmounts it. Absent, the
+ *             record lives and dies with this mount.
+ *   stageRef  the caller's ref to this player's frame — always mounted, and focusable
+ *             (tabIndex -1) — where a Retry puts focus back
+ *   onVerdict(v)      { complete, playedPct, reason, videoId }, only when it CHANGES — and null
+ *                     when a DIFFERENT video replaces the one the caller's record was about
+ *   onGiveUp(reason)  it will not play: a player problem ('sign' | 'missing' | 'decode' |
+ *                     'already-retried' | …), a failed start (its app error code, or 'start'), or
+ *                     'slow' — nothing has played ONBOARDING_LOAD_TIMEOUT_MS after the mount
+ *   onRecover()       it played after all — a re-sign, the player's own "Try again", or an answer
+ *                     that landed after the bound
+ *
+ * ★ RETRY IS A REMOUNT: the caller bumps this component's key, so start_onboarding_video() runs
+ *   again and returns the CURRENT live object — the one answer a re-sign of the old name can
+ *   never give when the file was replaced.
+ * ★ WHAT WAS WATCHED OUTLIVES THE <video> AND THIS PLAYER. SignedLessonVideo mounts a NEW
+ *   element on a re-sign and on "Try again", and the old one's `played` goes with it; a Retry
+ *   remounts this player, and closing the card unmounts it. The record — the union of every
+ *   element's ranges, and the place — lives in the caller's watchRef, starts over only for a
+ *   DIFFERENT video (watchRecordFor), and a new <video> that opens at 0:00 is put back where
+ *   the student was (resumeAt). A student 85% in who presses Retry carries on from 85%.
+ * ★ THE STUDENT PRESSES PLAY. SignedLessonVideo renders preload="metadata", playsInline and
+ *   controlsList="nodownload", and nothing here starts playback.
+ * ★ NOTHING BETWEEN THE STUDENT AND THE VIDEO WAITS FOR EVER (GF-3). start_onboarding_video() and
+ *   the first signature were unbounded — postgrest-js never times out a POST, storage-js has no
+ *   timeout — so a STALLED one left "Loading video…" with no Retry and no "Continue to dashboard
+ *   for now". One bound from the mount to the first frame (ONBOARDING_LOAD_TIMEOUT_MS) gives up as
+ *   'slow'; an answer that lands after it still shows the video, and onRecover clears the panel.
+ *   A slow load is not a fact about the video, so it is never reported to the Super Admin.
+ */
+function GettingStartedPlayer({ mode = 'page', source = 'live', watchRef = null, stageRef = null, onVerdict, onGiveUp, onRecover }) {
+  const frameRef = useRef(null);       // the .gs-stage frame, mounted for the player's whole life
+  const mediaRef = useRef(null);       // the CURRENT <video>, or null — SignedLessonVideo keeps it
+  usePauseWhenHidden(frameRef, mediaRef);
+  // The frame the observer watches is also the caller's focus target.
+  const setFrame = useCallback((node) => {
+    frameRef.current = node;
+    if (stageRef) stageRef.current = node;
+  }, [stageRef]);
+
+  // The caller's callbacks are inline closures. They are read through refs, so nothing here
+  // re-runs, re-signs or re-starts because a parent re-rendered.
+  const onVerdictRef = useRef(onVerdict);
+  onVerdictRef.current = onVerdict;
+  const onGiveUpRef = useRef(onGiveUp);
+  onGiveUpRef.current = onGiveUp;
+  const onRecoverRef = useRef(onRecover);
+  onRecoverRef.current = onRecover;
+
+  const isLive = source === 'live';
+  const [started, setStarted] = useState(null);      // start_onboarding_video()'s answer
+  const [startFailed, setStartFailed] = useState(false);
+  // ★ ONE start per mount, <React.StrictMode> included: the request is made once and KEPT, and
+  //   each run of the effect only listens to it. A ref flag alone would drop the answer — the
+  //   first run's listener is cancelled, and the second run would never ask.
+  const startRef = useRef(null);
+  const settledRef = useRef(false);    // the video played, or the player already gave up (GF-3)
+  useEffect(() => {
+    if (!isLive) return undefined;
+    let alive = true;
+    if (!startRef.current) startRef.current = Promise.resolve().then(() => supabase.rpc('start_onboarding_video'));
+    startRef.current.then(({ data, error }) => {
+      if (!alive) return;
+      if (error || !data?.video_id || !data?.storage_path) {
+        settledRef.current = true;
+        setStartFailed(true);
+        onGiveUpRef.current?.(appErrorCode(error) || 'start');
+        return;
+      }
+      setStarted({ video_id: data.video_id, storage_path: data.storage_path, duration_seconds: data.duration_seconds ?? null });
+    }).catch(() => {
+      if (!alive) return;
+      settledRef.current = true;
+      setStartFailed(true);
+      onGiveUpRef.current?.('start');
+    });
+    return () => { alive = false; };
+  }, [isLive]);
+  // GF-3: the one bound on the start, the signature and the first frame together. Settled by a
+  // played video, a refused start or a player problem, so it never overrides a real reason.
+  useEffect(() => {
+    if (!isLive) return undefined;
+    const timer = setTimeout(() => {
+      if (!settledRef.current) onGiveUpRef.current?.('slow');
+    }, ONBOARDING_LOAD_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [isLive]);
+
+  const media = isLive ? started : (source && typeof source === 'object' ? source : null);
+  const videoId = media?.video_id || null;
+  const storagePath = media?.storage_path || null;
+  const knownSeconds = Number(media?.duration_seconds) > 0 ? Number(media.duration_seconds) : null;
+  // MEMOIZED on the id and the path — all SignedLessonVideo re-signs on.
+  const lesson = useMemo(() => (videoId && storagePath ? { id: videoId, storage_path: storagePath } : null),
+    [videoId, storagePath]);
+
+  // The watch record: the caller's when it keeps one (watchRef), else this mount's own.
+  const ownWatchRef = useRef(null);
+  const recordRef = watchRef || ownWatchRef;
+  const lastVerdictRef = useRef('');
+  const resumedRef = useRef(null);     // the <video> this player last put back in place
+  useEffect(() => {
+    lastVerdictRef.current = '';
+    if (!videoId) return;
+    const kept = recordRef.current;
+    const next = watchRecordFor(kept, videoId);
+    // The same video: carry on where it was.
+    if (next === kept) return;
+    recordRef.current = next;
+    // A DIFFERENT video: what the caller shows — a verdict, an unlock — was about the old one.
+    if (kept) onVerdictRef.current?.(null);
+  }, [videoId, recordRef]);
+
+  const track = useCallback((e) => {
+    const video = e?.currentTarget || mediaRef.current;
+    if (!video || !videoId) return;
+    const record = watchRecordFor(recordRef.current, videoId);
+    recordRef.current = record;
+    record.ranges = mergeRanges(record.ranges, video.played);
+    if (Number.isFinite(video.currentTime)) record.position = video.currentTime;
+    // The element's own duration when it has one. Some recordings report Infinity; then the
+    // length verified at upload measures the share instead.
+    const own = video.duration;
+    const duration = Number.isFinite(own) && own > 0 ? own : (knownSeconds ?? own);
+    const v = watchVerdict({
+      ended: video.ended, currentTime: video.currentTime, duration,
+      ranges: record.ranges, seeking: video.seeking,
+    });
+    const key = `${v.complete}|${v.playedPct}|${v.reason}`;
+    if (key === lastVerdictRef.current) return;
+    lastVerdictRef.current = key;
+    onVerdictRef.current?.({ ...v, videoId });
+  }, [videoId, knownSeconds, recordRef]);
+
+  const handleReady = useCallback(() => {
+    settledRef.current = true;
+    onRecoverRef.current?.();
+    // A NEW <video> that opens at 0:00 — this player's first, or the one SignedLessonVideo's
+    // "Try again" mounted — goes back to where the student was. A re-sign has already put its
+    // own element back (currentTime > 0), and a quiet refresh keeps the same element: both are
+    // left alone.
+    const video = mediaRef.current;
+    if (video && resumedRef.current !== video) {
+      resumedRef.current = video;
+      const own = video.duration;
+      const at = resumeAt(recordRef.current, videoId, Number.isFinite(own) && own > 0 ? own : knownSeconds);
+      if (at > 0 && !(video.currentTime > 0)) {
+        try { video.currentTime = at; } catch { /* a seek it refuses: it starts from the beginning */ }
+      }
+    }
+    track(null);
+  }, [track, videoId, knownSeconds, recordRef]);
+
+  const handleProblem = useCallback((reason) => {
+    settledRef.current = true;
+    if (isLive) {
+      // Best effort: a report is a diagnostic for the Super Admin, and its failure changes
+      // nothing for the student. ALWAYS as onboardingProblemCode(reason) — the server keeps
+      // only its enum, and a raw player reason would be stored as 'other'.
+      Promise.resolve()
+        .then(() => supabase.rpc('report_onboarding_video_problem', { p_code: onboardingProblemCode(reason) }))
+        .catch(() => {});
+    }
+    onGiveUpRef.current?.(reason);
+  }, [isLive]);
+
+  let frame;
+  if (lesson) {
+    frame = (
+      <SignedLessonVideo signUrl={signOnboardingVideo} lesson={lesson} isAdmin={false} mediaRef={mediaRef}
+        onEnded={track} onTimeUpdate={track} onSeeking={track} onProblem={handleProblem} onReady={handleReady} />
+    );
+  } else if (isLive && !startFailed) {
+    frame = (
+      <div className="course-stage">
+        <div className="course-stage-msg" role="status">
+          <span className="inline-flex items-center gap-2">
+            <Loader2 size={16} className="animate-spin" aria-hidden="true" /> Loading video…
+          </span>
+        </div>
+      </div>
+    );
+  } else {
+    // Fixed light-on-black, as SignedLessonVideo's own frames are: the stage is #000 in both themes.
+    frame = (
+      <div className="course-stage">
+        <div className="course-stage-msg">
+          <AlertCircle size={24} aria-hidden="true" style={{ color: '#FF8A84' }} />
+          <div>{isLive ? 'The video isn’t available right now.' : 'This version has no video file yet.'}</div>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div ref={setFrame} className="gs-stage" data-gs-mode={mode} tabIndex={-1} role="group" aria-label="Getting Started video">
+      {frame}
+    </div>
+  );
+}
+
+/** A transcript, folded away until asked for. Plain text: React escapes it, and it keeps its line breaks. */
+function GettingStartedTranscript({ text }) {
+  if (!text) return null;
+  return (
+    <details className="rounded-2xl px-4 py-3" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+      <summary className="cursor-pointer text-sm font-semibold" style={{ color: C.text }}>Read the transcript</summary>
+      <div className="mt-3" style={{ fontSize: 13.5, lineHeight: 1.65, color: C.textSoft, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+        {text}
+      </div>
+    </details>
+  );
+}
+
+/**
+ * What a student sees on the Getting Started screen. Presentational, so the Super Admin's
+ * preview of a version renders exactly this, with an inert button.
+ *
+ *   name       the student's full name — the heading greets the first word of it
+ *   video      my_onboarding_video().video — { title, description, transcript, duration_seconds }
+ *   player     the <GettingStartedPlayer /> element
+ *   verdict    its latest onVerdict() value, or null before the first one
+ *   onContinue () => void for a press of the UNLOCKED button. Absent, the button is INERT (a
+ *              preview): it locks and unlocks exactly as the student's does, and does nothing.
+ *   busy       the completion is being recorded
+ *   notice     a node under the progress line — a message, or the give-up panel
+ *   email, onSignOut  the "Signed in as … · Sign out" row (absent in a preview)
+ *   goRef      optional: the caller's ref to the Go to dashboard button — a focus target
+ *   headingLevel  1 — the gate, where the heading is the page's <h1> — or 2, inside a dialog
+ *              that holds the title (the Super Admin's Preview): an <h2>, and the journey's <h3>
+ *   announcement  optional { text, n }: a sentence the caller shows in `notice` that a screen reader
+ *              must also HEAR — said through this Body's one polite region whenever the object
+ *              changes (S5: a live region mounted together with its text is often never read)
+ *
+ * ★ aria-disabled, NEVER disabled: the button's state changes while the student's focus may be
+ *   on it, and a disabled button drops focus to <body> the moment it disables.
+ * ★ A PRESS WHILE LOCKED SAYS WHY, through the one polite live region that also announces the
+ *   unlock (once). Nothing else happens.
+ * ★ THE UNLOCK IS BROUGHT INTO VIEW. Where the window is too short even for the gate frame's
+ *   floor (.gs-stage[data-gs-mode="gate"] in src/index.css), the button sits below the fold; the
+ *   unlock scrolls it to the nearest edge, once, and leaves focus where it was.
+ * ★ AT THE END, SKIPPED PARTS ARE SAID AS SUCH (S2). Under 90% with the video ENDED is the
+ *   verdict's 'skipped': "keep going" cannot be done at the end, so the line says to play it again,
+ *   and that what was watched still counts. The intro no longer promises that the end alone unlocks it.
+ * ★ ITS SMALL TEXT CLEARS AA IN BOTH THEMES (S8). The help line, the journey heading and the
+ *   sign-out row read in C.textSoft, and the support address in NAVY, the deep-blue text token: the
+ *   mute grey measured 2.97:1 and the accent blue 3.6:1 as text — on the one route to support when
+ *   the video fails.
+ */
+function GettingStartedBody({ name = '', video = null, player = null, verdict = null, onContinue = null,
+  busy = false, notice = null, email = '', onSignOut = null, announcement = null, goRef = null, headingLevel = 1 }) {
+  const hintId = useId();
+  const journeyId = useId();
+  const ownGoRef = useRef(null);
+  const goButtonRef = goRef || ownGoRef;
+  const inert = typeof onContinue !== 'function';
+  const unlocked = verdict?.complete === true;
+  const locked = !unlocked || busy;
+  const first = String(name || '').trim().split(/\s+/)[0] || '';
+  const length = formatVideoDuration(video?.duration_seconds);
+  const support = PAYMENT_SETTINGS_FALLBACK.notify_email;
+  // The gate is a page of its own, so its heading is the page's <h1>. Inside a dialog (the Super
+  // Admin's Preview) the dialog holds the title, and the Body steps down a level.
+  const Heading = headingLevel === 2 ? 'h2' : 'h1';
+  const SubHeading = headingLevel === 2 ? 'h3' : 'h2';
+
+  let progress;
+  if (unlocked) progress = 'Finished — your dashboard is unlocked.';
+  else if (verdict && verdict.playedPct == null) progress = 'Keep watching to unlock your dashboard.';
+  // Enough of it played, but not the end — and only the end unlocks it, so say that.
+  else if (verdict?.reason === 'playing') progress = `Watched ${verdict.playedPct}% — play it to the end to unlock your dashboard.`;
+  // At the END with parts skipped (S2): "keep going" cannot be done there — the video has stopped,
+  // and the way on is to play it again. What was watched already counts (the record is a union).
+  else if (verdict?.reason === 'skipped') progress = `You skipped part of it (watched ${verdict.playedPct}%). Play it again — what you’ve already watched still counts.`;
+  else if (verdict?.playedPct > 0) progress = `Watched ${verdict.playedPct}% — keep going to unlock your dashboard.`;
+  else progress = 'Watch the video to the end to unlock your dashboard.';
+  const showBar = unlocked || typeof verdict?.playedPct === 'number';
+  const barPct = unlocked ? 100 : Math.max(0, Math.min(100, verdict?.playedPct || 0));
+
+  const [live, setLive] = useState({ text: '', n: 0 });
+  const say = useCallback((text) => setLive((l) => ({ text, n: l.n + 1 })), []);
+  // A preview's press says it is a preview ON SCREEN too, not only to a screen reader: the button
+  // looks ready once the clip ends, and a press that changes nothing visible reads as broken (T9UI-6).
+  const [previewNoted, setPreviewNoted] = useState(false);
+  const announcedRef = useRef(false);
+  useEffect(() => {
+    if (!unlocked) { announcedRef.current = false; return; }
+    if (announcedRef.current) return;
+    announcedRef.current = true;
+    say('Your dashboard is unlocked. Press Go to dashboard to continue.');
+    // …and brought into view where the video left it below the fold. 'nearest' moves nothing
+    // when it is already in view.
+    const reduce = typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    goButtonRef.current?.scrollIntoView?.({ block: 'nearest', behavior: reduce ? 'auto' : 'smooth' });
+  }, [unlocked, say, goButtonRef]);
+  // S5: what the caller shows in `notice` is SAID here, through the region that was already on the
+  // page — never by a role="status" mounted together with its text, which NVDA and JAWS often skip.
+  useEffect(() => {
+    if (announcement?.text) say(announcement.text);
+  }, [announcement, say]);
+
+  const press = () => {
+    if (!unlocked) { say(progress); return; }
+    if (busy) return;
+    if (inert) { setPreviewNoted(true); say('This is a preview, so nothing is recorded.'); return; }
+    onContinue();
+  };
+
+  return (
+    <>
+      <div className="px-5 sm:px-8 pt-7 pb-6 text-center" style={{ background: SHEEN, borderBottom: `1px solid ${GLASS.borderSoft}` }}>
+        <Heading style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 'clamp(20px, 4.6vw, 26px)', letterSpacing: '-0.02em', lineHeight: 1.2, color: C.text, overflowWrap: 'anywhere' }}>
+          {first ? `Welcome to Toolkits, ${first}!` : 'Welcome to Toolkits!'}
+        </Heading>
+        <p className="mt-2 mx-auto" style={{ fontSize: 14, lineHeight: 1.55, color: C.textSoft, maxWidth: 520 }}>
+          {`Start with this ${length ? `${length} ` : 'short '}welcome video — it shows you around. When you’ve watched it to the end, press Go to dashboard below.`}
+        </p>
+      </div>
+      <div className="px-4 sm:px-8 py-6 space-y-5">
+        {player}
+        <div className="space-y-2">
+          {showBar ? (
+            <div className="gs-progress" aria-hidden="true">
+              <div className="gs-progress__bar" style={{ width: `${barPct}%` }} />
+            </div>
+          ) : null}
+          <p id={hintId} className="text-center" style={{ fontSize: 13, lineHeight: 1.5, color: unlocked ? 'var(--status-ok-fg)' : C.textSoft }}>
+            {progress}
+          </p>
+        </div>
+        {notice}
+        <button ref={goButtonRef} type="button" data-gs-go onClick={press}
+          aria-disabled={locked ? 'true' : undefined}
+          aria-describedby={unlocked ? undefined : hintId}
+          aria-busy={busy ? 'true' : undefined}
+          className="w-full py-3 rounded-xl text-sm font-bold flex items-center justify-center gap-2 transition"
+          style={locked
+            ? { background: 'var(--wash-strong)', color: C.textMute, border: `1px solid ${C.border}`, cursor: 'not-allowed' }
+            : GS_PRIMARY_BTN}>
+          {busy ? <Loader2 size={15} className="animate-spin" aria-hidden="true" /> : null}
+          Go to dashboard <ArrowRight size={15} aria-hidden="true" />
+        </button>
+        {inert && previewNoted ? (
+          <p className="text-center" style={{ fontSize: 12.5, lineHeight: 1.5, color: C.textSoft }}>
+            This is a preview, so nothing is recorded.
+          </p>
+        ) : null}
+        <div role="status" aria-live="polite" className="sr-only">{live.text}{live.n % 2 ? ' ' : ''}</div>
+        <GettingStartedTranscript text={video?.transcript || ''} />
+        <section className="gs-journey" aria-labelledby={journeyId}>
+          <SubHeading id={journeyId} className="gh-label" style={{ color: C.textSoft }}>The journey ahead</SubHeading>
+          <ol className="gs-journey__grid mt-3">
+            {WELCOME_JOURNEY_STAGES.map((s) => (
+              <li key={s.n} className="flex items-start gap-3 p-3 rounded-2xl" style={{ background: GLASS.card, border: `1px solid ${GLASS.borderSoft}` }}>
+                <span className="flex items-center justify-center flex-shrink-0 rounded-xl text-xs font-bold" aria-hidden="true"
+                  style={{ width: 34, height: 34, background: C.primarySolid, color: '#fff' }}>{s.n}</span>
+                <span className="min-w-0">
+                  <span className="block" style={{ fontWeight: 700, fontSize: 13.5, color: C.text }}>{s.label}</span>
+                  <span className="block" style={{ fontSize: 12, lineHeight: 1.45, color: C.textSoft }}>{s.desc}</span>
+                </span>
+              </li>
+            ))}
+          </ol>
+        </section>
+        <div className="text-center space-y-1">
+          <p style={{ fontSize: 12.5, lineHeight: 1.6, color: C.textSoft }}>
+            Trouble playing the video? Email{' '}
+            <a href={`mailto:${support}`} className="font-semibold underline" style={{ color: NAVY, overflowWrap: 'anywhere' }}>{support}</a>.
+          </p>
+          {onSignOut ? (
+            <button type="button" onClick={onSignOut} className="py-2 text-xs font-semibold" style={{ color: C.textSoft, overflowWrap: 'anywhere' }}>
+              {email ? `Signed in as ${email} · Sign out` : 'Sign out'}
+            </button>
+          ) : null}
+        </div>
+      </div>
+    </>
+  );
+}
+
+/**
+ * The gate (GATE_SCREENS.GETTING_STARTED): the video a newly approved student watches once
+ * before their first dashboard. It renders BEFORE the app shell, outside the provider, so it is
+ * handed the root's useGettingStarted() value as `gs`.
+ *
+ *   onDone(result, uid)  the completion was recorded for the account `uid` — the one signed in when
+ *                   it was ASKED for — and the root marks it, closes the first-login welcome and
+ *                   opens the Dashboard; it does none of that for any other account (GF-7)
+ *   onDefer()       "Continue to dashboard for now", offered only once the video will not play.
+ *                   Session-only, and it records NOTHING: no RPC; the student is asked again the
+ *                   next time the toolkit is opened — a reload, a new tab, or a new sign-in
+ *   onSignOut()
+ *
+ * The one server call here is recordOnboardingCompletion(), on a press of the unlocked button,
+ * and every refusal it can bring has a way forward:
+ *   NOT_FINISHED for a newer version — say so, ask for the new video's details (keeping the
+ *                                      answer if that fails), and START the player OVER
+ *   NOT_FINISHED, never started      — start the player over, so start_onboarding_video() records it
+ *   NOT_FINISHED, started too lately — "try again in a few seconds" (the server's floor)
+ *   NOT_ELIGIBLE / UNAVAILABLE       — ask the root again: no live video, or no longer eligible,
+ *                                      means the gate no longer applies
+ *   anything else, a timeout too     — an inline error and Retry; it never navigates
+ *
+ * ★ IT ASKS AGAIN WHEN THE STUDENT COMES BACK TO IT (GF-4) — useRecheckOnReturn, with keep: a
+ *   student who finished the video in another tab is let go here too, and a check that fails can
+ *   never be what opens the gate.
+ * ★ WHAT IT SHOWS AFTER A PRESS IS ALSO SAID (S5), through the Body's one polite region — a
+ *   message, or the give-up panel. A role="status" mounted together with its text is often never
+ *   read by NVDA or JAWS; an error keeps its role="alert", which is.
+ * ★ THE WAY OUT IS BROUGHT INTO VIEW (S3). On the laptop sizes the frame's height budget was made
+ *   for, the give-up panel's Retry and "Continue to dashboard for now" sat half below the fold; the
+ *   panel is scrolled to the nearest edge when it appears, and focus stays where it was. Its first
+ *   sentence says what happened (gettingStartedGiveUpCopy) — "on this device" only for a decode
+ *   failure, never for a refused signature, a start or a slow load.
+ */
+function GettingStartedScreen({ gs, name = '', email = '', onDone, onDefer, onSignOut }) {
+  const [playerKey, setPlayerKey] = useState(0);
+  const [verdict, setVerdict] = useState(null);
+  const [giveUp, setGiveUp] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState(null);     // { tone: 'info' | 'danger', text, retry? }
+  const [spoken, setSpoken] = useState(null);       // { text, n }: what the Body's region says next
+  const busyRef = useRef(false);                     // a state flag is not a lock
+  const watchRef = useRef(null);                     // what was watched, across every Retry
+  const stageRef = useRef(null);                     // the player's frame: focus after its Retry
+  const goRef = useRef(null);                        // Go to dashboard: focus after a message's Retry
+  const giveUpRef = useRef(null);                    // the give-up panel: scrolled into view
+  // The root's value changes identity as its answer changes; the handlers read the latest.
+  const gsRef = useRef(gs);
+  gsRef.current = gs;
+  const support = PAYMENT_SETTINGS_FALLBACK.notify_email;
+  // GF-4: back to this tab (a focus, or the page turning visible) — has the video been finished
+  // somewhere else? keep: a failed check leaves the answer, and so the gate, where they were.
+  useRecheckOnReturn(() => gsRef.current?.refresh({ keep: true }));
+  // S5: the sentence the Body's polite region says next. A counter, so the same sentence twice
+  // (a second "Almost there") is said twice.
+  const speak = useCallback((text) => setSpoken((s) => ({ text, n: (s?.n || 0) + 1 })), []);
+
+  // Once watched, the SAME video stays watched: a rewind after the end, or the native replay
+  // control, must not re-lock the button under a full progress bar. A null verdict is the player
+  // saying it started a DIFFERENT video than the one it was watching — a Retry that landed on a
+  // replacement — so the intro's length and the transcript describe the old one: the answer is
+  // asked for again, keeping it if that fails (RV8-UI-L1).
+  const onVerdict = useCallback((v) => {
+    if (v === null) gsRef.current?.refresh({ keep: true });
+    setVerdict((shown) => holdWatchVerdict(shown, v));
+  }, []);
+  // A REMOUNT, never a re-sign: start_onboarding_video() runs again and returns the CURRENT
+  // live object. What was watched (watchRef) and the verdict are KEPT — a student 85% in is not
+  // sent back to the start — and the player clears the verdict itself if the live video turns
+  // out to be a different one.
+  const reloadPlayer = useCallback(() => {
+    setPlayerKey((k) => k + 1);
+    setGiveUp(null);
+  }, []);
+  // The give-up panel's Retry: the panel goes with the press, so focus goes to the player.
+  const retryPlayer = useCallback(() => {
+    reloadPlayer();
+    refocusIfLost(stageRef);
+  }, [reloadPlayer]);
+  // …and a START OVER, when the video must be watched again from nothing: a newer version was
+  // published, or the server has no record of this one being started.
+  const restartPlayer = useCallback(() => {
+    watchRef.current = null;
+    setVerdict(null);
+    reloadPlayer();
+  }, [reloadPlayer]);
+  const handleGiveUp = useCallback((reason) => {
+    setGiveUp(reason || 'other');
+    // Nothing live to start, or no longer eligible: the gate may not apply any more.
+    if (reason === 'ONBOARDING_VIDEO_UNAVAILABLE' || reason === 'ONBOARDING_VIDEO_NOT_ELIGIBLE') gsRef.current?.refresh();
+  }, []);
+  const handleRecover = useCallback(() => setGiveUp(null), []);
+
+  const finish = async () => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setMessage(null);
+    // GF-7: the account this completion is FOR, captured before the wait — a sign-out and a new
+    // sign-in can happen while it is in flight, and the root acts only for this one.
+    const forUid = gsRef.current?.uid ?? null;
+    const r = await recordOnboardingCompletion();
+    busyRef.current = false;
+    setBusy(false);
+    if (r.ok) { onDone?.(r.data, forUid); return; }
+    const ctx = r.context || {};
+    if (r.code === 'ONBOARDING_VIDEO_NOT_FINISHED') {
+      if (ctx.current_video_id && ctx.current_video_id !== verdict?.videoId) {
+        // The Super Admin replaced the video while this student was watching it: start the new
+        // one from nothing, and ask for its title, length and transcript. { keep: true }: if that
+        // fails the answer stands — a cosmetic refresh must never be what opens the gate.
+        setMessage({ tone: 'info', text: 'A new Getting Started video was just published — please watch it from the start.' });
+        gsRef.current?.refresh({ keep: true });
+        restartPlayer();
+      } else if (ctx.started === false) {
+        setMessage({ tone: 'info', text: 'We couldn’t confirm when you started the video, so it has been reloaded. Please play it to the end once more.' });
+        restartPlayer();
+      } else if (Number(ctx.seconds_remaining) > 0) {
+        // The server's floor. No number: a static message cannot count down, and one that says
+        // "3 seconds" for a minute is wrong for all but the first of them (S5).
+        setMessage({ tone: 'info', text: 'Almost there — try again in a few seconds.' });
+      } else {
+        setMessage({ tone: 'info', text: APP_ERROR_COPY.ONBOARDING_VIDEO_NOT_FINISHED });
+      }
+      return;
+    }
+    if (r.code === 'ONBOARDING_VIDEO_NOT_ELIGIBLE' || r.code === 'ONBOARDING_VIDEO_UNAVAILABLE') {
+      setMessage({ tone: 'info', text: 'One moment — checking your account…' });
+      gsRef.current?.refresh();
+      return;
+    }
+    // Anything else — a refusal with no way forward of its own, a dropped connection, or a call
+    // that did not answer in time (S4: 'timeout', which is no app error code).
+    setMessage({
+      tone: 'danger',
+      text: (r.code && APP_ERROR_COPY[r.code]) || 'We couldn’t save that just now. Check your connection, then try again.',
+      retry: true,
+    });
+  };
+  // A message's Retry is gone the moment finish() clears the message, so focus goes to Go to
+  // dashboard — the same action, now showing that it is working.
+  const retryFinish = () => {
+    refocusIfLost(goRef);
+    finish();
+  };
+  // ★ A MESSAGE NEVER HIDES AN UNLOCKED "Go to dashboard" (RV8-UI-L2). It renders above the
+  //   button, so on a short laptop window "Almost there" pushed the button below the fold (38 of
+  //   its 46px at 1366×657), and the unlock's own scroll had already run, once. Brought back to
+  //   the NEAREST edge — nothing moves when it is in view — instantly under reduced motion, and
+  //   focus stays where it is.
+  useEffect(() => {
+    if (!message || verdict?.complete !== true) return;
+    const reduce = typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    goRef.current?.scrollIntoView?.({ block: 'nearest', behavior: reduce ? 'auto' : 'smooth' });
+  }, [message]); // eslint-disable-line react-hooks/exhaustive-deps
+  // S3: the way out is brought into view when the video gives up — to the nearest edge, so nothing
+  // moves when it is already in view; instantly under reduced motion; focus stays where it is.
+  useEffect(() => {
+    if (!giveUp) return;
+    const reduce = typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    giveUpRef.current?.scrollIntoView?.({ block: 'nearest', behavior: reduce ? 'auto' : 'smooth' });
+  }, [giveUp]);
+  // S5: say what the panel and the messages show. An error is said by its own role="alert".
+  useEffect(() => {
+    if (message && message.tone !== 'danger') speak(message.text);
+  }, [message, speak]);
+  useEffect(() => {
+    if (giveUp) speak(`${gettingStartedGiveUpCopy(giveUp)} You can retry it, continue to your dashboard for now, or email ${support} for help.`);
+  }, [giveUp, speak]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const notice = (giveUp || message) ? (
+    <div className="space-y-3">
+      {giveUp ? (
+        <div ref={giveUpRef} className="rounded-2xl px-4 py-3 space-y-3"
+          style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)', fontSize: 13, lineHeight: 1.55 }}>
+          <p>
+            {gettingStartedGiveUpCopy(giveUp)} Try it again, or email{' '}
+            <a href={`mailto:${support}`} className="font-semibold underline" style={{ color: 'inherit', overflowWrap: 'anywhere' }}>{support}</a>{' '}
+            and we’ll help.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" onClick={retryPlayer}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-semibold transition hover:opacity-90" style={GS_SECONDARY_BTN}>
+              <RefreshCw size={14} aria-hidden="true" /> Retry
+            </button>
+            <button type="button" onClick={onDefer}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-semibold transition hover:opacity-90" style={GS_SECONDARY_BTN}>
+              Continue to dashboard for now
+            </button>
+          </div>
+          <p style={{ fontSize: 12 }}>Continuing now records nothing — we’ll ask you again the next time you open the toolkit.</p>
+        </div>
+      ) : null}
+      {message ? (
+        <div role={message.tone === 'danger' ? 'alert' : undefined} className="rounded-2xl px-4 py-3 flex flex-wrap items-center gap-x-3 gap-y-2"
+          style={message.tone === 'danger'
+            ? { background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)', color: 'var(--status-danger-fg)', fontSize: 13, lineHeight: 1.55 }
+            : { background: 'var(--status-info-bg)', border: '1px solid var(--status-info-bd)', color: C.text, fontSize: 13, lineHeight: 1.55 }}>
+          <span className="min-w-0 flex-1">{message.text}</span>
+          {message.retry ? (
+            <button type="button" onClick={retryFinish}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-sm font-semibold transition hover:opacity-90" style={GS_SECONDARY_BTN}>
+              <RefreshCw size={14} aria-hidden="true" /> Retry
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  ) : null;
+
+  return (
+    <div className="h-screen w-full overflow-y-auto gh-app-bg" style={{ fontFamily: fontBody, color: C.text }}>
+      <div className="mx-auto w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-10">
+        <div className="flex justify-center mb-5">
+          <img src={LOGO_DATA_URI} alt="Get Hired With Alex" style={{ width: 52, height: 52, objectFit: 'contain', filter: 'drop-shadow(0 6px 16px rgba(10,132,255,0.20))' }} />
+        </div>
+        <main className="gs-surface auth-in rounded-3xl overflow-hidden" style={{
+          background: GLASS.cardDeep,
+          backdropFilter: 'blur(30px) saturate(180%)',
+          WebkitBackdropFilter: 'blur(30px) saturate(180%)',
+          border: `1px solid ${GLASS.border}`,
+          boxShadow: '0 24px 60px -12px rgba(10,30,80,0.22), inset 0 1px 0 rgba(255,255,255,0.6)',
+        }}>
+          <GettingStartedBody name={name} video={gs?.data?.video || null} verdict={verdict} busy={busy} notice={notice}
+            onContinue={finish} email={email} onSignOut={onSignOut} goRef={goRef} announcement={spoken}
+            player={<GettingStartedPlayer key={playerKey} mode="gate" source="live" watchRef={watchRef} stageRef={stageRef}
+              onVerdict={onVerdict} onGiveUp={handleGiveUp} onRecover={handleRecover} />} />
+        </main>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * How a REPLAY records a completion — shared by the tab and the card. When the verdict
+ * completes for an eligible viewer who has not finished the CURRENT version, the completion is
+ * recorded ONCE per version and merged into the root's answer.
+ * ★ Triggered from the verdict EVENT, not from an effect, so a replay that goes on playing (new
+ *   verdicts) can never cancel a recording in flight, or the one retry after the server's floor.
+ * ★ A FAILURE THAT IS NOT THE LAST WORD RE-ARMS THE VERSION. The note promises it will be
+ *   recorded the next time the student watches it to the end, and the tab and the card are
+ *   keep-alive: "once per version" must not outlive a network blip, or that promise is false for
+ *   the rest of the session.
+ * ★ "Completed" MEANS THE SERVER HAS IT. A staff viewer is answered { ok: true, recorded: false },
+ *   and nothing is marked.
+ * ★ …AND ONLY FOR THE ACCOUNT IT WAS SENT FOR (GF-7). The account is captured before the wait and
+ *   handed to markCompleted(), which refuses any other: a completion that outlived a sign-out never
+ *   lands in whoever signed in next.
+ *   onReload()  start the player OVER — a newer version, or one the server never saw started
+ * → { verdict, onVerdict, note }
+ */
+function useReplayRecorder(gs, onReload) {
+  const [verdict, setVerdict] = useState(null);
+  const [note, setNote] = useState(null);
+  const gsRef = useRef(gs);
+  gsRef.current = gs;
+  const reloadRef = useRef(onReload);
+  reloadRef.current = onReload;
+  const sentForRef = useRef(null);      // the version a completion has been sent for
+  const retryRef = useRef(null);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; clearTimeout(retryRef.current); };
+  }, []);
+
+  const send = useCallback(async (videoId) => {
+    const forUid = gsRef.current?.uid ?? null;
+    const r = await recordOnboardingCompletion();
+    if (r.ok) {
+      if (r.data?.recorded !== false) gsRef.current?.markCompleted(r.data, forUid);
+      if (mountedRef.current) setNote(null);
+      return;
+    }
+    if (!mountedRef.current) return;
+    const ctx = r.context || {};
+    if (r.code === 'ONBOARDING_VIDEO_NOT_FINISHED') {
+      if (ctx.current_video_id && ctx.current_video_id !== videoId) {
+        setNote('A new Getting Started video was just published — play it from the start to finish it.');
+        // Its title, length and transcript — keeping the answer if that fails.
+        gsRef.current?.refresh({ keep: true });
+        reloadRef.current?.();
+        return;
+      }
+      if (ctx.started === false) {
+        sentForRef.current = null;
+        setNote('We couldn’t confirm when you started the video, so it has been reloaded. Play it to the end once more.');
+        reloadRef.current?.();
+        return;
+      }
+      const secs = Number(ctx.seconds_remaining);
+      if (secs > 0 && secs <= 600) {
+        // The server's floor has not passed yet (a replay at double speed can get there first):
+        // ask once more, the moment it has.
+        clearTimeout(retryRef.current);
+        retryRef.current = setTimeout(() => { if (mountedRef.current) send(videoId); }, (Math.ceil(secs) + 1) * 1000);
+        return;
+      }
+    } else if (r.code === 'ONBOARDING_VIDEO_NOT_ELIGIBLE' || r.code === 'ONBOARDING_VIDEO_UNAVAILABLE') {
+      gsRef.current?.refresh();
+      return;
+    }
+    // Re-armed: the next time this version plays to the end, it is sent again.
+    if (sentForRef.current === videoId) sentForRef.current = null;
+    setNote('We couldn’t record that you finished it just now. It will be recorded the next time you watch it to the end.');
+  }, []);
+
+  const onVerdict = useCallback((v) => {
+    setVerdict(v);
+    // null: the player started a DIFFERENT video than the one it was watching (a Retry that landed
+    // on a replacement). The title, length and transcript on screen are the old one's, so the
+    // answer is asked for again — keeping it if that fails (RV8-UI-L1).
+    if (v === null) { gsRef.current?.refresh({ keep: true }); return; }
+    const d = gsRef.current?.data;
+    if (!v?.complete || !v.videoId || d?.eligible !== true || d?.completed_current === true) return;
+    if (sentForRef.current === v.videoId) return;       // once per version
+    sentForRef.current = v.videoId;
+    send(v.videoId);
+  }, [send]);
+
+  return { verdict, onVerdict, note };
+}
+
+const GS_PAGE_DESC = 'The welcome video every new member starts with — watch it again any time.';
+
+/**
+ * The Getting Started tab (`gettingstarted`, first in Home): a replay, never a gate — "Go to
+ * dashboard" is always available here. A replay by an eligible viewer who has not finished the
+ * current version records it (useReplayRecorder); a staff viewer's records nothing.
+ * ★ A START THE SERVER REFUSES IS NOT A PLAYBACK PROBLEM (GF-5). ONBOARDING_VIDEO_UNAVAILABLE (the
+ *   video was unpublished, or its file removed, during the session) and _NOT_ELIGIBLE (the term
+ *   lapsed) ask the root again, so the page shows the state that answer brings, and the panel says
+ *   what happened — "on this device" only for a decode failure (gettingStartedGiveUpCopy, S3).
+ * ★ WHAT IT SHOWS AFTER THE FACT IS SAID through one polite region mounted with the video section
+ *   and empty until it speaks (S5): a give-up panel or a note that mounts WITH its own role="status"
+ *   is often never read.
+ * ★ ITS STATUS LINE AND THE CARD'S CHIP ARE ONE DERIVATION, gettingStartedStanding() (S6): a
+ *   member who finished an earlier version is told so, and one who was never asked to watch it is
+ *   not told it is unfinished.
+ * ★ A DATABASE WITHOUT #69 IS SAID PLAINLY (GF-8): `gs.missing` — no function to call, so no
+ *   "try again" that can never succeed.
+ */
+function GettingStartedPage({ goto }) {
+  const gs = useContext(GettingStartedContext);
+  const { profile, staff } = useAuth();
+  const [playerKey, setPlayerKey] = useState(0);
+  const [giveUp, setGiveUp] = useState(null);
+  const [spoken, setSpoken] = useState({ text: '', n: 0 });   // the polite region's next sentence
+  const watchRef = useRef(null);        // what was watched, across a Retry
+  const stageRef = useRef(null);        // the player's frame: focus after its Retry
+  const bodyRef = useRef(null);         // this page's card: focus after "Try again"
+  // The root's value changes identity as its answer changes; the handlers read the latest.
+  const gsRef = useRef(gs);
+  gsRef.current = gs;
+  // The give-up panel's Retry: a remount (start_onboarding_video() again) that keeps what was
+  // watched; the panel goes with the press, so focus goes to the player.
+  const retryPlayer = useCallback(() => {
+    setPlayerKey((k) => k + 1);
+    setGiveUp(null);
+    refocusIfLost(stageRef);
+  }, []);
+  // A start over — the replay recorder's: a newer version, or one the server never saw started.
+  const restartPlayer = useCallback(() => {
+    watchRef.current = null;
+    setPlayerKey((k) => k + 1);
+    setGiveUp(null);
+  }, []);
+  const clearGiveUp = useCallback(() => setGiveUp(null), []);
+  // GF-5: an unpublished video or a lapsed term is a fact about the account, not the device — the
+  // answer is asked for again (plainly: this page is a replay, never the gate).
+  const handleGiveUp = useCallback((reason) => {
+    setGiveUp(reason || 'other');
+    if (reason === 'ONBOARDING_VIDEO_UNAVAILABLE' || reason === 'ONBOARDING_VIDEO_NOT_ELIGIBLE') gsRef.current?.refresh();
+  }, []);
+  const replay = useReplayRecorder(gs, restartPlayer);
+  const titleId = useId();
+  // S5: said through the region below, which is mounted with the video section.
+  const speak = useCallback((text) => setSpoken((s) => ({ text, n: s.n + 1 })), []);
+  useEffect(() => {
+    if (giveUp) speak(gettingStartedGiveUpCopy(giveUp));
+  }, [giveUp, speak]);
+  useEffect(() => {
+    if (replay.note) speak(replay.note);
+  }, [replay.note, speak]);
+  const { status, data } = gs;
+  const isStaff = !!profile?.is_admin || staffBypassesPaywall(staff);
+  const support = PAYMENT_SETTINGS_FALLBACK.notify_email;
+  // "Try again" is replaced by whatever its answer brings, so focus follows the answer: onto
+  // the card it lands on (bodyRef names whichever is rendered).
+  const refocusOnAnswerRef = useRef(false);
+  useEffect(() => {
+    if (!refocusOnAnswerRef.current || !data) return;
+    refocusOnAnswerRef.current = false;
+    refocusIfLost(bodyRef);
+  }, [data]);
+  const tryAgain = () => {
+    refocusOnAnswerRef.current = true;
+    gs.refresh();
+  };
+
+  const head = <SectionHead eyebrow="Home" title="Getting Started" desc={GS_PAGE_DESC} />;
+  const toDashboard = (
+    <button type="button" onClick={() => goto?.('dashboard')}
+      className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-bold transition hover:opacity-90" style={GS_PRIMARY_BTN}>
+      Go to dashboard <ArrowRight size={15} aria-hidden="true" />
+    </button>
+  );
+  const plain = (text, extra = null, tone = 'neutral') => (
+    <div ref={bodyRef} tabIndex={-1} className="gs-surface glass-card p-5 space-y-4">
+      <p style={{ fontSize: 14.5, lineHeight: 1.6, color: tone === 'danger' ? 'var(--status-danger-fg)' : C.text }}>{text}</p>
+      <div className="flex flex-wrap items-center gap-2">{extra}{toDashboard}</div>
+    </div>
+  );
+
+  if (!data) {
+    if (status === 'loading') {
+      return (
+        <div>
+          {head}
+          <div className="glass-card p-5 animate-pulse motion-reduce:animate-none" aria-hidden="true">
+            <div className="rounded" style={{ height: 14, width: 200, maxWidth: '60%', background: 'var(--wash-strong)' }} />
+            <div className="gs-stage mt-4" style={{ aspectRatio: '16 / 9', background: 'var(--wash-strong)' }} />
+          </div>
+          <p role="status" className="sr-only">Loading the Getting Started video…</p>
+        </div>
+      );
+    }
+    // GF-8: the database has no Getting Started yet. Nothing to retry — no answer can come.
+    if (gs.missing === true) {
+      return <div>{head}{plain('Getting Started isn’t set up yet, so there’s no welcome video to watch here.')}</div>;
+    }
+    return (
+      <div>
+        {head}
+        {plain('The Getting Started video isn’t available right now. Please try again in a moment.', (
+          <button type="button" onClick={tryAgain}
+            className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-semibold transition hover:opacity-90" style={GS_SECONDARY_BTN}>
+            <RefreshCw size={14} aria-hidden="true" /> Try again
+          </button>
+        ))}
+      </div>
+    );
+  }
+
+  const video = data.video || null;
+  const canManage = data.can_manage === true;
+  if (data.eligible !== true && !canManage) {
+    return <div>{head}{plain('The Getting Started video opens here once your enrollment is approved.')}</div>;
+  }
+  if (!video) {
+    return <div>{head}{plain('There’s no Getting Started video right now.', canManage ? <GettingStartedManageLink goto={goto} /> : null)}</div>;
+  }
+  if (data.media_available === false) {
+    return (
+      <div>
+        {head}
+        {canManage
+          ? plain('The live Getting Started video’s file is missing, so nobody is asked to watch it and replays won’t play. Replace it or unpublish it.', <GettingStartedManageLink goto={goto} />, 'danger')
+          : plain('The Getting Started video isn’t available right now. Please check back later.')}
+      </div>
+    );
+  }
+
+  const length = formatVideoDuration(video.duration_seconds);
+  const when = data.completed_at ? fmtManilaDate(data.completed_at) : '';
+  const standing = gettingStartedStanding(data);
+  let statusLine;
+  if (isStaff) statusLine = 'Staff views aren’t recorded.';
+  else if (standing === 'completed') statusLine = when ? `Completed on ${when}` : 'Completed';
+  else if (standing === 'earlier') statusLine = when ? `You finished an earlier version on ${when}.` : 'You finished an earlier version.';
+  else if (standing === 'owed') statusLine = 'Not finished yet';
+  else statusLine = 'Optional — watch it whenever you like';
+  const done = !isStaff && standing === 'completed';
+
+  return (
+    <div>
+      {head}
+      <section ref={bodyRef} tabIndex={-1} className="gs-surface glass-card p-5 space-y-4" aria-labelledby={titleId}>
+        <div>
+          <h2 id={titleId} style={{ fontFamily: fontDisplay, fontWeight: 600, fontSize: 18, letterSpacing: '-0.01em', color: C.text, overflowWrap: 'anywhere' }}>
+            {video.title || 'Welcome to Toolkits'}
+          </h2>
+          {length ? <p className="mt-0.5" style={{ fontSize: 12.5, color: C.textSoft }}>{length}</p> : null}
+          {video.description ? <p className="mt-2" style={{ fontSize: 14, lineHeight: 1.6, color: C.textSoft }}>{video.description}</p> : null}
+        </div>
+        <GettingStartedPlayer key={playerKey} mode="page" source="live" watchRef={watchRef} stageRef={stageRef}
+          onVerdict={replay.onVerdict} onGiveUp={handleGiveUp} onRecover={clearGiveUp} />
+        {giveUp ? (
+          <div className="rounded-2xl px-4 py-3 flex flex-wrap items-center gap-x-3 gap-y-2"
+            style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)', fontSize: 13, lineHeight: 1.55 }}>
+            <span className="min-w-0 flex-1">
+              {gettingStartedGiveUpCopy(giveUp)} Try it again, or email{' '}
+              <a href={`mailto:${support}`} className="font-semibold underline" style={{ color: 'inherit', overflowWrap: 'anywhere' }}>{support}</a>.
+            </span>
+            <button type="button" onClick={retryPlayer}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-sm font-semibold transition hover:opacity-90" style={GS_SECONDARY_BTN}>
+              <RefreshCw size={14} aria-hidden="true" /> Retry
+            </button>
+          </div>
+        ) : null}
+        {replay.note ? <p style={{ fontSize: 13, lineHeight: 1.55, color: C.textSoft }}>{replay.note}</p> : null}
+        <p role="status" aria-live="polite" className="sr-only">{spoken.text}{spoken.n % 2 ? ' ' : ''}</p>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold"
+            style={done
+              ? { background: 'var(--status-ok-bg)', border: '1px solid var(--status-ok-bd)', color: 'var(--status-ok-fg)' }
+              : { background: 'var(--status-neutral-bg)', border: '1px solid var(--status-neutral-bd)', color: 'var(--status-neutral-fg)' }}>
+            {done ? <CheckCircle2 size={13} aria-hidden="true" /> : null}{statusLine}
+          </span>
+          {toDashboard}
+        </div>
+        {canManage ? (
+          <div className="flex flex-wrap items-center gap-2"><GettingStartedManageLink goto={goto} /></div>
+        ) : null}
+        <GettingStartedTranscript text={video.transcript || ''} />
+      </section>
+    </div>
+  );
+}
+
+/**
+ * The Dashboard card, directly under the hero. Renders NOTHING when no video is live and the
+ * viewer cannot manage one; a Super Admin sees why nobody is being asked to watch. Otherwise:
+ * the title, the length, where the viewer stands with it, "Open video" — which EXPANDS an inline
+ * player, so nothing is started or signed until it is asked for — and a link to the tab where the
+ * viewer's plan opens it.
+ * ★ Laid out by the .gs-card CONTAINER (src/index.css), never the viewport, and never a row of
+ *   buttons in an `auto` grid track beside a minmax(0, 1fr) column.
+ * ★ ITS CHIP IS THE PAGE'S STATUS, gettingStartedStanding() (S6): "Completed", "Finished an earlier
+ *   version" — never "Not finished" beside a replay of a video the student DID finish — and no chip
+ *   at all for a member who was never asked to watch it, rather than a to-do nobody set. The toggle
+ *   says "Open video": it opens a paused player, and never promised to play.
+ * ★ A START THE SERVER REFUSES ASKS THE ROOT AGAIN, and the panel says what happened (GF-5, S3);
+ *   both are SAID through one polite region mounted with the card (S5).
+ */
+function GettingStartedCard({ goto }) {
+  const gs = useContext(GettingStartedContext);
+  const ent = useContext(EntitlementContext);
+  const { profile, staff } = useAuth();
+  const [open, setOpen] = useState(false);
+  const [playerKey, setPlayerKey] = useState(0);
+  const [giveUp, setGiveUp] = useState(null);
+  const [spoken, setSpoken] = useState({ text: '', n: 0 });   // the polite region's next sentence
+  // What was watched survives a Retry AND a close: the player unmounts when the card closes,
+  // and opening it again carries on where the student was.
+  const watchRef = useRef(null);
+  const stageRef = useRef(null);        // the player's frame: focus after its Retry
+  // The root's value changes identity as its answer changes; the handlers read the latest.
+  const gsRef = useRef(gs);
+  gsRef.current = gs;
+  const retryPlayer = useCallback(() => {
+    setPlayerKey((k) => k + 1);
+    setGiveUp(null);
+    refocusIfLost(stageRef);
+  }, []);
+  // A start over — the replay recorder's: a newer version, or one the server never saw started.
+  const restartPlayer = useCallback(() => {
+    watchRef.current = null;
+    setPlayerKey((k) => k + 1);
+    setGiveUp(null);
+  }, []);
+  const clearGiveUp = useCallback(() => setGiveUp(null), []);
+  // GF-5: an unpublished video or a lapsed term is a fact about the account, not the device.
+  const handleGiveUp = useCallback((reason) => {
+    setGiveUp(reason || 'other');
+    if (reason === 'ONBOARDING_VIDEO_UNAVAILABLE' || reason === 'ONBOARDING_VIDEO_NOT_ELIGIBLE') gsRef.current?.refresh();
+  }, []);
+  const replay = useReplayRecorder(gs, restartPlayer);
+  const titleId = useId();
+  const panelId = useId();
+  // S5: said through the region at the foot of the card, which is mounted with it.
+  const speak = useCallback((text) => setSpoken((s) => ({ text, n: s.n + 1 })), []);
+  useEffect(() => {
+    if (giveUp) speak(gettingStartedGiveUpCopy(giveUp));
+  }, [giveUp, speak]);
+  useEffect(() => {
+    if (replay.note) speak(replay.note);
+  }, [replay.note, speak]);
+
+  const data = gs.data;
+  if (!data) return null;                   // not answered, or it failed: nothing to say
+  const video = data.video || null;
+  const canManage = data.can_manage === true;
+  if (!video || data.media_available === false) {
+    if (!canManage) return null;            // nothing a student could play: no card at all
+    const missing = !!video;
+    return (
+      <div className="gs-surface glass-card p-5 mb-8 flex items-start gap-3" role="note"
+        style={missing ? { borderColor: 'var(--status-danger-bd)', background: 'var(--status-danger-bg)' } : undefined}>
+        {missing
+          ? <AlertTriangle size={18} className="flex-shrink-0 mt-0.5" aria-hidden="true" style={{ color: 'var(--status-danger-fg)' }} />
+          : <Info size={18} className="flex-shrink-0 mt-0.5" aria-hidden="true" style={{ color: C.primary }} />}
+        <div className="min-w-0" style={{ fontSize: 13.5, lineHeight: 1.55 }}>
+          <div style={{ fontWeight: 700, color: missing ? 'var(--status-danger-fg)' : C.text }}>
+            {missing ? 'The live Getting Started video’s file is missing' : 'No Getting Started video is live — new students go straight to their dashboard.'}
+          </div>
+          {missing ? (
+            <div className="mt-0.5" style={{ color: C.textSoft }}>
+              Nobody is asked to watch it, and replays won’t play until it is replaced or unpublished.
+            </div>
+          ) : null}
+          <div className="mt-3"><GettingStartedManageLink goto={goto} /></div>
+        </div>
+      </div>
+    );
+  }
+
+  const isStaff = !!profile?.is_admin || staffBypassesPaywall(staff);
+  const standing = gettingStartedStanding(data);
+  const chip = isStaff ? null : ({ completed: 'Completed', earlier: 'Finished an earlier version', owed: 'Not finished' })[standing] || null;
+  const done = standing === 'completed';
+  const length = formatVideoDuration(video.duration_seconds);
+  return (
+    <section className="gs-card glass-card gs-surface p-5 mb-8" aria-labelledby={titleId}>
+      <div className="gs-card__row">
+        <div className="gs-card__icon" aria-hidden="true"><PlayCircle size={22} /></div>
+        <div className="gs-card__text">
+          <div className="gh-label" style={{ color: NAVY }}>Getting Started</div>
+          <h2 id={titleId} className="mt-1" style={{ fontFamily: fontDisplay, fontWeight: 600, fontSize: 17, letterSpacing: '-0.01em', lineHeight: 1.25, color: C.text, overflowWrap: 'anywhere' }}>
+            {video.title || 'Welcome to Toolkits'}
+          </h2>
+          <div className="mt-1.5 flex flex-wrap items-center gap-2" style={{ fontSize: 12.5, color: C.textSoft }}>
+            {length ? <span>{length}</span> : null}
+            {chip ? (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11.5px] font-semibold"
+                style={done
+                  ? { background: 'var(--status-ok-bg)', border: '1px solid var(--status-ok-bd)', color: 'var(--status-ok-fg)' }
+                  : { background: 'var(--status-neutral-bg)', border: '1px solid var(--status-neutral-bd)', color: 'var(--status-neutral-fg)' }}>
+                {done ? <CheckCircle2 size={12} aria-hidden="true" /> : null}{chip}
+              </span>
+            ) : null}
+          </div>
+        </div>
+        <div className="gs-card__actions">
+          <button type="button" aria-expanded={open} aria-controls={panelId} onClick={() => setOpen((o) => !o)}
+            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-bold transition hover:opacity-90" style={GS_PRIMARY_BTN}>
+            {open ? <X size={15} aria-hidden="true" /> : <Play size={15} aria-hidden="true" />}
+            {open ? 'Close video' : 'Open video'}
+          </button>
+          {ent.allowsTab('gettingstarted') ? (
+            <a href={tabHref('gettingstarted')}
+              onClick={(e) => { if (!goto || !shouldHandleInAppClick(e)) return; e.preventDefault(); goto('gettingstarted'); }}
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold transition hover:opacity-90" style={GS_SECONDARY_BTN}>
+              Open Getting Started
+            </a>
+          ) : null}
+          {canManage ? <GettingStartedManageLink goto={goto} /> : null}
+        </div>
+      </div>
+      <div id={panelId} className="gs-card__player" hidden={!open}>
+        {open ? (
+          <>
+            <GettingStartedPlayer key={playerKey} mode="card" source="live" watchRef={watchRef} stageRef={stageRef}
+              onVerdict={replay.onVerdict} onGiveUp={handleGiveUp} onRecover={clearGiveUp} />
+            {giveUp ? (
+              <div className="mt-3 rounded-2xl px-4 py-3 flex flex-wrap items-center gap-x-3 gap-y-2"
+                style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)', fontSize: 13, lineHeight: 1.55 }}>
+                <span className="min-w-0 flex-1">{gettingStartedGiveUpCopy(giveUp)}</span>
+                <button type="button" onClick={retryPlayer}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-sm font-semibold transition hover:opacity-90" style={GS_SECONDARY_BTN}>
+                  <RefreshCw size={14} aria-hidden="true" /> Retry
+                </button>
+              </div>
+            ) : null}
+            {replay.note ? <p className="mt-3" style={{ fontSize: 13, lineHeight: 1.55, color: C.textSoft }}>{replay.note}</p> : null}
+          </>
+        ) : null}
+      </div>
+      <p role="status" aria-live="polite" className="sr-only">{spoken.text}{spoken.n % 2 ? ' ' : ''}</p>
+    </section>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// GETTING STARTED (#69) — the Super Admin screen, GettingStartedVideoAdmin
+// ═══════════════════════════════════════════════════════════════════
+// Tab `gettingstartedadmin` (/admin/getting-started-video), the FIRST row of the admin nav, gated
+// on onboarding.manage — Super Admin only. At most one version is live; the others are drafts
+// being prepared, or history (retired, deleted).
+//
+// ★ IT CALLS admin_onboarding_video_* AND NOTHING ELSE. The student RPCs keep their one door each
+//   (§28b): Preview renders the student's own GettingStartedBody and GettingStartedPlayer on a
+//   GIVEN version, which starts nothing, records nothing and reports nothing. Storage is reached
+//   only through the upload target's discard() — an upload never attached, the file a new upload
+//   replaced, a deleted version's.
+// ★ A DRAFT COMES FIRST. The storage INSERT policy and the object's name both need the draft's
+//   id, so "New video" asks for the title, creates the draft, and only then opens the editor.
+// ★ REPLACING THE LIVE VIDEO IS ASKED FOR, NEVER ASSUMED. p_replace_live is true in ONE handler,
+//   the Replace dialog's. A publish that meets a live version it did not know about (published
+//   from another window) comes back as ONBOARDING_VIDEO_REPLACE_CONFIRM, and the answer is that
+//   dialog — never a silent retry.
+// ★ WHO IS AFFECTED IS SAID BEFORE EVERY CHANGE: publishImpact() for a publish, the overview's
+//   counts for the rest, and required_since exactly as the overview returns it (null until the
+//   first publish). The banner here and the nav row's badge read the SAME onboardingHealth()
+//   verdict, and every change asks the root to read it again (onHealthChange).
+// Pinned by test/uiSafety.test.mjs §28c.
+
+/**
+ * onboardingHealth() level → AdminNotice kind. 'info' is AdminNotice's own neutral kind (nothing
+ * live breaks nothing); an unexpected level is a warning — never the danger an unknown kind
+ * would otherwise render as.
+ */
+const ONBOARDING_NOTICE_KINDS = Object.freeze({ ok: 'ok', info: 'info', warn: 'warn', danger: 'danger' });
+function onboardingNoticeKind(level) {
+  return Object.prototype.hasOwnProperty.call(ONBOARDING_NOTICE_KINDS, level) ? ONBOARDING_NOTICE_KINDS[level] : 'warn';
+}
+
+/**
+ * The verdicts that raise the Getting Started Video row's badge. 'unknown' is not one of them: a
+ * read that failed — or a database without #69 — is not a fact about the video.
+ */
+const ONBOARDING_ATTENTION_CODES = Object.freeze(['none_live', 'file_missing', 'playback_problems', 'unverified']);
+function onboardingNeedsAttention(overview) {
+  return ONBOARDING_ATTENTION_CODES.includes(onboardingHealth(overview).code);
+}
+
+/**
+ * The uploader's owner-specific wording for this screen: LESSON_UPLOAD_COPY's four keys, and
+ * `messages` — the refusals whose shared wording (src/lib/courseVideo.js) names a lesson, course
+ * videos or the course-videos bucket (T9V-L1). Each is (file) => sentence, read by the uploader in
+ * place of the shared one; a reason not listed keeps the shared wording, which names neither.
+ * ★ bucket-missing names THIS bucket and THIS migration. The lesson wording sent a Super Admin to
+ *   create course-videos and run the #44 file, neither of which brings back onboarding-videos.
+ * ★ `removed` is the ONE thing said after Remove: the drawer's own note under the uploader is
+ *   plain text, never a second announcement of the same fact (T9UI-10).
+ */
+const ONBOARDING_UPLOAD_COPY = Object.freeze({
+  pickLabel: 'Upload the video',
+  fallbackName: 'Getting Started video',
+  accessRequired: 'Managing the Getting Started video needs the Super Admin role.',
+  removed: 'Video cleared here. A draft that already had a saved video keeps it until you upload a replacement.',
+  messages: Object.freeze({
+    'unsupported-type': () => 'The Getting Started video must be an MP4 or MOV file. Other containers (.mkv, .webm, '
+      + '.avi) need converting first — HandBrake or CloudConvert will do it.',
+    'unsupported-extension': () => 'The Getting Started video must end in .mp4 or .mov. Other containers need '
+      + 'converting first — HandBrake or CloudConvert will do it.',
+    'too-large': (file) => `That video is ${formatBytes(Number(file?.size) || 0)} — the limit is `
+      + `${formatBytes(LESSON_VIDEO_MAX_BYTES)}. Re-export it at a lower bitrate, or make it shorter.`,
+    'storage-limit': () => 'Storage refused this file as too large — but the app checked it against the '
+      + `${formatBytes(LESSON_VIDEO_MAX_BYTES)} upload limit before sending a single byte, so the file itself is not `
+      + 'the problem. Supabase caps every upload at the SMALLER of the bucket limit and the project-wide Storage '
+      + 'limit, and the project-wide one is set below it. Raise it (npm run storage:config -- --apply, or Supabase '
+      + '→ Storage → Settings). Resuming before then fails at exactly the same point.',
+    forbidden: () => 'This account is not allowed to upload the Getting Started video. That needs the Super Admin role.',
+    'bucket-missing': () => 'The onboarding-videos storage bucket is missing. Create it as a PRIVATE bucket and run '
+      + 'db/2026-09-30-getting-started-video.sql, then retry.',
+  }),
+});
+
+/**
+ * A length as the database counts it (T9V-L3). The CHECKs use char_length(), which counts
+ * characters — code points — while a JavaScript string's .length counts UTF-16 units, so an emoji
+ * is 1 there and 2 here: a title of 61 emoji read "122 / 120" in red, and Create refused a title
+ * the server would have taken.
+ */
+function gsTextLength(text) {
+  return Array.from(String(text ?? '')).length;
+}
+
+/**
+ * What to say as a field crosses its limit: ONCE as it goes over, ONCE as it comes back, and
+ * nothing while it stays on one side — so a long paste is one sentence, not one per keystroke
+ * (T9UI-12). null: nothing to say.
+ */
+function gsLimitTransition(wasOver, over, label, max) {
+  if (!!wasOver === !!over) return null;
+  const limit = `${Number(max).toLocaleString('en-US')}-character limit`;
+  return over ? `${label} is over its ${limit}.` : `${label} is within its ${limit} again.`;
+}
+
+/**
+ * A field's limit, said as it is crossed (T9UI-12). The counter beside a field is read only when
+ * the field is focused, so typing past 120, 600 or 20,000 characters was silent until Create or
+ * Save refused it.
+ */
+function GsLimitAnnouncer({ over, label, max }) {
+  const [said, setSaid] = useState('');
+  const wasOverRef = useRef(over);
+  useEffect(() => {
+    const next = gsLimitTransition(wasOverRef.current, over, label, max);
+    wasOverRef.current = over;
+    if (next) setSaid(next);
+  }, [over, label, max]);
+  return <span role="status" aria-live="polite" className="sr-only">{said}</span>;
+}
+
+// One frozen target per draft, so the uploader is handed the SAME record on every render.
+const ONBOARDING_UPLOAD_TARGETS = new Map();
+
+/**
+ * LessonVideoUploader's `target` for ONE Getting Started draft — the shape LESSON_UPLOAD_TARGET
+ * documents: where the upload goes, and what it is called.
+ *   isOwnPath   FOLDER-SCOPED to this draft (versions/<draft id>/…). Another draft's upload is
+ *               not this draft's to adopt or resume into, and attach_media refuses it anyway.
+ *   the resume key (fingerprintScope + fingerprintPrefix) belongs to this draft alone.
+ *   discard     a plain remove. ★ IT HAS NO REFERENCE CHECK — unlike a lesson's — because no two
+ *               versions share a file. What protects a SAVED file is the uploader's own
+ *               `path === savedPath` guard (T7-L2) and this screen's close sweep, which skips it.
+ * null without a draft id: there is nowhere for an upload to go.
+ */
+function onboardingUploadTarget(videoId) {
+  if (!videoId) return null;
+  const known = ONBOARDING_UPLOAD_TARGETS.get(videoId);
+  if (known) return known;
+  const target = Object.freeze({
+    bucket: ONBOARDING_VIDEO_BUCKET,
+    buildPath: ({ uploadId }) => buildOnboardingVideoPath(videoId, uploadId),
+    isOwnPath: (p) => onboardingVideoPathVideoId(p) === videoId,
+    fingerprintScope: videoId,
+    fingerprintPrefix: 'gh-onboarding',
+    sign: signOnboardingVideo,
+    // ★ remove() RESOLVES { error } — supabase-js never rejects it — so a refused or failed removal is
+    //   thrown HERE, where every caller's catch logs it (AUI-4). Returned as it was, it was silent
+    //   everywhere, and this bucket has no "unused files" panel to find what it left behind.
+    discard: async (p) => {
+      const { error } = await supabase.storage.from(ONBOARDING_VIDEO_BUCKET).remove([p]);
+      if (error) throw error;
+    },
+    copy: ONBOARDING_UPLOAD_COPY,
+  });
+  ONBOARDING_UPLOAD_TARGETS.set(videoId, target);
+  return target;
+}
+
+/**
+ * Remove one of a version's files — best effort, and never silently (AUI-4): a refusal or a fault is
+ * logged with its status, and `what` says which removal it was, because the object name is opaque.
+ * Through the target, so every removal on this screen is a discard() somebody chose.
+ */
+function sweepOnboardingFile(target, path, what) {
+  if (!target || !path) return;
+  Promise.resolve().then(() => target.discard(path)).catch((e) => {
+    console.error(`[getting-started-admin] ${what} could not be removed`, e?.status || e?.statusCode || e?.name || 'error');
+  });
+}
+
+/**
+ * admin_onboarding_video_attach_media's arguments for the upload that just passed verification.
+ * `facts` is LessonVideoUploader's onMediaFacts, recorded with the path it verified; facts about
+ * any OTHER path describe nothing here. What is unknown is null — the server then reads the size
+ * and the type from the stored object — and a length that is not a finite positive number is
+ * unknown, never a guess.
+ */
+function onboardingAttachArgs(videoId, path, facts) {
+  const f = facts && facts.path === path ? facts : null;
+  const whole = (v) => (Number.isInteger(v) && v > 0 ? v : null);
+  const positive = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null);
+  const text = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+  return {
+    p_video_id: videoId,
+    p_storage_path: path,
+    p_byte_size: whole(f?.byteSize),
+    p_mime_type: text(f?.mimeType),
+    p_duration_seconds: positive(f?.durationSeconds),
+    p_original_filename: text(f?.fileName),
+  };
+}
+
+/**
+ * "Who sees this", in words: the state today, from the overview's counts. Pure, so every
+ * singular and plural is a test — and never "all students", because no state asks everyone.
+ *   hasLive      a version is live
+ *   fileMissing  …and its file is missing from storage (media_present === false)
+ *   sinceDay     the Manila day of required_since, or '' before the first publish
+ *   pending, completed, members   the overview's counts
+ * ★ A LIVE VERSION WITH NO FILE ASKS NOBODY (T9V-H1). user_onboarding_video_state() requires the
+ *   object and start_onboarding_video() refuses without it, so nobody is gated and a replay fails
+ *   — what the danger banner above this says. This line used to say the opposite under it: "watch
+ *   it once before their first dashboard … can replay it".
+ */
+function onboardingAudienceLine({ hasLive = false, fileMissing = false, sinceDay = '', pending = 0, completed = 0, members = 0 } = {}) {
+  // A count from the overview: a whole number, never negative — anything else is none.
+  const whole = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.floor(Number(v)) : 0);
+  const p = whole(pending);
+  const c = whole(completed);
+  const m = whole(members);
+  const fmt = (n) => n.toLocaleString('en-US');
+  const done = c === 0 ? 'No student has finished a Getting Started video yet.'
+    : `${fmt(c)} ${c === 1 ? 'student has' : 'students have'} finished a Getting Started video.`;
+  const since = `since the first publish${sinceDay ? `, on ${sinceDay},` : ''}`;
+  if (hasLive && fileMissing) {
+    const then = p === 0
+      ? `Once a working video replaces it, students approved ${since} who haven’t finished one are asked — none are waiting now.`
+      : `Once a working video replaces it, the ${fmt(p)} ${p === 1 ? 'student' : 'students'} approved ${since} who `
+        + `${p === 1 ? 'hasn’t' : 'haven’t'} finished one will be asked.`;
+    return `The live video’s file is missing, so nobody is asked to watch it and replays won’t play. ${then} ${done}`;
+  }
+  if (hasLive) {
+    const waiting = p === 0 ? 'nobody is waiting to finish it'
+      : `${fmt(p)} ${p === 1 ? 'student' : 'students'} still to finish it`;
+    return `Students approved ${since} watch it once before their `
+      + `first dashboard — ${waiting}. ${done} Anyone approved earlier isn’t asked, but can replay it.`;
+  }
+  if (sinceDay) {
+    const asks = p === 0
+      ? 'no student approved since then is waiting, so publishing a video asks only students approved from now on'
+      : `publishing a video asks the ${fmt(p)} ${p === 1 ? 'student' : 'students'} approved since then who `
+        + `${p === 1 ? 'hasn’t' : 'haven’t'} finished one`;
+    return `Nothing is live, so nobody is asked to watch. The cutoff stays the first publish, on ${sinceDay}: ${asks}.`;
+  }
+  const today = m === 0 ? 'There are no current members yet.'
+    : `There ${m === 1 ? 'is' : 'are'} ${fmt(m)} current ${m === 1 ? 'member' : 'members'} today.`;
+  return 'Nothing has been published yet, so nobody is asked to watch. The first publish sets the cutoff: only students '
+    + `approved after it are asked. ${today}`;
+}
+
+/**
+ * What unpublishing the live video does, and to whom — `waiting` is the overview's
+ * pending_students.
+ * ★ A LIVE VERSION WHOSE FILE IS MISSING already asks nobody and already plays for nobody, so
+ *   unpublishing it changes nothing for a student: the line must not claim it sends anyone to their
+ *   dashboard who is not going there already (T9UI-1).
+ */
+function onboardingUnpublishLine(waiting, fileMissing = false) {
+  if (fileMissing) {
+    return 'Its file is missing, so nobody is asked to watch it now and replays already don’t play — unpublishing '
+      + 'changes nothing for students. Until you publish a video again, newly approved students go straight to '
+      + 'their dashboard.';
+  }
+  const n = Number.isFinite(Number(waiting)) && Number(waiting) > 0 ? Math.floor(Number(waiting)) : 0;
+  const who = n === 0 ? ''
+    : n === 1 ? ', and so does the 1 student who hasn’t finished it yet'
+      : `, and so do the ${n.toLocaleString('en-US')} students who haven’t finished it yet`;
+  return 'Until you publish a video again, nobody is asked to watch one: newly approved students go straight to '
+    + `their dashboard${who}. Members can’t replay it meanwhile.`;
+}
+
+/** "Manage in Getting Started Video" — for a viewer the server says can manage it (can_manage). */
+function GettingStartedManageLink({ goto }) {
+  return (
+    <a href={tabHref('gettingstartedadmin')}
+      onClick={(e) => { if (!goto || !shouldHandleInAppClick(e)) return; e.preventDefault(); goto('gettingstartedadmin'); }}
+      className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold transition hover:opacity-90" style={GS_SECONDARY_BTN}>
+      <Clapperboard size={14} aria-hidden="true" /> Manage in Getting Started Video
+    </a>
+  );
+}
+
+/**
+ * The Super Admin's Preview of ONE version: the student's own screen — GettingStartedBody around
+ * GettingStartedPlayer — on that version's file, inert.
+ * ★ NOTHING HERE REACHES A SERVER. A given `source` makes the player start nothing, record nothing
+ *   and report nothing; without onContinue the Go button locks and unlocks exactly as the
+ *   student's does, and a press only says it is a preview.
+ * ★ ITS OWN WATCH RECORD. The record its player keeps (watchRef) belongs to this preview — shared
+ *   with no other player, gone with the dialog — and survives the preview's own Retry. The unlock
+ *   holds for the version (holdWatchVerdict), as it does on the gate.
+ * ★ THE STUDENT'S VIEW: the player's copy is the student's (it never passes isAdmin), and the Body
+ *   steps its headings down a level, because the dialog holds the title.
+ */
+function GettingStartedPreview({ version }) {
+  const { profile } = useAuth();
+  const [playerKey, setPlayerKey] = useState(0);
+  const [verdict, setVerdict] = useState(null);
+  const [giveUp, setGiveUp] = useState(null);
+  const watchRef = useRef(null);
+  const stageRef = useRef(null);
+  const onVerdict = useCallback((v) => setVerdict((shown) => holdWatchVerdict(shown, v)), []);
+  // The give-up note goes with its Retry, so focus goes to the player that is reloading.
+  const retryPlayer = useCallback(() => {
+    setPlayerKey((k) => k + 1);
+    setGiveUp(null);
+    refocusIfLost(stageRef);
+  }, []);
+  const clearGiveUp = useCallback(() => setGiveUp(null), []);
+  const source = useMemo(() => ({
+    video_id: version.id, storage_path: version.storage_path, duration_seconds: version.duration_seconds ?? null,
+  }), [version.id, version.storage_path, version.duration_seconds]);
+  const video = useMemo(() => ({
+    title: version.title, description: version.description, transcript: version.transcript,
+    duration_seconds: version.duration_seconds,
+  }), [version.title, version.description, version.transcript, version.duration_seconds]);
+  const notice = giveUp ? (
+    <div role="status" className="rounded-2xl px-4 py-3 flex flex-wrap items-center gap-x-3 gap-y-2"
+      style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)', fontSize: 13, lineHeight: 1.55 }}>
+      <span className="min-w-0 flex-1">
+        This version isn’t playing in this browser. If it won’t play on another device either, students can’t watch it.
+      </span>
+      <button type="button" onClick={retryPlayer}
+        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-sm font-semibold transition hover:opacity-90" style={GS_SECONDARY_BTN}>
+        <RefreshCw size={14} aria-hidden="true" /> Retry
+      </button>
+    </div>
+  ) : null;
+  return (
+    <GettingStartedBody headingLevel={2} name={profile?.full_name || ''} video={video} verdict={verdict} notice={notice}
+      player={<GettingStartedPlayer key={playerKey} mode="preview" source={source} watchRef={watchRef} stageRef={stageRef}
+        onVerdict={onVerdict} onGiveUp={setGiveUp} onRecover={clearGiveUp} />} />
+  );
+}
+
+/**
+ * The first step of "New video" (and of Replace): the title, before anything else — the draft is
+ * created on submit, because the upload's object name needs its id.
+ */
+function GettingStartedTitlePrompt({ replacing = null, busy = false, err = '', onCreate, onClose }) {
+  const [title, setTitle] = useState('');
+  const inputRef = useRef(null);
+  const fieldId = useId();
+  // AccountModal moves focus to its panel when it mounts. This effect runs after that one (a
+  // parent's effects run after its children's), so the admin starts in the one field to fill in.
+  useEffect(() => { inputRef.current?.focus(); }, []);
+  const submit = (e) => {
+    e.preventDefault();
+    if (!busy) onCreate?.(title);
+  };
+  // Characters, as the database counts them (gsTextLength, T9V-L3).
+  const length = gsTextLength(title.trim());
+  return (
+    <AccountModal title={replacing ? 'Replace the live video' : 'New Getting Started video'}
+      subtitle={replacing ? `Name the video that will replace “${replacing.title}”.` : 'Name it first. Nobody sees it until you publish it.'}
+      icon={Plus} canClose={!busy} onClose={onClose} bodyClass="gs-dialog px-6 py-5">
+      <form onSubmit={submit} className="space-y-3">
+        <div>
+          <div className="flex items-baseline justify-between gap-3">
+            <label htmlFor={`${fieldId}-title`} className="text-xs font-semibold" style={{ color: C.textSoft }}>Title</label>
+            <span id={`${fieldId}-count`} className="text-[11px] tabular-nums" style={{ color: length > 120 ? 'var(--status-danger-fg)' : C.textMute }}>
+              {length} / 120
+            </span>
+            <GsLimitAnnouncer over={length > 120} label="Title" max={120} />
+          </div>
+          <input ref={inputRef} id={`${fieldId}-title`} value={title} onChange={(e) => setTitle(e.target.value)}
+            aria-required="true" aria-describedby={`${fieldId}-count ${fieldId}-help`}
+            className="gh-input w-full mt-1" style={{ fontSize: 14 }} />
+        </div>
+        <p id={`${fieldId}-help`} style={{ fontSize: 12.5, lineHeight: 1.55, color: C.textSoft }}>
+          {replacing
+            ? 'It starts as a draft: upload the new file, check it with Preview, then publish it. You’ll confirm the replacement, and who it affects, before anything changes.'
+            : 'It starts as a draft: upload the file, check it with Preview, then publish it.'}
+        </p>
+        {err ? <AdminNotice kind="danger">{err}</AdminNotice> : null}
+        <div className="flex flex-wrap justify-end gap-2 pt-1">
+          <button type="button" onClick={() => { if (!busy) onClose?.(); }} aria-disabled={busy ? 'true' : undefined}
+            className="px-4 py-2 rounded-xl text-sm font-semibold transition hover:opacity-90" style={GS_SECONDARY_BTN}>
+            Cancel
+          </button>
+          <button type="submit" aria-disabled={busy ? 'true' : undefined} aria-busy={busy ? 'true' : undefined}
+            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-bold transition hover:opacity-90" style={GS_PRIMARY_BTN}>
+            {busy ? <Loader2 size={15} className="animate-spin" aria-hidden="true" /> : <Plus size={15} aria-hidden="true" />}
+            {busy ? 'Creating…' : 'Create draft'}
+          </button>
+        </div>
+      </form>
+    </AccountModal>
+  );
+}
+
+// What the editor's words reach, by the version's status (AUI-5): a draft reaches nobody yet; the
+// live version reaches every student who opens it, the moment it is saved.
+const GS_EDITOR_SUBTITLE = Object.freeze({
+  draft: 'A draft. Students see nothing until you publish it.',
+  published: 'Live now. Students see these details as soon as you save them.',
+  retired: 'Retired. Students see it only if you publish it again.',
+});
+
+// ★ SOLID FILLS BEHIND WHITE TEXT, as GS_PRIMARY_BTN's is (T9UI-4). ADMIN_BTN_OK / ADMIN_BTN_DANGER
+//   are gradients whose bright stops put white text at 1.87–3.16:1 (green) and 2.52–5.32:1 (red),
+//   under the 4.5:1 a 14px bold label needs. --ok-solid and --danger-solid are theme-independent,
+//   as --primary-solid is, and test/uiSafety.test.mjs measures both against white.
+const GS_OK_BTN = Object.freeze({ background: 'var(--ok-solid)', color: '#fff', border: '1px solid transparent' });
+const GS_DANGER_BTN = Object.freeze({ background: 'var(--danger-solid)', color: '#fff', border: '1px solid transparent' });
+
+/**
+ * One confirmation, in AccountModal: what will happen and who it affects, in one tone per action
+ * (the icon tile and the confirm button agree).
+ *   warning  a sentence for when the dialog CHANGED under the admin's focus — a publish that met a
+ *            version gone live elsewhere, which is now "Replace the live video" on the very button
+ *            they pressed. ★ Said through a role="alert" that is ALWAYS mounted and only fills: a
+ *            sentence that merely appears inside a dialog is not reliably heard (T9UI-5).
+ * ★ aria-disabled while the change runs, never `disabled`: the press is what started it, focus is
+ *   on that button, and a disabled button drops focus out of the dialog, to <body>.
+ * ★ .gs-dialog on the body: the screen's focus ring, though the dialog is portaled out of
+ *   .gs-admin (T9UI-14). overflowWrap: a version title with no spaces wraps instead of scrolling
+ *   the dialog sideways (T9UI-3).
+ */
+function GettingStartedConfirm({ title, subtitle = null, tone = 'primary', icon, children, actionLabel, busy = false, err = '', warning = '', onConfirm, onClose }) {
+  const action = { ok: GS_OK_BTN, danger: GS_DANGER_BTN }[tone] || GS_PRIMARY_BTN;
+  return (
+    <AccountModal title={title} subtitle={subtitle} icon={icon} tone={tone} canClose={!busy} onClose={onClose} bodyClass="gs-dialog px-6 py-5">
+      <div style={{ fontSize: 13.5, lineHeight: 1.6, color: C.text, overflowWrap: 'anywhere' }}>
+        <div role="alert">
+          {warning ? (
+            <p className="mb-3 rounded-xl px-3 py-2"
+              style={{ background: 'var(--status-warn-bg)', border: '1px solid var(--status-warn-bd)', color: 'var(--status-warn-fg)' }}>
+              {warning}
+            </p>
+          ) : null}
+        </div>
+        <div className="space-y-3">
+          {children}
+          {err ? <AdminNotice kind="danger">{err}</AdminNotice> : null}
+          <div className="flex flex-wrap justify-end gap-2 pt-1">
+            <button type="button" onClick={() => { if (!busy) onClose?.(); }} aria-disabled={busy ? 'true' : undefined}
+              className="px-4 py-2 rounded-xl text-sm font-semibold transition hover:opacity-90" style={GS_SECONDARY_BTN}>
+              Cancel
+            </button>
+            <button type="button" onClick={() => { if (!busy) onConfirm?.(); }} aria-disabled={busy ? 'true' : undefined} aria-busy={busy ? 'true' : undefined}
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-bold text-white transition hover:opacity-90" style={action}>
+              {busy ? <Loader2 size={15} className="animate-spin" aria-hidden="true" /> : null}
+              {busy ? 'Working…' : actionLabel}
+            </button>
+          </div>
+        </div>
+      </div>
+    </AccountModal>
+  );
+}
+
+/**
+ * The Super Admin screen (see the block comment above).
+ *   onHealthChange  () => void — the root's refreshOnboardingHealth, called after every change so
+ *                   the nav row's badge follows the banner here.
+ */
+function GettingStartedVideoAdmin({ onHealthChange }) {
+  // ★ staffDegraded destructured — uiSafety.test.mjs §12.
+  const { profile, staff, staffReady, staffDegraded } = useAuth();
+  // This admin's OWN Getting Started answer — their Dashboard card and the Getting Started tab —
+  // asked for again after a change to what is live (afterChange).
+  const ownAnswer = useContext(GettingStartedContext);
+  const allowed = adminTabVisible(staff, {
+    staffReady, staffDegraded, profileIsAdmin: !!profile?.is_admin,
+  }, 'gettingstartedadmin');
+
+  const [overview, setOverview] = useState(null);
+  const [loadState, setLoadState] = useState('loading');   // loading | ready | error | setup | forbidden
+  const [refreshing, setRefreshing] = useState(false);
+  const [notice, setNotice] = useState(null);              // { kind, text }
+  const [creating, setCreating] = useState(null);          // { replacing, busy, err }
+  const [editor, setEditor] = useState(null);              // { id, saved: { title, description, transcript, storage_path } }
+  const [draft, setDraft] = useState(null);                // { id, title, description, transcript, storage_path }
+  const [uploadState, setUploadState] = useState(UPLOAD_STATES.EMPTY);
+  const [savingDraft, setSavingDraft] = useState(false);
+  const [editorErr, setEditorErr] = useState('');
+  const [confirm, setConfirm] = useState(null);            // { kind, version, live?, raced? }
+  const [confirmBusy, setConfirmBusy] = useState(false);
+  const [confirmErr, setConfirmErr] = useState('');
+  const [previewFor, setPreviewFor] = useState(null);      // the version being previewed
+  const healthRef = useRef(onHealthChange);
+  healthRef.current = onHealthChange;
+  const loadSeqRef = useRef(0);
+  // A state flag is not a lock (a double press would send twice); these are.
+  const createLockRef = useRef(false);
+  const saveLockRef = useRef(false);
+  const confirmLockRef = useRef(false);
+  // What the uploader reports arrives from the render that PICKED the file (T7-L3): refs, not state.
+  const pendingPathRef = useRef(null);    // uploaded and verified, NOT yet attached
+  const readyPathRef = useRef(null);      // the path the last READY patch named
+  const mediaFactsRef = useRef(null);     // onMediaFacts for that path
+  // Where focus goes once a change has re-rendered the list — the control that made the change
+  // may have moved (a published draft leaves Drafts) or gone (a deleted version).
+  const focusAfterLoadRef = useRef(null);
+  const liveRef = useRef(null);
+  const newVideoRef = useRef(null);
+  const fieldId = useId();
+  const liveTitleId = useId();
+  const whoId = useId();
+  const draftsId = useId();
+  const draftHintId = useId();
+  const liveHintId = useId();
+  // The draft's SAVED file, for notePendingPath — which runs from the uploader's closures.
+  const savedPathRef = useRef(null);
+  savedPathRef.current = editor?.saved.storage_path || null;
+
+  const load = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
+    try {
+      const { data, error } = await supabase.rpc('admin_onboarding_video_overview');
+      if (seq !== loadSeqRef.current) return;
+      if (error) {
+        if (isMigrationMissing(error)) setLoadState('setup');
+        else if (appErrorCode(error) === 'FORBIDDEN') setLoadState('forbidden');
+        else {
+          console.warn('[getting-started-admin] the overview could not be read', appErrorCode(error) || error.code || 'error');
+          setLoadState('error');
+        }
+        return;
+      }
+      setOverview(data && typeof data === 'object' ? data : null);
+      setLoadState('ready');
+    } catch (e) {
+      if (seq !== loadSeqRef.current) return;
+      console.warn('[getting-started-admin] the overview could not be read', e?.name || 'error');
+      setLoadState('error');
+    } finally {
+      if (seq === loadSeqRef.current) setRefreshing(false);
+    }
+  }, []);
+  // ★ EVERY READ OF THE LIST IS PAIRED WITH THE ROOT'S READ OF THE BADGE. The badge was read when
+  //   the app started; the banner is read here. Apart, a Refresh that found a new verdict — a
+  //   playback problem reported since sign-in, a file deleted from the Storage dashboard — showed
+  //   it in the banner and left the badge saying the opposite.
+  const reload = () => {
+    load();
+    healthRef.current?.();
+  };
+  useEffect(() => { if (allowed) reload(); /* eslint-disable-next-line */ }, [allowed]);
+  // Once the new list has rendered: if the change removed the control that had focus, focus the
+  // live card (after a publish) or "New video" — never <body> (T8-UI-1's rule).
+  useEffect(() => {
+    const where = focusAfterLoadRef.current;
+    if (!where) return;
+    focusAfterLoadRef.current = null;
+    refocusIfLost(where === 'live' && liveRef.current ? liveRef : newVideoRef);
+  }, [overview]);
+
+  const editorId = editor?.id || null;
+  const uploadTarget = onboardingUploadTarget(editorId);
+  // Read once, when the uploader mounts: a draft with a saved file opens on "Video uploaded" — unless
+  // the overview said that file is gone (AUI-2): then it opens empty, ready for the file again.
+  const uploaderValue = useMemo(() => {
+    const usable = editor?.saved.storage_path && !editor.missing ? editor.saved.storage_path : null;
+    return { storage_path: usable, video_provider: usable ? 'upload' : null, video_url: null };
+  }, [editor?.saved.storage_path, editor?.missing]);
+  // The draft still stands on a saved file the overview says is gone: it can't be shown or published.
+  const savedFileGone = !!(editor?.missing && (!draft?.storage_path || draft.storage_path === editor.saved.storage_path));
+  // The drawer's player, for the file the draft names — never one that would only fail to sign (AUI-2).
+  const drawerLesson = useMemo(() => (editorId && draft?.storage_path && !savedFileGone
+    ? { id: editorId, storage_path: draft.storage_path } : null), [editorId, draft?.storage_path, savedFileGone]);
+  // ★ null FROM THE UPLOADER MEANS IT DISCARDED THAT UPLOAD — discardPending is its only null: a
+  //   replacement it ACCEPTED (it reads the new file first, and a refused pick discards nothing),
+  //   a Cancel or a Remove. The draft goes back to its SAVED file, and the facts about the dropped
+  //   one go with it — or the draft would name a deleted object: Save would write the details and
+  //   have the attach refused, and the drawer's player would sign a file that was gone (T9V-L4,
+  //   found while the uploader still discarded BEFORE it validated).
+  const notePendingPath = useCallback((path) => {
+    const dropped = pendingPathRef.current;
+    pendingPathRef.current = path;
+    if (path || !dropped) return;
+    if (readyPathRef.current === dropped) {
+      readyPathRef.current = null;
+      mediaFactsRef.current = null;
+    }
+    setDraft((d) => (d && d.storage_path === dropped ? { ...d, storage_path: savedPathRef.current } : d));
+  }, []);
+  // ★ FROM THE RENDER THAT PICKED THE FILE (T7-L3). A long transfer finishes minutes after the
+  //   pick, while the admin goes on typing above it: the patch is merged into the draft as it is
+  //   NOW (a functional update), and only while it is still the same draft.
+  const applyUploadPatch = useCallback((patch) => {
+    const path = patch?.storage_path ?? null;
+    readyPathRef.current = path;
+    setDraft((d) => (d && d.id === editorId ? { ...d, storage_path: path } : d));
+  }, [editorId]);
+  // Fires right after the READY patch, for the same path — kept for Save draft to read.
+  const noteMediaFacts = useCallback((facts) => {
+    mediaFactsRef.current = { ...facts, path: readyPathRef.current };
+  }, []);
+
+  const refresh = () => {
+    setRefreshing(true);
+    reload();
+  };
+  // The unknown banner's own "Try again" goes away when the answer comes; focus then moves on.
+  const retryLoad = () => {
+    focusAfterLoadRef.current = 'top';
+    refresh();
+  };
+  // ★ AFTER A CHANGE TO WHAT IS LIVE, THIS ADMIN'S OWN ANSWER IS ASKED FOR AGAIN (T9V-M1). The
+  //   root read it at sign-in, and it is what their Dashboard card and the Getting Started tab
+  //   show: after a publish the card still said nothing was live, and after an unpublish it offered
+  //   Play on a video that was gone — until a reload, one click from here. keep: a read that fails
+  //   leaves the answer where it was, and the root's hook stays the one place it is asked for.
+  const afterChange = (kind, text, focus = 'top', liveChanged = false) => {
+    setNotice(text ? { kind, text } : null);
+    focusAfterLoadRef.current = focus;
+    reload();
+    if (liveChanged) ownAnswer.refresh?.({ keep: true });
+  };
+
+  // ── The editor ────────────────────────────────────────────────────────────
+  const openEditor = (v) => {
+    pendingPathRef.current = null;
+    readyPathRef.current = null;
+    mediaFactsRef.current = null;
+    setEditorErr('');
+    // ★ A SAVED FILE THE OVERVIEW SAYS IS GONE IS NOT A FILE (AUI-2). The row said "File missing from
+    //   storage" while the uploader beside it said "Video uploaded ✓" and the drawer's player failed
+    //   to sign it. Only an explicit false — a missing fact is not a missing file.
+    const missing = !!v.storage_path && v.media_present === false;
+    setUploadState(v.storage_path && !missing ? UPLOAD_STATES.SAVED_AND_PLAYABLE : UPLOAD_STATES.EMPTY);
+    const saved = {
+      title: v.title || '', description: v.description || '', transcript: v.transcript || '',
+      storage_path: v.storage_path || null,
+    };
+    // `status`: the LIVE version and a RETIRED one open for their words alone (AUI-5) — a version's
+    // file is fixed once it has been live, and attach_media takes a draft's only.
+    setEditor({ id: v.id, status: v.status || 'draft', missing, saved });
+    setDraft({ id: v.id, ...saved });
+  };
+  const resetEditor = () => {
+    pendingPathRef.current = null;
+    readyPathRef.current = null;
+    mediaFactsRef.current = null;
+    setEditor(null);
+    setDraft(null);
+    setEditorErr('');
+    setUploadState(UPLOAD_STATES.EMPTY);
+  };
+  const draftDirty = !!(editor && draft && (draft.title !== editor.saved.title
+    || draft.description !== editor.saved.description || draft.transcript !== editor.saved.transcript
+    || (draft.storage_path || null) !== (editor.saved.storage_path || null)));
+  const closeEditor = () => {
+    if (!editor || savingDraft) return;
+    if (needsCloseConfirmation(uploadState)
+      && !window.confirm('This draft\'s video is still uploading.\n\nClose anyway? The transfer stops, '
+        + 'and choosing the same file again later picks up where it left off.')) return;
+    if (draftDirty && !window.confirm(editor.status === 'draft'
+      ? 'Discard your unsaved changes to this draft?' : 'Discard your unsaved changes to these details?')) return;
+    // ★ Sweep an upload that FINISHED but was never attached — the lesson drawer's reason: closing
+    //   unmounts the uploader, the only other thing that knew the path. ★ NEVER THE SAVED PATH:
+    //   this bucket's discard has no reference check, so this comparison is what protects the
+    //   draft's own file (T7-L2).
+    const orphan = pendingPathRef.current;
+    pendingPathRef.current = null;
+    if (orphan && orphan !== editor.saved.storage_path) sweepOnboardingFile(uploadTarget, orphan, 'an upload that was never saved');
+    resetEditor();
+  };
+  const saveDraft = async () => {
+    if (!editor || !draft || saveLockRef.current) return;
+    const title = draft.title.trim();
+    const description = draft.description.trim();
+    const transcript = draft.transcript.trim();
+    // ★ A REFUSED SAVE IS NEVER SILENT (the lesson editor's rule): every refusal says why.
+    if (uploadState === UPLOAD_STATES.UNSUPPORTED_FILE) {
+      setEditorErr('That file can’t be used. Dismiss it, or choose another file, before saving.');
+      return;
+    }
+    if (blocksLessonSave(uploadState)) {
+      setEditorErr('The video is still uploading or being checked. Save once it says it is ready, or cancel the upload.');
+      return;
+    }
+    if (!title || gsTextLength(title) > 120 || gsTextLength(description) > 600 || gsTextLength(transcript) > 20000) {
+      setEditorErr(APP_ERROR_COPY.ONBOARDING_VIDEO_TEXT_INVALID);
+      return;
+    }
+    const id = editor.id;
+    const saved = editor.saved;
+    // The LIVE version's words reach students as soon as they are saved (AUI-5) — so its admin's own
+    // answer, their Dashboard card and Getting Started tab, is asked for again (T9V-M1).
+    const wasLive = editor.status === 'published';
+    const newPath = draft.storage_path && draft.storage_path !== saved.storage_path ? draft.storage_path : null;
+    const keptFile = !draft.storage_path && !!saved.storage_path;
+    saveLockRef.current = true;
+    setSavingDraft(true);
+    setEditorErr('');
+    let wroteDetails = false;
+    try {
+      if (title !== saved.title || description !== saved.description || transcript !== saved.transcript) {
+        // ★ ALL THREE, ALWAYS. The RPC has no defaults: an empty field clears it, and a missing one
+        //   is refused — never read as "leave it".
+        const { error } = await supabase.rpc('admin_onboarding_video_update_details', {
+          p_video_id: id, p_title: title, p_description: description, p_transcript: transcript,
+        });
+        if (error) throw error;
+        wroteDetails = true;
+        setEditor((ed) => (ed && ed.id === id ? { ...ed, saved: { ...ed.saved, title, description, transcript } } : ed));
+      }
+      if (newPath) {
+        const { data, error } = await supabase.rpc('admin_onboarding_video_attach_media',
+          onboardingAttachArgs(id, newPath, mediaFactsRef.current));
+        if (error) throw error;
+        pendingPathRef.current = null;      // the draft's own file now — never an orphan to sweep
+        const previous = data?.previous_storage_path;
+        if (previous && previous !== newPath) {
+          // The file this upload replaced: no row cites it now, and a draft's file was never live.
+          sweepOnboardingFile(onboardingUploadTarget(id), previous, 'the file this upload replaced');
+        }
+      }
+      // ★ AN UPLOAD THE SAVED DRAFT DOES NOT CITE IS SWEPT NOW, NOT FORGOTTEN (AUI-1). One that
+      //   finished but FAILED its check stays pending — "Check again" needs it — and a refused pick
+      //   keeps it (only an accepted one replaces it), so Dismiss, then Save, dropped the one reference
+      //   to it: resetEditor() forgets the path, and the object stayed in the bucket for good. Never the
+      //   saved file: this bucket's discard has no reference check.
+      const leftover = pendingPathRef.current;
+      pendingPathRef.current = null;
+      if (leftover && leftover !== newPath && leftover !== saved.storage_path) {
+        sweepOnboardingFile(onboardingUploadTarget(id), leftover, 'an upload that was never attached');
+      }
+      resetEditor();
+      const words = wasLive && wroteDetails;
+      afterChange('ok', keptFile
+        ? `Saved “${title}”. Its video file was kept: a draft keeps its file until you upload a replacement.`
+        : words ? `Saved “${title}”. Students see the new details now.` : `Saved “${title}”.`, 'top', words);
+    } catch (e) {
+      console.error('[getting-started-admin] the draft was not saved', appErrorCode(e) || e?.code || 'error');
+      // ★ TWO CALLS, SO A REFUSAL CAN COME AFTER THE DETAILS LANDED (T9V-L4). The attach's own copy
+      //   ends "Nothing was changed", which is false by then: say what was saved, and what was not.
+      setEditorErr(wroteDetails
+        ? `The details were saved, but the video wasn’t attached. ${appErrorMessage(e, 'Try again.').replace(/\s*Nothing was changed\.\s*$/, '')}`
+        : appErrorMessage(e, 'The draft was not saved. Try again.'));
+      // …and the list behind the drawer says what IS saved (AUI-3). It kept the old title, so a Cancel
+      // then looked as if it had thrown the rename away too — and a re-opened editor wrote it back.
+      if (wroteDetails) reload();
+    } finally {
+      saveLockRef.current = false;
+      setSavingDraft(false);
+    }
+  };
+
+  // ── New video (and Replace): the title, then the draft, then the editor ──────
+  const startNewVideo = (replacing = null) => setCreating({ replacing, busy: false, err: '' });
+  const createDraft = async (rawTitle) => {
+    const title = String(rawTitle || '').trim();
+    if (!title || gsTextLength(title) > 120) {
+      setCreating((c) => c && { ...c, err: title ? 'The title can be at most 120 characters.' : 'Give the video a title.' });
+      return;
+    }
+    if (createLockRef.current) return;
+    createLockRef.current = true;
+    setCreating((c) => c && { ...c, busy: true, err: '' });
+    try {
+      const { data, error } = await supabase.rpc('admin_onboarding_video_create_draft', {
+        p_title: title, p_description: null, p_transcript: null,
+      });
+      if (error) throw error;
+      if (!data?.video_id) throw new Error('The draft was created, but its id did not come back. Refresh to find it in Drafts.');
+      setCreating(null);
+      openEditor({ id: data.video_id, title, description: '', transcript: '', storage_path: null });
+      afterChange(null, '');
+    } catch (e) {
+      console.error('[getting-started-admin] the draft was not created', appErrorCode(e) || e?.code || 'error');
+      setCreating((c) => c && { ...c, busy: false, err: appErrorMessage(e, 'The draft was not created. Try again.') });
+    } finally {
+      createLockRef.current = false;
+    }
+  };
+
+  // ── Publish, replace, unpublish, delete ──────────────────────────────────────
+  const versions = Array.isArray(overview?.versions) ? overview.versions : [];
+  const liveId = overview?.live_video_id || null;
+  const live = (liveId && versions.find((v) => v.id === liveId)) || null;
+  const openConfirm = (kind, version, extra = null) => {
+    setConfirmErr('');
+    setConfirm({ kind, version, ...(extra || {}) });
+  };
+  const closeConfirm = () => {
+    if (confirmLockRef.current) return;
+    setConfirm(null);
+    setConfirmErr('');
+  };
+  // A list's Publish goes straight to the Replace dialog when another version is live.
+  const requestPublish = (v) => {
+    if (live && live.id !== v.id) openConfirm('replace', v, { live });
+    else openConfirm('publish', v);
+  };
+  const runConfirm = async (work) => {
+    if (confirmLockRef.current) return;
+    confirmLockRef.current = true;
+    setConfirmBusy(true);
+    setConfirmErr('');
+    try {
+      await work();
+    } catch (e) {
+      console.error('[getting-started-admin] the change was refused', appErrorCode(e) || e?.code || 'error');
+      setConfirmErr(appErrorMessage(e, 'Nothing was changed. Try again.'));
+      // A refusal about the version ITSELF means this list is out of date (AUI-6) — its file gone from
+      // storage, the version deleted or moved on in another window. Read it again, so its row says so.
+      const code = appErrorCode(e);
+      if (code === 'ONBOARDING_VIDEO_MEDIA_INVALID' || code === 'ONBOARDING_VIDEO_NOT_FOUND'
+        || code === 'ONBOARDING_VIDEO_STATE_INVALID') reload();
+    } finally {
+      confirmLockRef.current = false;
+      setConfirmBusy(false);
+    }
+  };
+  const confirmPublish = () => runConfirm(async () => {
+    const v = confirm.version;
+    const { data, error } = await supabase.rpc('admin_onboarding_video_publish', { p_video_id: v.id, p_replace_live: false });
+    if (error) {
+      if (appErrorCode(error) === 'ONBOARDING_VIDEO_REPLACE_CONFIRM') {
+        // Another version went live after this list was read (another window). Ask again — as
+        // the replacement this now is — naming the version that is live NOW.
+        const ctx = appErrorContext(error);
+        setConfirm({ kind: 'replace', version: v, live: { id: ctx.live_id, title: ctx.live_title || '' }, raced: true });
+        reload();
+        return;
+      }
+      throw error;
+    }
+    setConfirm(null);
+    afterChange('ok', data?.first_publish
+      ? `“${v.title}” is live. New students approved from now on watch it once before their first dashboard.`
+      : `“${v.title}” is live.`, 'live', true);
+  });
+  // ★ BOUND TO THE VERSION ITS DIALOG NAMED (DBSEC-1). `confirm.live` is frozen when the dialog opens —
+  //   requestPublish's `live`, or the version a refusal named — and it is the version the dialog's own
+  //   words say will be retired. The server retires nothing else: if another window published or
+  //   unpublished in between, it refuses with REPLACE_CONFIRM, naming what is live NOW (or nothing),
+  //   and the admin is asked about THAT — never retried with the stale name, never a silent retire.
+  const confirmReplace = () => runConfirm(async () => {
+    const v = confirm.version;
+    const named = confirm.live;
+    const { error } = await supabase.rpc('admin_onboarding_video_publish', { p_video_id: v.id, p_replace_live: true, p_expected_live_id: named.id });
+    if (error) {
+      if (appErrorCode(error) === 'ONBOARDING_VIDEO_REPLACE_CONFIRM') {
+        const ctx = appErrorContext(error);
+        if (ctx.live_id) setConfirm({ kind: 'replace', version: v, live: { id: ctx.live_id, title: ctx.live_title || '' }, raced: true });
+        else setConfirm({ kind: 'publish', version: v, raced: true });
+        reload();
+        return;
+      }
+      throw error;
+    }
+    setConfirm(null);
+    afterChange('ok', `“${v.title}” replaced the live video.`, 'live', true);
+  });
+  const confirmUnpublish = () => runConfirm(async () => {
+    const v = confirm.version;
+    const { error } = await supabase.rpc('admin_onboarding_video_unpublish', { p_video_id: v.id });
+    if (error) throw error;
+    setConfirm(null);
+    afterChange('ok', `“${v.title}” is no longer live. Nobody is asked to watch a Getting Started video until you publish one.`, 'top', true);
+  });
+  // ★ A LIVE VERSION IS UNPUBLISHED, THEN DELETED — one confirmation, two calls. If the second
+  //   fails the first stands: the video is safely unpublished and in History, and the screen says
+  //   so, rather than reporting the delete as simply failed.
+  const confirmDelete = () => runConfirm(async () => {
+    const v = confirm.version;
+    let unpublished = false;
+    if (v.status === 'published') {
+      const { error } = await supabase.rpc('admin_onboarding_video_unpublish', { p_video_id: v.id });
+      if (error) throw error;
+      unpublished = true;
+    }
+    const { data, error } = await supabase.rpc('admin_onboarding_video_delete', { p_video_id: v.id });
+    if (error) {
+      if (!unpublished) throw error;
+      console.error('[getting-started-admin] unpublished, but not deleted', appErrorCode(error) || error.code || 'error');
+      setConfirm(null);
+      afterChange('warn', `“${v.title}” was unpublished — nobody is asked to watch it — but it could not be deleted. `
+        + 'It is in History, where you can delete it.', 'top', true);
+      return;
+    }
+    // Its file: nothing live cites it any more, so the delete policy allows it.
+    sweepOnboardingFile(onboardingUploadTarget(v.id), data?.storage_path, 'the deleted version\'s file');
+    setConfirm(null);
+    afterChange('ok', `“${v.title}” was deleted.`, 'top', unpublished);
+  });
+
+  // ── What the screen shows ───────────────────────────────────────────────────
+  const health = onboardingHealth(loadState === 'ready' ? overview : null);
+  const drafts = versions.filter((v) => v.status === 'draft');
+  const history = versions.filter((v) => v.status === 'retired' || v.status === 'deleted');
+  const hasFile = (v) => !!v?.storage_path && v.media_present !== false;
+  const candidate = drafts.find(hasFile) || null;
+  const count = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0; };
+  const students = (n, one = 'student', many = 'students') => `${n.toLocaleString('en-US')} ${n === 1 ? one : many}`;
+  const by = (name) => (name ? ` by ${name}` : '');
+  const btn = 'inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-semibold transition hover:opacity-90';
+  const offBtn = { ...GS_SECONDARY_BTN, opacity: 0.55, cursor: 'not-allowed' };
+  const dangerBtn = { background: 'var(--status-danger-bg)', color: 'var(--status-danger-fg)', border: '1px solid var(--status-danger-bd)' };
+
+  let dialog = null;
+  if (confirm && overview) {
+    const v = confirm.version;
+    const name = `“${v.title}”`;
+    const waiting = count(overview.counts?.pending_students);
+    const completions = count(v.completions);
+    if (confirm.kind === 'publish') {
+      const impact = publishImpact({ live: null, target: v, counts: overview.counts, requiredSince: overview.required_since });
+      dialog = (
+        <GettingStartedConfirm tone="ok" icon={Send} title={impact.title} actionLabel="Publish"
+          busy={confirmBusy} err={confirmErr} onConfirm={confirmPublish} onClose={closeConfirm}
+          warning={confirm.raced ? 'The video this was going to replace is no longer live, so publishing now replaces nothing.' : ''}>
+          <p>{impact.body}</p>
+        </GettingStartedConfirm>
+      );
+    } else if (confirm.kind === 'replace') {
+      // The version this dialog names is the one confirmReplace sends: confirm.live, frozen when it
+      // opened — never a newer overview's, which would say one thing and retire another (DBSEC-1).
+      const impact = publishImpact({ live: confirm.live, target: v, counts: overview.counts, requiredSince: overview.required_since });
+      dialog = (
+        <GettingStartedConfirm tone="primary" icon={RefreshCw} title={impact.title} actionLabel="Replace the live video"
+          busy={confirmBusy} err={confirmErr} onConfirm={confirmReplace} onClose={closeConfirm}
+          warning={confirm.raced ? 'Another version went live after this page was loaded, so publishing now replaces it.' : ''}>
+          <p>{impact.body}</p>
+        </GettingStartedConfirm>
+      );
+    } else if (confirm.kind === 'unpublish') {
+      dialog = (
+        <GettingStartedConfirm tone="danger" icon={EyeOff} title={`Unpublish ${name}?`} actionLabel="Unpublish"
+          busy={confirmBusy} err={confirmErr} onConfirm={confirmUnpublish} onClose={closeConfirm}>
+          <p>{onboardingUnpublishLine(waiting, v.media_present === false)}</p>
+          <p style={{ color: C.textSoft }}>It moves to History, where you can publish it again.</p>
+        </GettingStartedConfirm>
+      );
+    } else if (confirm.kind === 'delete') {
+      let what;
+      if (v.status === 'published' && v.media_present === false) {
+        // Its file is already gone: nobody is asked to watch it NOW, and unpublishing changes nothing (T9UI-1).
+        what = `${name} is live, but its file is missing, so nobody is asked to watch it now. It is unpublished and then deleted — until you publish another video, newly approved students go straight to their dashboard.`;
+      } else if (v.status === 'published') {
+        what = `${name} is live. It is unpublished first — until you publish another video, nobody is asked to watch one and members can’t replay it — and then deleted with its file.`;
+      } else if (v.status === 'draft') {
+        what = `${name}${v.storage_path ? ' and its uploaded file are' : ' is'} deleted. It was never live, so no student has seen it.`;
+      } else {
+        what = `${name} and its file are deleted. It isn’t live, so nobody is asked to watch it.`;
+      }
+      dialog = (
+        <GettingStartedConfirm tone="danger" icon={Trash2} title={`Delete ${name}?`} actionLabel="Delete"
+          busy={confirmBusy} err={confirmErr} onConfirm={confirmDelete} onClose={closeConfirm}>
+          <p>{what}</p>
+          {completions > 0 ? <p>{`The ${students(completions)} who finished it keep their completion.`}</p> : null}
+          <p style={{ color: C.textSoft }}>This can’t be undone.</p>
+        </GettingStartedConfirm>
+      );
+    }
+  }
+
+  const head = (
+    <SectionHead eyebrow="Admin" title="Getting Started Video"
+      desc="The welcome video newly approved students watch once before their first dashboard. Upload it as a draft, check it with Preview, then publish it." gold />
+  );
+  if (!allowed || loadState === 'forbidden') {
+    return (
+      <div className="gs-admin">
+        {head}
+        <div className="glass-card p-8 text-center" style={{ maxWidth: 520, margin: '24px auto 0' }}>
+          <Shield size={28} className="mx-auto" style={{ color: C.textMute }} aria-hidden="true" />
+          <div className="mt-3" style={{ fontWeight: 700, fontSize: 15, color: C.text }}>Super Admins only</div>
+          <div className="mt-1.5" style={{ fontSize: 13, color: C.textSoft }}>
+            Your account can’t manage the Getting Started video. If you need to, ask a Super Admin.
+          </div>
+        </div>
+      </div>
+    );
+  }
+  if (loadState === 'setup') {
+    return (
+      <div className="gs-admin">
+        {head}
+        <div className="glass-card p-8 text-center" style={{ maxWidth: 560, margin: '24px auto 0' }}>
+          <AlertCircle size={26} className="mx-auto" style={{ color: C.amber }} aria-hidden="true" />
+          <div className="mt-3" style={{ fontWeight: 700, fontSize: 15, color: C.text }}>Finish database setup</div>
+          <div className="mt-1.5" style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
+            The Getting Started video needs its database migration: run db/2026-09-30-getting-started-video.sql in
+            the Supabase SQL Editor, then refresh. Until then, nobody is asked to watch a video.
+          </div>
+        </div>
+      </div>
+    );
+  }
+  if (loadState === 'loading') {
+    return <div className="gs-admin">{head}<AdminListSkeleton rows={3} /></div>;
+  }
+
+  const pending = count(overview?.counts?.pending_students);
+  const completed = count(overview?.counts?.completed_students);
+  const members = count(overview?.counts?.active_members);
+  const sinceDay = overview?.required_since ? fmtManilaDate(overview.required_since) : '';
+  // Only an explicit false: a missing fact is not evidence of a missing file (onboardingHealth's rule).
+  const liveFileMissing = !!live && live.media_present === false;
+  const nowLine = onboardingAudienceLine({ hasLive: !!live, fileMissing: liveFileMissing, sinceDay, pending, completed, members });
+  const impact = overview && (candidate || !live)
+    ? publishImpact({ live, target: candidate, counts: overview.counts, requiredSince: overview.required_since })
+    : null;
+  const fact = (label, value) => (
+    <div key={label} className="min-w-0">
+      <dt style={{ fontSize: 11, fontWeight: 600, color: C.textMute, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</dt>
+      <dd className="mt-0.5" style={{ fontSize: 13.5, color: C.text, overflowWrap: 'anywhere' }}>{value}</dd>
+    </div>
+  );
+  const field = (key, label, max, rows) => {
+    const value = draft?.[key] || '';
+    // What is SAVED is the trimmed text, so that is what the counter shows — and what the limit
+    // is held to. A raw length would read "601 / 600" in the calm colour for a draft that saves.
+    // In characters, as the database counts them (gsTextLength, T9V-L3).
+    const count = gsTextLength(value.trim());
+    const over = count > max;
+    const id = `${fieldId}-${key}`;
+    const onChange = (e) => {
+      const next = e.target.value;
+      setDraft((d) => (d ? { ...d, [key]: next } : d));
+    };
+    const common = {
+      id, value, onChange,
+      'aria-describedby': `${id}-count`,
+      'aria-invalid': over ? 'true' : undefined,
+      'aria-required': key === 'title' ? 'true' : undefined,
+      className: 'gh-input w-full mt-1',
+      style: { fontSize: 14, ...(over ? { borderColor: 'var(--status-danger-bd)' } : {}) },
+    };
+    return (
+      <div>
+        <div className="flex items-baseline justify-between gap-3">
+          <label htmlFor={id} className="text-xs font-semibold" style={{ color: C.textSoft }}>
+            {label}{key === 'title' ? '' : ' (optional)'}
+          </label>
+          <span id={`${id}-count`} className="text-[11px] tabular-nums" style={{ color: over ? 'var(--status-danger-fg)' : C.textMute }}>
+            {count.toLocaleString('en-US')} / {max.toLocaleString('en-US')}
+          </span>
+          <GsLimitAnnouncer over={over} label={label} max={max} />
+        </div>
+        {rows ? <textarea rows={rows} {...common} /> : <input {...common} />}
+      </div>
+    );
+  };
+  // Only an unfinished upload reads "Video not ready". A refused pick (UNSUPPORTED_FILE) does not:
+  // the draft's saved video is fine, and a press of Save says what to do (the lesson drawer's rule).
+  const saveBlocked = blocksLessonSave(uploadState);
+  const editorFooter = (
+    <div className="gs-dialog space-y-2">
+      {editorErr ? (
+        <div role="alert" className="rounded-xl px-3 py-2 text-xs flex items-start gap-2"
+          style={{ background: 'var(--status-danger-bg)', border: '1px solid var(--status-danger-bd)', color: 'var(--status-danger-fg)' }}>
+          <AlertCircle size={14} className="mt-0.5 shrink-0" aria-hidden="true" />
+          <span>{editorErr}</span>
+        </div>
+      ) : null}
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        <button type="button" onClick={closeEditor} aria-disabled={savingDraft ? 'true' : undefined} className={btn} style={GS_SECONDARY_BTN}>
+          Cancel
+        </button>
+        <button type="button" onClick={saveDraft} aria-disabled={savingDraft || saveBlocked ? 'true' : undefined}
+          aria-busy={savingDraft ? 'true' : undefined}
+          className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-bold transition hover:opacity-90"
+          style={saveBlocked && !savingDraft ? { ...GS_PRIMARY_BTN, opacity: 0.6 } : GS_PRIMARY_BTN}>
+          {savingDraft ? <Loader2 size={15} className="animate-spin" aria-hidden="true" /> : <Save size={15} aria-hidden="true" />}
+          {savingDraft ? 'Saving…' : saveBlocked ? 'Video not ready' : editor && editor.status !== 'draft' ? 'Save details' : 'Save draft'}
+        </button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="gs-admin">
+      {head}
+      <AdminNotice kind={onboardingNoticeKind(health.level)}>
+        <div style={{ fontWeight: 700 }}>{health.title}</div>
+        <div className="mt-0.5" style={{ color: C.textSoft }}>{health.body}</div>
+        {health.code === 'unknown' ? (
+          <button type="button" onClick={retryLoad}
+            className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition hover:opacity-90" style={GS_SECONDARY_BTN}>
+            <RefreshCw size={13} aria-hidden="true" /> Try again
+          </button>
+        ) : null}
+      </AdminNotice>
+      {/* Dismiss goes with its notice: focus goes to "New video", never to <body> (T9UI-2). */}
+      {notice ? <AdminNotice kind={notice.kind} onDismiss={() => { setNotice(null); refocusIfLost(newVideoRef); }}>{notice.text}</AdminNotice> : null}
+
+      <div className="mt-5 flex flex-wrap items-center gap-2">
+        <button ref={newVideoRef} type="button" onClick={() => startNewVideo(null)}
+          className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-bold transition hover:opacity-90" style={GS_PRIMARY_BTN}>
+          <Plus size={15} aria-hidden="true" /> New video
+        </button>
+        <div className="flex-1" />
+        <button type="button" onClick={refresh} aria-busy={refreshing ? 'true' : undefined}
+          className="px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition"
+          style={{ background: C.white, color: C.textSoft, border: `1px solid ${C.border}` }}>
+          {refreshing ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <RefreshCw size={14} aria-hidden="true" />} Refresh
+        </button>
+      </div>
+
+      {overview ? (
+        <>
+          <div className="gs-admin__top mt-4">
+            {live ? (
+              <section ref={liveRef} tabIndex={-1} aria-labelledby={liveTitleId} className="gs-surface glass-card p-5 gs-admin__row">
+                <div className="min-w-0">
+                  {/* Never the green "Live now" over a video nobody can play (T9UI-1). */}
+                  {liveFileMissing
+                    ? <div className="gh-label" style={{ color: 'var(--status-danger-fg)' }}>Live — file missing</div>
+                    : <div className="gh-label" style={{ color: 'var(--status-ok-fg)' }}>Live now</div>}
+                  <h2 id={liveTitleId} className="mt-1" style={{ fontFamily: fontDisplay, fontWeight: 600, fontSize: 18, color: C.text, overflowWrap: 'anywhere' }}>
+                    {live.title}
+                  </h2>
+                  {live.description ? (
+                    <p className="mt-1.5" style={{ fontSize: 13.5, lineHeight: 1.6, color: C.textSoft, overflowWrap: 'anywhere' }}>{live.description}</p>
+                  ) : null}
+                  <dl className="gs-admin__facts mt-4">
+                    {fact('Length', formatVideoDuration(live.duration_seconds) || 'Not verified')}
+                    {fact('File size', Number(live.byte_size) > 0 ? formatBytes(Number(live.byte_size)) : '—')}
+                    {fact('Live since', `${fmtManilaDate(live.last_published_at || live.published_at)}${by(live.published_by_name)}`)}
+                    {fact('Finished it', students(count(live.completions)))}
+                    {fact('Playback problems, 7 days', count(live.problems_7d).toLocaleString('en-US'))}
+                  </dl>
+                  {!hasFile(live) ? (
+                    <p id={liveHintId} className="mt-3" style={{ fontSize: 12, color: C.textMute }}>
+                      {liveFileMissing
+                        ? 'The live video’s file is missing from storage, so it can’t be previewed.'
+                        : 'The live video has no file, so it can’t be previewed.'}
+                    </p>
+                  ) : null}
+                </div>
+                <div className="gs-admin__actions">
+                  <button type="button" onClick={() => { if (hasFile(live)) setPreviewFor(live); }}
+                    aria-disabled={hasFile(live) ? undefined : 'true'} aria-describedby={hasFile(live) ? undefined : liveHintId}
+                    className={btn} style={hasFile(live) ? GS_SECONDARY_BTN : offBtn}>
+                    <Eye size={14} aria-hidden="true" /> Preview
+                  </button>
+                  {/* Its words, without a new version (AUI-5): a typo in what every newly approved student
+                      reads should not cost a re-upload and a Replace. */}
+                  <button type="button" onClick={() => openEditor(live)} className={btn} style={GS_SECONDARY_BTN}>
+                    <Pencil size={14} aria-hidden="true" /> Edit details
+                  </button>
+                  <button type="button" onClick={() => startNewVideo(live)} className={btn} style={GS_SECONDARY_BTN}>
+                    <Upload size={14} aria-hidden="true" /> Replace
+                  </button>
+                  <button type="button" onClick={() => openConfirm('unpublish', live)} className={btn} style={GS_SECONDARY_BTN}>
+                    <EyeOff size={14} aria-hidden="true" /> Unpublish
+                  </button>
+                  <button type="button" onClick={() => openConfirm('delete', live)} className={btn} style={dangerBtn}>
+                    <Trash2 size={14} aria-hidden="true" /> Delete
+                  </button>
+                </div>
+              </section>
+            ) : (
+              <section aria-labelledby={liveTitleId} className="glass-card p-5">
+                <div className="gh-label" style={{ color: C.textMute }}>Live now</div>
+                <h2 id={liveTitleId} className="mt-1" style={{ fontWeight: 700, fontSize: 15, color: C.text }}>Nothing is live</h2>
+                <p className="mt-1.5" style={{ fontSize: 13.5, lineHeight: 1.6, color: C.textSoft, overflowWrap: 'anywhere' }}>
+                  {candidate
+                    ? `Newly approved students go straight to their dashboard. “${candidate.title}” is ready to publish from Drafts.`
+                    : 'Newly approved students go straight to their dashboard. Start with New video: upload the file, check it with Preview, then publish it.'}
+                </p>
+              </section>
+            )}
+            <section aria-labelledby={whoId} className="glass-card p-5">
+              <h2 id={whoId} className="gh-label" style={{ color: C.primary }}>Who sees this</h2>
+              <p className="mt-2" style={{ fontSize: 13.5, lineHeight: 1.6, color: C.text, overflowWrap: 'anywhere' }}>{nowLine}</p>
+              {impact ? (
+                <div className="mt-3 rounded-xl px-3.5 py-3" style={{ background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+                  <div style={{ fontSize: 12.5, fontWeight: 700, color: C.text, overflowWrap: 'anywhere' }}>
+                    {candidate ? `If you publish “${candidate.title}” now` : 'When you publish a video'}
+                  </div>
+                  <p className="mt-1" style={{ fontSize: 13, lineHeight: 1.6, color: C.textSoft, overflowWrap: 'anywhere' }}>{impact.body}</p>
+                </div>
+              ) : null}
+            </section>
+          </div>
+
+          <section className="mt-6" aria-labelledby={draftsId}>
+            <h2 id={draftsId} style={{ fontFamily: fontDisplay, fontWeight: 600, fontSize: 16, color: C.text }}>Drafts</h2>
+            {drafts.length === 0 ? (
+              <p className="mt-2" style={{ fontSize: 13, color: C.textSoft }}>No drafts. New video starts one.</p>
+            ) : (
+              <ul className="mt-3 space-y-2.5">
+                {drafts.map((v) => {
+                  const playable = hasFile(v);
+                  const hint = `${draftHintId}-${v.id}`;
+                  const length = formatVideoDuration(v.duration_seconds);
+                  let upload = 'No video yet';
+                  if (v.storage_path && v.media_present === false) upload = 'File missing from storage';
+                  else if (v.storage_path) upload = `Video uploaded${Number(v.byte_size) > 0 ? ` · ${formatBytes(Number(v.byte_size))}` : ''}`;
+                  return (
+                    <li key={v.id} className="gs-surface glass-card p-4 gs-admin__row">
+                      <div className="min-w-0">
+                        <div style={{ fontWeight: 700, fontSize: 14, color: C.text, overflowWrap: 'anywhere' }}>{v.title}</div>
+                        <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1" style={{ fontSize: 12.5, color: C.textSoft }}>
+                          <span>{upload}</span>
+                          {v.storage_path ? <span>{length ? `Length ${length}` : 'Length not verified'}</span> : null}
+                          <span>{`Created ${fmtManilaDate(v.created_at)}${by(v.created_by_name)}`}</span>
+                        </div>
+                        {!playable ? (
+                          <p id={hint} className="mt-1.5" style={{ fontSize: 12, color: C.textMute }}>Upload a video to preview or publish this draft.</p>
+                        ) : null}
+                      </div>
+                      <div className="gs-admin__actions">
+                        <button type="button" onClick={() => openEditor(v)} className={btn} style={GS_SECONDARY_BTN}>
+                          <Pencil size={14} aria-hidden="true" /> Edit
+                        </button>
+                        <button type="button" onClick={() => { if (playable) setPreviewFor(v); }}
+                          aria-disabled={playable ? undefined : 'true'} aria-describedby={playable ? undefined : hint}
+                          className={btn} style={playable ? GS_SECONDARY_BTN : offBtn}>
+                          <Eye size={14} aria-hidden="true" /> Preview
+                        </button>
+                        <button type="button" onClick={() => { if (playable) requestPublish(v); }}
+                          aria-disabled={playable ? undefined : 'true'} aria-describedby={playable ? undefined : hint}
+                          className={btn} style={playable ? GS_SECONDARY_BTN : offBtn}>
+                          <Send size={14} aria-hidden="true" /> Publish
+                        </button>
+                        <button type="button" onClick={() => openConfirm('delete', v)} className={btn} style={dangerBtn}>
+                          <Trash2 size={14} aria-hidden="true" /> Delete
+                        </button>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </section>
+
+          {history.length > 0 ? (
+            <details className="mt-6 glass-card p-4">
+              <summary className="cursor-pointer text-sm font-semibold" style={{ color: C.text }}>History ({history.length})</summary>
+              <ul className="mt-3 space-y-2.5">
+                {history.map((v) => (
+                  <li key={v.id} className="gs-admin__row py-2.5" style={{ borderTop: `1px solid ${GLASS.borderSoft}` }}>
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span style={{ fontWeight: 600, fontSize: 13.5, color: C.text, overflowWrap: 'anywhere' }}>{v.title}</span>
+                        <span className="px-2 py-0.5 rounded-full text-[11px] font-bold"
+                          style={{ background: 'var(--status-neutral-bg)', border: '1px solid var(--status-neutral-bd)', color: 'var(--status-neutral-fg)' }}>
+                          {v.status === 'retired' ? 'Retired' : 'Deleted'}
+                        </span>
+                      </div>
+                      <div className="mt-1" style={{ fontSize: 12.5, color: C.textSoft }}>
+                        {v.status === 'retired'
+                          ? `Retired ${fmtManilaDate(v.retired_at)}${by(v.retired_by_name)}`
+                          : `Deleted ${fmtManilaDate(v.deleted_at)}${by(v.deleted_by_name)}`}
+                        {` · ${students(count(v.completions))} finished it`}
+                      </div>
+                      {/* Why "Publish again" is not offered, rather than its silent absence (AUI-7). */}
+                      {v.status === 'retired' && v.storage_path && v.media_present === false ? (
+                        <p className="mt-1" style={{ fontSize: 12, color: C.textSoft }}>
+                          File missing from storage, so it can’t be published again. To use this video, upload it as a new video.
+                        </p>
+                      ) : null}
+                    </div>
+                    {v.status === 'retired' ? (
+                      <div className="gs-admin__actions">
+                        {hasFile(v) ? (
+                          <button type="button" onClick={() => requestPublish(v)} className={btn} style={GS_SECONDARY_BTN}>
+                            <RotateCcw size={14} aria-hidden="true" /> Publish again
+                          </button>
+                        ) : null}
+                        <button type="button" onClick={() => openEditor(v)} className={btn} style={GS_SECONDARY_BTN}>
+                          <Pencil size={14} aria-hidden="true" /> Edit details
+                        </button>
+                        <button type="button" onClick={() => openConfirm('delete', v)} className={btn} style={dangerBtn}>
+                          <Trash2 size={14} aria-hidden="true" /> Delete
+                        </button>
+                      </div>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          ) : null}
+        </>
+      ) : null}
+
+      {creating ? (
+        <GettingStartedTitlePrompt replacing={creating.replacing} busy={creating.busy} err={creating.err}
+          onCreate={createDraft} onClose={() => { if (!createLockRef.current) setCreating(null); }} />
+      ) : null}
+
+      {editor && draft ? (
+        <SidePanel title={editor.saved.title ? `Edit “${editor.saved.title}”` : 'Edit draft'}
+          subtitle={GS_EDITOR_SUBTITLE[editor.status] || GS_EDITOR_SUBTITLE.draft} icon={Pencil}
+          maxW="sm:max-w-xl lg:max-w-2xl" closeLabel={editor.status === 'draft' ? 'Close the draft editor' : 'Close the editor'}
+          bodyClass="gs-dialog px-6 py-5"
+          canClose={!savingDraft} onClose={closeEditor} footer={editorFooter}>
+          <SettingsSectionLabel first>Details</SettingsSectionLabel>
+          <div className="space-y-4">
+            {field('title', 'Title', 120, 0)}
+            {field('description', 'Description', 600, 3)}
+            {field('transcript', 'Transcript', 20000, 8)}
+          </div>
+          <SettingsSectionLabel>Video</SettingsSectionLabel>
+          {editor.status === 'draft' ? (
+            <div className="space-y-3">
+              <LessonVideoUploader key={editor.id} value={uploaderValue} savedPath={editor.saved.storage_path}
+                onChange={applyUploadPatch} onStateChange={setUploadState} onPendingPath={notePendingPath}
+                disabled={savingDraft} target={uploadTarget} onMediaFacts={noteMediaFacts} />
+              {/* Plain text, never a second live region: the uploader has just said it once (T9UI-10). */}
+              {savedFileGone ? (
+                <p style={{ fontSize: 12.5, lineHeight: 1.55, color: 'var(--status-danger-fg)' }}>
+                  This draft’s saved video file is missing from storage, so it can’t be previewed or published. Upload the video again.
+                </p>
+              ) : !draft.storage_path && editor.saved.storage_path ? (
+                <p style={{ fontSize: 12.5, lineHeight: 1.55, color: C.textSoft }}>
+                  This draft keeps its saved video until you upload a replacement.
+                </p>
+              ) : null}
+              {/* ★ UNMOUNTED while a Preview is open, never merely hidden: a hidden <video> is still a
+                  mounted player holding a second signed URL, and display:none does not pause it. */}
+              {!previewFor && drawerLesson ? (
+                <div className="rounded-xl overflow-hidden max-w-md">
+                  <SignedLessonVideo signUrl={signOnboardingVideo} lesson={drawerLesson} isAdmin />
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            // A version's file is fixed once it has been live: attach_media takes a draft's only, and a
+            // completion belongs to the version a student watched (AUI-5).
+            <p style={{ fontSize: 12.5, lineHeight: 1.55, color: C.textSoft }}>
+              {editor.status === 'published'
+                ? 'A version’s file can’t change once it has been live. To show students a different video, use Replace.'
+                : 'A version’s file can’t change once it has been live. To use a different video, start a New video.'}
+            </p>
+          )}
+        </SidePanel>
+      ) : null}
+
+      {dialog}
+
+      {previewFor ? (
+        <AccountModal title={`Preview: ${previewFor.title}`} subtitle="What a newly approved student sees. Nothing is recorded."
+          icon={Eye} maxW="max-w-3xl" bodyClass="gs-dialog p-0" onClose={() => setPreviewFor(null)}>
+          <GettingStartedPreview version={previewFor} />
+        </AccountModal>
+      ) : null}
+    </div>
+  );
 }
 
 // Shared receipt-upload + enrollment_requests insert + best-effort admin alert. Used by
@@ -6225,9 +9100,11 @@ function AccountModal({ title, subtitle, icon: Icon, onClose, children, maxW = '
               <Icon size={18} style={{ color: tile.color }} />
             </div>
           )}
+          {/* overflowWrap: a title with no spaces (a version name, an address) wraps rather than being
+              clipped by the panel (#69, T9UI-3). Ordinary words wrap exactly as before. */}
           <div className="flex-1 min-w-0">
-            <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 16, color: C.text }}>{title}</div>
-            {subtitle && <div className="mt-0.5" style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.45 }}>{subtitle}</div>}
+            <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 16, color: C.text, overflowWrap: 'anywhere' }}>{title}</div>
+            {subtitle && <div className="mt-0.5" style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.45, overflowWrap: 'anywhere' }}>{subtitle}</div>}
           </div>
           {headerAction}
           <button onClick={close} aria-label="Close" disabled={!canClose}
@@ -6302,9 +9179,10 @@ function SidePanel({ title, subtitle, icon: Icon, onClose, children, tone = 'pri
               <Icon size={18} style={{ color: tile.color }} />
             </div>
           )}
+          {/* overflowWrap: as AccountModal's (#69, T9UI-3). */}
           <div className="flex-1 min-w-0">
-            <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 16, color: C.text }}>{title}</div>
-            {subtitle && <div className="mt-0.5" style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.45 }}>{subtitle}</div>}
+            <div style={{ fontFamily: fontDisplay, fontWeight: 700, fontSize: 16, color: C.text, overflowWrap: 'anywhere' }}>{title}</div>
+            {subtitle && <div className="mt-0.5" style={{ fontSize: 12.5, color: C.textSoft, lineHeight: 1.45, overflowWrap: 'anywhere' }}>{subtitle}</div>}
           </div>
           {/* disabled also drops it from the focus-trap selector (button:not([disabled])), so a
               drawer that cannot be closed does not offer a dead tab stop. */}
@@ -8275,11 +11153,13 @@ function VoiceAssistant({ user, profile, sub, latestReq, entitlement, showBillin
 // unmounting would kill in-flight AI work).
 // Adding a tool = a new case here + sidebar config + TAB_ROUTES (CLAUDE.md).
 // ═══════════════════════════════════════════════════════════════════
-function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImportCount, interviewSub }) {
+function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImportCount, onOnboardingHealth, interviewSub }) {
   switch (tabId) {
     case 'dashboard': return <Dashboard goto={goto} />;
+    case 'gettingstarted': return <GettingStartedPage goto={goto} />;
     case 'progress': return <ProgressRankings goto={goto} />;
     case 'community': return <CommunityHub />;
+    case 'gettingstartedadmin': return <GettingStartedVideoAdmin onHealthChange={onOnboardingHealth} />;
     case 'accessrequests': return <AccessRequests onCountChange={onAccessCount} />;
     case 'enrollments': return <AdminEnrollments onCountChange={onEnrollCount} />;
     case 'studentimports': return <StudentImports onCountChange={onImportCount} />;
@@ -8345,13 +11225,13 @@ function renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImport
 //   never build one by concatenation.
 const WIDE_CANVAS_TABS = new Set(['qbomastery', 'resumestrategy', 'interview', 'portfoliogenerator']);
 
-const TabPanel = React.memo(function TabPanel({ tabId, active, goto, onAccessCount, onEnrollCount, onImportCount, interviewSub }) {
+const TabPanel = React.memo(function TabPanel({ tabId, active, goto, onAccessCount, onEnrollCount, onImportCount, onOnboardingHealth, interviewSub }) {
   return (
     <div
       hidden={!active}
       aria-hidden={!active}
       className={`${active ? 'fade-in ' : ''}p-4 sm:p-6 lg:p-10 ${WIDE_CANVAS_TABS.has(tabId) ? 'max-w-[1800px]' : 'max-w-7xl'} mx-auto`}>
-      {renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImportCount, interviewSub })}
+      {renderToolContent(tabId, { goto, onAccessCount, onEnrollCount, onImportCount, onOnboardingHealth, interviewSub })}
     </div>
   );
 });
@@ -8382,6 +11262,45 @@ export default function BookkeeperProToolkit() {
   const enrollConfigured = enroll.configured;
   const enrollPass = enroll.state === 'pass';
   const enrollPlanKey = enroll.sub?.plan_key || null;
+  // #69: does this student watch the Getting Started video before their first dashboard?
+  //   Asked the moment a uid exists — in parallel with the two reads above, never after them —
+  //   and answered DURING RENDER, so the gate below cannot render the app a frame early. The
+  //   same memoized value is the GettingStartedContext the tab and the Dashboard card read.
+  //   ★ Handed the enrollment PHASE, never enrollPass itself: 'pass' only for a SETTLED pass — this
+  //     account's profile AND its reads have landed (T12-D1, K3R-GATE-DIRECT-SWITCH: on a direct account
+  //     switch the profile in hand until the new one lands is the previous account's) — and 'hold' told
+  //     apart from 'unknown' (V-GF1-DOUBLE-BOUND). While the two reads above are in
+  //     flight, enrollGateState() says 'pass' for any paid profile (no term loaded yet is the
+  //     grandfather rule), and a LAPSED member spent the hook's one re-ask on it — so a renewal
+  //     approved later in the same session skipped the video. And a pass alone could not tell "still
+  //     loading" from "held": a first answer that FAILED before the reads landed was re-asked at
+  //     sign-in, and the splash waited a second 7 s. Only this input is settled: enrollPass, and the
+  //     entitlement memo that reads it, are exactly as they were. The latch below reads it too.
+  //   ★ Above every early return, like every hook in this component.
+  const gsEnrollPhase = gettingStartedEnrollPhase({ profileReady, ready: enroll.ready, pass: enrollPass });
+  const gs = useGettingStarted(user?.id, gsEnrollPhase);
+  // "Continue to dashboard for now" (offered only when the video would not play) holds for
+  // THIS session and THIS account: the uid that deferred, compared on every render, so an
+  // account switch drops it at once, and a reload asks again.
+  const [gsDeferredUid, setGsDeferredUid] = useState(null);
+  const gsDeferred = !!user?.id && gsDeferredUid === user.id;
+  // GF-2: the account whose app shell is RUNNING for a member in this session — set by the effect
+  // after the gate decides, below, only on a settled pass, and ended by any hold screen. While it
+  // stands, Getting Started never takes the session over: a required answer that arrives later (a
+  // replay page's "Try again", a refresh) is shown on the page and the card, and the gate asks again
+  // at the next load, as the deferral does. Before it, one failed enrollment read on a focus refetch
+  // could replace a working app with the gate, unmounting every keep-alive tab and whatever was in
+  // flight in it.
+  const [gsShellUid, setGsShellUid] = useState(null);
+  const gsShellShown = !!user?.id && gsShellUid === user.id;
+  // V-GF4-WELCOME: the account the gate SHOWED the video to in this session. When the gate lets go
+  // because that video was finished — here, or in another tab — the first-login welcome must not
+  // open on top of the dashboard the video leads to (below, beside the latch).
+  const [gsGateUid, setGsGateUid] = useState(null);
+  // …and a sign-out forgets all three. signOut() does not reload the page, so this component stays
+  // mounted, and the same student signing in again would find them still standing — though the
+  // panel promised to ask again.
+  useEffect(() => { if (!user?.id) { setGsDeferredUid(null); setGsShellUid(null); setGsGateUid(null); } }, [user?.id]);
   // #49: the invitation token, captured once at module load and stripped from the
   // URL there. Held in state (never storage) so it survives this component's
   // re-renders and is dropped the moment it is spent or declined.
@@ -8771,7 +11690,9 @@ export default function BookkeeperProToolkit() {
       label: 'Home',
       number: '',
       desc: 'Start here',
+      // #69: Getting Started FIRST — Home is flat, so saved layouts get it on top with no version bump.
       tabs: [
+        { id: 'gettingstarted', label: 'Getting Started', icon: PlayCircle },
         { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
         { id: 'progress', label: 'Progress & Rankings', icon: TrendingUp },
         { id: 'community', label: 'Community', icon: MessagesSquare },
@@ -8935,6 +11856,7 @@ export default function BookkeeperProToolkit() {
   const canReviewAccess = adminTabAllowed('accessrequests');
   const canReviewEnrollments = adminTabAllowed('enrollments');
   const canRunImports = adminTabAllowed('studentimports');
+  const canManageOnboarding = adminTabAllowed('gettingstartedadmin');
   // Not a tab, so it does not go through adminTabAllowed — same legacy rule though.
   const canCustomizeSidebar = staffDegraded ? isAdmin : (staffReady && can('sidebar.customize'));
   // Pending-approval count for the admin sidebar badge (temporary approval workflow). Only
@@ -9003,6 +11925,26 @@ export default function BookkeeperProToolkit() {
     } catch { /* #67 not applied — leave at 0 */ }
   }, [canRunImports]);
   useEffect(() => { refreshImportCount(); /* eslint-disable-next-line */ }, [canRunImports]);
+  // #69: does the Getting Started video need a Super Admin's attention? ONE badge, 0 or 1, on the
+  // first admin row, from the same onboardingHealth() verdict the screen's banner shows: nothing
+  // live, the live file missing, playback problems, a length never verified. 'unknown' — a read
+  // that failed, or a database without #69 — is not a fact about the video, and raises nothing.
+  const [onboardingAttention, setOnboardingAttention] = useState(0);
+  // The newest read: a change followed quickly by another must not leave the FIRST answer on
+  // the badge because it happened to land last.
+  const onboardingHealthSeqRef = useRef(0);
+  // useCallback: passed to the memoized Getting Started Video TabPanel (onOnboardingHealth).
+  const refreshOnboardingHealth = useCallback(async () => {
+    const seq = ++onboardingHealthSeqRef.current;
+    // A viewer who can no longer open the screen loses its badge, and any answer in flight.
+    if (!canManageOnboarding) { setOnboardingAttention(0); return; }
+    try {
+      const { data, error } = await supabase.rpc('admin_onboarding_video_overview');
+      if (seq !== onboardingHealthSeqRef.current) return;
+      setOnboardingAttention(!error && onboardingNeedsAttention(data) ? 1 : 0);
+    } catch { if (seq === onboardingHealthSeqRef.current) setOnboardingAttention(0); }
+  }, [canManageOnboarding]);
+  useEffect(() => { refreshOnboardingHealth(); /* eslint-disable-next-line */ }, [canManageOnboarding]);
   const [labelByKey, setLabelByKey] = useState({});
   const [draftLabels, setDraftLabels] = useState({});
   const [savingLabels, setSavingLabels] = useState(false);
@@ -9019,6 +11961,9 @@ export default function BookkeeperProToolkit() {
   // Adding an admin screen means adding a row HERE plus TAB_ROUTES,
   // NON_TOOL_TAB_IDS, TOOL_META and renderToolContent (see CLAUDE.md).
   const adminNavItems = useMemo(() => ([
+    // #69: FIRST — the welcome every newly approved student meets. Super Admin only; its badge is
+    // the Getting Started video's health, 0 or 1 (refreshOnboardingHealth above).
+    { id: 'gettingstartedadmin', label: 'Getting Started Video', Icon: Clapperboard, count: onboardingAttention, tone: C.amber },
     { id: 'accessrequests', label: 'Access Requests', Icon: ShieldCheck, count: pendingCount, tone: C.amber },
     { id: 'enrollments', label: 'Enrollments', Icon: Receipt, count: enrollPendingCount, tone: C.amber },
     // Directly after Enrollments, by owner decision: approving a payment there is what
@@ -9032,7 +11977,7 @@ export default function BookkeeperProToolkit() {
     { id: 'batches', label: 'Batches', Icon: CalendarCheck, count: 0, tone: C.primary },
     { id: 'staffroles', label: 'Team & Roles', Icon: Users, count: 0, tone: C.primary },
   ].filter((item) => adminTabAllowed(item.id))),
-  [pendingCount, enrollPendingCount, importActiveCount, adminTabAllowed]);
+  [onboardingAttention, pendingCount, enrollPendingCount, importActiveCount, adminTabAllowed]);
 
   // Sidebar layout reconciliation lives in the pure src/lib/sidebarLayout.js (#56) so it can
   // be unit-tested; DEFAULT_STAGES is built here (its icons are components) and is passed in.
@@ -9634,6 +12579,9 @@ export default function BookkeeperProToolkit() {
   //   lived inside a 33,000-line component with no rendering test infrastructure.
   //   resolveGateScreen() is a pure function over this state, so
   //   test/gateMatrix.test.mjs asserts the whole table; this switch only renders.
+  // #69: what the gate's last arm reads. gettingStartedGateInput() trusts `required` only on a
+  // 'ready' answer, so a malformed one fails open.
+  const gsGate = gettingStartedGateInput(gs);
   const gate = resolveGateScreen({
     loading, recovery, user, profileReady, profile, profileFailed,
     staffReady, staffDegraded, staffMembership, staff,
@@ -9645,6 +12593,10 @@ export default function BookkeeperProToolkit() {
     importWelcomePending: importWelcome,
     requireApproval: REQUIRE_ADMIN_APPROVAL,
     requireEnrollment: REQUIRE_ENROLLMENT,
+    // #69 — see useGettingStarted() and the last arm of resolveGateScreen().
+    gettingStarted: gsGate,
+    gettingStartedDeferred: gsDeferred,
+    appShellShown: gsShellShown,
   });
 
   // The old chain carried five separate console.debug lines, added deliberately so
@@ -9654,6 +12606,48 @@ export default function BookkeeperProToolkit() {
   if (gate.screen !== GATE_SCREENS.APP) {
     console.debug('[gate]', gate.reason, { uid: user?.id, screen: gate.screen });
   }
+  // #69 (GF-2): the latch gsShellShown reads — set once the app has REALLY rendered for a MEMBER of
+  // this account (an effect, never mid-render), and above the first early return, like every hook here.
+  // ★ ONLY ON A SETTLED PASS (V-GF2-LATCH). The enrollment arm FAILS OPEN into the app when one of its
+  //   reads errors — for a student who is not a member yet, too. Latching THAT render switched Getting
+  //   Started off for the session, so an enrollment approved later in it went straight to the
+  //   dashboard the video comes before: Review Focus 1's flow, which worked before the latch existed.
+  // ★ AND ANY HOLD SCREEN ENDS IT. A hold has unmounted the shell, so no running session is left to
+  //   protect, and the gate's next answer is the next load's. A splash does not end it: it decides
+  //   nothing, and a momentary splash must never turn into a takeover.
+  useEffect(() => {
+    if (!user?.id) return;
+    if (gate.screen === GATE_SCREENS.APP) {
+      if (gsEnrollPhase === 'pass') setGsShellUid(user.id);
+    } else if (gate.screen !== GATE_SCREENS.SPLASH) {
+      setGsShellUid(null);
+    }
+    if (gate.screen === GATE_SCREENS.GETTING_STARTED) setGsGateUid(user.id);
+  }, [gate.screen, user?.id, gsEnrollPhase]);
+  // V-GF4-WELCOME: the gate let go because the video it showed was FINISHED — the re-check on return
+  // found a completion made in another tab, or on another device, so this tab's own finish (onDone,
+  // which closes the welcome) never ran, and the first-login welcome opened over the dashboard. Held
+  // by derivation, so it is never mounted even for a frame (it moves focus when it mounts), and
+  // remembered as dismissed, exactly as onDone does.
+  const gsWelcomeHeld = !!user?.id && gsGateUid === user.id && gs.data?.completed === true;
+  useEffect(() => { if (gsWelcomeHeld && showWelcome) dismissWelcome(); }, [gsWelcomeHeld, showWelcome]);
+  // K3R-FOCUS-HANDOVER: when the Getting Started gate hands over to the app — Go to dashboard, "Continue
+  // to dashboard for now", or a re-check that lets go — the control that had focus unmounts with the gate
+  // and the browser drops focus to <body>: a keyboard user's next Tab started again at the top of the
+  // sidebar, and a screen reader was told nothing about the new screen (WCAG 2.4.3). So focus goes to
+  // <main>, the new screen, without scrolling — through refocusIfLost(), which acts only when focus really
+  // was lost: never on an ordinary load, never over the first-login welcome or a dialog that already took
+  // it. A splash between the two decides nothing, so it neither starts nor breaks the hand-over.
+  // ★ K3RV-MAIN-CLICK-FOCUS: <main> is NOT focusable at rest. transientFocusTarget() makes it focusable for
+  //   this one focus and takes that away again on the first blur or pointer press — a static tabIndex={-1}
+  //   made a click on any plain text focus <main>, and the next Tab jumped to the top of the page.
+  const gsLastScreenRef = useRef(null);
+  useEffect(() => {
+    if (gate.screen === GATE_SCREENS.SPLASH) return;
+    const prev = gsLastScreenRef.current;
+    gsLastScreenRef.current = gate.screen;
+    if (prev === GATE_SCREENS.GETTING_STARTED && gate.screen === GATE_SCREENS.APP) refocusIfLost(transientFocusTarget(mainRef), { preventScroll: true });
+  }, [gate.screen]);
 
   switch (gate.screen) {
     case GATE_SCREENS.SPLASH:
@@ -9668,10 +12662,11 @@ export default function BookkeeperProToolkit() {
     case GATE_SCREENS.IMPORT_ONBOARDING:
       return <AccountSetupScreen onFinished={markImportWelcome} />;
 
-    // #67: the summary, then "Go To Dashboard" — the Dashboard, not the claim path.
+    // #67: the summary, then "Go To Dashboard" — the Dashboard, not the claim path. (#69: the
+    // button says "Continue" when the Getting Started video is what the gate shows next.)
     case GATE_SCREENS.IMPORT_WELCOME:
       return (
-        <ImportWelcomeScreen onSignOut={signOut} onContinue={() => {
+        <ImportWelcomeScreen onSignOut={signOut} continueLabel={gsGate.required ? 'Continue' : undefined} onContinue={() => {
           try { if (window.location.pathname === IMPORT_CLAIM_PATH) window.history.replaceState(null, '', '/'); } catch { /* cosmetic */ }
           setTab('dashboard');
           setImportWelcome(false);
@@ -9758,6 +12753,21 @@ export default function BookkeeperProToolkit() {
     case GATE_SCREENS.APPROVAL_PENDING:
       return <PendingApprovalScreen email={user?.email} uid={user?.id} onSignOut={signOut} onRefresh={refreshProfile} />;
 
+    // #69: the Getting Started video, once, before the first dashboard. Handed the root's
+    // answer as `gs`, because the provider wraps only the app shell below. Finishing also closes
+    // the first-login welcome, so it never stacks on the dashboard this opens — but only for the
+    // account the completion was asked for: one that outlived a sign-out opens nothing for whoever
+    // signed in next (GF-7). The deferral — offered only when the video would not play — records
+    // nothing, asks no server, and lands on the Dashboard its button names: from /welcome or
+    // /getting-started it used to reopen the very player that had just failed (GF-6).
+    case GATE_SCREENS.GETTING_STARTED:
+      return (
+        <GettingStartedScreen gs={gs} name={profile?.full_name || ''} email={user?.email}
+          onDone={(r, forUid) => { if (!gs.markCompleted(r, forUid)) return; dismissWelcome(); setTab('dashboard'); }}
+          onDefer={() => { setGsDeferredUid(user?.id ?? null); setTab('dashboard'); }}
+          onSignOut={signOut} />
+      );
+
     case GATE_SCREENS.APP:
     default:
       break;   // valid membership (or grandfathered) → app shell below
@@ -9767,8 +12777,9 @@ export default function BookkeeperProToolkit() {
   // Global styles/tokens live in src/index.css (moved out of the old in-shell <style>).
   return (
     <EntitlementContext.Provider value={entitlement}>
+    <GettingStartedContext.Provider value={gs}>
     <div style={{ fontFamily: fontBody, color: C.text }} className="h-screen w-full flex overflow-hidden gh-app-bg">
-      {showWelcome && <WelcomeOverlay name={profile?.full_name || user?.email} onClose={dismissWelcome} />}
+      {showWelcome && !gsWelcomeHeld && <WelcomeOverlay name={profile?.full_name || user?.email} onClose={dismissWelcome} />}
 
       {/* Mobile drawer backdrop — click to dismiss (hidden on lg+) */}
       {sidebarOpen && (
@@ -10461,12 +13472,17 @@ export default function BookkeeperProToolkit() {
       </aside>
 
       {/* MAIN */}
+      {/* Where focus goes when the Getting Started gate hands over (K3R-FOCUS-HANDOVER) — and NOT focusable
+          at rest: transientFocusTarget() gives it tabindex="-1" for that one focus alone. A static tabIndex
+          made a click on any plain text focus <main>, and the next Tab jumped to the top of the page
+          (K3RV-MAIN-CLICK-FOCUS). The outline it would draw then is the CONTAINER's, never a control's:
+          every control inside keeps its own :focus-visible ring. */}
       <main
         ref={mainRef}
         onScroll={() => {
           if (mainRef.current) scrollPositionsRef.current[tab] = mainRef.current.scrollTop || 0;
         }}
-        className="flex-1 overflow-y-auto">
+        className="flex-1 overflow-y-auto focus:outline-none">
         {/* Mobile top bar — hamburger opens the drawer (hidden on lg+) */}
         <div
           className="lg:hidden sticky top-0 z-30 flex items-center gap-3 px-4 py-3"
@@ -10506,23 +13522,34 @@ export default function BookkeeperProToolkit() {
             ★ Gated on staffReady: while my_staff_context() is in flight every context is
               legitimately EMPTY, so admitting a tab then would be admitting it to nobody,
               and refusing it would flash RestrictedTab at a real administrator. We hold
-              the panel until the answer lands. */}
-        {Array.from(visitedTabs).map(tabId => (
-          entitlement.allowsTab(tabId) && adminTabAllowed(tabId) ? (
-            <TabPanel
-              key={tabId}
-              tabId={tabId}
-              active={tabId === tab}
-              goto={setTab}
-              onAccessCount={refreshPendingCount}
-              onEnrollCount={refreshEnrollPendingCount}
-              onImportCount={refreshImportCount}
-              interviewSub={tabId === 'interview' ? (interviewSubRoute || undefined) : undefined}
-            />
-          ) : (
-            <RestrictedTab key={tabId} active={tabId === tab} goto={setTab} />
-          )
-        ))}
+              the panel until the answer lands — tabAccessView()'s 'checking' (T12B-D1); before
+              it, a deep-linked admin tab rendered the PLAN upsell until the answer came.
+            ★ AND AN ADMIN TAB'S REFUSAL IS A ROLE ANSWER: no plan includes an admin screen, so
+              RestrictedTab's reason="role" sells nothing (T12B-D1). */}
+        {Array.from(visitedTabs).map((tabId) => {
+          const view = tabAccessView(tabId, {
+            settled: staffReady || staffDegraded,
+            adminAllowed: adminTabAllowed(tabId),
+            planAllows: entitlement.allowsTab(tabId),
+          });
+          if (view === 'panel') {
+            return (
+              <TabPanel
+                key={tabId}
+                tabId={tabId}
+                active={tabId === tab}
+                goto={setTab}
+                onAccessCount={refreshPendingCount}
+                onEnrollCount={refreshEnrollPendingCount}
+                onImportCount={refreshImportCount}
+                onOnboardingHealth={refreshOnboardingHealth}
+                interviewSub={tabId === 'interview' ? (interviewSubRoute || undefined) : undefined}
+              />
+            );
+          }
+          if (view === 'checking') return <TabAccessCheck key={tabId} active={tabId === tab} />;
+          return <RestrictedTab key={tabId} active={tabId === tab} goto={setTab} reason={view} />;
+        })}
       </main>
 
       {/* Account menu surfaces — read the already-loaded gate state (no refetch). Extend/
@@ -10586,6 +13613,7 @@ export default function BookkeeperProToolkit() {
           entitlement={entitlement} showBillingControls={showBillingControls} />
       )}
     </div>
+    </GettingStartedContext.Provider>
     </EntitlementContext.Provider>
   );
 }
@@ -10635,18 +13663,23 @@ function adminBadgePhrase(id, n) {
   if (id === 'enrollments') return `${n} enrollment ${n === 1 ? 'request' : 'requests'} awaiting review`;
   if (id === 'accessrequests') return `${n} access ${n === 1 ? 'request' : 'requests'} awaiting review`;
   if (id === 'studentimports') return `${n} migration ${n === 1 ? 'job' : 'jobs'} with work waiting`;
+  // #69: 0 or 1 — a state, not a queue — so the phrase names the state, not a count.
+  if (id === 'gettingstartedadmin') return 'the Getting Started video needs attention';
   return `${n} waiting`;
 }
 
 // Success / error banner with a dismiss control (status-token colors end to end).
 // 'warn' (#38) is for something an admin should act on but that has broken
 // nothing yet — e.g. no batch is open for next month. Red overstates those and
-// makes real failures easier to ignore. Any kind that is not 'ok' or 'warn'
+// makes real failures easier to ignore. Any kind that is not 'ok', 'warn' or 'info'
 // stays danger, so every existing call site is unchanged.
+// 'info' (#69) is for a neutral fact that breaks nothing — "no Getting Started video is live" —
+// and, like 'ok' and 'warn', is announced politely (role=status), never as an alert.
 const ADMIN_NOTICE_KINDS = {
   ok: { fg: 'var(--status-ok-fg)', bg: 'var(--status-ok-bg)', bd: 'var(--status-ok-bd)', Icon: CheckCircle2 },
   warn: { fg: 'var(--status-warn-fg)', bg: 'var(--status-warn-bg)', bd: 'var(--status-warn-bd)', Icon: AlertCircle },
   danger: { fg: 'var(--status-danger-fg)', bg: 'var(--status-danger-bg)', bd: 'var(--status-danger-bd)', Icon: AlertTriangle },
+  info: { fg: 'var(--status-info-fg)', bg: 'var(--status-info-bg)', bd: 'var(--status-info-bd)', Icon: Info },
 };
 
 function AdminNotice({ kind = 'ok', children, onDismiss }) {
@@ -10661,7 +13694,9 @@ function AdminNotice({ kind = 'ok', children, onDismiss }) {
     <div role={urgent ? 'alert' : 'status'} className="mt-4 flex items-start gap-3 p-4 rounded-xl border"
       style={{ background: bg, borderColor: bd }}>
       <Icon size={18} className="mt-0.5 flex-shrink-0" style={{ color: fg }} />
-      <div className="text-sm flex-1" style={{ color: C.text }}>{children}</div>
+      {/* min-w-0 + overflowWrap: a notice naming something with no spaces (a version title, an
+          address) wraps inside the banner instead of widening it past its container (#69, T9UI-3). */}
+      <div className="text-sm flex-1 min-w-0" style={{ color: C.text, overflowWrap: 'anywhere' }}>{children}</div>
       {onDismiss && (
         <button onClick={onDismiss} aria-label="Dismiss" className="flex-shrink-0 transition hover:opacity-70" style={{ color: fg }}>
           <X size={16} />
@@ -18884,6 +21919,27 @@ function MeetingsTasks() {
   );
 }
 
+// How long a bulk decision run waits before asking again for an email the server answered 429 —
+// "not now" — and so how many times it asks (EMAIL-1). The server's window is a minute; these two
+// waits cover it, and then the row is recorded as the server last answered.
+const BULK_EMAIL_RETRY_DELAYS_MS = Object.freeze([20_000, 40_000]);
+
+/**
+ * Did a decision email's send end WITHOUT a clear answer (T9V-L2, EMAIL-4)? ONE rule for both
+ * screens that announce a decision — Access Requests (api/notify-access.js) and Enrollments
+ * (api/notify-enrollment.js, action 'decision'), whose failures answer alike. A 502 carries the
+ * provider outcome's code: resend_timeout and resend_failed (no answer, or a dropped connection), a
+ * provider 5xx, or none at all when the send itself threw — and each of those may have been
+ * delivered. A 504 is the function running out of time, possibly after sending. Every other answer
+ * is a clear no: a provider 4xx refusal (resend_409 and resend_429 included), or the handler's own
+ * 400/401/403/404/409/422/429/503 before anything was sent.
+ */
+function emailOutcomeUnclear(status, code) {
+  if (status === 504) return true;
+  if (status !== 502) return false;
+  return !code || code === 'resend_timeout' || code === 'resend_failed' || /^resend_5\d\d$/.test(String(code));
+}
+
 function AccessRequests({ onCountChange }) {
   const { user, profile, can, staffReady, staffDegraded } = useAuth();
   // #45: reviewing signups is its own capability, so an Operations Admin can work
@@ -18977,6 +22033,10 @@ function AccessRequests({ onCountChange }) {
   useEffect(() => { if (staffReady && isAdmin) load(); /* eslint-disable-next-line */ }, [staffReady, isAdmin]);
 
   // Best-effort email (never blocks the approval). Returns { ok } / { skipped } / { ok:false }.
+  // ★ The body names the ACCOUNT and the DECISION — { userId, status } — and nothing else (#69).
+  //   api/notify-access.js reads the address, the name and the reason from that profile row with
+  //   the reviewer's own JWT, answers 409 when the recorded status differs, and answers a
+  //   duplicate (the provider's 409 on its stable key) with 200 { ok:false, skipped:'in_flight' }.
   const notifyAccess = async (payload) => {
     try {
       const { data: s } = await supabase.auth.getSession();
@@ -18986,15 +22046,23 @@ function AccessRequests({ onCountChange }) {
         headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
         body: JSON.stringify(payload),
       });
-      if (!res.ok) return { ok: false };
+      if (!res.ok) {
+        // ★ AN UNANSWERED SEND IS NOT A REFUSED ONE (T9V-L2): the body says which it was.
+        const body = await res.json().catch(() => null);
+        return { ok: false, unclear: emailOutcomeUnclear(res.status, body?.code) };
+      }
       return await res.json().catch(() => ({ ok: false }));
     } catch {
-      return { ok: false };
+      // No answer at all: the request may have reached the server, and the server may have sent it.
+      return { ok: false, unclear: true };
     }
   };
 
-  const emailSuffix = (mail) =>
-    mail?.ok ? ' · email sent' : mail?.skipped ? ' · email not configured' : ' · email not sent';
+  const emailSuffix = (mail) => (mail?.ok ? ' · email sent'
+    : mail?.skipped === 'in_flight' ? ' · email already on its way'
+      : mail?.skipped ? ' · email not configured'
+        : mail?.unclear ? ' · email may not have been sent'
+          : ' · email not sent');
 
   const setStatus = async (row, status, reason = null) => {
     setBusyId(row.id); setErr(''); setNotice('');
@@ -19045,7 +22113,7 @@ function AccessRequests({ onCountChange }) {
         ? { ...r, approval_status: updated.approval_status, rejection_reason: status === 'rejected' ? reason : null }
         : r));
       onCountChange?.();
-      const mail = await notifyAccess({ email: row.email, fullName: row.full_name, status, reason });
+      const mail = await notifyAccess({ userId: row.id, status });
       setNotice(`${status === 'approved' ? 'Approved' : 'Rejected'} ${row.email}${emailSuffix(mail)}.`);
     } catch (e) {
       console.error('[access] setStatus failed', { targetId: row.id, status, code: appErrorCode(e) || e?.code });
@@ -19227,6 +22295,30 @@ function AccessRequests({ onCountChange }) {
 // student paywall, and an opt-in sound alert for new submissions.
 // See db/2026-07-04-enrollment.sql + ENROLLMENT_SETUP.md.
 
+// #69: the admin alert email links to ONE request — /admin/enrollments?request=<id>.
+// ★ READ WHEN THE SCREEN MOUNTS, which is early enough: nothing rewrites the query before the app
+//   shell renders this tab — the path is a known route (normalizeUnknownRoute leaves it alone),
+//   setPanelParam keeps every other param, and nothing calls setTab/writeAppRoute before the
+//   shell. The screen then stays mounted (keep-alive), so a later link arrives through the
+//   route-change listener instead. Resolved only once a load has SUCCEEDED, then dropped from the
+//   address with replaceState(history.state), so a refresh or Back does not run it again.
+function readEnrollRequestParam() {
+  try {
+    const v = new URLSearchParams(window.location.search).get('request');
+    return IMPORT_JOB_RE.test(v || '') ? v.toLowerCase() : null;
+  } catch { return null; }
+}
+function dropEnrollRequestParam() {
+  try {
+    const u = new URL(window.location.href);
+    if (!u.searchParams.has('request')) return;
+    u.searchParams.delete('request');
+    window.history.replaceState(window.history.state, '', u.pathname + u.search + u.hash);
+  } catch { /* cosmetic */ }
+}
+/** The Enrollments filter a request's status is listed under. */
+const ENROLL_FILTER_FOR_STATUS = Object.freeze({ pending_review: 'pending', approved: 'approved', rejected: 'rejected', expired: 'expired' });
+
 function AdminEnrollments({ onCountChange }) {
   const { user, profile, can, staffReady, staffDegraded } = useAuth();
   // #45: reviewing payment proofs is `enrollments.review`. Section 15 re-gated the
@@ -19299,6 +22391,13 @@ function AdminEnrollments({ onCountChange }) {
   const soundOnRef = useRef(false);
   const audioCtxRef = useRef(null);
   const [testingEmail, setTestingEmail] = useState(false);   // "Test email" diagnostic busy state
+  // #69: the request the admin alert linked to (?request=<id>), held until a load has succeeded.
+  const [linkedRequest, setLinkedRequest] = useState(() => readEnrollRequestParam());
+  const [focusRequestId, setFocusRequestId] = useState(null);   // the card marked data-enroll-focus
+  const [linkMissing, setLinkMissing] = useState(false);
+  // Loads that have SUCCEEDED since the last failure. A link is resolved only against rows a load
+  // actually returned, so "not found" is never said about a list that failed to load.
+  const [rowsOk, setRowsOk] = useState(0);
 
   const load = async (silent = false) => {
     if (!silent) { setLoading(true); }
@@ -19326,10 +22425,12 @@ function AdminEnrollments({ onCountChange }) {
         else setErr(error.message || 'Could not load enrollment requests.');
         setRows([]);
         setSubsByUser({});
+        setRowsOk(0);
       } else {
         const data = [...(pendRes.data || []), ...(histRes.data || [])]
           .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
         setRows(data);
+        setRowsOk((n) => n + 1);
         loadHolds(data);
         loadEmailStatus(data);
         // Second query (no FK-embed fragility): the linked profiles, for the
@@ -19389,11 +22490,63 @@ function AdminEnrollments({ onCountChange }) {
     } catch (e) {
       setErr(String(e?.message || e));
       setRows([]);
+      setRowsOk(0);
     } finally {
       if (!silent) setLoading(false);
     }
   };
   useEffect(() => { if (isAdmin) load(); /* eslint-disable-next-line */ }, [isAdmin]);
+  // #69: resolve the linked request once a load has succeeded — in the filter its status lives
+  // under, with the search and package filter that could hide it cleared — mark it, bring it into
+  // view and focus it, then drop ?request= from the address.
+  useEffect(() => {
+    if (!linkedRequest || !rowsOk) return;
+    const id = linkedRequest;
+    setLinkedRequest(null);
+    dropEnrollRequestParam();
+    const row = rows.find((r) => r.id === id);
+    if (!row) {
+      setFocusRequestId(null);
+      setLinkMissing(true);
+      return;
+    }
+    setLinkMissing(false);
+    setFilter(ENROLL_FILTER_FOR_STATUS[row.status] || 'pending');
+    setQuery('');
+    setPlanFilter('');
+    setFocusRequestId(id);
+    // Once the new filter has rendered the card: a few frames at most, and never forever.
+    let frames = 0;
+    const step = () => {
+      const card = document.getElementById(`enroll-card-${id}`);
+      if (!card) { if (++frames < 30) requestAnimationFrame(step); return; }
+      const reduce = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      card.scrollIntoView?.({ block: 'center', behavior: reduce ? 'auto' : 'smooth' });
+      card.focus?.({ preventScroll: true });
+    };
+    requestAnimationFrame(step);
+  }, [linkedRequest, rowsOk, rows]);
+  // …and a link that arrives while the screen is already open (Back/Forward, an in-app route).
+  useEffect(() => {
+    const onRoute = () => {
+      const id = readEnrollRequestParam();
+      if (!id) return;
+      setLinkMissing(false);
+      setLinkedRequest(id);
+    };
+    window.addEventListener(APP_ROUTE_CHANGE_EVENT, onRoute);
+    window.addEventListener('popstate', onRoute);
+    return () => {
+      window.removeEventListener(APP_ROUTE_CHANGE_EVENT, onRoute);
+      window.removeEventListener('popstate', onRoute);
+    };
+  }, []);
+  // The not-found notice's Dismiss goes with its notice: focus goes to the list the link was about
+  // — `enroll-list` is the list, or its empty state — never to <body> (T9UI-2).
+  const dismissLinkMissing = () => {
+    setLinkMissing(false);
+    refocusIfLost({ get current() { return document.getElementById('enroll-list'); } });
+  };
 
   // Payment-settings editor state — load current values once.
   useEffect(() => {
@@ -19501,6 +22654,11 @@ function AdminEnrollments({ onCountChange }) {
   }, [isAdmin]);
 
   // Best-effort decision email to the student (never blocks the review action).
+  // ★ AN UNANSWERED SEND IS NOT A REFUSED ONE (EMAIL-4). Every non-2xx used to read "email not
+  //   sent", so a send that timed out — and may well have been delivered — invited the reviewer to
+  //   email the student a second time by hand. The body says which it was, by the rule Access
+  //   Requests reads (emailOutcomeUnclear, T9V-L2); a request that never answered may have been sent
+  //   too. `rateLimited`: the server's "not now" (429), which a bulk run waits out (EMAIL-1).
   const notifyDecision = async (payload) => {
     try {
       const { data: s } = await supabase.auth.getSession();
@@ -19510,14 +22668,34 @@ function AdminEnrollments({ onCountChange }) {
         headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
         body: JSON.stringify({ action: 'decision', ...payload }),
       });
-      if (!res.ok) return { ok: false };
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        return { ok: false, unclear: emailOutcomeUnclear(res.status, body?.code), rateLimited: res.status === 429 };
+      }
       return await res.json().catch(() => ({ ok: false }));
     } catch {
-      return { ok: false };
+      // No answer at all: the request may have reached the server, and the server may have sent it.
+      return { ok: false, unclear: true };
     }
   };
-  const emailSuffix = (mail) =>
-    mail?.ok ? ' · email sent' : mail?.skipped ? ' · email not configured' : ' · email not sent';
+  const emailSuffix = (mail) => (mail?.ok ? ' · email sent'
+    : mail?.skipped === 'in_flight' ? ' · email already on its way'
+      : mail?.skipped ? ' · email not configured'
+        : mail?.unclear ? ' · email may not have been sent'
+          : ' · email not sent');
+  // A bulk run's emails, counted in emailSuffix's own words (EMAIL-1), in one fixed order — the run
+  // goes newest first, and a tally in the order outcomes happened to arrive reads as noise. '' when no
+  // row asked for an email.
+  const emailTally = (results) => {
+    const counts = new Map(['sent', 'already on its way', 'may not have been sent', 'not sent', 'not configured'].map((w) => [w, 0]));
+    for (const x of results || []) {
+      if (!x?.mail) continue;
+      const words = emailSuffix(x.mail).replace(/^ · email /, '');
+      counts.set(words, (counts.get(words) || 0) + 1);
+    }
+    const said = [...counts].filter(([, n]) => n > 0);
+    return said.length ? `Emails: ${said.map(([words, n]) => `${n} ${words}`).join(', ')}.` : '';
+  };
 
   // After a decision the button that was pressed usually disappears — the card leaves the
   // Pending view, or its actions change — and the browser drops focus to <body>, throwing a
@@ -19752,6 +22930,28 @@ function AdminEnrollments({ onCountChange }) {
     } finally { setBusyId(null); }
   };
 
+  // ★ EVERY ROW SAYS WHAT BECAME OF ITS EMAIL (EMAIL-1). notifyDecision's answer was thrown away, so a
+  //   cohort's bulk approval showed fifteen green ticks while the server refused the eleventh email
+  //   onward — under a dialog that promised "the student is emailed". A 429 is the server's "not
+  //   now": it is waited out and asked again, at most BULK_EMAIL_RETRY_DELAYS_MS.length times, and the
+  //   dialog says which request it is waiting on. Any other answer is recorded exactly as it came.
+  // ★ BY THE NAME ON THE REQUEST, NEVER THE ADDRESS TYPED ON IT (K3R-AE-1). The decision email goes to
+  //   the ACCOUNT's address (profiles.email, read by the server), so naming the student-typed
+  //   enrollment_requests.email here could name an address that is never emailed. And the 429 is THIS
+  //   app's own limit on decision emails (the per-decision and per-reviewer guards), not the email
+  //   service's — whose refusal arrives as 502 resend_429 and is recorded, never waited out.
+  const decisionEmail = async (payload, name) => {
+    let mail = await notifyDecision(payload);
+    for (const ms of BULK_EMAIL_RETRY_DELAYS_MS) {
+      if (!mail?.rateLimited) break;
+      setBulk((b) => (b ? { ...b, waiting: { name: String(name || '').trim() } } : b));
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      mail = await notifyDecision(payload);
+    }
+    setBulk((b) => (b && b.waiting ? { ...b, waiting: null } : b));
+    return mail;
+  };
+
   // Bulk actions run ONE AT A TIME through the same server paths as a single click, and
   // report every row: a batch that fails halfway must say which students it reached.
   const runBulk = async () => {
@@ -19766,8 +22966,8 @@ function AdminEnrollments({ onCountChange }) {
             p_request_id: r.id, p_batch_id: bulk.batchId || null,
           });
           if (error) throw error;
-          if (!data?.already) await notifyDecision({ requestId: r.id, status: 'approved' });
-          results.push({ id: r.id, email: r.email, ok: true, note: data?.already ? 'already approved' : 'approved' });
+          const mail = data?.already ? null : await decisionEmail({ requestId: r.id, status: 'approved' }, r.full_name);
+          results.push({ id: r.id, email: r.email, ok: true, note: data?.already ? 'already approved' : 'approved', mail });
         } else if (kind === 'reject') {
           const nowIso = new Date().toISOString();
           const { data, error } = await supabase.from('enrollment_requests')
@@ -19775,8 +22975,8 @@ function AdminEnrollments({ onCountChange }) {
             .eq('id', r.id).eq('status', 'pending_review').select('id');
           if (error) throw error;
           if (!data?.[0]) throw new Error('Not changed — it may already have been decided.');
-          await notifyDecision({ requestId: r.id, status: 'rejected' });
-          results.push({ id: r.id, email: r.email, ok: true, note: 'rejected' });
+          const mail = await decisionEmail({ requestId: r.id, status: 'rejected' }, r.full_name);
+          results.push({ id: r.id, email: r.email, ok: true, note: 'rejected', mail });
         } else if (kind === 'hold') {
           const { error } = await supabase.rpc('admin_set_enrollment_hold', {
             p_request_id: r.id, p_reason: bulk.reason.trim(), p_follow_up_on: bulk.followUp || null,
@@ -20081,6 +23281,9 @@ function AdminEnrollments({ onCountChange }) {
     email_from_not_configured: { label: 'Review alert not sent — no sender',  tone: 'warn'   },
     admin_email_invalid:       { label: 'Review alert not sent — no recipient', tone: 'warn' },
     provider_error:            { label: 'Review alert not sent — provider',   tone: 'danger' },
+    // ★ No clear answer from the provider (EMAIL-4): a timeout, a dropped connection or a 5xx. It may
+    //   have gone out, so it never reads "not sent" — which invites a second alert by hand.
+    provider_unclear:          { label: 'Review alert may not have been sent', tone: 'warn' },
   };
   const NotifyBadge = ({ request }) => {
     const meta = NOTIFY_META[request.notify_status];
@@ -20088,7 +23291,9 @@ function AdminEnrollments({ onCountChange }) {
     const tip = [
       meta.tone === 'ok'
         ? 'The enrollment review alert was sent to the configured administrator.'
-        : 'The enrollment review alert to the configured administrator did not send.',
+        : request.notify_status === 'provider_unclear'
+          ? 'The email provider gave no clear answer, so the enrollment review alert may or may not have reached the configured administrator.'
+          : 'The enrollment review alert to the configured administrator did not send.',
       request.notified_at ? new Date(request.notified_at).toLocaleString() : null,
       request.notify_detail || null,
     ].filter(Boolean).join(' · ');
@@ -20284,6 +23489,11 @@ function AdminEnrollments({ onCountChange }) {
       {/* Notices */}
       {notice && <AdminNotice kind="ok" onDismiss={() => setNotice('')}>{notice}</AdminNotice>}
       {err && <AdminNotice kind="error" onDismiss={() => setErr('')}>{err}</AdminNotice>}
+      {linkMissing && (
+        <AdminNotice kind="warn" onDismiss={dismissLinkMissing}>
+          That request was not found. It may have been removed, or it is older than the requests this list shows.
+        </AdminNotice>
+      )}
 
       {/* Body */}
       {notConfigured ? (
@@ -20340,6 +23550,7 @@ function AdminEnrollments({ onCountChange }) {
               // be a fifth `auto` grid track, and their max-content squeezed the student's
               // identity to 0px on every laptop with the sidebar open (2026-09-24).
               <div key={r.id} id={`enroll-card-${r.id}`} role="group" tabIndex={-1} aria-label={`Enrollment request from ${r.full_name || r.email}`}
+                data-enroll-focus={focusRequestId === r.id ? 'true' : undefined}
                 className="glass-card p-4 enroll-card">
                 <div className="enroll-card__head">
                   <div className="enroll-card__who" data-enroll-region="who">
@@ -20766,8 +23977,8 @@ function AdminEnrollments({ onCountChange }) {
             {!bulk.done && !bulk.running && (
               <>
                 <p style={{ fontSize: 13, color: C.textSoft, lineHeight: 1.55 }}>
-                  {bulk.kind === 'approve' && 'Each request is approved on its own, exactly as the Approve button does, and the student is emailed. A request that cannot be approved — your own, or a VIP request with no batch — is skipped and listed.'}
-                  {bulk.kind === 'reject' && 'Each student is emailed this reason and can resubmit.'}
+                  {bulk.kind === 'approve' && 'Each request is approved on its own, exactly as the Approve button does, and each student is then sent the decision email — the list says what became of every email. A request that cannot be approved — your own, or a VIP request with no batch — is skipped and listed.'}
+                  {bulk.kind === 'reject' && 'Each request is rejected with this reason, and each student is sent it by email and can resubmit — the list says what became of every email.'}
                   {bulk.kind === 'hold' && 'The students are not told. Each request stays pending and stops counting as overdue.'}
                   {bulk.kind === 'clearhold' && 'The holds are removed; the requests stay pending.'}
                 </p>
@@ -20796,15 +24007,19 @@ function AdminEnrollments({ onCountChange }) {
             )}
             {(bulk.running || bulk.done) && (
               <div className="mt-2" style={{ fontSize: 12.5 }}>
-                <div className="mb-2" style={{ color: C.textSoft }}>
-                  {bulk.running ? `Working… ${bulk.results.length} of ${targets.length}` : `${bulk.results.filter((x) => x.ok).length} done, ${bulk.results.filter((x) => !x.ok).length} not done.`}
+                <div className="mb-2" role="status" style={{ color: C.textSoft }}>
+                  {bulk.running
+                    ? (bulk.waiting
+                      ? `Working… ${bulk.results.length} of ${targets.length}. Pausing for this app’s own limit on decision emails — the email for ${bulk.waiting.name ? `${bulk.waiting.name}’s request` : 'the request it just decided'} is asked for again in a moment.`
+                      : `Working… ${bulk.results.length} of ${targets.length}`)
+                    : `${bulk.results.filter((x) => x.ok).length} done, ${bulk.results.filter((x) => !x.ok).length} not done.${emailTally(bulk.results) ? ` ${emailTally(bulk.results)}` : ''}`}
                 </div>
                 <ul className="space-y-1" style={{ maxHeight: 260, overflowY: 'auto' }}>
                   {bulk.results.map((x) => (
                     <li key={x.id} className="flex gap-2">
                       <span style={{ color: x.ok ? C.green : C.red, fontWeight: 700 }}>{x.ok ? '✓' : '✕'}</span>
                       <span className="truncate" style={{ color: C.text }}>{x.email}</span>
-                      <span style={{ color: C.textMute }}>{x.note}</span>
+                      <span style={{ color: C.textMute }}>{x.note}{x.mail ? emailSuffix(x.mail) : ''}</span>
                     </li>
                   ))}
                 </ul>
@@ -23454,8 +26669,9 @@ function StudentImports({ onCountChange }) {
 // current plan + access scope, quick links to what they CAN open, and an Upgrade/Renew
 // CTA that routes to the Dashboard (where MembershipPanel hosts the renew/upgrade flow).
 // Reads the shared entitlement from context. Themed via tokens; light + dark safe.
-function RestrictedTab({ active, goto }) {
+function RestrictedTab({ active, goto, reason = 'plan' }) {
   const ent = useContext(EntitlementContext);
+  const { staff } = useAuth();
   const QUICK = [
     { id: 'qbomastery', label: 'QuickBooks Online Mastery', icon: GraduationCap },
     { id: 'course', label: 'Accounting 101', icon: BookOpen },
@@ -23463,6 +26679,38 @@ function RestrictedTab({ active, goto }) {
     { id: 'ustax', label: 'US Tax 101', icon: Landmark },
     { id: 'chat', label: 'ProAdvisor Chat', icon: MessageCircle },
   ].filter(t => ent.allowsTab(t.id));
+
+  // ★ A ROLE REFUSAL SELLS NOTHING (T12B-D1). An admin screen is in no plan, so "This tool isn’t part
+  //   of your plan yet … Upgrade or renew" told an Operations Admin or a Trainer — and a student who
+  //   typed an admin address — to buy their way into a screen no purchase opens.
+  if (reason === 'role') {
+    const roleLabel = staff?.isStaff && staff.status === 'active' ? staff.roleLabel : null;
+    return (
+      <div hidden={!active} aria-hidden={!active} className={`${active ? 'fade-in ' : ''}p-4 sm:p-6 lg:p-10 max-w-3xl mx-auto`}>
+        <div className="glass-card p-7 sm:p-9">
+          <div className="inline-flex items-center justify-center rounded-2xl mb-5"
+            style={{ width: 52, height: 52, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+            <Shield size={24} aria-hidden="true" style={{ color: C.textSoft }} />
+          </div>
+          <h2 style={{ fontFamily: fontDisplay, fontWeight: 800, fontSize: 24, letterSpacing: '-0.02em', color: C.text, lineHeight: 1.15 }}>
+            Your account can’t open this screen
+          </h2>
+          <p className="mt-3" style={{ fontSize: 14.5, color: C.textSoft, lineHeight: 1.6 }}>
+            {roleLabel ? (
+              <>It’s an admin screen, and your role — <span style={{ fontWeight: 700, color: C.text }}>{roleLabel}</span> — doesn’t include it. If you need it, ask a Super Admin.</>
+            ) : 'It’s an admin screen for the team that runs the toolkit, and no membership plan includes it.'}
+          </p>
+          <div className="mt-7 flex flex-wrap items-center gap-2.5">
+            <button type="button" onClick={() => goto('dashboard')}
+              className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-semibold transition hover:opacity-80"
+              style={{ color: C.textSoft, background: 'var(--wash)', border: `1px solid ${GLASS.borderSoft}` }}>
+              <ArrowLeft size={15} aria-hidden="true" /> Back to Dashboard
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div hidden={!active} aria-hidden={!active} className={`${active ? 'fade-in ' : ''}p-4 sm:p-6 lg:p-10 max-w-3xl mx-auto`}>
@@ -23522,6 +26770,39 @@ function RestrictedTab({ active, goto }) {
             Dashboard membership panel
           </button>.
         </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * What the chokepoint renders for one visited tab (T12B-D1). Pure, so its order is a test:
+ *   'checking'  an ADMIN tab before my_staff_context() has answered. Nothing is decided yet, so
+ *               nothing is said: the screen would be admitted to nobody, and a refusal flashed the
+ *               plan upsell at a real administrator who had deep-linked.
+ *   'panel'     the tool.
+ *   'role'      an admin tab refused. It is a ROLE question — no plan includes an admin screen —
+ *               so its answer names the role and sells nothing.
+ *   'plan'      any other tab refused: the plan upsell, as before.
+ *   settled       my_staff_context() has answered, or could not be read (the degraded branch, which
+ *                 adminTabAllowed() then answers from the legacy cache).
+ *   adminAllowed  adminTabAllowed(tabId) — true for every tab that is not an admin tab.
+ *   planAllows    entitlement.allowsTab(tabId).
+ */
+function tabAccessView(tabId, { settled, adminAllowed, planAllows }) {
+  const adminTab = Object.prototype.hasOwnProperty.call(ADMIN_TAB_PERMISSION, tabId);
+  if (adminTab && !settled) return 'checking';
+  if (adminAllowed && planAllows) return 'panel';
+  return adminTab ? 'role' : 'plan';
+}
+
+/** An admin tab while the staff context is still being read (tabAccessView's 'checking'). Neutral. */
+function TabAccessCheck({ active }) {
+  return (
+    <div hidden={!active} aria-hidden={!active} className="p-4 sm:p-6 lg:p-10 max-w-3xl mx-auto">
+      <div role="status" className="glass-card p-7 flex items-center gap-3" style={{ fontSize: 14, color: C.textSoft }}>
+        <Loader2 size={18} className="animate-spin" aria-hidden="true" style={{ color: C.textSoft }} />
+        Checking your access…
       </div>
     </div>
   );
@@ -23963,6 +27244,10 @@ function Dashboard({ goto }) {
           Everything you need to operate like a seasoned US bookkeeper — from your first client to your hundredth.
         </p>
       </div>
+
+      {/* #69: the Getting Started video — replay it, see whether it is finished, or (a Super
+          Admin) learn that none is live. Renders nothing for anyone else when none is. */}
+      <GettingStartedCard goto={goto} />
 
       {/* Membership / subscription status (students only; fail-silent) */}
       <MembershipPanel />
@@ -25573,14 +28858,81 @@ const FEATURE_GUIDE_SELECT = 'feature_key,title,description,video_url,video_path
 // signed URLs gated by RLS. Course covers + feature-guide videos stay in the PUBLIC course-media
 // bucket. The bucket name, size cap, format and every other rule now live in ./lib/courseVideo.
 // See db/2026-08-24-course-video-upload-only.sql (#44).
+// The Getting Started video (#69) is the same shape in a private bucket of its own
+// (onboarding-videos): the same signer, TTL, player and uploader. See ./lib/gettingStarted.
 
-/** Sign one lesson object, returning { url, signedAt } or throwing a described error. */
-async function signLessonVideo(path) {
+/**
+ * Sign one object in a PRIVATE video bucket: { url, signedAt }, or a thrown, described error.
+ *
+ * ★ THE ONE PLACE A VIDEO URL IS MINTED — for a lesson and for the Getting Started video
+ *   alike — and it can only mint a SIGNED one. There is no public-URL sibling and there
+ *   must never be: a public URL is built, not fetched, so it always "succeeds", and
+ *   against a private bucket it is simply an address that returns 400. That is how every
+ *   distinct playback failure once came to look identical (see SignedLessonVideo).
+ *   test/uiSafety.test.mjs §28a pins both halves.
+ */
+async function signPrivateVideo(bucket, path) {
   const { data, error } = await supabase.storage
-    .from(LESSON_VIDEO_BUCKET).createSignedUrl(path, LESSON_VIDEO_SIGN_TTL_SECONDS);
+    .from(bucket).createSignedUrl(path, LESSON_VIDEO_SIGN_TTL_SECONDS);
   if (error || !data?.signedUrl) throw (error || new Error('No signed URL was returned.'));
   return { url: data.signedUrl, signedAt: Date.now() };
 }
+
+// ★ HOISTED `function` DECLARATIONS, NOT `const` ARROWS — AND THAT IS LOAD-BEARING.
+//   LESSON_UPLOAD_TARGET, further down, stores signLessonVideo while this MODULE IS BEING
+//   EVALUATED. A hoisted declaration exists before any module code runs, wherever it sits
+//   in the file; a `const` arrow would be a temporal-dead-zone ReferenceError the day the
+//   two changed order — a blank page that `npm run build` and every node --test suite
+//   pass straight through, because neither of them evaluates this module. Pinned by §28a.
+
+/** Sign one lesson object (the private course-videos bucket). */
+async function signLessonVideo(path) {
+  return signPrivateVideo(LESSON_VIDEO_BUCKET, path);
+}
+
+/** Sign one Getting Started object (the private onboarding-videos bucket, #69). */
+async function signOnboardingVideo(path) {
+  return signPrivateVideo(ONBOARDING_VIDEO_BUCKET, path);
+}
+
+/**
+ * Is this object in the private lesson bucket? (RES-1) Proven the way the uploader proves it — by
+ * signing it, which Storage refuses for an object that is not there. ANY failure is a no: the one
+ * caller is about to point a lesson's row at the object, and a row naming nothing plays for nobody.
+ */
+async function lessonVideoInStorage(path) {
+  try {
+    await signLessonVideo(path);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * The bucket each private-video signer signs in, and what the player tells an ADMIN when signing
+ * fails there (TDR-8, AUI-2). Keyed on the signer FUNCTION, so the words can never name a bucket the
+ * URL was not asked from: SignedLessonVideo logged every failure as "[course-videos]", and told the
+ * Super Admin to look for a lesson in course-videos while the Getting Started drawer was signing in
+ * onboarding-videos. A lesson's sentence is unchanged, word for word.
+ */
+const PRIVATE_VIDEO_SIGNERS = new Map([
+  [signLessonVideo, Object.freeze({
+    log: `[${LESSON_VIDEO_BUCKET}]`,
+    adminSignFailure: 'This lesson’s video file could not be authorized. Confirm the file is still in the '
+      + 'course-videos bucket, and that the course is published for the plans that need it.',
+  })],
+  [signOnboardingVideo, Object.freeze({
+    log: `[${ONBOARDING_VIDEO_BUCKET}]`,
+    adminSignFailure: 'This Getting Started video’s file could not be authorized for playback. If its row says '
+      + '“File missing from storage”, upload the video again; otherwise try again in a moment.',
+  })],
+]);
+// A signer the map does not know: honest about knowing nothing more.
+const PRIVATE_VIDEO_SIGNER_UNKNOWN = Object.freeze({
+  log: '[private-video]',
+  adminSignFailure: 'This video file could not be authorized for playback. Confirm it is still in storage, then try again.',
+});
 
 /**
  * Renders an uploaded lesson video from the PRIVATE bucket via a signed URL.
@@ -25601,8 +28953,25 @@ async function signLessonVideo(path) {
  * ★ One URL per mounted lesson, held with its mint time in a ref and refreshed BEFORE it
  *   expires — not minted per render, and not left to rot for the hour a learner might
  *   spend on one lesson. Same idiom as the community feed's signedExpRef.
+ *
+ * Optional props (#69) — every one of them. With none passed this is exactly the lesson
+ * player, which is how LessonStage still calls it:
+ *   signUrl       (path) => Promise<{ url, signedAt }>: which private bucket to sign
+ *                 against. Pass a MODULE-SCOPE function (signLessonVideo, signOnboardingVideo).
+ *                 It is a dependency of sign(), so an inline closure would mint a new URL —
+ *                 and unmount the <video> — on every parent render.
+ *   mediaRef      a ref (object or callback) kept on the CURRENT <video>, and null while
+ *                 there is none, so a parent can read played / currentTime / duration and
+ *                 call pause().
+ *   onEnded, onTimeUpdate, onSeeking
+ *                 the <video>'s own events, passed straight through.
+ *   onProblem     (reason) => void, from EVERY path into the error state, with the reason
+ *                 this component already keeps in `problem.reason`: 'sign' | 'missing' |
+ *                 'decode' | 'already-retried' | 'aborted' | 'none'. Never after unmount.
+ *   onReady       () => void, each time a (re)load succeeds — the first load, a re-sign,
+ *                 a quiet pre-expiry refresh.
  */
-function SignedLessonVideo({ lesson, isAdmin = false }) {
+function SignedLessonVideo({ lesson, isAdmin = false, signUrl = signLessonVideo, mediaRef, onEnded, onTimeUpdate, onSeeking, onProblem, onReady }) {
   const [state, setState] = useState('signing');      // signing | ready | error
   const [src, setSrc] = useState(null);
   const [problem, setProblem] = useState(null);       // { reason, message, fatal }
@@ -25614,7 +28983,37 @@ function SignedLessonVideo({ lesson, isAdmin = false }) {
   const resumeAtRef = useRef(0);
   const resumePlayingRef = useRef(false);
   const videoRef = useRef(null);
+  // ★ THE FRAME — the one element every state shares (see the three returns below) — and so the
+  //   one place focus can go when "Try again" removes itself. That press flips the state to
+  //   'signing', which unmounts the button under the student's finger, and the browser drops focus
+  //   to <body>: a keyboard user starts again from the top of the page (WCAG 2.4.3). tabIndex -1
+  //   puts it outside the Tab order; it is focused only by refocusIfLost(), only when focus really
+  //   was lost.
+  const stageRef = useRef(null);
   const path = lesson?.storage_path;
+  // ★ onProblem is read through a REF, never through a dependency array. sign() and the
+  //   path effect below both report into it, and that effect re-signs whenever sign()
+  //   changes identity — so listing a parent's inline closure as a dependency would mint
+  //   a fresh URL, and unmount the <video>, on every one of the parent's renders.
+  const onProblemRef = useRef(onProblem);
+  onProblemRef.current = onProblem;
+  // …and only while MOUNTED. sign() can still be in flight when its player is unmounted
+  // (a caller's Retry remounts it; a card collapses), and a failure that lands afterwards
+  // must not report a problem for a video nobody is looking at. Re-armed on mount, not
+  // just disarmed on unmount: <React.StrictMode> runs mount → cleanup → mount in
+  // development, and a ref the first cleanup left false would silence every report for
+  // the life of the component. Declared ABOVE the path effect, so it is re-armed first.
+  const mountedRef = useRef(true);
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
+  // ★ A CALLBACK ref, so an optional `mediaRef` always names the CURRENT <video> — and
+  //   null while there is none. A re-sign and "Try again" both unmount the element and
+  //   mount a new one; a parent holding the first node would go on reading `played` from,
+  //   and pausing, a detached element. With no mediaRef this is `ref={videoRef}` exactly.
+  const attachVideo = useCallback((node) => {
+    videoRef.current = node;
+    if (typeof mediaRef === 'function') mediaRef(node);
+    else if (mediaRef) mediaRef.current = node;
+  }, [mediaRef]);
 
   /**
    * Mint a signed URL.
@@ -25630,6 +29029,9 @@ function SignedLessonVideo({ lesson, isAdmin = false }) {
    *   cause the very outage the refresh is preventing.
    */
   const sign = useCallback(async (label, { quiet = false } = {}) => {
+    // Which bucket this signer signs in — what the log lines and an admin's sentence name (TDR-8,
+    // AUI-2). Looked up from the signer itself, so the words can never disagree with the URL.
+    const about = PRIVATE_VIDEO_SIGNERS.get(signUrl) || PRIVATE_VIDEO_SIGNER_UNKNOWN;
     // ★ Captured BEFORE the await and re-checked after it. The effect's own `cancelled`
     //   flag was only ever read synchronously before this call, so it could never suppress
     //   a late result: a request in flight when the learner moved to another lesson — or a
@@ -25638,37 +29040,40 @@ function SignedLessonVideo({ lesson, isAdmin = false }) {
     const gen = genRef.current;
     if (!quiet) { setState('signing'); setProblem(null); }
     try {
-      const { url, signedAt } = await signLessonVideo(path);
+      const { url, signedAt } = await signUrl(path);
       if (gen !== genRef.current) return false;      // a different lesson took over
       signedAtRef.current = signedAt;
       setSrc(url); setState('ready');
       return true;
     } catch (e) {
       if (quiet) {
-        console.warn('[course-videos] refresh failed; keeping the current URL', e?.status || e?.name || 'error');
+        console.warn(about.log, 'refresh failed; keeping the current URL', e?.status || e?.name || 'error');
         return false;
       }
       if (gen !== genRef.current) return false;      // stale failure, not this lesson's
       // Never log or render the signed URL itself — it is a working grant of the file.
-      console.error(`[course-videos] ${label} failed`, e?.status || e?.name || 'error');
+      console.error(about.log, `${label} failed`, e?.status || e?.name || 'error');
       setProblem({
         reason: 'sign',
         fatal: false,
-        message: isAdmin
-          ? 'This lesson’s video file could not be authorized. Confirm the file is still in the '
-            + 'course-videos bucket, and that the course is published for the plans that need it.'
-          : 'This video isn’t loading right now.',
+        message: isAdmin ? about.adminSignFailure : 'This video isn’t loading right now.',
       });
       setState('error');
+      if (mountedRef.current) onProblemRef.current?.('sign');   // a first attempt, a re-sign, "Try again"
       return false;
     }
-  }, [path, isAdmin]);
+  }, [path, isAdmin, signUrl]);
 
   useEffect(() => {
     genRef.current += 1;                              // invalidate anything already in flight
     attemptRef.current = 0; resumeAtRef.current = 0; resumePlayingRef.current = false;
     setSrc(null); setProblem(null); setState('signing');
-    if (!path) { setState('error'); setProblem({ reason: 'missing', fatal: true, message: 'No video file is attached to this lesson yet.' }); return undefined; }
+    if (!path) {
+      setState('error');
+      setProblem({ reason: 'missing', fatal: true, message: 'No video file is attached to this lesson yet.' });
+      if (mountedRef.current) onProblemRef.current?.('missing');
+      return undefined;
+    }
     sign('sign');
     return undefined;
   }, [lesson?.id, path, sign]);
@@ -25718,6 +29123,7 @@ function SignedLessonVideo({ lesson, isAdmin = false }) {
         : 'This video stopped loading.',
     });
     setState('error');
+    if (mountedRef.current) onProblemRef.current?.(decision.reason);   // 'decode' | 'already-retried' | 'aborted' | 'none'
   }
 
   // ★ ALL THREE returns below render the SAME .course-stage frame, and that is the
@@ -25725,9 +29131,12 @@ function SignedLessonVideo({ lesson, isAdmin = false }) {
   //   of whatever height its message ran to, and 'ready' was a <video> at its intrinsic
   //   ratio — so a signing failure reflowed the whole lesson page under the learner,
   //   and so did every lesson change. One frame, three children.
+  //   ★ And one DOM node: React keeps the root <div> across the three (same type, same place),
+  //     so each carries the same ref and tabIndex — a return without them would detach the ref,
+  //     or leave a focused frame unfocusable, and focus would fall to <body> after all.
   if (state === 'error') {
     return (
-      <div className="course-stage">
+      <div className="course-stage" ref={stageRef} tabIndex={-1}>
         {/* Fixed light-on-black, not the status tokens: the frame is #000 in BOTH
             themes, and --status-danger-fg is #D02323 in light mode — about 2.3:1
             against black, which is unreadable exactly where the message matters. */}
@@ -25736,7 +29145,7 @@ function SignedLessonVideo({ lesson, isAdmin = false }) {
           <div>{problem?.message}</div>
           {!problem?.fatal && (
             <button type="button" className="course-stage-btn"
-              onClick={() => { attemptRef.current = 0; sign('retry'); }}>
+              onClick={() => { attemptRef.current = 0; sign('retry'); refocusIfLost(stageRef); }}>
               Try again
             </button>
           )}
@@ -25746,7 +29155,7 @@ function SignedLessonVideo({ lesson, isAdmin = false }) {
   }
   if (state === 'signing' || !src) {
     return (
-      <div className="course-stage">
+      <div className="course-stage" ref={stageRef} tabIndex={-1}>
         <div className="course-stage-msg" role="status">
           <span className="inline-flex items-center gap-2">
             <Loader2 size={16} className="animate-spin" aria-hidden="true" /> Loading video…
@@ -25756,9 +29165,9 @@ function SignedLessonVideo({ lesson, isAdmin = false }) {
     );
   }
   return (
-    <div className="course-stage">
+    <div className="course-stage" ref={stageRef} tabIndex={-1}>
     <video
-      ref={videoRef}
+      ref={attachVideo}
       key={`${lesson.id}:${path}`}
       src={src}
       controls
@@ -25781,8 +29190,17 @@ function SignedLessonVideo({ lesson, isAdmin = false }) {
           resumePlayingRef.current = false;
           videoRef.current.play?.().catch(() => { /* autoplay policy — leave it paused */ });
         }
+        // Every successful (re)load lands here — the first one, a re-sign, a quiet
+        // refresh — so this is the one place "the video is back" can be said.
+        onReady?.();
       }}
       onError={handleMediaError}
+      // Optional observers (#69), passed straight through: this component has no logic
+      // of its own on these three events for a caller's handler to run after, and an
+      // absent prop attaches nothing.
+      onEnded={onEnded}
+      onTimeUpdate={onTimeUpdate}
+      onSeeking={onSeeking}
       // Sizing is .course-stage > video's job now. The old `w-full rounded-xl bg-black`
       // + `maxHeight: 460` needed an 818px-wide box before the clamp could bind, and
       // the 1/3-2/3 grid never gave it one — so it had never fired in production.
@@ -25920,6 +29338,73 @@ function buildFaststartFile(file, plan) {
 }
 
 /**
+ * The content type an upload is SENT with — and therefore the one Storage records.
+ *
+ * ★ The file's REAL type, not a blanket 'video/mp4'. This is what Storage checks against
+ *   the bucket's allowed_mime_types, so hardcoding mp4 would let a .mov through only by
+ *   MISLABELLING it — the bucket would never see what it was actually storing. Windows
+ *   frequently reports '' for a picked file, so an unknown type falls back to the
+ *   canonical one.
+ * ★ ONE function, because the transfer's metadata and onMediaFacts must never disagree
+ *   about what was stored.
+ */
+const videoUploadContentType = (file) => (
+  LESSON_VIDEO_UPLOAD_MIMES.includes(file?.type) ? file.type : LESSON_VIDEO_MIME
+);
+
+/**
+ * The uploader's OWNER-SPECIFIC wording — and only that.
+ *
+ * Everything else LessonVideoUploader says is about the file or the transfer, is true
+ * whoever owns the object, and stays inline where it is used — describeVerifyFailure's
+ * arms in particular, which test/uiSafety.test.mjs §13 reads in place.
+ */
+const LESSON_UPLOAD_COPY = Object.freeze({
+  pickLabel: 'Upload lesson video',                        // the file-picker button
+  fallbackName: 'Lesson video',                            // the progress row, before a name is known
+  // The second sentence of the "could not read it back" verdict: whose access is missing.
+  accessRequired: 'Admin access to course videos is required.',
+  removed: 'Video removed. Save the lesson to confirm.',   // announced after Remove
+});
+
+/**
+ * WHERE an upload goes and what it is called: one frozen record per owner.
+ *
+ * LessonVideoUploader is a single resumable-upload component with two callers — a course
+ * lesson (this record, its default) and the Getting Started video (#69), which passes a
+ * record of its own. Everything that differs between them is here; the transfer, the
+ * faststart remux, the verification and the state machine are shared and know neither.
+ *
+ *   bucket             the PRIVATE bucket the object is written to
+ *   buildPath          ({ courseId, uploadId, fileName }) => object name; THROWS on a bad id
+ *   isOwnPath          (path) => boolean — is this an object name this owner builds?
+ *   fingerprintPrefix  \ together they scope the tus resume key, so re-picking a file for a
+ *   fingerprintScope   / DIFFERENT owner can never resume into the first owner's object.
+ *                        null means "the uploader's courseId prop".
+ *   sign               (path) => Promise<{ url, signedAt }> — see signPrivateVideo
+ *   discard            (path) => Promise: drop an object that was uploaded but never saved.
+ *                      Best-effort — the uploader logs a rejection and carries on.
+ *   copy               the owner-specific wording; keys as LESSON_UPLOAD_COPY. A key a
+ *                      record omits falls back to the lesson wording, never to nothing.
+ *
+ * ★ DECLARED AFTER THE SIGNERS AND AFTER LESSON_UPLOAD_COPY, and that order is pinned
+ *   (§28a). This object is built while the module is being evaluated, so a `const` it
+ *   reads must already be initialised. The two functions it only CALLS later
+ *   (buildLessonVideoPath, removeMediaIfUnreferenced) need not be.
+ */
+const LESSON_UPLOAD_TARGET = Object.freeze({
+  bucket: LESSON_VIDEO_BUCKET,
+  buildPath: ({ courseId, uploadId, fileName }) => buildLessonVideoPath(courseId, uploadId, fileName),
+  isOwnPath: isLessonVideoPath,
+  fingerprintScope: null,
+  fingerprintPrefix: 'gh-lesson',
+  sign: signLessonVideo,
+  // Reference-aware: a duplicated course can legitimately share a path.
+  discard: (path) => removeMediaIfUnreferenced([path]),
+  copy: LESSON_UPLOAD_COPY,
+});
+
+/**
  * The lesson-video uploader. Module scope, NOT declared inside CourseProgram: a component
  * defined in the parent gets a fresh type identity on every render, so React would unmount
  * and remount it on each keystroke elsewhere in the drawer — losing an upload in progress.
@@ -25936,9 +29421,27 @@ function buildFaststartFile(file, plan) {
  *                   an abandoned upload is otherwise an object nothing on earth points
  *                   at — which is exactly how 1.60 GiB accumulated in production.
  *   disabled        the drawer is busy saving
+ *   target          WHERE the object goes and what it is called: LESSON_UPLOAD_TARGET (a
+ *                   course lesson) unless another owner passes a record of its own (#69).
+ *                   ★ Treated exactly as `courseId` always was — read from the closure of
+ *                     the render whose EVENT started the flow. No effect reads it, and the
+ *                     one dependency array that lists it (discardPending's) feeds no effect,
+ *                     so a new `target` identity re-creates one callback and nothing else.
+ *                     It cannot restart a transfer or mint a second signed URL, and a
+ *                     transfer in flight finishes against the target it started with.
+ *   onMediaFacts    ({ byteSize, mimeType, fileName, durationSeconds }) => void, each time
+ *                   an upload passes verification — beside the READY onChange — for a
+ *                   caller that stores facts about the object. The lesson editor passes
+ *                   nothing: it needs only the duration, which already rides on onChange
+ *                   as __durationSeconds.
+ *   ★ onChange and onMediaFacts are called from the closure of the render that PICKED the file,
+ *     which a long transfer outlives by minutes — so a caller applies them with a functional
+ *     setState or through a ref, never by merging into draft state it captured at render time.
  */
-function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChange, onPendingPath, disabled }) {
-  const hasSaved = isLessonVideoPath(value?.storage_path);
+function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChange, onPendingPath, disabled, target = LESSON_UPLOAD_TARGET, onMediaFacts }) {
+  const hasSaved = target.isOwnPath(value?.storage_path);
+  // Owner-specific wording; the lesson's is the fallback for any key a record omits.
+  const copy = { ...LESSON_UPLOAD_COPY, ...target.copy };
   const [state, setState] = useState(hasSaved ? UPLOAD_STATES.SAVED_AND_PLAYABLE : UPLOAD_STATES.EMPTY);
   const [progress, setProgress] = useState({ loaded: 0, total: 0 });
   const [fileInfo, setFileInfo] = useState(null);        // { name, size }
@@ -26059,9 +29562,13 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     notePendingPath(null);
     signedRef.current = null;              // don't hold a signed URL for an object we are dropping
     if (!path || path === savedPath) return;
-    // Reference-aware even here: a duplicated course can legitimately share a path.
-    await removeMediaIfUnreferenced([path]);
-  }, [savedPath, notePendingPath]);
+    // The target decides HOW. A lesson's is reference-aware even here, because a duplicated
+    // course can legitimately share a path. Best-effort either way: a cleanup that fails
+    // must never strand the pick, cancel or remove that asked for it.
+    try { await target.discard(path); } catch (e) {
+      console.error('[video-upload] an unsaved upload could not be removed', e?.status || e?.name || 'error');
+    }
+  }, [savedPath, notePendingPath, target]);
 
   function announce(text, step) {
     // Throttled on purpose: announcing every progress tick makes a screen reader unusable.
@@ -26073,8 +29580,19 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
   }
 
   async function startUpload(file) {
+    // ★ WHERE THIS TRANSFER GOES IS READ ONCE, UP HERE — never inside the tus options below.
+    //   test/uiSafety.test.mjs §6/§6b read a fixed 4,000-character window that starts at
+    //   the tus constructor and must still reach the bearer header, so every character
+    //   added between the two spends it. §28a records what is left.
+    // ★ The resume key is scoped to THIS OWNER — a course, or one Getting Started draft.
+    //   tus's default browser fingerprint is name+type+size+lastModified+endpoint — the
+    //   bucket and object path are not in it, so uploading the same file for owner A and
+    //   then for owner B would "resume" B's upload into A's object.
+    const fpPrefix = target.fingerprintPrefix;
+    const fpScope = target.fingerprintScope ?? courseId;
+    const bucketName = target.bucket;
     // `let`, because a resumed transfer may already be writing somewhere else — see below.
-    let path = buildLessonVideoPath(courseId, crypto.randomUUID(), file.name);
+    let path = target.buildPath({ courseId, uploadId: crypto.randomUUID(), fileName: file.name });
     const { data: sess } = await supabase.auth.getSession();
     const token = sess?.session?.access_token;
     // ★ The freshest bearer we have actually seen succeed. onBeforeRequest reassigns it
@@ -26089,12 +29607,9 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     await new Promise((resolve, reject) => {
       const upload = new tus.Upload(file, {
         endpoint: resumableUploadEndpoint(),
-        // ★ Scope the fingerprint to THIS course. tus's default browser fingerprint is
-        //   name+type+size+lastModified+endpoint — the bucket and object path are not in it,
-        //   so uploading the same file to course A and then to course B would "resume"
-        //   B's upload into A's object.
+        // Scoped to this upload's owner — see fpPrefix / fpScope above.
         fingerprint: (f) => Promise.resolve(
-          `gh-lesson-${courseId}-${f.name}-${f.type}-${f.size}-${f.lastModified}`),
+          `${fpPrefix}-${fpScope}-${f.name}-${f.type}-${f.size}-${f.lastModified}`),
         retryDelays: [...LESSON_VIDEO_RETRY_DELAYS],
         headers: {
           // ★ NO `authorization` HERE — it is set in onBeforeRequest below, and it must be
@@ -26152,14 +29667,10 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
         uploadDataDuringCreation: true,
         removeFingerprintOnSuccess: true,               // so the same file can be re-uploaded later
         metadata: {
-          bucketName: LESSON_VIDEO_BUCKET,
+          bucketName,
           objectName: path,
-          // ★ The file's REAL type, not a blanket 'video/mp4'. This is what Storage
-          //   checks against the bucket's allowed_mime_types, so hardcoding mp4 would
-          //   let a .mov through only by MISLABELLING it — the bucket would never see
-          //   what it was actually storing. Windows frequently reports '' for a picked
-          //   file, so an unknown type still falls back to the canonical one.
-          contentType: LESSON_VIDEO_UPLOAD_MIMES.includes(file?.type) ? file.type : LESSON_VIDEO_MIME,
+          // The file's REAL type, never a blanket 'video/mp4' — see videoUploadContentType.
+          contentType: videoUploadContentType(file),
           cacheControl: '3600',
         },
         // Supabase requires EXACTLY this. It is not a tuning knob.
@@ -26189,7 +29700,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
         const resumed = prev[0];
         if (resumed) {
           const resumedName = resumed.metadata?.objectName;
-          if (typeof resumedName === 'string' && isLessonVideoPath(resumedName)) path = resumedName;
+          if (typeof resumedName === 'string' && target.isOwnPath(resumedName)) path = resumedName;
           upload.resumeFromPreviousUpload(resumed);
         }
         upload.start();
@@ -26210,7 +29721,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     if (cached && cached.path === path && Date.now() - cached.signedAt < ttlMs - LESSON_VIDEO_RESIGN_MARGIN_MS) {
       return cached.url;
     }
-    const { url, signedAt } = await signLessonVideo(path);
+    const { url, signedAt } = await target.sign(path);
     signedRef.current = { url, signedAt, path };
     return url;
   }
@@ -26302,7 +29813,6 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     setNotice(null); setWeightNote(''); setRemuxNote('');
     codecRiskRef.current = false;
     if (!file) return;
-    await discardPending();                              // replacing? drop the last orphan first
     fileRef.current = file;
     setFileInfo({ name: file.name, size: file.size });
     setProgress({ loaded: 0, total: file.size });
@@ -26313,7 +29823,11 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
 
     // The hard refusals, and the only ones left: not an MP4, empty, or over the cap.
     const verdict = validateVideoFile(file);
-    if (!verdict.ok) { setErrMsg(verdict.message); go(UPLOAD_EVENTS.VALIDATE_FAIL); announce(verdict.message); return; }
+    // The owner's own wording where the shared one names a lesson (target.copy.messages, T9V-L1).
+    if (!verdict.ok) {
+      const why = copy.messages?.[verdict.reason]?.(file) || verdict.message;
+      setErrMsg(why); go(UPLOAD_EVENTS.VALIDATE_FAIL); announce(why); return;
+    }
 
     // What the CONTAINER says, before a single byte is sent. validateVideoFile can only
     // see the name, the MIME type and the size — all of which an H.265 file satisfies —
@@ -26404,6 +29918,16 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     setDuration(secs);
     setWeightNote(describeVideoWeight(upload.size, secs).message);
 
+    // ★ EVERY CHECK HAS PASSED: the replacement is ACCEPTED, so only now does the upload it
+    //   replaces go. This was the FIRST line of handlePick, before validateVideoFile had looked at
+    //   the new file: a refused "Replace video" deleted a verified upload the lesson draft still
+    //   named, and Save then wrote a lesson whose video was gone — saveLesson's refused-pick guard
+    //   fires only when the draft names no file. A refusal now changes nothing. The discard runs
+    //   while the state is LOCAL_VALIDATING (Save blocked, the picker disabled), and an uploader
+    //   closed meanwhile starts no transfer.
+    await discardPending();
+    if (!mountedRef.current) return;
+
     // ★ FINDINGS NEVER STOP THE UPLOAD. They are recorded and shown beside a transfer
     //   that is already running. The previous version rendered exactly these notes in a
     //   card with an "Upload anyway" button and waited — every state transition behind
@@ -26437,10 +29961,11 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
       if (!mountedRef.current) return;
       const d = describeUploadError(e);
       if (d.reason === 'aborted') return;                // cancel/pause already set the state
+      const why = copy.messages?.[d.reason]?.(file) || d.message;
       setRetryable(d.retryable);
-      setErrMsg(d.message);
+      setErrMsg(why);
       go(UPLOAD_EVENTS.INTERRUPT);
-      announce(d.message);
+      announce(why);
     }
   }
 
@@ -26458,7 +29983,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
   function describeVerifyFailure(e) {
     if (e?.reason === 'forbidden') {
       return 'The file uploaded, but this account was not allowed to read it back. '
-        + 'Admin access to course videos is required.';
+        + copy.accessRequired;
     }
     if (e?.reason === 'missing') {
       return 'The file finished uploading but is not in storage yet. Wait a few seconds and check again.';
@@ -26496,6 +30021,19 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
       if (secs != null) setDuration(secs);
       notePendingPath(path);
       onChange?.({ storage_path: path, video_provider: 'upload', video_url: null, __durationSeconds: secs });
+      // (#69) What a caller may want to STORE about the object that just passed. Beside
+      // the READY onChange and nowhere else, so it can never describe an upload that is
+      // not verified. The duration is the SAME value as __durationSeconds above — one
+      // number, two listeners — and never a second key on the patch, because
+      // applyVideoPatch spreads whatever else that patch carries into the lesson draft.
+      const sent = fileRef.current;
+      const bytes = Number(expectedBytes);
+      onMediaFacts?.({
+        byteSize: Number.isFinite(bytes) && bytes > 0 ? bytes : null,   // what verification compared
+        mimeType: sent ? videoUploadContentType(sent) : null,           // what Storage recorded
+        fileName: sent?.name || null,
+        durationSeconds: secs,
+      });
       go(UPLOAD_EVENTS.VERIFY_OK);
       announce('Video uploaded and ready to save.');
     } catch (e) {
@@ -26546,7 +30084,10 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
     onChange?.({ storage_path: null, video_provider: null, video_url: null });
     setFileInfo(null); setDuration(null); setProgress({ loaded: 0, total: 0 });
     go(UPLOAD_EVENTS.RESET);
-    announce('Video removed. Save the lesson to confirm.');
+    announce(copy.removed);
+    // The Remove button goes with the row it sat in: focus goes to the picker that replaces it,
+    // never to <body> (T9UI-9).
+    refocusIfLost(inputRef);
   }
 
   const pct = progress.total ? Math.min(100, Math.round((progress.loaded / progress.total) * 100)) : 0;
@@ -26565,7 +30106,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
         <>
           <label className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border text-sm font-semibold cursor-pointer focus-within:ring-2"
             style={{ borderColor: 'var(--glass-border)', color: C.text, ringColor: 'var(--focus-ring)' }}>
-            <UploadCloud size={16} /> Upload lesson video
+            <UploadCloud size={16} /> {copy.pickLabel}
             {/* sr-only rather than hidden: display:none drops it from the tab order. */}
             <input ref={inputRef} type="file" accept={LESSON_VIDEO_ACCEPT} className="sr-only" disabled={busy}
               onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) handlePick(f); }} />
@@ -26584,7 +30125,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
       {showBar && (
         <div>
           <div className="flex items-center justify-between gap-3 text-sm font-semibold" style={{ color: C.text }}>
-            <span className="truncate">{fileInfo?.name || 'Lesson video'}</span>
+            <span className="truncate">{fileInfo?.name || copy.fallbackName}</span>
             <span className="tabular-nums text-xs" style={{ color: C.textSoft }}>
               {state === UPLOAD_STATES.VERIFYING_PRIVATE_OBJECT ? 'Checking playback' : `${pct}%`}
             </span>
@@ -26706,7 +30247,7 @@ function LessonVideoUploader({ courseId, value, savedPath, onChange, onStateChan
                 except reloading the page and losing the draft. */}
             {state === UPLOAD_STATES.UNSUPPORTED_FILE && (
               <button type="button" className="ml-2 underline font-semibold"
-                onClick={() => { setErrMsg(''); fileRef.current = null; setFileInfo(null); go(UPLOAD_EVENTS.RESET); }}>
+                onClick={() => { setErrMsg(''); fileRef.current = null; setFileInfo(null); go(UPLOAD_EVENTS.RESET); refocusIfLost(inputRef); }}>
                 Dismiss
               </button>
             )}
@@ -27582,9 +31123,43 @@ function CourseProgram({
   // exists only so closeLessonEditor can delete what an abandoned upload left behind, and
   // nothing renders from it. See the sweep in closeLessonEditor.
   const pendingVideoPathRef = useRef(null);
+  // The video columns the lesson's ROW holds — what still exists — for notePendingVideoPath, which
+  // runs from the uploader's closures. Assigned each render, beside originalEditingLesson.
+  const savedLessonVideoRef = useRef(null);
+  // V-RES1-LABEL: the duration label applyVideoPatch PRE-FILLED from an upload — { id, path, label,
+  // before } — so a discard of that upload takes back the length it described (the revert below).
+  const prefilledLabelRef = useRef(null);
   // Stable identity: LessonVideoUploader lists this in a useCallback dependency array, and
   // a new function every render would rebuild discardPending on every keystroke.
-  const notePendingVideoPath = useCallback((path) => { pendingVideoPathRef.current = path; }, []);
+  // ★ null FROM THE UPLOADER MEANS IT DISCARDED THAT UPLOAD (RES-1). discardPending is its only
+  //   null: a replacement it ACCEPTED, a Cancel or a Remove. A draft still naming the dropped
+  //   object goes back to what the row holds — the Getting Started drawer's rule (T9V-L4). Without
+  //   it: a saved video S, upload A (it verifies, so the draft names A), "Replace video" with B
+  //   (which discards A, by design), Cancel B, Save — and the row was pointed at the deleted A while
+  //   saveLesson's cleanup deleted S as "replaced". Both files gone; the lesson played nothing.
+  // ★ THE LENGTH THAT UPLOAD PRE-FILLED GOES BACK WITH IT (V-RES1-LABEL) — to what the label said
+  //   before, and only while it still says what the upload put there: a label the admin wrote since
+  //   stands. Kept, it was saved beside the row's own video, and students read the dropped upload's
+  //   length in the curriculum — and a replacement that then finished could not pre-fill its own.
+  const notePendingVideoPath = useCallback((path) => {
+    const dropped = pendingVideoPathRef.current;
+    pendingVideoPathRef.current = path;
+    if (path || !dropped) return;
+    setEditingLesson((d) => {
+      if (!d || d.storage_path !== dropped) return d;
+      const row = savedLessonVideoRef.current;
+      const saved = row && row.id === d.id ? row : null;
+      const pre = prefilledLabelRef.current;
+      const labelBack = !!pre && pre.id === d.id && pre.path === dropped && d.duration_label === pre.label;
+      return {
+        ...d,
+        storage_path: saved?.storage_path ?? null,
+        video_provider: saved?.video_provider ?? null,
+        video_url: saved?.video_url ?? null,
+        ...(labelBack ? { duration_label: pre.before } : {}),
+      };
+    });
+  }, []);
   const [metaBusy, setMetaBusy] = useState(false);           // saving course details / toggling publish
   const [structBusy, setStructBusy] = useState(false);       // adding a module or lesson
   // ── Errors raised from inside the lesson drawer ───────────────────────────────
@@ -28218,6 +31793,12 @@ function CourseProgram({
   const savedCourseDraft = courseDraftFromRow(course);
   const courseMetaDirty = !!(isAdmin && course && JSON.stringify(courseDraft) !== JSON.stringify(savedCourseDraft));
   const originalEditingLesson = editingLesson ? allLessons.find(l => l.id === editingLesson.id) : null;
+  savedLessonVideoRef.current = originalEditingLesson ? {
+    id: originalEditingLesson.id,
+    storage_path: originalEditingLesson.storage_path ?? null,
+    video_provider: originalEditingLesson.video_provider ?? null,
+    video_url: originalEditingLesson.video_url ?? null,
+  } : null;
   const lessonComparable = (l = {}) => ({
     title: l.title || '',
     type: l.type || 'video',
@@ -28555,13 +32136,17 @@ function CourseProgram({
   //   phantom lesson — and a later Save would run .eq('id', undefined).
   function applyVideoPatch(patch) {
     const { __durationSeconds, ...cols } = patch || {};
+    const label = formatMediaDuration(__durationSeconds);
     setEditingLesson(d => {
       if (!d) return d;
       const next = { ...d, ...cols };
       // Prefill the duration label from the file itself, but never overwrite a label the
-      // admin already wrote.
-      const label = formatMediaDuration(__durationSeconds);
-      if (label && !String(d.duration_label || '').trim()) next.duration_label = label;
+      // admin already wrote — and remember it was THIS upload's, so discarding the upload takes
+      // it back (notePendingVideoPath, V-RES1-LABEL).
+      if (label && !String(d.duration_label || '').trim()) {
+        next.duration_label = label;
+        prefilledLabelRef.current = { id: d.id, path: next.storage_path ?? null, label, before: d.duration_label ?? null };
+      }
       return next;
     });
   }
@@ -28902,6 +32487,20 @@ function CourseProgram({
       // Same omit-don't-send-undefined rule for #65. A pre-#65 database keeps every lesson
       // plain, which is exactly what its renderer expects.
       if (!lessonRowsArePreRichContent(allLessons)) payload.content_format = normalizeFormat(d.content_format);
+      // ★ NEVER POINT A LESSON AT A FILE THAT IS NOT THERE (RES-1). A NEW video path is proven in
+      //   storage before the row is pointed at it — by signing it, the uploader's own first proof.
+      //   Saving one that was gone wrote a lesson nobody could play AND, through the cleanup below,
+      //   deleted the video the row held: the draft no longer cited it, so it looked replaced. The
+      //   revert in notePendingVideoPath keeps the uploader from leaving the draft on a discarded
+      //   upload; this keeps every other way there — a restored draft naming an upload the "unused
+      //   files" panel has since deleted — from costing the lesson its video.
+      if (payload.storage_path && payload.storage_path !== oldPath
+        && !(await lessonVideoInStorage(payload.storage_path))) {
+        refuseSave('The new video for this lesson isn’t in storage any more, so nothing was saved — the lesson '
+          + 'would have pointed at a file that isn’t there. Upload the video again, then save. If your '
+          + 'connection dropped, press Save again.');
+        return;
+      }
       const { error } = await supabase.from('course_lessons').update(payload).eq('id', d.id);
       if (error) throw error;
       // The save succeeded, so the trigger has rebuilt this lesson's image references.
@@ -28914,7 +32513,14 @@ function CourseProgram({
       // The row now cites this object, so it is no longer pending and closeLessonEditor
       // must not sweep it. (removeMediaIfUnreferenced would refuse to delete a referenced
       // path anyway — this keeps the bookkeeping honest rather than leaning on that.)
+      // ★ AND AN UPLOAD THE ROW DOES NOT CITE IS SWEPT HERE, NOT FORGOTTEN (AUI-1). One that
+      //   finished but FAILED its check stays pending — "Check again" needs it — and a refused pick
+      //   keeps it (only an accepted one replaces it), so Dismiss, then Save, dropped the one
+      //   reference to it and left it in the bucket for good. So did a video uploaded before the
+      //   lesson was switched to Text. Reference-aware, as every lesson sweep is.
+      const leftover = pendingVideoPathRef.current;
       pendingVideoPathRef.current = null;
+      if (leftover && leftover !== payload.storage_path) await removeMediaIfUnreferenced([leftover]);
       setVideoUploadState(UPLOAD_STATES.EMPTY);
       setLessonImages([]);
       clearLessonDraft();

@@ -58,10 +58,12 @@ npm run ai:knowledge:push  # regenerate + upload it to the ElevenLabs knowledge 
 npm run ai:provision       # regenerate + create/update the ElevenLabs agent, its client tools, the AI-trainer webhook tools (needs APP_URL), and the KB (needs ELEVENLABS_API_KEY; --dry-run to preview)
 npm test                   # node --test — the pure-lib suites in test/ (planCatalog, studentImport, trainerToken, trainerContent, trainerAccess, communitySpaces, communityCapabilities, batchEntitlements, batchLifecycle, appErrors, lessonReplay, enrollmentIntake, enrollmentIntakeSql, communityChannels, trainingAgreement, bootstrapFolds, courseVideo, courseVideoSql, courseVideoContent, mp4Faststart, studentProgress, studentProgressSql, uiSafety, coaIntegrity, portfolioGenerator,
                            approveGrantSql, financeDailyIncome, financeDailyIncomeSql, lessonContent, lessonContentSql, lessonDocument, sidebarLayout,
-                           legacyMigration, legacyMigrationSql, legacyClaimEmail, importClaim, enrollGate, …)
+                           legacyMigration, legacyMigrationSql, legacyClaimEmail, importClaim, enrollGate,
+                           gettingStarted, gettingStartedSql, notifyAccessDecision, …)
 npm run test:e2e           # RENDERED suites (test-e2e/*.e2etest.mjs): the real app served by Vite against
                            # the SHADOW project, driven through Chrome by a zero-dependency CDP client.
-                           # Measures geometry a source scan cannot see (enrollmentLayout, workspaceSweep).
+                           # Measures geometry a source scan cannot see (enrollmentLayout, workspaceSweep),
+                           # and drives whole flows (gettingStarted: the gate's personas, on a clip recorded in Chrome).
                            # Needs .env.test + Chrome; skips loudly without them. Never targets production.
 npm run storage:config     # read the PROJECT-WIDE Supabase Storage upload limit and the effective
                            # limit of every bucket; --apply raises it to LESSON_VIDEO_MAX_BYTES.
@@ -241,6 +243,20 @@ The sanctioned exceptions to the single-file rule (same spirit as the `main.jsx`
   stepped and clamped, which days count as empty (net zero is NOT empty: a correction that cancels a
   collection stays visible), and what "today" is in the **business** timezone — `todayISODate()` is
   the browser's. One column list drives the table, the CSV and the print view, so they cannot disagree.
+- `src/lib/gettingStarted.js` — the pure client half of the Getting Started video (#69; no imports).
+  The object-name shape and its builder/parser (`ONBOARDING_VIDEO_PATH_RE` IS the SQL `storage_path`
+  CHECK and `onboarding_video_path_version_id()`'s pattern — lowercase, no flags), the watch rule
+  (`mergeRanges`, `playedFraction`, `watchVerdict`, `holdWatchVerdict`, `watchRecordFor`, `resumeAt`),
+  the three elapsed constants `complete_onboarding_video()` mirrors, the root hook's status
+  (`gettingStartedStatus`) and when it asks again (`gettingStartedNeedsReask`, the same rule), the
+  enrollment phase the root hook is handed (`gettingStartedEnrollPhase`, whose `'pass'` is
+  `gettingStartedEnrollPass`) and what a failed first answer means by the phase it lands in
+  (`gettingStartedFailedBeforePass`), the gate's input (`gettingStartedGateInput`), the three client time
+  bounds (`ONBOARDING_STATE_TIMEOUT_MS`, `ONBOARDING_LOAD_TIMEOUT_MS`, `ONBOARDING_COMPLETE_TIMEOUT_MS`),
+  what a student is told (`gettingStartedGiveUpCopy`, `gettingStartedStanding`), the problem-code coercion
+  `report_onboarding_video_problem()` mirrors, and the ONE interpreter of the Super Admin overview's facts
+  (`onboardingHealth`, `publishImpact`). SQL is the authority on who must watch and on what a completion
+  needs. See "Getting Started onboarding video (#69)".
 - `src/lib/voiceAccess.js` — who may open a voice session (pure). `voiceSessionVerdict()` is the
   ONE decision table behind `api/elevenlabs/signed-url.js`, which imports it: it fails CLOSED
   (`unavailable` → 503) and admits active staff without a subscription. Also the single source of
@@ -385,6 +401,31 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
   failure no longer reflows the page. The stage caps its **WIDTH** at `min(78vh,900px)*16/9` —
   capping `max-height` on a `aspect-ratio: 16/9` box leaves it full-width and pillarboxes the
   video, which is exactly the bug the old clamp would have caused.
+  ★ **That frame is also where focus goes after the player's OWN "Try again".** The press flips
+  the state to `signing`, which unmounts the button under the student's finger, and the browser
+  used to drop focus to `<body>` (WCAG 2.4.3) — on every lesson page, and on the Getting Started
+  gate, whose player is this component. React keeps the root `<div>` across the three returns, so it
+  is the one element that outlives the press: every return carries `ref={stageRef} tabIndex={-1}`
+  (a return without the ref detaches it; one without the tabIndex leaves a focused frame
+  unfocusable) and NOTHING else — no role, no name, no handler, so a lesson renders as it did — and
+  the button calls `refocusIfLost(stageRef)`. Pinned by `uiSafety` (the residue block after §28c),
+  mutation-tested, and proven in Chrome with real key presses on a lesson and on the gate.
+  ★ **Its focus ring is drawn INSIDE the frame and ABOVE the video** (the last block of
+  `src/index.css`). Every caller clips the frame — the learner card is `overflow-hidden`,
+  `.gs-stage` rounds and clips — so the scoped rings, 2px OUTSIDE the element, showed one edge of
+  four on a lesson and none on the gate. An outline pulled inside with a negative offset is not
+  enough: the `<video>` is positioned, so it paints AFTER the frame's own outline and hid the whole
+  ring whenever a video was showing (measured). So `.course-stage:focus-visible` drops its outline
+  and an `::after` paints the 2px ring last. Its `pointer-events: none` is load-bearing: the
+  overlay covers the whole video, and without it a click lands on the frame and never starts
+  playback (measured too). It overrides the scoped rings at the same specificity, so it must stay
+  AFTER every one of them. Pinned by `uiSafety` (the same block); measured in Chrome — all four
+  edges, message and video, lesson and gate, light and dark. ★ **And the same ring when the
+  `<video>` ITSELF has focus (S1)** — it is the first keyboard stop on a lesson and on the Getting
+  Started gate, page and card, and its own outline sat outside it and was clipped away (not one ring
+  pixel, measured). `.course-stage > video:focus-visible` draws no outline, and a SEPARATE rule,
+  `.course-stage:has(> video:focus-visible)::after`, paints the frame's ring: never a second selector
+  on the rule above, because a browser without `:has()` drops a whole selector list.
   ★ **Text lessons never get the black frame** (`lessonUsesMediaStage`, derived INSIDE `LessonCard`
   so the learner page and the student preview cannot answer it differently), and `LessonStage`'s
   other caller — the admin `max-w-md` lesson-editor preview, which keeps `adminView` — stays
@@ -501,6 +542,32 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
   would refuse to delete it, but relying on that is a safety net standing in for a design.
   `LessonVideoOrphans` remains the backstop for the cases no client code can reach (a crashed
   tab, a closed laptop). Pinned by `test/uiSafety.test.mjs` §19.
+  ★ **A DISCARDED upload stops being the lesson draft's video (RES-1 — high, and pre-existing in
+  production).** When the uploader drops the path the draft names (a replacement it ACCEPTED, a
+  Cancel, a Remove — `discardPending` is its only null), `notePendingVideoPath(null)` puts the draft
+  back on what the SAVED row holds — `savedLessonVideoRef`: its `storage_path`, `video_provider` and
+  `video_url`, for the same lesson id. It is the Getting Started drawer's T9V-L4 idiom. It runs only
+  when an upload WAS pending (`if (path || !dropped) return;`): Remove's own null with nothing pending
+  is no discard, so a removal the admin made stands (V-RES1-GUARD). The duration label that upload
+  PRE-FILLED goes back with it, to what the label said before (`prefilledLabelRef`
+  `{ id, path, label, before }`, recorded by `applyVideoPatch` when it pre-fills), and only while it
+  still reads what that upload put there — a label the admin wrote since stands (V-RES1-LABEL). Before
+  it: a saved video S, an upload A that verified, a Replace with B (which discards A, by design),
+  Cancel B, Save — the row named the deleted A, `saveLesson`'s old-path cleanup then deleted S as
+  "replaced", and Learn read "could not be authorized". Kept, the label also put the dropped upload's
+  length beside the row's own video, and a replacement that then finished could not pre-fill its own.
+  ★ **`saveLesson` proves a NEW video exists before writing it.** When `storage_path` changes,
+  `lessonVideoInStorage()` signs it once (Storage refuses to sign a missing object). A missing object
+  or a failed sign refuses the save — "The new video for this lesson isn’t in storage any more, so
+  nothing was saved…" — and writes nothing. It is the only guard for a draft restored from
+  `window.storage` (`course:<id>:lessonDraft`) that names an upload swept since.
+  ★ **An upload whose verification FAILED is swept at the next SAVE, in both editors (AUI-1) — a sixth
+  orphan case, beside the abandoned upload.** A refused pick discards nothing (see "Changing what a
+  course lesson video may be"), and a draft never names an upload that failed its check, so Dismiss
+  then Save dropped the only reference to it and the object stayed in the bucket for good. `saveLesson`
+  (through `removeMediaIfUnreferenced`) and the Getting Started `saveDraft` (through
+  `sweepOnboardingFile`) now remove a leftover pending path that is not the path being saved. Pinned by
+  `uiSafety` §19 (RES-1 twice, V-RES1-GUARD, V-RES1-LABEL) and §19/§28c (AUI-1), mutation-tested.
 - **Storage (three buckets):** PAID lesson **videos** live in the **private** `course-videos` bucket
   (`lessons/{course.id}/…`), served via short-lived **signed URLs** gated by `is_enrolled()` RLS —
   because a *public* Supabase bucket serves every object publicly and bypasses RLS on read, so a
@@ -523,6 +590,26 @@ To add a course to either catalog: an admin clicks **"New course"** (auto-genera
   its own chunk)** straight from the browser to `<ref>.storage.supabase.co` — never through Vercel.
   `LessonVideoUploader` is **module scope**, not declared inside `CourseProgram`, or it would
   remount and lose an upload on every keystroke elsewhere in the drawer.
+  ★ **Since #69 the uploader and the player have a second owner, and the lesson is the DEFAULT of
+  both.** `LessonVideoUploader` takes a `target` record (`LESSON_UPLOAD_TARGET` unless given one:
+  bucket, path builder, own-path test, tus resume-key scope, signer, discard, wording — whose
+  optional `messages` replace each shared refusal that names a lesson, read FIRST; a lesson passes
+  none and keeps `courseVideo.js`'s wording) plus an optional `onMediaFacts`; `SignedLessonVideo`
+  takes `signUrl` (default `signLessonVideo`) plus
+  optional observers (`mediaRef`, `onEnded`/`onTimeUpdate`/`onSeeking`, `onProblem` from EVERY
+  path into its error state, `onReady`). Every URL the BROWSER mints for an uploaded lesson video or
+  the Getting Started video comes from ONE function, `signPrivateVideo(bucket, path)` — not every
+  video URL in the app: an uploaded feature-guide video is a public `course-media` URL, a community
+  video attachment is batch-signed by `CommunityHub`, and the AI trainer's Scribe transcription signs a
+  lesson video on the server (`api/admin/course-trainer.js`). A lesson caller passes none of those
+  props, and `uiSafety` §28a pins that the transfer, the verification and the state machine stayed
+  shared and owner-blind. See "Getting Started onboarding video (#69)".
+  ★ **`SignedLessonVideo` names the bucket its signer signs in (TDR-8).** `PRIVATE_VIDEO_SIGNERS` is
+  keyed on the signer FUNCTION: `signLessonVideo` → the log tag `[course-videos]` and the lesson's
+  admin sentence, word for word as before; `signOnboardingVideo` → `[onboarding-videos]` and "This
+  Getting Started video’s file could not be authorized for playback…". Any other signer logs
+  `[private-video]` with a neutral sentence. It used to log every failure as `[course-videos]` and send
+  a Super Admin to look for a lesson in the wrong bucket. Pinned by `uiSafety` §28a.
   ★ **"Storage accepted the bytes" is not "ready".** `READY_TO_SAVE` has exactly one inbound edge,
   from `VERIFYING_PRIVATE_OBJECT`, where the app signs the object and loads its metadata from that
   signed URL. Save is disabled until then.
@@ -784,7 +871,8 @@ gated on **`students.legacy_migrate`**. Built by **#67**
 - ★ **SUPER ADMIN ONLY, AND THAT IS THE POINT.** `students.legacy_migrate` replaced `students.import`,
   which Operations Admin held. Activating a legacy student creates a real subscription and cohort
   seats with no payment recorded in this system — the `students.extend_access` reasoning (#47). The
-  old key is DELETED, not left dead. 22 permissions / **34 grants**.
+  old key is DELETED, not left dead. 22 permissions / **34 grants** after #67 (23 / **35** since #69
+  added `onboarding.manage`, Super Admin alone).
 - ★ **STAGED IS NOT ACTIVATED.** A roster is staged once into a durable job; every row is then
   `inactive`, `ready` or `blocked` (`validation_status` and `activation_state` are separate columns,
   so a valid row can be deliberately inactive). Staging creates no Auth user, no subscription, no
@@ -1053,34 +1141,37 @@ member together with any active term (`subscriptions_one_live_or_scheduled`), an
 - Capacity: `batch_seat_holders` counts live `active` terms only, so a scheduled student is not in a
   batch's occupancy until they start (imports are capacity-exempt anyway; the preflight shows both).
 
-### [src/BookkeeperPro.jsx](src/BookkeeperPro.jsx) — the entire app (~36.8k lines)
+### [src/BookkeeperPro.jsx](src/BookkeeperPro.jsx) — the entire app (~51.7k lines)
 
 > Note: lines are long; prefer `Grep` over reading the whole file. Line numbers below are anchors,
 > approximate as the file evolves.
 
 | Region | Lines (approx) | Contents |
 |---|---|---|
-| Routing + shared AI helper | 20–610 | URL/panel routing helpers (`TAB_ROUTES` L79, `readAppRoute` L219, `setPanelParam` L263), the voice-assistant literals (`VOICE_TAB_INFO`…), `callClaude()` (L563) — the single entry point every AI tool uses (see AI/proxy pattern) |
-| Domain data | 610–1175 | `COA_BASE` (L613), `COA_INDUSTRY` (L666), `INDUSTRY_NOTES` (L886), `VENDOR_PATTERNS` (L912), `COURSE_MODULES` (L1008), checklists, `TIPS` (L1148) |
-| Design system + helpers | 1175–1510 | colors `C` (L1177), `SHEEN` (L1230), `GLASS` (L1233), fonts `fontDisplay` (L1247) / `fontMono`, `downloadFile()` (L1257), `useCurrency()` (L1309), `CurrencyToggle()` (L1497) |
-| Auth / enrollment / account infra | ~1510–4880 | gate screens, `useEnrollmentGate` (L2336), `submitSubscriptionRequest` (L2435), `OverlayPortal` + `AccountModal`/`SidePanel` shells (~L3000), `AccountMenu` + the Account-Center components (`ProfileSettingsBody`/`AccountSettingsPanel`/`MembershipPlanModal`/`ExtendAccessModal`, ~L3174–3760), `VoiceAssistant` (L4367), `renderToolContent` switch (L4834) + `TabPanel` |
-| Root component | 4887–~6600 | `BookkeeperProToolkit` (L4887): `tab` + `accountPanel` state, sidebar `DEFAULT_STAGES` config (L5080), drag-drop reorder, rename/persist to `window.storage` (`sidebar:*` keys), and the **keep-alive render** (`visitedTabs` map). |
-| Tool components | ~8200–end | ~60 self-contained functional components |
+| Routing + shared AI helper | 20–~900 | URL/panel routing helpers (`TAB_ROUTES` L190, `readAppRoute` L347, `setPanelParam` L432), the voice-assistant literals (`VOICE_TAB_INFO`…), `callClaude()` (L873) — the single entry point every AI tool uses (see AI/proxy pattern) |
+| Domain data | ~900–1490 | `COA_BASE` (L923), `COA_INDUSTRY` (L976), `INDUSTRY_NOTES` (L1196), `VENDOR_PATTERNS` (L1222), `COURSE_MODULES` (L1318), checklists, `TIPS` (L1466) |
+| Design system + helpers | ~1490–1900 | colors `C` (L1495), `SHEEN` (L1549), `GLASS` (L1552), fonts `fontDisplay` (L1566) / `fontMono`, `downloadFile()` (L1578), `useCurrency()` (L1633), `CurrencyToggle()` (L1820) |
+| Auth / enrollment / account infra | ~1900–11239 | gate screens (`AuthScreen` L1924 …), `isEnrollmentTableMissingErr` (L3882), `useEnrollmentGate` (L3945), **the Getting Started block (#69, ~L4091–6875)** — `GettingStartedContext` (L4124) → `useGettingStarted` (L4184) → `recordOnboardingCompletion` (L4332) → `usePauseWhenHidden` (L4367) → `useRecheckOnReturn` (L4407) → `GettingStartedPlayer` (L4528) → `GettingStartedBody` (L4746) → `GettingStartedScreen` (L4913, the gate) → `useReplayRecorder` (L5132) → `GettingStartedPage` (L5223) → `GettingStartedCard` (L5416), then the Super Admin half: `onboardingUploadTarget` (L5681), `sweepOnboardingFile` (L5710), `GS_EDITOR_SUBTITLE` (L5930), `GettingStartedVideoAdmin` (L5994); `submitSubscriptionRequest` (L6955), `OverlayPortal` + `AccountModal`/`SidePanel` shells (~L9023–9226), `AccountMenu` + the Account-Center components (`ProfileSettingsBody`/`AccountSettingsPanel`/`MembershipPlanModal`/`ExtendAccessModal`, ~L9227–10231), `VoiceAssistant` (L10638), the `renderToolContent` (L11156) switch + `TabPanel` (L11228) |
+| Root component | 11239–~13619 | `BookkeeperProToolkit` (L11239): `tab` + `accountPanel` state, sidebar `DEFAULT_STAGES` (L11687) config, drag-drop reorder, rename/persist to `window.storage` (`sidebar:*` keys), the auth gate switch (with #69's `gsShellUid` / `gsGateUid` latches beside it), and the **keep-alive render** (`visitedTabs` map — the chokepoint, ~L13529). |
+| Admin screens | ~13621–26663 | the shared admin kit (`AdminNotice` L13685 …), `AdminStaffRoles` (L14475), `AdminBatches` (L14823), Financial Management + its parts (`FINANCE_SUBTABS` L15513 … `FinancialManagement` L20136), `Communications` (L19536), `MeetingsTasks` (L21242), `BULK_EMAIL_RETRY_DELAYS_MS` (L21925) + `emailOutcomeUnclear` (L21937, the one email-outcome rule), `AccessRequests` (L21943), `AdminEnrollments` (L22322), `StudentImports` (L26563) |
+| Tool components | ~26664–end | `RestrictedTab` (L26672) + the chokepoint's `tabAccessView` (L26792) / `TabAccessCheck` (L26800), `MembershipPanel` (L26821), `Dashboard` and ~60 self-contained functional components |
 
-**Notable tools → approximate line:** `Dashboard` 8236, `ProgressRankings` ~14740 (the `progress`
-tab — learner report + leaderboard + staff report), `CoaGenerator` 8521, `Course` 8624,
-`CourseProgram` ~8805 (single-course Supabase video engine — builder + PDF certificate),
-`CourseCatalog` ~9966 (prefix-parameterized multi-course catalog) + the `QBOMastery` (`qbo-`) /
+**Notable tools → approximate line:** `Dashboard` 27138 (`GettingStartedCard` sits under its hero), `ProgressRankings` ~27835 (the `progress`
+tab — learner report + leaderboard + staff report), `CoaGenerator` 28179, `Course` 28282,
+`CourseProgram` ~31061 (single-course Supabase video engine — builder + PDF certificate; the shared
+private-video plumbing sits above it: `signPrivateVideo` 28874 → `lessonVideoInStorage` 28903 →
+`PRIVATE_VIDEO_SIGNERS` 28919 → `SignedLessonVideo` 28974 → `LessonVideoUploader` 29441),
+`CourseCatalog` ~33763 (prefix-parameterized multi-course catalog) + the `QBOMastery` (`qbo-`) /
 `InterviewStrategyCatalog` (`interview-`, the `winstrat` subtab) / `ResumeStrategy` (`resume-`) wrappers right after it,
-`BankFeed` 10466, `StatementConverter` 10665, `CommunityHub` ~12359 (the community forum — see the
-Community section above; the forum suite `MemberAvatar` 11151 → `useCommunityBell` 11848 →
-`CommunityPostCard` 12102 sits just above it), `ProChat` 13281,
-`AuthenticBranding` 14445, `CoverLetterGenerator` ~17900 (tab id `proposal`, route `/proposal-generator` —
+`BankFeed` 36340, `StatementConverter` 36539, `CommunityHub` ~39249 (the community forum — see the
+Community section above; the forum suite `MemberAvatar` 37049 → `useCommunityBell` 38583 →
+`CommunityPostCard` 38877 sits above it), `ProChat` 41124,
+`AuthenticBranding` 42288, `CoverLetterGenerator` ~43138 (tab id `proposal`, route `/proposal-generator` —
 replaced the old 7-document-type `ProposalGenerator`; paste a job post → industry auto-detect → 3 letter
 variations + a timecoded video-intro script + an interview-prep pack from ONE `callClaude` call at
 `max_tokens: 8000`. Pure logic lives in `src/lib/coverLetterIndustry.js` (industry table + keyword
 detector) and `src/lib/partialJson.js` (tolerant JSON + truncated-prefix recovery), both covered by
-`npm test`), `BookkeeperPortfolioGenerator` ~20000 (tab id `portfoliogenerator`, route
+`npm test`), `BookkeeperPortfolioGenerator` ~34698 (tab id `portfoliogenerator`, route
 `/profile-optimization/portfolio-generator`, sidebar Job Application → Profile Optimization between
 Resume Winning Strategy and Book 1-on-1 — a **two-pane authoring workspace**: 13 editor sections on
 the left, a live sandboxed preview on the right, and a download in **two formats** — one
@@ -1093,11 +1184,11 @@ the whole engine in `src/lib/portfolioGenerator.js`; **both are lazy-loaded toge
 somebody picks a résumé, and `jspdf` + `html2canvas` load only when somebody chooses PDF. Layout is
 the `.pf-tool` **container query** in `src/index.css`, not a media query. Pinned by
 `test/portfolioGenerator.test.mjs` (197 tests, incl. source scans of all seven wiring sites, both
-iframe sandboxes and the export flow)), `EngagementLetter` 15168, `EmailTemplates` 15717,
-`PainPointsGenerator` 15970, `IndustryAccounting` 16330, `USTax101` 16466,
-`MonthlyWorkflow` 16560, `MonthEndChecklist` 16650, `InvoiceCreator` 16881, `CoachAlexChat` 17369,
-`CPAAIChat` 17399, `AccountingCalculators` 18201,
-`LinkedInOptimizer` 18405, `MockInterviewSimulator` 18561 (a **guided-video + external-link page** —
+iframe sandboxes and the export flow)), `EngagementLetter` 43804, `EmailTemplates` 44353,
+`PainPointsGenerator` 44606, `IndustryAccounting` 44966, `USTax101` 45102,
+`MonthlyWorkflow` 45196, `MonthEndChecklist` 45286, `InvoiceCreator` 45517, `CoachAlexChat` 46009,
+`CPAAIChat` 46039, `AccountingCalculators` 46841,
+`LinkedInOptimizer` 46903, `MockInterviewSimulator` 47064 (a **guided-video + external-link page** —
 admin-uploaded explainer video + a "Open Mock Interview Simulator" button to the external
 `https://app.sesame.com/`; Supabase-backed via the `feature_guides` table — **not** the old internal
 AI simulator. The CTA is **gated behind watching the guide video** — grey/disabled until the video ends
@@ -1106,9 +1197,9 @@ completion persists in `feature_video_completions` and re-locks when the admin r
 takes an **`embedded`** prop and now renders as the **2nd sub-tab inside `InterviewPrep`** (Job Interview
 Mastery), not a standalone sidebar item; when `embedded` it drops its own `SectionHead`. The legacy
 `mockinterview` tab id is kept only as a defensive render-switch redirect → `<InterviewPrep initialSub="mock" />`),
-`DiscoveryCallSimulator` 18973,
-`SOPGenerator` 19280, `ClientHealthScore` 19945, `CapacityPlanner` 21029, `PaymentTracker` 21213,
-`QBDiagnostic` 21965. (Note: `ClientHealthScore`,
+`DiscoveryCallSimulator` 47472,
+`SOPGenerator` 47779, `ClientHealthScore` 48444, `CapacityPlanner` 49528, `PaymentTracker` 49712,
+`QBDiagnostic` 50464. (Note: `ClientHealthScore`,
 `CapacityPlanner`, and `PaymentTracker` are among ~10 components currently defined but wired to no
 route/sidebar entry — see the 2026-07-14 cleanup audit; pending a product call to delete or restore.)
 
@@ -1118,7 +1209,7 @@ A single `tab` string in the root selects which tool renders, and navigation is 
 keep-alive** (see below). Four pieces must stay in sync when adding/removing a tool:
 
 1. **Sidebar config** (`DEFAULT_STAGES` array): `{ id, number, label, groups: [{ key, label, tabIds }], tabs: [{ id, label, icon }] }`. Each group carries a stable `key` (label-independent — see below).
-2. **`renderToolContent(tabId, handlers)`** — a `switch (tabId)` at **module scope** (just above the root component) that returns each tool's element; `handlers` carries the few props tools need (`goto`, the two admin badge refreshers, `interviewSub`). It is rendered through the memoized **`TabPanel`** (see keep-alive below). This replaced the old in-root `renderTabContent` closure and, before that, the `{tab === 'id' && <Cmp/>}` chain.
+2. **`renderToolContent(tabId, handlers)`** — a `switch (tabId)` at **module scope** (just above the root component) that returns each tool's element; `handlers` carries the few props tools need (`goto`, the admin badge refreshers `onAccessCount` / `onEnrollCount` / `onImportCount`, #69's `onOnboardingHealth`, and `interviewSub`). It is rendered through the memoized **`TabPanel`** (see keep-alive below). This replaced the old in-root `renderTabContent` closure and, before that, the `{tab === 'id' && <Cmp/>}` chain.
 3. **`TAB_ROUTES`** (module scope, top of file) — maps each tab id to a stable URL path (e.g. `qbomastery → /courses/quickbooks-online-mastery`). Powers deep-linking, refresh, and "open in new tab"; `VALID_APP_TABS` is derived from it.
 4. **Dashboard roadmap tiles**: optional `{ id, label, desc, icon, color }` entries.
 
@@ -1160,8 +1251,8 @@ keep-alive** (see below). Four pieces must stay in sync when adding/removing a t
   so a tool mounts on first visit and then **stays mounted** (hidden via the `hidden` attribute) — its
   local state, scroll, and in-flight work survive tab switches, and Supabase-backed tools
   (`CourseProgram`/`CourseCatalog`) don't refetch on return. `TabPanel` is `React.memo`'d and all its
-  props are referentially stable (`setTab`/`rememberScroll` are `useCallback([])`, the badge refreshers
-  `useCallback([isAdmin])`), so **hidden panels skip every root re-render** — only the active tab
+  props are referentially stable (`setTab`/`rememberScroll` are `useCallback([])`, each badge refresher
+  a `useCallback` on its own capability boolean), so **hidden panels skip every root re-render** — only the active tab
   re-renders, and a tab switch reconciles exactly two panels. Don't pass a TabPanel a prop that changes
   identity per render or you silently re-enable app-wide re-renders. `visitedTabs` is deliberately
   **never pruned** (unmounting a hidden tab would kill in-flight AI work — accepted memory trade-off).
@@ -1169,6 +1260,16 @@ keep-alive** (see below). Four pieces must stay in sync when adding/removing a t
   here:** this same `visitedTabs.map` is the entitlement chokepoint — a tab the user's plan can't open
   renders `RestrictedTab` instead of its `TabPanel` (see the "Plan-based access" bullet in
   Authentication). The sidebar/tiles are filtered cosmetically; this render is the real boundary.
+  ★ **The chokepoint asks the pure `tabAccessView(tabId, { settled, adminAllowed, planAllows })`**
+  (T12B-D1), which answers one of four views. `'checking'`: an ADMIN tab (one listed in
+  `ADMIN_TAB_PERMISSION`) before `my_staff_context()` has answered (`settled = staffReady ||
+  staffDegraded`; AuthProvider gives up at 8 s) renders the neutral `TabAccessCheck` ("Checking your
+  access…", `role="status"`), never a refusal. `'panel'`: the tool. `'role'`: a refused admin tab
+  renders `RestrictedTab reason="role"` — "Your account can’t open this screen", naming the viewer's
+  active staff role or saying no membership plan includes it, with Back to Dashboard only and nothing
+  for sale. `'plan'`: any other refused tab gets the plan upsell, unchanged. Who sees a panel is
+  unchanged; before it, a deep-linked admin tab flashed the plan upsell at a Super Admin until the
+  staff context landed, and a staff member refused by ROLE was told to "Upgrade or renew".
 
 **Sidebar customization is split by concern:**
 - **Labels are global + admin-controlled** via the Supabase `sidebar_settings` table (admin-write,
@@ -1184,6 +1285,11 @@ keep-alive** (see below). Four pieces must stay in sync when adding/removing a t
 - **Order + collapse/expanded-groups stay per-user** in `window.storage` under `sidebar:*` keys
   (unchanged). `expandedGroups` keys off the group `key`, not its label, so collapse-state survives
   a rename. Do **not** add a label key to `LEGACY_KEYS` — labels now live in Supabase.
+  ★ **A new default tab in a FLAT stage needs no layout-version bump.** `mergeStoredWithDefaults`
+  re-inserts a default the saved layout predates at its default-RELATIVE position — at index 0 when it
+  has no earlier neighbour, ahead of a student's own order, which it leaves intact. That is how #69's
+  **Getting Started** became the FIRST Home item in every saved layout. Pinned by
+  `test/sidebarLayout.test.mjs`.
 - ★ **GROUPED STAGES PERSIST THEIR OWN ORDER SINCE v5, AND UNTIL THEN THEY SILENTLY COULD NOT.**
   A grouped stage renders from `groups[].tabIds` — `stage.tabs` is collapsed to an id→object
   dictionary first, so its array order is discarded — and `mergeStoredWithDefaults` re-stamped
@@ -1285,16 +1391,47 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   around); ② the **enrollment/payment gate** (see the Enrollment bullet below) — for unpaid
   non-admins it renders `<EnrollmentPaywall/>` / `<EnrollmentPendingScreen/>` and **subsumes** the
   pending-approval screen; ③ the legacy admin-approval gate — `approval_status==='pending'` →
-  `<PendingApprovalScreen/>` (active only when enrollment is off or not migrated). `AuthScreen`
+  `<PendingApprovalScreen/>` (active only when enrollment is off or not migrated). (The ordering now
+  lives in the pure `resolveGateScreen()` in `src/lib/gateScreen.js`, #49 — see "Changing WHO the auth
+  gate holds".) After every hold, #69 adds a last arm that decides NO access: a newly approved student
+  who must watch the **Getting Started** video sees `GettingStartedScreen` once before the dashboard,
+  and that arm fails OPEN — see "Getting Started onboarding video (#69)". `AuthScreen`
   (defined just above the root component) is the login/signup/reset UI, built from the design
   tokens (`C`, `SHEEN`, `GLASS`, `fontDisplay`, `LOGO_DATA_URI`).
 - **Admin-approval gate (temporary, Phase-1.5):** new email/Google signups default to
   `approval_status='pending'` and are held on `PendingApprovalScreen` until an admin approves them in
   the **Access Requests** admin tab (`accessrequests` route; admin-only sidebar entry + pending-count
-  badge; component `AccessRequests`). Approve/reject writes `profiles` directly (RLS:
-  `profiles_admin_select` / `profiles_admin_update` — users can't self-approve) and emails the user via
-  the **env-gated** serverless fn `api/notify-access.js` (Resend; non-fatal if `RESEND_API_KEY` /
-  `RESEND_FROM` unset). Backend defense-in-depth: `public.is_approved()` gates the course/feature
+  badge; component `AccessRequests`). Approve/reject goes through the SECURITY DEFINER
+  `admin_review_access_request()` (gated on `access_requests.review` since #45, which revoked the
+  direct `profiles` UPDATE — users still can't self-approve), then emails the user via the
+  **env-gated** serverless fn `api/notify-access.js` (Resend; non-fatal if `RESEND_API_KEY` /
+  `RESEND_FROM` unset). ★ **Since #69 the browser sends ONLY `{ userId, status }`, after the decision
+  has committed.** The function reads that account's own row with the REVIEWER's JWT
+  (`profiles_admin_select` admits `access_requests.review` holders — no service client, no new SQL),
+  mails the row's `email`, refuses (409) unless the row's `approval_status` IS the decision being
+  announced, refuses a migrated account still being set up (`ACCESS_REQUEST_IMPORT_TARGET`), answers
+  503 — never "not found" — when the read itself failed, and logs status codes, never the provider's
+  body. It used to take the address, name and reason from the body: the hole `decision` closed on
+  2026-09-24. Its approved copy no longer promises a dashboard (an approved signup who has not paid
+  is asked to choose a plan). Pinned by `test/notifyAccessDecision.test.mjs`. ★ **A body that names
+  a decision but carries no `userId` is a STALE CLIENT (TDR-7):** a page opened before #69 posts
+  `{ email, fullName, status, reason }`, and it is refused as 400 `{ code: 'stale_client' }` —
+  recognised by the missing `userId`, the body's email never read — and logged as `[notify-access]
+  refused a decision with no userId …`, with no address. The decision itself is already recorded;
+  only its email is lost, and the stale tab reads ` · email not sent` (see Deployment). The panel's
+  notice ends with what became of the email: ` · email sent`; ` · email already on its way` (a 200
+  `{ ok: false, skipped: 'in_flight' }`, answered ONLY when the provider's 409 is named
+  `concurrent_idempotent_requests` — another request is still sending that same decision's email; not
+  an error); ` · email not configured`; ` · email may not have been sent` (NO clear answer: a 502
+  whose code is `resend_timeout`, `resend_failed`, a provider 5xx or none, a 504, or a request that
+  never answered — `emailOutcomeUnclear()`, the ONE rule Access Requests and Enrollments share
+  (T9V-L2, EMAIL-4, TDR-5) — so it may have been delivered); or ` · email not sent` (a clear no). Any
+  OTHER provider 409 is a refusal, 502 `{ code: 'resend_409' }`, and so reads ` · email not sent`:
+  `invalid_idempotent_request` (this decision's key was already used with a different payload, so an
+  email for it went out earlier), or a 409 whose body cannot be read. The Enrollments decision notice
+  uses the same endings (sent / already on its way / may not have been sent / not sent / not
+  configured): a 502 is read for its code; a 504, or a request that never answered, is unclear. Backend
+  defense-in-depth: `public.is_approved()` gates the course/feature
   `*_read` RLS too. Toggle the whole feature with `REQUIRE_ADMIN_APPROVAL` (module const in
   BookkeeperPro.jsx, default on; off via `VITE_REQUIRE_ADMIN_APPROVAL=false`). SQL +
   walkthrough: [db/2026-06-29-user-approval.sql](db/2026-06-29-user-approval.sql) +
@@ -1322,37 +1459,118 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   expire** keeps the student blocked with a resubmit path. Receipt preview uses `createSignedUrl`
   (the app's **first** signed-URL use — everything else is public-bucket `getPublicUrl`). Emails
   via env-gated `api/notify-enrollment.js` (`RESEND_API_KEY`/`RESEND_FROM`, optional
-  `NOTIFY_ADMIN_EMAIL` + `APP_URL` for the "Review in Enrollments" button; the submitted alert
-  carries a Type: Renewal/New row). Three actions: `submitted` (**TWO emails** — the admin alert,
-  plus a student confirmation carrying the onboarding video `ONBOARDING_VIDEO_ID` and the
-  processing-hours SLA. `ONBOARDING_VIDEO_ID` is still a hardcoded module const in
-  `api/notify-enrollment.js`; the SLA is **not** — since 2026-08-23 it is
-  `ENROLLMENT_PROCESSING_NOTE`, **imported** from `src/lib/enrollmentIntake.js` so the pending
-  screen and the email physically cannot state different turnarounds (see "Changing the
-  enrollment processing-hours copy" below). Neither is admin-editable like the `payment_settings`
-  copy on the same screen — move them there if they must change without a deploy;
-  JWT-ownership auth),
+  `NOTIFY_ADMIN_EMAIL` + `APP_URL`). Four actions: `submitted` (**TWO emails** — the
+  admin alert, then, only once the alert has succeeded, a student confirmation carrying the
+  processing-hours SLA and, for a NEW enrollment only, the onboarding video `ONBOARDING_VIDEO_ID` — a
+  hardcoded YouTube id in `api/notify-enrollment.js`, unrelated to #69's in-app Getting Started video.
+  The SLA is **not** hardcoded — since 2026-08-23 it is `ENROLLMENT_PROCESSING_NOTE`, **imported**
+  from `src/lib/enrollmentIntake.js` so the pending screen and the email physically cannot state
+  different turnarounds (see "Changing the enrollment processing-hours copy" below). Neither is
+  admin-editable like the `payment_settings` copy on the same screen — move them there if they must
+  change without a deploy. JWT-ownership auth: the row is re-read with the student's own JWT.
+  ★ **#69: THE STUDENT COPY GOES ONLY TO THE ACCOUNT'S `profiles.email`** — never to the
+  `enrollment_requests.email` the student types, which let any signed-in account have the business's
+  branded email delivered to a stranger — and with no readable account address there is no student
+  copy at all; the admin alert still goes. ★ **The facts are read server-side, best-effort, each
+  bounded at 4 s** and all with the student's JWT: the ACCOUNT (the alert's "Email" is the account
+  address; a different name or address typed on the form shows beside it, labelled as such), the
+  PACKAGE — name, tagline, price, length and `entitlement_summary` scope — from `enrollment_plans` by
+  `plan_key` (the row's own `plan_name` snapshot stands in for the NAME only when that read fails, and
+  the price, length, scope and cohort lines are then left out), the KIND from `request_kind` (new /
+  renewal / upgrade / extension; an extension states its days, and a row recorded `new` still reads as
+  a renewal when the student has held a term before), and the COHORT, a VIP fact read from the plan's
+  `community_segment`, never its key. None of them can block or skip the admin alert),
   `decision` (admin→student — ★ since 2026-09-24 the body names ONLY `{ requestId, status }`; the
-  package and rejection reason are read from the request row and the RECIPIENT from the student's
-  `profiles` row (never the student-typed `enrollment_requests.email`), both with the reviewer's own JWT,
-  and the send is refused (409) unless `status` is the decision actually recorded. It used to take
-  `email`/`fullName`/`planName`/`reason` from the body, so any `enrollments.review` holder could send
-  the business's own "your enrollment is approved" email to any address with any text — the #61 rule,
-  "the page describes, the server resolves", now holds here too; pinned by
-  `test/notifyEnrollmentDecision.test.mjs`), `test` (admin-only diagnostic → the **"Test email"** button in the
-  Enrollments toolbar; verifies the admin JWT server-side and reports sent/not-configured/provider
-  error). The admin **recipient** resolves `NOTIFY_ADMIN_EMAIL` → the admin-editable
-  `payment_settings.notify_email` ("Proof / support email" field, read with the caller's JWT) →
-  address in `RESEND_FROM`; the GET health check reports `{ ok, hasKey, hasFrom, adminRecipient }`
-  (env-only, no address). **Supabase Auth's SMTP/Resend settings do NOT power this** — it needs its
+  row is read with the reviewer's own JWT, the RECIPIENT is the student's `profiles` row (never the
+  student-typed `enrollment_requests.email`), and the send is refused (409) unless `status` is the
+  decision actually recorded. It used to take `email`/`fullName`/`planName`/`reason` from the body,
+  so any `enrollments.review` holder could send the business's own "your enrollment is approved" email
+  to any address with any text — the #61 rule, "the page describes, the server resolves", now holds
+  here too. ★ **#69: what an approval STATES comes from `enrollment_decision_email_facts()`**, asked
+  with the reviewer's JWT — the catalog's package name, the **Manila** day the granted term runs to,
+  the cohort, and the Getting Started sentence only when the server says `getting_started_required ===
+  true` — and never "everything is unlocked", which was false for Essentials. Only a term that is
+  active or scheduled with its end still ahead is ever stated; a term not yet open says when it opens,
+  carries no sign-in button and no Getting Started sentence; a rejected or expired decision states no
+  term at all. ANY facts failure — a pre-#69 database, a 5xx, a timeout, an answer about another
+  decision — sends the generic copy rather than refusing a decision that was recorded. Pinned by
+  `test/notifyEnrollmentDecision.test.mjs`), plus `test` (admin-only diagnostic → the **"Test email"**
+  button in the Enrollments toolbar; verifies the admin JWT server-side and reports
+  sent/not-configured/provider error — it stays on the raw `sendResend` so the provider's own detail
+  reaches the admin) and `import_onboarded` (#67, the migration's own addresses). The admin
+  **recipient** resolves `NOTIFY_ADMIN_EMAIL` → the admin-editable `payment_settings.notify_email`
+  ("Proof / support email" field, read with the caller's JWT) → address in `RESEND_FROM`; the GET
+  health check reports `{ ok, hasKey, hasFrom, adminRecipient }` (env-only, no address).
+  ★ **#69's sending rules, for the alert, both student-facing enrollment emails and the access
+  decision:** every one goes through `sendEmail()` (`api/_lib/email.js`) with a **text part**
+  (`plainTextEmail()`, built from the same object as the HTML, every link spelled out, every row
+  folded to one line so a typed value cannot forge a row of its own) and a **STABLE idempotency
+  key** — `enrollment-submitted-admin-<id>`, `enrollment-submitted-student-<id>`,
+  `enrollment-decision-<id>-<status>-<epoch ms of the request's reviewed_at>`,
+  `access-decision-<userId>-<status>-<epoch ms of the recorded decision>` — so a double click or a
+  retry is one email. ★ **A decision made AGAIN is a new email (EMAIL-2, TDR-4).** A request a Super
+  Admin reopens (#66) and decides again — a corrected reason, a re-approval that stacked a new term —
+  used to meet a provider 409 for 24 h under the old key, and was reported "already on its way" while
+  nothing was sent. `reviewed_at` is stamped by `admin_finalize_enrollment` (`now()`) and by both
+  decline paths; a row with no readable moment keys on `'0'`. A key must match `[A-Za-z0-9:_-]{8,128}`:
+  `sendEmail()` SILENTLY swaps any other for a random UUID, which is why timestamps are epoch ms,
+  never ISO. ★ **Only a provider 409 NAMED `concurrent_idempotent_requests` answers
+  `{ ok:false, skipped:'in_flight' }`,** and it is NOT recorded, so it can never overwrite an earlier
+  `sent`. Resend also answers 409 `invalid_idempotent_request` when a key was already used with a
+  DIFFERENT payload. Both decision handlers answer that, and a 409 whose name cannot be read, as a
+  refusal: 502 `{ code: 'resend_409' }`. `submitted` records it as `provider_unclear`, because under the
+  request's own key it means an alert for that request already went out. `sendEmail({ classify409:
+  true })` adds `conflict: 'in_flight' | 'payload' | 'unknown'`, from the pure `resendConflictKind()` in
+  `api/_lib/email.js`; without the flag the answer stays the bare `{ ok:false, code:'resend_409' }` that
+  `commSend.js`, the migration and the onboarding notice rely on. ★ **The text part's fold covers
+  EVERY Unicode mandatory line break** — CR, LF, VT, FF, NEL (U+0085), LINE SEPARATOR (U+2028) and
+  PARAGRAPH SEPARATOR (U+2029) — through `foldLineBreaks()` in `api/_lib/email.js` (EMAIL-3). It finds
+  each whitespace run once (`WHITESPACE_RUN`, NEL included) and folds it to one space only when it holds
+  a mandatory break (`MANDATORY_BREAK`), in LINEAR time (EMAIL3-PERF): the single regex it replaced
+  backtracked quadratically on a long run of spaces with no break (80,000 spaces: 18 s), and the folded
+  values include student-typed columns with no length CHECK. `test/notifyEnrollmentSubmitted.test.mjs`
+  pins 100k spaces under 1 s, and the same output as the old pattern on all 16,104 strings of up to four
+  characters over the relevant alphabet. `notify-enrollment`'s `clean()` and `notify-access`'s greeting
+  fold NEL by name, because JS's `\s` does not include it. ★ **Both decision emails have TWO burst
+  guards** (`notify-enrollment`'s `decision` and `notify-access`), each per warm instance and run after
+  the decision is verified. The first counts sends of ONE decision, never a reviewer's run of decisions:
+  10 a minute, keyed `<reviewer id>:<decision key>` (EMAIL-1). Keyed on the reviewer alone, it answered
+  429 to every email after the tenth of a bulk approve or reject in a minute, while the dialog said "the
+  student is emailed". The second caps ONE reviewer's decision emails at 60 a minute, every decision
+  together (key `decisions:<reviewer id>`, `REVIEWER_DECISIONS_PER_WINDOW`; EMAIL1-R1), checked AFTER the
+  per-decision guard, so a loop on one decision never spends it. It exists because neither the decisions
+  themselves nor the provider's 24-hour de-duplication bound the volume: an `enrollments.review` holder
+  can re-stamp `reviewed_at` on a decided request (#48's column grant; #66 locks only the status), and
+  `admin_review_access_request()` re-stamps `approved_at`/`rejected_at` on every call — each re-stamp is a
+  new key. A bulk run goes one row at a time (about 1.5–3 s a row) and stays far below 60; one that
+  reaches it gets 429, which the Enrollments bulk run waits out. `submitted`, `import_onboarded` and
+  `test` keep the per-caller guard. A student-facing email's
+  **Reply-To** is `studentReplyTo()`:
+  `payment_settings.notify_email` → `NOTIFY_ADMIN_EMAIL` → omitted — **never `RESEND_FROM`**, typically a
+  no-reply mailbox — and with no Reply-To the copy drops its "just reply to this email". **Links** use
+  `APP_URL`; on Vercel there is NO fallback (a preview deployment shares production's database), and
+  the request's own host is trusted only by `npm run dev`. The alert's button opens
+  `/admin/enrollments?request=<id>`: `AdminEnrollments` resolves it only after a load has SUCCEEDED —
+  into the filter its status lives under, search and package filter cleared, the card marked
+  `data-enroll-focus` and focused — then drops the param with `replaceState`, and says "not found" only
+  after a load that worked. **Supabase Auth's SMTP/Resend settings do NOT power this** — it needs its
   own Vercel env vars (or a Supabase Edge Function + function secrets off-Vercel). Receipts are
   never attached; the client submit fires the alert best-effort (never blocks the student).
   **Notify audit trail:** the `submitted` handler stamps the send outcome onto the request row
   (`enrollment_requests.notify_status`/`notified_at`/`notify_detail`) via the SECURITY DEFINER
   `record_enrollment_notification()` RPC (owner-or-admin guard — mirrors `approve_subscription`, so
   the function's student JWT can write without a broad UPDATE policy or a service-role key); each
-  Enrollments card shows a green **"Admin emailed"** or amber/red **"Email not sent — …"** badge
-  (`AdminEnrollments`' `NotifyBadge`) so a misconfigured admin email isn't invisible. All best-effort
+  Enrollments card shows `AdminEnrollments`' `NotifyBadge` — **"Review alert sent"**, **"Review alert
+  not sent — no key | no sender | no recipient | provider"**, and since EMAIL-4 **"Review alert may not
+  have been sent"** (amber, `notify_status = 'provider_unclear'`, tip "The email provider gave no clear
+  answer, so the enrollment review alert may or may not have reached the configured administrator.") —
+  so a misconfigured admin email isn't invisible. ★ **`notify_status` gained `provider_unclear`
+  (EMAIL-4)**, with no SQL change: the column has no CHECK and `record_enrollment_notification()` stores
+  any status up to 40 characters. An alert send with no clear answer may have been delivered, so it is
+  recorded as `provider_unclear`, its slug in `notify_detail`: `resend_timeout`, `resend_failed`, a
+  provider 5xx, or a 409 not named "in progress". `provider_error` now means a refusal (a provider 4xx,
+  or a 429 after retries). Both stay retryable, since only `sent` stops a re-POST, and the student
+  confirmation still goes only after an alert that SUCCEEDED. All best-effort
   (never blocks the response); older rows/installs without the migration just show no badge.
   See [db/2026-07-08-enrollment-notify-status.sql](db/2026-07-08-enrollment-notify-status.sql).
   **Enrollment intake form (#42):** the paywall's `form` step is the Google Apps Script
@@ -1560,7 +1778,7 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   staff-activation-consistency (#50) → access-request-staff-target (#51) →
   student-progress-rankings (#52) → progress-rankings-followup (#53) →
   progress-course-family-scoping (#54) → approve-rpc-grant-revoke (#55) →
-  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61) → meetings-tasks (#62) → management-hardening (#63) → finance-daily-income (#64) → course-lesson-assets (#65) → enrollment-decision-lock (#66) → legacy-student-migration (#67) → legacy-migration-round2 (#68)** — see the Staff-authorization
+  community-staff-authority (#56) → lesson-video-quicktime (#57) → financial-management (#58) → finance-parity (#59) → enrollment-management (#60) → communications (#61) → meetings-tasks (#62) → management-hardening (#63) → finance-daily-income (#64) → course-lesson-assets (#65) → enrollment-decision-lock (#66) → legacy-student-migration (#67) → legacy-migration-round2 (#68) → getting-started-video (#69)** — see the Staff-authorization
   and Progress & Rankings sections for what each does. **#67**
   ([db/2026-09-25-legacy-student-migration.sql](db/2026-09-25-legacy-student-migration.sql), fold **§54**)
   is the legacy Thinkific migration and the `scheduled` subscription status — see the Student Imports
@@ -1570,7 +1788,16 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   is its second round: Silver and Essentials rosters, seats from the paid term, the batch-gap refusal,
   the higher-plan-wins rule, the grandfathered block, the sender/reply-to split, and the plan RENAME
   (`vip` → VIP Package, `silver_self_paced` → Silver · Self-Paced, `sampler` → Essentials; the old product
-  names move to `tagline`). It restates `app_error_catalog()` (133 codes, + `LEGACY_BATCH_GAP`). **#66**
+  names move to `tagline`). It restates `app_error_catalog()` (133 codes, + `LEGACY_BATCH_GAP`). **#69**
+  ([db/2026-09-30-getting-started-video.sql](db/2026-09-30-getting-started-video.sql), fold **§56**)
+  is the Getting Started onboarding video — see its section. It restates the staff seed
+  (+ `onboarding.manage`, Super Admin alone: 23 permissions / 35 grants) and `app_error_catalog()`
+  (141 codes, + eight `ONBOARDING_VIDEO_*`), both **copied by a script** from #67 §1 and #68 after
+  comparing each with production. Additive: nobody is gated until a Super Admin publishes a version.
+  Its CURRENT file (md5 `3b62d98d…`, with the publish re-signed to take `p_expected_live_id` and the
+  attach no-op) was **applied to production on 2026-10-02** as one transaction, right after a
+  forced-rollback rehearsal on the live catalog — and, before that, twice on the shadow project, where all
+  13 `#69` audit entries pass. **#66**
   ([db/2026-09-24-enrollment-decision-lock.sql](db/2026-09-24-enrollment-decision-lock.sql), fold
   **§53**) makes a DECIDED enrollment request final: #48's column grant let every
   `enrollments.review` holder PATCH `status`, and both existing guards fire only on a move TO
@@ -1669,9 +1896,19 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   (an action bar pinned *below* the scrolling body). Header, body and footer are three rows of one
   flex column, so **a drawer never needs `sticky top-0`/`sticky bottom-0`** — the body alone is
   `flex-1 overflow-y-auto overscroll-contain`. `SidePanel` is the preferred surface for a **long
-  editing form**. Consumers: `AccountSettingsPanel` (`sm:max-w-lg`) and the **course lesson editor**
-  (`CourseProgram.renderLessonEditor`, `sm:max-w-xl lg:max-w-2xl`, Cancel/Save in `footer`,
-  `canClose={!savingLesson && !uploading}`). ★ That editor was a hand-rolled `fixed inset-0` overlay
+  editing form**. Consumers include `AccountSettingsPanel` (`sm:max-w-lg`), the **course lesson
+  editor** (`CourseProgram.renderLessonEditor`, `sm:max-w-2xl lg:max-w-3xl xl:max-w-4xl`, Cancel/Save
+  in `footer`) and #69's Getting Started draft editor (`sm:max-w-xl lg:max-w-2xl`).
+  ★ **Both editors gate closing on the SAVE alone — never on an upload.** The lesson drawer passes
+  `canClose={lessonPreview || !savingLesson}` (while previewing, the X, Escape and the backdrop mean
+  "back to editing") and the draft editor `canClose={!savingDraft}`. Gating on the transfer would
+  strand the admin behind an un-closable drawer whose only exit is a reload; instead
+  `closeLessonEditor` / the draft editor's `closeEditor` return early only while saving, ask
+  `window.confirm` when `needsCloseConfirmation(uploadState)` says a transfer is in flight (a
+  resumable upload picks up again when the same file is re-picked), confirm discarding unsaved edits,
+  and then sweep an upload that finished but was never saved — never the SAVED path. (From 2026-08-18
+  until #69 this sentence said `canClose={!savingLesson && !uploading}`; no version of the code ever
+  did.) ★ The lesson editor was a hand-rolled `fixed inset-0` overlay
   until 2026-08-18 and it anchored to the **course canvas, not the viewport**: `.fade-in`
   (index.css:471) animates `transform` with `forwards`, so the active `TabPanel` keeps a non-`none`
   transform permanently and is therefore the containing block for every `position:fixed` descendant.
@@ -1683,7 +1920,9 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   `h-screen … overflow-hidden`), and scroll chaining follows the DOM ancestor chain, not visual
   stacking; `overscroll-contain` on the body is belt-and-braces. Both admin screens
   (`AccessRequests` + `AdminEnrollments`) are built from the shared module-scope kit right above them:
-  `AdminNotice` (status-token banners), `AdminFilterChip`/`AdminFilterCaption` (labeled filter rows),
+  `AdminNotice` (status-token banners: `ok` / `warn` / `danger` and, since #69, `info` for a neutral
+  fact that breaks nothing; any other kind renders as danger and is announced as an alert),
+  `AdminFilterChip`/`AdminFilterCaption` (labeled filter rows),
   `AdminListSkeleton` (first-load skeleton; refresh keeps the list), `AdminUserCell`
   (avatar/name/badges/email/meta identity block; `wrap` = name and email wrap instead of truncating,
   used by the Enrollments card only), `ADMIN_BTN_OK`/`ADMIN_BTN_DANGER` (token-gradient
@@ -1708,7 +1947,10 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   "Sampler Session", ₱1,499 / 60 days) is the ONE scoped
   plan — Home + the QuickBooks catalog (`qbomastery`) but only its **Essentials** course
   (`access_tier='essentials'`, NOT Mastery) + both 1-on-1 booking tabs (`linkedinopt`, `coachalex`)
-  + `community`. Its ₱1,499 buys the coaching session, not more course content, so the CHEAPEST
+  + `community` + #69's Getting Started replay page (`gettingstarted`, listed EXPLICITLY: the
+  fail-closed unknown-plan entitlement stays Dashboard-only, and `staffEntitlement()` adds it for
+  neither an Operations Admin nor a Trainer; a Super Admin resolves FULL). Its ₱1,499 buys the
+  coaching session, not more course content, so the CHEAPEST
   plan is also the most scoped — **never assume price ⇒ scope.** `silver_self_paced` (**Silver · Self-Paced**,
   "QBO + Resume Combo", ₱2,999 / 60 days) and `vip` (**VIP Package**, "Personalized Coaching Program",
   ₱16,999 / 180 days) are both
@@ -1790,6 +2032,23 @@ full-screen login/signup screen; only signed-in users reach the toolkit.
   normal-speed 401/403 still signs out. `useEnrollmentGate` fires its two own-row queries as
   soon as a uid exists (its returned `active`/`ready` still key off `profileReady` — gate semantics
   unchanged). Don't re-serialize these when editing the provider.
+  ★ **What it reports from those reads is the SIGNED-IN account's only (#69, K3R-GATE-DIRECT-SWITCH).**
+  `loadedFor` is the uid the landed reads were made for, set in the same commit as their data, and
+  until it is the current uid the hook reports what a fresh mount reports: not ready, no request, no
+  term, `configured` and `migrated` at their defaults. ★ **`configured` is kept WITH the uid it was read
+  for** (`configuredRead`, `{ uid, ok }`, forgotten at sign-out; K3RV-CONFIGURED-CARRYOVER): the 7-s
+  timeout leaves it as it was and still marks the reads landed, so before this the NEXT account whose
+  reads stalled — after a direct switch or a sign-out — was handed the previous account's failed read,
+  and an unpaid student landed in the app (the legacy approval gate) instead of the paywall a fresh
+  mount's timeout shows (measured in Chrome). The same account's timeout still leaves its own last
+  answer standing. `migrated` is deliberately NOT kept per uid: it describes the database, not an
+  account. Its effect re-runs on a new uid without clearing
+  what it holds — and must not clear on a refetch, or every focus would flash the splash — so on a
+  DIRECT account switch (a sign-in to another account with no signed-out render between, e.g. two auth
+  events batched into one render on a resumed tab) it used to report the previous account's term,
+  ready, until the new reads landed: measured in Chrome, a lapsed B was shown A's dashboard for the
+  2.5 s B's own reads took. A refetch for the SAME account keeps `loadedFor`, so it never shows a
+  splash (measured too). Pinned by `uiSafety` §28b (K3R-GATE-DIRECT-SWITCH), which runs the real hook.
 - **Backend setup:** a `profiles` table + RLS + a signup trigger must exist in Supabase. Email
   confirmation and Site/Redirect URLs are configured in the Supabase dashboard. See README / the
   setup steps for the exact SQL.
@@ -1822,7 +2081,7 @@ That direction is the whole safety argument. **Never repair a missed check by ha
 role `is_admin = true`.**
 
 - **Tables** (`db/2026-08-25-staff-authorization.sql`, #45): `staff_roles` / `staff_permissions` /
-  `staff_role_permissions` (the 22 × 3 matrix, **34 grants** — #67 replaced `students.import` (super_admin + operations_admin) with `students.legacy_migrate` (super_admin alone); #61 added `communications.send` and #62 `meetings.manage`, each to super_admin alone; #52 added `student_progress.read`, #56 the
+  `staff_role_permissions` (the 23 × 3 matrix, **35 grants** — #69 added `onboarding.manage` to super_admin alone; #67 replaced `students.import` (super_admin + operations_admin) with `students.legacy_migrate` (super_admin alone); #61 added `communications.send` and #62 `meetings.manage`, each to super_admin alone; #52 added `student_progress.read`, #56 the
   two community keys to both non-super roles, #58 `finance.manage` to super_admin alone) → `staff_memberships` (ONE row per
   user, mutated in place; only `status='active'` confers authority, which is what makes a suspension
   take effect on the next *request* rather than the next token refresh) → `staff_role_events`
@@ -1866,7 +2125,10 @@ role `is_admin = true`.**
 - **The chokepoint gained a role half.** `visitedTabs.map` used to test `entitlement.allowsTab(tabId)`
   alone — but admin tabs are not in `DEFAULT_STAGES`, so `allowsTab` never had an opinion about them,
   and a `full: true` student who typed `/admin/enrollments` **mounted the component and ran its
-  queries**. `adminTabAllowed()` now refuses first, gated on `staffReady`.
+  queries**. `adminTabAllowed()` now refuses first, gated on `staffReady`. Since T12B-D1 its refusal
+  is a ROLE answer (`RestrictedTab reason="role"`, no Upgrade), and an admin tab waits for the staff
+  context ("Checking your access…") instead of flashing the plan upsell at a Super Admin who
+  deep-linked one — see `tabAccessView()` in the Navigation model's keep-alive bullet.
 - **Server**: [api/_lib/staffAuth.js](api/_lib/staffAuth.js) is the ONE gate for `api/admin/*` —
   verify JWT → ask the database with the CALLER's JWT → only then may `service()` be constructed.
   It **fails CLOSED**, deliberately unlike the fail-open `is_enrolled()` gate in `api/anthropic`
@@ -2060,8 +2322,8 @@ role `is_admin = true`.**
 ## Financial Management — the business ledger, Super Admin only (#58)
 
 Tab id `financialmanagement`, route `/admin/financial-management`, an admin-nav row directly after
-Enrollments (Access Requests · Enrollments · Financial Management · Communications · Meetings & Tasks ·
-Student Imports · Batches · Team & Roles).
+Enrollments (Getting Started Video · Access Requests · Enrollments · Financial Management · Communications ·
+Meetings & Tasks · Student Imports · Batches · Team & Roles — #69 put Getting Started Video first).
 **Applied to production 2026-09-14** as one transaction, after a full rehearsal on the live catalog that
 was forced to abort — the first attempt was refused whole on a STABLE function in a generated column (see
 the fingerprint comment in the migration). Verified there by rolled-back impersonation: Ops Admin, Trainer,
@@ -2187,7 +2449,7 @@ payee + account quick-picks, never an amount, seeded by category only).
   all lock their row before checking. Add, Match and status changes refuse inside a closed reconciliation.
 - Re-signs five #58 functions (each dropped first) and restates the catalog; #60 restates it again, so
   the catalog has been restated again since, so `CURRENT_CATALOG_MIGRATION` (communityStaffSql) and
-  `CATALOG_OWNER` (financeSql) both point at **#68** (133 codes) — repoint them with every restatement. No permission changes.
+  `CATALOG_OWNER` (financeSql) both point at **#69** (141 codes) — repoint them with every restatement. No permission changes.
   Suite: `test/financeParitySql.test.mjs` (it pins every stage-review fix above).
 
 **Daily Income (#64, [db/2026-09-19-finance-daily-income.sql](db/2026-09-19-finance-daily-income.sql), fold §51)** —
@@ -2262,6 +2524,21 @@ correction; still gated on `enrollments.review`, so Operations Admins keep it. *
 - `admin_correct_enrollment_amount` works on PENDING requests only (a posted collection is corrected in
   Financial Management) and never on your own request. `admin_staff_display_names` returns names of
   STAFF only. Suite: `test/enrollmentManagementSql.test.mjs`.
+- ★ **A BULK DECISION SAYS WHAT BECAME OF EVERY EMAIL (#69, EMAIL-1 — pre-existing since #60).**
+  `runBulk` used to discard `notifyDecision`'s answer, so a cohort's bulk approval showed every row
+  green while the server refused the eleventh email onward. A bulk approve or reject now records each
+  row's email outcome and lists it under the row, followed by a fixed-order "Emails: …" tally (sent,
+  already on its way, may not have been sent, not sent, not configured). A 429 is waited out
+  (`BULK_EMAIL_RETRY_DELAYS_MS`: 20 s, then 40 s; at most three asks per row), announced in the
+  dialog's `role="status"` header — "Pausing for this app’s own limit on decision emails — the email
+  for Maria Santos’s request is asked for again in a moment." (K3R-AE-1: the request by the NAME on it, never
+  the address typed on it, because the email goes to the account's `profiles.email`; and this app's
+  limit, never "the email service") — and reported as the row's outcome if it never lets up. Only the
+  SERVER's own 429 counts: `rateLimited` is `res.status === 429` exactly, pinned (V-EMAIL1-RATELIMIT).
+  Every other answer — a provider 429 (502 `resend_429`) and an unclear 502/504 included — is recorded
+  exactly as it came. The dialog says "the list says what became of every email", and no longer
+  promises "the student is emailed". The endings are `emailOutcomeUnclear()`'s, shared with Access
+  Requests (see the Access Requests bullet in Authentication).
 
 ## Communications — announcements, student emails, payment reminders, automations (#61)
 
@@ -2518,7 +2795,8 @@ deleted them silently.
 - **Two client fixes ride with it.** `api/notify-enrollment.js` stored the provider's rejection body in
   `notify_detail` — a column on the student's OWN request row, which `enroll_req_own_select` lets them read,
   and which names the from-address and the admin recipient. It stores `resend_<status>` now and logs the
-  status only, the rule `api/_lib/email.js` has followed since #49; the full detail still reaches an admin
+  status only, the rule `api/_lib/email.js` has followed since #49 (since #69 the slug is `sendEmail()`'s own
+  code — `resend_422`, `resend_timeout` — the same shape); the full detail still reaches an admin
   through the gated `test` action. And a **refused** Zoom invitation was reported as "the outcome is
   uncertain": `api/admin/meetings.js` now marks uncertain only for callerRpc's 502 (timeout, network fault,
   5xx), the schedule banner takes its colour from `meetingInviteNeedsAttention()` (the Invite panel's own
@@ -2533,7 +2811,8 @@ deleted them silently.
 - ★ **`CATALOG_OWNER` in `test/financeSql.test.mjs` had been stale since #60.** The finance-code check read
   #59's catalog, which is a superseded definition — it kept passing only because no migration since added a
   `FINANCE_` code. Repoint it, and `CURRENT_CATALOG_MIGRATION` in `test/communityStaffSql.test.mjs`, whenever
-  a migration restates `app_error_catalog()`. Both now name #68 (133 codes).
+  a migration restates `app_error_catalog()`. Both now name #69 (141 codes), as does
+  `CURRENT_SEED_MIGRATION` in `test/staffRolesSql.test.mjs`, because #69 restated the staff seed too.
 - Suite: `test/managementHardeningSql.test.mjs` — every assertion runs against the dated file AND the §50
   fold, and all 40 guards are mutation-tested. ★ The mutation runner counts a run that did not finish as an
   ERROR, never as a passing guard: it once read a timeout as "SURVIVED".
@@ -2647,6 +2926,480 @@ no function reads, and `test/studentProgressSql.test.mjs` asserts the scorer nev
   `test/studentProgressSql.test.mjs` (asserts against the dated file **and** the bootstrap fold),
   `test-db/studentProgress.dbtest.mjs`.
 
+## Getting Started onboarding video (#69)
+
+A newly approved student watches ONE Super-Admin-managed welcome video once, before their first
+dashboard, and can replay it later. Tab ids **`gettingstarted`** (the student replay page, route
+`/getting-started`, alias `/welcome`, FIRST in Home) and **`gettingstartedadmin`** (the Super Admin
+screen, route `/admin/getting-started-video`, the FIRST admin-nav row). Migration
+[db/2026-09-30-getting-started-video.sql](db/2026-09-30-getting-started-video.sql), folded verbatim as
+bootstrap **§56**; pure client half [src/lib/gettingStarted.js](src/lib/gettingStarted.js).
+**Database status (2026-10-02):** the CURRENT file — dated md5 `3b62d98d7897676c29adaaa1aad6d387`, with
+`p_expected_live_id` and the attach no-op — was applied to the SHADOW project twice (idempotent). Shadow
+holds exactly one publish signature, `(uuid,boolean,uuid)`, and all 20 function bodies equal the file. The
+13 `#69` audit entries pass there, including the whole-deparse policy literals and the two `prosrc` checks
+that had been verified only offline before; both `prosrc` checks were also shown to FAIL on live mutants.
+**Applied to production 2026-10-02 (13:11 UTC)** as one transaction (`set local lock_timeout = '5s'`, 4.8 s),
+right after a forced-rollback rehearsal on the live catalog. The restated catalog and staff seed were
+re-checked against production first (catalog md5 `bf3a27bd…`, 22 permissions / 34 grants). Verified
+there by the file's AFTER RUNNING checks; by impersonated probes in a rolled-back block (a Super Admin
+gets the manager view, a student nothing required and the overview refused, anon 42501); and by an
+advisors comparison. Its only changes are the 15 functions `authenticated` must reach (the 12 client
+RPCs and the 3 storage-policy helpers, each checking its own permission) and seven INFO notes on the
+new, still-empty tables.
+
+- ★ **WHO MUST WATCH IS DECIDED IN ONE PLACE: `user_onboarding_video_state(p_user)`.** A student is
+  asked when ALL of these hold: a version is published; its object really exists in `storage.objects`;
+  they are approved AND enrolled (`user_is_approved()` + `user_is_enrolled()` — the 3-day grace
+  counts); they are not staff (an `invited`/`active` `staff_memberships` row, or `profiles.is_admin` —
+  staff are never learners, #52); they have finished NO version; and their FIRST `subscriptions` row
+  (`min(created_at)`, whatever its status) was created on or after the FIRST publish of ANY version
+  (`min(onboarding_videos.published_at)`). `required` is `coalesce(…, false)` — always a boolean, never
+  null — and the client trusts only the literal `true`. Three edges are deliberate, and all three are
+  pinned by `test-db/onboardingVideo.dbtest.mjs`, whose `migrated` persona is a real import grant
+  (`grant_source 'import'`, `account_origin 'import'`) activated before the first publish. The rendered
+  suite does NOT pin edge (a) (TDR-6): its test 10 seeds a plain, payment-sourced member whose first term
+  predates the first publish — the same cutoff, but not a migrated student — and its test 6 walks a
+  migrated student whose import term is NEWER than the publish, who is asked:
+  (a) a migrated student activated BEFORE the first publish is an existing member and is not asked;
+  (b) a grandfathered member (paid before dated terms, so no subscription row) is not asked — until an
+  upgrade creates their first row after the first publish; then once;
+  (c) the cutoff is the first publish of any version, even one later retired or deleted
+  (`published_at` is set once; the guard refuses a rewrite) — so a Super Admin checks a draft with
+  **Preview**, never with a trial publish, and the first-publish confirmation names the day.
+  The function answers about ANY user, so it is INTERNAL: revoked from every client role — right after
+  its CREATE as well as in section 10, because the file is transaction-free and
+  `scripts/apply-db-files.mjs` sends one statement per call. `my_onboarding_video()` asks it about the
+  caller and `enrollment_decision_email_facts()` about a request's student; the overview's set-based
+  counts restate the same rule.
+- ★ **THE GATE GRANTS NOTHING, SO THE CLIENT FAILS OPEN; EVERY FUNCTION FAILS CLOSED.** The arm is the
+  LAST in `resolveGateScreen()` — below even the legacy approval gate, because that rule orders the
+  holds that decide access and this one decides none. `loading` holds the splash (an approval that
+  lands on the pending screen must not flash the dashboard the video comes before); `ready` + `required
+  === true` shows `GATE_SCREENS.GETTING_STARTED`; every other answer — an RPC error, a pre-#69
+  database, the 7 s `ONBOARDING_STATE_TIMEOUT_MS`, a malformed answer — renders the app. Failing open
+  costs one orientation video, never access: membership RLS still guards every paid read. Never a price
+  on this screen. The arm's scope and precedence are in "Changing WHO the auth gate holds".
+  ★ **A first answer that FAILED or TIMED OUT on a HOLD screen is asked again when the approval lands
+  (GF-1)**, exactly as a cached `eligible:false` is. A hold is the pending screen, a lapsed term, a
+  scheduled start or the paywall (`failedBeforePass` true): nothing waited on the answer there, and
+  failing open on it hours later sent a newly approved student past the video for the whole session. A
+  pre-#69 database (`missing`) is never re-asked. ★ **A failure is decided by the enrollment PHASE it
+  lands in** (`gettingStartedFailedBeforePass()`). On a hold it is re-asked at the pass. On the pass it
+  IS the gate's answer, and fails open at once. While the profile or the enrollment reads are still out
+  (`'unknown'`) it is undecided (`null`) until they land, and is then decided by that first settled
+  phase. So the client gate fails open on a 7 s timeout counted from the uid's arrival, never 7 s twice
+  (V-GF1-DOUBLE-BOUND: handed a boolean pass, the sign-in splash waited 14.4 s, measured in Chrome, when
+  the reads were slower than the failure).
+- ★ **VOCABULARY, AND WHY THE IDS ARE SPELLED THIS WAY.** The database and the API say "onboarding
+  video" (`onboarding_videos`, `onboarding.manage`, `ONBOARDING_VIDEO_*`); the UI says **Getting
+  Started** to a student and **Getting Started Video** to a Super Admin. Neither tab id may be
+  `onboarding` — that is the Client Onboarding tool (`/client-onboarding`) — and there is no bare
+  `onboarding` voice alias, because `resolveVoiceTool()` tries an exact tab id before any alias. For
+  the same reason the admin id is not the spoken phrase: the resolver collapses "getting started video"
+  to `gettingstartedvideo` and tests `VALID_APP_TABS` FIRST, so an admin tab spelled that way would
+  answer a student asking for the welcome video with the Super Admin screen. Hence
+  `gettingstartedadmin`, and the alias `'getting started video'` → `gettingstarted`. Both ids are in
+  `NON_TOOL_TAB_IDS` (a welcome video, not a tool) and in `VOICE_TAB_INFO`, the admin one `adminOnly`
+  and navigation-only.
+- **STORAGE: a private `onboarding-videos` bucket at the lesson-video limits** (`2147483648` bytes =
+  `LESSON_VIDEO_MAX_BYTES`; `video/mp4` + `video/quicktime` = `LESSON_VIDEO_UPLOAD_MIMES` — pinned to
+  the JS constants by `test/gettingStartedSql.test.mjs` and by the `#69` audit block, which imports
+  them). An object is named `versions/<video uuid>/<upload uuid>.mp4` and nothing else — **opaque by
+  design**: a Supabase signed URL necessarily contains the object name, so the name carries no filename
+  (`original_filename` is an admin-only column). `ONBOARDING_VIDEO_PATH_RE` is the `storage_path`
+  CHECK's own pattern, lowercase and flag-free (the SQL `~` is case-sensitive; `LESSON_VIDEO_PATH_RE` is
+  `/i` — never copy that flag here), and `onboarding_videos_path_in_own_folder` makes a file outside its
+  version's folder unrepresentable.
+  ★ **READS BY REFERENCE, WRITES BY PATH — #65's inversion, on purpose.** A student reads exactly one
+  object, the one the PUBLISHED row cites, while approved and enrolled
+  (`onboarding_video_object_readable()`); a Super Admin reads the whole bucket (Preview plays drafts). A
+  write names an object that does not exist yet, so INSERT and UPDATE are authorized by the path:
+  `onboarding.manage` AND a DRAFT whose id the path parses to (`onboarding_video_upload_allowed()`;
+  `onboarding_video_path_version_id()` returns NULL for any other shape, and NULL authorizes nothing).
+  DELETE refuses the live object (`onboarding_video_object_is_live()`). So the live file can be neither
+  overwritten — only a draft's folder takes writes — nor deleted, not even by a Super Admin.
+  ★ **"NO RAW PATHS" IS FOUR THINGS TOGETHER, NOT A HIDDEN NAME:** the private bucket; the
+  reference-based read of the ONE live object; a name that, of #69's functions, only
+  `start_onboarding_video()` discloses to a STUDENT, and only to an eligible one (`my_onboarding_video()`
+  never returns one — a Super Admin, by contrast, sees every version's path, in the overview and through
+  the table's own SELECT policy); and a 1 h signed URL (`LESSON_VIDEO_SIGN_TTL_SECONDS`) that
+  `SignedLessonVideo` refreshes before it expires. Every URL the browser mints for an uploaded lesson
+  video or the Getting Started video comes from ONE function, `signPrivateVideo(bucket, path)` — the
+  app's other video URLs come from elsewhere: a feature-guide upload is a public `course-media` URL, a
+  community video attachment is batch-signed by `CommunityHub`, and the AI trainer's transcription
+  signs a lesson video on the server. No #69 server code signs an onboarding object. `signLessonVideo`
+  and `signOnboardingVideo` are hoisted `function` declarations that only choose the bucket, and no
+  `getPublicUrl` ever names this bucket. `uiSafety` §28a pins exactly that — one definition, the two
+  delegations, `SignedLessonVideo` minting only through its `signUrl`, no public URL for this bucket —
+  and does not scan the rest of the app for other signing calls. A failed signature here is logged as
+  `[onboarding-videos]` and told to a Super Admin as "This Getting Started video’s file could not be
+  authorized for playback…" (`PRIVATE_VIDEO_SIGNERS`, keyed on the signer; TDR-8 — see the Course
+  platform section).
+- **TABLES.** `onboarding_videos` holds every VERSION (`draft → published | deleted`, `published →
+  retired`, `retired → published | deleted`; at most ONE published, by the partial unique index
+  `onboarding_videos_one_live`); `student_onboarding_progress` holds one row per student per version
+  (`first_started_at` kept for good, `completed_at` the FIRST completion, the last playback problem);
+  `onboarding_video_events` is the append-only trail. Each has RLS, exactly ONE SELECT policy
+  (`onboarding.manage`, plus a student's own progress rows) and NO client write path — the finance rule;
+  **never `force row level security`**, the guards and the RPCs run as the owner.
+  ★ `onboarding_videos_guard()` holds the state machine for EVERY writer, the table owner included: the
+  media columns change only while a row is and stays a draft; `published_at` is set once; each actor
+  column moves only on its own transition — but may ALWAYS become NULL (the FK's `ON DELETE SET NULL`;
+  refusing it would make an Auth user who ever published undeletable); a deleted row stays deleted; and a
+  row DELETE is refused: history is permanent, and TRUNCATE (test-only) is the only reset.
+- **THE RPCS, IN THREE ACL CLASSES** — listed separately in section 10, because they fail in opposite
+  directions and a new function starts with Supabase's default EXECUTE for anon and authenticated:
+  - **Client RPCs (12) → `authenticated` only.** Student: `my_onboarding_video()` (`configured,
+    eligible, required, completed, completed_at, completed_current, media_available, can_manage,
+    video` — metadata only, to an eligible viewer or a manager; never a path, never a draft),
+    `start_onboarding_video()` (the only #69 function that discloses the live object's name to a
+    STUDENT — a Super Admin also sees every version's path in the overview; records the first open, for
+    eligible non-staff only), `complete_onboarding_video()`, and
+    `report_onboarding_video_problem(p_code)` (UPDATE-only on the caller's live-version row — never an
+    insert — at most once a minute, coerced to `ONBOARDING_PROBLEM_CODES`, silent for staff and the
+    ineligible). ★ **No student RPC takes a user, path or video id**: the subject is `auth.uid()`, the
+    video is the live one, and `p_code` is the only student parameter. Super Admin: the seven
+    `admin_onboarding_video_*` (overview, create_draft, update_details, attach_media, publish — with
+    the optional `p_expected_live_id` a Replace binds itself to — unpublish, delete), each opening with
+    the `onboarding.manage` check and writing ONE event per state change — none for a no-op (#56's rule).
+    ★ **`attach_media` follows the rule too (DBSEC-4):** re-attaching the file a draft already cites,
+    with the same facts, answers `changed: false` with `previous_storage_path` null and writes no event.
+    The facts are compared as the write would STORE them — path, original file name, type, size, length
+    — and the answer comes only after every check, so a file that has since vanished from storage is
+    still `ONBOARDING_VIDEO_MEDIA_INVALID`. A real attach answers `changed: true`. Pinned on shadow by
+    `test-db/onboardingVideo.dbtest.mjs`. Plus `enrollment_decision_email_facts()` on `enrollments.review`.
+  - **Storage-policy helpers (3) → `authenticated`**: `onboarding_video_object_readable`,
+    `onboarding_video_upload_allowed`, `onboarding_video_object_is_live`. ★ A policy qual runs AS THE
+    CALLER, so without the grant EVERY `storage.objects` statement, in every bucket, fails with
+    "permission denied for function". The two write-side helpers check `onboarding.manage` themselves,
+    so the grant is no oracle.
+  - **Internal (4) → revoked from every client role**: the path parser, `user_onboarding_video_state()`
+    and both guard trigger functions.
+- ★ **WHAT COUNTS AS FINISHED — two rules, and only the second is security.** *Presentation:* "Go to
+  dashboard" unlocks when ≥ 90% of the timeline has ACTUALLY played (`ONBOARDING_WATCH_MIN_FRACTION`)
+  and `ended` fires — or, for a browser that never fires it, a stop within 1.5 s of the end while not
+  seeking (`ONBOARDING_NEAR_END_SECONDS`). `watchVerdict()` checks the played share FIRST, so dragging
+  the scrubber to the end stays locked, and an unknown duration (NaN, Infinity) finishes only on
+  `ended`. "Played" is the union of every `<video>` element's `played` ranges (`mergeRanges()`), because
+  a re-sign or "Try again" mounts a NEW element and the old one's ranges go with it; the union is
+  bounded at 64 ranges by dropping the SHORTEST, never the latest long stretch. *Security:*
+  `complete_onboarding_video()` refuses with `ONBOARDING_VIDEO_NOT_FINISHED` until
+  `greatest(coalesce(duration_seconds, 60) × 0.4, 5)` seconds after `first_started_at` — a 2× viewer of
+  any video of 10 s or more is never refused, and an unverified (NULL) length still waits 24 s. A
+  student can call the RPC without loading the client at all; this guard is what refuses a forged
+  completion, and `test/gettingStartedSql.test.mjs` builds its pattern FROM the three JS constants.
+  ★ **A completion is earned once and never re-stamped:** `completed_at = coalesce(completed_at, now())`
+  (#52's recency-forgery rule; the suite fails on a bare `completed_at = now()`). The live row is locked
+  `FOR SHARE` — and read a second time before the function answers "nothing is live", because a publish
+  racing it retires the old row first — and the progress row `FOR UPDATE`, so a completion belongs to
+  the version the student actually watched. A replacement published mid-watch answers `NOT_FINISHED`
+  with `current_video_id` = the new version, and the screen starts that one over.
+- ★ **REPLAYS RECORD ONCE PER VERSION; STAFF RECORD NOTHING.** The page and the card share
+  `useReplayRecorder`: an eligible viewer who has not finished the CURRENT version records it once,
+  triggered from the verdict EVENT (so playback that goes on cannot cancel it), asks once more when the
+  server's floor has passed, and re-arms after a transient failure. `start` records progress only for
+  eligible non-staff; `complete` answers staff `{ ok: true, recorded: false }`, and a replay marks the
+  root's answer completed only when `recorded !== false`.
+- **CLIENT ARCHITECTURE** (the Getting Started block of BookkeeperPro.jsx; pinned by `uiSafety` §28b):
+  - `useGettingStarted(uid, enrollPhase)` runs in the root ABOVE every early return and asks
+    `my_onboarding_video()` the moment a uid exists — in parallel with the profile and enrollment
+    reads, never after them — once per account (StrictMode included), each request bounded by
+    `ONBOARDING_STATE_TIMEOUT_MS`. Its value is `{ status, data, missing, uid, markCompleted, refresh }`:
+    `missing` says the database has no #69 (GF-8), and `uid` names the account the answer is for.
+    ★ **Its status is DERIVED DURING RENDER** by `gettingStartedStatus()`
+    from one `fetched` state, never set by an effect: an effect-set status leaves one frame in which the
+    gate has no answer and renders the dashboard, and an answer fetched for another uid is `loading`,
+    never rendered. ★ **The approval edge:** a student approved on the pending screen holds an
+    `eligible:false` answer when the pass arrives, so the status is `loading` until ONE re-ask lands. The
+    re-ask is decided by `gettingStartedNeedsReask()`, the twin of `gettingStartedStatus()`'s hold. It
+    fires for a cached `eligible:false` requested before the pass, or for a failure that landed on a hold
+    (or landed while the profile or the reads were still out, which then landed on a hold). A failure that
+    landed on the pass, or while they were out and they then landed on the pass, is never re-asked; nor is
+    an answer requested after the pass, or a missing function. `test/gettingStarted.test.mjs` checks the two agree on every settled
+    answer. It fires on that
+    STATE, never on an edge, because the two first reads race and an edge can fire before the answer
+    exists. A cached `eligible:true` costs no extra round trip. Late answers (past their timeout, behind a
+    newer request, for another account) are discarded. ★ **`markCompleted(result, uid)`** takes the uid
+    the caller captured BEFORE awaiting (`gs.uid`), applies only while that account is signed in and its
+    answer is there, and returns whether it did; otherwise it changes nothing and makes nothing stale
+    (GF-7: `signOut()` does not reload, so a completion can outlive a sign-out). The root's `onDone`
+    dismisses the welcome and opens the Dashboard only when it applied.
+    `refresh()` asks again, and its failure fails open like any answer, while `refresh({ keep: true })`
+    — the cosmetic re-read after a video was replaced — leaves the current answer standing if it fails
+    or times out, because it must never be what opens the gate. A keep answer that LANDS supersedes
+    every question asked before it (RV8-K1). The Super Admin screen asks one after every change to
+    what is LIVE — a publish, a replace, an unpublish, deleting the live version, a save of the live
+    version's words (AUI-5) — so their own Dashboard card and Getting Started tab follow without a
+    reload (T9V-M1); a draft's edit asks nothing.
+    ★ **It is handed the enrollment PHASE:** `gsEnrollPhase = gettingStartedEnrollPhase({ profileReady,
+    ready: enroll.ready, pass: enrollPass })`, never `enrollPass` itself. That is `'pass'` only for a
+    SETTLED pass — this account's profile AND both enrollment reads have landed and say pass (exactly
+    `gettingStartedEnrollPass()`, T12-D1, K3R-GATE-DIRECT-SWITCH); `'hold'` once the profile AND both
+    enrollment reads have landed and do not pass; else `'unknown'` (V-GF1-DOUBLE-BOUND). Both need
+    `profileReady` because `useEnrollmentGate` reports `ready: true` while it is inactive, i.e. before the
+    profile loads — and on a direct account switch the profile in hand until the new one lands is the
+    PREVIOUS account's: a pass read off it stamped the new account's first question `reaskedAfterPass`,
+    and an enrollment approved later in that session skipped the video. (The hook reporting only the
+    signed-in account's reads closed the other door; Chrome showed each fix alone leaves one of the two
+    switch cases open.) While the two enrollment reads are in flight, `enrollGateState()` answers from the
+    profile alone — `pass` for any paid profile with no term loaded yet (the grandfather rule) — and a
+    LAPSED member spent the hook's one re-ask on it, so a renewal approved later in the same session
+    found nothing left to ask with and skipped the video. Only the hook's input is settled: `enrollPass`
+    and the entitlement memo that reads it are unchanged, and the gate holds its splash until
+    `enroll.ready` anyway. The root's latch (see "Changing WHO the auth gate holds") reads the same phase.
+    Pinned by `test/gettingStarted.test.mjs` and by the `uiSafety` T12-D1 test, which RUNS the root's own
+    phase expression on the real hook.
+  - `GettingStartedContext` carries that memoized value to the page and the card. The provider wraps
+    only the app shell, so the gate screen is handed it as a prop; its default fails safe
+    (`unavailable` — render the app, show nothing).
+  - `GettingStartedPlayer` (modes `gate | page | card | preview`) is `SignedLessonVideo` with
+    `signUrl={signOnboardingVideo}` and `isAdmin={false}`, plus the watch rule. `source="live"` calls
+    `start_onboarding_video()` once per mount — its only call site; a given `{ video_id, storage_path,
+    duration_seconds }` (the Super Admin's Preview) makes no RPC, records nothing and reports nothing. A
+    player problem is reported as `onboardingProblemCode(reason)`, never the raw reason. ★ **Retry is a
+    REMOUNT** (the caller bumps a key), so `start` runs again and returns the CURRENT live object — the
+    one answer a re-sign of the old name can never give. ★ **The watch record outlives the `<video>` AND
+    the player:** it lives in the caller's `watchRef` (`watchRecordFor()` keeps it for the same video and
+    starts afresh for another), and a new element is put back where the student was (`resumeAt()` —
+    never inside the last 1.5 s). A start-over (a newer version, or a start the server never saw) clears
+    it. ★ **Nothing between the student and the video waits for ever (GF-3):** one bound,
+    `ONBOARDING_LOAD_TIMEOUT_MS` (15 s), from mount to the first frame covers `start_onboarding_video()`
+    and the first signature (neither postgrest-js nor storage-js times out a POST or a sign). A stalled
+    one gives up as `'slow'` into the give-up panel; an answer that lands later still shows the video and
+    clears the panel; a slow load is never reported to the Super Admin.
+  - `holdWatchVerdict()` — once unlocked, the SAME video stays unlocked, so a rewind or the native
+    replay control cannot re-lock Go under a full progress bar — is applied at the gate and in Preview
+    only; the replay recorder sees the raw verdicts.
+  - `usePauseWhenHidden(frameRef, mediaRef)` pauses a replay whose keep-alive tab is HIDDEN. It observes
+    the always-mounted `.gs-stage` frame, never the `<video>` (replaced on every re-sign), with an
+    IntersectionObserver AND a ResizeObserver (a frame already scrolled out of view gets no intersection
+    entry when its panel hides), and pauses only when `offsetParent === null` — scrolling down to read
+    the transcript keeps it playing.
+  - Go is `aria-disabled`, never `disabled`, and its unlock is announced once, politely; every Retry
+    that removes itself hands focus back (`refocusIfLost` → the player frame, `tabIndex=-1 role=group`,
+    or Go) — never to `<body>` — and so does the shared player's OWN "Try again", to its
+    `.course-stage` frame (see the Course platform section). ★ **The first keyboard stop on the gate,
+    the page, the card and a lesson is the `<video>` itself (S1).** Its own outline would be clipped by
+    the frames, so `.course-stage > video:focus-visible { outline: none; }` and a separate rule,
+    `.course-stage:has(> video:focus-visible)::after`, paints the frame's inset ring for it (D2's, see the
+    Course platform section) — a rule of its own because a browser without `:has()` drops a whole
+    selector list, and the frame's own ring would go with it. ★ **A status shown after a press is SAID
+    through a region that was already mounted (S5)**:
+    the gate's messages and give-up panel through the Body's polite region (its `announcement` prop); the
+    page and the card each through one `sr-only` polite region mounted with the surface. An error keeps
+    `role="alert"`. A `role="status"` mounted together with its text is often never read by NVDA or
+    JAWS. Nothing autoplays: `SignedLessonVideo`
+    renders `preload="metadata"`, `playsInline` and `controlsList="nodownload"`, and `uiSafety` §28b
+    refuses these spellings of starting playback in these components, each named on its own:
+    `autoplay` in any case (the prop, the property, `setAttribute`), `muted`/`defaultMuted`, any
+    `.play` member access, a `'play'` looked up by name (`video['play']()`) and a destructured `play`
+    (`const { play } = video`). ★ It is a source scan, not a proof: a name built at run time
+    (`video['pl' + 'ay']()`, `String.fromCharCode(…)`) still passes it, so it lists spellings and
+    never claims to know every one.
+  - **The gate** (`GettingStartedScreen`) records through `recordOnboardingCompletion()` — the ONE call
+    site of `complete_onboarding_video` — and answers every refusal without navigating: a newer version,
+    or a start the server never saw → start over; too soon → "Almost there — try again in a few
+    seconds." (no number: a static message cannot count down); ineligible or unavailable → ask the root
+    again (the gate may no longer apply); anything else → an inline error and Retry. A completion that
+    never answers ends at `ONBOARDING_COMPLETE_TIMEOUT_MS` (15 s) as `{ ok: false, code: 'timeout' }` →
+    the inline error and Retry (S4); retrying is safe, because the server keeps the first `completed_at`.
+    Done → `markCompleted(r, uid)` and, only if it applied, `dismissWelcome()` (the first-login
+    `WelcomeOverlay` never stacks on the dashboard this opens) and the Dashboard. Once the video will not
+    play it offers Retry, support and **"Continue to dashboard for now"**: a deferral held in root state
+    for THIS uid only, recording nothing and calling no server, so a reload, a new tab, an account switch
+    or a sign-out asks again — and it lands on the Dashboard too (GF-6). The give-up panel names its
+    reason through `gettingStartedGiveUpCopy()` ("on this device" only for a decode failure) and is
+    scrolled to the nearest edge when it appears, focus unmoved (S3). Ended under 90%, the line says to
+    play it again (`watchVerdict()`'s `'skipped'`, S2), and the intro says "When you’ve watched it to the
+    end". ★ **The gate asks again when the student comes back to the tab (GF-4):** `useRecheckOnReturn`
+    calls `refresh({ keep: true })` on a focus or a `visibilitychange` — at most every 10 s, never in the
+    first 10 s — so a video finished in another tab lets it go, and a failed check never does. If it lets
+    go because the answer reports a completion (`gs.data.completed`) for the account the gate showed the
+    video to in this session (the root's `gsGateUid`, cleared at sign-out), the first-login
+    `WelcomeOverlay` is held by derivation — `gsWelcomeHeld`, so it is never mounted even for a frame,
+    since it moves focus on mount — and remembered as dismissed (`dismissWelcome()`), as a finish in this
+    tab does through `onDone` (V-GF4-WELCOME). Any version's completion counts — `completed`, never
+    `completed_current`: one finished elsewhere before a newer version was published is still a finished
+    video (K3R-X04-TESTGAP pins it). A gate that lets go WITHOUT a completion (an unpublished
+    video) leaves the first-login welcome as it was. The gate frame's width also answers to the window's
+    HEIGHT (`.gs-stage[data-gs-mode="gate"]`), and the unlock scrolls Go into view without moving focus.
+    An imported student's one-time summary says "Continue" when Getting Started is next.
+    ★ **When the gate hands over to the app, focus goes to `<main>` (K3R-FOCUS-HANDOVER).** Go to
+    dashboard, "Continue to dashboard for now" and a re-check that lets go each unmount the control that
+    had focus, and the browser dropped it to `<body>`: the next Tab started again at the top of the
+    sidebar, and a screen reader heard nothing about the new screen (WCAG 2.4.3). A root effect on
+    `gate.screen` (above the first early return; a splash between the two is skipped, deciding nothing)
+    calls `refocusIfLost(transientFocusTarget(mainRef), { preventScroll: true })` on GETTING_STARTED →
+    APP only. ★ **`<main>` is NOT focusable at rest (K3RV-MAIN-CLICK-FOCUS).** `transientFocusTarget()`
+    gives it `tabindex="-1"` for that one focus and takes it away on the first blur or the first pointer
+    press anywhere (before the press moves focus), and at once if the focus did not land. A static
+    `tabIndex={-1}` made it CLICK-focusable for its whole life: a mouse click on plain text focused
+    `<main>`, and the next Tab went to the first control at the top of the page and scrolled there —
+    measured with real events, the Dashboard scrolled to 700 jumped to 0 and Invoice Creator to 1; now
+    focus stays where the browser puts it and Tab reaches the control beside the click, scroll unmoved.
+    Blur alone was not enough, measured too: a click on plain text right after the hand-over kept the
+    still-focusable `<main>` focused and jumped the same way. `focus:outline-none` is for the container
+    alone; every control inside keeps its own `:focus-visible` ring. `refocusIfLost` acts only when focus
+    really was lost, so an ordinary load leaves focus where the browser put it, and the first-login
+    `WelcomeOverlay` (which takes focus when it mounts) keeps it. Measured in Chrome with real key
+    presses: before, focus on `BODY` and the next Tab on "Collapse sidebar"; after, `MAIN` (no visible
+    outline in either theme, nothing scrolled) and the next Tab on the card's "Open video" — after which
+    `<main>` carries no `tabindex` again.
+  - **The replay page** (`GettingStartedPage`, the `gettingstarted` tab) is never a gate: Go to
+    dashboard is always there, beside a status line and plain states for not-eligible, no video and a
+    missing file. **The Dashboard card** (`GettingStartedCard`, under the hero) signs nothing until
+    "Open video" expands it (a paused player), links the page only where
+    `entitlement.allowsTab('gettingstarted')`, and renders nothing when nothing could play — except to a
+    manager, who is told why. ★ **Where a viewer stands is ONE derivation, `gettingStartedStanding()`**
+    (completed · earlier · owed · optional; S6). The card's chip is "Completed", "Finished an earlier
+    version" or "Not finished", and there is none for a never-asked member or for staff; the page's line
+    matches ("Completed on …", "You finished an earlier version on …", "Not finished yet", "Optional —
+    watch it whenever you like"; staff read "Staff views aren’t recorded."). A start the server refuses
+    (`ONBOARDING_VIDEO_UNAVAILABLE` / `_NOT_ELIGIBLE`) asks the root again, and the panel says what
+    happened (GF-5). On a pre-#69 database the page says "Getting Started isn’t set up yet…", with no
+    Try again (GF-8). The page frame has its own height budget, `.gs-stage[data-gs-mode="page"]`: the
+    window less the 151px sticky `SectionHead` and 24px to spare, at least 160px, binding only below a
+    625px-tall window (S7). The small text S8 measured below AA — the help line, the journey heading, the
+    sign-out row — reads in `C.textSoft`, and the support address in the deep-blue `NAVY` token (the mute
+    grey measured 2.97:1 and the accent blue 3.6:1 as text). The card lays out
+    by its own `.gs-card` container; the page has no container query of its own (its rows simply
+    wrap); the journey strip in `GettingStartedBody` — the gate's and Preview's — lays out by
+    `.gs-journey`, and the Super Admin screen by `.gs-admin`. What stacks and what sits side by side
+    follows those containers, never a viewport breakpoint — `sm:` here only adds padding or widens the
+    draft drawer, and the player frame's `vh` caps (the gate's and the page's height budgets among them)
+    size the video without switching any layout.
+- **PLANS AND STAFF.** `gettingstarted` is in the Essentials allowlist; Silver and VIP reach it through
+  full access; the unknown-plan / `NO_ACCESS_ENTITLEMENT` stays Dashboard-only, and `staffEntitlement()`
+  adds neither tab for an Operations Admin or a Trainer. `ADMIN_TAB_PERMISSION` maps only
+  `gettingstartedadmin` → `onboarding.manage`: mapping the student tab would refuse it to the students
+  it is for (the Community reasoning, #56). **`onboarding.manage`** is the 23rd staff permission, Super
+  Admin only (35 grants): publishing or replacing the video changes the first screen every newly
+  approved student sees, and the live file is served to every paying member.
+- **THE SUPER ADMIN SCREEN** (`GettingStartedVideoAdmin`; pinned by `uiSafety` §28c):
+  - ★ **It calls `admin_onboarding_video_*` and nothing else**, and reaches Storage only through its
+    upload target. Preview renders the student's own `GettingStartedBody` + `GettingStartedPlayer` on a
+    GIVEN version in an `AccountModal` — inert, on a watch record of its own — and the draft drawer's own
+    player is UNMOUNTED while it is open (a hidden `<video>` still holds a second signed URL, and
+    `display:none` does not pause it).
+  - ★ **A draft comes first.** "New video" (and Replace) asks for the title, calls `create_draft`, and
+    only then opens the editor `SidePanel` — the storage INSERT policy and the object's name both need
+    the draft's id. The uploader is `LessonVideoUploader` with `target = onboardingUploadTarget(draftId)`:
+    one frozen record per draft — the private bucket, `buildOnboardingVideoPath`, an own-path test
+    scoped to THIS draft's folder, a tus resume key of its own, the onboarding signer, a plain-remove
+    discard, and its own wording (`ONBOARDING_UPLOAD_COPY`, whose `messages` replace every shared
+    refusal that names a lesson, course videos or their bucket — `bucket-missing` names
+    `onboarding-videos` and the #69 migration; T9V-L1). That discard has no reference check because
+    no two versions share a file, so what protects a SAVED file is the uploader's `path === savedPath`
+    guard and the close sweep that skips it. It THROWS the `{ error }` that supabase-js `remove()`
+    resolves (it never rejects), so the uploader logs it (AUI-4); every other removal on the screen goes
+    through `sweepOnboardingFile(target, path, what)`, which logs what could not be removed, with its
+    status — never the path. A `null` from the uploader means it discarded an upload —
+    an accepted replacement, a Cancel or a Remove, never a refused pick — and puts the draft back on
+    its SAVED file (T9V-L4). ★ **A version whose saved file is missing (`media_present === false`) opens
+    as missing (AUI-2):** an empty uploader, no drawer player, and "This draft’s saved video file is
+    missing from storage, so it can’t be previewed or published. Upload the video again." Save
+    draft sends all three text fields whenever one changed (the RPC has NO defaults: an omitted field is
+    a PostgREST error, never a silent clear — the #41 lesson), then `attach_media` with the facts
+    `onMediaFacts` reported for THAT path (null where unknown; the server reads size and type from the
+    object), then removes the `previous_storage_path` it returns, and sweeps a leftover upload the saved
+    draft does not cite (AUI-1; see the Course platform section). A save whose attach is refused AFTER
+    the details landed says what was saved, and re-reads the list (AUI-3). Closing follows the lesson
+    drawer's rule (see the `SidePanel` bullet in Authentication).
+  - ★ **The LIVE version and a RETIRED version can have their WORDS corrected (AUI-5).** "Edit details"
+    opens the same drawer with no uploader ("A version’s file can’t change once it has been live…"), a
+    status subtitle from `GS_EDITOR_SUBTITLE` and a "Save details" footer; only `update_details` is
+    called. Editing the live version's words asks for the root's own answer again (`afterChange`'s
+    fourth argument), so the Super Admin's card and tab follow.
+  - ★ **Replacing the live video is asked for, never assumed — and bound to the version its dialog
+    NAMED (DBSEC-1).** The literal `p_replace_live:` appears exactly twice: `true` in `confirmReplace`,
+    `false` in `confirmPublish`. A publish that meets a version made live from another window comes back
+    as `ONBOARDING_VIDEO_REPLACE_CONFIRM` and reopens as the Replace dialog. ★ **The server contract,
+    proven on shadow:** `admin_onboarding_video_publish(p_video_id, p_replace_live boolean default false,
+    p_expected_live_id uuid default null)` is the ONLY signature. The two-argument form is DROPPED first,
+    because a new parameter otherwise adds an overload and every call that omits it becomes ambiguous
+    (PGRST203, or "is not unique" in SQL). A replace whose named version is no longer the live one is
+    refused with `ONBOARDING_VIDEO_REPLACE_CONFIRM` `{ live_id, live_title, expected_live_id }` and changes
+    nothing — that covers another version published from a second window, and nothing live at all
+    because someone unpublished it (then `live_id` and `live_title` are null). A NULL expected id keeps
+    the original contract (retire whatever is live); a plain publish ignores the id. Pinned on the
+    shadow project by `test-db/onboardingVideo.dbtest.mjs`. ★ **The client half:** `confirmReplace` sends
+    `p_expected_live_id`, the live id frozen into the dialog when it opened (`confirm.live`), and the
+    replace dialog's text is built from `confirm.live` alone. A stale one comes back as `REPLACE_CONFIRM`
+    and reopens as Replace naming what is live NOW (`ctx.live_id`) — or, when nothing is live, as a plain
+    publish warning "The video this was going to replace is no longer live, so publishing now replaces
+    nothing." — with the list re-read, and never retried automatically. A publish refused with
+    `ONBOARDING_VIDEO_MEDIA_INVALID`, `_NOT_FOUND` or `_STATE_INVALID` re-reads the list too (AUI-6), and
+    `MEDIA_INVALID`'s copy now fits both the attach and the publish that raise it. A retired version whose
+    file is missing says "File missing from storage, so it can’t be published again. To use this video,
+    upload it as a new video." where its Publish again used to vanish silently (AUI-7). Every change
+    confirms in an `AccountModal` that says who it affects (`publishImpact()` for a publish — the first one names the
+    cutoff day — and the overview's counts for the rest), on a SOLID button that clears AA behind white
+    text in both themes (`GS_OK_BTN` on `--ok-solid`, `GS_DANGER_BTN` on `--danger-solid`, else
+    `--primary-solid` — never the `ADMIN_BTN_*` gradients; T9UI-4), and deleting the live version is
+    unpublish-then-delete under one confirmation: a failed second call leaves it safely unpublished.
+  - ★ **ONE health verdict, two surfaces.** `admin_onboarding_video_overview()` returns facts only;
+    `onboardingHealth()` is their one interpreter (`unknown` · `none_live` · `file_missing` ·
+    `playback_problems` · `unverified` · `ok`). The banner shows it through `AdminNotice` (whose `info`
+    kind is new in #69 — an unknown kind would render as danger), and the admin-nav row's 0-or-1 badge
+    ("the Getting Started video needs attention") is raised by the SAME verdict and never by `unknown`:
+    a failed read is not a fact. Every overview read on the screen is paired with the root's badge read
+    (`onHealthChange` → `refreshOnboardingHealth`, the fourth stable `TabPanel` callback), so the two
+    cannot disagree.
+  - A pre-#69 database shows the "finish database setup" card (`isMigrationMissing`), never a raw error.
+- **`enrollment_decision_email_facts(p_request_id)`** (`enrollments.review`) is what the decision email
+  may state: the request (status, kind, extension days); the plan of the GRANTED term (an extension is
+  granted on the member's current plan, which need not be the request's); the subscription carrying the
+  request — or, for an APPROVED extension no row carries (`approve_extension()` returns a no-end-date term
+  unchanged), the live one, and for a rejected or pending request nothing beyond what carries it; the
+  cohort, for a VIP segment only (#68); and `getting_started_required`. ★ It reports FACTS; the email
+  decides what to say — a request reopened and then declined (#66) can still carry the term it once
+  granted, which is why a rejection email states no term whatever the facts hold. There is deliberately
+  NO access-request facts function: `api/notify-access.js` reads the profile with the reviewer's JWT.
+  The email rules are in the Enrollment bullet of Authentication.
+- **TESTS.** `test/gettingStarted.test.mjs` (the lib — since the final pass also
+  `gettingStartedEnrollPhase` / `gettingStartedFailedBeforePass` and the sign-in-bound sequence,
+  `gettingStartedNeedsReask`, `gettingStartedGiveUpCopy`, `gettingStartedStanding`);
+  `test/gettingStartedSql.test.mjs` (every assertion against the dated file AND §56; the copied seed and
+  catalog line-diffed against #67 §1 and #68; ACLs per function, the one publish signature included; all
+  seven policies and the `required` rule's statements pinned WHOLE, operators included (TDR-2); a wiring
+  scan of every RPC the app calls, its argument NAMES included (TDR-3) — a call shape it cannot read
+  fails the suite); `test/gateMatrix.test.mjs` (the arm's precedence; its GF-2 cases, "a transient
+  enrollment read error does not switch Getting Started off" and "once a member's app is running for
+  this account, Getting Started never takes the session over"); `uiSafety` §28a (the shared media
+  plumbing, incl. TDR-8/AUI-2), §28b (the student surfaces — since the final pass also the ROOT-LEVEL
+  latch/welcome SEQUENCE test, which RUNS the root's own deferral block, phase line and latch effect
+  through `resolveGateScreen()` and replaced the old latch test; the V-GF1-DOUBLE-BOUND hook test; the
+  V-MIGRATED-PREDICATE test; a direct-switch case in the GF-7 test; the two K3R-GATE-DIRECT-SWITCH tests,
+  which RUN the real `useEnrollmentGate` across a direct account switch (and, K3RV-CONFIGURED-CARRYOVER,
+  a next account whose reads time out) and then the root's phase line with the real `useGettingStarted`;
+  the K3RV-HOOK-SETTLE-UNPINNED test (`ready` while the hook is inactive; a first load that throws or
+  stalls ends ready); the gate's focus hand-over and the earlier-version welcome case inside the sequence
+  test, and `transientFocusTarget()` RUN on a stand-in element (K3RV-MAIN-CLICK-FOCUS); and GF-1/3/4/5/8,
+  S1–S8), §28c (the
+  admin screen — AUI-2…AUI-7, DBSEC-1, EMAIL-1, EMAIL-4, and the T9V-L2 test, which pins `rateLimited`
+  as exactly a 429, V-EMAIL1-RATELIMIT), §19 (RES-1 twice, V-RES1-GUARD, V-RES1-LABEL; AUI-1 with §28c)
+  and §T12B (the chokepoint's `tabAccessView`); the notify suites
+  (`notifyEnrollmentDecision` and `notifyAccessDecision` gain EMAIL-1, EMAIL-2, EMAIL-3 and EMAIL1-R1,
+  and `notifyAccessDecision` TDR-7's `stale_client`; `notifyEnrollmentSubmitted` gains EMAIL-2, EMAIL-3,
+  EMAIL-4 and EMAIL3-PERF); `test-db/onboardingVideo.dbtest.mjs` on the shadow
+  project — run it ALONE with `node --test --test-concurrency=1`, never `npm run test:db`. It also pins
+  DBSEC-1 (a Replace bound to the version it named) and DBSEC-4 (the attach no-op, the no-op against
+  the current row, a vanished file still refused): 47 tests (17 top-level), about 16 minutes on this
+  link — 954.7 s on 2026-10-01, up from 37 tests in about 12 minutes. And
+  `test-e2e/gettingStarted.e2etest.mjs`, which records its clip with the test Chrome's `MediaRecorder`;
+  its test 8 must read the ROLE refusal ("Your account can’t open this screen"). ★ **A version left
+  PUBLISHED on the shadow project gates every later student persona.** `resetOnboardingVideos()`
+  (`test-db/_harness.mjs`) truncates — the only reset — and the rendered suite calls it in `before()`
+  AND `after()`; `legacyMigration.e2etest.mjs` refuses to start while a version is live. ★ **A known
+  transport flake, not a defect:** one TLS reset (`ECONNRESET`, "fetch failed") in an e2e `before()`
+  fails the whole run, and a Storage "fetch failed" can fail one dbtest case; re-run once. It is
+  deliberately not retried inside `scripts/_shadow.mjs`' `runSql`: retrying a THROWN fetch could
+  execute a write twice when the reset came after the request reached the server. The `#69` block of
+  `scripts/audit-db.mjs` checks the bucket, the storage policy QUALS (each policy's deciding expression
+  compared WHOLE against its deparsed text), the three ACL classes with one signature per function, the
+  141-code catalog and the gate rule's own source.
+
 ## AI / proxy pattern
 
 Every AI tool goes through the shared **`callClaude()`** helper at the top of `BookkeeperPro.jsx`
@@ -2744,7 +3497,7 @@ setup/ops guide: [docs/ai/voice-agent-setup.md](docs/ai/voice-agent-setup.md).
   generator/provisioner exit 1 with an actionable message otherwise.
 - **Knowledge pipeline:** `npm run ai:knowledge` regenerates
   [docs/ai/toolkits-voice-agent-knowledge.md](docs/ai/toolkits-voice-agent-knowledge.md)
-  (deterministic — extracts `TAB_ROUTES`/`VOICE_TAB_INFO`/`TIPS` from the JSX, **imports**
+  (deterministic — extracts `TAB_ROUTES`/`VOICE_TAB_INFO`/`TIPS`/`NON_TOOL_TAB_IDS` from the JSX, **imports**
   `ENROLLMENT_PLANS_FALLBACK`/`PLAN_ENTITLEMENTS` from `src/lib/planCatalog.js` since #39, and fills
   a hand-authored template; it now FAILS if a catalog plan has no entitlement entry);
   `npm run ai:knowledge:push`
@@ -2753,6 +3506,12 @@ setup/ops guide: [docs/ai/voice-agent-setup.md](docs/ai/voice-agent-setup.md).
   tools/plans change (see Keeping docs current), and **`npm run ai:knowledge:check`** rebuilds
   the doc in memory + diffs it against disk (Generated-date ignored; exit 1 on drift) so a
   feature change can't silently leave the static product guide stale.
+  ★ **The tool count it states is the APP'S OWN** — `TAB_ROUTES` minus `NON_TOOL_TAB_IDS`, the
+  expression behind the Dashboard's "Pro Tools" figure (`mockinterview` is in the set). It used to
+  subtract only `dashboard`/`accessrequests`/`enrollments`, so the document called every other Home
+  and admin screen a tool: 38 at #68, 40 after #69, while the app said 30. `--check` could not see
+  it, because it compares the generator with itself; `test/voiceKnowledge.test.mjs` runs the
+  generator in a throwaway copy and fails when its number and the app's expression disagree.
 - **Provisioning pipeline:** `npm run ai:provision` builds the whole ElevenLabs side from the
   repo so the only manual step is the API key — it regenerates the KB, then
   `scripts/provision-voice-agent.mjs` creates/updates the client tools from
@@ -2844,6 +3603,11 @@ explain/quiz/practice/recap the Supabase-hosted courses. Full setup:
   (`linear-gradient(180deg, C.primaryHi, C.primary)`, ~73 inline uses plus `.sheen-btn`) still puts
   white text on `--c-primary-hi` #3D8BFF = 3.31:1. `test/uiSafety.test.mjs` ratchets the flat pattern
   and cannot see the gradient one; restyling those ~109 controls is a visual change, not an audit fix.
+  ★ **Its two siblings (#69, T9UI-4): `--ok-solid` #1B7A35 (5.41:1) and `--danger-solid` #D02323
+  (5.32:1)**, theme-independent like it (the dark block does not override them) — the flat green and
+  red behind white text, used by #69's dialogs through `GS_OK_BTN` / `GS_DANGER_BTN`. The shared
+  `ADMIN_BTN_OK` / `ADMIN_BTN_DANGER` gradients still put white text on their bright stops (1.87–4.11:1)
+  and are left alone for the same reason as the blue gradient.
 - **Never string-concat an alpha onto a token** — `` `${C.primary}66` `` is broken CSS against a var.
   Use the alpha tokens instead: `var(--primary-glow)` (was `66`), `--primary-glow-soft` (`55`),
   `--primary-selection` (`33`), `--primary-halo` (`1A`), `--primary-tint` (`14`), `--green-ring`,
@@ -2927,7 +3691,10 @@ explain/quiz/practice/recap the Supabase-hosted courses. Full setup:
 - **Email (server-only, optional):** `RESEND_API_KEY` + `RESEND_FROM` enable the approval + enrollment
   notification emails (`api/notify-access.js` / `api/notify-enrollment.js`); `NOTIFY_ADMIN_EMAIL`
   optionally overrides where "new enrollment submitted" alerts go (else the enrollment fn falls back
-  to `payment_settings.notify_email`, then to `RESEND_FROM`); `APP_URL` sets the review-button origin.
+  to `payment_settings.notify_email`, then to `RESEND_FROM`), and since #69 it is also the SECOND choice
+  for a student email's Reply-To (after `payment_settings.notify_email`; never `RESEND_FROM`).
+  `APP_URL` is the origin of every link those emails carry — on Vercel there is no fallback (without it
+  an email has no link), and the request's own host is used only under `npm run dev`.
   These are **this app's own** secrets — **Supabase Auth's SMTP/Resend settings are unrelated** and
   only send Auth emails. All are non-fatal when unset. ★ **Both notify fns DO run under
   `npm run dev`** since 2026-08-22 — `vite.config.js` registers `notifyDevApi` for
@@ -2956,6 +3723,13 @@ explain/quiz/practice/recap the Supabase-hosted courses. Full setup:
 
 - **Vercel:** push to GitHub → import project → set `ANTHROPIC_API_KEY` (Production + Preview) → deploy.
   The serverless function at `api/anthropic/v1/messages.js` replaces the dev proxy automatically.
+- ★ **After deploying #69, reload every open admin tab (TDR-7).** A tab loaded before the deploy keeps
+  the old bundle, whose Access Requests posts `{ email, fullName, status, reason }` with no `userId`.
+  The new `api/notify-access.js` refuses that with 400 `{ code: 'stale_client' }` (an earlier #69 build
+  answered a bare 400 "userId (uuid) required.") and logs `[notify-access] refused a decision with no userId …`,
+  with no address. The DECISION is still recorded; only its email is not sent, and the stale tab shows
+  ` · email not sent`. A reload fixes it. A decision made from a stale tab is not re-emailed
+  automatically, so tell that person another way if it matters.
 - **Google Apps Script (alternate) — LEGACY, NOT MAINTAINED:**
   [standalone/index.html](standalone/index.html) is a self-contained build for embedding in
   Google Sheets. ★ It has not been regenerated since the initial Vite scaffold (2026-06-07):
@@ -3001,7 +3775,9 @@ docs **in the same change**:
   (+ aliases) in BookkeeperPro.jsx and rerun `npm run ai:knowledge` (and `ai:knowledge:push` when
   deployed) **in the same change**, so the voice assistant's knowledge never drifts from the app.
   `npm run ai:knowledge:check` must pass (it exits 1 when the committed doc no longer matches the
-  code — run it before calling any tools/plans change done).
+  code — run it before calling any tools/plans change done). The document's tool count is the app's
+  own (`TAB_ROUTES` minus `NON_TOOL_TAB_IDS`): a screen that is not a tool goes in that set, and
+  `test/voiceKnowledge.test.mjs` fails if the generator ever counts differently.
 - **Deciding whether a post is an ANNOUNCEMENT** → the `community_channels.kind` of the channel it
   is in, and nothing else (#43). The tag `community_tags.slug = 'announcements'` is post TAXONOMY
   only. These were two disagreeing switches: the rail, header and composer read `kind` while the
@@ -3076,6 +3852,35 @@ docs **in the same change**:
   already waiting. `test/enrollmentIntake.test.mjs` pins each of the four promises separately (the
   24-hour turnaround, the 9–5 window, the after-5PM rule, and weekends/holidays) so a reword cannot
   silently drop one. `emailHtml`'s `note` accepts a string or an array of lines.
+- **Changing what an enrollment or access EMAIL may state, or to whom** (#69) → every STUDENT-facing
+  email's recipient is always the account's `profiles.email`, read server-side (the student's JWT for
+  `submitted`, the reviewer's for `decision` and `api/notify-access.js`) — never an address a request
+  body or a student-typed column names (the `submitted` admin alert goes to the admin recipient chain
+  instead: `NOTIFY_ADMIN_EMAIL` → `payment_settings.notify_email` → `RESEND_FROM`'s address); and the
+  facts come from the database (`enrollment_plans` / `batches` for `submitted`,
+  `enrollment_decision_email_facts()` for `decision`, the reviewed `profiles` row for access). Moving
+  together: `api/notify-enrollment.js` / `api/notify-access.js` ↔ `plainTextEmail()` + `studentReplyTo()`
+  in `api/_lib/email.js` ↔ `enrollment_decision_email_facts()` (#69 + §56) ↔
+  `test/notifyEnrollmentSubmitted.test.mjs` + `test/notifyEnrollmentDecision.test.mjs` +
+  `test/notifyAccessDecision.test.mjs` (exact idempotency headers, text-part link parity, Manila day
+  boundaries) ↔ the `AccessRequests` payload and the Enrollments `?request=` deep link (`uiSafety`
+  §28c). ★ A key stays inside `[A-Za-z0-9:_-]{8,128}`: `sendEmail()` silently swaps any other for a
+  random UUID, which quietly turns "one email per decision" back into one per click. ★ Reply-To never
+  falls back to `RESEND_FROM`. ★ Every date is the Manila calendar day (`manilaDateOf` +
+  `formatCalendarDate`). ★ A facts failure sends the generic copy — it never refuses a decision that was
+  recorded. ★ A decision's key carries the moment it was recorded (`reviewed_at`, or `approved_at` /
+  `rejected_at`), so a decision made again is a new email; only a 409 named
+  `concurrent_idempotent_requests` is "in flight" (`resendConflictKind()`, opted into with
+  `classify409`); the text-part fold is `foldLineBreaks()`, linear, over every mandatory line break; and
+  a decision email has two burst guards — 10 a minute of ONE decision, 60 a minute of one reviewer's
+  decisions — never one keyed on the reviewer alone.
+- **Changing how an email outcome is reported** → `emailOutcomeUnclear()` (the ONE rule) ↔
+  `AccessRequests`' `notifyAccess` / `emailSuffix` ↔ `AdminEnrollments`' `notifyDecision` / `emailSuffix`
+  / `emailTally` / `decisionEmail` (`rateLimited` is exactly a 429) ↔ `NOTIFY_META` ↔ the codes
+  `api/notify-enrollment.js` and `api/notify-access.js` return ↔ `uiSafety` (T9V-L2, EMAIL-1, EMAIL-4,
+  TDR-5, V-EMAIL1-RATELIMIT). ★ "May not have been sent" is for an answer that proves nothing either
+  way (a timeout, a dropped connection, a provider 5xx, a 504, no answer); never let it read "not sent",
+  which invites a second email by hand.
 - **Changing what a course lesson video may be** → the rules live in ONE pure module and are
   mirrored in SQL. Move together: `src/lib/courseVideo.js` ↔ `course_lessons_video_guard()` /
   `courses_publish_guard()` / `course_video_object_readable()` in
@@ -3129,7 +3934,8 @@ docs **in the same change**:
   refused with *"must be MP4 (H.264 video, AAC audio)"*, which is a codec instruction from a
   gate that cannot see a codec, and iPhone/Mac recordings are exactly `.mov` + HEVC. Moving
   together: `LESSON_VIDEO_UPLOAD_MIMES` / `LESSON_VIDEO_ACCEPT` / `validateVideoFile()` ↔ the tus
-  `contentType` ↔ the bucket's `allowed_mime_types` ↔ `test/courseVideoSql.test.mjs`.
+  `contentType` ↔ the bucket's `allowed_mime_types` — in BOTH video buckets since #69, which gave
+  `onboarding-videos` the same list — ↔ `test/courseVideoSql.test.mjs` + `test/gettingStartedSql.test.mjs`.
   ★ **The client now sends the file's REAL content type.** It used to send a hardcoded
   `video/mp4` for everything, so a `.mov` would have passed the bucket check *by being
   mislabelled*. Passing by mislabelling is not a grant; it is a bug nobody has noticed yet.
@@ -3140,7 +3946,21 @@ docs **in the same change**:
   drawer closed, lesson unchanged, still link-backed, still un-publishable, no error anywhere —
   which is indistinguishable from "the upload is broken". `saveLesson` now refuses with an
   explanation, and the refusal card carries a **Dismiss** (`RESET` → `EMPTY`) so the guard can
-  never trap anyone. Pinned by `uiSafety` §19, mutation-tested.
+  never trap anyone. Pinned by `uiSafety` §19, mutation-tested. Dismiss and Remove each hand focus to
+  the picker that replaces them (`refocusIfLost(inputRef)`), never to `<body>` (T9UI-9).
+  ★ **A REFUSED PICK DISCARDS NOTHING.** `handlePick` used to open with `await discardPending()`,
+  before `validateVideoFile` had looked at the new file: a refused "Replace video" deleted the
+  verified upload the draft still named, and — because the guard above fires only when the draft
+  names NO file — Save then wrote a lesson whose video was gone (reproduced in Chrome: the Learn view
+  then read "could not be authorized"). The discard now runs once every check has passed — the
+  replacement is ACCEPTED — still in `LOCAL_VALIDATING` (Save blocked, the picker disabled), and is
+  followed by a mounted check, so an uploader closed meanwhile starts no transfer. A refusal leaves
+  the previous upload, the draft's `storage_path` and the pending-path ref exactly as they were.
+  Pinned by `uiSafety` (handlePick RUN against the real `validateVideoFile`), mutation-tested. …And
+  an upload whose CHECK failed is swept at the next SAVE (AUI-1), never at the pick: it stays pending
+  so "Check again" can still use it, and a draft never names it, so the save is the last moment
+  anything knows the path. Pinned by `uiSafety` §19 (RES-1 twice) and §19/§28c (AUI-1),
+  mutation-tested. See the RES-1 and AUI-1 bullets in the Course platform section.
   ★ **The legacy-link banner hides once `d.storage_path` is set.** During a replacement upload it
   kept insisting *"the course cannot be published until it is replaced"* directly above the
   uploader replacing it — two contradictory amber cards, and a large part of why the screen read
@@ -3218,9 +4038,11 @@ docs **in the same change**:
   MANUAL in three places; it was never performed, and on 2026-09-02 the project was still at
   the 50 MiB default **on Pro** (upgrading does not raise it), so every lesson video over
   50 MiB died at ~6 MiB — one TUS chunk — while the app blamed the admin's file. Moving
-  together now: `LESSON_VIDEO_MAX_BYTES` ↔ the bucket literal ↔ **the project-wide limit**
-  ↔ `scripts/storage-config.mjs` ↔ the storage section of `scripts/audit-db.mjs` (which
-  imports the cap rather than retyping it) ↔ `test/courseVideoSql.test.mjs`.
+  together now: `LESSON_VIDEO_MAX_BYTES` ↔ the bucket literal — `course-videos` AND #69's
+  `onboarding-videos`, which takes the same cap — ↔ **the project-wide limit**
+  ↔ `scripts/storage-config.mjs` ↔ the storage section and the `#69` block of `scripts/audit-db.mjs`
+  (both import the cap rather than retyping it) ↔ `test/courseVideoSql.test.mjs` +
+  `test/gettingStartedSql.test.mjs`.
 
   ★ **The upload bearer is attached PER REQUEST via tus's `onBeforeRequest`, and nowhere
   else.** Raising the ceiling to 2 GiB made hour-long transfers possible, so a 1-hour access
@@ -3235,6 +4057,12 @@ docs **in the same change**:
   a transfer-time 413 can only mean the server ceiling is lower than the one we enforce. The
   message must never quote a limit the client cannot know — Supabase's 413 body carries no
   number — and the UI must not offer Resume, which re-sends the identical request.
+- **Changing which lesson video a draft names** → `notePendingVideoPath`'s revert ↔
+  `savedLessonVideoRef` ↔ `prefilledLabelRef` / `applyVideoPatch`'s pre-fill ↔ `saveLesson`'s existence
+  check (`lessonVideoInStorage()`) and its leftover sweep ↔ `uiSafety` §19 (RES-1, V-RES1-GUARD,
+  V-RES1-LABEL, AUI-1). ★ A null from the uploader with nothing pending is not a discard
+  (`if (path || !dropped) return;`), and the revert puts back what the SAVED row holds — never a guess.
+  The Getting Started drawer's `notePendingPath` is the same idiom (T9V-L4); keep the two in step.
 - **Changing what the Portfolio Generator may emit** → the rules live in ONE pure module and are
   mirrored in the stylesheet. Move together: `src/lib/portfolioGenerator.js` ↔
   `src/data/portfolio-generator.js` (the 9 themes, whose hexes the contrast floors are computed
@@ -3631,6 +4459,13 @@ docs **in the same change**:
   null there is a blank white page, not a degraded render. See the entitlement bullet in
   "Plan-based access". `test/staffInvite.test.mjs` + `test/staffRoles.test.mjs` +
   `test/uiSafety.test.mjs` §15 pin it.
+- **Changing what the chokepoint renders for a refused or undecided tab** → `tabAccessView()` ↔
+  `TabAccessCheck` / `RestrictedTab`'s `reason` ↔ `adminTabVisible()` + `staffEntitlement()` (both answer
+  an admin tab from `staffCan`, so an admin tab a role lacks is refused by both, and reads as `'role'`,
+  never `'plan'`) ↔ `uiSafety` §T12B ↔ `typedAddressOutcome()` in `test-e2e/gettingStarted.e2etest.mjs`
+  (test 8). ★ An admin tab must be listed in `ADMIN_TAB_PERMISSION`: that is what makes the chokepoint
+  wait for the staff context ("Checking your access…") and refuse by ROLE — a tab missing from it is
+  treated as a plan tab. ★ A role refusal sells nothing: no plan includes an admin screen.
 - **Changing WHO the auth gate holds, or in what order** → `resolveGateScreen()` in
   [src/lib/gateScreen.js](src/lib/gateScreen.js) ↔ the switch in `BookkeeperProToolkit` ↔
   `test/gateMatrix.test.mjs`.
@@ -3650,8 +4485,32 @@ docs **in the same change**:
   `MEMBERSHIP_EXPIRED`/`RENEWAL_PAYWALL` carry the only Renew/Extend/Upgrade actions and belong to
   someone who already bought; and it grants nothing — authority still fails closed, a ban and the
   staff bypass both still outrank it. The ordering is load-bearing (a ban outranks the paywall, imported
-  onboarding outranks the membership gate, the legacy approval gate comes last) and for years none
-  of it was a test. Add the case to the matrix in the same change. ★ There is no jsdom or RTL in
+  onboarding outranks the membership gate, the legacy approval gate comes last among the holds that
+  decide access) and for years none of it was a test. Add the case to the matrix in the same change.
+  ★ **#69's Getting Started arm sits after even the legacy approval gate, and decides NO access.**
+  It runs only where the paywall is enforced and MIGRATED (`requireEnrollment && enroll.migrated !==
+  false`). `useEnrollmentGate`'s `migrated` turns false only when `isEnrollmentTableMissingErr()` says
+  so, by the error CODE alone (PGRST205/42P01 a missing table, PGRST204/42703 a missing column).
+  `isEnrollmentNotConfiguredErr()` stays the broad LOGGING classifier: its message regex also matches a
+  PGRST002 schema-cache reload and a 42501 permission error that names `enrollment_requests`, and
+  neither may switch the arm off (V-MIGRATED-PREDICATE). `configured` follows the LAST read and flips
+  on any transient error; keying the arm on it made the gate flap GETTING_STARTED → APP →
+  GETTING_STARTED mid-video (GF-2), so only the enrollment arm keeps reading `configured`.
+  ★ **The arm never takes over a MEMBER's running app** (`appShellShown`, the root's `gsShellUid`
+  latch). An effect sets it only when the gate's verdict is APP AND the enrollment phase is a settled
+  pass (`gsEnrollPhase === 'pass'`). Any other screen except SPLASH ends it — a hold screen has already
+  unmounted the shell, so the next pass is the next load's answer (a member whose term ends
+  mid-session and who renews is asked then) — and so does a sign-out. The enrollment arm's own
+  fail-open app (one `enrollment_requests` read error, for a student who is not a member yet) is never
+  latched: latching it skipped the video for an enrollment approved later in that session
+  (V-GF2-LATCH). A required answer that arrives while the latch stands is shown on the page and the
+  card, and the gate asks again at the next load. The arm also never runs for `is_admin` or a
+  staff-bypass viewer (no `staffReady` wait: the server's `required` already excludes staff), never
+  after a session's deferral; `loading` holds the SPLASH and only a
+  `ready` answer whose `required` is the literal `true` shows the video. Everything else — an RPC
+  error, a pre-#69 database, the 7 s timeout, junk input — renders the APP: it fails OPEN because it
+  grants nothing and membership RLS still guards every paid read. `test/gateMatrix.test.mjs` pins that
+  every earlier screen still wins over a required video, unchanged. ★ There is no jsdom or RTL in
   this repo, so the suite pins the DECISION, not the render — a new `GATE_SCREENS` value still
   needs its switch arm added by hand, or it falls through `default` and renders the app.
   ★ **The `!profileReady` arm is NOT allowed to swallow a live invitation token** (#50): a
@@ -3659,6 +4518,64 @@ docs **in the same change**:
   `→ SPLASH` there unmounts the invitation screen at the moment it has just spent the one-time
   token — which is the whole "your invitation has expired" incident. The pinned rule: token +
   `!profileReady` → `STAFF_INVITATION`, and the ban still wins the moment the profile lands.
+- **Changing WHO must watch the Getting Started video** → `user_onboarding_video_state()` in
+  `db/2026-09-30-getting-started-video.sql` **and its fold §56** is the ONE decision (the overview's
+  set-based counts restate it and move with it) ↔ the client mirrors in
+  [src/lib/gettingStarted.js](src/lib/gettingStarted.js) (`gettingStartedStatus()`,
+  `gettingStartedEnrollPhase()` — whose `'pass'` is `gettingStartedEnrollPass()`, so the root hands the
+  hook only a SETTLED pass, this account's profile and reads, T12-D1 and K3R-GATE-DIRECT-SWITCH; its
+  `'hold'` vs `'unknown'` decides what a failed first answer
+  means, V-GF1-DOUBLE-BOUND — and `gettingStartedFailedBeforePass()`,
+  `gettingStartedGateInput()`, `publishImpact()`'s three cases) ↔ the last arm of `resolveGateScreen()`
+  ↔ `test/gettingStartedSql.test.mjs` + `test/gettingStarted.test.mjs` + `test/gateMatrix.test.mjs` +
+  `test-db/onboardingVideo.dbtest.mjs` (edges a–c) ↔ the `#69` block of `scripts/audit-db.mjs`, whose
+  source probe names the cutoff clause itself. ★ `required` stays a boolean (`coalesce(…, false)`),
+  staff stay excluded by the #50/#52 rule (`invited` + `active`, plus `is_admin`), and the cutoff stays
+  the FIRST publish of ANY version. ★ The gate keeps failing OPEN and the functions CLOSED: never turn a
+  failed, timed-out or malformed answer into a hold — the video grants nothing.
+- **Changing what counts as FINISHED** → presentation: `watchVerdict()` / `playedFraction()` /
+  `mergeRanges()` / `holdWatchVerdict()` / `watchRecordFor()` / `resumeAt()` with
+  `ONBOARDING_WATCH_MIN_FRACTION` / `ONBOARDING_NEAR_END_SECONDS` ↔ `test/gettingStarted.test.mjs` ↔
+  `uiSafety` §28b. Security: `ONBOARDING_MIN_ELAPSED_FRACTION` / `ONBOARDING_UNKNOWN_DURATION_SECONDS`
+  / `ONBOARDING_MIN_ELAPSED_FLOOR_SECONDS` ↔ `complete_onboarding_video()`'s
+  `greatest(coalesce(duration_seconds, 60) * 0.4, 5)` in BOTH SQL files ↔ `test/gettingStartedSql.test.mjs`
+  (which builds its pattern from the constants) ↔ `test-db/onboardingVideo.dbtest.mjs` ↔
+  `test-e2e/gettingStarted.e2etest.mjs`, whose 3-second clip must wait out the 5-second floor.
+  ★ Keep the fraction under one half or a 2× viewer is refused; keep a floor and a stand-in or an
+  unverified duration means no wait at all. ★ Never re-stamp `completed_at`.
+- **Changing the `onboarding-videos` bucket** → it takes the LESSON limits:
+  `LESSON_VIDEO_MAX_BYTES` / `LESSON_VIDEO_UPLOAD_MIMES` in `src/lib/courseVideo.js` ↔ the bucket literal
+  in #69 + §56 ↔ `test/gettingStartedSql.test.mjs` ↔ the `#69` audit entry (which imports both) ↔
+  `db/README.md` step 3 (exact bytes, never "2 GB") — and the project-wide limit stays the real
+  ceiling for both video buckets (`npm run storage:config`). Its object name: `ONBOARDING_VIDEO_PATH_RE`
+  ↔ the `storage_path` CHECK ↔ `onboarding_video_path_version_id()` (the suite runs hostile paths
+  through all of them). Its four storage policies ↔ the three helpers ↔ their `authenticated` grant: a
+  helper a policy calls without that grant breaks EVERY bucket, not just this one.
+- **Changing what the Getting Started arm treats as set up, or when it may take a session over** →
+  `resolveGateScreen()` (`enroll.migrated`, `appShellShown`) ↔ `useEnrollmentGate`'s `migrated` ↔
+  `isEnrollmentTableMissingErr()` (codes only — never the logging classifier
+  `isEnrollmentNotConfiguredErr()`) ↔ the root's `gsShellUid` latch effect and its two rules (set on APP
+  with `gsEnrollPhase === 'pass'`; ended by any screen but APP or SPLASH, and at sign-out) ↔
+  `test/gateMatrix.test.mjs` + `uiSafety` §28b, whose root-level sequence test RUNS the root's own lines
+  through `resolveGateScreen()`. ★ Never key the arm on `enroll.configured` again: it follows the last
+  read, and one transient error took a student out of the video mid-watch (GF-2).
+- **Changing when the root hook asks again** → `gettingStartedNeedsReask()` ↔ `gettingStartedStatus()`'s
+  hold (ONE rule: a hold with no re-ask behind it is a splash that never ends, and a re-ask with no hold
+  in front of it is a round trip nobody waits for) ↔ the hook's `failedBeforePass` ↔
+  `gettingStartedEnrollPhase()` / `gettingStartedFailedBeforePass()` ↔ the hook's settling effect (a
+  failure that landed while the phase was `'unknown'` takes the first settled phase) ↔
+  `test/gettingStarted.test.mjs` + `uiSafety` §28b.
+- **Changing where a viewer stands, or why the video gave up** → `gettingStartedStanding()` (the card's
+  chip AND the page's line: one derivation, S6) / `gettingStartedGiveUpCopy()` (every give-up panel; "on
+  this device" only for a decode failure, S3) ↔ `test/gettingStarted.test.mjs` + `uiSafety` §28b ↔ the
+  rendered suite's card-chip finder (`gsCard()` in `test-e2e/gettingStarted.e2etest.mjs`).
+- **Changing what a Replace confirmation binds to** → `admin_onboarding_video_publish(p_video_id,
+  p_replace_live, p_expected_live_id)`'s expected-live guard and its `REPLACE_CONFIRM` context (dated
+  file + §56) ↔ `confirmReplace` in `GettingStartedVideoAdmin` (it sends the live id frozen when the
+  dialog opened; the dialog's text is built from that same `confirm.live`) ↔ `uiSafety` §28c (DBSEC-1) ↔
+  `test/gettingStartedSql.test.mjs` ↔ `test-db/onboardingVideo.dbtest.mjs` (DBSEC-1) ↔ the `#69` audit's
+  one-signature check. ★ Re-signing a function needs the old signature DROPPED first: CREATE OR REPLACE
+  with a new parameter adds an overload, and every call that omits the new parameter becomes ambiguous.
 - **Changing what the INVITATION SCREEN shows, or when** → the decision is
   `resolveInviteState()` in [src/lib/inviteMachine.js](src/lib/inviteMachine.js) ↔ the switch in
   `StaffInvitationSetup` ↔ `staff_invitation_state()` in

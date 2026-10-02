@@ -97,7 +97,7 @@ export const STAFF_PERMISSIONS = [
   { key: 'payment_settings.manage', category: 'Settings', label: 'Edit payment settings',
     description: 'Change the manual-payment instructions and the notification address.' },
 
-  // ── Finance (#58) + Communications (#61) + Meetings (#62) ─────────────────
+  // ── Finance (#58), Communications (#61), Meetings (#62), Onboarding (#69) ──
   // ★ ORDER MATTERS: the SQL seed lists these last, in this order, and
   //   test/staffRolesSql.test.mjs asserts deepEqual on ORDER, not set membership.
   //   Moving one moves nothing about authorization and breaks the parity test.
@@ -107,6 +107,11 @@ export const STAFF_PERMISSIONS = [
     description: 'Send announcements, student emails and payment reminders, run email automations, and read the delivery tracker.' },
   { key: 'meetings.manage', category: 'Meetings', label: 'Manage meetings and staff tasks',
     description: 'Schedule and cancel Zoom meetings, keep meeting templates, invite students, and use the shared staff to-do board.' },
+  // #69: Super Admin only. Publishing or replacing this video changes the first screen every
+  // newly approved student sees, and the live file is served to every paying member: a
+  // product-wide change, like the global settings above.
+  { key: 'onboarding.manage', category: 'Onboarding', label: 'Manage the Getting Started video',
+    description: 'Upload, preview, publish, replace and remove the video newly approved students watch before their dashboard.' },
 ];
 
 /** Fast membership test + the canonical ordering. */
@@ -149,15 +154,16 @@ export const STAFF_ROLE_KEYS = STAFF_ROLES.map((r) => r.key);
 export const SUPER_ADMIN_ROLE = 'super_admin';
 
 /**
- * THE matrix. 22 permissions x 3 roles (#58 added finance.manage, #61
- * communications.send and #62 meetings.manage, each held by super_admin alone).
+ * THE matrix. 23 permissions x 3 roles, 35 grants (#58 added finance.manage, #61
+ * communications.send, #62 meetings.manage and #69 onboarding.manage, each held by
+ * super_admin alone).
  *
- * Two deliberate omissions, both of which a reader will want to challenge:
+ * Three deliberate omissions, each of which a reader will want to challenge:
  *
  *   - operations_admin does NOT hold `students.legacy_migrate` (#67, which retired
  *     `students.import`). Activating an already-paid legacy membership grants a real
  *     subscription and cohort seats with no payment recorded here — the same reason as
- *     the next bullet. 34 grants.
+ *     the next bullet.
  *
  *   - operations_admin does NOT hold `students.extend_access`. A discretionary
  *     expiry extension creates paid access with no payment behind it, so it stays
@@ -171,7 +177,7 @@ export const SUPER_ADMIN_ROLE = 'super_admin';
  *     DUPLICATED course may still reference by path (duplication reuses the
  *     source course's files by reference — no copy is made).
  *
- * Both are additive later — insert a staff_role_permissions row — and neither can
+ * All three are additive later — insert a staff_role_permissions row — and none can
  * be worked around from the client, because RLS reads the table, not this file.
  *
  * #56 added `community.manage` + `community.moderate` to BOTH non-super roles, taking
@@ -562,6 +568,11 @@ export const ADMIN_TAB_PERMISSION = {
   // Super Admin only (#62). Creates meetings in the business Zoom account, invites students,
   // and holds the shared staff to-do board.
   meetings: 'meetings.manage',
+  // Super Admin only (#69). The video every newly approved student must watch before their
+  // first dashboard. The STUDENT replay tab, `gettingstarted`, is deliberately NOT listed:
+  // mapping it here would refuse it to students, who are exactly who it is for (the
+  // Community tab's reasoning, #56). Neither id is `onboarding`, the Client Onboarding tool.
+  gettingstartedadmin: 'onboarding.manage',
 };
 
 /**

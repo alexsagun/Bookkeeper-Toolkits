@@ -40,6 +40,14 @@
      left alone deliberately: restyling ~109 controls is a visual redesign, not an audit fix.
      test/uiSafety.test.mjs ratchets the flat pattern and CANNOT see the gradient one. */
   --primary-solid: #0070E0;
+  /* ★ Its siblings for the other two solid actions (#69, T9UI-4): FLAT fills behind WHITE TEXT,
+     theme-independent as --primary-solid is (the dark block does not override them). The
+     ADMIN_BTN_OK / ADMIN_BTN_DANGER gradients put white text on their bright stops — #34C759
+     2.22:1 and #E04545 4.11:1 here, #3BD86A 1.87:1 and #FF7B73 2.52:1 in dark — under the 4.5:1 a
+     14px bold label needs. #1B7A35 (the light status-ok-fg) is 5.41:1 and #D02323 (the light
+     --c-red) 5.32:1; test/uiSafety.test.mjs measures both. */
+  --ok-solid: #1B7A35;
+  --danger-solid: #D02323;
   --c-accent: #5AC8FA;
   --c-soft: #6FAAFF;
 
@@ -1110,6 +1118,8 @@ body.is-col-resizing iframe { pointer-events: none; }
 .course-workspace :focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
 /* The splitter track is only 10px wide; a 2px offset would read as a second rail. */
 .course-splitter:focus-visible { outline-offset: 0; }
+/* The video frame's own ring is NOT this one: 2px outside the frame, it is clipped by the card around
+   it. The last block in this file draws that ring inside the frame, above the video (D2). */
 
 @media (prefers-reduced-motion: reduce) {
   /* Only the splitter's hover tint. NOT a blanket `* { animation: none }` — that would
@@ -1791,6 +1801,21 @@ body.is-col-resizing iframe { pointer-events: none; }
 
 .enroll-card { container: enroll-card / inline-size; }
 .enroll-card:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+/* #69: the request an admin alert linked to (/admin/enrollments?request=<id>) — a ring that says
+   "this one", drawn in by one short pulse. A ring, not a fill: the card's status colours stay
+   readable under it. Reduced motion keeps the ring and drops the pulse. */
+.enroll-card[data-enroll-focus] {
+  outline: 2px solid var(--c-primary);
+  outline-offset: 3px;
+  animation: enroll-focus-in 0.9s ease-out 2;
+}
+@keyframes enroll-focus-in {
+  from { outline-offset: 12px; outline-color: transparent; }
+  to { outline-offset: 3px; outline-color: var(--c-primary); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .enroll-card[data-enroll-focus] { animation: none; }
+}
 /* The list (or the empty state that replaces it) is where focus lands when the decided card
    left the view. A mouse-driven programmatic focus shows nothing; a keyboard one shows this. */
 .enroll-list:focus { outline: none; }
@@ -1962,4 +1987,191 @@ body.is-col-resizing iframe { pointer-events: none; }
 @container import-ws (min-width: 900px) {
   .iw-grid { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); align-items: start; }
   .iw-map-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   GETTING STARTED (#69) — GettingStartedPlayer / Body / Card in BookkeeperPro.jsx
+   ═══════════════════════════════════════════════════════════════════════════
+   ★ .gs-stage is the frame the player's pause observer watches (usePauseWhenHidden), and it
+     is mounted for the player's whole life. It centres and rounds, and nothing more: the 16:9
+     box inside it is SignedLessonVideo's own .course-stage, which caps its width at
+     min(78vh, 900px) × 16/9. This cap is tighter, min(72vh, 820px) × 16/9, so the
+     .course-stage inside always resolves to 100% of it, and the two never fight.
+   ★ THE GATE'S FRAME ANSWERS TO THE WINDOW'S HEIGHT TOO. That cap never binds on the gate: its
+     column is 654px wide, and 72vh × 16/9 only drops under that below a 511px-tall window. So
+     the video was 368px tall everywhere, "Go to dashboard" ended 760px down, and on a
+     1366×768 laptop (about 657px of window) the button unlocked out of sight. Measured at
+     1280×800, 392px of the gate is not the video: the page's top padding (40), the logo (72),
+     the welcome band (136 — the heading and a two-line intro), the body's top padding (24),
+     then under the frame a 20px gap, the progress line (34), a 20px gap and the button (46).
+     With 28px to spare, the frame gets the window's height less 420px, at 16:9 — but never
+     under 200px tall (356px wide): below that, a phone held sideways scrolls instead, and the
+     unlock scrolls the button into view (GettingStartedBody). vh first, for a browser without
+     dvh.
+   ★ The Dashboard card is laid out by the CARD, not the viewport: at one viewport width the
+     tab has three different amounts of room (the sidebar open, the rail, or no sidebar).
+     Narrow is the base, and everything stacks. Inline from 560px of card: the 44px icon, a
+     16px gap, the text, a 16px gap and the actions — the "Open video" / "Close video" toggle
+     (133 / 135px) and "Open Getting Started" (177px) with an 8px gap, 318–320px. At 560 the
+     text keeps 560 − 44 − 32 − 320 ≈ 164px: a short title takes two lines, a 120-character one
+     seven, and the longest chip ("Finished an earlier version", 164px) wraps onto a second line
+     while the video is open. A manager's third action ("Manage in Getting Started Video",
+     274px) cannot sit beside the other two: the actions reach their 60% cap (336px at 560) and
+     wrap onto a second row, leaving the text 148px. Measured in Chrome with Inter loaded, in
+     both themes, the toggle open and closed, at 520/560/600/720: nothing overflows, overlaps or
+     clips (with the fallback system font the actions measure ~309px and the text ~175px). The
+     actions are a flex item capped at 60% that WRAPS rather than squeezing the text — never an
+     `auto` grid track, which takes its max-content before a minmax(0, 1fr) column gets anything
+     (the Enrollments card's 0px identity column).
+   ★ The journey strip goes three-across at 640px of strip: a stage needs ~200px (12px of
+     padding each side, the 34px badge, a 12px gap and ~130px of text), so 3 × 200 + 2 × 10 =
+     620 → 640.
+   Pinned by test/uiSafety.test.mjs §28b.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.gs-stage {
+  width: min(100%, calc(min(72vh, 820px) * 16 / 9));
+  margin-inline: auto;
+  border-radius: 16px;
+  overflow: hidden;
+  background: #000;
+}
+.gs-stage[data-gs-mode="gate"] {
+  width: min(100%, calc(max(200px, 100vh - 420px) * 16 / 9));
+  width: min(100%, calc(max(200px, 100dvh - 420px) * 16 / 9));
+}
+/* ★ THE REPLAY PAGE'S FRAME FITS UNDER ITS STICKY HEADER (S7). The page sits in the app shell, under
+     SectionHead, which is sticky at the top of the page's scroller: 151px tall at 844×390 and at
+     667×375 (measured — it overlaps the 65px mobile topbar rather than stacking under it). The 72vh
+     cap knows nothing of it, so on a phone held sideways the 281px frame could never be seen whole:
+     its top slid under the header while its controls sat below the fold. So the page's frame also
+     answers to the window's height, less the header and 24px to spare (175px), and never under
+     160px tall. It binds only below a 625px-tall window (where 100vh - 175px drops under 72vh):
+     at 1366×657 and taller the 72vh cap is the smaller one, and nothing changes. vh first, for a
+     browser without dvh. */
+.gs-stage[data-gs-mode="page"] {
+  width: min(100%, calc(min(72vh, 820px, max(160px, 100vh - 175px)) * 16 / 9));
+  width: min(100%, calc(min(72vh, 820px, max(160px, 100dvh - 175px)) * 16 / 9));
+}
+
+.gs-progress { height: 6px; border-radius: 999px; background: var(--wash-strong); overflow: hidden; }
+.gs-progress__bar { height: 100%; border-radius: inherit; background: var(--c-primary); transition: width .3s ease-out; }
+
+.gs-journey { container: gs-journey / inline-size; }
+.gs-journey__grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+@container gs-journey (min-width: 640px) {
+  .gs-journey__grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+.gs-card { container: gs-card / inline-size; }
+.gs-card__row { display: flex; flex-direction: column; gap: 14px 16px; }
+.gs-card__icon {
+  flex: 0 0 auto; width: 44px; height: 44px; border-radius: 14px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--primary-tint); color: var(--c-primary);
+}
+.gs-card__text { min-width: 0; }
+.gs-card__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.gs-card__player { margin-top: 16px; animation: gs-expand .28s cubic-bezier(.16, 1, .3, 1) both; }
+@keyframes gs-expand { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+@container gs-card (min-width: 560px) {
+  .gs-card__row { flex-direction: row; align-items: center; }
+  .gs-card__text { flex: 1 1 0; }
+  .gs-card__actions { flex: 0 1 auto; max-width: 60%; justify-content: flex-end; }
+}
+
+/* A visible ring on every control of these surfaces — scoped, for the reason the
+   .course-workspace one is: the app-wide focus pass is still its own change. */
+.gs-surface :focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+/* …and on a surface focused ITSELF — the tab's card after "Try again", the admin's live card after
+   a publish — which the descendant rule above never matched: those drew the browser's default ring
+   (RV8-UI-L3, T9UI-14). The Super Admin screen takes the same ring, and so do its dialogs, which are
+   portaled out of .gs-admin and carry .gs-dialog on their body (and the editor's footer). An input
+   keeps its soft halo inside the ring, as .cl-tool's do. After .gh-input's own focus rule, which
+   sets outline: none at the same specificity. */
+.gs-surface:focus-visible,
+.gs-admin :focus-visible,
+.gs-dialog :focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+.gs-admin .gh-input:focus-visible,
+.gs-dialog .gh-input:focus-visible { outline-offset: 4px; }
+
+@media (prefers-reduced-motion: reduce) {
+  /* The card's expand, the progress bar's glide and the gate's entrance (the shared .auth-in
+     rise, which no earlier block stills). NOT a blanket "animation: none" on everything: that
+     would still the Loader2 in the player's "Loading video…" frame, which is how these viewers
+     tell loading from a dead black box. */
+  .gs-card__player { animation: none; }
+  .gs-progress__bar { transition: none; }
+  .gs-surface.auth-in { animation: none; }
+}
+
+/* ── The Super Admin screen (GettingStartedVideoAdmin, #69) ──────────────────
+   Laid out by the SCREEN's width, not the viewport: the tab is 726px wide at 1024 with the sidebar
+   open and 938px with it collapsed, and no viewport breakpoint can tell those apart. Narrow is the
+   base — everything stacks. From 880px of screen the live card and "Who sees this" sit side by
+   side, 1.5fr to 1fr around a 16px gap: at 880 the live card is 0.6 × (880 − 16) ≈ 518px and "Who
+   sees this" 0.4 × (880 − 16) ≈ 346px, room for a readable line. Inside the card's 2 × 20px of
+   padding its facts (10rem = 160px columns, 16px apart) fit TWO columns there; three
+   (3 × 160 + 2 × 16 + 40 = 552px of card) fit only from 552 / 0.6 + 16 = 936px of screen. Two
+   columns between 880 and 936 is intended — five short facts read well in two — and the threshold
+   is for the side-by-side layout, not for three columns (T9UI-11: this used to claim 552px at 880).
+   ★ A ROW'S ACTIONS ARE A FLEX ROW OF THEIR OWN, UNDER ITS TEXT — never an `auto` grid track beside
+     a minmax(0, 1fr) column, which takes its max-content before the text gets anything (the
+     Enrollments card's 0px identity column).
+   ★ The container is the wrapper INSIDE the TabPanel, never the TabPanel: container-type would
+     make it the containing block for every fixed overlay in the tab. (Every dialog here portals
+     through AccountModal or SidePanel anyway.)
+   Pinned by test/uiSafety.test.mjs §28c. */
+.gs-admin { container: gs-admin / inline-size; }
+.gs-admin__top { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+.gs-admin__row { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.gs-admin__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.gs-admin__facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(10rem, 100%), 1fr)); gap: 10px 16px; }
+@container gs-admin (min-width: 880px) {
+  .gs-admin__top { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); align-items: start; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   THE MEDIA STAGE'S OWN FOCUS RING — keep this block LAST: it must follow every scoped ring above.
+   ═══════════════════════════════════════════════════════════════════════════
+   ★ SignedLessonVideo's own "Try again" hands focus to its .course-stage frame (tabIndex -1), on a
+     lesson and in every Getting Started player. Each caller CLIPS that frame — the learner card is
+     overflow-hidden, .gs-stage rounds and clips — so the scoped rings (.course-workspace,
+     .gs-surface, .gs-admin, .gs-dialog), drawn 2px OUTSIDE the element, showed one edge of four on
+     a lesson and none at all on the gate (D2).
+   ★ PULLING THE OUTLINE INSIDE IS NOT ENOUGH HERE, and that was measured in Chrome, not assumed:
+     the <video> is positioned, so it paints AFTER the frame's own outline. An outline-offset of
+     -2px (the .lesson-doc-surface fix) drew all four edges over the message and none over a video,
+     and a video is the very state "Try again" exists to reach. So the frame drops its outline, and
+     an ::after (positioned too, and later in tree order) paints the ring over whatever the frame
+     holds, inside every clip. pointer-events: none keeps the video's own controls under it: the
+     overlay covers the whole video, and without it every click lands on the frame and never starts
+     playback (measured).
+   ★ The same specificity as each scoped ring it overrides, so it must come after all of them, or
+     their 2px offset wins back and draws a clipped ring beside this one. Where a caller rounds the
+     frame (.gs-stage, the learner card's top corners) the clip trims the ring's corners, as it
+     would any inset ring. Pinned by test/uiSafety.test.mjs (the residue block after §28c). */
+.course-stage:focus-visible { outline: none; }
+.course-stage:focus-visible::after {
+  content: '';
+  position: absolute;
+  top: 0; right: 0; bottom: 0; left: 0;
+  border: 2px solid var(--c-primary);
+  pointer-events: none;
+}
+/* ★ …AND THE SAME RING WHEN THE FRAME'S <video> HAS FOCUS ITSELF (S1). Tab's first stop on the
+     Getting Started gate, the replay page and the Dashboard card — and on a lesson — is the <video>,
+     not its frame. Its 2px outline sits 2px OUTSIDE it, and the frame (and .gs-stage around it) clip
+     it away: measured in Chrome, not one ring pixel on any edge of the stage, in either theme. So the
+     video draws no outline, and the frame paints the ::after above for it — inside every clip, over
+     the picture, with the controls still under the pointer. A rule of its own, never a second
+     selector on the one above: a browser without :has() drops a whole selector list, and the frame's
+     own ring would go with it. */
+.course-stage > video:focus-visible { outline: none; }
+.course-stage:has(> video:focus-visible)::after {
+  content: '';
+  position: absolute;
+  top: 0; right: 0; bottom: 0; left: 0;
+  border: 2px solid var(--c-primary);
+  pointer-events: none;
 }

@@ -187,8 +187,8 @@ test('the catalog has no duplicates and every code matches the wire shape', () =
 
 test('LEGACY_BATCH_GAP is a known code, read off the hint, with its missing months', () => {
   assert.ok(APP_ERROR_CODES.includes('LEGACY_BATCH_GAP'));
-  // 133 SQL codes in app_error_catalog() after #68, plus the one client-synthesised code.
-  assert.equal(APP_ERROR_CODES.filter((c) => c !== 'MIGRATION_MISSING').length, 133);
+  // 141 SQL codes in app_error_catalog() after #69, plus the one client-synthesised code.
+  assert.equal(APP_ERROR_CODES.filter((c) => c !== 'MIGRATION_MISSING').length, 141);
   const e = pgErr({ hint: 'LEGACY_BATCH_GAP', code: 'PT409', context: { missing: ['2026-11'] } });
   assert.equal(appErrorCode(e), 'LEGACY_BATCH_GAP');
   assert.deepEqual(appErrorContext(e), { missing: ['2026-11'] });
@@ -211,4 +211,53 @@ test('a busy run no longer blames a window that may not exist', () => {
   const copy = APP_ERROR_COPY.LEGACY_RUN_BUSY;
   assert.match(copy, /stopped part-way/);
   assert.match(copy, /10 minutes/);
+});
+
+// ── #69: the Getting Started onboarding video ───────────────────────────────
+
+const ONBOARDING_VIDEO_CODES = [
+  'ONBOARDING_VIDEO_NOT_FOUND',
+  'ONBOARDING_VIDEO_UNAVAILABLE',
+  'ONBOARDING_VIDEO_NOT_ELIGIBLE',
+  'ONBOARDING_VIDEO_NOT_FINISHED',
+  'ONBOARDING_VIDEO_STATE_INVALID',
+  'ONBOARDING_VIDEO_MEDIA_INVALID',
+  'ONBOARDING_VIDEO_REPLACE_CONFIRM',
+  'ONBOARDING_VIDEO_TEXT_INVALID',
+];
+
+test('the eight #69 codes are known, read off the hint, and each shows its own copy', () => {
+  for (const code of ONBOARDING_VIDEO_CODES) {
+    assert.ok(APP_ERROR_CODES.includes(code), `${code} is not in APP_ERROR_CODES`);
+    const copy = APP_ERROR_COPY[code];
+    assert.ok(typeof copy === 'string' && copy.length > 20, `${code} has no copy`);
+    const e = pgErr({ hint: code, code: 'PT409', message: 'start_onboarding_video: a sentence for the log' });
+    assert.equal(appErrorCode(e), code, `${code} must survive the hint validator`);
+    assert.equal(appErrorMessage(e), copy, `${code} must show its written copy, not the database sentence`);
+  }
+  assert.equal(new Set(ONBOARDING_VIDEO_CODES.map((c) => APP_ERROR_COPY[c])).size, ONBOARDING_VIDEO_CODES.length,
+    'each refusal says its own thing');
+});
+
+test('ONBOARDING_VIDEO_MEDIA_INVALID is worded for the PUBLISH that raises it, as well as the attach (AUI-6)', () => {
+  // admin_onboarding_video_publish raises it for "This version has no file in storage", and this copy
+  // outranks the server's sentence — which, for "Publish again" on a RETIRED version, used to send the
+  // Super Admin to attach a file to a draft from an editor that version does not have.
+  const copy = APP_ERROR_COPY.ONBOARDING_VIDEO_MEDIA_INVALID;
+  assert.match(copy, /no longer in storage/, 'what a publish meets: the file vanished after the list loaded');
+  assert.match(copy, /in a draft’s editor, or as a new video/, 'a way forward for a draft and for a version that was live before');
+  assert.doesNotMatch(copy, /attached to this draft/, 'not an attach-only sentence');
+  assert.match(copy, /Nothing was changed\.$/, 'the Getting Started editor strips this ending when the details had already been saved');
+  const e = pgErr({ hint: 'ONBOARDING_VIDEO_MEDIA_INVALID', code: 'PT422', message: 'admin_onboarding_video_publish: This version has no file in storage.' });
+  assert.equal(appErrorMessage(e), copy);
+});
+
+test('a student-facing #69 refusal never talks about the admin screen or the storage behind it', () => {
+  // These three reach a STUDENT, on the welcome screen or the replay page. The student has
+  // no admin screen and no bucket, so copy about drafts or files would only confuse them.
+  for (const code of ['ONBOARDING_VIDEO_UNAVAILABLE', 'ONBOARDING_VIDEO_NOT_ELIGIBLE', 'ONBOARDING_VIDEO_NOT_FINISHED']) {
+    const copy = APP_ERROR_COPY[code];
+    assert.match(copy, /Getting Started video/, `${code} names what it is about`);
+    assert.doesNotMatch(copy, /Super Admin|draft|publish|upload|storage|bucket|onboarding_video/i, code);
+  }
 });

@@ -191,6 +191,15 @@ export const APP_ERROR_CODES = [
   'LEGACY_REVERT_REFUSED',
   // Legacy student migration, round 2 (#68)
   'LEGACY_BATCH_GAP',
+  // Getting Started onboarding video (#69)
+  'ONBOARDING_VIDEO_NOT_FOUND',
+  'ONBOARDING_VIDEO_UNAVAILABLE',
+  'ONBOARDING_VIDEO_NOT_ELIGIBLE',
+  'ONBOARDING_VIDEO_NOT_FINISHED',
+  'ONBOARDING_VIDEO_STATE_INVALID',
+  'ONBOARDING_VIDEO_MEDIA_INVALID',
+  'ONBOARDING_VIDEO_REPLACE_CONFIRM',
+  'ONBOARDING_VIDEO_TEXT_INVALID',
   // ── Client-synthesised (never raised by SQL) ──
   'MIGRATION_MISSING',
 ];
@@ -559,6 +568,41 @@ const COPY = {
   LEGACY_BATCH_GAP:
     'A month in this cohort run has no batch yet, while a later batch exists. Create the missing '
     + 'batch in Admin → Batches before activating, or those students will skip that month for good.',
+  // Getting Started onboarding video (#69). UNAVAILABLE, NOT_ELIGIBLE and NOT_FINISHED reach a
+  // STUDENT on the welcome screen or the replay page, so they never mention the admin screen or
+  // storage. The other five reach the Super Admin on the Getting Started Video screen, and each
+  // names the next move. TEXT_INVALID restates the onboarding_videos CHECK limits.
+  ONBOARDING_VIDEO_NOT_FOUND:
+    'That Getting Started video no longer exists. It may have been deleted in another window. '
+    + 'Refresh the page to see the current versions.',
+  ONBOARDING_VIDEO_UNAVAILABLE:
+    'The Getting Started video isn’t available to play right now. Please try again in a moment, '
+    + 'and if it keeps happening, contact support.',
+  ONBOARDING_VIDEO_NOT_ELIGIBLE:
+    'The Getting Started video is for members with an active membership. If your enrollment was '
+    + 'approved a moment ago, refresh the page and try again.',
+  ONBOARDING_VIDEO_NOT_FINISHED:
+    'The Getting Started video hasn’t played all the way through yet. Keep watching, and you can '
+    + 'continue once it ends.',
+  ONBOARDING_VIDEO_STATE_INVALID:
+    'That change isn’t possible from this video’s current state. A published video must be '
+    + 'unpublished before it can be deleted, only a draft can take a new file, and a deleted version '
+    + 'stays deleted. Refresh the page to see where it stands. Nothing was changed.',
+  // ★ Raised by admin_onboarding_video_attach_media AND by admin_onboarding_video_publish ("This
+  //   version has no file in storage"), and this copy outranks the server's sentence — so it is worded
+  //   for both (AUI-6). It used to speak of attaching to a draft from the editor, which a Publish again
+  //   on a RETIRED version has neither of. It still ends "Nothing was changed.": saveDraft strips that
+  //   sentence when the details had landed first (T9V-L4).
+  ONBOARDING_VIDEO_MEDIA_INVALID:
+    'That video file can’t be used: it is no longer in storage, it isn’t one of this version’s uploads, '
+    + 'or its size, type or length isn’t valid. Upload the video again — in a draft’s editor, or as a new '
+    + 'video. Nothing was changed.',
+  ONBOARDING_VIDEO_REPLACE_CONFIRM:
+    'Another Getting Started video is already live. Publishing this one replaces it, so confirm the '
+    + 'replacement first. Nothing was changed.',
+  ONBOARDING_VIDEO_TEXT_INVALID:
+    'Check the video’s details: the title needs 1 to 120 characters, the description can be at most '
+    + '600 and the transcript at most 20,000.',
   MIGRATION_MISSING:
     'This feature needs a database migration that has not been run yet. No changes were made.',
 };

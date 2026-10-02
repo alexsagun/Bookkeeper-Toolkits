@@ -866,3 +866,303 @@ test('the enrollment flag off, or an unconfigured gate, still holds nobody', () 
   assert.equal(screenOf(migratedNoTerm({ enroll: { active: true, ready: true, configured: false, state: 'paywall' } })),
     GATE_SCREENS.APP);
 });
+
+// ── #69: Getting Started, once, before the first dashboard ──────────────────
+// A newly approved student watches the Super-Admin-managed welcome video once before
+// their first dashboard. The SERVER decides `required` — who counts as newly approved,
+// whether a video is live, whether they have finished it — and this table pins only
+// where that answer sits. The arm is the LAST one, so every rule above has already
+// passed, and it is presentation only: it grants nothing, and membership RLS still
+// protects paid content, which is why anything but a ready answer fails OPEN.
+//
+// `gettingStarted` is gettingStartedGateInput()'s { status, required }: status is
+// 'loading' | 'ready' | 'unavailable', and required is true only when ready.
+
+const GS_REQUIRED = Object.freeze({ status: 'ready', required: true });
+const GS_NOT_REQUIRED = Object.freeze({ status: 'ready', required: false });
+const GS_LOADING = Object.freeze({ status: 'loading', required: false });
+const GS_UNAVAILABLE = Object.freeze({ status: 'unavailable', required: false });
+
+const enrollAt = (state) => ({ active: true, ready: true, configured: true, state });
+
+// An approved, paying student whose server answer says the video is required.
+const newlyApproved = (over = {}) => student({
+  profile: { is_admin: false, approval_status: 'approved', is_paid: true },
+  enroll: enrollAt('pass'),
+  gettingStarted: GS_REQUIRED,
+  ...over,
+});
+
+test('a newly approved student is shown Getting Started before the dashboard', () => {
+  const s = newlyApproved();
+  assert.equal(screenOf(s), GATE_SCREENS.GETTING_STARTED);
+  assert.equal(resolveGateScreen(s).reason, 'getting_started');
+});
+
+test('the Getting Started screen is a declared id', () => {
+  assert.equal(GATE_SCREENS.GETTING_STARTED, 'getting_started');
+  assert.ok(new Set(Object.values(GATE_SCREENS)).has(screenOf(newlyApproved())),
+    'an undeclared screen id would hit the switch default and render the app');
+});
+
+test('a student the server does not require it of goes straight to the app', () => {
+  assert.equal(screenOf(newlyApproved({ gettingStarted: GS_NOT_REQUIRED })), GATE_SCREENS.APP);
+});
+
+test('while the answer is loading the gate holds the splash, never the dashboard', () => {
+  const s = newlyApproved({ gettingStarted: GS_LOADING });
+  assert.equal(screenOf(s), GATE_SCREENS.SPLASH);
+  assert.equal(resolveGateScreen(s).reason, 'getting_started_loading');
+});
+
+test('an unavailable answer fails OPEN to the app', () => {
+  // An RPC error, a pre-#69 database, or the 7 s timeout. Failing open costs one
+  // orientation video; failing closed would strand every student behind a video that
+  // cannot load (a pre-#69 database has no such RPC at all).
+  assert.equal(screenOf(newlyApproved({ gettingStarted: GS_UNAVAILABLE })), GATE_SCREENS.APP);
+  // Only a READY answer is trusted: `required` beside any other status is ignored.
+  assert.equal(screenOf(newlyApproved({ gettingStarted: { status: 'unavailable', required: true } })),
+    GATE_SCREENS.APP);
+  assert.equal(screenOf(newlyApproved({ gettingStarted: { required: true } })), GATE_SCREENS.APP);
+});
+
+test('"Continue to dashboard for now" lets the student through for this session', () => {
+  // Session-only state, set after the video would not play. It records nothing, so the
+  // gate asks again at the next sign-in.
+  assert.equal(screenOf(newlyApproved({ gettingStartedDeferred: true })), GATE_SCREENS.APP);
+  assert.equal(screenOf(newlyApproved({ gettingStartedDeferred: true, gettingStarted: GS_LOADING })),
+    GATE_SCREENS.APP, 'a deferral is not replaced by a splash when the answer reloads');
+  assert.equal(screenOf(newlyApproved({ gettingStartedDeferred: false })), GATE_SCREENS.GETTING_STARTED);
+});
+
+test('no Getting Started input changes nothing', () => {
+  assert.equal(screenOf(newlyApproved({ gettingStarted: null })), GATE_SCREENS.APP);
+  assert.equal(screenOf(newlyApproved({ gettingStarted: undefined })), GATE_SCREENS.APP,
+    'omitted, it defaults to null');
+});
+
+test('junk Getting Started input never holds anyone', () => {
+  for (const gs of [{}, 'ready', true, 1, []]) {
+    assert.equal(screenOf(newlyApproved({ gettingStarted: gs })), GATE_SCREENS.APP,
+      `gettingStarted=${JSON.stringify(gs)}`);
+  }
+  // A 'ready' answer is trusted only when `required` is the boolean true. The SQL
+  // coalesces it to a boolean, so anything else is malformed — and it fails open.
+  for (const gs of [{ status: 'ready' }, { status: 'ready', required: null },
+    { status: 'ready', required: 'true' }, { status: 'ready', required: 1 }]) {
+    assert.equal(screenOf(newlyApproved({ gettingStarted: gs })), GATE_SCREENS.APP,
+      `gettingStarted=${JSON.stringify(gs)}`);
+  }
+});
+
+test('the legacy approval flag does not switch Getting Started off', () => {
+  // VITE_REQUIRE_ADMIN_APPROVAL=false turns off the ACCESS-REQUEST gate only; the
+  // video belongs to the enrollment paywall, which is still enforced here.
+  assert.equal(screenOf(newlyApproved({ requireApproval: false })), GATE_SCREENS.GETTING_STARTED);
+});
+
+test('an absent enroll object does not suppress a required video', () => {
+  // The membership gate treats a missing `enroll` as "nothing to hold" (see above). For
+  // Getting Started that is not a reason to skip: the server only answers required:true
+  // for an approved, enrolled member, so the answer itself carries the membership fact.
+  assert.equal(screenOf(newlyApproved({ enroll: undefined })), GATE_SCREENS.GETTING_STARTED);
+});
+
+test('with the enrollment paywall off there is no membership to onboard into', () => {
+  for (const gs of [GS_REQUIRED, GS_LOADING]) {
+    assert.equal(screenOf(newlyApproved({ requireEnrollment: false, gettingStarted: gs })),
+      GATE_SCREENS.APP, `status=${gs.status}`);
+  }
+});
+
+test('nor behind an unmigrated enrollment gate', () => {
+  // `migrated` is false only when the enrollment tables are MISSING — by the error's code
+  // (isEnrollmentTableMissingErr, V-MIGRATED-PREDICATE) — never because one read failed (GF-2, below).
+  for (const enroll of [{ migrated: false }, { configured: false, migrated: false },
+    { active: true, ready: true, configured: false, migrated: false, state: 'pass' },
+    { active: true, ready: true, configured: true, migrated: false, state: 'pass' }]) {
+    for (const gs of [GS_REQUIRED, GS_LOADING]) {
+      assert.equal(screenOf(newlyApproved({ enroll, gettingStarted: gs })), GATE_SCREENS.APP,
+        `enroll=${JSON.stringify(enroll)}, status=${gs.status}`);
+    }
+  }
+});
+
+// ── GF-2: the arm must not follow a read that merely failed ─────────────────────
+// useEnrollmentGate sets `configured` false on ANY error of the enrollment_requests read — a 500,
+// a 502 or 504 postgrest-js does not retry, a thrown fetch — and true again on the next good read,
+// and it reads again on every focus, every visibilitychange and every realtime event. The arm used
+// to test `configured`, so one transient error flipped GETTING_STARTED → APP → GETTING_STARTED: the
+// gate unmounted mid-video (its <video>, its watch record and its place gone), or a required student
+// let in at sign-in by an error was pulled OUT of a working session by the next focus. The arm now
+// reads `migrated`, which only a MISSING table can make false, and the enrollment arm keeps its own
+// fail-open on `configured` exactly as before.
+
+test('a transient enrollment read error does not switch Getting Started off (GF-2)', () => {
+  const transient = { active: true, ready: true, configured: false, migrated: true, state: 'pass' };
+  assert.equal(screenOf(newlyApproved({ enroll: transient })), GATE_SCREENS.GETTING_STARTED);
+  assert.deepEqual(resolveGateScreen(newlyApproved({ enroll: transient, gettingStarted: GS_LOADING })),
+    { screen: GATE_SCREENS.SPLASH, reason: 'getting_started_loading' });
+  // The flap the review reproduced, read by read: configured true → false → true.
+  const seen = [true, false, true].map((configured) => screenOf(newlyApproved({
+    enroll: { active: true, ready: true, configured, migrated: true, state: 'pass' } })));
+  assert.deepEqual(seen, [GATE_SCREENS.GETTING_STARTED, GATE_SCREENS.GETTING_STARTED, GATE_SCREENS.GETTING_STARTED],
+    'one failed read must not unmount the gate in the middle of the video');
+  // The arm never reads `configured` at all: with `migrated` unknown (absent), flipping it changes nothing.
+  for (const configured of [true, false, undefined]) {
+    assert.equal(screenOf(newlyApproved({ enroll: { active: true, ready: true, configured, state: 'pass' } })),
+      GATE_SCREENS.GETTING_STARTED, `configured=${configured}`);
+  }
+  // …and the enrollment arm's own fail-open on `configured` is exactly as it was.
+  const pendingButUnread = { active: true, ready: true, configured: false, migrated: true, state: 'pending' };
+  assert.equal(screenOf(student({ enroll: pendingButUnread })), GATE_SCREENS.APP,
+    'a read that failed still skips the enrollment hold (fail open), as before #69');
+  assert.equal(screenOf(student({ enroll: { ...pendingButUnread, configured: true } })), GATE_SCREENS.ENROLL_PENDING);
+});
+
+// ── GF-2: once a member's app is running, Getting Started never takes the session over ──────────
+// `appShellShown` is the root's latch: a MEMBER's app shell is running for THIS account in THIS session
+// — set when the app renders on a SETTLED pass, ended by any hold screen and at sign-out (V-GF2-LATCH;
+// the root's own lines are RUN through those sequences in uiSafety §28b). A required answer that
+// arrives while it stands — a page's "Try again", a replay's refresh — is shown on the page and the
+// card; the gate asks again at the next load, as a deferral does.
+
+test('once a member\'s app is running for this account, Getting Started never takes the session over (GF-2)', () => {
+  assert.equal(screenOf(newlyApproved({ appShellShown: true })), GATE_SCREENS.APP);
+  assert.equal(screenOf(newlyApproved({ appShellShown: true, gettingStarted: GS_LOADING })), GATE_SCREENS.APP,
+    'not even the splash: a running app is never replaced while an answer reloads');
+  assert.equal(screenOf(newlyApproved({ appShellShown: false })), GATE_SCREENS.GETTING_STARTED);
+  assert.equal(screenOf(newlyApproved()), GATE_SCREENS.GETTING_STARTED, 'omitted, it defaults to false');
+  for (const junk of ['true', 1, {}]) {
+    assert.equal(screenOf(newlyApproved({ appShellShown: junk })), GATE_SCREENS.GETTING_STARTED,
+      `appShellShown ${JSON.stringify(junk)}: only the literal true latches`);
+  }
+  // It latches GETTING STARTED only — every rule that decides access still takes the app away.
+  const cases = [
+    ['a ban', student({ profile: { is_admin: false, approval_status: 'rejected' } }), GATE_SCREENS.REJECTED],
+    ['a receipt under review', student({ enroll: enrollAt('pending') }), GATE_SCREENS.ENROLL_PENDING],
+    ['a lapsed membership', student({ enroll: enrollAt('expired') }), GATE_SCREENS.MEMBERSHIP_EXPIRED],
+    ['the paywall', student({ enroll: enrollAt('paywall') }), GATE_SCREENS.PAYWALL],
+    ['the legacy approval gate', student({ profile: { is_admin: false, approval_status: 'pending' } }), GATE_SCREENS.APPROVAL_PENDING],
+    ['an unread profile', unknownIdentity({ enroll: enrollAt('paywall') }), GATE_SCREENS.PROFILE_UNAVAILABLE],
+    ['the enrollment rows in flight', student({ enroll: { active: true, ready: false, configured: true, state: 'pass' } }), GATE_SCREENS.SPLASH],
+  ];
+  for (const [label, base, expected] of cases) {
+    const latched = { ...base, gettingStarted: GS_REQUIRED, appShellShown: true };
+    assert.equal(screenOf(latched), expected, `${label}: still wins with the app latched`);
+    assert.deepEqual(resolveGateScreen(latched), resolveGateScreen({ ...base, gettingStarted: GS_REQUIRED }), label);
+  }
+});
+
+test('staff are never learners: active staff and a Super Admin are never held, not even by the splash', () => {
+  // The server's `required` already excludes staff. The client's own exclusion is a
+  // second line for 'ready' — and the ONLY line for 'loading', or every staff member
+  // would sit on the splash until the fetch lands.
+  for (const role of ['operations_admin', 'trainer']) {
+    for (const gs of [GS_REQUIRED, GS_LOADING]) {
+      const s = newlyApproved({
+        staff: staffCtx(role),
+        staffMembership: membership(role, 'active'),
+        enroll: { active: false, ready: true, configured: true, state: 'pass' },
+        gettingStarted: gs,
+      });
+      assert.equal(screenOf(s), GATE_SCREENS.APP, `${role}, status=${gs.status}`);
+    }
+  }
+  for (const gs of [GS_REQUIRED, GS_LOADING]) {
+    const admin = {
+      profile: { is_admin: true, approval_status: 'approved' },
+      enroll: { active: false, ready: true, configured: true, state: 'paywall' },
+      gettingStarted: gs,
+    };
+    assert.equal(screenOf(newlyApproved({ ...admin, staff: staffCtx('super_admin') })), GATE_SCREENS.APP,
+      `Super Admin, status=${gs.status}`);
+    assert.equal(screenOf(newlyApproved({ ...admin, staffDegraded: true })), GATE_SCREENS.APP,
+      `Super Admin on the legacy column alone, status=${gs.status}`);
+  }
+});
+
+test('it does not wait on the staff lookup: the server already excludes staff', () => {
+  assert.equal(screenOf(newlyApproved({ staffReady: false })), GATE_SCREENS.GETTING_STARTED);
+});
+
+// Every screen above the arm must still win over a REQUIRED video, and win UNCHANGED:
+// the same screen and the same reason as with no Getting Started input at all.
+const withRequiredVideo = (base) => ({ ...base, gettingStarted: GS_REQUIRED });
+
+test('every earlier screen still wins over a required video, unchanged', () => {
+  const importDone = { is_admin: false, approval_status: 'approved', is_paid: true,
+    account_origin: 'import', onboarding_status: 'completed' };
+  const cases = [
+    ['a ban', student({ profile: { is_admin: false, approval_status: 'rejected' } }), GATE_SCREENS.REJECTED],
+    ['imported onboarding', student({ profile: { ...importDone, onboarding_status: 'invited' } }),
+      GATE_SCREENS.IMPORT_ONBOARDING],
+    ['the import summary', onboarded(), GATE_SCREENS.IMPORT_WELCOME],
+    ['a pending staff invitation', student({ staffMembership: membership('trainer', 'invited') }),
+      GATE_SCREENS.STAFF_INVITATION],
+    ['an invitation token', student({ hasInviteToken: true }), GATE_SCREENS.STAFF_INVITATION],
+    ['a claim link opened while signed in', student({ hasClaimToken: true }), GATE_SCREENS.IMPORT_CLAIM],
+    ['a receipt under review', student({ enroll: enrollAt('pending') }), GATE_SCREENS.ENROLL_PENDING],
+    ['a renewal under review', student({ enroll: enrollAt('renew_pending') }), GATE_SCREENS.ENROLL_PENDING],
+    ['an approval being finalized', student({ enroll: enrollAt('finalizing') }), GATE_SCREENS.ENROLL_PENDING],
+    ['a lapsed membership', student({ enroll: enrollAt('expired') }), GATE_SCREENS.MEMBERSHIP_EXPIRED],
+    ['renewing a lapsed membership', student({ enroll: enrollAt('expired'), renewNow: true }),
+      GATE_SCREENS.RENEWAL_PAYWALL],
+    ['a membership that starts later', scheduled(), GATE_SCREENS.MEMBERSHIP_SCHEDULED],
+    ['the paywall', student({ enroll: enrollAt('paywall') }), GATE_SCREENS.PAYWALL],
+    ['the paywall after a rejected request', student({ enroll: enrollAt('paywall_notice') }),
+      GATE_SCREENS.PAYWALL],
+    ['an unread profile', unknownIdentity({ enroll: enrollAt('paywall') }), GATE_SCREENS.PROFILE_UNAVAILABLE],
+    ['a migrated account with no term', migratedNoTerm(), GATE_SCREENS.IMPORT_MEMBERSHIP_PENDING],
+    // The enrollment gate is configured and passing here, so every one of the arm's own
+    // conditions holds: this is the row that catches the arm moved above approval.
+    ['the legacy approval gate', student({ profile: { is_admin: false, approval_status: 'pending' } }),
+      GATE_SCREENS.APPROVAL_PENDING],
+    ['the legacy approval gate, enrollment unmigrated', student({
+      profile: { is_admin: false, approval_status: 'pending' },
+      enroll: { active: false, ready: true, configured: false, state: 'pass' },
+    }), GATE_SCREENS.APPROVAL_PENDING],
+  ];
+  for (const [label, base, expected] of cases) {
+    assert.equal(screenOf(withRequiredVideo(base)), expected, `${label} must still win over Getting Started`);
+    assert.deepEqual(resolveGateScreen(withRequiredVideo(base)), resolveGateScreen(base),
+      `${label}: the verdict must be identical with and without a required video`);
+  }
+});
+
+test('the splashes and sign-in screens above it are untouched too', () => {
+  const cases = [
+    ['the initial auth load', student({ loading: true }), 'auth_loading'],
+    ['the profile load', student({ profileReady: false }), 'profile_loading'],
+    ['the enrollment rows in flight',
+      student({ enroll: { active: true, ready: false, configured: true, state: 'pass' } }), 'enroll_loading'],
+    ['the narrow staff wait before a price', student({ staffReady: false, enroll: enrollAt('paywall') }),
+      'staff_context_loading'],
+    ['the staff wait before legacy approval',
+      student({ staffReady: false, profile: { is_admin: false, approval_status: 'pending' } }),
+      'staff_context_loading'],
+  ];
+  for (const [label, base, reason] of cases) {
+    assert.deepEqual(resolveGateScreen(withRequiredVideo(base)), { screen: GATE_SCREENS.SPLASH, reason }, label);
+  }
+  assert.equal(screenOf(withRequiredVideo(student({ recovery: true }))), GATE_SCREENS.RECOVERY);
+  assert.equal(screenOf(withRequiredVideo(student({ user: null }))), GATE_SCREENS.AUTH);
+});
+
+test('an approval that lands mid-wait: pending, then the splash, then Getting Started', () => {
+  // While the receipt is under review the cached answer says "not eligible yet". When the
+  // approval lands, gettingStartedStatus() reports 'loading' until its one re-ask returns,
+  // so the frame in between is the splash — never a flash of the dashboard.
+  assert.equal(screenOf(newlyApproved({ enroll: enrollAt('pending'), gettingStarted: GS_NOT_REQUIRED })),
+    GATE_SCREENS.ENROLL_PENDING);
+  assert.equal(screenOf(newlyApproved({ gettingStarted: GS_LOADING })), GATE_SCREENS.SPLASH);
+  assert.equal(screenOf(newlyApproved()), GATE_SCREENS.GETTING_STARTED);
+  assert.equal(screenOf(newlyApproved({ gettingStarted: GS_NOT_REQUIRED })), GATE_SCREENS.APP,
+    'finishing the video opens the dashboard');
+});
+
+test('a migrated student sees the import summary first, then Getting Started', () => {
+  assert.equal(screenOf(onboarded({ gettingStarted: GS_REQUIRED })), GATE_SCREENS.IMPORT_WELCOME);
+  assert.equal(screenOf(onboarded({ importWelcomePending: false, gettingStarted: GS_REQUIRED })),
+    GATE_SCREENS.GETTING_STARTED);
+});

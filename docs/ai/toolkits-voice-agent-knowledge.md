@@ -1,5 +1,5 @@
 <!-- GENERATED FILE — do not hand-edit. Regenerate with `npm run ai:knowledge`
-     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-09-29 -->
+     (scripts/generate-voice-agent-knowledge.mjs). Generated: 2026-10-02 -->
 
 # Toolkits by Alex — Voice Assistant Knowledge
 
@@ -12,7 +12,7 @@ paths never change.
 
 ## 1. App overview
 
-- The toolkit bundles **38 tools** across three career stages: **01 Training &
+- The toolkit bundles **30 tools** across three career stages: **01 Training &
   Skills** (build your foundation), **02 Job Application** (land US clients), and
   **03 Client Management & Delivery** (onboard, operate, close the year), plus a Home
   dashboard.
@@ -43,6 +43,7 @@ paths never change.
 
 | Tool | Tab id | URL path | What it does |
 |---|---|---|---|
+| Getting Started | `gettingstarted` | `/getting-started` | Replay the Getting Started welcome video and see whether you have finished it. |
 | Dashboard | `dashboard` | `/` | Progress overview with career-stage tiles, membership status, and quick links to every tool. |
 | Progress & Rankings | `progress` | `/progress-rankings` | Private learning report with completion-based Accounting Foundations, QuickBooks Mastery, Profile Optimization and Interview Readiness progress, daily trends, fair plan and VIP batch leaderboards, and privacy controls. |
 | Community | `community` | `/community` | Member forum organised into channels grouped by category, like a chat community. Text channels for discussion and announcement channels that are read-and-react only. Every member sees #announcements plus general channels for QuickBooks help, the job search and client work; VIP members also get their own private cohort channels. Channels can be limited to particular plans or batches, and members only ever see the channels they may open. Includes per-channel unread markers, search within a channel or across all of them, free-form tags, image/video/link attachments, @mentions, reactions, pinned posts and a notification bell. Admins create and organise channels from Manage community. Access follows the membership automatically. |
@@ -96,6 +97,7 @@ paths never change.
 
 | Tool | Tab id | URL path | What it does |
 |---|---|---|---|
+| Getting Started Video | `gettingstartedadmin` | `/admin/getting-started-video` | Admin screen: upload, preview, publish, replace or remove the Getting Started video that newly approved students watch before their first dashboard. Super Admin only. |
 | Access Requests | `accessrequests` | `/admin/access-requests` | Admin screen: approve or reject new signups. |
 | Financial Management | `financialmanagement` | `/admin/financial-management` | Admin screen: the business finance dashboard. Super Admin only. |
 | Communications | `communications` | `/admin/communications` | Admin screen: send announcements and student emails, manage email automations, and read the delivery tracker. Super Admin only. |
@@ -123,7 +125,7 @@ to USD.
 
 **What each plan can open (entitlement scope):**
 
-- **Essentials** (`sampler`): Essentials + 1-on-1 coaching. Can open: Dashboard, Progress & Rankings, QuickBooks Online Mastery, Book 1-on-1 with Alex, Personalized Coaching With Alex, Community. Within the QuickBooks catalog it can only open **essentials-tier** courses (QuickBooks Online Essentials — NOT Mastery).
+- **Essentials** (`sampler`): Essentials + 1-on-1 coaching. Can open: Getting Started, Dashboard, Progress & Rankings, QuickBooks Online Mastery, Book 1-on-1 with Alex, Personalized Coaching With Alex, Community. Within the QuickBooks catalog it can only open **essentials-tier** courses (QuickBooks Online Essentials — NOT Mastery).
 - **Silver · Self-Paced** (`silver_self_paced`): **Full toolkit access** — every student tool in the toolkit.
 - **VIP Package** (`vip`): **Full toolkit access** — every student tool in the toolkit.
 - **Admins, and legacy members with no plan key on file**: full toolkit access.

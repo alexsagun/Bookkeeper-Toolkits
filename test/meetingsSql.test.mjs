@@ -170,9 +170,12 @@ test('every #62 code is in the client code list and has its own copy', () => {
   }
 });
 
-test('the mirror: meetings.manage is the last key and only super_admin holds it', () => {
-  assert.equal(STAFF_PERMISSION_KEYS.length, 22);
-  assert.equal(STAFF_PERMISSION_KEYS.at(-1), 'meetings.manage');
+test('the mirror: meetings.manage is the 22nd key and only super_admin holds it', () => {
+  // #69 appended onboarding.manage after it. The SQL seed order is still what
+  // staffRolesSql.test.mjs diffs, so position 22 is pinned rather than "last".
+  assert.equal(STAFF_PERMISSION_KEYS.length, 23);
+  assert.equal(STAFF_PERMISSION_KEYS.indexOf('meetings.manage'), 21);
+  assert.equal(STAFF_PERMISSION_KEYS.at(-1), 'onboarding.manage');
   assert.ok(ROLE_PERMISSIONS.super_admin.includes('meetings.manage'));
   assert.ok(!ROLE_PERMISSIONS.operations_admin.includes('meetings.manage'));
   assert.ok(!ROLE_PERMISSIONS.trainer.includes('meetings.manage'));

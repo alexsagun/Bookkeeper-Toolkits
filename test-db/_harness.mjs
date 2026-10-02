@@ -389,7 +389,16 @@ export async function resetShadow() {
       public.course_lesson_assets,
       public.course_lessons,
       public.course_modules,
-      public.courses
+      public.courses,
+      -- #69: the Getting Started video. A version left PUBLISHED gates every later student
+      -- persona behind the welcome video — in this directory and, worse, in the rendered e2e
+      -- suites, which never call resetShadow(). TRUNCATE is also the ONLY way to empty
+      -- onboarding_videos: its BEFORE DELETE guard refuses a row delete (history is permanent),
+      -- and row triggers do not fire on TRUNCATE. The progress table is named before the
+      -- versions it points at (ON DELETE RESTRICT); CASCADE would reach it anyway.
+      public.student_onboarding_progress,
+      public.onboarding_video_events,
+      public.onboarding_videos
     restart identity cascade`);
   // Objects the course-video tests file under the private bucket. Deleted rather than
   // truncated: storage.objects is shared with the community-media and receipts suites.
@@ -402,10 +411,15 @@ export async function resetShadow() {
   //   each request on its own — so the setting and the delete have to travel in ONE statement.
   //   A `do` block is that statement: its implicit transaction scopes the setting to exactly
   //   this delete, so nothing else in the run inherits permission to bypass the guard.
+  // ★ #69 added 'onboarding-videos'. A live version whose object row is gone gates nobody
+  //   (user_onboarding_video_state() checks storage.objects), and the rows are truncated above
+  //   anyway — but an object left behind would make the next run's "this draft has no file yet"
+  //   assertions depend on what an earlier run uploaded.
   await runSql(`do $storage$
     begin
       perform set_config('storage.allow_delete_query', 'true', true);
-      delete from storage.objects where bucket_id in ('course-videos', 'course-lesson-assets');
+      delete from storage.objects
+       where bucket_id in ('course-videos', 'course-lesson-assets', 'onboarding-videos');
     end
   $storage$`);
   // Cohorts and their spaces: delete the batches, let the FK cascade take the
@@ -487,6 +501,56 @@ export async function resetFinance() {
   await runSql(`update public.finance_accounts set active = true
                  where code in ('1010', '4000', '4010', '4040', '4900')`);
   await runSql(`update public.enrollment_plans set finance_income_account_id = null`);
+}
+
+/**
+ * Remove every Getting Started video version, its progress and audit rows, and every object
+ * in the private onboarding-videos bucket (#69) — and nothing else.
+ *
+ * ★ WHY THIS IS ITS OWN HELPER. resetShadow() clears the same things, but it also wipes
+ *   memberships, courses, the community and the batches, in ~20 round trips. A suite that only
+ *   needs "no video is live" calls this instead — above all the rendered e2e suites, which
+ *   never call resetShadow() and would otherwise find every student persona held on the
+ *   Getting Started gate by a version an earlier run left PUBLISHED. Call it in before() AND
+ *   in after(): the first protects this run from the last one, the second protects the next
+ *   suite from this one.
+ *
+ * ★ TRUNCATE IS THE ONLY RESET. onboarding_videos_guard refuses a row DELETE (history is
+ *   permanent) and the events table is append-only; row triggers do not fire on TRUNCATE, and
+ *   every client role lost TRUNCATE when #69 revoked all on the three tables. The progress
+ *   table is named before the versions it points at (ON DELETE RESTRICT).
+ *
+ * ★ ONE STATEMENT for the rows and the object rows: storage.protect_delete() raises 42501 on a
+ *   direct DELETE unless `storage.allow_delete_query` is 'true', which must be set with
+ *   is_local = true, which needs a transaction — and the Management API commits each request on
+ *   its own (see resetShadow). The DO block is that transaction, so there is no moment at which
+ *   a version is gone while its object is still listed, or the reverse.
+ *
+ * The Storage API call comes first and is best effort: an object a test really uploaded has
+ * BYTES behind its row, and deleting only the row would strand them in the shadow project's
+ * backing store run after run. A row inserted by fixture SQL has no bytes; the API removes its
+ * row all the same. Whatever that call leaves, the DO block removes — so a transport fault
+ * there can cost a few orphaned bytes, never a row that gates somebody.
+ */
+export async function resetOnboardingVideos() {
+  shadowEnv(); // re-asserts we are not pointed at production
+  try {
+    const rows = await runSql(
+      `select name from storage.objects where bucket_id = 'onboarding-videos' order by name limit 500`);
+    const names = (Array.isArray(rows) ? rows : []).map((r) => r.name).filter(Boolean);
+    if (names.length) await serviceClient().storage.from('onboarding-videos').remove(names);
+  } catch { /* fall through: the row delete below is what the gate reads */ }
+  await runSql(`do $storage$
+    begin
+      truncate table
+        public.student_onboarding_progress,
+        public.onboarding_video_events,
+        public.onboarding_videos
+      restart identity cascade;
+      perform set_config('storage.allow_delete_query', 'true', true);
+      delete from storage.objects where bucket_id = 'onboarding-videos';
+    end
+  $storage$`);
 }
 
 /** Convenience for tests that need the General space id. */

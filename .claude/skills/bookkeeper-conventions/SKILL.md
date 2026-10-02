@@ -17,7 +17,9 @@ are **CSS custom-property references**, with the actual per-theme values in
 
 - `C` — color palette: `C.primary` = `var(--c-primary)`, `C.primarySolid` = `var(--primary-solid)`
   (**the blue for a FLAT fill behind white text — `C.primary` is 3.65:1 on white and fails WCAG AA in
-  both themes; use `C.primary` only for borders, icons, rings, bars and accent text**), `C.text`,
+  both themes; use `C.primary` only for borders, icons, rings, bars and accent text**; its green and
+  red siblings for a flat fill behind white text are `var(--ok-solid)` and `var(--danger-solid)`,
+  never the `ADMIN_BTN_OK`/`ADMIN_BTN_DANGER` gradients, whose bright stops fail AA), `C.text`,
   `C.textSoft`, `C.textMute`,
   `C.green`, `C.amber`, `C.red`, `C.bg`, `C.white` (a *surface*, dark-aware), etc.
 - `GLASS` — glass surfaces (`GLASS.card`, `GLASS.cardElev`, `GLASS.border`…), `SHEEN` — the
@@ -92,6 +94,14 @@ beside a `minmax(0,1fr)` column**: grid gives the `auto` track its max-content f
 2026-09-24 that squeezed the Enrollments card's student identity to 0px with the sidebar open while
 nothing overflowed. Actions get their own row. Verify with `npm run test:e2e`, sidebar open AND
 collapsed — an overflow check is not a layout check.
+**Media focus.** A focused `<video>` inside `.course-stage` draws no outline of its own — every caller
+clips it — and the frame paints the ring with an inset `::after` (the last block of `index.css`), so put
+any new media in `.course-stage` or give it the same two rules. Keep the `:has()` rule separate from the
+frame's own: a browser without `:has()` drops a whole selector list (S1).
+**Announcements.** A status message that appears after a press is said through a live region that was
+ALREADY mounted (the Getting Started surfaces alternate a trailing space, so a repeated sentence is
+announced again), never one mounted together
+with its text, which NVDA and JAWS often skip; an error keeps `role="alert"` (S5).
 
 ## AI calls (use the shared `callClaude()` helper)
 
@@ -214,6 +224,20 @@ with the URL and **bypasses RLS on read entirely**, so a public bucket cannot pr
   re-sign decision — lives in the pure [src/lib/courseVideo.js](../../../src/lib/courseVideo.js) and
   is mirrored in `db/2026-08-24-course-video-upload-only.sql`. Change the module, the SQL, and
   `test/courseVideo*.test.mjs` together.
+- **A second owner of uploaded video reuses the SAME uploader and player — never a copy.** #69's
+  Getting Started video lives in a third, private bucket (`onboarding-videos`, at the lesson cap and
+  MIME list) and passes `LessonVideoUploader` a `target` record (bucket, path builder, own-path test,
+  resume-key scope, signer, discard, wording — `LESSON_UPLOAD_TARGET` is the default; an owner's
+  `copy.messages` replace the shared refusals that name a lesson) and `SignedLessonVideo` a `signUrl`
+  (default `signLessonVideo`). The uploader reads a new file BEFORE it discards anything: a refused
+  pick changes nothing, and the upload a replacement replaces goes only once that replacement is
+  accepted. Every URL the browser mints for an
+  uploaded lesson video or the Getting Started video comes from ONE function,
+  `signPrivateVideo(bucket, path)` — not every video URL in the app: an uploaded feature-guide video
+  stays a public `course-media` URL (above), community video attachments are batch-signed by
+  `CommunityHub`, and the AI trainer's transcription signs a lesson video on the server. Pass
+  module-scope signers only, because `signUrl` is a dependency of the signing callback and an inline
+  closure would re-sign on every render.
 - ★ **A client-side limit is a PROMISE, not a grant — check the whole chain of ceilings.**
   Supabase enforces `min(bucket file_size_limit, PROJECT-WIDE fileSizeLimit)`, and the
   project-wide value lives in storage-api config: it is in no `db/*.sql`, not in
@@ -243,8 +267,16 @@ with the URL and **bypasses RLS on read entirely**, so a public bucket cannot pr
   distinct failure looked identical, so nothing was diagnosable. Give a player named states, an
   `onError`, and **one** re-sign — never on a DECODE error, which re-signing cannot fix.
 - **`supabase-js` returns storage failures as `{ data: null, error }` without throwing.** A bare
-  `try/catch` around `.remove()` or `.list()` swallows them silently. Inspect the result. And
+  `try/catch` around `.remove()` or `.list()` swallows them silently. Inspect the result: storage
+  `remove()` RESOLVES `{ data, error }` and never rejects, so a try/catch alone swallows every failed
+  delete. `removeMediaIfUnreferenced()` checks it, and the Getting Started upload target's `discard`
+  THROWS the resolved error so every caller's catch logs it (AUI-4). And
   `.list()` caps at 1000 with no total — paginate, or you under-collect and never know.
+- **A discarded upload stops being the draft's file.** When the uploader hands back `null` for a path
+  the draft names (an accepted replacement, a Cancel, a Remove), put the draft back on what its SAVED
+  row holds — never leave it naming a deleted object (RES-1; the lesson editor's
+  `notePendingVideoPath`, the Getting Started drawer's `notePendingPath`). An upload whose check failed
+  stays pending until the next SAVE sweeps it (AUI-1).
 - **Cleanup fails conservatively.** If references cannot be confirmed, keep the file. Course
   duplication reuses `storage_path` by reference (copy-on-write), so a path is legitimately shared
   across courses — that is what `removeMediaIfUnreferenced()` exists for. Never delete by prefix,

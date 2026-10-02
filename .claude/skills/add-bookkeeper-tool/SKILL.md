@@ -114,6 +114,15 @@ The app is **URL-routed + keep-alive** (see CLAUDE.md → "Navigation model"). A
 
 The `id` must be identical in the sidebar config, the `renderToolContent` case, and `TAB_ROUTES`.
 
+**An ADMIN screen (staff only) is not a sidebar tool.** It gets a row in the root's `adminNavItems`
+instead of a `DEFAULT_STAGES` entry, its id goes in `NON_TOOL_TAB_IDS` (it is not counted as a tool),
+and it **must be listed in `ADMIN_TAB_PERMISSION`** in [src/lib/staffRoles.js](../../../src/lib/staffRoles.js).
+That listing is what makes the render chokepoint (`tabAccessView()`) wait for the staff context
+("Checking your access…") and refuse by ROLE ("Your account can’t open this screen", no upsell). A tab
+missing from it is treated as a PLAN tab: a full-access student would MOUNT it (`allowsTab` is true for
+every id on a full plan — the hole #45 closed), and anyone else is offered an "Upgrade or renew" that no
+purchase can satisfy. Name the server-side check the permission gates in the same change.
+
 ## Step 4 — Verify
 
 ```powershell
